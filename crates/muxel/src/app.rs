@@ -757,6 +757,10 @@ pub struct MuxelApp {
     settings_resize: Option<(Point<Pixels>, gpui::Size<Pixels>)>,
     /// Active settings-move drag: (start cursor pos, base offset).
     settings_move: Option<(Point<Pixels>, Point<Pixels>)>,
+    /// Update modal card size (resizable via the bottom-right corner).
+    update_modal_size: gpui::Size<Pixels>,
+    /// Active update-modal-resize drag: (start cursor pos, base size).
+    update_resize: Option<(Point<Pixels>, gpui::Size<Pixels>)>,
     /// A terminal shown maximized over the pane area (transient; not persisted).
     maximized: Option<Uuid>,
     /// Panes detached into their own OS windows, keyed by instance id.
@@ -1297,6 +1301,7 @@ impl Render for PopoutView {
                 div()
                     .absolute()
                     .inset_0()
+                    .occlude()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1728,6 +1733,8 @@ impl MuxelApp {
             settings_offset: point(px(0.0), px(0.0)),
             settings_resize: None,
             settings_move: None,
+            update_modal_size: size(px(560.0), px(520.0)),
+            update_resize: None,
             maximized: None,
             popouts: HashMap::new(),
             pending_editor_redock: Vec::new(),
@@ -5478,6 +5485,7 @@ impl MuxelApp {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -5511,6 +5519,7 @@ impl MuxelApp {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -5622,6 +5631,7 @@ impl MuxelApp {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -11662,6 +11672,7 @@ impl MuxelApp {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -11730,6 +11741,7 @@ impl MuxelApp {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -11817,6 +11829,7 @@ impl MuxelApp {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -11912,6 +11925,7 @@ impl MuxelApp {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -12149,6 +12163,7 @@ impl MuxelApp {
         div()
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -12193,7 +12208,7 @@ impl MuxelApp {
         let muted = cx.theme().muted_foreground;
         let self_updatable = self.install_kind.self_updatable();
 
-        let mut body = v_flex().gap_3().w_full().child(
+        let mut body = v_flex().gap_3().w_full().flex_1().min_h_0().child(
             div()
                 .text_sm()
                 .text_color(muted)
@@ -12218,15 +12233,14 @@ impl MuxelApp {
                 );
                 let notes = info.notes.trim();
                 if !notes.is_empty() {
-                    let preview: String = notes.chars().take(600).collect();
+                    // The full release notes as scrollable markdown, growing to
+                    // fill the (resizable) card.
                     body = body.child(
-                        div()
-                            .id("update-notes")
-                            .max_h(px(160.0))
-                            .overflow_y_scroll()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(preview),
+                        div().flex_1().min_h_0().child(
+                            gpui_component::text::markdown(notes.to_string())
+                                .selectable(true)
+                                .scrollable(true),
+                        ),
                     );
                 }
                 if !self_updatable && let Some(hint) = self.install_kind.upgrade_hint() {
@@ -12320,6 +12334,9 @@ impl MuxelApp {
         div()
             .absolute()
             .inset_0()
+            // Opaque hitbox: block clicks/scroll/hover from falling through the
+            // backdrop to the terminals + sidebar painted behind the modal.
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -12331,9 +12348,26 @@ impl MuxelApp {
                     cx.notify();
                 }),
             )
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                if let Some((start, base)) = this.update_resize {
+                    let w = (f32::from(base.width) + f32::from(ev.position.x - start.x)).max(420.0);
+                    let h =
+                        (f32::from(base.height) + f32::from(ev.position.y - start.y)).max(320.0);
+                    this.update_modal_size = size(px(w), px(h));
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _w, _cx| this.update_resize = None),
+            )
             .child(
                 div()
-                    .w(px(420.0))
+                    .relative()
+                    .w(self.update_modal_size.width)
+                    .h(self.update_modal_size.height)
+                    .max_w(relative(0.95))
+                    .max_h(relative(0.9))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -12346,7 +12380,24 @@ impl MuxelApp {
                     .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
                     .child(div().text_lg().font_semibold().child("Software update"))
                     .child(body)
-                    .child(footer),
+                    .child(footer)
+                    .child(
+                        // Bottom-right corner: drag to resize the modal.
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .right_0()
+                            .size(px(18.0))
+                            .cursor(CursorStyle::ResizeUpLeftDownRight)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                                    cx.stop_propagation();
+                                    this.update_resize =
+                                        Some((ev.position, this.update_modal_size));
+                                }),
+                            ),
+                    ),
             )
             .into_any_element()
     }

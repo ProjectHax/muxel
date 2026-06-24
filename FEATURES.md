@@ -281,7 +281,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **In-app updates** — check for and apply updates from within the app: it
   fetches the latest GitHub Release and self-replaces in place (the AppImage, the
   portable binary, the Windows `.exe`, or the macOS `.app`), then relaunches;
-  package-managed installs get the right upgrade command instead.
+  package-managed installs get the right upgrade command instead. The update
+  dialog shows the release's full changelog rendered as markdown, and is
+  resizable.
 - **Windows installer** — a basic per-user Inno Setup installer (`.exe`, no
   admin) with a Start Menu shortcut and an uninstaller; it installs to a
   user-writable location so the in-app auto-updater keeps working without
