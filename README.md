@@ -1,4 +1,6 @@
-# muxel
+<p align="center">
+  <img src="docs/banner.png" alt="muxel — a native multi-agent terminal multiplexer, built on GPUI" width="820">
+</p>
 
 A native, GPU-accelerated **multi-agent terminal multiplexer** for running many
 AI coding agents (Claude, opencode, Amp, …) and shells side by side — built in
