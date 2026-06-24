@@ -9294,23 +9294,32 @@ impl MuxelApp {
                 .flex()
                 .items_center()
                 .gap_1()
+                .w_full()
+                .min_w_0()
+                // "New Project" takes the available width and may shrink; the
+                // remote-SSH icon button is fixed so it's never clipped at a
+                // narrow sidebar width.
                 .child(
-                    Button::new("new-project")
-                        .ghost()
-                        .icon(IconName::Plus)
-                        .label("New Project")
-                        .on_click(cx.listener(|this, _ev, window, cx| {
-                            this.new_project_dialog(window, cx);
-                        })),
+                    div().flex_1().min_w_0().overflow_hidden().child(
+                        Button::new("new-project")
+                            .ghost()
+                            .icon(IconName::Plus)
+                            .label("New Project")
+                            .on_click(cx.listener(|this, _ev, window, cx| {
+                                this.new_project_dialog(window, cx);
+                            })),
+                    ),
                 )
                 .child(
-                    Button::new("new-remote-project")
-                        .ghost()
-                        .icon(IconName::Network)
-                        .tooltip("New remote project (SSH)")
-                        .on_click(cx.listener(|this, _ev, window, cx| {
-                            this.open_remote_project_modal(window, cx);
-                        })),
+                    div().flex_none().child(
+                        Button::new("new-remote-project")
+                            .ghost()
+                            .icon(IconName::Network)
+                            .tooltip("New remote project (SSH)")
+                            .on_click(cx.listener(|this, _ev, window, cx| {
+                                this.open_remote_project_modal(window, cx);
+                            })),
+                    ),
                 ),
         )
     }
