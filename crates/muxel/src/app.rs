@@ -9362,16 +9362,18 @@ impl MuxelApp {
                         .into_any_element()
                     } else {
                         base.cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                                    if ev.click_count >= 2 {
-                                        this.start_rename_instance(iid, window, cx);
-                                    } else {
-                                        this.select_instance(iid, window, cx);
-                                    }
-                                }),
-                            )
+                            // Focus on click (mouse-up), not mouse-down: focusing
+                            // the terminal during a press on a draggable row gets
+                            // reset by the drag/release handling, so the pane would
+                            // only highlight and you couldn't type. Double-click
+                            // renames (like before).
+                            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                                if matches!(ev, ClickEvent::Mouse(e) if e.up.click_count >= 2) {
+                                    this.start_rename_instance(iid, window, cx);
+                                } else {
+                                    this.select_instance(iid, window, cx);
+                                }
+                            }))
                             .child(
                                 div()
                                     .flex_1()
