@@ -2366,6 +2366,10 @@ impl MuxelApp {
         self.workspace.add_instance(instance);
         self.workspace.add_project(project);
         self.workspace.active_project = Some(pid);
+        // Point the open file browser at the new project right away.
+        if self.show_file_browser {
+            self.load_file_browser(pid, cx);
+        }
 
         self.spawn_terminal(iid, window, cx);
         self.focus_instance(iid, window, cx);
@@ -2399,6 +2403,10 @@ impl MuxelApp {
         self.workspace.add_instance(instance);
         self.workspace.add_project(project);
         self.workspace.active_project = Some(pid);
+        // Point the open file browser at the new project right away.
+        if self.show_file_browser {
+            self.load_file_browser(pid, cx);
+        }
 
         // Goes through the remote pre-flight (password prompt + login check).
         self.ensure_project_terminals(pid, window, cx);
