@@ -138,7 +138,8 @@ feature is added or changed, update the matching entry here in the same change**
 ## Notifications
 
 - **Desktop notifications** — bell-driven (an agent rings the terminal bell when it
-  needs attention or finishes); fired only when the pane isn't focused.
+  needs attention or finishes); fired only when the pane isn't focused. Clicking the
+  notification raises muxel and jumps to the pane that fired it.
 - **In-app NOTIFICATIONS sidebar** — a category above PROJECTS collecting agent
   events **and** all app messages (git results, SSH connections, save errors —
   everything that used to be a pop-up toast goes here instead). Agent rows are

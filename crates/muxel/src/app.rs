@@ -195,23 +195,40 @@ fn shell_dir_title(osc: &str) -> &str {
     }
 }
 
-/// Fire a desktop notification off the UI thread (best-effort).
-fn notify(summary: String, body: String) {
+/// Instance a clicked desktop notification wants muxel to jump to. Set from the
+/// notification's D-Bus action thread (off the UI thread); drained on the UI
+/// thread by `handle_notification_click` each tick.
+static PENDING_NOTIFICATION_FOCUS: std::sync::Mutex<Option<Uuid>> = std::sync::Mutex::new(None);
+
+/// Fire a desktop notification off the UI thread (best-effort). When `focus` is
+/// set, clicking the notification raises muxel and switches to that instance's
+/// project + pane.
+fn notify(summary: String, body: String, focus: Option<Uuid>) {
     std::thread::spawn(move || {
-        let shown = notify_rust::Notification::new()
+        let mut builder = notify_rust::Notification::new();
+        builder
             .appname("muxel")
             .icon("muxel")
             .summary(&summary)
             .body(&body)
-            .timeout(notify_rust::Timeout::Milliseconds(10_000))
-            .show();
-        // notify-rust's handle owns the D-Bus connection that sent the
-        // notification; GNOME withdraws the notification when that connection
-        // closes. Keep it open while the notification is displayed so it doesn't
-        // vanish after <1s.
-        if let Ok(handle) = shown {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            drop(handle);
+            .timeout(notify_rust::Timeout::Milliseconds(10_000));
+        // "default" is the action GNOME invokes when the notification *body* is
+        // clicked; only register it when there's a pane to jump to.
+        if focus.is_some() {
+            builder.action("default", "Open");
+        }
+        if let Ok(handle) = builder.show() {
+            // Blocks running the D-Bus loop until the notification is clicked or
+            // closed — which also keeps the sending connection alive (GNOME
+            // withdraws the popup when it closes), replacing the old keep-alive
+            // sleep. On a body click we record the target for the UI thread.
+            handle.wait_for_action(|action| {
+                if action == "default"
+                    && let Some(iid) = focus
+                {
+                    *PENDING_NOTIFICATION_FOCUS.lock().unwrap() = Some(iid);
+                }
+            });
         }
     });
 }
@@ -1348,12 +1365,21 @@ impl Render for PopoutView {
 
 impl MuxelApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let status_timer = cx.spawn(async move |view: WeakEntity<Self>, cx| {
+        // `spawn_in` so the closure has a window: `tick` updates agent status, and
+        // a clicked desktop notification (`handle_notification_click`) has to focus
+        // a pane and raise the window.
+        let status_timer = cx.spawn_in(window, async move |view: WeakEntity<Self>, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(1000))
                     .await;
-                if view.update(cx, |this, cx| this.tick(cx)).is_err() {
+                if view
+                    .update_in(cx, |this, window, cx| {
+                        this.tick(cx);
+                        this.handle_notification_click(window, cx);
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -2752,6 +2778,7 @@ impl MuxelApp {
                             notify(
                                 format!("muxel {} is available", info.version),
                                 "Open muxel to install the update.".to_string(),
+                                None,
                             );
                         }
                         this.update_state = UpdateState::Available(info);
@@ -2793,6 +2820,7 @@ impl MuxelApp {
                             notify(
                                 "muxel update ready".to_string(),
                                 "Restart to finish updating.".to_string(),
+                                None,
                             );
                         }
                         this.update_state = UpdateState::Ready(plan);
@@ -2972,7 +3000,7 @@ impl MuxelApp {
                     // only the OS popup respects `notifications_enabled`.
                     self.add_notification(iid, kind, &title, &project);
                     if self.notifications_enabled {
-                        notify(format!("{title} {}", kind.label()), project);
+                        notify(format!("{title} {}", kind.label()), project, Some(iid));
                     }
                 }
             }
@@ -6687,6 +6715,19 @@ impl MuxelApp {
             self.select_project(pid, window, cx);
         }
         self.focus_instance(iid, window, cx);
+    }
+
+    /// If a desktop notification was clicked since the last tick, raise muxel and
+    /// switch to the instance it pointed at. Polled from the status timer because
+    /// the click lands on a background D-Bus thread that can't touch the UI.
+    fn handle_notification_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(iid) = PENDING_NOTIFICATION_FOCUS.lock().unwrap().take() else {
+            return;
+        };
+        if self.workspace.instance(iid).is_some() {
+            self.select_instance(iid, window, cx);
+            window.activate_window();
+        }
     }
 
     /// Swap two terminals' positions (sidebar or pane drag). Only within one project.
@@ -12780,6 +12821,7 @@ impl MuxelApp {
                             notify(
                                 "muxel test notification".to_string(),
                                 "If you can see this, notifications are working.".to_string(),
+                                None,
                             );
                         })),
                 ),
