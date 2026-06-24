@@ -1,0 +1,30 @@
+/target
+**/*.rs.bk
+*.swp
+.DS_Store
+
+# muxel runtime data written during local dev
+/.muxel-dev/
+
+# local-only dev config (per-developer; not part of the public repo)
+/.claude/
+/.githooks/
+/target/tools/
+
+# editor / IDE
+/.vscode/
+/.idea/
+*~
+
+# secrets / credentials — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.pkcs12
+*.keystore
+*.jks
+*.token

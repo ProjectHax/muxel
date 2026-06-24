@@ -1,0 +1,16 @@
+[package]
+name = "muxel-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Persistence for muxel: load/save the workspace (projects + pane layouts)."
+
+[dependencies]
+muxel-core.workspace = true
+serde_json.workspace = true
+toml = "1"
+directories = "6"
+anyhow.workspace = true
+log.workspace = true

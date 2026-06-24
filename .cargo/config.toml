@@ -1,0 +1,5 @@
+# Use the system `git` binary to fetch git dependencies. The `zed` repo (source
+# of gpui/gpui_platform) is large; the system git handles big fetches and shows
+# progress better than cargo's built-in libgit2 fetcher.
+[net]
+git-fetch-with-cli = true

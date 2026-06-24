@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = ["crates/muxel", "crates/muxel-core", "crates/muxel-store", "crates/muxel-terminal"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-only"
+authors = ["ProjectHax LLC"]
+repository = "https://github.com/projecthax/muxel"
+
+[workspace.dependencies]
+# --- GPUI (Zed's UI framework) ---
+# Pinned to the exact rev that gpui-component is built against, so the `gpui`
+# types pulled in directly and transitively (via gpui-component) unify. See
+# gpui-component's own workspace Cargo.toml.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = [
+    "font-kit",
+    "x11",
+    "wayland",
+] }
+
+# --- UI component library (Longbridge) ---
+# Pinned to the commit we verified locally; it internally pins gpui to the rev above.
+# `tree-sitter-languages` enables all bundled syntax-highlighting grammars for
+# the code-editor panes (InputState::code_editor).
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "e416af7f4dad861f251d357b6aa677dbc13a500e", features = [
+    "tree-sitter-languages",
+] }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "e416af7f4dad861f251d357b6aa677dbc13a500e", package = "gpui-component-assets" }
+
+# --- workspace-internal crates (added in later phases) ---
+muxel-core = { path = "crates/muxel-core" }
+muxel-terminal = { path = "crates/muxel-terminal" }
+muxel-store = { path = "crates/muxel-store" }
+
+# --- shared third-party deps ---
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }

@@ -1,0 +1,293 @@
+name: release
+
+# Push a tag like `v0.1.0` to build distributable packages on each OS and attach
+# them to a GitHub Release. Can also be run manually (workflow_dispatch) to build
+# the packages as artifacts without cutting a release. GPUI can't be
+# cross-compiled across OSes, so each OS builds on its own native runner.
+#
+# Outputs:
+#   Linux   — .deb, .rpm, AppImage, .tar.gz (x86_64 + aarch64)
+#   macOS   — a universal .app (Intel x86_64 + Apple Silicon) inside a .dmg + .zip
+#   Windows — portable .zip + an Inno Setup installer .exe (x86_64 + arm64)
+#
+# Linux aarch64 builds on a native ARM64 runner. GPUI can't be cross-compiled
+# across OSes, so each OS builds on its own runner; within macOS, x86_64 is
+# cross-compiled from the Apple Silicon runner (cross-arch in one OS is fine).
+#
+# Windows artifacts (the portable .zip's muxel.exe and the installer .exe) are
+# Authenticode-signed out of band after the build, via Azure Trusted Signing —
+# run `scripts/sign-windows.sh --release <tag>` once the release exists (it
+# re-uploads the signed zips and installers).
+#
+# macOS is signed + notarized in-job by scripts/sign-macos.sh when the MACOS_*
+# secrets (a paid Apple Developer ID + an App Store Connect notary key) are
+# configured; without them it falls back to ad-hoc signing and Gatekeeper still
+# warns. See scripts/sign-macos.sh for the exact secrets and how to obtain them.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Linux: build the release binary once, then reuse it for every package format.
+  # ----------------------------------------------------------------------------
+  linux-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang lld cmake pkg-config \
+            libfontconfig-dev libfreetype6-dev \
+            libwayland-dev wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libx11-dev libx11-xcb-dev \
+            libasound2-dev libvulkan-dev libdbus-1-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p muxel
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-build-bin-${{ matrix.arch }}
+          path: target/release/muxel
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------------------
+  # Linux packages off the prebuilt binary: .deb, .rpm, AppImage, .tar.gz.
+  # ----------------------------------------------------------------------------
+  linux-packages:
+    needs: linux-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch prebuilt binary
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-build-bin-${{ matrix.arch }}
+          path: target/release
+      - run: chmod +x target/release/muxel
+      - name: Install packaging deps
+        run: |
+          # Runtime libs so cargo-deb's `$auto` dependency detection
+          # (dpkg-shlibdeps) can resolve sonames to packages.
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfontconfig1 libfreetype6 libwayland-client0 \
+            libxkbcommon0 libxkbcommon-x11-0 libxcb1 libx11-6 libx11-xcb1 \
+            libasound2 libvulkan1 libdbus-1-3
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall -y cargo-deb cargo-generate-rpm
+
+      - name: Build .deb
+        run: cargo deb --no-build -p muxel
+
+      - name: Build .rpm
+        run: cargo generate-rpm -p crates/muxel
+
+      - name: Build .tar.gz
+        run: |
+          set -eux
+          stage="muxel-linux-${{ matrix.arch }}"
+          mkdir -p "$stage"
+          cp target/release/muxel "$stage/"
+          cp README.md LICENSE "$stage/"
+          cp packaging/muxel.desktop "$stage/"
+          cp crates/muxel/assets/muxel.svg "$stage/"
+          tar -czf "$stage.tar.gz" "$stage"
+
+      - name: Build AppImage
+        run: |
+          set -eux
+          arch="${{ matrix.arch }}"
+          # GitHub runners lack FUSE; run the AppImage tools by self-extracting.
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${arch}.AppImage"
+          chmod +x "linuxdeploy-${arch}.AppImage"
+          mkdir -p AppDir
+          "./linuxdeploy-${arch}.AppImage" \
+            --appdir AppDir \
+            --executable target/release/muxel \
+            --desktop-file packaging/muxel.desktop \
+            --icon-file crates/muxel/assets/muxel.png \
+            --output appimage
+          # linuxdeploy names it after the desktop "Name"; normalize it.
+          mv muxel*-"${arch}".AppImage "muxel-linux-${arch}.AppImage" 2>/dev/null \
+            || mv muxel*.AppImage "muxel-linux-${arch}.AppImage"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: muxel-linux-packages-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+            muxel-linux-${{ matrix.arch }}.tar.gz
+            muxel-linux-${{ matrix.arch }}.AppImage
+
+  # ----------------------------------------------------------------------------
+  # macOS — a single UNIVERSAL app (Intel x86_64 + Apple Silicon aarch64 in one
+  # binary via `lipo`). Both arches build on Apple Silicon — aarch64 natively,
+  # x86_64 cross-compiled (Apple's toolchain handles x86_64<->arm64 within macOS),
+  # avoiding the Intel macos-13 runner Apple is retiring. Bundles muxel.app and
+  # ships one .dmg + .zip that runs on any Mac.
+  # ----------------------------------------------------------------------------
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin, aarch64-apple-darwin
+      # rust-toolchain.toml pins the channel, so `targets:` above lands on the
+      # wrong toolchain — add them to the pinned one that cargo actually uses.
+      - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both architectures
+        run: |
+          cargo build --release --target x86_64-apple-darwin -p muxel
+          cargo build --release --target aarch64-apple-darwin -p muxel
+      - name: Install icon tooling
+        run: brew install librsvg
+      - name: Build universal muxel.app
+        run: |
+          set -eux
+          app="muxel.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          # Fuse the two arch binaries into one universal Mach-O.
+          lipo -create -output "$app/Contents/MacOS/muxel" \
+            target/x86_64-apple-darwin/release/muxel \
+            target/aarch64-apple-darwin/release/muxel
+          lipo -info "$app/Contents/MacOS/muxel"
+          cp packaging/macos/Info.plist "$app/Contents/Info.plist"
+
+          # SVG -> .icns (standard iconset sizes + @2x retina variants).
+          mkdir -p muxel.iconset
+          for s in 16 32 128 256 512; do
+            rsvg-convert -w "$s" -h "$s" crates/muxel/assets/muxel.svg \
+              -o "muxel.iconset/icon_${s}x${s}.png"
+            d=$((s * 2))
+            rsvg-convert -w "$d" -h "$d" crates/muxel/assets/muxel.svg \
+              -o "muxel.iconset/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns muxel.iconset -o "$app/Contents/Resources/muxel.icns"
+      # Signs with a Developer ID + notarizes when the MACOS_* secrets are set,
+      # otherwise ad-hoc signs. Either way, writes the .dmg and .zip.
+      - name: Sign, notarize + package
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: scripts/sign-macos.sh muxel.app "muxel-macos-universal"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: muxel-macos-universal
+          if-no-files-found: error
+          path: |
+            muxel-macos-universal.dmg
+            muxel-macos-universal.zip
+
+  # ----------------------------------------------------------------------------
+  # Windows (x86_64 + arm64): portable .zip per architecture. arm64 is
+  # cross-compiled with the MSVC ARM64 tools bundled in the windows-2022 image.
+  # ----------------------------------------------------------------------------
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            name: muxel-windows-x86_64
+            arch: x86_64
+          - target: aarch64-pc-windows-msvc
+            name: muxel-windows-arm64
+            arch: arm64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # rust-toolchain.toml pins the channel, so `targets:` above lands on the
+      # wrong toolchain — add it to the pinned one that cargo actually uses
+      # (the windows-2022 runner only preinstalls the x86_64 target, not arm64).
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }} -p muxel
+      - name: Package .zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/muxel.exe" dist/
+          Copy-Item README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.name }}.zip"
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          # ISCC is the Inno Setup compiler; install it from Chocolatey.
+          choco install innosetup --no-progress -y
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          # Version = the only line-anchored `version = "..."` in the root
+          # Cargo.toml (the workspace package), so this works for both tag pushes
+          # and manual workflow_dispatch runs.
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          # Inno resolves [Files] / SetupIconFile paths relative to the .iss file's
+          # OWN directory, not the cwd — so pass ABSOLUTE source/asset/output dirs.
+          $root = (Get-Location).Path
+          & $iscc "/DMyAppVersion=$ver" "/DMyArch=${{ matrix.arch }}" `
+            "/DSourceDir=$root\dist" "/DAssetDir=$root\crates\muxel\assets" `
+            "/O$root" `
+            "$root\packaging\windows\muxel.iss"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            ${{ matrix.name }}.zip
+            ${{ matrix.name }}-setup.exe
+
+  # ----------------------------------------------------------------------------
+  # Collect every package and attach to the GitHub Release (tag pushes only).
+  # The intermediate `linux-build-bin-*` artifacts are excluded via the pattern.
+  # ----------------------------------------------------------------------------
+  release:
+    needs: [linux-packages, macos, windows]
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: muxel-*
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

@@ -1,0 +1,87 @@
+[package]
+name = "muxel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A multi-agent terminal multiplexer for managing many AI coding agents across projects."
+
+[[bin]]
+name = "muxel"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+muxel-core.workspace = true
+muxel-terminal.workspace = true
+muxel-store.workspace = true
+anyhow.workspace = true
+log.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+notify-rust = "4"
+rust-embed = "8"
+# Gitignore-aware file walk for the Ctrl+P search palette.
+ignore = "0.4"
+# Local wall-clock time for scheduled Loops (time-of-day + interval firing).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# In-app updater: check GitHub Releases (ureq, blocking on a bg thread), replace
+# the running binary (self_replace), and unpack the Windows/macOS zip (zip).
+ureq = { version = "2", features = ["json", "tls"] }
+self-replace = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Secure storage of remote-host passwords in the OS keychain (Secret Service on
+# Linux, Keychain on macOS, Credential Manager on Windows).
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }
+
+# Embeds the .exe icon (see build.rs); Windows build-host only, so it never
+# affects the Linux/macOS builds.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+# --- Linux .deb packaging (cargo-deb) ---
+# Asset source paths are resolved relative to THIS crate's directory, so files
+# at the workspace root are reached with `../../`. The release workflow builds
+# the binary first and runs `cargo deb --no-build -p muxel`.
+[package.metadata.deb]
+maintainer = "ProjectHax LLC"
+copyright = "2026, ProjectHax LLC"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+muxel is a terminal multiplexer for managing many AI coding agents (Claude, \
+Ollama, and others) across multiple projects, with split panes, tmux/worktree \
+integration, and one-click task runners."""
+assets = [
+    ["../../target/release/muxel", "usr/bin/muxel", "755"],
+    ["../../packaging/muxel.desktop", "usr/share/applications/muxel.desktop", "644"],
+    ["assets/muxel.svg", "usr/share/icons/hicolor/scalable/apps/muxel.svg", "644"],
+    ["assets/muxel.png", "usr/share/icons/hicolor/256x256/apps/muxel.png", "644"],
+    ["../../README.md", "usr/share/doc/muxel/README.md", "644"],
+    ["../../LICENSE", "usr/share/doc/muxel/LICENSE", "644"],
+]
+
+# --- Linux .rpm packaging (cargo-generate-rpm) ---
+# Unlike cargo-deb, cargo-generate-rpm resolves `source` paths relative to the
+# directory it is invoked from. The release workflow runs it from the workspace
+# root: `cargo generate-rpm -p crates/muxel`.
+[package.metadata.generate-rpm]
+summary = "Multi-agent terminal multiplexer for AI coding agents"
+assets = [
+    { source = "target/release/muxel", dest = "/usr/bin/muxel", mode = "755" },
+    { source = "packaging/muxel.desktop", dest = "/usr/share/applications/muxel.desktop", mode = "644" },
+    { source = "crates/muxel/assets/muxel.svg", dest = "/usr/share/icons/hicolor/scalable/apps/muxel.svg", mode = "644" },
+    { source = "crates/muxel/assets/muxel.png", dest = "/usr/share/icons/hicolor/256x256/apps/muxel.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/muxel/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/muxel/LICENSE", mode = "644", doc = true },
+]

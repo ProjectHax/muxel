@@ -1,0 +1,18 @@
+<svg width="256" height="256" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- app tile -->
+  <rect x="3" y="3" width="58" height="58" rx="14" fill="#1e1e2e"/>
+  <rect x="3.75" y="3.75" width="56.5" height="56.5" rx="13.25" fill="none" stroke="#89b4fa" stroke-width="1.5" opacity="0.65"/>
+
+  <!-- left pane (active, with prompt) -->
+  <rect x="11" y="14" width="23" height="36" rx="3.5" fill="#181825" stroke="#89b4fa" stroke-width="1.4"/>
+  <path d="M16 25 L20.5 29.5 L16 34" fill="none" stroke="#89b4fa" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="22.5" y="32.2" width="7.5" height="2.6" rx="1.3" fill="#a6e3a1"/>
+
+  <!-- right top pane -->
+  <rect x="37" y="14" width="16" height="16" rx="3.5" fill="#181825" stroke="#45475a" stroke-width="1.2"/>
+  <circle cx="45" cy="22" r="2.1" fill="#f9e2af"/>
+
+  <!-- right bottom pane -->
+  <rect x="37" y="34" width="16" height="16" rx="3.5" fill="#181825" stroke="#45475a" stroke-width="1.2"/>
+  <circle cx="45" cy="42" r="2.1" fill="#f38ba8"/>
+</svg>

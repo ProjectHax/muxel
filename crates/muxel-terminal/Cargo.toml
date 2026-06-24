@@ -1,0 +1,23 @@
+[package]
+name = "muxel-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Terminal backend (PTY + alacritty_terminal) and GPUI terminal element for muxel."
+
+[dependencies]
+gpui.workspace = true
+
+# Terminal emulation (VTE parser + grid) and cross-platform PTY.
+alacritty_terminal = "0.25"
+portable-pty = "0.9"
+
+parking_lot = "0.12"
+async-channel = "2.3"
+libc = "0.2"
+
+anyhow.workspace = true
+log.workspace = true
+uuid.workspace = true

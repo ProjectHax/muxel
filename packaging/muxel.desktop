@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=muxel
+GenericName=Terminal Multiplexer
+Comment=Multi-agent terminal multiplexer
+Exec=muxel
+Icon=muxel
+Terminal=false
+Categories=Development;TerminalEmulator;
+Keywords=terminal;multiplexer;agent;claude;tmux;
+StartupNotify=true
+StartupWMClass=muxel

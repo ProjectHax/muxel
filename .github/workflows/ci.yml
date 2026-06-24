@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang lld cmake pkg-config \
+            libfontconfig-dev libfreetype6-dev \
+            libwayland-dev wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libx11-dev libx11-xcb-dev \
+            libasound2-dev libvulkan-dev libdbus-1-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64 + arm64 Linux (native runners), macOS (Apple Silicon), Windows.
+        # Intel macOS isn't a separate test runner — it's covered by the release
+        # job's x86_64 cross-compile (the code is arch-portable).
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang lld cmake pkg-config \
+            libfontconfig-dev libfreetype6-dev \
+            libwayland-dev wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libx11-dev libx11-xcb-dev \
+            libasound2-dev libvulkan-dev libdbus-1-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace
