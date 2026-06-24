@@ -1,4 +1,4 @@
 # Powers the "Sponsor" button on the repo. Stripe isn't a built-in platform, so
 # the donate link goes under `custom` (which accepts up to 4 arbitrary URLs).
-github: ryanclouser
+github: projecthax
 custom: ["https://donate.stripe.com/bJeaEX2OVaE68Fae7X8k80X"]
