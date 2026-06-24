@@ -173,6 +173,18 @@ fn status_label(status: Option<AgentStatus>) -> &'static str {
     }
 }
 
+/// Detail line(s) for a git-op success notification: the first couple of
+/// non-empty lines of git's output (e.g. `[main a1b2c3] message`, `main -> main`,
+/// `Already up to date.`), trimmed.
+fn git_notify_detail(out: &str) -> String {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Fire a desktop notification off the UI thread (best-effort).
 fn notify(summary: String, body: String) {
     std::thread::spawn(move || {
@@ -1093,6 +1105,10 @@ enum GitModalKind {
 struct GitModal {
     pid: Uuid,
     kind: GitModalKind,
+    /// Commit only: every changed/untracked file, and whether each is checked for
+    /// the commit (parallel to `files`). Empty for `NewBranch`.
+    files: Vec<integrations::GitChange>,
+    selected: Vec<bool>,
 }
 
 /// A prompt for an SSH password not saved in the keychain. `Connect` stores the
@@ -4608,7 +4624,7 @@ impl MuxelApp {
             typed
         };
         match integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), &msg) {
-            Ok(()) => {
+            Ok(_) => {
                 integrations::remove_worktree(&d.root, &d.path);
                 self.workspace.remove_worktree_meta(d.wid);
             }
@@ -4713,13 +4729,13 @@ impl MuxelApp {
         err_title: String,
         op: F,
     ) where
-        F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+        F: FnOnce() -> anyhow::Result<String> + Send + 'static,
     {
         cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
             let result = cx.background_executor().spawn(async move { op() }).await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(()) => this.add_event(NotifKind::Success, ok, String::new()),
+                    Ok(out) => this.add_event(NotifKind::Success, ok, git_notify_detail(&out)),
                     Err(e) => this.add_event(NotifKind::Error, err_title, format!("{e}")),
                 }
                 cx.notify();
@@ -4739,7 +4755,7 @@ impl MuxelApp {
             cx,
             format!("Pushed “{name}”"),
             format!("Couldn't push “{name}”"),
-            move || integrations::push_branch(&path, &branch),
+            move || integrations::push_branch(&path, &branch).map(|()| String::new()),
         );
     }
 
@@ -4754,7 +4770,7 @@ impl MuxelApp {
             cx,
             format!("Opening a PR for “{name}”…"),
             format!("Couldn't create a PR for “{name}”"),
-            move || integrations::create_pr(&path, &branch),
+            move || integrations::create_pr(&path, &branch).map(|()| String::new()),
         );
     }
 
@@ -4769,7 +4785,7 @@ impl MuxelApp {
             cx,
             format!("Opening the PR for “{name}”…"),
             format!("No PR found for “{name}”"),
-            move || integrations::open_pr(&path),
+            move || integrations::open_pr(&path).map(|()| String::new()),
         );
     }
 
@@ -5065,7 +5081,7 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) where
-        F: FnOnce(&integrations::RepoLoc) -> anyhow::Result<()> + Send + 'static,
+        F: FnOnce(&integrations::RepoLoc) -> anyhow::Result<String> + Send + 'static,
     {
         let Some(loc) = self.repo_loc(pid) else {
             return;
@@ -5162,7 +5178,10 @@ impl MuxelApp {
         );
     }
 
-    /// Open the single-input git modal (commit message / new branch name).
+    /// Open the single-input git modal (commit message / new branch name). For a
+    /// commit it first lists every changed/untracked file (all checked by default)
+    /// so the user can review and uncheck before committing; if the tree is clean
+    /// it shows a toast and opens nothing.
     fn open_git_modal(
         &mut self,
         pid: Uuid,
@@ -5170,12 +5189,45 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.git_modal = Some(GitModal { pid, kind });
+        let (files, selected) = match kind {
+            GitModalKind::Commit => {
+                let files = self
+                    .repo_loc(pid)
+                    .map(|loc| integrations::git_status_files(&loc))
+                    .unwrap_or_default();
+                if files.is_empty() {
+                    self.add_event(NotifKind::Success, "Nothing to commit", "");
+                    cx.notify();
+                    return;
+                }
+                let n = files.len();
+                (files, vec![true; n])
+            }
+            GitModalKind::NewBranch => (Vec::new(), Vec::new()),
+        };
+        self.git_modal = Some(GitModal {
+            pid,
+            kind,
+            files,
+            selected,
+        });
         self.git_action_input
             .update(cx, |s, cx| s.set_value("", window, cx));
         let handle = self.git_action_input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
         cx.notify();
+    }
+
+    /// Toggle whether the file at `idx` in the open commit modal is included.
+    fn toggle_git_file(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(sel) = self
+            .git_modal
+            .as_mut()
+            .and_then(|m| m.selected.get_mut(idx))
+        {
+            *sel = !*sel;
+            cx.notify();
+        }
     }
 
     fn close_git_modal(&mut self, cx: &mut Context<Self>) {
@@ -5184,24 +5236,45 @@ impl MuxelApp {
     }
 
     fn confirm_git_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(m) = self.git_modal.take() else {
+        // Validate against the still-open modal first, so an empty message or an
+        // empty file selection leaves it open for the user to fix.
+        let Some(m) = self.git_modal.as_ref() else {
             return;
         };
         let value = self.git_action_input.read(cx).value().trim().to_string();
         if value.is_empty() {
             return;
         }
-        match m.kind {
+        let (pid, kind) = (m.pid, m.kind);
+        let commit_paths: Vec<String> = match kind {
+            GitModalKind::Commit => {
+                let paths: Vec<String> = m
+                    .files
+                    .iter()
+                    .zip(&m.selected)
+                    .filter(|(_, checked)| **checked)
+                    .map(|(f, _)| f.path.clone())
+                    .collect();
+                if paths.is_empty() {
+                    return;
+                }
+                paths
+            }
+            GitModalKind::NewBranch => Vec::new(),
+        };
+
+        self.git_modal = None;
+        match kind {
             GitModalKind::Commit => self.run_project_git(
-                m.pid,
+                pid,
                 "Committed".into(),
                 "Commit failed".into(),
-                move |root| integrations::git_commit(root, &value),
+                move |root| integrations::git_commit_paths(root, &value, &commit_paths),
                 window,
                 cx,
             ),
             GitModalKind::NewBranch => self.run_project_git(
-                m.pid,
+                pid,
                 format!("Created branch {value}"),
                 "Couldn't create branch".into(),
                 move |root| integrations::create_branch(root, &value),
@@ -5431,10 +5504,55 @@ impl MuxelApp {
         let Some(m) = &self.git_modal else {
             return div().into_any_element();
         };
-        let (title, label, confirm) = match m.kind {
-            GitModalKind::Commit => ("Commit all changes", "Commit message", "Commit"),
-            GitModalKind::NewBranch => ("New branch", "Branch name", "Create"),
+        let (title, label) = match m.kind {
+            GitModalKind::Commit => ("Commit changes", "Commit message"),
+            GitModalKind::NewBranch => ("New branch", "Branch name"),
         };
+        let confirm = match m.kind {
+            GitModalKind::Commit => {
+                format!("Commit ({})", m.selected.iter().filter(|&&s| s).count())
+            }
+            GitModalKind::NewBranch => "Create".to_string(),
+        };
+        // For a commit, a scrollable checklist of every changed/untracked file
+        // (checked = will be committed), so nothing is staged without the user
+        // seeing it.
+        let file_list = matches!(m.kind, GitModalKind::Commit).then(|| {
+            let mut list = div()
+                .id("git-commit-files")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .max_h(px(220.0))
+                .overflow_y_scroll();
+            for (i, f) in m.files.iter().enumerate() {
+                let checked = m.selected.get(i).copied().unwrap_or(false);
+                let row = match &f.orig {
+                    Some(orig) => format!("{}  {} → {}", f.status.trim(), orig, f.path),
+                    None => format!("{}  {}", f.status.trim(), f.path),
+                };
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Checkbox::new(SharedString::from(format!("git-file-{i}")))
+                                .checked(checked)
+                                .on_click(cx.listener(move |this, _c: &bool, _w, cx| {
+                                    this.toggle_git_file(i, cx)
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(row),
+                        ),
+                );
+            }
+            list
+        });
         div()
             .absolute()
             .inset_0()
@@ -5467,6 +5585,7 @@ impl MuxelApp {
                             .child(label),
                     )
                     .child(Input::new(&self.git_action_input).w_full())
+                    .children(file_list)
                     .child(
                         div()
                             .flex()

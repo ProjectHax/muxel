@@ -197,10 +197,15 @@ feature is added or changed, update the matching entry here in the same change**
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live).
-- **Project git** — right-click a git project for: switch branch (submenu), new
-  branch, commit (all changes + message), pull, push, fetch, and stash / pop /
-  drop stash; each runs off the main thread and toasts its result. Destructive
-  actions (switching with a dirty tree, pop/drop stash) ask first.
+- **Project git** — right-click a git project for: git diff (opens the diff pane;
+  local projects), switch branch (submenu), new branch, commit, pull, push, fetch,
+  and stash / pop / drop stash; each runs off the main thread and toasts its
+  result. Destructive actions (switching with a dirty tree, pop/drop stash) ask
+  first.
+- **Reviewed commit** — the commit dialog lists every changed/untracked file with
+  a checkbox (all checked by default); only the checked files are committed, so
+  stray files are never swept in. The button shows the count (e.g. *Commit (3)*),
+  and a clean tree just toasts “Nothing to commit”.
 - **Reorder & rearrange** — drag-reorder projects; swap/move instances between
   panes from the sidebar.
 - **Instance names** — custom names with inline rename and right-click menus.

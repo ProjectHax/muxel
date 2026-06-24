@@ -297,7 +297,7 @@ fn git_line_loc(loc: &RepoLoc, args: &[&str]) -> Option<String> {
 }
 
 /// `git <args>` at `loc`; `bail!`s with stderr (a useful toast) on failure.
-fn git_run_loc(loc: &RepoLoc, args: &[&str]) -> Result<()> {
+fn git_run_loc(loc: &RepoLoc, args: &[&str]) -> Result<String> {
     let out = git_output(loc, args).with_context(|| format!("running `git {}`", args.join(" ")))?;
     if !out.status.success() {
         bail!(
@@ -306,7 +306,15 @@ fn git_run_loc(loc: &RepoLoc, args: &[&str]) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(())
+    // git writes its human summary to stdout (pull / commit / stash) or stderr
+    // (push / fetch) — return whichever is non-empty so callers can surface it.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let summary = stdout.trim();
+    Ok(if summary.is_empty() {
+        String::from_utf8_lossy(&out.stderr).trim().to_string()
+    } else {
+        summary.to_string()
+    })
 }
 
 /// Run a one-off command on a remote host over SSH, reusing/establishing the
@@ -612,11 +620,82 @@ pub fn delete_branch(repo: &Path, branch: &str) {
         .output();
 }
 
-/// Stage all changes and commit them at `loc` (local or remote). Errors on git
-/// failure.
-pub fn git_commit(loc: &RepoLoc, msg: &str) -> Result<()> {
+/// Stage **all** changes (tracked, untracked, and deletions) and commit them at
+/// `loc`. Used where committing an entire worktree's work is the intent (e.g.
+/// disposing a worktree). For a reviewed, file-by-file commit use
+/// [`git_status_files`] + [`git_commit_paths`]. Errors on git failure.
+pub fn git_commit(loc: &RepoLoc, msg: &str) -> Result<String> {
     git_run_loc(loc, &["add", "-A"])?;
     git_run_loc(loc, &["commit", "-m", msg])
+}
+
+/// One entry from `git status --porcelain` — i.e. a file a blanket `git add -A`
+/// would stage. `status` is the two-char XY code (e.g. " M", "??", "A ", "D ",
+/// "R "); `path` is the path to stage; `orig` is the source path for a
+/// rename/copy (display only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitChange {
+    pub status: String,
+    pub path: String,
+    pub orig: Option<String>,
+}
+
+/// List every changed/untracked file at `loc` — exactly what `git add -A` would
+/// stage — from `git status --porcelain=v1 -z`. Empty on git failure or a clean
+/// tree. The `-z` (NUL-separated) form sidesteps the path quoting `git status`
+/// otherwise applies to names with spaces or non-ASCII characters.
+pub fn git_status_files(loc: &RepoLoc) -> Vec<GitChange> {
+    git_output(loc, &["status", "--porcelain=v1", "-z"])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_status_z(&o.stdout))
+        .unwrap_or_default()
+}
+
+/// Parse the NUL-separated records of `git status --porcelain -z`: each record is
+/// `XY <path>`, and for a rename/copy (X or Y is 'R'/'C') the *next* NUL field is
+/// the original path (the `-z` form lists the new path first, then the old).
+fn parse_status_z(bytes: &[u8]) -> Vec<GitChange> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut fields = text.split('\0').filter(|s| !s.is_empty());
+    let mut out = Vec::new();
+    while let Some(rec) = fields.next() {
+        // A record needs the two status chars, the separator space, and at least
+        // one path character.
+        if rec.len() < 4 {
+            continue;
+        }
+        let status = rec[..2].to_string();
+        let path = rec[3..].to_string();
+        let orig = if status.starts_with('R') || status.starts_with('C') {
+            fields.next().map(str::to_string)
+        } else {
+            None
+        };
+        out.push(GitChange { status, path, orig });
+    }
+    out
+}
+
+/// Stage exactly `paths` (their additions, modifications, and deletions, via
+/// `git add -A -- <paths>`) and commit only those paths at `loc` (`git commit
+/// --only`). Files outside `paths` are left untouched — even if already staged.
+/// Errors on an empty selection or git failure.
+pub fn git_commit_paths(loc: &RepoLoc, msg: &str, paths: &[String]) -> Result<String> {
+    if paths.is_empty() {
+        bail!("Select at least one file to commit");
+    }
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+
+    // Stage the selected paths first so untracked ones become known to git; then
+    // commit only those paths, taking their working-tree state.
+    let mut add = vec!["add", "-A", "--"];
+    add.extend_from_slice(&refs);
+    git_run_loc(loc, &add)?;
+
+    let mut commit = vec!["commit", "--only", "-m", msg, "--"];
+    commit.extend_from_slice(&refs);
+    git_run_loc(loc, &commit)
 }
 
 /// Push the worktree's `branch` to `origin` (setting upstream). Errors on failure.
@@ -818,48 +897,63 @@ pub fn list_branches(loc: &RepoLoc) -> Vec<String> {
 }
 
 /// Check out an existing branch.
-pub fn checkout_branch(loc: &RepoLoc, branch: &str) -> Result<()> {
+pub fn checkout_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
     git_run_loc(loc, &["checkout", branch])
 }
 
 /// Create + switch to a new branch.
-pub fn create_branch(loc: &RepoLoc, name: &str) -> Result<()> {
+pub fn create_branch(loc: &RepoLoc, name: &str) -> Result<String> {
     git_run_loc(loc, &["checkout", "-b", name])
 }
 
 /// `git pull` at `loc`.
-pub fn git_pull(loc: &RepoLoc) -> Result<()> {
+pub fn git_pull(loc: &RepoLoc) -> Result<String> {
     git_run_loc(loc, &["pull"])
 }
 
 /// `git push` at `loc`.
-pub fn git_push(loc: &RepoLoc) -> Result<()> {
+pub fn git_push(loc: &RepoLoc) -> Result<String> {
     git_run_loc(loc, &["push"])
 }
 
 /// `git fetch` at `loc`.
-pub fn git_fetch(loc: &RepoLoc) -> Result<()> {
+pub fn git_fetch(loc: &RepoLoc) -> Result<String> {
     git_run_loc(loc, &["fetch"])
 }
 
 /// Stash the working tree (incl. untracked) at `loc`.
-pub fn git_stash(loc: &RepoLoc) -> Result<()> {
+pub fn git_stash(loc: &RepoLoc) -> Result<String> {
     git_run_loc(loc, &["stash", "push", "--include-untracked"])
 }
 
 /// Pop (apply + remove) the most recent stash at `loc`.
-pub fn git_stash_pop(loc: &RepoLoc) -> Result<()> {
+pub fn git_stash_pop(loc: &RepoLoc) -> Result<String> {
     git_run_loc(loc, &["stash", "pop"])
 }
 
 /// Drop (discard) the most recent stash at `loc` — destructive.
-pub fn git_stash_drop(loc: &RepoLoc) -> Result<()> {
+pub fn git_stash_drop(loc: &RepoLoc) -> Result<String> {
     git_run_loc(loc, &["stash", "drop"])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_failure_vs_command_failure() {
+        // ssh's own transport/auth error (255) is a connection failure.
+        assert!(is_ssh_transport_failure(SshAuth::Agent, Some(255)));
+        assert!(is_ssh_transport_failure(SshAuth::Password, Some(255)));
+        // sshpass auth failure (e.g. wrong password = 5) is too.
+        assert!(is_ssh_transport_failure(SshAuth::Password, Some(5)));
+        // A remote command exiting non-zero (e.g. `test -d` = 1 for a missing
+        // dir) is NOT a connection failure — it's a path problem.
+        assert!(!is_ssh_transport_failure(SshAuth::Key, Some(1)));
+        assert!(!is_ssh_transport_failure(SshAuth::Password, Some(1)));
+        // sshpass codes 2..=6 only apply to password auth, not key/agent.
+        assert!(!is_ssh_transport_failure(SshAuth::Key, Some(5)));
+    }
 
     #[test]
     fn worktree_create_and_remove() {
@@ -1074,5 +1168,107 @@ mod tests {
             remote_layout_abs("/home/me/proj/"),
             "/home/me/proj/.muxel/workspace.json"
         );
+    }
+
+    #[test]
+    fn parse_status_z_handles_untracked_modified_and_rename() {
+        // -z records: " M a.txt", "?? b c.txt" (space in name, unquoted),
+        // and a staged rename "R  new.txt\0old.txt" (new path first, then old).
+        let raw = b" M a.txt\0?? b c.txt\0R  new.txt\0old.txt\0";
+        let got = parse_status_z(raw);
+        assert_eq!(
+            got,
+            vec![
+                GitChange {
+                    status: " M".into(),
+                    path: "a.txt".into(),
+                    orig: None,
+                },
+                GitChange {
+                    status: "??".into(),
+                    path: "b c.txt".into(),
+                    orig: None,
+                },
+                GitChange {
+                    status: "R ".into(),
+                    path: "new.txt".into(),
+                    orig: Some("old.txt".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn status_files_lists_all_changes_and_commit_paths_is_selective() {
+        let repo = std::env::temp_dir().join("muxel-it-commit-paths");
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@muxel"]);
+        git(&["config", "user.name", "muxel test"]);
+        std::fs::write(repo.join("keep.txt"), "v1\n").unwrap();
+        std::fs::write(repo.join("gone.txt"), "bye\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        // Modify a tracked file, delete a tracked file, add two untracked files.
+        std::fs::write(repo.join("keep.txt"), "v2\n").unwrap();
+        std::fs::remove_file(repo.join("gone.txt")).unwrap();
+        std::fs::write(repo.join("wanted.txt"), "new\n").unwrap();
+        std::fs::write(repo.join("extra.txt"), "junk\n").unwrap();
+
+        let loc = RepoLoc::Local(repo.clone());
+
+        // status lists every changed + untracked file.
+        let listed: std::collections::BTreeSet<String> =
+            git_status_files(&loc).into_iter().map(|c| c.path).collect();
+        assert_eq!(
+            listed,
+            ["extra.txt", "gone.txt", "keep.txt", "wanted.txt"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+
+        // Commit only a subset (modify + deletion + one new file), NOT extra.txt.
+        git_commit_paths(
+            &loc,
+            "selective",
+            &["keep.txt".into(), "gone.txt".into(), "wanted.txt".into()],
+        )
+        .expect("selective commit");
+
+        // The unselected untracked file is all that remains uncommitted.
+        let remaining: Vec<String> = git_status_files(&loc).into_iter().map(|c| c.path).collect();
+        assert_eq!(remaining, vec!["extra.txt".to_string()]);
+
+        // HEAD recorded exactly the three selected changes.
+        let show = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["show", "--name-status", "--format=", "HEAD"])
+            .output()
+            .unwrap();
+        let names = String::from_utf8_lossy(&show.stdout);
+        assert!(names.contains("keep.txt"), "modify committed:\n{names}");
+        assert!(names.contains("gone.txt"), "deletion committed:\n{names}");
+        assert!(names.contains("wanted.txt"), "new file committed:\n{names}");
+        assert!(
+            !names.contains("extra.txt"),
+            "unselected file must not be committed:\n{names}"
+        );
+
+        // An empty selection is rejected rather than producing an empty commit.
+        assert!(git_commit_paths(&loc, "noop", &[]).is_err());
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
