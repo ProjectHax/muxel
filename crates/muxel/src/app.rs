@@ -3345,6 +3345,33 @@ impl MuxelApp {
         self.place_with_preset(target, PlacementMode::Tab, self.current_preset, window, cx);
     }
 
+    /// The preset index of the active pane's instance — what the keyboard New
+    /// Tab / New Pane shortcuts clone, so a new pane matches whatever you're on
+    /// rather than the toolbar's "new agent" selector. `None` when there's no
+    /// active instance or its preset no longer exists.
+    fn active_preset_index(&self) -> Option<usize> {
+        let inst = self.workspace.instance(self.active_instance?)?;
+        if let Some(pid) = inst.preset_id
+            && let Some(idx) = self.presets.iter().position(|p| p.id == pid)
+        {
+            return Some(idx);
+        }
+        self.presets.iter().position(|p| p.name == inst.preset)
+    }
+
+    /// New tab / new pane from the **active pane's** preset (the keyboard
+    /// shortcuts), so you get a fresh instance of whatever you're on. Falls back
+    /// to the toolbar selector if the active pane has no matching preset.
+    fn new_like_active(
+        &mut self,
+        mode: PlacementMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let preset = self.active_preset_index().unwrap_or(self.current_preset);
+        self.place_with_preset(self.active_instance, mode, preset, window, cx);
+    }
+
     /// Cycle the active pane's tabs by `delta` (wrapping), focusing the result.
     fn cycle_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.active_instance else {
@@ -14162,9 +14189,11 @@ impl Render for MuxelApp {
                 cx.listener(|this, _ev: &DragMoveEvent<DragPane>, _w, cx| this.clear_pane_drop(cx)),
             )
             .on_action(cx.listener(|this, _: &NewPane, window, cx| {
-                this.add_agent(SplitDirection::Horizontal, window, cx)
+                this.new_like_active(PlacementMode::Split(SplitDirection::Horizontal), window, cx)
             }))
-            .on_action(cx.listener(|this, _: &NewTab, window, cx| this.new_tab(window, cx)))
+            .on_action(cx.listener(|this, _: &NewTab, window, cx| {
+                this.new_like_active(PlacementMode::Tab, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &TabNext, window, cx| this.cycle_tab(1, window, cx)))
             .on_action(cx.listener(|this, _: &TabPrev, window, cx| this.cycle_tab(-1, window, cx)))
             .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
