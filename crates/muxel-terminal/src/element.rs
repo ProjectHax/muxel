@@ -197,10 +197,15 @@ impl Element for TerminalElement {
         let rows = (((f32::from(bounds.size.height) - 0.5) / line_h)
             .floor()
             .max(1.0)) as u16;
-        // Debounced: while a resize is still settling, keep requesting frames so
-        // it lands even if nothing else repaints (a close/drag burst coalesces
-        // into one resize, avoiding repeated agent redraws).
-        if self.session.resize(cols, rows) {
+        // Resize the PTY/grid to fit — but NOT while a pane/tab is being dragged.
+        // A drag churns the layout through many intermediate sizes; resizing on
+        // each one floods the agent with SIGWINCHes, making it redraw (and often
+        // garble) its UI repeatedly. Defer until the drag drops and the layout
+        // settles — the post-drop repaint applies the final size. Divider/window
+        // resizes don't set an active drag, so they stay live. The debounce still
+        // coalesces a settling burst into one resize (frames are re-requested
+        // while it settles).
+        if !cx.has_active_drag() && self.session.resize(cols, rows) {
             window.refresh();
         }
 
