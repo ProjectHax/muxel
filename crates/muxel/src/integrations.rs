@@ -319,6 +319,22 @@ fn ssh_exec(
     password: Option<&str>,
     remote_cmd: &str,
 ) -> Result<()> {
+    let out = ssh_run(host, control_path, password, remote_cmd)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    bail!("{}", ssh_error_message(&out));
+}
+
+/// Run `remote_cmd` over ssh and return its raw output. Lower level than
+/// [`ssh_exec`]: callers inspect the exit status themselves (e.g. to tell an ssh
+/// transport failure apart from the remote command exiting non-zero).
+fn ssh_run(
+    host: &RemoteHost,
+    control_path: &str,
+    password: Option<&str>,
+    remote_cmd: &str,
+) -> Result<std::process::Output> {
     let mut argv = ssh::connection_args(host, control_path);
     argv.push("-o".into());
     argv.push("ConnectTimeout=10".into());
@@ -341,18 +357,32 @@ fn ssh_exec(
         cmd = Command::new("ssh");
         cmd.args(&argv);
     }
-    let out = cmd.output().map_err(|e| ssh_spawn_error(host.auth, e))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let msg = err.trim();
-        let msg = if msg.is_empty() {
-            "connection failed"
-        } else {
-            msg
-        };
-        bail!("{msg}");
+    cmd.output().map_err(|e| ssh_spawn_error(host.auth, e))
+}
+
+/// A human message for an ssh transport/auth failure: ssh's stderr, or a generic
+/// line when ssh said nothing.
+fn ssh_error_message(out: &std::process::Output) -> String {
+    let err = String::from_utf8_lossy(&out.stderr);
+    let msg = err.trim();
+    if msg.is_empty() {
+        "connection failed".to_string()
+    } else {
+        msg.to_string()
     }
-    Ok(())
+}
+
+/// Whether a non-zero ssh run was ssh's own *transport/auth* failure rather than
+/// the remote command exiting non-zero. ssh uses exit code 255 for its own errors
+/// and otherwise passes the remote command's status through; `sshpass` uses 2..=6
+/// for its auth failures (a passed-through command status — e.g. 1 from `test` —
+/// is the command's own code, so it must NOT be treated as a connection failure).
+fn is_ssh_transport_failure(auth: SshAuth, code: Option<i32>) -> bool {
+    match code {
+        Some(255) => true,
+        Some(c) if auth == SshAuth::Password && (2..=6).contains(&c) => true,
+        _ => false,
+    }
 }
 
 /// Map an ssh/sshpass spawn failure to an actionable message: a missing
@@ -438,12 +468,21 @@ pub fn ssh_test_dir(
     password: Option<&str>,
     dir: &str,
 ) -> Result<()> {
-    ssh_exec(
+    let out = ssh_run(
         host,
         control_path,
         password,
         &format!("test -d {}", ssh::sh_quote(dir)),
-    )
+    )?;
+    if out.status.success() {
+        return Ok(());
+    }
+    // ssh connected fine but `test -d` failed → it's the PATH, not the link.
+    // A genuine ssh transport/auth failure keeps the connection message instead.
+    if is_ssh_transport_failure(host.auth, out.status.code()) {
+        bail!("{}", ssh_error_message(&out));
+    }
+    bail!("directory not found: {dir}");
 }
 
 /// Whether `path` is inside a git working tree.
