@@ -3698,6 +3698,21 @@ impl MuxelApp {
         self.open_diff_for_dir(pid, dir, anchor, window, cx);
     }
 
+    /// Open a read-only git-diff pane for `pid`'s repo root, split beside one of
+    /// its panes (or seeding the layout if empty). Local projects only — the diff
+    /// pane runs `git diff` on a local path.
+    fn open_project_diff(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = self.workspace.project(pid).map(|p| p.root_path.clone()) else {
+            return;
+        };
+        let anchor = self
+            .workspace
+            .project(pid)
+            .and_then(|p| p.first_instance())
+            .or(self.active_instance);
+        self.open_diff_for_dir(pid, dir, anchor, window, cx);
+    }
+
     /// Open (or refresh + focus) a read-only git-diff pane for `dir`, split beside
     /// `anchor` (or seeding the layout if the project is empty).
     fn open_diff_for_dir(
@@ -8737,6 +8752,7 @@ impl MuxelApp {
                 None => integrations::RepoLoc::Local(project.root_path.clone()),
             };
             let is_repo = self.project_branches.get(&pid).is_some_and(|b| b.is_some());
+            let is_local = project.remote.is_none();
             let current_branch = self.project_branches.get(&pid).cloned().flatten();
             let drop_hl = cx.theme().sidebar_accent;
             let chevron = if collapsed {
@@ -8944,6 +8960,20 @@ impl MuxelApp {
                             // Git actions (only when the project is a repo).
                             if is_repo {
                                 menu = menu.separator();
+                                // Review changes — local projects only (the diff
+                                // pane runs `git diff` on a local path).
+                                if is_local {
+                                    menu = menu.item(
+                                        PopupMenuItem::new("Git diff")
+                                            .icon(Icon::empty().path("icons/diff.svg"))
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, window, cx| {
+                                                    this.open_project_diff(pid, window, cx)
+                                                },
+                                            )),
+                                    );
+                                }
                                 let branches = integrations::list_branches(&menu_loc);
                                 if !branches.is_empty() {
                                     let entity_sb = entity.clone();
