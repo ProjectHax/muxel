@@ -185,6 +185,16 @@ fn git_notify_detail(out: &str) -> String {
         .join("\n")
 }
 
+/// Display title for a shell pane. A shell's OSC title is usually
+/// `user@host:dir`; strip the `user@host:` so only the directory shows. Titles
+/// without that shape (no `@` before the first `:`) are returned unchanged.
+fn shell_dir_title(osc: &str) -> &str {
+    match osc.split_once(':') {
+        Some((prefix, path)) if prefix.contains('@') && !path.is_empty() => path,
+        _ => osc,
+    }
+}
+
 /// Fire a desktop notification off the UI thread (best-effort).
 fn notify(summary: String, body: String) {
     std::thread::spawn(move || {
@@ -1037,6 +1047,7 @@ impl PopoutView {
             PaneView::Terminal(v) => v
                 .read(cx)
                 .title()
+                .map(|t| shell_dir_title(&t).to_string())
                 .unwrap_or_else(|| "Terminal".to_string())
                 .into(),
             PaneView::Editor(v) => v.read(cx).title().into(),
@@ -7293,12 +7304,12 @@ impl MuxelApp {
             .into_any_element()
     }
 
-    /// A tab/pane's display name. Static by design: the user's custom name if
-    /// set, else the editor's file name, else the terminal's preset name (set
-    /// once at creation). It deliberately does NOT follow the live OSC title an
-    /// agent rewrites as it works, so a tab keeps a stable name until renamed.
-    /// (Live activity is still conveyed by the agent-status badge and the
-    /// terminal's own output.)
+    /// A tab/pane's display name: the user's custom name if set, else the
+    /// editor's file name; for a **shell** the live working directory (its OSC
+    /// title with any `user@host:` prefix stripped — handier than a static
+    /// "Shell"); for an **agent** the static preset name, which deliberately does
+    /// NOT follow the OSC title an agent rewrites as it works, so the tab keeps a
+    /// stable name until renamed.
     fn instance_title(&self, iid: Uuid, cx: &App) -> SharedString {
         let inst = self.workspace.instance(iid);
         if let Some(c) = inst
@@ -7309,6 +7320,13 @@ impl MuxelApp {
         }
         if let Some(ed) = self.editors.get(&iid) {
             return ed.read(cx).title().into();
+        }
+        // A shell (no agent program) shows its current directory from the live
+        // terminal title; an agent keeps its static preset name.
+        if inst.is_some_and(|i| i.program.is_none())
+            && let Some(osc) = self.terminals.get(&iid).and_then(|v| v.read(cx).title())
+        {
+            return shell_dir_title(&osc).to_string().into();
         }
         inst.map(|i| i.title.clone()).unwrap_or_default().into()
     }
@@ -9308,7 +9326,14 @@ impl MuxelApp {
                     let meta = inst.map(|i| i.title.clone()).unwrap_or_default();
                     let (app_title, status) = if let Some(view) = self.terminals.get(&iid) {
                         let view = view.read(cx);
-                        (view.title().unwrap_or(meta), view.status())
+                        // Shells show their cwd: strip the `user@host:` OSC prefix.
+                        // Agent titles have no such prefix and pass through unchanged.
+                        (
+                            view.title()
+                                .map(|t| shell_dir_title(&t).to_string())
+                                .unwrap_or(meta),
+                            view.status(),
+                        )
                     } else if let Some(ed) = self.editors.get(&iid) {
                         (ed.read(cx).title(), AgentStatus::Idle)
                     } else {
@@ -14274,5 +14299,23 @@ impl Render for MuxelApp {
             )
             // No toast layer: all notifications go to the sidebar feed instead.
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod shell_title_tests {
+    use super::shell_dir_title;
+
+    #[test]
+    fn strips_user_host_prefix() {
+        assert_eq!(
+            shell_dir_title("ryan@zen-rhel:~/Projects/Bot/phBot"),
+            "~/Projects/Bot/phBot"
+        );
+        // No `user@host` prefix → unchanged (bare path or a running command).
+        assert_eq!(shell_dir_title("~/Projects"), "~/Projects");
+        assert_eq!(shell_dir_title("make build"), "make build");
+        // A colon but no `@` before it → unchanged.
+        assert_eq!(shell_dir_title("12:34"), "12:34");
     }
 }
