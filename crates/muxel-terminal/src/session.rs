@@ -194,6 +194,13 @@ impl TerminalSession {
         if let Some(cwd) = &spec.cwd {
             builder.cwd(cwd);
         }
+        // When muxel itself runs from an AppImage, its process environment
+        // carries the AppImage runtime's leakage — APPDIR/APPIMAGE/ARGV0/OWD, a
+        // `MAKE` pointing back at the AppImage, and AppImage-mount entries in
+        // PATH/LD_LIBRARY_PATH. Strip it so spawned shells/agents/build tools get
+        // a clean system environment (otherwise e.g. cmake caches `$(MAKE)` as the
+        // AppImage and `make` relaunches muxel instead of building).
+        sanitize_appimage_env(&mut builder);
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
         for (k, v) in &spec.env {
@@ -620,6 +627,72 @@ fn push_wheel_report(buf: &mut Vec<u8>, up: bool, col: usize, row: usize, sgr: b
     }
 }
 
+/// Strip an AppImage runtime's environment leakage from a child command, so a
+/// shell/agent muxel spawns gets a clean system environment. No-op unless muxel
+/// itself is running from an AppImage (`$APPIMAGE` set).
+fn sanitize_appimage_env(builder: &mut CommandBuilder) {
+    let Some(appimage) = std::env::var("APPIMAGE").ok() else {
+        return;
+    };
+    let appdir = std::env::var("APPDIR").unwrap_or_default();
+    let vars: Vec<(String, String)> = std::env::vars().collect();
+    let (drop, overrides) = appimage_env_fixups(&vars, &appimage, &appdir);
+    for k in drop {
+        builder.env_remove(&k);
+    }
+    for (k, v) in overrides {
+        builder.env(&k, &v);
+    }
+}
+
+/// Pure half of [`sanitize_appimage_env`]: given the current environment plus the
+/// AppImage's binary path and mount dir, return the env keys to DROP and the
+/// `(key, cleaned-value)` pairs to OVERRIDE.
+///
+/// - `APPDIR`/`APPIMAGE`/`ARGV0`/`OWD` (the runtime markers) are dropped.
+/// - colon-separated search paths have their AppImage-mount (`$APPDIR/…`) entries
+///   stripped (dropped if nothing's left).
+/// - any other variable whose value is the AppImage binary or points into the
+///   mount (e.g. a poisoned `MAKE`) is dropped.
+fn appimage_env_fixups(
+    vars: &[(String, String)],
+    appimage: &str,
+    appdir: &str,
+) -> (Vec<String>, Vec<(String, String)>) {
+    const MARKERS: [&str; 4] = ["APPDIR", "APPIMAGE", "ARGV0", "OWD"];
+    const PATH_LISTS: [&str; 5] = [
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "PYTHONPATH",
+        "PERLLIB",
+        "XDG_DATA_DIRS",
+    ];
+    let in_mount = |s: &str| !appdir.is_empty() && s.starts_with(appdir);
+    let mut drop = Vec::new();
+    let mut overrides = Vec::new();
+    for (k, v) in vars {
+        if MARKERS.contains(&k.as_str()) {
+            drop.push(k.clone());
+        } else if PATH_LISTS.contains(&k.as_str()) {
+            let kept: Vec<&str> = v
+                .split(':')
+                .filter(|e| !e.is_empty() && !in_mount(e))
+                .collect();
+            let orig = v.split(':').filter(|e| !e.is_empty()).count();
+            if kept.len() != orig {
+                if kept.is_empty() {
+                    drop.push(k.clone());
+                } else {
+                    overrides.push((k.clone(), kept.join(":")));
+                }
+            }
+        } else if v == appimage || in_mount(v) {
+            drop.push(k.clone());
+        }
+    }
+    (drop, overrides)
+}
+
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         // Best-effort: kill the child so the reader thread sees EOF and exits.
@@ -653,7 +726,50 @@ fn read_loop(mut reader: Box<dyn Read + Send>, tx: async_channel::Sender<PtyChun
 
 #[cfg(test)]
 mod wheel_report_tests {
-    use super::push_wheel_report;
+    use super::{appimage_env_fixups, push_wheel_report};
+
+    #[test]
+    fn appimage_env_fixups_strip_leakage_keep_the_rest() {
+        let appimage = "/home/u/Apps/muxel-linux-x86_64.AppImage";
+        let appdir = "/tmp/.mount_muxelXYZ";
+        let s = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let vars = vec![
+            s("APPIMAGE", appimage),
+            s("APPDIR", appdir),
+            s("ARGV0", appimage),
+            s("OWD", "/home/u"),
+            s("MAKE", appimage), // poisoned scalar
+            s("PATH", &format!("{appdir}/usr/bin:/usr/bin:/bin")), // partly poisoned
+            s("LD_LIBRARY_PATH", &format!("{appdir}/usr/lib")), // wholly poisoned
+            s("HOME", "/home/u"), // keep
+            s("EDITOR", "vim"),  // keep
+        ];
+        let (drop, overrides) = appimage_env_fixups(&vars, appimage, appdir);
+
+        for k in [
+            "APPIMAGE",
+            "APPDIR",
+            "ARGV0",
+            "OWD",
+            "MAKE",
+            "LD_LIBRARY_PATH",
+        ] {
+            assert!(drop.contains(&k.to_string()), "should drop {k}");
+        }
+        // PATH keeps only the system entries.
+        assert_eq!(
+            overrides
+                .iter()
+                .find(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.as_str()),
+            Some("/usr/bin:/bin")
+        );
+        // Untouched, legitimate vars stay.
+        for k in ["HOME", "EDITOR"] {
+            assert!(!drop.contains(&k.to_string()));
+            assert!(!overrides.iter().any(|(o, _)| o == k));
+        }
+    }
 
     #[test]
     fn sgr_encoding() {
