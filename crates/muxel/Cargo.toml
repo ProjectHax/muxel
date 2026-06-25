@@ -25,6 +25,8 @@ uuid.workspace = true
 serde_json.workspace = true
 notify-rust = "4"
 rust-embed = "8"
+# Detect the OS UI locale at startup for i18n (already resolved transitively).
+sys-locale = "0.3"
 # Gitignore-aware file walk for the Ctrl+P search palette.
 ignore = "0.4"
 # Local wall-clock time for scheduled Loops (time-of-day + interval firing).

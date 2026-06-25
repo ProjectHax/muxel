@@ -4,6 +4,7 @@
 //! [`InputState`] widgets that are repopulated on selection and read back on
 //! Save. The rendering + handlers live as `MuxelApp` methods in `app.rs`.
 
+use crate::i18n::t;
 use gpui::*;
 use gpui_component::input::InputState;
 use muxel_core::{EnvVar, InjectionMode, SshAuth};
@@ -163,43 +164,44 @@ impl SettingsUi {
             section: SettingsSection::Appearance,
             selected_preset: None,
             p_injection: InjectionMode::None,
-            p_name: cx.new(|cx| InputState::new(window, cx).placeholder("Name")),
+            p_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
             p_program: cx
-                .new(|cx| InputState::new(window, cx).placeholder("Program (blank = shell)")),
-            p_model: cx.new(|cx| InputState::new(window, cx).placeholder("Model (optional)")),
-            p_model_flag: cx.new(|cx| InputState::new(window, cx).placeholder("--model")),
-            p_effort: cx.new(|cx| InputState::new(window, cx).placeholder("Effort (optional)")),
-            p_effort_flag: cx.new(|cx| InputState::new(window, cx).placeholder("Effort flag")),
-            p_args: cx
-                .new(|cx| InputState::new(window, cx).placeholder("Extra args (space-separated)")),
+                .new(|cx| InputState::new(window, cx).placeholder(t("Program (blank = shell)"))),
+            p_model: cx.new(|cx| InputState::new(window, cx).placeholder(t("Model (optional)"))),
+            p_model_flag: cx.new(|cx| InputState::new(window, cx).placeholder(t("--model"))),
+            p_effort: cx.new(|cx| InputState::new(window, cx).placeholder(t("Effort (optional)"))),
+            p_effort_flag: cx.new(|cx| InputState::new(window, cx).placeholder(t("Effort flag"))),
+            p_args: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(t("Extra args (space-separated)"))
+            }),
             p_prompt: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line(true)
-                    .placeholder("System prompt")
+                    .placeholder(t("System prompt"))
             }),
             p_inj_flag: cx
-                .new(|cx| InputState::new(window, cx).placeholder("--append-system-prompt")),
+                .new(|cx| InputState::new(window, cx).placeholder(t("--append-system-prompt"))),
             p_env: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line(true)
-                    .placeholder("KEY=VALUE per line")
+                    .placeholder(t("KEY=VALUE per line"))
             }),
             p_working_markers: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("comma-separated; blank = default")
+                InputState::new(window, cx).placeholder(t("comma-separated; blank = default"))
             }),
             p_blocked_markers: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("comma-separated; blank = default")
+                InputState::new(window, cx).placeholder(t("comma-separated; blank = default"))
             }),
             p_startup_delay: cx
-                .new(|cx| InputState::new(window, cx).placeholder("0 = auto (wait for quiet)")),
+                .new(|cx| InputState::new(window, cx).placeholder(t("0 = auto (wait for quiet)"))),
             selected_runner: None,
             r_preset_id: None,
             r_presses: 3,
-            r_name: cx.new(|cx| InputState::new(window, cx).placeholder("Name")),
+            r_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
             r_prompt: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line(true)
-                    .placeholder("Task prompt — use {{input}} for the run-time details")
+                    .placeholder(t("Task prompt — use {{input}} for the run-time details"))
             }),
             selected_loop: None,
             l_preset_id: None,
@@ -208,11 +210,11 @@ impl SettingsUi {
             l_sched_kind: 1,
             l_exit: false,
             l_enabled: true,
-            l_name: cx.new(|cx| InputState::new(window, cx).placeholder("Name")),
+            l_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
             l_prompt: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line(true)
-                    .placeholder("Prompt to run each time")
+                    .placeholder(t("Prompt to run each time"))
             }),
             l_interval: cx.new(|cx| InputState::new(window, cx).placeholder("1")),
             l_hour: cx.new(|cx| InputState::new(window, cx).placeholder("9")),
@@ -223,33 +225,37 @@ impl SettingsUi {
             s_has_password: false,
             s_forward_agent: false,
             s_use_tmux: true,
-            s_name: cx.new(|cx| InputState::new(window, cx).placeholder("Name")),
+            s_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
             s_host: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("host.example.com or ~/.ssh/config alias")
+                InputState::new(window, cx)
+                    .placeholder(t("host.example.com or ~/.ssh/config alias"))
             }),
             s_port: cx.new(|cx| InputState::new(window, cx).placeholder("22")),
-            s_user: cx.new(|cx| InputState::new(window, cx).placeholder("login user (optional)")),
-            s_identity: cx.new(|cx| InputState::new(window, cx).placeholder("~/.ssh/id_ed25519")),
+            s_user: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("login user (optional)"))),
+            s_identity: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("~/.ssh/id_ed25519"))),
             s_password: cx.new(|cx| {
                 InputState::new(window, cx)
                     .masked(true)
-                    .placeholder("stored in the OS keychain")
+                    .placeholder(t("stored in the OS keychain"))
             }),
             s_jump: cx
-                .new(|cx| InputState::new(window, cx).placeholder("ProxyJump host (optional)")),
+                .new(|cx| InputState::new(window, cx).placeholder(t("ProxyJump host (optional)"))),
             s_keepalive: cx
-                .new(|cx| InputState::new(window, cx).placeholder("ServerAliveInterval secs")),
-            s_strict: cx.new(|cx| InputState::new(window, cx).placeholder("accept-new")),
+                .new(|cx| InputState::new(window, cx).placeholder(t("ServerAliveInterval secs"))),
+            s_strict: cx.new(|cx| InputState::new(window, cx).placeholder(t("accept-new"))),
             s_extra: cx.new(|cx| {
                 InputState::new(window, cx)
                     .multi_line(true)
-                    .placeholder("extra -o options, one KEY=VALUE per line")
+                    .placeholder(t("extra -o options, one KEY=VALUE per line"))
             }),
             selected_project: None,
-            proj_name: cx.new(|cx| InputState::new(window, cx).placeholder("Project name")),
-            font_family: cx.new(|cx| InputState::new(window, cx).placeholder("DejaVu Sans Mono")),
+            proj_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Project name"))),
+            font_family: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("DejaVu Sans Mono"))),
             editor_font_family: cx
-                .new(|cx| InputState::new(window, cx).placeholder("theme monospace")),
+                .new(|cx| InputState::new(window, cx).placeholder(t("theme monospace"))),
             keybinds: DEFAULT_KEYBINDINGS
                 .iter()
                 .map(|(name, default, _ctx)| {
@@ -260,7 +266,7 @@ impl SettingsUi {
                 })
                 .collect(),
             passthrough_keys: cx
-                .new(|cx| InputState::new(window, cx).placeholder("ctrl-p, ctrl-t")),
+                .new(|cx| InputState::new(window, cx).placeholder(t("ctrl-p, ctrl-t"))),
         }
     }
 }

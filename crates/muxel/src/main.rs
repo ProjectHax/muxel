@@ -10,12 +10,14 @@
 mod app;
 mod editor;
 mod filetree;
+mod i18n;
 mod integrations;
 mod secrets;
 mod settings_view;
 mod theme;
 mod update;
 
+use crate::i18n::t;
 use app::MuxelApp;
 use gpui::*;
 use gpui_component::{Root, TitleBar, button::*, *};
@@ -71,22 +73,21 @@ impl Render for AlreadyOpenView {
                 div()
                     .text_xl()
                     .font_semibold()
-                    .child("muxel is already open"),
+                    .child(t("muxel is already open")),
             )
             .child(
                 div()
                     .max_w(px(380.0))
                     .text_center()
                     .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "This workspace is already in use by another muxel window. Close \
-                         it first so your settings aren't overwritten.",
-                    ),
+                    .child(t(
+                        "This workspace is already in use by another muxel window. Close it first so your settings aren't overwritten.",
+                    )),
             )
             .child(
                 Button::new("quit-already-open")
                     .primary()
-                    .label("Quit")
+                    .label(t("Quit"))
                     .on_click(|_, _window, cx| cx.quit()),
             )
     }
@@ -117,6 +118,9 @@ fn main() {
             app::register_actions(cx);
 
             let settings = muxel_store::load_settings();
+            // Localization: pick the UI language (explicit setting → OS locale)
+            // and load its catalog before any window renders.
+            i18n::set_language(&i18n::detect_language(&settings));
             cx.set_global(theme::UiScale(settings.zoom));
             cx.set_global(theme::UiFontSize(settings.ui_font_size));
             theme::apply_initial_theme(&settings.theme, cx);

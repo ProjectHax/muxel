@@ -3972,6 +3972,7 @@ dependencies = [
  "rust-embed",
  "self-replace",
  "serde_json",
+ "sys-locale",
  "ureq",
  "uuid",
  "winresource",

@@ -841,6 +841,10 @@ pub struct Settings {
     /// Theme mode override: "dark" | "light" | "" (use the theme's own mode).
     #[serde(default)]
     pub theme_mode: String,
+    /// UI language override (BCP-47, e.g. "fr", "zh-CN"). None/empty = auto-detect
+    /// from the OS locale at startup.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Terminal font family (empty = built-in per-OS monospace default).
     #[serde(default)]
     pub font_family: String,
@@ -926,6 +930,7 @@ impl Default for Settings {
             presets: AgentPreset::defaults(),
             theme: String::new(),
             theme_mode: String::new(),
+            language: None,
             font_family: String::new(),
             font_size: 14.0,
             ui_font_size: 16.0,

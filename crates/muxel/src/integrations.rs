@@ -1,6 +1,7 @@
 //! Side-effecting wrappers around the `git` and `tmux` CLIs — the I/O half of
 //! muxel-core's pure tmux/worktree helpers.
 
+use crate::i18n::{t, tf};
 use anyhow::{Context, Result, bail};
 use muxel_core::{MEMORY_DIR, MEMORY_FILE, RemoteHost, SshAuth, memory_header, ssh};
 use std::path::{Path, PathBuf};
@@ -816,19 +817,28 @@ pub fn git_diff(dir: &Path) -> String {
     // Resolve the repo root (also our "is this a git repo?" check, in one call).
     let toplevel = match git(&["rev-parse", "--show-toplevel"]) {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => return format!("# {}\n\nNot a git repository.\n", dir.display()),
+        _ => {
+            return tf(
+                "# {dir}\n\nNot a git repository.\n",
+                &[("dir", &dir.display().to_string())],
+            );
+        }
     };
 
     // A header so it's always obvious which folder the diff is reading from, and
     // a heads-up when that folder is only a subdirectory of a larger repo.
-    let mut header = format!("# Changes in {}\n", dir.display());
+    let mut header = tf(
+        "# Changes in {dir}\n",
+        &[("dir", &dir.display().to_string())],
+    );
     let is_subdir = matches!(
         (dir.canonicalize(), Path::new(&toplevel).canonicalize()),
         (Ok(d), Ok(t)) if d != t
     );
     if is_subdir {
-        header.push_str(&format!(
-            "# (subfolder of git repo {toplevel} — showing changes under this folder only)\n"
+        header.push_str(&tf(
+            "# (subfolder of git repo {toplevel} — showing changes under this folder only)\n",
+            &[("toplevel", &toplevel)],
         ));
     }
     header.push('\n');
@@ -848,10 +858,10 @@ pub fn git_diff(dir: &Path) -> String {
 
     if out.len() > MAX_DIFF_BYTES {
         out.truncate(MAX_DIFF_BYTES);
-        out.push_str("\n… diff truncated …\n");
+        out.push_str(&t("\n… diff truncated …\n"));
     }
     if out.trim().is_empty() {
-        format!("{header}No changes.")
+        format!("{header}{}", t("No changes."))
     } else {
         format!("{header}{out}")
     }

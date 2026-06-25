@@ -4,6 +4,7 @@
 //! `terminals`, keyed by instance id.
 
 use crate::editor::{EditorConfig, EditorView};
+use crate::i18n::{t, tf, tn};
 use crate::integrations;
 use crate::settings_view::{self, RemoteTestState, SettingsSection, SettingsUi};
 use crate::theme;
@@ -157,10 +158,10 @@ fn agent_icon_obj(program: Option<&str>) -> Icon {
 /// A small status pill for an agent.
 fn status_tag(status: AgentStatus) -> Tag {
     match status {
-        AgentStatus::Working => Tag::primary().small().child("working"),
-        AgentStatus::Idle => Tag::new().small().child("idle"),
-        AgentStatus::Blocked => Tag::warning().small().child("blocked"),
-        AgentStatus::Done => Tag::success().small().child("done"),
+        AgentStatus::Working => Tag::primary().small().child(t("working")),
+        AgentStatus::Idle => Tag::new().small().child(t("idle")),
+        AgentStatus::Blocked => Tag::warning().small().child(t("blocked")),
+        AgentStatus::Done => Tag::success().small().child(t("done")),
     }
 }
 
@@ -260,7 +261,7 @@ fn notify(summary: String, body: String, focus: Option<Uuid>) {
         // "default" is the action GNOME invokes when the notification *body* is
         // clicked; only register it when there's a pane to jump to.
         if focus.is_some() {
-            builder.action("default", "Open");
+            builder.action("default", &t("Open"));
         }
         if let Ok(handle) = builder.show() {
             // Blocks running the D-Bus loop until the notification is clicked or
@@ -320,6 +321,16 @@ pub fn register_actions(cx: &mut App) {
         };
         if let Some(app) = weak.upgrade() {
             app.update(cx, |this, cx| this.set_theme(a.0.clone(), cx));
+        }
+    });
+    // Language picks come from the settings dropdown (overlay menu → global
+    // action), same routing as the theme picker.
+    cx.on_action(|a: &crate::i18n::SetLanguage, cx| {
+        let Some(weak) = cx.try_global::<MuxelHandle>().map(|h| h.0.clone()) else {
+            return;
+        };
+        if let Some(app) = weak.upgrade() {
+            app.update(cx, |this, cx| this.set_language(a.0.clone(), cx));
         }
     });
     // Cmd+Q (macOS) / Ctrl+Q: route to the same confirm flow as the title-bar
@@ -548,9 +559,16 @@ fn unix_now() -> u64 {
 /// A short human summary of a loop's schedule (for the settings list).
 fn loop_schedule_summary(s: &LoopSchedule) -> String {
     match s {
-        LoopSchedule::EveryMinutes { minutes } => format!("every {minutes} min"),
-        LoopSchedule::EveryHours { hours } => format!("every {hours} h"),
-        LoopSchedule::DailyAt { hour, minute } => format!("daily {hour:02}:{minute:02}"),
+        LoopSchedule::EveryMinutes { minutes } => {
+            tf("every {minutes} min", &[("minutes", &minutes.to_string())])
+        }
+        LoopSchedule::EveryHours { hours } => {
+            tf("every {hours} h", &[("hours", &hours.to_string())])
+        }
+        LoopSchedule::DailyAt { hour, minute } => tf(
+            "daily {time}",
+            &[("time", &format!("{hour:02}:{minute:02}"))],
+        ),
     }
 }
 
@@ -1274,12 +1292,12 @@ impl NotifKind {
     }
 
     /// Short label shown after the title (agent notifications only).
-    fn label(self) -> &'static str {
+    fn label(self) -> SharedString {
         match self {
-            NotifKind::Blocked => "needs input",
-            NotifKind::Done => "finished",
-            NotifKind::Success => "success",
-            NotifKind::Error => "error",
+            NotifKind::Blocked => t("needs input"),
+            NotifKind::Done => t("finished"),
+            NotifKind::Success => t("success"),
+            NotifKind::Error => t("error"),
         }
     }
 }
@@ -1362,7 +1380,7 @@ impl Render for PopoutView {
                                             .ghost()
                                             .xsmall()
                                             .icon(IconName::PanelBottom)
-                                            .tooltip("Dock back into the app")
+                                            .tooltip(t("Dock back into the app"))
                                             .on_click(cx.listener(|this, _e, window, cx| {
                                                 let iid = this.iid;
                                                 if let Some(app) = cx
@@ -1410,18 +1428,18 @@ impl Render for PopoutView {
                             .shadow_lg()
                             .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
                             .child(div().text_lg().font_semibold().child(if self.is_editor() {
-                                "Close editor?"
+                                t("Close editor?")
                             } else {
-                                "Close terminal?"
+                                t("Close terminal?")
                             }))
                             .child(
                                 div()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(if self.is_editor() {
-                                        "Unsaved changes will be lost."
+                                        t("Unsaved changes will be lost.")
                                     } else {
-                                        "This terminal will be terminated."
+                                        t("This terminal will be terminated.")
                                     }),
                             )
                             .child(
@@ -1433,7 +1451,7 @@ impl Render for PopoutView {
                                     .child(
                                         Button::new("popout-close-cancel")
                                             .ghost()
-                                            .label("Cancel")
+                                            .label(t("Cancel"))
                                             .on_click(cx.listener(|this, _e, _w, cx| {
                                                 this.show_close_confirm = false;
                                                 cx.notify();
@@ -1442,7 +1460,7 @@ impl Render for PopoutView {
                                     .child(
                                         Button::new("popout-close-ok")
                                             .danger()
-                                            .label("Close")
+                                            .label(t("Close"))
                                             .on_click(|_e, window, _cx| window.remove_window()),
                                     ),
                             ),
@@ -1603,7 +1621,7 @@ impl MuxelApp {
         let settings_ui = SettingsUi::new(window, cx);
         let rename_input = cx.new(|cx| InputState::new(window, cx));
         let dispose_commit_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Commit message (default: worktree name)")
+            InputState::new(window, cx).placeholder(t("Commit message (default: worktree name)"))
         });
         cx.subscribe_in(
             &rename_input,
@@ -1616,7 +1634,7 @@ impl MuxelApp {
         .detach();
 
         let workspace_name_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("New workspace name"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("New workspace name")));
         cx.subscribe_in(
             &workspace_name_input,
             window,
@@ -1628,8 +1646,8 @@ impl MuxelApp {
         )
         .detach();
 
-        let runner_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Additional details (optional)"));
+        let runner_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder(t("Additional details (optional)")));
         cx.subscribe_in(
             &runner_input,
             window,
@@ -1642,7 +1660,7 @@ impl MuxelApp {
         .detach();
 
         let search_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search files and terminals…"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("Search files and terminals…")));
         cx.subscribe_in(
             &search_input,
             window,
@@ -1657,7 +1675,8 @@ impl MuxelApp {
         )
         .detach();
 
-        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in project…"));
+        let find_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("Find in project…")));
         cx.subscribe_in(
             &find_input,
             window,
@@ -1673,7 +1692,7 @@ impl MuxelApp {
         .detach();
 
         let term_search_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search terminal…"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("Search terminal…")));
         cx.subscribe_in(
             &term_search_input,
             window,
@@ -1691,7 +1710,8 @@ impl MuxelApp {
         .detach();
 
         let broadcast_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Send a line to every agent in this project…")
+            InputState::new(window, cx)
+                .placeholder(t("Send a line to every agent in this project…"))
         });
         cx.subscribe_in(
             &broadcast_input,
@@ -1717,14 +1737,14 @@ impl MuxelApp {
         .detach();
 
         let nr_dir = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("/path/to/project on the remote host")
+            InputState::new(window, cx).placeholder(t("/path/to/project on the remote host"))
         });
-        let nr_name = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
+        let nr_name = cx.new(|cx| InputState::new(window, cx).placeholder(t("Project name")));
 
         let password_prompt_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .masked(true)
-                .placeholder("SSH password")
+                .placeholder(t("SSH password"))
         });
         cx.subscribe_in(
             &password_prompt_input,
@@ -1738,7 +1758,7 @@ impl MuxelApp {
         .detach();
 
         let file_browser_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search files…"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("Search files…")));
         cx.subscribe_in(
             &file_browser_input,
             window,
@@ -2270,6 +2290,17 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Switch the UI language at runtime: load the catalog, persist the choice
+    /// ("en"/None = follow the OS locale), and refresh every window so all `t()`
+    /// strings re-render without a restart.
+    fn set_language(&mut self, lang: String, cx: &mut Context<Self>) {
+        crate::i18n::set_language(&lang);
+        self.settings.language = if lang == "en" { None } else { Some(lang) };
+        self.persist_settings();
+        cx.refresh_windows();
+        cx.notify();
+    }
+
     /// Ensure every instance in a project's layout has a live terminal.
     /// Spawn live terminals/editors for a project's panes that lack one. For a
     /// remote project this prompts for a password if needed, then verifies login
@@ -2337,7 +2368,7 @@ impl MuxelApp {
                     Ok(()) => {
                         this.add_event(
                             NotifKind::Success,
-                            format!("Connected to “{name}”"),
+                            tf("Connected to “{name}”", &[("name", &name.to_string())]),
                             String::new(),
                         );
                         if first_sync {
@@ -2360,7 +2391,10 @@ impl MuxelApp {
                         this.session_passwords.remove(&host_id);
                         this.add_event(
                             NotifKind::Error,
-                            format!("Couldn't connect to “{name}”"),
+                            tf(
+                                "Couldn't connect to “{name}”",
+                                &[("name", &name.to_string())],
+                            ),
                             format!("{e}"),
                         );
                         cx.notify();
@@ -2635,7 +2669,7 @@ impl MuxelApp {
         // Can't verify a password host without a password (none saved/in session).
         if host.auth == SshAuth::Password && password.is_none() {
             self.nr_verify = RemoteTestState::Failed(
-                "Save a password for this host (or connect once) to verify.".into(),
+                t("Save a password for this host (or connect once) to verify.").into(),
             );
             cx.notify();
             return;
@@ -2654,7 +2688,7 @@ impl MuxelApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.nr_verify = match res {
-                    Ok(dir) => RemoteTestState::Ok(format!("Found {dir}")),
+                    Ok(dir) => RemoteTestState::Ok(tf("Found {dir}", &[("dir", &dir.to_string())])),
                     Err(e) => RemoteTestState::Failed(format!("{e}")),
                 };
                 cx.notify();
@@ -2693,7 +2727,7 @@ impl MuxelApp {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Open".into()),
+            prompt: Some(t("Open")),
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = receiver.await
@@ -2910,8 +2944,11 @@ impl MuxelApp {
                     Ok(Some(info)) => {
                         if notify_enabled {
                             notify(
-                                format!("muxel {} is available", info.version),
-                                "Open muxel to install the update.".to_string(),
+                                tf(
+                                    "muxel {version} is available",
+                                    &[("version", &info.version.to_string())],
+                                ),
+                                t("Open muxel to install the update.").to_string(),
                                 None,
                             );
                         }
@@ -2952,8 +2989,8 @@ impl MuxelApp {
                     Ok(plan) => {
                         if notify_enabled {
                             notify(
-                                "muxel update ready".to_string(),
-                                "Restart to finish updating.".to_string(),
+                                t("muxel update ready").to_string(),
+                                t("Restart to finish updating.").to_string(),
                                 None,
                             );
                         }
@@ -3255,7 +3292,7 @@ impl MuxelApp {
                 .unwrap_or_default();
             self.add_event(
                 NotifKind::Success,
-                format!("Loop “{}” started", lp.name),
+                tf("Loop “{name}” started", &[("name", &lp.name.to_string())]),
                 project,
             );
         }
@@ -3750,9 +3787,11 @@ impl MuxelApp {
         self.persist();
         self.add_event(
             NotifKind::Success,
-            format!(
-                "Saved {n} agent{} as startup for “{name}”",
-                if n == 1 { "" } else { "s" }
+            tn(
+                "Saved {n} agent as startup for “{name}”",
+                "Saved {n} agents as startup for “{name}”",
+                n,
+                &[("n", &n.to_string()), ("name", &name)],
             ),
             String::new(),
         );
@@ -4058,21 +4097,21 @@ impl MuxelApp {
 
     fn palette_command_label(&self, cmd: PaletteCommand) -> String {
         match cmd {
-            PaletteCommand::SplitRight => "Split pane right".into(),
-            PaletteCommand::SplitDown => "Split pane down".into(),
-            PaletteCommand::NewTab => "New tab".into(),
+            PaletteCommand::SplitRight => t("Split pane right").into(),
+            PaletteCommand::SplitDown => t("Split pane down").into(),
+            PaletteCommand::NewTab => t("New tab").into(),
             PaletteCommand::ClosePane => "Close pane".into(),
             PaletteCommand::RestartAgent => "Restart agent".into(),
             PaletteCommand::ClearScrollback => "Clear scrollback".into(),
-            PaletteCommand::ToggleWorktree => "Toggle git worktree for new agents".into(),
-            PaletteCommand::FocusAttention => "Focus next agent needing attention".into(),
+            PaletteCommand::ToggleWorktree => t("Toggle git worktree for new agents").into(),
+            PaletteCommand::FocusAttention => t("Focus next agent needing attention").into(),
             PaletteCommand::ToggleSidebar => "Toggle sidebar".into(),
-            PaletteCommand::ToggleDashboard => "Toggle dashboard (all agents)".into(),
-            PaletteCommand::OpenSettings => "Open settings".into(),
+            PaletteCommand::ToggleDashboard => t("Toggle dashboard (all agents)").into(),
+            PaletteCommand::OpenSettings => t("Open settings").into(),
             PaletteCommand::RunRunner(i) => self
                 .runners
                 .get(i)
-                .map(|r| format!("Run: {}", r.name))
+                .map(|r| tf("Run: {name}", &[("name", &r.name.to_string())]))
                 .unwrap_or_default(),
         }
     }
@@ -4337,13 +4376,15 @@ impl MuxelApp {
                                     }
                                     this.add_event(
                                         NotifKind::Success,
-                                        format!("Saved {name}"),
+                                        tf("Saved {name}", &[("name", &name.to_string())]),
                                         String::new(),
                                     );
                                 }
-                                Err(e) => {
-                                    this.add_event(NotifKind::Error, "Save failed", format!("{e}"))
-                                }
+                                Err(e) => this.add_event(
+                                    NotifKind::Error,
+                                    t("Save failed"),
+                                    format!("{e}"),
+                                ),
                             }
                             cx.notify();
                         });
@@ -4898,8 +4939,8 @@ impl MuxelApp {
                 }
                 self.add_event(
                     NotifKind::Error,
-                    format!("Couldn't merge {}", d.name),
-                    format!("{e} — the worktree was kept."),
+                    tf("Couldn't merge {name}", &[("name", &d.name.to_string())]),
+                    tf("{e} — the worktree was kept.", &[("e", &e.to_string())]),
                 );
             }
         }
@@ -4953,8 +4994,8 @@ impl MuxelApp {
         self.run_git_task(
             window,
             cx,
-            format!("Pushed “{name}”"),
-            format!("Couldn't push “{name}”"),
+            tf("Pushed “{name}”", &[("name", &name.to_string())]),
+            tf("Couldn't push “{name}”", &[("name", &name.to_string())]),
             move || integrations::push_branch(&path, &branch).map(|()| String::new()),
         );
     }
@@ -4968,8 +5009,11 @@ impl MuxelApp {
         self.run_git_task(
             window,
             cx,
-            format!("Opening a PR for “{name}”…"),
-            format!("Couldn't create a PR for “{name}”"),
+            tf("Opening a PR for “{name}”…", &[("name", &name.to_string())]),
+            tf(
+                "Couldn't create a PR for “{name}”",
+                &[("name", &name.to_string())],
+            ),
             move || integrations::create_pr(&path, &branch).map(|()| String::new()),
         );
     }
@@ -4983,8 +5027,11 @@ impl MuxelApp {
         self.run_git_task(
             window,
             cx,
-            format!("Opening the PR for “{name}”…"),
-            format!("No PR found for “{name}”"),
+            tf(
+                "Opening the PR for “{name}”…",
+                &[("name", &name.to_string())],
+            ),
+            tf("No PR found for “{name}”", &[("name", &name.to_string())]),
             move || integrations::open_pr(&path).map(|()| String::new()),
         );
     }
@@ -5056,7 +5103,7 @@ impl MuxelApp {
                 .await;
             if let Err(e) = res {
                 let _ = this.update(cx, |this, cx| {
-                    this.add_event(NotifKind::Error, "Project memory", format!("{e}"));
+                    this.add_event(NotifKind::Error, t("Project memory"), format!("{e}"));
                     cx.notify();
                 });
             }
@@ -5131,7 +5178,7 @@ impl MuxelApp {
                 .await;
             if let Err(e) = res {
                 let _ = this.update(cx, |this, cx| {
-                    this.add_event(NotifKind::Error, "Layout sync", format!("{e}"));
+                    this.add_event(NotifKind::Error, t("Layout sync"), format!("{e}"));
                     cx.notify();
                 });
             }
@@ -5247,7 +5294,7 @@ impl MuxelApp {
         self.persist();
         self.add_event(
             NotifKind::Success,
-            "Layout restored from remote",
+            t("Layout restored from remote").to_string(),
             String::new(),
         );
     }
@@ -5304,12 +5351,12 @@ impl MuxelApp {
             .is_some_and(|p| integrations::worktree_change_count(&p.root_path) > 0);
         if dirty {
             self.request_confirm(
-                "Switch branch?",
+                t("Switch branch?"),
                 format!(
                     "You have uncommitted changes — switching to “{branch}” may fail or carry \
                      them over."
                 ),
-                "Switch",
+                t("Switch"),
                 ConfirmAction::SwitchBranch { pid, branch },
                 cx,
             );
@@ -5328,8 +5375,8 @@ impl MuxelApp {
         let b = branch.clone();
         self.run_project_git(
             pid,
-            format!("Switched to {branch}"),
-            "Couldn't switch branch".into(),
+            tf("Switched to {branch}", &[("branch", &branch.to_string())]),
+            t("Couldn't switch branch").into(),
             move |root| integrations::checkout_branch(root, &b),
             window,
             cx,
@@ -5338,9 +5385,9 @@ impl MuxelApp {
 
     fn request_stash_pop(&mut self, pid: Uuid, cx: &mut Context<Self>) {
         self.request_confirm(
-            "Pop stash?",
-            "Applying the latest stash can conflict with your working tree.",
-            "Pop",
+            t("Pop stash?"),
+            t("Applying the latest stash can conflict with your working tree."),
+            t("Pop"),
             ConfirmAction::StashPop(pid),
             cx,
         );
@@ -5349,8 +5396,8 @@ impl MuxelApp {
     fn do_stash_pop(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.run_project_git(
             pid,
-            "Popped stash".into(),
-            "Pop stash failed".into(),
+            t("Popped stash").into(),
+            t("Pop stash failed").into(),
             integrations::git_stash_pop,
             window,
             cx,
@@ -5359,9 +5406,9 @@ impl MuxelApp {
 
     fn request_stash_drop(&mut self, pid: Uuid, cx: &mut Context<Self>) {
         self.request_confirm(
-            "Drop stash?",
-            "The latest stash will be permanently discarded.",
-            "Drop",
+            t("Drop stash?"),
+            t("The latest stash will be permanently discarded."),
+            t("Drop"),
             ConfirmAction::StashDrop(pid),
             cx,
         );
@@ -5370,8 +5417,8 @@ impl MuxelApp {
     fn do_stash_drop(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.run_project_git(
             pid,
-            "Dropped stash".into(),
-            "Drop stash failed".into(),
+            t("Dropped stash").into(),
+            t("Drop stash failed").into(),
             integrations::git_stash_drop,
             window,
             cx,
@@ -5396,7 +5443,7 @@ impl MuxelApp {
                     .map(|loc| integrations::git_status_files(&loc))
                     .unwrap_or_default();
                 if files.is_empty() {
-                    self.add_event(NotifKind::Success, "Nothing to commit", "");
+                    self.add_event(NotifKind::Success, t("Nothing to commit"), "");
                     cx.notify();
                     return;
                 }
@@ -5467,16 +5514,16 @@ impl MuxelApp {
         match kind {
             GitModalKind::Commit => self.run_project_git(
                 pid,
-                "Committed".into(),
-                "Commit failed".into(),
+                t("Committed").into(),
+                t("Commit failed").into(),
                 move |root| integrations::git_commit_paths(root, &value, &commit_paths),
                 window,
                 cx,
             ),
             GitModalKind::NewBranch => self.run_project_git(
                 pid,
-                format!("Created branch {value}"),
-                "Couldn't create branch".into(),
+                tf("Created branch {value}", &[("value", &value.to_string())]),
+                t("Couldn't create branch").into(),
                 move |root| integrations::create_branch(root, &value),
                 window,
                 cx,
@@ -5501,14 +5548,21 @@ impl MuxelApp {
             .rounded(cx.theme().radius_lg)
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-            .child(div().text_lg().font_semibold().child("New remote project"));
+            .child(
+                div()
+                    .text_lg()
+                    .font_semibold()
+                    .child(t("New remote project")),
+            );
 
         let card = if self.remotes.is_empty() {
             card.child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("No SSH hosts yet. Add one in Settings → Remotes, then come back."),
+                    .child(t(
+                        "No SSH hosts yet. Add one in Settings → Remotes, then come back.",
+                    )),
             )
             .child(
                 div()
@@ -5516,13 +5570,18 @@ impl MuxelApp {
                     .justify_end()
                     .gap_2()
                     .pt_2()
-                    .child(Button::new("nr-cancel").ghost().label("Cancel").on_click(
-                        cx.listener(|this, _e, _w, cx| this.close_remote_project_modal(cx)),
-                    ))
+                    .child(
+                        Button::new("nr-cancel")
+                            .ghost()
+                            .label(t("Cancel"))
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.close_remote_project_modal(cx)),
+                            ),
+                    )
                     .child(
                         Button::new("nr-open-settings")
                             .primary()
-                            .label("Open Settings")
+                            .label(t("Open Settings"))
                             .on_click(cx.listener(|this, _e, window, cx| {
                                 this.close_remote_project_modal(cx);
                                 if !this.show_settings {
@@ -5553,11 +5612,11 @@ impl MuxelApp {
                         })),
                 );
             }
-            card.child(self.settings_label("Host", cx))
+            card.child(self.settings_label(&t("Host"), cx))
                 .child(hosts)
-                .child(self.settings_label("Remote directory", cx))
+                .child(self.settings_label(&t("Remote directory"), cx))
                 .child(Input::new(&self.nr_dir))
-                .child(self.settings_label("Project name (optional)", cx))
+                .child(self.settings_label(&t("Project name (optional)"), cx))
                 .child(Input::new(&self.nr_name))
                 // Inline Verify result, above the buttons.
                 .children(match &self.nr_verify {
@@ -5567,7 +5626,7 @@ impl MuxelApp {
                             .pt_1()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Verifying…")
+                            .child(t("Verifying…"))
                             .into_any_element(),
                     ),
                     RemoteTestState::Ok(msg) => Some(
@@ -5594,18 +5653,31 @@ impl MuxelApp {
                         .items_center()
                         .gap_2()
                         .pt_2()
-                        .child(Button::new("nr-verify").ghost().label("Verify").on_click(
-                            cx.listener(|this, _e, window, cx| this.verify_remote_dir(window, cx)),
-                        ))
+                        .child(
+                            Button::new("nr-verify")
+                                .ghost()
+                                .label(t("Verify"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.verify_remote_dir(window, cx)
+                                })),
+                        )
                         .child(div().flex_1())
-                        .child(Button::new("nr-cancel").ghost().label("Cancel").on_click(
-                            cx.listener(|this, _e, _w, cx| this.close_remote_project_modal(cx)),
-                        ))
-                        .child(Button::new("nr-create").primary().label("Create").on_click(
-                            cx.listener(|this, _e, window, cx| {
-                                this.confirm_remote_project(window, cx)
-                            }),
-                        )),
+                        .child(
+                            Button::new("nr-cancel")
+                                .ghost()
+                                .label(t("Cancel"))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.close_remote_project_modal(cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("nr-create")
+                                .primary()
+                                .label(t("Create"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.confirm_remote_project(window, cx)
+                                })),
+                        ),
                 )
         };
 
@@ -5638,10 +5710,10 @@ impl MuxelApp {
             .unwrap_or_default();
         let (confirm, hint) = match p.action {
             PasswordAction::Connect(_) => (
-                "Connect",
-                "Kept in memory for this session only — not saved to the keychain.",
+                t("Connect"),
+                t("Kept in memory for this session only — not saved to the keychain."),
             ),
-            PasswordAction::Verify(_) => ("Test", "Used once to test, then forgotten."),
+            PasswordAction::Verify(_) => (t("Test"), t("Used once to test, then forgotten.")),
         };
         div()
             .absolute()
@@ -5668,12 +5740,10 @@ impl MuxelApp {
                     .rounded(cx.theme().radius_lg)
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_semibold()
-                            .child(format!("SSH password for “{host_name}”")),
-                    )
+                    .child(div().text_lg().font_semibold().child(tf(
+                        "SSH password for “{host_name}”",
+                        &[("host_name", &host_name.to_string())],
+                    )))
                     .child(
                         div()
                             .text_xs()
@@ -5687,11 +5757,14 @@ impl MuxelApp {
                             .justify_end()
                             .gap_2()
                             .pt_2()
-                            .child(Button::new("pw-cancel").ghost().label("Cancel").on_click(
-                                cx.listener(|this, _e, window, cx| {
-                                    this.close_password_prompt(window, cx)
-                                }),
-                            ))
+                            .child(
+                                Button::new("pw-cancel")
+                                    .ghost()
+                                    .label(t("Cancel"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.close_password_prompt(window, cx)
+                                    })),
+                            )
                             .child(Button::new("pw-confirm").primary().label(confirm).on_click(
                                 cx.listener(|this, _e, window, cx| {
                                     this.confirm_password_prompt(window, cx)
@@ -5707,13 +5780,17 @@ impl MuxelApp {
             return div().into_any_element();
         };
         let (title, label) = match m.kind {
-            GitModalKind::Commit => ("Commit changes", "Commit message"),
-            GitModalKind::NewBranch => ("New branch", "Branch name"),
+            GitModalKind::Commit => (t("Commit changes"), t("Commit message")),
+            GitModalKind::NewBranch => (t("New branch"), t("Branch name")),
         };
         let confirm = match m.kind {
-            GitModalKind::Commit => {
-                format!("Commit ({})", m.selected.iter().filter(|&&s| s).count())
-            }
+            GitModalKind::Commit => tf(
+                "Commit ({count})",
+                &[(
+                    "count",
+                    &m.selected.iter().filter(|&&s| s).count().to_string(),
+                )],
+            ),
             GitModalKind::NewBranch => "Create".to_string(),
         };
         // For a commit, a scrollable checklist of every changed/untracked file
@@ -5796,9 +5873,12 @@ impl MuxelApp {
                             .gap_2()
                             .pt_2()
                             .child(
-                                Button::new("git-cancel").ghost().label("Cancel").on_click(
-                                    cx.listener(|this, _e, _w, cx| this.close_git_modal(cx)),
-                                ),
+                                Button::new("git-cancel")
+                                    .ghost()
+                                    .label(t("Cancel"))
+                                    .on_click(
+                                        cx.listener(|this, _e, _w, cx| this.close_git_modal(cx)),
+                                    ),
                             )
                             .child(
                                 Button::new("git-confirm")
@@ -6172,19 +6252,22 @@ impl MuxelApp {
                 .is_none_or(|e| !e.read(cx).is_dirty());
         if self.confirm_close_for(kind) && !clean_editor {
             let (noun, verb) = match kind {
-                InstanceKind::Terminal => ("terminal", "terminated"),
-                InstanceKind::Editor => ("editor", "closed"),
-                InstanceKind::Diff => ("diff", "closed"),
+                InstanceKind::Terminal => (t("terminal"), t("terminated")),
+                InstanceKind::Editor => (t("editor"), t("closed")),
+                InstanceKind::Diff => (t("diff"), t("closed")),
             };
             let name = self
                 .workspace
                 .instance(iid)
                 .map(|i| i.custom_name.clone().unwrap_or_else(|| i.title.clone()))
-                .unwrap_or_else(|| format!("this {noun}"));
+                .unwrap_or_else(|| tf("this {noun}", &[("noun", &noun)]));
             self.request_confirm(
-                format!("Close {noun}?"),
-                format!("“{name}” will be {verb}."),
-                "Close",
+                tf("Close {noun}?", &[("noun", &noun)]),
+                tf(
+                    "“{name}” will be {verb}.",
+                    &[("name", &name), ("verb", &verb)],
+                ),
+                t("Close"),
                 ConfirmAction::CloseInstance(iid),
                 cx,
             );
@@ -6375,12 +6458,14 @@ impl MuxelApp {
         if needs_confirm {
             let n = others.len();
             self.request_confirm(
-                "Close other tabs?",
-                format!(
-                    "{n} other tab{} in this pane will be terminated.",
-                    if n == 1 { "" } else { "s" }
+                t("Close other tabs?"),
+                tn(
+                    "{n} other tab in this pane will be terminated.",
+                    "{n} other tabs in this pane will be terminated.",
+                    n,
+                    &[("n", &n.to_string())],
                 ),
-                "Close others",
+                t("Close others"),
                 ConfirmAction::CloseOtherTabs(keep),
                 cx,
             );
@@ -6441,12 +6526,14 @@ impl MuxelApp {
             let n = ids.len();
             let side = if right { "right" } else { "left" };
             self.request_confirm(
-                "Close tabs?",
-                format!(
-                    "{n} tab{} to the {side} will be terminated.",
-                    if n == 1 { "" } else { "s" }
+                t("Close tabs?"),
+                tn(
+                    "{n} tab to the {side} will be terminated.",
+                    "{n} tabs to the {side} will be terminated.",
+                    n,
+                    &[("n", &n.to_string()), ("side", side)],
                 ),
-                "Close tabs",
+                t("Close tabs"),
                 ConfirmAction::CloseTabsSide { anchor, right },
                 cx,
             );
@@ -7396,7 +7483,7 @@ impl MuxelApp {
                                 let row_name = row_name.clone();
                                 let mut menu = menu
                                     .item(
-                                        PopupMenuItem::new("Copy path")
+                                        PopupMenuItem::new(t("Copy path"))
                                             .icon(IconName::Copy)
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -7408,7 +7495,7 @@ impl MuxelApp {
                                             )),
                                     )
                                     .item(
-                                        PopupMenuItem::new("Copy relative path")
+                                        PopupMenuItem::new(t("Copy relative path"))
                                             .icon(IconName::Copy)
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -7422,7 +7509,7 @@ impl MuxelApp {
                                     .separator();
                                 if !is_remote {
                                     menu = menu.item(
-                                        PopupMenuItem::new("Reveal in file manager")
+                                        PopupMenuItem::new(t("Reveal in file manager"))
                                             .icon(IconName::FolderOpen)
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -7433,7 +7520,7 @@ impl MuxelApp {
                                     );
                                 }
                                 menu = menu.item(
-                                    PopupMenuItem::new("Open in terminal")
+                                    PopupMenuItem::new(t("Open in terminal"))
                                         .icon(IconName::SquareTerminal)
                                         .on_click(window.listener_for(
                                             &entity,
@@ -7444,7 +7531,7 @@ impl MuxelApp {
                                 );
                                 if !is_remote {
                                     menu = menu.separator().item(
-                                        PopupMenuItem::new("Rename…")
+                                        PopupMenuItem::new(t("Rename…"))
                                             .icon(Icon::empty().path("icons/pencil.svg"))
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -7492,14 +7579,17 @@ impl MuxelApp {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .child(format!("FILES · {proj_name}")),
+                            .child(tf(
+                                "FILES · {proj_name}",
+                                &[("proj_name", &proj_name.to_string())],
+                            )),
                     )
                     .child(
                         Button::new("fb-close")
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
-                            .tooltip("Close file browser")
+                            .tooltip(t("Close file browser"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.show_file_browser = false;
                                 cx.notify();
@@ -7604,7 +7694,7 @@ impl MuxelApp {
                         .items_center()
                         .justify_center()
                         .text_color(cx.theme().muted_foreground)
-                        .child("(terminal exited)")
+                        .child(t("(terminal exited)"))
                         .into_any_element()
                 };
                 // Each pane is a rounded card with a thin header that doubles as
@@ -7658,7 +7748,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(IconName::PanelRight)
-                            .tooltip("Split right (hold to choose agent)")
+                            .tooltip(t("Split right (hold to choose agent)"))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
@@ -7687,7 +7777,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(IconName::PanelBottom)
-                            .tooltip("Split down (hold to choose agent)")
+                            .tooltip(t("Split down (hold to choose agent)"))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
@@ -7718,7 +7808,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(Icon::empty().path("icons/diff.svg"))
-                            .tooltip("Show changes (git diff)")
+                            .tooltip(t("Show changes (git diff)"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
                                 this.open_diff_for(iid, window, cx)
                             }))
@@ -7728,7 +7818,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .label("↻")
-                            .tooltip("Refresh diff")
+                            .tooltip(t("Refresh diff"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
                                 this.refresh_diff_pane(iid, window, cx)
                             }))
@@ -7743,11 +7833,11 @@ impl MuxelApp {
                                 Button::new(SharedString::from(format!("md-{sid}")))
                                     .ghost()
                                     .xsmall()
-                                    .label(if rendered { "Raw" } else { "Rendered" })
+                                    .label(if rendered { t("Raw") } else { t("Rendered") })
                                     .tooltip(if rendered {
-                                        "Show raw text"
+                                        t("Show raw text")
                                     } else {
-                                        "Show rendered markdown"
+                                        t("Show rendered markdown")
                                     })
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
                                         if let Some(ed) = this.editors.get(&iid).cloned() {
@@ -7761,7 +7851,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(max_icon)
-                            .tooltip("Maximize")
+                            .tooltip(t("Maximize"))
                             .on_click(
                                 cx.listener(move |this, _e, _w, cx| this.toggle_maximize(iid, cx)),
                             ),
@@ -7771,7 +7861,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(IconName::ExternalLink)
-                            .tooltip("Pop out")
+                            .tooltip(t("Pop out"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
                                 this.pop_out_instance(iid, window, cx)
                             })),
@@ -7781,7 +7871,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
-                            .tooltip("Close")
+                            .tooltip(t("Close"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 this.request_close_instance(iid, cx)
                             })),
@@ -7905,10 +7995,10 @@ impl MuxelApp {
                             .context_menu({
                                 let entity = entity.clone();
                                 move |menu, window, _cx| {
-                                    let pin_label = if tab_pinned { "Unpin" } else { "Pin" };
+                                    let pin_label = if tab_pinned { t("Unpin") } else { t("Pin") };
                                     let menu = menu
                                         .item(
-                                            PopupMenuItem::new("Rename")
+                                            PopupMenuItem::new(t("Rename"))
                                                 .icon(Icon::empty().path("icons/pencil.svg"))
                                                 .on_click(window.listener_for(
                                                     &entity,
@@ -7918,7 +8008,7 @@ impl MuxelApp {
                                                 )),
                                         )
                                         .item(
-                                            PopupMenuItem::new("Duplicate")
+                                            PopupMenuItem::new(t("Duplicate"))
                                                 .icon(IconName::Copy)
                                                 .on_click(window.listener_for(
                                                     &entity,
@@ -7939,7 +8029,7 @@ impl MuxelApp {
                                     // Clear scrollback (terminals only).
                                     let menu = if tab_is_terminal {
                                         menu.item(
-                                            PopupMenuItem::new("Clear scrollback")
+                                            PopupMenuItem::new(t("Clear scrollback"))
                                                 .icon(IconName::Delete)
                                                 .on_click(window.listener_for(
                                                     &entity,
@@ -7954,7 +8044,7 @@ impl MuxelApp {
                                     // Rename the tab's worktree, when it has one.
                                     let menu = if let Some(wid) = tab_wt_id {
                                         menu.item(
-                                            PopupMenuItem::new("Rename worktree")
+                                            PopupMenuItem::new(t("Rename worktree"))
                                                 .icon(Icon::empty().path("icons/git-branch.svg"))
                                                 .on_click(window.listener_for(
                                                     &entity,
@@ -7968,7 +8058,7 @@ impl MuxelApp {
                                     };
                                     menu.separator()
                                         .item(
-                                            PopupMenuItem::new("Close tabs to the left")
+                                            PopupMenuItem::new(t("Close tabs to the left"))
                                                 .icon(IconName::PanelLeftClose)
                                                 .on_click(window.listener_for(
                                                     &entity,
@@ -7978,7 +8068,7 @@ impl MuxelApp {
                                                 )),
                                         )
                                         .item(
-                                            PopupMenuItem::new("Close tabs to the right")
+                                            PopupMenuItem::new(t("Close tabs to the right"))
                                                 .icon(IconName::PanelRightClose)
                                                 .on_click(window.listener_for(
                                                     &entity,
@@ -7988,7 +8078,7 @@ impl MuxelApp {
                                                 )),
                                         )
                                         .item(
-                                            PopupMenuItem::new("Close others")
+                                            PopupMenuItem::new(t("Close others"))
                                                 .icon(IconName::CircleX)
                                                 .on_click(window.listener_for(
                                                     &entity,
@@ -7998,7 +8088,7 @@ impl MuxelApp {
                                                 )),
                                         )
                                         .item(
-                                            PopupMenuItem::new("Close")
+                                            PopupMenuItem::new(t("Close"))
                                                 .icon(IconName::Close)
                                                 .on_click(window.listener_for(
                                                     &entity,
@@ -8051,7 +8141,7 @@ impl MuxelApp {
                                         .ghost()
                                         .xsmall()
                                         .icon(IconName::Close)
-                                        .tooltip("Close tab")
+                                        .tooltip(t("Close tab"))
                                         .on_click(
                                             cx.listener(move |this, _e, _w, cx| {
                                                 this.request_close_instance(tab, cx)
@@ -8097,7 +8187,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .label("+")
-                            .tooltip("New tab (hold to choose agent)")
+                            .tooltip(t("New tab (hold to choose agent)"))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
@@ -8442,26 +8532,26 @@ impl MuxelApp {
                             .flex_none()
                             .rounded(cx.theme().radius_lg),
                     )
-                    .child(div().text_xl().font_semibold().child("Welcome to muxel")),
+                    .child(div().text_xl().font_semibold().child(t("Welcome to muxel"))),
             )
             .child(
                 div()
                     .text_sm()
                     .text_color(muted)
-                    .child("Please review and accept the terms before you start."),
+                    .child(t("Please review and accept the terms before you start.")),
             )
             .child(
                 v_flex()
                     .gap_2()
                     .py_1()
                     .child(bullet(
-                        "muxel is free, open-source software provided “as is”, without warranty of any kind.",
+                        &t("muxel is free, open-source software provided “as is”, without warranty of any kind."),
                     ))
                     .child(bullet(
-                        "To the maximum extent permitted by law, the authors accept no liability for any damages arising from its use.",
+                        &t("To the maximum extent permitted by law, the authors accept no liability for any damages arising from its use."),
                     ))
                     .child(bullet(
-                        "muxel runs locally on your machine and collects no personal data.",
+                        &t("muxel runs locally on your machine and collects no personal data."),
                     )),
             )
             .child(
@@ -8472,7 +8562,7 @@ impl MuxelApp {
                     .child(
                         Button::new("terms-full")
                             .ghost()
-                            .label("View full terms")
+                            .label(t("View full terms"))
                             .on_click(cx.listener(|_t, _e, _w, cx| {
                                 cx.open_url("https://muxel.sh/legal.html")
                             })),
@@ -8480,7 +8570,7 @@ impl MuxelApp {
                     .child(
                         Button::new("terms-license")
                             .ghost()
-                            .label("License (GPL-3.0)")
+                            .label(t("License (GPL-3.0)"))
                             .on_click(cx.listener(|_t, _e, _w, cx| {
                                 cx.open_url(
                                     "https://github.com/projecthax/muxel/blob/master/LICENSE",
@@ -8496,7 +8586,7 @@ impl MuxelApp {
                     .pt_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(Button::new("terms-quit").ghost().label("Quit").on_click(
+                    .child(Button::new("terms-quit").ghost().label(t("Quit")).on_click(
                         cx.listener(|this, _e, _w, cx| {
                             this.confirm_quit = true;
                             cx.quit();
@@ -8505,7 +8595,7 @@ impl MuxelApp {
                     .child(
                         Button::new("terms-accept")
                             .primary()
-                            .label("I Agree & Continue")
+                            .label(t("I Agree & Continue"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.accept_terms(cx))),
                     ),
             );
@@ -8572,14 +8662,15 @@ impl MuxelApp {
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Close)
-                                    .tooltip("Delete workspace")
+                                    .tooltip(t("Delete workspace"))
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
                                         this.request_confirm(
-                                        "Delete workspace?",
-                                        format!(
-                                            "Workspace “{label}” and its layout will be deleted."
+                                        t("Delete workspace?"),
+                                        tf(
+                                            "Workspace “{label}” and its layout will be deleted.",
+                                            &[("label", &label)],
                                         ),
-                                        "Delete",
+                                        t("Delete"),
                                         ConfirmAction::DeleteWorkspace(id),
                                         cx,
                                     )
@@ -8598,12 +8689,19 @@ impl MuxelApp {
             .border_color(cx.theme().border)
             .bg(cx.theme().background)
             .shadow_lg()
-            .child(div().text_xl().font_semibold().child("Choose a workspace"))
+            .child(
+                div()
+                    .text_xl()
+                    .font_semibold()
+                    .child(t("Choose a workspace")),
+            )
             .child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Each workspace keeps its own projects and terminal layout."),
+                    .child(t(
+                        "Each workspace keeps its own projects and terminal layout.",
+                    )),
             )
             .child(
                 div()
@@ -8624,7 +8722,7 @@ impl MuxelApp {
                     .child(
                         Button::new("create-workspace")
                             .primary()
-                            .label("Create")
+                            .label(t("Create"))
                             .on_click(cx.listener(|this, _e, window, cx| {
                                 this.create_workspace_from_input(window, cx)
                             })),
@@ -8633,28 +8731,30 @@ impl MuxelApp {
 
         // Always offer a way out (otherwise first-run users with no workspace yet
         // are trapped); when switching at runtime, also allow backing out.
-        card =
-            card.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(Button::new("quit-selector").ghost().label("Quit").on_click(
-                        cx.listener(|this, _e, _w, cx| {
+        card = card.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    Button::new("quit-selector")
+                        .ghost()
+                        .label(t("Quit"))
+                        .on_click(cx.listener(|this, _e, _w, cx| {
                             this.confirm_quit = true;
                             cx.quit();
-                        }),
-                    ))
-                    .children(self.current_workspace.is_some().then(|| {
-                        Button::new("cancel-selector")
-                            .ghost()
-                            .label("Cancel")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.show_workspace_selector = false;
-                                cx.notify();
-                            }))
-                    })),
-            );
+                        })),
+                )
+                .children(self.current_workspace.is_some().then(|| {
+                    Button::new("cancel-selector")
+                        .ghost()
+                        .label(t("Cancel"))
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.show_workspace_selector = false;
+                            cx.notify();
+                        }))
+                })),
+        );
 
         div()
             .size_full()
@@ -8678,7 +8778,7 @@ impl MuxelApp {
                 div()
                     .text_lg()
                     .text_color(cx.theme().foreground)
-                    .child("All agents"),
+                    .child(t("All agents")),
             );
 
         for project in &self.workspace.projects {
@@ -8812,20 +8912,23 @@ impl MuxelApp {
                     .flex_none()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!("{changes} changed"))
+                    .child(tf(
+                        "{changes} changed",
+                        &[("changes", &changes.to_string())],
+                    ))
             }))
-            .children(detached.then(|| Tag::new().small().child("kept")))
+            .children(detached.then(|| Tag::new().small().child(t("kept"))))
             .context_menu(move |menu, window, _cx| {
                 let mut menu = menu
                     .item(
-                        PopupMenuItem::new("New agent here")
+                        PopupMenuItem::new(t("New agent here"))
                             .icon(IconName::Plus)
                             .on_click(window.listener_for(&entity, move |this, _, window, cx| {
                                 this.spawn_into_worktree(wid, window, cx)
                             })),
                     )
                     .item(
-                        PopupMenuItem::new("View changes")
+                        PopupMenuItem::new(t("View changes"))
                             .icon(IconName::Eye)
                             .on_click(window.listener_for(&entity, move |this, _, window, cx| {
                                 this.open_worktree_diff(wid, window, cx)
@@ -8848,7 +8951,7 @@ impl MuxelApp {
                     menu = menu
                         .separator()
                         .item(
-                            PopupMenuItem::new("Push branch")
+                            PopupMenuItem::new(t("Push branch"))
                                 .icon(IconName::ArrowUp)
                                 .on_click(window.listener_for(
                                     &entity,
@@ -8858,7 +8961,7 @@ impl MuxelApp {
                                 )),
                         )
                         .item(
-                            PopupMenuItem::new("Create PR…")
+                            PopupMenuItem::new(t("Create PR…"))
                                 .icon(IconName::ExternalLink)
                                 .on_click(window.listener_for(
                                     &entity,
@@ -8868,7 +8971,7 @@ impl MuxelApp {
                                 )),
                         )
                         .item(
-                            PopupMenuItem::new("Open PR")
+                            PopupMenuItem::new(t("Open PR"))
                                 .icon(IconName::Github)
                                 .on_click(window.listener_for(
                                     &entity,
@@ -8881,35 +8984,35 @@ impl MuxelApp {
                 menu = menu
                     .separator()
                     .item(
-                        PopupMenuItem::new("Rename worktree")
+                        PopupMenuItem::new(t("Rename worktree"))
                             .icon(Icon::empty().path("icons/pencil.svg"))
                             .on_click(window.listener_for(&entity, move |this, _, window, cx| {
                                 this.start_rename_worktree(wid, window, cx)
                             })),
                     )
                     .item(
-                        PopupMenuItem::new("Discard changes…")
+                        PopupMenuItem::new(t("Discard changes…"))
                             .icon(IconName::Undo)
                             .on_click(window.listener_for(&entity, move |this, _, _w, cx| {
                                 this.request_confirm(
-                                    "Discard changes?",
+                                    t("Discard changes?"),
                                     "Reset this worktree to its base branch, discarding all \
                                  the agent's work (uncommitted changes and commits). The \
                                  worktree is kept.",
-                                    "Discard changes",
+                                    t("Discard changes"),
                                     ConfirmAction::DiscardWorktreeChanges(wid),
                                     cx,
                                 )
                             })),
                     )
                     .item(
-                        PopupMenuItem::new("Discard worktree…")
+                        PopupMenuItem::new(t("Discard worktree…"))
                             .icon(IconName::Delete)
                             .on_click(window.listener_for(&entity, move |this, _, _w, cx| {
                                 this.request_confirm(
-                                    "Discard worktree?",
-                                    "Close its panes and delete the worktree and its branch.",
-                                    "Discard worktree",
+                                    t("Discard worktree?"),
+                                    t("Close its panes and delete the worktree and its branch."),
+                                    t("Discard worktree"),
                                     ConfirmAction::DiscardWorktree(wid),
                                     cx,
                                 )
@@ -8918,7 +9021,7 @@ impl MuxelApp {
                 // Kept worktrees can also be resolved (commit / merge / keep).
                 if detached {
                     menu = menu.separator().item(
-                        PopupMenuItem::new("Resolve…")
+                        PopupMenuItem::new(t("Resolve…"))
                             .icon(IconName::Check)
                             .on_click(window.listener_for(&entity, move |this, _, _w, cx| {
                                 this.review_worktree(wid, cx)
@@ -8951,7 +9054,7 @@ impl MuxelApp {
                     .text_xs()
                     .font_semibold()
                     .text_color(muted)
-                    .child("NOTIFICATIONS"),
+                    .child(t("NOTIFICATIONS")),
             )
             .children(has.then(|| {
                 // stop_propagation so the clear-all click isn't anything else.
@@ -8962,7 +9065,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
-                            .tooltip("Clear all notifications")
+                            .tooltip(t("Clear all notifications"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.clear_notifications(cx))),
                     )
             }));
@@ -8978,7 +9081,7 @@ impl MuxelApp {
                     .py_1()
                     .text_xs()
                     .text_color(muted)
-                    .child("No notifications"),
+                    .child(t("No notifications")),
             );
         }
 
@@ -9044,7 +9147,7 @@ impl MuxelApp {
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Close)
-                                .tooltip("Dismiss")
+                                .tooltip(t("Dismiss"))
                                 .on_click(cx.listener(
                                     move |this, _e, _w, cx| this.dismiss_notification(nid, cx),
                                 )),
@@ -9075,7 +9178,7 @@ impl MuxelApp {
                     .text_xs()
                     .font_semibold()
                     .text_color(cx.theme().muted_foreground)
-                    .child("PROJECTS"),
+                    .child(t("PROJECTS")),
             );
 
         for (ix, project) in self.workspace.projects.iter().enumerate() {
@@ -9220,7 +9323,7 @@ impl MuxelApp {
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::File)
-                                    .tooltip("Project memory (.muxel/MEMORY.md)")
+                                    .tooltip(t("Project memory (.muxel/MEMORY.md)"))
                                     .on_click(cx.listener(move |this, _e, window, cx| {
                                         this.open_project_memory(pid, window, cx)
                                     })),
@@ -9239,7 +9342,7 @@ impl MuxelApp {
                                         self.show_file_browser
                                             && self.file_browser_pid == Some(pid),
                                     )
-                                    .tooltip("File browser")
+                                    .tooltip(t("File browser"))
                                     .on_click(cx.listener(move |this, _e, window, cx| {
                                         this.toggle_file_browser(pid, window, cx)
                                     })),
@@ -9258,7 +9361,7 @@ impl MuxelApp {
                         move |menu, window, cx| {
                             let mut menu = menu
                                 .item(
-                                    PopupMenuItem::new("Rename")
+                                    PopupMenuItem::new(t("Rename"))
                                         .icon(Icon::empty().path("icons/pencil.svg"))
                                         .on_click(window.listener_for(
                                             &entity,
@@ -9269,7 +9372,7 @@ impl MuxelApp {
                                 )
                                 .separator()
                                 .item(
-                                    PopupMenuItem::new("Save panes as startup")
+                                    PopupMenuItem::new(t("Save panes as startup"))
                                         .icon(IconName::Star)
                                         .on_click(window.listener_for(
                                             &entity,
@@ -9280,9 +9383,9 @@ impl MuxelApp {
                                 )
                                 .item(
                                     PopupMenuItem::new(if memory_on {
-                                        "Disable shared memory"
+                                        t("Disable shared memory")
                                     } else {
-                                        "Enable shared memory"
+                                        t("Enable shared memory")
                                     })
                                     .icon(IconName::File)
                                     .on_click(
@@ -9296,7 +9399,7 @@ impl MuxelApp {
                                 );
                             if has_startup {
                                 menu = menu.item(
-                                    PopupMenuItem::new("Launch startup agents")
+                                    PopupMenuItem::new(t("Launch startup agents"))
                                         .icon(IconName::Play)
                                         .on_click(window.listener_for(
                                             &entity,
@@ -9313,7 +9416,7 @@ impl MuxelApp {
                                 // pane runs `git diff` on a local path).
                                 if is_local {
                                     menu = menu.item(
-                                        PopupMenuItem::new("Git diff")
+                                        PopupMenuItem::new(t("Git diff"))
                                             .icon(Icon::empty().path("icons/diff.svg"))
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -9329,7 +9432,7 @@ impl MuxelApp {
                                     let cur = current_branch.clone();
                                     menu = menu.submenu_with_icon(
                                         Some(Icon::empty().path("icons/git-branch.svg")),
-                                        "Switch branch",
+                                        t("Switch branch"),
                                         window,
                                         cx,
                                         move |mut sm, window, _c| {
@@ -9359,7 +9462,7 @@ impl MuxelApp {
                                 }
                                 menu = menu
                                     .item(
-                                        PopupMenuItem::new("New branch…")
+                                        PopupMenuItem::new(t("New branch…"))
                                             .icon(IconName::Plus)
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -9374,7 +9477,7 @@ impl MuxelApp {
                                             )),
                                     )
                                     .item(
-                                        PopupMenuItem::new("Commit…")
+                                        PopupMenuItem::new(t("Commit…"))
                                             .icon(IconName::Check)
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -9389,15 +9492,15 @@ impl MuxelApp {
                                             )),
                                     )
                                     .item(
-                                        PopupMenuItem::new("Pull")
+                                        PopupMenuItem::new(t("Pull"))
                                             .icon(IconName::ArrowDown)
                                             .on_click(window.listener_for(
                                                 &entity,
                                                 move |this, _, window, cx| {
                                                     this.run_project_git(
                                                         pid,
-                                                        "Pulled".into(),
-                                                        "Pull failed".into(),
+                                                        t("Pulled").into(),
+                                                        t("Pull failed").into(),
                                                         integrations::git_pull,
                                                         window,
                                                         cx,
@@ -9406,15 +9509,15 @@ impl MuxelApp {
                                             )),
                                     )
                                     .item(
-                                        PopupMenuItem::new("Push")
+                                        PopupMenuItem::new(t("Push"))
                                             .icon(IconName::ArrowUp)
                                             .on_click(window.listener_for(
                                                 &entity,
                                                 move |this, _, window, cx| {
                                                     this.run_project_git(
                                                         pid,
-                                                        "Pushed".into(),
-                                                        "Push failed".into(),
+                                                        t("Pushed").into(),
+                                                        t("Push failed").into(),
                                                         integrations::git_push,
                                                         window,
                                                         cx,
@@ -9423,15 +9526,15 @@ impl MuxelApp {
                                             )),
                                     )
                                     .item(
-                                        PopupMenuItem::new("Fetch")
+                                        PopupMenuItem::new(t("Fetch"))
                                             .icon(IconName::Replace)
                                             .on_click(window.listener_for(
                                                 &entity,
                                                 move |this, _, window, cx| {
                                                     this.run_project_git(
                                                         pid,
-                                                        "Fetched".into(),
-                                                        "Fetch failed".into(),
+                                                        t("Fetched").into(),
+                                                        t("Fetch failed").into(),
                                                         integrations::git_fetch,
                                                         window,
                                                         cx,
@@ -9441,15 +9544,15 @@ impl MuxelApp {
                                     )
                                     .separator()
                                     .item(
-                                        PopupMenuItem::new("Stash changes")
+                                        PopupMenuItem::new(t("Stash changes"))
                                             .icon(IconName::Inbox)
                                             .on_click(window.listener_for(
                                                 &entity,
                                                 move |this, _, window, cx| {
                                                     this.run_project_git(
                                                         pid,
-                                                        "Stashed".into(),
-                                                        "Stash failed".into(),
+                                                        t("Stashed").into(),
+                                                        t("Stash failed").into(),
                                                         integrations::git_stash,
                                                         window,
                                                         cx,
@@ -9458,7 +9561,7 @@ impl MuxelApp {
                                             )),
                                     )
                                     .item(
-                                        PopupMenuItem::new("Pop stash")
+                                        PopupMenuItem::new(t("Pop stash"))
                                             .icon(IconName::Redo)
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -9468,7 +9571,7 @@ impl MuxelApp {
                                             )),
                                     )
                                     .item(
-                                        PopupMenuItem::new("Drop stash")
+                                        PopupMenuItem::new(t("Drop stash"))
                                             .icon(IconName::Delete)
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -9479,15 +9582,15 @@ impl MuxelApp {
                                     );
                             }
                             menu.separator().item(
-                                PopupMenuItem::new("Remove")
+                                PopupMenuItem::new(t("Remove"))
                                     .icon(IconName::CircleX)
                                     .on_click(window.listener_for(
                                         &entity,
                                         move |this, _, _window, cx| {
                                             this.request_confirm(
-                                                "Remove project?",
-                                                "The project and its panes will be removed.",
-                                                "Remove",
+                                                t("Remove project?"),
+                                                t("The project and its panes will be removed."),
+                                                t("Remove"),
                                                 ConfirmAction::DeleteProject(pid),
                                                 cx,
                                             )
@@ -9633,7 +9736,7 @@ impl MuxelApp {
                                 let entity = entity.clone();
                                 move |menu, window, _cx| {
                                     menu.item(
-                                        PopupMenuItem::new("Rename")
+                                        PopupMenuItem::new(t("Rename"))
                                             .icon(Icon::empty().path("icons/pencil.svg"))
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -9643,7 +9746,7 @@ impl MuxelApp {
                                             )),
                                     )
                                     .item(
-                                        PopupMenuItem::new("Duplicate")
+                                        PopupMenuItem::new(t("Duplicate"))
                                             .icon(IconName::Copy)
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -9654,7 +9757,7 @@ impl MuxelApp {
                                     )
                                     .separator()
                                     .item(
-                                        PopupMenuItem::new("Kill")
+                                        PopupMenuItem::new(t("Kill"))
                                             .icon(IconName::CircleX)
                                             .on_click(window.listener_for(
                                                 &entity,
@@ -9700,7 +9803,7 @@ impl MuxelApp {
                         Button::new("new-project")
                             .ghost()
                             .icon(IconName::Plus)
-                            .label("New Project")
+                            .label(t("New Project"))
                             .on_click(cx.listener(|this, _ev, window, cx| {
                                 this.new_project_dialog(window, cx);
                             })),
@@ -9711,7 +9814,7 @@ impl MuxelApp {
                         Button::new("new-remote-project")
                             .ghost()
                             .icon(IconName::Network)
-                            .tooltip("New remote project (SSH)")
+                            .tooltip(t("New remote project (SSH)"))
                             .on_click(cx.listener(|this, _ev, window, cx| {
                                 this.open_remote_project_modal(window, cx);
                             })),
@@ -9764,7 +9867,7 @@ impl MuxelApp {
                         .small()
                         .icon(agent_icon_obj(current_program.as_deref()))
                         .label(current_name.clone())
-                        .tooltip("New pane with the current preset")
+                        .tooltip(t("New pane with the current preset"))
                         .on_click(cx.listener(|this, _ev, window, cx| {
                             this.add_agent(SplitDirection::Horizontal, window, cx)
                         })),
@@ -9784,7 +9887,7 @@ impl MuxelApp {
                     }
                     menu = menu.separator();
                     menu.menu(
-                        "Set current as default",
+                        t("Set current as default"),
                         Box::new(SetDefaultPreset(current_id)),
                     )
                 }),
@@ -9796,8 +9899,8 @@ impl MuxelApp {
                     .ghost()
                     .small()
                     .icon(IconName::Play)
-                    .label("Run task")
-                    .tooltip("Run a saved task (review, security review, …)")
+                    .label(t("Run task"))
+                    .tooltip(t("Run a saved task (review, security review, …)"))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, e: &MouseDownEvent, _w, cx| {
@@ -9811,8 +9914,8 @@ impl MuxelApp {
                     .ghost()
                     .small()
                     .icon(IconName::Redo)
-                    .label("Loops")
-                    .tooltip("Scheduled loops — run a prompt on a timer")
+                    .label(t("Loops"))
+                    .tooltip(t("Scheduled loops — run a prompt on a timer"))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, e: &MouseDownEvent, _w, cx| {
@@ -9827,7 +9930,7 @@ impl MuxelApp {
                     .ghost()
                     .icon(IconName::SquareTerminal)
                     .selected(self.use_tmux)
-                    .tooltip("Run in a tmux session")
+                    .tooltip(t("Run in a tmux session"))
                     .on_click(cx.listener(|this, _ev, _window, cx| this.toggle_tmux(cx))),
             )
             .child(
@@ -9835,7 +9938,7 @@ impl MuxelApp {
                     .ghost()
                     .icon(Icon::empty().path("icons/git-branch.svg"))
                     .selected(self.use_worktree)
-                    .tooltip("Create a git worktree")
+                    .tooltip(t("Create a git worktree"))
                     .on_click(cx.listener(|this, _ev, _window, cx| this.toggle_worktree(cx))),
             )
             .child(div().w(px(6.0)))
@@ -9843,7 +9946,7 @@ impl MuxelApp {
                 Button::new("split-right")
                     .ghost()
                     .icon(IconName::PanelRight)
-                    .tooltip("Split right")
+                    .tooltip(t("Split right"))
                     .on_click(cx.listener(|this, _ev, window, cx| {
                         this.add_agent(SplitDirection::Horizontal, window, cx)
                     })),
@@ -9852,7 +9955,7 @@ impl MuxelApp {
                 Button::new("split-down")
                     .ghost()
                     .icon(IconName::PanelBottom)
-                    .tooltip("Split down")
+                    .tooltip(t("Split down"))
                     .on_click(cx.listener(|this, _ev, window, cx| {
                         this.add_agent(SplitDirection::Vertical, window, cx)
                     })),
@@ -9862,14 +9965,14 @@ impl MuxelApp {
                     .ghost()
                     .icon(IconName::Play)
                     .disabled(self.active_is_editor())
-                    .tooltip("Restart agent")
+                    .tooltip(t("Restart agent"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.restart_active(window, cx))),
             )
             .child(
                 Button::new("close")
                     .ghost()
                     .icon(IconName::Close)
-                    .tooltip("Close pane")
+                    .tooltip(t("Close pane"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.close_active(window, cx))),
             )
     }
@@ -9880,16 +9983,16 @@ impl MuxelApp {
         let active_root = self.workspace.active().map(|p| p.root_path.clone());
         let muted = cx.theme().muted_foreground;
         let mut list = v_flex().w_full().gap(px(1.0));
-        let mut last_section: Option<&'static str> = None;
+        let mut last_section: Option<SharedString> = None;
         for (i, item) in self.search_results.iter().enumerate() {
             // Group the results under "Projects & panes" vs "Files" headers.
             let section = match item {
-                SearchItem::FocusInstance(_) => "Projects & panes",
-                SearchItem::RunCommand(_) => "Commands",
-                SearchItem::OpenFile(_) | SearchItem::CreateFile(_) => "Files",
+                SearchItem::FocusInstance(_) => t("Projects & panes"),
+                SearchItem::RunCommand(_) => t("Commands"),
+                SearchItem::OpenFile(_) | SearchItem::CreateFile(_) => t("Files"),
             };
-            if last_section != Some(section) {
-                last_section = Some(section);
+            if last_section.as_ref() != Some(&section) {
+                last_section = Some(section.clone());
                 list = list.child(
                     div()
                         .px_3()
@@ -9957,7 +10060,10 @@ impl MuxelApp {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    (format!("＋ Create {name}"), "new file".to_string())
+                    (
+                        tf("＋ Create {name}", &[("name", &name.to_string())]),
+                        "new file".to_string(),
+                    )
                 }
                 SearchItem::RunCommand(cmd) => {
                     (self.palette_command_label(*cmd), "command".to_string())
@@ -10067,7 +10173,7 @@ impl MuxelApp {
                     .py_2()
                     .text_sm()
                     .text_color(muted)
-                    .child("Type to search file contents across the project."),
+                    .child(t("Type to search file contents across the project.")),
             );
         }
         for (i, hit) in self.find_results.iter().enumerate() {
@@ -10163,7 +10269,7 @@ impl MuxelApp {
                                     .text_sm()
                                     .font_semibold()
                                     .flex_none()
-                                    .child("Find in project"),
+                                    .child(t("Find in project")),
                             )
                             .child(div().flex_1().child(Input::new(&self.find_input))),
                     )
@@ -10194,7 +10300,7 @@ impl MuxelApp {
                     .px_2()
                     .flex()
                     .items_center()
-                    .child(div().font_semibold().child("muxel")),
+                    .child(div().font_semibold().child(t("muxel"))),
             )
     }
 
@@ -10227,12 +10333,12 @@ impl MuxelApp {
                         Button::new("toggle-sidebar")
                             .ghost()
                             .icon(IconName::PanelLeft)
-                            .tooltip("Toggle sidebar")
+                            .tooltip(t("Toggle sidebar"))
                             .on_click(
                                 cx.listener(|this, _ev, _window, cx| this.toggle_sidebar(cx)),
                             ),
                     ))
-                    .child(div().font_semibold().child("muxel"))
+                    .child(div().font_semibold().child(t("muxel")))
                     .child(
                         div()
                             .text_xs()
@@ -10245,8 +10351,8 @@ impl MuxelApp {
                             .ghost()
                             .small()
                             .icon(IconName::Search)
-                            .label("Search…")
-                            .tooltip("Search files and terminals (Ctrl+P)")
+                            .label(t("Search…"))
+                            .tooltip(t("Search files and terminals (Ctrl+P)"))
                             .on_click(cx.listener(|this, _ev, window, cx| {
                                 this.open_search_palette(window, cx)
                             })),
@@ -10258,11 +10364,11 @@ impl MuxelApp {
                             .icon(IconName::ArrowUp)
                             .selected(self.update_pending())
                             .tooltip(if matches!(self.update_state, UpdateState::Checking) {
-                                "Checking for updates…"
+                                t("Checking for updates…")
                             } else if self.update_pending() {
-                                "Update available"
+                                t("Update available")
                             } else {
-                                "Check for updates"
+                                t("Check for updates")
                             })
                             .on_click(
                                 cx.listener(|this, _ev, _window, cx| this.open_update_modal(cx)),
@@ -10272,7 +10378,7 @@ impl MuxelApp {
                         Button::new("workspaces")
                             .ghost()
                             .icon(IconName::CircleUser)
-                            .tooltip("Switch workspace")
+                            .tooltip(t("Switch workspace"))
                             .on_click(cx.listener(|this, _ev, _window, cx| {
                                 this.open_workspace_selector(cx)
                             })),
@@ -10282,7 +10388,7 @@ impl MuxelApp {
                             .ghost()
                             .icon(IconName::LayoutDashboard)
                             .selected(self.show_dashboard)
-                            .tooltip("Dashboard")
+                            .tooltip(t("Dashboard"))
                             .on_click(
                                 cx.listener(|this, _ev, _window, cx| this.toggle_dashboard(cx)),
                             ),
@@ -10292,7 +10398,7 @@ impl MuxelApp {
                             .ghost()
                             .icon(IconName::Settings)
                             .selected(self.show_settings)
-                            .tooltip("Settings")
+                            .tooltip(t("Settings"))
                             .on_click(cx.listener(|this, _ev, window, cx| {
                                 this.toggle_settings(window, cx)
                             })),
@@ -10302,7 +10408,7 @@ impl MuxelApp {
                             .ghost()
                             .icon(IconName::Bell)
                             .selected(self.notifications_enabled)
-                            .tooltip("Notifications")
+                            .tooltip(t("Notifications"))
                             .on_click(
                                 cx.listener(|this, _ev, _window, cx| this.toggle_notifications(cx)),
                             ),
@@ -10311,7 +10417,7 @@ impl MuxelApp {
                         Button::new("donate")
                             .ghost()
                             .icon(IconName::Heart)
-                            .tooltip("Support muxel")
+                            .tooltip(t("Support muxel"))
                             .on_click(cx.listener(|_t, _ev, _window, cx| {
                                 cx.open_url("https://donate.stripe.com/bJeaEX2OVaE68Fae7X8k80X")
                             })),
@@ -10492,9 +10598,10 @@ impl MuxelApp {
         v_flex()
             .gap_3()
             .max_w(px(520.0))
-            .child(
-                self.settings_label("Code & diff font size — code editor and git-diff panes", cx),
-            )
+            .child(self.settings_label(
+                &t("Code & diff font size — code editor and git-diff panes"),
+                cx,
+            ))
             .child(
                 div()
                     .flex()
@@ -10513,7 +10620,7 @@ impl MuxelApp {
                         cx.listener(|this, _e, w, cx| this.adjust_editor_font(1.0, w, cx)),
                     )),
             )
-            .child(self.settings_label("Editor font family (blank = theme monospace)", cx))
+            .child(self.settings_label(&t("Editor font family (blank = theme monospace)"), cx))
             .child(
                 div()
                     .flex()
@@ -10527,13 +10634,15 @@ impl MuxelApp {
                     .child(
                         Button::new("apply-ed-font")
                             .primary()
-                            .label("Apply")
+                            .label(t("Apply"))
                             .on_click(
                                 cx.listener(|this, _e, w, cx| this.apply_editor_font_family(w, cx)),
                             ),
                     ),
             )
-            .child(self.settings_label("Tab width (spaces) — applies to newly opened files", cx))
+            .child(
+                self.settings_label(&t("Tab width (spaces) — applies to newly opened files"), cx),
+            )
             .child(
                 div()
                     .flex()
@@ -10566,7 +10675,7 @@ impl MuxelApp {
                             this.apply_editor_config(w, cx);
                             cx.notify();
                         })),
-                    "Soft wrap long lines",
+                    &t("Soft wrap long lines"),
                 ),
             )
             .child(
@@ -10579,7 +10688,7 @@ impl MuxelApp {
                             this.apply_editor_config(w, cx);
                             cx.notify();
                         })),
-                    "Show line numbers",
+                    &t("Show line numbers"),
                 ),
             )
             .child(
@@ -10592,7 +10701,7 @@ impl MuxelApp {
                             this.apply_editor_config(w, cx);
                             cx.notify();
                         })),
-                    "Show indent guides",
+                    &t("Show indent guides"),
                 ),
             )
             .into_any_element()
@@ -10695,9 +10804,9 @@ impl MuxelApp {
         let (def_w, def_b) = default_markers(p.program.as_deref());
         let ph = |xs: Vec<String>| {
             if xs.is_empty() {
-                "comma-separated; blank = heuristic".to_string()
+                t("comma-separated; blank = heuristic").to_string()
             } else {
-                format!("default: {}", xs.join(", "))
+                tf("default: {value}", &[("value", &xs.join(", "))])
             }
         };
         ui.p_working_markers
@@ -10799,7 +10908,7 @@ impl MuxelApp {
 
     fn add_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut p = AgentPreset::shell();
-        p.name = "New preset".to_string();
+        p.name = t("New preset").to_string();
         self.presets.push(p);
         let idx = self.presets.len() - 1;
         self.persist_settings();
@@ -10870,7 +10979,7 @@ impl MuxelApp {
     fn add_runner(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.runners.push(Runner {
             id: Uuid::new_v4(),
-            name: "New runner".to_string(),
+            name: t("New runner").to_string(),
             preset_id: None,
             auto_mode_presses: 3,
             prompt: "{{input}}".to_string(),
@@ -10985,13 +11094,13 @@ impl MuxelApp {
         let Some(pid) = self.workspace.active_project else {
             self.add_event(
                 NotifKind::Error,
-                "Can't add a loop",
-                "Open a project first — a loop runs in a specific project.",
+                t("Can't add a loop").to_string(),
+                t("Open a project first — a loop runs in a specific project.").to_string(),
             );
             cx.notify();
             return;
         };
-        let mut lp = Loop::new("New loop", pid);
+        let mut lp = Loop::new(t("New loop"), pid);
         // Arm so the first interval fire is after one interval.
         lp.last_run = Some(unix_now());
         self.loops.push(lp);
@@ -11105,7 +11214,7 @@ impl MuxelApp {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Choose key".into()),
+            prompt: Some(t("Choose key")),
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = receiver.await
@@ -11178,7 +11287,7 @@ impl MuxelApp {
             self.session_passwords.remove(&id);
             match crate::secrets::set_remote_password(id, &password) {
                 Ok(()) => self.settings_ui.s_has_password = true,
-                Err(e) => self.add_event(NotifKind::Error, "Keychain error", format!("{e}")),
+                Err(e) => self.add_event(NotifKind::Error, t("Keychain error"), format!("{e}")),
             }
             self.settings_ui
                 .s_password
@@ -11189,7 +11298,7 @@ impl MuxelApp {
     }
 
     fn add_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.remotes.push(RemoteHost::new("New host", ""));
+        self.remotes.push(RemoteHost::new(t("New host"), ""));
         let idx = self.remotes.len() - 1;
         self.persist_settings();
         self.open_remote_editor(idx, window, cx);
@@ -11247,7 +11356,7 @@ impl MuxelApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.settings_ui.s_test = match res {
-                    Ok(()) => RemoteTestState::Ok("Connected".into()),
+                    Ok(()) => RemoteTestState::Ok(t("Connected").into()),
                     Err(e) => RemoteTestState::Failed(format!("{e}")),
                 };
                 cx.notify();
@@ -11319,7 +11428,7 @@ impl MuxelApp {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Open".into()),
+            prompt: Some(t("Open")),
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = receiver.await
@@ -11458,8 +11567,8 @@ impl MuxelApp {
             return div().into_any_element();
         };
         let heading = match placement {
-            PlacementMode::Tab => "New tab agent",
-            PlacementMode::Split(_) => "New pane agent",
+            PlacementMode::Tab => t("New tab agent"),
+            PlacementMode::Split(_) => t("New pane agent"),
         };
         let mut list = v_flex().gap_px().w_full();
         for (idx, preset) in self.presets.iter().enumerate() {
@@ -11571,7 +11680,7 @@ impl MuxelApp {
                     .py_1()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("No runners — add one in Settings → Runners."),
+                    .child(t("No runners — add one in Settings → Runners.")),
             );
         }
         for (idx, runner) in self.runners.iter().enumerate() {
@@ -11650,7 +11759,7 @@ impl MuxelApp {
                                         .py_1()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child("Run task"),
+                                        .child(t("Run task")),
                                 )
                                 .child(list),
                         ),
@@ -11672,7 +11781,7 @@ impl MuxelApp {
                     .py_1()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("No loops yet."),
+                    .child(t("No loops yet.")),
             );
         }
         for (idx, lp) in self.loops.iter().enumerate() {
@@ -11748,7 +11857,7 @@ impl MuxelApp {
                     this.add_loop(window, cx);
                 }))
                 .child(Icon::new(IconName::Plus).size(px(14.0)))
-                .child(div().text_sm().child("New loop…")),
+                .child(div().text_sm().child(t("New loop…"))),
         );
         div()
             .absolute()
@@ -11784,7 +11893,7 @@ impl MuxelApp {
                                         .py_1()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child("Loops — click to run now, pencil to edit"),
+                                        .child(t("Loops — click to run now, pencil to edit")),
                                 )
                                 .child(list),
                         ),
@@ -11799,7 +11908,7 @@ impl MuxelApp {
         let Some(runner) = self.active_runner.and_then(|i| self.runners.get(i)) else {
             return div().into_any_element();
         };
-        let title = format!("Run: {}", runner.name);
+        let title = tf("Run: {name}", &[("name", &runner.name)]);
         let preview = runner.prompt.replace("{{input}}", "…").trim().to_string();
         div()
             .absolute()
@@ -11846,14 +11955,17 @@ impl MuxelApp {
                             .justify_end()
                             .gap_2()
                             .pt_2()
-                            .child(Button::new("run-cancel").ghost().label("Cancel").on_click(
-                                cx.listener(|this, _e, _w, cx| {
-                                    this.show_run_dialog = false;
-                                    this.active_runner = None;
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(Button::new("run-go").primary().label("Run").on_click(
+                            .child(
+                                Button::new("run-cancel")
+                                    .ghost()
+                                    .label(t("Cancel"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.show_run_dialog = false;
+                                        this.active_runner = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(Button::new("run-go").primary().label(t("Run")).on_click(
                                 cx.listener(|this, _e, window, cx| this.execute_runner(window, cx)),
                             )),
                     ),
@@ -11911,7 +12023,7 @@ impl MuxelApp {
                             .child(
                                 Button::new("confirm-cancel")
                                     .ghost()
-                                    .label("Cancel")
+                                    .label(t("Cancel"))
                                     .on_click(
                                         cx.listener(|this, _e, _w, cx| this.cancel_confirm(cx)),
                                     ),
@@ -11945,19 +12057,26 @@ impl MuxelApp {
         // The queue condition guarantees at least one part.
         let mut parts: Vec<String> = Vec::new();
         if n > 0 {
-            parts.push(format!(
-                "{n} uncommitted file{}",
-                if n == 1 { "" } else { "s" }
+            parts.push(tn(
+                "{n} uncommitted file",
+                "{n} uncommitted files",
+                n,
+                &[("n", &n.to_string())],
             ));
         }
         if m > 0 {
-            parts.push(format!(
-                "{m} unmerged commit{} (not in {base_label})",
-                if m == 1 { "" } else { "s" }
+            parts.push(tn(
+                "{m} unmerged commit (not in {base_label})",
+                "{m} unmerged commits (not in {base_label})",
+                m,
+                &[("m", &m.to_string()), ("base_label", &base_label)],
             ));
         }
-        let body = format!("{}.", parts.join(" and "));
-        let merge_tip = format!("Merge into {base_label}, then remove the worktree + branch");
+        let body = format!("{}.", parts.join(&t(" and ")));
+        let merge_tip = tf(
+            "Merge into {base_label}, then remove the worktree + branch",
+            &[("base_label", &base_label)],
+        );
         div()
             .absolute()
             .inset_0()
@@ -12016,8 +12135,8 @@ impl MuxelApp {
                             .child(
                                 Button::new("wt-keep")
                                     .ghost()
-                                    .label("Keep")
-                                    .tooltip("Leave the worktree on disk to resume later")
+                                    .label(t("Keep"))
+                                    .tooltip(t("Leave the worktree on disk to resume later"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                         this.dispose_worktree_keep(cx)
                                     })),
@@ -12025,16 +12144,16 @@ impl MuxelApp {
                             .child(
                                 Button::new("wt-discard")
                                     .danger()
-                                    .label("Discard")
-                                    .tooltip("Delete the worktree and its branch (lose the work)")
+                                    .label(t("Discard"))
+                                    .tooltip(t("Delete the worktree and its branch (lose the work)"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                         this.dispose_worktree_discard(cx)
                                     })),
                             )
                             .children(show_commit.then(|| {
                                 Button::new("wt-commit")
-                                    .label("Commit & close")
-                                    .tooltip("Commit changes to its branch, then remove the worktree (branch kept, unmerged)")
+                                    .label(t("Commit & close"))
+                                    .tooltip(t("Commit changes to its branch, then remove the worktree (branch kept, unmerged)"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                         this.dispose_worktree_commit(cx)
                                     }))
@@ -12042,7 +12161,7 @@ impl MuxelApp {
                             .children(show_merge.then(|| {
                                 Button::new("wt-merge")
                                     .primary()
-                                    .label("Merge & close")
+                                    .label(t("Merge & close"))
                                     .tooltip(merge_tip.clone())
                                     .on_click(cx.listener(|this, _e, window, cx| {
                                         this.dispose_worktree_merge(window, cx)
@@ -12082,12 +12201,12 @@ impl MuxelApp {
                     .rounded(cx.theme().radius_lg)
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                    .child(div().text_lg().font_semibold().child("Quit muxel?"))
+                    .child(div().text_lg().font_semibold().child(t("Quit muxel?")))
                     .child(
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Running terminals will be closed."),
+                            .child(t("Running terminals will be closed.")),
                     )
                     .child(
                         div()
@@ -12095,18 +12214,24 @@ impl MuxelApp {
                             .justify_end()
                             .gap_2()
                             .pt_2()
-                            .child(Button::new("quit-cancel").ghost().label("Cancel").on_click(
-                                cx.listener(|this, _e, _w, cx| {
-                                    this.show_quit_confirm = false;
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(Button::new("quit-confirm").danger().label("Quit").on_click(
-                                cx.listener(|this, _e, _w, cx| {
-                                    this.confirm_quit = true;
-                                    cx.quit();
-                                }),
-                            )),
+                            .child(
+                                Button::new("quit-cancel")
+                                    .ghost()
+                                    .label(t("Cancel"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.show_quit_confirm = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("quit-confirm")
+                                    .danger()
+                                    .label(t("Quit"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.confirm_quit = true;
+                                        cx.quit();
+                                    })),
+                            ),
                     ),
             )
             .into_any_element()
@@ -12155,7 +12280,7 @@ impl MuxelApp {
                     .ghost()
                     .xsmall()
                     .icon(IconName::ChevronUp)
-                    .tooltip("Previous match (Enter)")
+                    .tooltip(t("Previous match (Enter)"))
                     .on_click(cx.listener(|this, _e, _w, cx| this.term_search_step(-1, cx))),
             )
             .child(
@@ -12163,7 +12288,7 @@ impl MuxelApp {
                     .ghost()
                     .xsmall()
                     .icon(IconName::ChevronDown)
-                    .tooltip("Next match")
+                    .tooltip(t("Next match"))
                     .on_click(cx.listener(|this, _e, _w, cx| this.term_search_step(1, cx))),
             )
             .child(
@@ -12171,7 +12296,7 @@ impl MuxelApp {
                     .ghost()
                     .xsmall()
                     .icon(IconName::Close)
-                    .tooltip("Close (Esc)")
+                    .tooltip(t("Close (Esc)"))
                     .on_click(
                         cx.listener(|this, _e, window, cx| this.close_term_search(window, cx)),
                     ),
@@ -12215,20 +12340,25 @@ impl MuxelApp {
                             .text_xs()
                             .font_semibold()
                             .text_color(cx.theme().warning)
-                            .child("BROADCAST"),
+                            .child(t("BROADCAST")),
                     )
                     .child(div().flex_1().child(Input::new(&self.broadcast_input)))
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!("→ {n} agent{}", if n == 1 { "" } else { "s" })),
+                            .child(tn(
+                                "→ {n} agent",
+                                "→ {n} agents",
+                                n,
+                                &[("n", &n.to_string())],
+                            )),
                     )
                     .child(
                         Button::new("bc-send")
                             .primary()
                             .xsmall()
-                            .label("Send")
+                            .label(t("Send"))
                             .on_click(
                                 cx.listener(|this, _e, window, cx| this.send_broadcast(window, cx)),
                             ),
@@ -12238,7 +12368,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(IconName::Close)
-                            .tooltip("Close (Esc)")
+                            .tooltip(t("Close (Esc)"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.broadcasting = false;
                                 cx.notify();
@@ -12264,11 +12394,11 @@ impl MuxelApp {
             })
             .collect();
         rows.push((
-            "Send Tab / Shift+Tab to terminal".into(),
-            "Tab / Shift+Tab".into(),
+            t("Send Tab / Shift+Tab to terminal").into(),
+            t("Tab / Shift+Tab").into(),
         ));
         rows.push((
-            "Quit muxel".into(),
+            t("Quit muxel").into(),
             if cfg!(target_os = "macos") {
                 "Cmd+Q"
             } else {
@@ -12330,7 +12460,12 @@ impl MuxelApp {
                     .rounded(cx.theme().radius_lg)
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                    .child(div().text_lg().font_semibold().child("Keyboard shortcuts"))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_semibold()
+                            .child(t("Keyboard shortcuts")),
+                    )
                     .child(
                         div()
                             .id("keys-list")
@@ -12350,28 +12485,27 @@ impl MuxelApp {
         let self_updatable = self.install_kind.self_updatable();
 
         let mut body = v_flex().gap_3().w_full().flex_1().min_h_0().child(
-            div()
-                .text_sm()
-                .text_color(muted)
-                .child(format!("Current version: {}", crate::update::APP_VERSION)),
+            div().text_sm().text_color(muted).child(tf(
+                "Current version: {version}",
+                &[("version", crate::update::APP_VERSION)],
+            )),
         );
 
         match &self.update_state {
             UpdateState::Idle => {
-                body = body.child(div().text_sm().child("Check for a newer version."));
+                body = body.child(div().text_sm().child(t("Check for a newer version.")));
             }
             UpdateState::Checking => {
-                body = body.child(div().text_sm().child("Checking for updates…"));
+                body = body.child(div().text_sm().child(t("Checking for updates…")));
             }
             UpdateState::UpToDate => {
-                body = body.child(div().text_sm().child("You’re on the latest version."));
+                body = body.child(div().text_sm().child(t("You’re on the latest version.")));
             }
             UpdateState::Available(info) => {
-                body = body.child(
-                    div()
-                        .font_semibold()
-                        .child(format!("muxel {} is available.", info.version)),
-                );
+                body = body.child(div().font_semibold().child(tf(
+                    "muxel {version} is available.",
+                    &[("version", &info.version.to_string())],
+                )));
                 let notes = info.notes.trim();
                 if !notes.is_empty() {
                     // The full release notes as scrollable markdown, growing to
@@ -12398,23 +12532,27 @@ impl MuxelApp {
                         .child(
                             div()
                                 .text_sm()
-                                .child("Update muxel with your package manager:"),
+                                .child(t("Update muxel with your package manager:")),
                         )
                         .child(box_);
                 }
             }
             UpdateState::Downloading => {
-                body = body.child(div().text_sm().child("Downloading and installing…"));
+                body = body.child(div().text_sm().child(t("Downloading and installing…")));
             }
             UpdateState::Ready(_) => {
                 body = body.child(
                     div()
                         .text_sm()
-                        .child("Update installed. Restart muxel to finish."),
+                        .child(t("Update installed. Restart muxel to finish.")),
                 );
             }
             UpdateState::Error(e) => {
-                body = body.child(div().text_sm().child(format!("Update failed: {e}")));
+                body = body.child(
+                    div()
+                        .text_sm()
+                        .child(tf("Update failed: {error}", &[("error", &e.to_string())])),
+                );
             }
         }
 
@@ -12422,7 +12560,7 @@ impl MuxelApp {
         let mut footer = div().flex().gap_2().justify_end().pt_2().child(
             Button::new("update-close")
                 .ghost()
-                .label("Close")
+                .label(t("Close"))
                 .on_click(cx.listener(|this, _e, _w, cx| {
                     this.show_update_modal = false;
                     cx.notify();
@@ -12433,7 +12571,7 @@ impl MuxelApp {
                 footer = footer.child(
                     Button::new("update-install")
                         .primary()
-                        .label("Download & Install")
+                        .label(t("Download & Install"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.start_update_download(cx))),
                 );
             }
@@ -12441,7 +12579,7 @@ impl MuxelApp {
                 footer = footer.child(
                     Button::new("update-releases")
                         .primary()
-                        .label("Open releases page")
+                        .label(t("Open releases page"))
                         .on_click(
                             cx.listener(|_t, _e, _w, cx| cx.open_url(crate::update::RELEASES_URL)),
                         ),
@@ -12451,21 +12589,21 @@ impl MuxelApp {
                 footer = footer.child(
                     Button::new("update-restart")
                         .primary()
-                        .label("Restart now")
+                        .label(t("Restart now"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.apply_update_restart(cx))),
                 );
             }
             UpdateState::Error(_) => {
                 footer = footer.child(
                     Button::new("update-retry")
-                        .label("Check again")
+                        .label(t("Check again"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.check_for_updates(cx))),
                 );
             }
             UpdateState::Idle | UpdateState::UpToDate => {
                 footer = footer.child(
                     Button::new("update-check")
-                        .label("Check now")
+                        .label(t("Check now"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.check_for_updates(cx))),
                 );
             }
@@ -12519,7 +12657,7 @@ impl MuxelApp {
                     .rounded(cx.theme().radius_lg)
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                    .child(div().text_lg().font_semibold().child("Software update"))
+                    .child(div().text_lg().font_semibold().child(t("Software update")))
                     .child(body)
                     .child(footer)
                     .child(
@@ -12621,7 +12759,7 @@ impl MuxelApp {
                                     this.settings_move = Some((ev.position, this.settings_offset));
                                 }),
                             )
-                            .child(div().font_semibold().child("Settings"))
+                            .child(div().font_semibold().child(t("Settings")))
                             .child(div().flex_1())
                             .child(
                                 // Pressing Close must not begin a title-bar drag.
@@ -12633,7 +12771,7 @@ impl MuxelApp {
                                         Button::new("close-settings")
                                             .ghost()
                                             .icon(IconName::Close)
-                                            .tooltip("Close")
+                                            .tooltip(t("Close"))
                                             .on_click(cx.listener(|this, _ev, _w, cx| {
                                                 this.close_settings(cx)
                                             })),
@@ -12660,7 +12798,7 @@ impl MuxelApp {
                             .child(
                                 Button::new("settings-cancel")
                                     .ghost()
-                                    .label("Cancel")
+                                    .label(t("Cancel"))
                                     .on_click(
                                         cx.listener(|this, _e, _w, cx| this.cancel_settings(cx)),
                                     ),
@@ -12668,7 +12806,7 @@ impl MuxelApp {
                             .child(
                                 Button::new("settings-save")
                                     .primary()
-                                    .label("Save")
+                                    .label(t("Save"))
                                     .on_click(
                                         cx.listener(|this, _e, _w, cx| this.save_settings(cx)),
                                     ),
@@ -12723,8 +12861,8 @@ impl MuxelApp {
 
     fn render_settings(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let current = self.settings_ui.section;
-        let nav_item = |label: &'static str, section: SettingsSection| {
-            Button::new(label)
+        let nav_item = |label: SharedString, section: SettingsSection| {
+            Button::new(label.clone())
                 .ghost()
                 .selected(section == current)
                 .label(label)
@@ -12736,33 +12874,33 @@ impl MuxelApp {
             .gap_1()
             .bg(cx.theme().sidebar)
             .child(
-                nav_item("Appearance", SettingsSection::Appearance).on_click(cx.listener(
+                nav_item(t("Appearance"), SettingsSection::Appearance).on_click(cx.listener(
                     |this, _e, _w, cx| this.set_section(SettingsSection::Appearance, cx),
                 )),
             )
-            .child(nav_item("Editor", SettingsSection::Editor).on_click(
+            .child(nav_item(t("Editor"), SettingsSection::Editor).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Editor, cx)),
             ))
-            .child(nav_item("Behavior", SettingsSection::Behavior).on_click(
+            .child(nav_item(t("Behavior"), SettingsSection::Behavior).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Behavior, cx)),
             ))
-            .child(nav_item("Agents", SettingsSection::Agents).on_click(
+            .child(nav_item(t("Agents"), SettingsSection::Agents).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Agents, cx)),
             ))
-            .child(nav_item("Runners", SettingsSection::Runners).on_click(
+            .child(nav_item(t("Runners"), SettingsSection::Runners).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Runners, cx)),
             ))
-            .child(nav_item("Loops", SettingsSection::Loops).on_click(
+            .child(nav_item(t("Loops"), SettingsSection::Loops).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Loops, cx)),
             ))
-            .child(nav_item("Remotes", SettingsSection::Remotes).on_click(
+            .child(nav_item(t("Remotes"), SettingsSection::Remotes).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Remotes, cx)),
             ))
-            .child(nav_item("Projects", SettingsSection::Projects).on_click(
+            .child(nav_item(t("Projects"), SettingsSection::Projects).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Projects, cx)),
             ))
             .child(
-                nav_item("Keybindings", SettingsSection::Keybindings).on_click(cx.listener(
+                nav_item(t("Keybindings"), SettingsSection::Keybindings).on_click(cx.listener(
                     |this, _e, _w, cx| this.set_section(SettingsSection::Keybindings, cx),
                 )),
             );
@@ -12818,7 +12956,7 @@ impl MuxelApp {
         v_flex()
             .gap_3()
             .max_w(px(520.0))
-            .child(self.settings_label("Theme", cx))
+            .child(self.settings_label(&t("Theme"), cx))
             .child(
                 DropdownButton::new("settings-theme")
                     .button(
@@ -12835,7 +12973,28 @@ impl MuxelApp {
                         menu.scrollable(true)
                     }),
             )
-            .child(self.settings_label("Interface font size — all UI text except the terminal", cx))
+            .child(self.settings_label(&t("Language"), cx))
+            .child(
+                DropdownButton::new("settings-language")
+                    .button(
+                        Button::new("settings-language-btn")
+                            .ghost()
+                            .label(crate::i18n::display_name(&crate::i18n::current_language())),
+                    )
+                    .dropdown_menu(move |mut menu, _window, _cx| {
+                        for entry in crate::i18n::available_languages() {
+                            menu = menu.menu(
+                                SharedString::from(entry.1),
+                                Box::new(crate::i18n::SetLanguage(entry.0.to_string())),
+                            );
+                        }
+                        menu.scrollable(true)
+                    }),
+            )
+            .child(self.settings_label(
+                &t("Interface font size — all UI text except the terminal"),
+                cx,
+            ))
             .child(
                 div()
                     .flex()
@@ -12859,7 +13018,7 @@ impl MuxelApp {
                             .on_click(cx.listener(|this, _e, _w, cx| this.adjust_ui_font(1.0, cx))),
                     ),
             )
-            .child(self.settings_label("UI zoom — scales the whole app", cx))
+            .child(self.settings_label(&t("UI zoom — scales the whole app"), cx))
             .child(
                 div()
                     .flex()
@@ -12884,7 +13043,7 @@ impl MuxelApp {
                             .on_click(cx.listener(|this, _e, _w, cx| this.adjust_zoom(0.1, cx))),
                     ),
             )
-            .child(self.settings_label("Terminal font size — independent of UI zoom", cx))
+            .child(self.settings_label(&t("Terminal font size — independent of UI zoom"), cx))
             .child(
                 div()
                     .flex()
@@ -12903,7 +13062,7 @@ impl MuxelApp {
                         cx.listener(|this, _e, _w, cx| this.adjust_terminal_font(1.0, cx)),
                     )),
             )
-            .child(self.settings_label("Terminal font family (blank = built-in default)", cx))
+            .child(self.settings_label(&t("Terminal font family (blank = built-in default)"), cx))
             .child(
                 div()
                     .flex()
@@ -12917,18 +13076,18 @@ impl MuxelApp {
                     .child(
                         Button::new("apply-font-family")
                             .primary()
-                            .label("Apply")
+                            .label(t("Apply"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.apply_font_family(cx))),
                     ),
             )
-            .child(self.settings_label("Pane border", cx))
+            .child(self.settings_label(&t("Pane border"), cx))
             .child(
                 div()
                     .flex()
                     .gap_1()
-                    .child(self.pane_border_btn("off", "Off", cx))
-                    .child(self.pane_border_btn("subtle", "Subtle", cx))
-                    .child(self.pane_border_btn("bold", "Bold", cx)),
+                    .child(self.pane_border_btn("off", &t("Off"), cx))
+                    .child(self.pane_border_btn("subtle", &t("Subtle"), cx))
+                    .child(self.pane_border_btn("bold", &t("Bold"), cx)),
             )
             .into_any_element()
     }
@@ -12998,7 +13157,7 @@ impl MuxelApp {
                             this.persist_settings();
                             cx.notify();
                         })),
-                    "Desktop notifications",
+                    &t("Desktop notifications"),
                 ),
             )
             .child(
@@ -13007,12 +13166,12 @@ impl MuxelApp {
                         .ghost()
                         .small()
                         .icon(IconName::Bell)
-                        .label("Send a test notification")
-                        .tooltip("Check that your desktop shows muxel notifications")
+                        .label(t("Send a test notification"))
+                        .tooltip(t("Check that your desktop shows muxel notifications"))
                         .on_click(cx.listener(|_this, _e, _w, _cx| {
                             notify(
-                                "muxel test notification".to_string(),
-                                "If you can see this, notifications are working.".to_string(),
+                                t("muxel test notification").to_string(),
+                                t("If you can see this, notifications are working.").to_string(),
                                 None,
                             );
                         })),
@@ -13025,7 +13184,7 @@ impl MuxelApp {
                         .on_click(
                             cx.listener(|this, c: &bool, _w, cx| this.set_close_on_exit(*c, cx)),
                         ),
-                    "Close a pane when its process exits",
+                    &t("Close a pane when its process exits"),
                 ),
             )
             .child(
@@ -13037,7 +13196,7 @@ impl MuxelApp {
                             this.persist_settings();
                             cx.notify();
                         })),
-                    "Confirm before closing a terminal",
+                    &t("Confirm before closing a terminal"),
                 ),
             )
             .child(
@@ -13049,7 +13208,7 @@ impl MuxelApp {
                             this.persist_settings();
                             cx.notify();
                         })),
-                    "Confirm before closing an editor",
+                    &t("Confirm before closing an editor"),
                 ),
             )
             .child(
@@ -13061,7 +13220,7 @@ impl MuxelApp {
                             this.persist_settings();
                             cx.notify();
                         })),
-                    "Confirm before closing a git-diff pane",
+                    &t("Confirm before closing a git-diff pane"),
                 ),
             )
             .child(
@@ -13073,7 +13232,7 @@ impl MuxelApp {
                             this.persist_settings();
                             cx.notify();
                         })),
-                    "New agents run in a tmux session",
+                    &t("New agents run in a tmux session"),
                 ),
             )
             .child(
@@ -13085,10 +13244,10 @@ impl MuxelApp {
                             this.persist_settings();
                             cx.notify();
                         })),
-                    "New agents use a git worktree",
+                    &t("New agents use a git worktree"),
                 ),
             )
-            .child(self.settings_label("Default preset for new agents", cx))
+            .child(self.settings_label(&t("Default preset for new agents"), cx))
             .child(div().flex().child(preset_row.flex_1()))
             .into_any_element()
     }
@@ -13126,7 +13285,7 @@ impl MuxelApp {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("not installed")
+                            .child(t("not installed"))
                     }));
             if selected {
                 row = row.bg(cx.theme().sidebar_accent);
@@ -13139,7 +13298,7 @@ impl MuxelApp {
             Button::new("add-preset")
                 .ghost()
                 .icon(IconName::Plus)
-                .label("Add preset")
+                .label(t("Add preset"))
                 .on_click(cx.listener(|this, _e, window, cx| this.add_preset(window, cx))),
         );
 
@@ -13148,7 +13307,7 @@ impl MuxelApp {
             _ => div()
                 .p_4()
                 .text_color(cx.theme().muted_foreground)
-                .child("Select a preset to edit, or add one.")
+                .child(t("Select a preset to edit, or add one."))
                 .into_any_element(),
         };
 
@@ -13202,7 +13361,7 @@ impl MuxelApp {
             Button::new("add-runner")
                 .ghost()
                 .icon(IconName::Plus)
-                .label("Add runner")
+                .label(t("Add runner"))
                 .on_click(cx.listener(|this, _e, window, cx| this.add_runner(window, cx))),
         );
 
@@ -13211,7 +13370,7 @@ impl MuxelApp {
             _ => div()
                 .p_4()
                 .text_color(cx.theme().muted_foreground)
-                .child("Select a runner to edit, or add one.")
+                .child(t("Select a runner to edit, or add one."))
                 .into_any_element(),
         };
 
@@ -13233,7 +13392,7 @@ impl MuxelApp {
             Button::new("runner-agent-default")
                 .ghost()
                 .selected(selected_preset.is_none())
-                .label("Current/default")
+                .label(t("Current/default"))
                 .on_click(cx.listener(|this, _e, _w, cx| this.set_runner_preset(None, cx))),
         );
         for p in &self.presets {
@@ -13253,11 +13412,11 @@ impl MuxelApp {
         v_flex()
             .gap_2()
             .max_w(px(560.0))
-            .child(self.settings_label("Name", cx))
+            .child(self.settings_label(&t("Name"), cx))
             .child(Self::wide_input(Input::new(&ui.r_name)))
-            .child(self.settings_label("Agent", cx))
+            .child(self.settings_label(&t("Agent"), cx))
             .child(div().flex().child(agent_row.flex_1()))
-            .child(self.settings_label("Auto mode — Shift+Tab presses at startup", cx))
+            .child(self.settings_label(&t("Auto mode — Shift+Tab presses at startup"), cx))
             .child(
                 div()
                     .flex()
@@ -13286,7 +13445,10 @@ impl MuxelApp {
                             ),
                     ),
             )
-            .child(self.settings_label("Prompt — {{input}} is replaced with run-time details", cx))
+            .child(self.settings_label(
+                &t("Prompt — {{input}} is replaced with run-time details"),
+                cx,
+            ))
             .child(Self::wide_input(Input::new(&ui.r_prompt).h(px(120.0))))
             .child(
                 div()
@@ -13296,25 +13458,28 @@ impl MuxelApp {
                     .child(
                         Button::new("save-runner")
                             .primary()
-                            .label("Save")
+                            .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_runner(cx))),
                     )
-                    .child(Button::new("del-runner").ghost().label("Delete").on_click(
-                        cx.listener(move |this, _e, _w, cx| {
-                            let name = this
-                                .runners
-                                .get(idx)
-                                .map(|r| r.name.clone())
-                                .unwrap_or_default();
-                            this.request_confirm(
-                                "Delete runner?",
-                                format!("The “{name}” runner will be deleted."),
-                                "Delete",
-                                ConfirmAction::DeleteRunner(idx),
-                                cx,
-                            )
-                        }),
-                    )),
+                    .child(
+                        Button::new("del-runner")
+                            .ghost()
+                            .label(t("Delete"))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                let name = this
+                                    .runners
+                                    .get(idx)
+                                    .map(|r| r.name.clone())
+                                    .unwrap_or_default();
+                                this.request_confirm(
+                                    t("Delete runner?"),
+                                    tf("The “{name}” runner will be deleted.", &[("name", &name)]),
+                                    t("Delete"),
+                                    ConfirmAction::DeleteRunner(idx),
+                                    cx,
+                                )
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -13375,7 +13540,7 @@ impl MuxelApp {
             Button::new("add-loop")
                 .ghost()
                 .icon(IconName::Plus)
-                .label("Add loop")
+                .label(t("Add loop"))
                 .on_click(cx.listener(|this, _e, window, cx| this.add_loop(window, cx))),
         );
 
@@ -13384,7 +13549,7 @@ impl MuxelApp {
             _ => div()
                 .p_4()
                 .text_color(cx.theme().muted_foreground)
-                .child("Select a loop to edit, or add one.")
+                .child(t("Select a loop to edit, or add one."))
                 .into_any_element(),
         };
 
@@ -13407,7 +13572,7 @@ impl MuxelApp {
             Button::new("loop-agent-default")
                 .ghost()
                 .selected(ui.l_preset_id.is_none())
-                .label("Current/default")
+                .label(t("Current/default"))
                 .on_click(cx.listener(|this, _e, _w, cx| this.set_loop_preset(None, cx))),
         );
         for p in &self.presets {
@@ -13439,7 +13604,11 @@ impl MuxelApp {
 
         // Schedule kind toggle.
         let mut sched_row = div().flex().flex_wrap().gap_1();
-        for (k, label) in [(0u8, "Every minutes"), (1, "Every hours"), (2, "Daily at")] {
+        for (k, label) in [
+            (0u8, t("Every minutes")),
+            (1, t("Every hours")),
+            (2, t("Daily at")),
+        ] {
             sched_row = sched_row.child(
                 Button::new(SharedString::from(format!("loop-sched-{k}")))
                     .ghost()
@@ -13460,7 +13629,7 @@ impl MuxelApp {
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child("local 24h time"),
+                        .child(t("local 24h time")),
                 )
         } else {
             let unit = if kind == 0 { "minutes" } else { "hours" };
@@ -13475,16 +13644,16 @@ impl MuxelApp {
         v_flex()
             .gap_2()
             .max_w(px(560.0))
-            .child(self.settings_label("Name", cx))
+            .child(self.settings_label(&t("Name"), cx))
             .child(Self::wide_input(Input::new(&ui.l_name)))
-            .child(self.settings_label("Agent", cx))
+            .child(self.settings_label(&t("Agent"), cx))
             .child(div().flex().child(agent_row.flex_1()))
-            .child(self.settings_label("Project", cx))
+            .child(self.settings_label(&t("Project"), cx))
             .child(div().flex().child(project_row.flex_1()))
-            .child(self.settings_label("Schedule", cx))
+            .child(self.settings_label(&t("Schedule"), cx))
             .child(div().flex().child(sched_row.flex_1()))
             .child(value_row)
-            .child(self.settings_label("Auto mode — Shift+Tab presses at startup", cx))
+            .child(self.settings_label(&t("Auto mode — Shift+Tab presses at startup"), cx))
             .child(
                 div()
                     .flex()
@@ -13507,7 +13676,7 @@ impl MuxelApp {
                         ),
                     ),
             )
-            .child(self.settings_label("Prompt", cx))
+            .child(self.settings_label(&t("Prompt"), cx))
             .child(Self::wide_input(Input::new(&ui.l_prompt).h(px(120.0))))
             .child(
                 self.check_row(
@@ -13517,7 +13686,7 @@ impl MuxelApp {
                             this.settings_ui.l_exit = *c;
                             cx.notify();
                         })),
-                    "Exit the agent after each run (close the pane once it finishes)",
+                    &t("Exit the agent after each run (close the pane once it finishes)"),
                 ),
             )
             .child(
@@ -13528,7 +13697,7 @@ impl MuxelApp {
                             this.settings_ui.l_enabled = *c;
                             cx.notify();
                         })),
-                    "Enabled",
+                    &t("Enabled"),
                 ),
             )
             .child(
@@ -13538,7 +13707,7 @@ impl MuxelApp {
                     .pt_2()
                     .child(
                         Button::new("loop-run-now")
-                            .label("Run now")
+                            .label(t("Run now"))
                             .icon(IconName::Play)
                             .on_click(cx.listener(move |this, _e, window, cx| {
                                 this.run_loop_now(idx, window, cx)
@@ -13547,28 +13716,25 @@ impl MuxelApp {
                     .child(
                         Button::new("save-loop")
                             .primary()
-                            .label("Save")
+                            .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_loop(cx))),
                     )
-                    .child(
-                        Button::new("del-loop")
-                            .ghost()
-                            .label("Delete")
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                let name = this
-                                    .loops
-                                    .get(idx)
-                                    .map(|l| l.name.clone())
-                                    .unwrap_or_default();
-                                this.request_confirm(
-                                    "Delete loop?",
-                                    format!("The “{name}” loop will be deleted."),
-                                    "Delete",
-                                    ConfirmAction::DeleteLoop(idx),
-                                    cx,
-                                )
-                            })),
-                    ),
+                    .child(Button::new("del-loop").ghost().label(t("Delete")).on_click(
+                        cx.listener(move |this, _e, _w, cx| {
+                            let name = this
+                                .loops
+                                .get(idx)
+                                .map(|l| l.name.clone())
+                                .unwrap_or_default();
+                            this.request_confirm(
+                                t("Delete loop?"),
+                                tf("The “{name}” loop will be deleted.", &[("name", &name)]),
+                                t("Delete"),
+                                ConfirmAction::DeleteLoop(idx),
+                                cx,
+                            )
+                        }),
+                    )),
             )
             .into_any_element()
     }
@@ -13615,7 +13781,7 @@ impl MuxelApp {
             Button::new("add-remote")
                 .ghost()
                 .icon(IconName::Plus)
-                .label("Add host")
+                .label(t("Add host"))
                 .on_click(cx.listener(|this, _e, window, cx| this.add_remote(window, cx))),
         );
 
@@ -13624,7 +13790,7 @@ impl MuxelApp {
             _ => div()
                 .p_4()
                 .text_color(cx.theme().muted_foreground)
-                .child("Select a host to edit, or add one. Hosts are used when creating remote projects.")
+                .child(t("Select a host to edit, or add one. Hosts are used when creating remote projects."))
                 .into_any_element(),
         };
 
@@ -13652,9 +13818,9 @@ impl MuxelApp {
             .gap_2()
             .w_full()
             .max_w(px(560.0))
-            .child(self.settings_label("Name", cx))
+            .child(self.settings_label(&t("Name"), cx))
             .child(Self::wide_input(Input::new(&ui.s_name)))
-            .child(self.settings_label("Host (or ~/.ssh/config alias)", cx))
+            .child(self.settings_label(&t("Host (or ~/.ssh/config alias)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_host)))
             .child(
                 div()
@@ -13664,18 +13830,18 @@ impl MuxelApp {
                         v_flex()
                             .flex_1()
                             .gap_1()
-                            .child(self.settings_label("Port", cx))
+                            .child(self.settings_label(&t("Port"), cx))
                             .child(Input::new(&ui.s_port)),
                     )
                     .child(
                         v_flex()
                             .flex_1()
                             .gap_1()
-                            .child(self.settings_label("User", cx))
+                            .child(self.settings_label(&t("User"), cx))
                             .child(Input::new(&ui.s_user)),
                     ),
             )
-            .child(self.settings_label("Authentication", cx))
+            .child(self.settings_label(&t("Authentication"), cx))
             .child(
                 div()
                     .flex()
@@ -13686,30 +13852,32 @@ impl MuxelApp {
             );
 
         if auth == SshAuth::Key {
-            form = form.child(self.settings_label("Identity file", cx)).child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(v_flex().flex_1().child(Input::new(&ui.s_identity)))
-                    .child(
-                        Button::new("remote-browse-key")
-                            .ghost()
-                            .icon(IconName::Folder)
-                            .label("Browse")
-                            .on_click(cx.listener(|this, _e, window, cx| {
-                                this.browse_identity_file(window, cx)
-                            })),
-                    ),
-            );
+            form = form
+                .child(self.settings_label(&t("Identity file"), cx))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .child(v_flex().flex_1().child(Input::new(&ui.s_identity)))
+                        .child(
+                            Button::new("remote-browse-key")
+                                .ghost()
+                                .icon(IconName::Folder)
+                                .label(t("Browse"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.browse_identity_file(window, cx)
+                                })),
+                        ),
+                );
         } else if auth == SshAuth::Password {
             let hint = if ui.s_has_password {
-                "A password is saved in the OS keychain. Type a new one to replace it."
+                t("A password is saved in the OS keychain. Type a new one to replace it.")
             } else {
-                "Stored securely in the OS keychain — never in muxel's config."
+                t("Stored securely in the OS keychain — never in muxel's config.")
             };
             form = form
-                .child(self.settings_label("Password", cx))
+                .child(self.settings_label(&t("Password"), cx))
                 .child(Self::wide_input(Input::new(&ui.s_password)))
                 .child(
                     div()
@@ -13734,7 +13902,7 @@ impl MuxelApp {
         let forward = ui.s_forward_agent;
         let use_tmux = ui.s_use_tmux;
         form = form
-            .child(self.settings_label("Jump host (ProxyJump, optional)", cx))
+            .child(self.settings_label(&t("Jump host (ProxyJump, optional)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_jump)))
             .child(
                 self.check_row(
@@ -13744,7 +13912,7 @@ impl MuxelApp {
                             this.settings_ui.s_forward_agent = *c;
                             cx.notify();
                         })),
-                    "Forward the ssh-agent (-A)",
+                    &t("Forward the ssh-agent (-A)"),
                 ),
             )
             .child(
@@ -13755,14 +13923,14 @@ impl MuxelApp {
                             this.settings_ui.s_use_tmux = *c;
                             cx.notify();
                         })),
-                    "Run remote panes in a persistent tmux session (survives disconnects)",
+                    &t("Run remote panes in a persistent tmux session (survives disconnects)"),
                 ),
             )
-            .child(self.settings_label("StrictHostKeyChecking (blank = accept-new)", cx))
+            .child(self.settings_label(&t("StrictHostKeyChecking (blank = accept-new)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_strict)))
-            .child(self.settings_label("Keepalive — ServerAliveInterval secs (optional)", cx))
+            .child(self.settings_label(&t("Keepalive — ServerAliveInterval secs (optional)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_keepalive)))
-            .child(self.settings_label("Extra ssh -o options (one per line)", cx))
+            .child(self.settings_label(&t("Extra ssh -o options (one per line)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_extra).h(px(60.0))));
 
         // Inline Test-connection result, above the buttons.
@@ -13773,7 +13941,7 @@ impl MuxelApp {
                     .pt_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Connecting…")
+                    .child(t("Connecting…"))
                     .into_any_element(),
             ),
             RemoteTestState::Ok(msg) => Some(
@@ -13803,7 +13971,7 @@ impl MuxelApp {
                     Button::new("test-remote")
                         .ghost()
                         .icon(IconName::Network)
-                        .label("Test connection")
+                        .label(t("Test connection"))
                         .on_click(cx.listener(move |this, _e, window, cx| {
                             this.save_remote(window, cx);
                             this.test_remote_connection(idx, window, cx);
@@ -13812,13 +13980,13 @@ impl MuxelApp {
                 .child(
                     Button::new("save-remote")
                         .primary()
-                        .label("Save")
+                        .label(t("Save"))
                         .on_click(cx.listener(|this, _e, window, cx| this.save_remote(window, cx))),
                 )
                 .child(
                     Button::new("del-remote")
                         .ghost()
-                        .label("Delete")
+                        .label(t("Delete"))
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             let name = this
                                 .remotes
@@ -13826,11 +13994,12 @@ impl MuxelApp {
                                 .map(|h| h.name.clone())
                                 .unwrap_or_default();
                             this.request_confirm(
-                                "Delete host?",
-                                format!(
-                                    "The “{name}” SSH host and its saved password will be removed."
+                                t("Delete host?"),
+                                tf(
+                                    "The “{name}” SSH host and its saved password will be removed.",
+                                    &[("name", &name)],
                                 ),
-                                "Delete",
+                                t("Delete"),
                                 ConfirmAction::DeleteRemote(idx),
                                 cx,
                             )
@@ -13847,9 +14016,9 @@ impl MuxelApp {
         v_flex()
             .gap_2()
             .max_w(px(560.0))
-            .child(self.settings_label("Name", cx))
+            .child(self.settings_label(&t("Name"), cx))
             .child(Self::wide_input(Input::new(&ui.p_name)))
-            .child(self.settings_label("Program (blank = default shell)", cx))
+            .child(self.settings_label(&t("Program (blank = default shell)"), cx))
             .child(Self::wide_input(Input::new(&ui.p_program)))
             .child(
                 div()
@@ -13859,14 +14028,14 @@ impl MuxelApp {
                         v_flex()
                             .flex_1()
                             .gap_1()
-                            .child(self.settings_label("Model", cx))
+                            .child(self.settings_label(&t("Model"), cx))
                             .child(Input::new(&ui.p_model)),
                     )
                     .child(
                         v_flex()
                             .flex_1()
                             .gap_1()
-                            .child(self.settings_label("Model flag", cx))
+                            .child(self.settings_label(&t("Model flag"), cx))
                             .child(Input::new(&ui.p_model_flag)),
                     ),
             )
@@ -13878,22 +14047,22 @@ impl MuxelApp {
                         v_flex()
                             .flex_1()
                             .gap_1()
-                            .child(self.settings_label("Effort", cx))
+                            .child(self.settings_label(&t("Effort"), cx))
                             .child(Input::new(&ui.p_effort)),
                     )
                     .child(
                         v_flex()
                             .flex_1()
                             .gap_1()
-                            .child(self.settings_label("Effort flag", cx))
+                            .child(self.settings_label(&t("Effort flag"), cx))
                             .child(Input::new(&ui.p_effort_flag)),
                     ),
             )
-            .child(self.settings_label("Extra arguments", cx))
+            .child(self.settings_label(&t("Extra arguments"), cx))
             .child(Self::wide_input(Input::new(&ui.p_args)))
-            .child(self.settings_label("System prompt", cx))
+            .child(self.settings_label(&t("System prompt"), cx))
             .child(Self::wide_input(Input::new(&ui.p_prompt).h(px(72.0))))
-            .child(self.settings_label("System-prompt injection", cx))
+            .child(self.settings_label(&t("System-prompt injection"), cx))
             .child(
                 div()
                     .flex()
@@ -13902,7 +14071,7 @@ impl MuxelApp {
                         Button::new("inj-none")
                             .ghost()
                             .selected(matches!(inj, InjectionMode::None))
-                            .label("None")
+                            .label(t("None"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.set_editor_injection(InjectionMode::None, cx)
                             })),
@@ -13911,7 +14080,7 @@ impl MuxelApp {
                         Button::new("inj-flag")
                             .ghost()
                             .selected(is_flag)
-                            .label("CLI flag")
+                            .label(t("CLI flag"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.set_editor_injection(
                                     InjectionMode::CliFlag {
@@ -13925,7 +14094,7 @@ impl MuxelApp {
                         Button::new("inj-typein")
                             .ghost()
                             .selected(matches!(inj, InjectionMode::TypeIn))
-                            .label("Type-in")
+                            .label(t("Type-in"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.set_editor_injection(InjectionMode::TypeIn, cx)
                             })),
@@ -13934,16 +14103,16 @@ impl MuxelApp {
             .children(is_flag.then(|| {
                 v_flex()
                     .gap_1()
-                    .child(self.settings_label("Injection flag", cx))
+                    .child(self.settings_label(&t("Injection flag"), cx))
                     .child(Self::wide_input(Input::new(&ui.p_inj_flag)))
             }))
-            .child(self.settings_label("Environment (KEY=VALUE per line)", cx))
+            .child(self.settings_label(&t("Environment (KEY=VALUE per line)"), cx))
             .child(Self::wide_input(Input::new(&ui.p_env).h(px(60.0))))
-            .child(self.settings_label("Status: working markers (comma-separated)", cx))
+            .child(self.settings_label(&t("Status: working markers (comma-separated)"), cx))
             .child(Self::wide_input(Input::new(&ui.p_working_markers)))
-            .child(self.settings_label("Status: blocked markers (comma-separated)", cx))
+            .child(self.settings_label(&t("Status: blocked markers (comma-separated)"), cx))
             .child(Self::wide_input(Input::new(&ui.p_blocked_markers)))
-            .child(self.settings_label("Runner startup delay (ms after first output)", cx))
+            .child(self.settings_label(&t("Runner startup delay (ms after first output)"), cx))
             .child(Self::wide_input(Input::new(&ui.p_startup_delay)))
             .child(
                 div()
@@ -13953,33 +14122,39 @@ impl MuxelApp {
                     .child(
                         Button::new("save-preset")
                             .primary()
-                            .label("Save")
+                            .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_preset(cx))),
                     )
                     .child(
                         Button::new("dup-preset")
                             .ghost()
-                            .label("Duplicate")
+                            .label(t("Duplicate"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
                                 this.duplicate_preset(idx, window, cx)
                             })),
                     )
-                    .child(Button::new("del-preset").ghost().label("Delete").on_click(
-                        cx.listener(move |this, _e, _w, cx| {
-                            let name = this
-                                .presets
-                                .get(idx)
-                                .map(|p| p.name.clone())
-                                .unwrap_or_default();
-                            this.request_confirm(
-                                "Delete agent?",
-                                format!("The “{name}” agent preset will be deleted."),
-                                "Delete",
-                                ConfirmAction::DeletePreset(idx),
-                                cx,
-                            )
-                        }),
-                    )),
+                    .child(
+                        Button::new("del-preset")
+                            .ghost()
+                            .label(t("Delete"))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                let name = this
+                                    .presets
+                                    .get(idx)
+                                    .map(|p| p.name.clone())
+                                    .unwrap_or_default();
+                                this.request_confirm(
+                                    t("Delete agent?"),
+                                    tf(
+                                        "The “{name}” agent preset will be deleted.",
+                                        &[("name", &name)],
+                                    ),
+                                    t("Delete"),
+                                    ConfirmAction::DeletePreset(idx),
+                                    cx,
+                                )
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -14007,7 +14182,7 @@ impl MuxelApp {
             _ => div()
                 .p_4()
                 .text_color(cx.theme().muted_foreground)
-                .child("Select a project to edit.")
+                .child(t("Select a project to edit."))
                 .into_any_element(),
         };
 
@@ -14044,9 +14219,9 @@ impl MuxelApp {
         v_flex()
             .gap_2()
             .max_w(px(560.0))
-            .child(self.settings_label("Name", cx))
+            .child(self.settings_label(&t("Name"), cx))
             .child(Self::wide_input(Input::new(&self.settings_ui.proj_name)))
-            .child(self.settings_label("Folder", cx))
+            .child(self.settings_label(&t("Folder"), cx))
             .child(
                 div()
                     .flex()
@@ -14056,13 +14231,13 @@ impl MuxelApp {
                     .child(
                         Button::new("change-folder")
                             .ghost()
-                            .label("Change…")
+                            .label(t("Change…"))
                             .on_click(cx.listener(|this, _e, window, cx| {
                                 this.change_project_folder(window, cx)
                             })),
                     ),
             )
-            .child(self.settings_label("Default preset", cx))
+            .child(self.settings_label(&t("Default preset"), cx))
             .child(div().flex().child(preset_row.flex_1()))
             .child(self.check_row(
                 Checkbox::new("proj-memory")
@@ -14074,7 +14249,7 @@ impl MuxelApp {
                     .on_click(cx.listener(move |this, _c: &bool, _w, cx| {
                         this.toggle_project_memory(pid, cx)
                     })),
-                "Shared agent memory — agents read + append lessons in .muxel/MEMORY.md across runs",
+                &t("Shared agent memory — agents read + append lessons in .muxel/MEMORY.md across runs"),
             ))
             .child(
                 div()
@@ -14084,18 +14259,18 @@ impl MuxelApp {
                     .child(
                         Button::new("save-project")
                             .primary()
-                            .label("Save")
+                            .label(t("Save"))
                             .on_click(cx.listener(|this, _e, _w, cx| this.save_project(cx))),
                     )
                     .child(
                         Button::new("del-project")
                             .ghost()
-                            .label("Delete project")
+                            .label(t("Delete project"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 this.request_confirm(
-                                    "Delete project?",
-                                    "The project and its panes will be removed.",
-                                    "Delete",
+                                    t("Delete project?"),
+                                    t("The project and its panes will be removed."),
+                                    t("Delete"),
                                     ConfirmAction::DeleteProject(pid),
                                     cx,
                                 )
@@ -14136,7 +14311,7 @@ impl MuxelApp {
                 div()
                     .pt_2()
                     .child(
-                        self.settings_label("Pass these keys through to the focused terminal", cx),
+                        self.settings_label(&t("Pass these keys through to the focused terminal"), cx),
                     )
                     .child(div().w(form_w).child(Input::new(&self.settings_ui.passthrough_keys))),
             )
@@ -14154,7 +14329,7 @@ impl MuxelApp {
                 div().pt_2().flex().items_center().gap_3().child(
                     Button::new("apply-keys")
                         .primary()
-                        .label("Apply keybindings")
+                        .label(t("Apply keybindings"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.apply_keybindings(cx))),
                 ),
             )
@@ -14163,7 +14338,7 @@ impl MuxelApp {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(
-                        "Examples: ctrl-shift-t, cmd-w, ctrl-shift-up. Applied immediately + saved.",
+                        t("Examples: ctrl-shift-t, cmd-w, ctrl-shift-up. Applied immediately + saved."),
                     ),
             );
         form.into_any_element()
@@ -14303,9 +14478,9 @@ impl Render for MuxelApp {
                 Some(root) => self.render_pane(&root, cx),
                 None => {
                     let msg = if self.workspace.projects.is_empty() {
-                        "No projects yet — click New Project in the sidebar."
+                        t("No projects yet — click New Project in the sidebar.")
                     } else {
-                        "No terminals — pick a preset and Split."
+                        t("No terminals — pick a preset and Split.")
                     };
                     div()
                         .size_full()

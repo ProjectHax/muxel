@@ -3,6 +3,7 @@
 //! tab indent, undo — all provided by the widget). This module adds file
 //! load/save plumbing, language detection, and a dirty flag on top.
 
+use crate::i18n::{t, tf};
 use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Input, InputEvent, InputState, Position, TabSize};
@@ -311,14 +312,14 @@ impl EditorView {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "diff".to_string());
-            return format!("Diff · {name}");
+            return tf("Diff · {name}", &[("name", &name)]);
         }
         let name = self
             .path
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Untitled".to_string());
+            .unwrap_or_else(|| t("Untitled").to_string());
         if self.dirty {
             format!("● {name}")
         } else {
