@@ -3,6 +3,32 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [0.0.4] — 2026-06-25
+
+### Added
+- **Localization** — the UI is translated into 24 languages, auto-detected from
+  your OS locale on startup with a Settings → Appearance → Language picker that
+  switches live (no restart). Untranslated strings fall back to English; a
+  `scripts/translate.py` generator (re)builds the catalogs.
+- **Session resume** — agents that support it (Claude) resume their previous
+  conversation when a pane is relaunched, via a stable per-pane session id.
+- **Single instance per workspace** — opening a workspace already open in another
+  muxel window shows an "already open" screen instead of clobbering its shared
+  layout and settings.
+
+### Changed
+- **Profiles are now "workspaces"** — renamed throughout the UI, with the active
+  workspace name shown in the title bar. Existing `profiles.json` / `profiles/`
+  migrate automatically.
+- **Agent launcher button** — shows just the agent's name (dropped the "New:"
+  prefix).
+- **Editor close** — closing an editor with no unsaved changes no longer prompts.
+
+### Fixed
+- **Session resume reliability** — a relaunched agent resumes its own session
+  unconditionally instead of probing the (possibly not-yet-flushed) on-disk session
+  file, fixing the intermittent "didn't resume" / "Session ID already in use".
+
 ## [0.0.3] — 2026-06-25
 
 ### Added
