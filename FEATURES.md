@@ -152,8 +152,9 @@ feature is added or changed, update the matching entry here in the same change**
 ## Terminal
 
 - **alacritty-based emulator** — full VTE terminal with truecolor support.
-- **Selection & clipboard** — mouse text selection, copy/paste, and right-click to
-  copy the selection.
+- **Selection & clipboard** — mouse text selection, copy/paste (`⌘C`/`⌘V` on
+  macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere), and right-click to copy the
+  selection.
 - **Scrollback** — history with a draggable overlay scrollbar; clear it via
   `Ctrl+Shift+K` or the tab's "Clear scrollback" menu item. The mouse wheel
   scrolls history, or — for full-screen apps that enable mouse reporting

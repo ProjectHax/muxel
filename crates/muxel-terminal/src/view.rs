@@ -298,8 +298,12 @@ impl TerminalView {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let m = &event.keystroke.modifiers;
 
-        // Copy / paste (ctrl-shift-c / ctrl-shift-v) — ctrl-c stays SIGINT.
-        if m.control && m.shift && !m.alt {
+        // Copy / paste. On macOS the platform shortcut is ⌘C / ⌘V; everywhere
+        // else it's ctrl-shift-c / ctrl-shift-v (plain ctrl-c must stay SIGINT).
+        // macOS accepts the ctrl-shift combo too so muscle memory carries over.
+        let copy_paste = (m.control && m.shift && !m.alt)
+            || (cfg!(target_os = "macos") && m.platform && !m.control && !m.shift && !m.alt);
+        if copy_paste {
             match event.keystroke.key.as_str() {
                 "c" => {
                     if let Some(text) = self.session.selection_to_string()
