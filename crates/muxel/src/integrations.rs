@@ -6,6 +6,22 @@ use muxel_core::{MEMORY_DIR, MEMORY_FILE, RemoteHost, SshAuth, memory_header, ss
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// `std::process::Command` for `program`, with the console window suppressed on
+/// Windows. muxel is a GUI app, so spawning a console child (git, ssh, gh, …)
+/// would otherwise flash a cmd window on every call — extremely visible because
+/// muxel polls git in the background. No-op off Windows.
+fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW — don't allocate/attach a console for the child.
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
 /// A remote git location: the host + the repo path on it + the shared
 /// ControlMaster socket + (optional) password for password auth.
 pub struct RemoteConn {
@@ -53,14 +69,14 @@ fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
     argv.push("--".into());
     argv.push(remote_cmd);
     if c.host.auth == SshAuth::Password {
-        let mut cmd = Command::new("sshpass");
+        let mut cmd = command("sshpass");
         cmd.arg("-e").arg("ssh").args(&argv);
         if let Some(pw) = &c.password {
             cmd.env("SSHPASS", pw);
         }
         cmd
     } else {
-        let mut cmd = Command::new("ssh");
+        let mut cmd = command("ssh");
         cmd.args(&argv);
         cmd
     }
@@ -70,7 +86,7 @@ fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
 /// over SSH (`ssh … -- git -C <remote_path> …`, fed as one quoted command).
 fn git_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
     match loc {
-        RepoLoc::Local(path) => Command::new("git").arg("-C").arg(path).args(args).output(),
+        RepoLoc::Local(path) => command("git").arg("-C").arg(path).args(args).output(),
         RepoLoc::Remote(c) => {
             let mut remote = format!("git -C {}", ssh::sh_quote(&c.remote_path));
             for a in args {
@@ -356,13 +372,13 @@ fn ssh_run(
 
     let mut cmd;
     if host.auth == SshAuth::Password {
-        cmd = Command::new("sshpass");
+        cmd = command("sshpass");
         cmd.arg("-e").arg("ssh").args(&argv);
         if let Some(pw) = password {
             cmd.env("SSHPASS", pw);
         }
     } else {
-        cmd = Command::new("ssh");
+        cmd = command("ssh");
         cmd.args(&argv);
     }
     cmd.output().map_err(|e| ssh_spawn_error(host.auth, e))
@@ -446,13 +462,13 @@ pub fn ssh_verify(host: &RemoteHost, password: Option<&str>) -> Result<()> {
 
     let mut cmd;
     if host.auth == SshAuth::Password {
-        cmd = Command::new("sshpass");
+        cmd = command("sshpass");
         cmd.arg("-e").arg("ssh").args(&argv);
         if let Some(pw) = password {
             cmd.env("SSHPASS", pw);
         }
     } else {
-        cmd = Command::new("ssh");
+        cmd = command("ssh");
         cmd.args(&argv);
     }
     let out = cmd.output().map_err(|e| ssh_spawn_error(host.auth, e))?;
@@ -495,7 +511,7 @@ pub fn ssh_test_dir(
 
 /// Whether `path` is inside a git working tree.
 pub fn is_git_repo(path: &Path) -> bool {
-    Command::new("git")
+    command("git")
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -506,7 +522,7 @@ pub fn is_git_repo(path: &Path) -> bool {
 
 /// Create a worktree at `worktree_path` on a new `branch`, based on `repo`.
 pub fn create_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> Result<()> {
-    let output = Command::new("git")
+    let output = command("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "add", "-b", branch])
@@ -528,7 +544,7 @@ pub fn worktree_change_count(worktree_path: &Path) -> usize {
     if !worktree_path.exists() {
         return 0;
     }
-    Command::new("git")
+    command("git")
         .arg("-C")
         .arg(worktree_path)
         .args(["status", "--porcelain"])
@@ -559,7 +575,7 @@ pub fn repo_current_branch(loc: &RepoLoc) -> Option<String> {
 /// Run a git command in `dir` and return its trimmed single-line stdout on
 /// success, else `None`.
 fn git_line(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+    let out = command("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -577,7 +593,7 @@ pub fn worktree_unmerged_count(worktree_path: &Path, base: &str) -> usize {
     if !worktree_path.exists() {
         return 0;
     }
-    Command::new("git")
+    command("git")
         .arg("-C")
         .arg(worktree_path)
         .args(["rev-list", "--count", &format!("{base}..HEAD")])
@@ -592,7 +608,7 @@ pub fn worktree_unmerged_count(worktree_path: &Path, base: &str) -> usize {
 /// failure (e.g. conflicts) abort the merge so the repo isn't left mid-merge,
 /// and return the error.
 pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
-    let out = Command::new("git")
+    let out = command("git")
         .arg("-C")
         .arg(repo)
         .args(["merge", "--no-edit", branch])
@@ -600,7 +616,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
         .context("running `git merge`")?;
     if !out.status.success() {
         // Leave no half-finished merge behind.
-        let _ = Command::new("git")
+        let _ = command("git")
             .arg("-C")
             .arg(repo)
             .args(["merge", "--abort"])
@@ -613,7 +629,7 @@ pub fn merge_worktree_branch(repo: &Path, branch: &str) -> Result<()> {
 /// Delete `branch` from `repo` (force). Best-effort — only valid once the branch
 /// is no longer checked out in any worktree.
 pub fn delete_branch(repo: &Path, branch: &str) {
-    let _ = Command::new("git")
+    let _ = command("git")
         .arg("-C")
         .arg(repo)
         .args(["branch", "-D", branch])
@@ -700,7 +716,7 @@ pub fn git_commit_paths(loc: &RepoLoc, msg: &str, paths: &[String]) -> Result<St
 
 /// Push the worktree's `branch` to `origin` (setting upstream). Errors on failure.
 pub fn push_branch(worktree_path: &Path, branch: &str) -> Result<()> {
-    let out = Command::new("git")
+    let out = command("git")
         .arg("-C")
         .arg(worktree_path)
         .args(["push", "-u", "origin", branch])
@@ -725,7 +741,7 @@ pub fn open_pr(worktree_path: &Path) -> Result<()> {
 
 /// Run `gh` in `dir`; bail with stderr on failure (e.g. not installed/authed).
 fn gh(dir: &Path, args: &[&str]) -> Result<()> {
-    let out = Command::new("gh")
+    let out = command("gh")
         .current_dir(dir)
         .args(args)
         .output()
@@ -745,7 +761,7 @@ fn gh(dir: &Path, args: &[&str]) -> Result<()> {
 /// stays (clean, at the base). Errors on git failure.
 pub fn discard_worktree_changes(worktree_path: &Path, base_ref: &str) -> Result<()> {
     let run = |args: &[&str]| {
-        Command::new("git")
+        command("git")
             .arg("-C")
             .arg(worktree_path)
             .args(args)
@@ -766,13 +782,13 @@ pub fn discard_worktree_changes(worktree_path: &Path, base_ref: &str) -> Result<
 
 /// Remove a worktree (force) and prune stale entries. Best-effort.
 pub fn remove_worktree(repo: &Path, worktree_path: &Path) {
-    let _ = Command::new("git")
+    let _ = command("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "remove", "--force"])
         .arg(worktree_path)
         .output();
-    let _ = Command::new("git")
+    let _ = command("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "prune"])
@@ -789,7 +805,7 @@ const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 /// (we can't tell agent-created files from pre-existing ones without a baseline).
 pub fn git_diff(dir: &Path) -> String {
     let git = |args: &[&str]| {
-        Command::new("git")
+        command("git")
             .arg("-C")
             .arg(dir)
             .arg("--no-pager")
@@ -843,7 +859,7 @@ pub fn git_diff(dir: &Path) -> String {
 
 /// Kill a tmux session. Best-effort.
 pub fn kill_tmux_session(session: &str) {
-    let _ = Command::new("tmux")
+    let _ = command("tmux")
         .args(muxel_core::tmux::kill_session_args(session))
         .output();
 }
@@ -864,9 +880,9 @@ pub fn kill_remote_tmux(
 /// Open the OS file manager at (or selecting) `path`. Best-effort, cross-platform.
 pub fn reveal_in_file_manager(path: &Path) {
     #[cfg(target_os = "macos")]
-    let _ = Command::new("open").arg("-R").arg(path).output();
+    let _ = command("open").arg("-R").arg(path).output();
     #[cfg(target_os = "windows")]
-    let _ = Command::new("explorer")
+    let _ = command("explorer")
         .arg(format!("/select,{}", path.display()))
         .output();
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
@@ -877,7 +893,7 @@ pub fn reveal_in_file_manager(path: &Path) {
         } else {
             path.parent().unwrap_or(path)
         };
-        let _ = Command::new("xdg-open").arg(dir).output();
+        let _ = command("xdg-open").arg(dir).output();
     }
 }
 
@@ -964,7 +980,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
 
         let git = |args: &[&str]| {
-            Command::new("git")
+            command("git")
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
@@ -1001,7 +1017,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&worktree);
         std::fs::create_dir_all(&repo).unwrap();
         let git = |dir: &Path, args: &[&str]| {
-            Command::new("git")
+            command("git")
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -1049,7 +1065,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| {
-            Command::new("git")
+            command("git")
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
@@ -1204,7 +1220,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| {
-            Command::new("git")
+            command("git")
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
@@ -1251,7 +1267,7 @@ mod tests {
         assert_eq!(remaining, vec!["extra.txt".to_string()]);
 
         // HEAD recorded exactly the three selected changes.
-        let show = Command::new("git")
+        let show = command("git")
             .arg("-C")
             .arg(&repo)
             .args(["show", "--name-status", "--format=", "HEAD"])
