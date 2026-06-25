@@ -300,16 +300,17 @@ pub fn register_actions(cx: &mut App) {
     });
     // Cmd+Q (macOS) / Ctrl+Q: route to the same confirm flow as the title-bar
     // close button. Registered globally (not on the main view) so it also fires
-    // on the first-run screens, whose render path omits the main element. There
-    // nothing is running yet, so quit outright — matching the minimal title
-    // bar's close button.
+    // on the first-run screens, whose render path omits the main element.
     cx.on_action(|_: &Quit, cx| {
         let Some(weak) = cx.try_global::<MuxelHandle>().map(|h| h.0.clone()) else {
             return;
         };
         if let Some(app) = weak.upgrade() {
             app.update(cx, |this, cx| {
-                if this.show_terms || this.show_profile_selector {
+                // Quit outright when there's nothing to confirm: the first-run
+                // screens (nothing running yet), or a second Cmd+Q while the
+                // confirm modal is already up — same as clicking its Quit button.
+                if this.show_terms || this.show_profile_selector || this.show_quit_confirm {
                     this.confirm_quit = true;
                     cx.quit();
                 } else {
