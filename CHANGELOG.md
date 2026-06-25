@@ -3,6 +3,30 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [0.0.3] — 2026-06-25
+
+### Added
+- **Quit shortcuts** — `Cmd+Q` / `Ctrl+Q` quits muxel; a second `Cmd+Q` quits even
+  while the close-confirm dialog is up.
+- **macOS clipboard** — `Cmd+C` / `Cmd+V` copy and paste in terminal panes.
+
+### Changed
+- **Update dialog** — shows the release's full changelog rendered as markdown, in a
+  bigger, resizable window.
+
+### Fixed
+- **Modal input passthrough** — clicks, scroll, and hover no longer fall through a
+  dialog's backdrop to the panes behind it.
+- **macOS agent detection** — reconstruct the GUI-launch `PATH` (Homebrew,
+  `~/.local/bin`) so agents are found when muxel is launched from Finder/Dock, not
+  only from a terminal.
+- **Windows agent detection** — find agents installed as `.exe` / `.cmd` / `.bat`
+  via `PATHEXT` (e.g. npm-shimmed `claude`).
+- **Windows console flashes** — suppress the cmd-window flash from background
+  `git` / `ssh` calls (`CREATE_NO_WINDOW`).
+- **Windows stack overflow** — raise the main-thread stack to 8 MiB, fixing a crash
+  when launching an agent.
+
 ## [0.0.2] — 2026-06-24
 
 ### Added
@@ -47,5 +71,6 @@ All notable changes to muxel are documented here. This project adheres to
 
 Initial public release.
 
+[0.0.3]: https://github.com/ProjectHax/muxel/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/ProjectHax/muxel/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/ProjectHax/muxel/releases/tag/v0.0.1
