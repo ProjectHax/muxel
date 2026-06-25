@@ -298,6 +298,27 @@ pub fn register_actions(cx: &mut App) {
             app.update(cx, |this, cx| this.set_theme(a.0.clone(), cx));
         }
     });
+    // Cmd+Q (macOS) / Ctrl+Q: route to the same confirm flow as the title-bar
+    // close button. Registered globally (not on the main view) so it also fires
+    // on the first-run screens, whose render path omits the main element. There
+    // nothing is running yet, so quit outright — matching the minimal title
+    // bar's close button.
+    cx.on_action(|_: &Quit, cx| {
+        let Some(weak) = cx.try_global::<MuxelHandle>().map(|h| h.0.clone()) else {
+            return;
+        };
+        if let Some(app) = weak.upgrade() {
+            app.update(cx, |this, cx| {
+                if this.show_terms || this.show_profile_selector {
+                    this.confirm_quit = true;
+                    cx.quit();
+                } else {
+                    this.show_quit_confirm = true;
+                    cx.notify();
+                }
+            });
+        }
+    });
 }
 
 // Keyboard-driven actions, handled by the root view (so they have `&mut Window`)
@@ -305,6 +326,10 @@ pub fn register_actions(cx: &mut App) {
 actions!(
     muxel,
     [
+        // Cmd+Q (macOS) / Ctrl+Q (elsewhere): ask to quit. Bound globally in
+        // [`install_keybindings`]; not in the rebindable table since it mirrors
+        // the platform-standard quit shortcut.
+        Quit,
         NewPane,
         NewTab,
         TabNext,
@@ -431,6 +456,9 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     // so a focused agent (e.g. opencode, which uses Ctrl+P) receives it, while
     // deselecting a pane (or focusing the sidebar/editor) routes Ctrl+P to muxel.
     bindings.push(KeyBinding::new("ctrl-p", GlobalSearch, Some("!Terminal")));
+    // Cmd+Q (macOS) / Ctrl+Q (elsewhere) quits from any focus, including a
+    // focused terminal — `secondary` resolves to the platform's quit modifier.
+    bindings.push(KeyBinding::new("secondary-q", Quit, None));
     cx.bind_keys(bindings);
 }
 
@@ -12155,6 +12183,15 @@ impl MuxelApp {
         rows.push((
             "Send Tab / Shift+Tab to terminal".into(),
             "Tab / Shift+Tab".into(),
+        ));
+        rows.push((
+            "Quit muxel".into(),
+            if cfg!(target_os = "macos") {
+                "Cmd+Q"
+            } else {
+                "Ctrl+Q"
+            }
+            .into(),
         ));
 
         let list = rows
