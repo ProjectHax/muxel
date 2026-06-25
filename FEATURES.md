@@ -259,10 +259,15 @@ feature is added or changed, update the matching entry here in the same change**
   SSH into the editor and Ctrl+S writes it back. Open-in-terminal opens a remote
   shell in that directory.
 
-## Profiles & persistence
+## Workspaces & persistence
 
-- **Profiles** — multiple profiles, each with its own workspace; a startup profile
+- **Workspaces** — multiple workspaces, each with its own projects + layout; a startup workspace
   selector.
+- **Single instance per workspace** — if a workspace is already open in another muxel
+  window, launching again with the same workspace refuses to load it and shows an
+  alert, so the two can't overwrite each other's workspace + settings. Different
+  workspaces still run side by side, and the lock releases on exit (even a crash), so
+  no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
 

@@ -48,6 +48,50 @@ impl AssetSource for AppAssets {
     }
 }
 
+/// Holds the single-instance workspace lock for the process lifetime (the OS
+/// releases it on exit). See [`muxel_store::try_lock_workspace`].
+static WORKSPACE_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// Shown instead of the app when this workspace is already open in another muxel
+/// window — so we never load or save the shared workspace and clobber it.
+struct AlreadyOpenView;
+
+impl Render for AlreadyOpenView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .text_xl()
+                    .font_semibold()
+                    .child("muxel is already open"),
+            )
+            .child(
+                div()
+                    .max_w(px(380.0))
+                    .text_center()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "This workspace is already in use by another muxel window. Close \
+                         it first so your settings aren't overwritten.",
+                    ),
+            )
+            .child(
+                Button::new("quit-already-open")
+                    .primary()
+                    .label("Quit")
+                    .on_click(|_, _window, cx| cx.quit()),
+            )
+    }
+}
+
 fn main() {
     // A macOS Dock/Finder launch inherits a minimal launchd PATH that omits
     // Homebrew and ~/.local/bin, so installed agents would be hidden from the
@@ -94,6 +138,9 @@ fn main() {
                 }
             });
 
+            // Single-instance guard: refuse to open a workspace another muxel already
+            // holds, so the two don't clobber each other's workspace + settings.
+            let lock = muxel_store::try_lock_workspace();
             cx.spawn(async move |cx| {
                 let options = WindowOptions {
                     titlebar: Some(TitleBar::title_bar_options()),
@@ -103,12 +150,23 @@ fn main() {
                     app_id: Some("muxel".to_string()),
                     ..Default::default()
                 };
-                cx.open_window(options, |window, cx| {
+                cx.open_window(options, move |window, cx| {
                     // Give the window an explicit title; without it the compositor
                     // shows "Unknown" in the title bar / window switcher.
                     window.set_window_title("muxel");
-                    let view = cx.new(|cx| MuxelApp::new(window, cx));
-                    cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
+                    match lock {
+                        Some(lock) => {
+                            // Hold the lock for the process lifetime.
+                            let _ = WORKSPACE_LOCK.set(lock);
+                            let view = cx.new(|cx| MuxelApp::new(window, cx));
+                            cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
+                        }
+                        None => {
+                            // Already open elsewhere — alert, and don't load it.
+                            let view = cx.new(|_cx| AlreadyOpenView);
+                            cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
+                        }
+                    }
                 })
                 .expect("failed to open muxel window");
             })

@@ -66,6 +66,29 @@ pub fn workspace_path() -> Option<PathBuf> {
     data_dir().map(|d| d.join("workspace.json"))
 }
 
+/// Try to take the single-instance lock for this workspace's data dir. Returns the
+/// locked file on success — **keep it alive for the process lifetime** (the OS
+/// releases the advisory lock when the process exits, even on a crash, so no
+/// stale lock survives). `None` means another muxel already holds it, so this
+/// instance should refuse to open and not clobber the shared workspace/settings.
+/// A lock that the platform can't support is treated as "available" rather than
+/// blocking the user.
+pub fn try_lock_workspace() -> Option<std::fs::File> {
+    let dir = data_dir()?;
+    let _ = std::fs::create_dir_all(&dir);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("instance.lock"))
+        .ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(std::fs::TryLockError::WouldBlock) => None,
+        Err(std::fs::TryLockError::Error(_)) => Some(file),
+    }
+}
+
 /// Load the workspace from the default location, if present and valid.
 pub fn load_workspace() -> Option<Workspace> {
     load_workspace_from(&workspace_path()?)
