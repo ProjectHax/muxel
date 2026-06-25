@@ -55,7 +55,9 @@ feature is added or changed, update the matching entry here in the same change**
   starters like opencode; 0 = auto-wait until output goes quiet).
 - **Installed-binary autodetect** — agents whose binary isn't on `PATH` are hidden
   from the new-agent menus and marked "not installed" in settings; they reappear
-  automatically once installed.
+  automatically once installed. On macOS, a Dock/Finder launch reconstructs the
+  Homebrew and `~/.local/bin` dirs that launchd otherwise omits, so agents are
+  detected and spawnable the same as from a terminal.
 - **Graceful launch failure** — if an agent can't be spawned, the pane falls back
   to a shell showing the underlying error instead of crashing.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or

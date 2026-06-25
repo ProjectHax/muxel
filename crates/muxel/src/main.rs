@@ -49,6 +49,21 @@ impl AssetSource for AppAssets {
 }
 
 fn main() {
+    // A macOS Dock/Finder launch inherits a minimal launchd PATH that omits
+    // Homebrew and ~/.local/bin, so installed agents would be hidden from the
+    // picker and fail to spawn (and the PTY children inherit this env too).
+    // Reconstruct the common dirs before any threads start — env::set_var must
+    // run while the process is still single-threaded.
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").ok();
+        let current = std::env::var("PATH").ok();
+        if let Some(path) = muxel_core::augmented_macos_path(current.as_deref(), home.as_deref()) {
+            // SAFETY: first statement in main, before any thread is spawned.
+            unsafe { std::env::set_var("PATH", path) };
+        }
+    }
+
     gpui_platform::application()
         // Serves muxel's agent icons + gpui-component's bundled SVG icons.
         .with_assets(AppAssets)

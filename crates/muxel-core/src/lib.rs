@@ -3,6 +3,7 @@
 //! unit-tested so the GPUI app and persistence layer can build on it.
 
 mod agent;
+mod gui_path;
 mod pane;
 pub mod ssh;
 pub mod tmux;
@@ -12,6 +13,7 @@ pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, ResolvedLaunch, memory_header,
     memory_instruction, resolve_launch,
 };
+pub use gui_path::augmented_macos_path;
 pub use pane::{
     FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
     move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove, set_active_tab,
