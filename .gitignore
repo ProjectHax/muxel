@@ -28,3 +28,6 @@
 *.keystore
 *.jks
 *.token
+
+# Python bytecode (scripts/)
+__pycache__/
