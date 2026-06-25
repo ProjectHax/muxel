@@ -1321,6 +1321,15 @@ impl Render for PopoutView {
             .child(
                 // Intercept the title-bar X to confirm before closing (which
                 // terminates the terminal).
+                //
+                // POSSIBLE KNOWN BUG (unconfirmed): double-clicking this bar over a
+                // popped-out editor *sometimes* leaves its text selection "stuck"
+                // (keeps highlighting as the mouse moves). Suspected gpui-component
+                // quirk — TitleBar is the only interactive component that doesn't
+                // claim its press via `GlobalState::suppress_text_selection` like
+                // Button/Input do, so a title-bar press can start the window-level
+                // text selection. A patch to add that was tried but the bug couldn't
+                // be reliably reproduced, so this is a note rather than a fix.
                 TitleBar::new()
                     .on_close_window(cx.listener(|this, _ev, _window, cx| {
                         this.show_close_confirm = true;
@@ -6144,7 +6153,14 @@ impl MuxelApp {
             .instance(iid)
             .map(|i| i.kind)
             .unwrap_or(InstanceKind::Terminal);
-        if self.confirm_close_for(kind) {
+        // A clean editor (no unsaved changes) has nothing to lose on close, so skip
+        // the confirmation regardless of the confirm-on-close setting.
+        let clean_editor = kind == InstanceKind::Editor
+            && self
+                .editors
+                .get(&iid)
+                .is_none_or(|e| !e.read(cx).is_dirty());
+        if self.confirm_close_for(kind) && !clean_editor {
             let (noun, verb) = match kind {
                 InstanceKind::Terminal => ("terminal", "terminated"),
                 InstanceKind::Editor => ("editor", "closed"),
