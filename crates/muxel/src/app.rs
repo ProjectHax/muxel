@@ -82,11 +82,32 @@ fn program_on_path(program: &str) -> bool {
             p.is_file()
         }
     }
-    if program.contains('/') || program.contains('\\') {
-        return is_exec(std::path::Path::new(program));
+    // Does `p` (or, on Windows, `p` + a PATHEXT suffix) resolve to an executable?
+    // A bare program name like "claude" is installed as claude.exe / claude.cmd on
+    // Windows, so the extension-less join would otherwise never match.
+    fn exec_with_ext(p: &std::path::Path) -> bool {
+        if is_exec(p) {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            let exts =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            exts.split(';').filter(|e| !e.is_empty()).any(|ext| {
+                let mut cand = p.as_os_str().to_owned();
+                cand.push(ext);
+                is_exec(std::path::Path::new(&cand))
+            })
+        }
+        #[cfg(not(windows))]
+        false
     }
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| is_exec(&dir.join(program))))
+    if program.contains('/') || program.contains('\\') {
+        return exec_with_ext(std::path::Path::new(program));
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| exec_with_ext(&dir.join(program)))
+    })
 }
 
 /// The distinct preset programs that are currently installed (for filtering the
