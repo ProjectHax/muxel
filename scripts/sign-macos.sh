@@ -72,7 +72,19 @@ if [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${MACOS_NOTARY_KEY:-}" ]; then
 fi
 
 # Final artifacts from the (signed, possibly stapled) app.
-hdiutil create -volname muxel -srcfolder "$app" -ov -format UDZO "$out.dmg"
+#
+# DMG: stage the app next to an /Applications symlink so the mounted volume
+# shows the familiar "drag muxel onto Applications" layout. `ditto` (not `cp`)
+# copies the bundle so its code signature and stapled notarization ticket carry
+# over intact.
+dmg_stage="$tmp/muxel-dmg-stage"
+rm -rf "$dmg_stage"
+mkdir -p "$dmg_stage"
+ditto "$app" "$dmg_stage/$(basename "$app")"
+ln -s /Applications "$dmg_stage/Applications"
+hdiutil create -volname muxel -srcfolder "$dmg_stage" -ov -format UDZO "$out.dmg"
+rm -rf "$dmg_stage"
+
 ditto -c -k --keepParent "$app" "$out.zip"
 if [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${MACOS_NOTARY_KEY:-}" ]; then
   xcrun stapler staple "$out.dmg"

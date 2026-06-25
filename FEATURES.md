@@ -316,6 +316,8 @@ feature is added or changed, update the matching entry here in the same change**
   elevation. A portable `.zip` is also published.
 - **Packaging & CI** — release packaging per OS/arch on native runners (.deb /
   .rpm / AppImage / .tar.gz for Linux, .dmg / .zip for macOS, an installer .exe +
-  .zip for Windows) and continuous integration. Windows builds are
-  Authenticode-signed; macOS builds are Developer-ID-signed + notarized when an
-  Apple cert is configured (else ad-hoc signed).
+  .zip for Windows) and continuous integration. The macOS `.dmg` opens to the
+  standard drag-onto-Applications layout (the app beside an Applications
+  shortcut). Windows builds are Authenticode-signed; macOS builds are
+  Developer-ID-signed + notarized when an Apple cert is configured (else ad-hoc
+  signed).
