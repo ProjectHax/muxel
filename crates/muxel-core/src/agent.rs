@@ -353,19 +353,19 @@ pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
 /// The CLI arguments to start or resume a session for a resume-capable agent.
 ///
 /// `None` when the preset has no resume support (`session_id_flag` / `resume_flag`
-/// unset) or the instance has no session id yet. Otherwise `[resume_flag, id]` when
-/// the session was already started and still exists on disk, else
-/// `[session_id_flag, id]` — so a fresh or vanished session starts anew while
-/// keeping the same id (the pane's stable slot).
-pub fn session_resume_args(
-    preset: &AgentPreset,
-    instance: &Instance,
-    session_exists: bool,
-) -> Option<Vec<String>> {
+/// unset) or the instance has no session id yet. Returns `[session_id_flag, id]` on
+/// the very first launch (creating the session with the pane's chosen id), then
+/// `[resume_flag, id]` on every later launch. Keying off `session_started` rather
+/// than probing the agent's on-disk session avoids a flush race: the session file
+/// may not be visible yet right after a restart, which would wrongly force a fresh
+/// `--session-id` and collide with the still-existing session ("id already in
+/// use"). If the session was genuinely deleted, the agent surfaces its own
+/// "session not found" on resume.
+pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<Vec<String>> {
     let id_flag = preset.session_id_flag.as_deref()?;
     let resume_flag = preset.resume_flag.as_deref()?;
     let id = instance.session_id.as_deref()?;
-    let flag = if instance.session_started && session_exists {
+    let flag = if instance.session_started {
         resume_flag
     } else {
         id_flag
@@ -421,30 +421,26 @@ mod tests {
         let preset = AgentPreset::claude();
         let mut inst = instance(&preset, None);
         // No session id yet → nothing to add.
-        assert_eq!(session_resume_args(&preset, &inst, true), None);
+        assert_eq!(session_resume_args(&preset, &inst), None);
         // First launch (not started): start the session with a chosen id.
         inst.session_id = Some("abc".to_string());
         assert_eq!(
-            session_resume_args(&preset, &inst, true),
+            session_resume_args(&preset, &inst),
             Some(vec!["--session-id".to_string(), "abc".to_string()])
         );
-        // Started + still on disk: resume it.
+        // Any later launch (started): resume by id — no on-disk probe, so a
+        // not-yet-flushed session can't be mistaken for a fresh one.
         inst.session_started = true;
         assert_eq!(
-            session_resume_args(&preset, &inst, true),
+            session_resume_args(&preset, &inst),
             Some(vec!["--resume".to_string(), "abc".to_string()])
-        );
-        // Started but the session vanished: start fresh with the same id.
-        assert_eq!(
-            session_resume_args(&preset, &inst, false),
-            Some(vec!["--session-id".to_string(), "abc".to_string()])
         );
         // A non-resume agent (shell) never gets resume args.
         let shell = AgentPreset::shell();
         let mut s = instance(&shell, None);
         s.session_id = Some("abc".to_string());
         s.session_started = true;
-        assert_eq!(session_resume_args(&shell, &s, true), None);
+        assert_eq!(session_resume_args(&shell, &s), None);
     }
 
     #[test]

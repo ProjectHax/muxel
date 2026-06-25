@@ -217,30 +217,6 @@ fn shell_dir_title(osc: &str) -> &str {
     }
 }
 
-/// Best-effort: does a resume-capable agent's saved session still exist on disk?
-/// Only Claude's layout is known (`~/.claude/projects/<slug>/<id>.jsonl`); since
-/// the id is globally unique we just scan for `<id>.jsonl` and ignore the slug.
-/// For any other program, assume it exists (let the agent decide on launch).
-fn session_exists_on_disk(program: Option<&str>, id: &str) -> bool {
-    let is_claude = program.is_some_and(|p| {
-        std::path::Path::new(p)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s.eq_ignore_ascii_case("claude"))
-    });
-    if !is_claude || id.is_empty() {
-        return true;
-    }
-    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERWORKSPACE")) else {
-        return true;
-    };
-    let projects = std::path::Path::new(&home).join(".claude").join("projects");
-    let file = format!("{id}.jsonl");
-    std::fs::read_dir(&projects)
-        .map(|dirs| dirs.flatten().any(|e| e.path().join(&file).is_file()))
-        .unwrap_or(false)
-}
-
 /// Instance a clicked desktop notification wants muxel to jump to. Set from the
 /// notification's D-Bus action thread (off the UI thread); drained on the UI
 /// thread by `handle_notification_click` each tick.
@@ -2086,8 +2062,7 @@ impl MuxelApp {
     /// bookkeeping: generate a stable session id on first launch, flip
     /// `session_started`, and persist. Returns the CLI args to inject, or `None`
     /// for agents/instances without resume. First launch starts the session with
-    /// `--session-id <id>`; later launches `--resume <id>`, falling back to a fresh
-    /// `--session-id <id>` if the saved session is gone.
+    /// `--session-id <id>`; every later launch `--resume <id>`.
     fn session_resume_for(&mut self, iid: Uuid) -> Option<Vec<String>> {
         let inst = self.workspace.instance(iid)?;
         let preset = inst
@@ -2105,11 +2080,7 @@ impl MuxelApp {
         let snapshot = inst.clone();
         inst.session_started = true;
         self.persist();
-        let exists = session_exists_on_disk(
-            snapshot.program.as_deref(),
-            snapshot.session_id.as_deref().unwrap_or_default(),
-        );
-        muxel_core::session_resume_args(&preset, &snapshot, exists)
+        muxel_core::session_resume_args(&preset, &snapshot)
     }
 
     fn command_for(&mut self, instance_id: Uuid) -> CommandSpec {
