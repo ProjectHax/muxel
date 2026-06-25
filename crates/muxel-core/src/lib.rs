@@ -780,18 +780,20 @@ pub struct WindowGeom {
     pub maximized: bool,
 }
 
-/// Metadata for one profile: a named workspace (its own projects + layouts).
+/// Metadata for one workspace: a named workspace (its own projects + layouts).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProfileMeta {
+pub struct WorkspaceMeta {
     pub id: Uuid,
     pub name: String,
 }
 
-/// The list of profiles plus the most recently used one (for pre-selection).
+/// The list of workspaces plus the most recently used one (for pre-selection).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ProfilesIndex {
-    #[serde(default)]
-    pub profiles: Vec<ProfileMeta>,
+pub struct WorkspacesIndex {
+    // `alias = "profiles"` reads the pre-rename index (`{"profiles": [...]}`) so
+    // existing setups aren't lost; muxel rewrites it as `workspaces` on next save.
+    #[serde(default, alias = "profiles")]
+    pub workspaces: Vec<WorkspaceMeta>,
     #[serde(default)]
     pub current: Option<Uuid>,
 }
@@ -950,7 +952,7 @@ impl Default for Settings {
 /// v4: added the Amp (ampcode) preset.
 /// v5: added the Grok (x.ai) preset.
 /// v6: opencode default runner startup delay.
-pub const PRESET_SEED_VERSION: u32 = 6;
+pub const PRESET_SEED_VERSION: u32 = 7;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
@@ -1094,6 +1096,16 @@ mod settings_tests {
         assert_eq!(back.post_run, PostRunAction::Leave);
         // `loops` defaults empty on an old config that lacks the field.
         assert!(Settings::default().loops.is_empty());
+    }
+
+    #[test]
+    fn workspaces_index_reads_legacy_profiles_key() {
+        // The pre-rename index used a "profiles" key; the serde alias keeps
+        // existing setups loadable so a user's workspace list isn't lost.
+        let json = r#"{"profiles":[{"id":"00000000-0000-0000-0000-000000000001","name":"Default"}],"current":"00000000-0000-0000-0000-000000000001"}"#;
+        let idx: WorkspacesIndex = serde_json::from_str(json).unwrap();
+        assert_eq!(idx.workspaces.len(), 1);
+        assert_eq!(idx.workspaces[0].name, "Default");
     }
 }
 

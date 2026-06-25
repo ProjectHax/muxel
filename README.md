@@ -35,8 +35,8 @@ embeds a real terminal emulator over a PTY.
   layout syncs to the host, so another machine restores the session).
 - **Editor & tools** — a built-in code editor, a git-diff viewer, a Ctrl+P file/
   command palette, and per-project startup-agent sets.
-- **Persistence & profiles** — projects, pane layouts, split sizes, tabs, and
-  window geometry are saved and restored; multiple profiles, each with its own
+- **Persistence & workspaces** — projects, pane layouts, split sizes, tabs, and
+  window geometry are saved and restored; multiple workspaces, each with its own
   workspace.
 - **In-app updates** — check for and apply updates from within the app.
 

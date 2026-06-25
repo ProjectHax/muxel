@@ -17,9 +17,9 @@ use gpui_component::tag::Tag;
 use gpui_component::{button::*, *};
 use muxel_core::{
     AgentPreset, FocusDir, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule, MEMORY_DIR,
-    MEMORY_FILE, PaneNode, PostRunAction, ProfileMeta, ProfilesIndex, Project, RemoteHost,
-    RemoteLayout, RemoteRef, ResolvedLaunch, Runner, SplitDirection, SshAuth, StartupAgent,
-    Workspace, Worktree, add_tab, add_tab_at, focus_in_direction, memory_instruction,
+    MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteRef,
+    ResolvedLaunch, Runner, SplitDirection, SshAuth, StartupAgent, Workspace, WorkspaceMeta,
+    WorkspacesIndex, Worktree, add_tab, add_tab_at, focus_in_direction, memory_instruction,
     migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove,
     resolve_launch, set_active_tab, set_split_sizes, set_tab_order, split, split_beside,
     swap_instances, swap_panes,
@@ -334,7 +334,7 @@ pub fn register_actions(cx: &mut App) {
                 // Quit outright when there's nothing to confirm: the first-run
                 // screens (nothing running yet), or a second Cmd+Q while the
                 // confirm modal is already up — same as clicking its Quit button.
-                if this.show_terms || this.show_profile_selector || this.show_quit_confirm {
+                if this.show_terms || this.show_workspace_selector || this.show_quit_confirm {
                     this.confirm_quit = true;
                     cx.quit();
                 } else {
@@ -811,14 +811,14 @@ pub struct MuxelApp {
     settings_scroll: ScrollHandle,
     /// Live state captured on open so the settings Cancel button can revert.
     settings_snapshot: Option<SettingsSnapshot>,
-    /// The active profile (None until one is chosen in the selector).
-    current_profile: Option<Uuid>,
-    /// All profiles + the last-used one (for pre-selection).
-    profiles: ProfilesIndex,
-    /// Whether the profile selector screen is shown (always true at launch).
-    show_profile_selector: bool,
-    /// "New profile" name editor used in the selector.
-    profile_name_input: Entity<InputState>,
+    /// The active workspace (None until one is chosen in the selector).
+    current_workspace: Option<Uuid>,
+    /// All workspaces + the last-used one (for pre-selection).
+    workspaces: WorkspacesIndex,
+    /// Whether the workspace selector screen is shown (always true at launch).
+    show_workspace_selector: bool,
+    /// "New workspace" name editor used in the selector.
+    workspace_name_input: Entity<InputState>,
     /// Settings modal size (resizable via the bottom-right corner).
     settings_size: gpui::Size<Pixels>,
     /// Cached definite inner width of the settings content pane (updated each
@@ -867,7 +867,7 @@ pub struct MuxelApp {
     /// While dragging a tab/pane over a pane body: (leaf anchor, zone) for the
     /// edge-split highlight. Mutually exclusive with `tab_drop` (strip vs body).
     pane_drop: Option<(Uuid, DropZone)>,
-    /// A destructive action awaiting confirmation (delete profile/agent, close).
+    /// A destructive action awaiting confirmation (delete workspace/agent, close).
     confirm: Option<PendingConfirm>,
     /// Dirty worktrees awaiting a Commit/Discard/Keep decision (modal shows front).
     pending_worktree_dispose: std::collections::VecDeque<WorktreeDispose>,
@@ -1164,7 +1164,7 @@ impl PopoutView {
 /// A destructive action awaiting user confirmation.
 #[derive(Clone)]
 enum ConfirmAction {
-    DeleteProfile(Uuid),
+    DeleteWorkspace(Uuid),
     DeletePreset(usize),
     DeleteProject(Uuid),
     DeleteRunner(usize),
@@ -1615,14 +1615,14 @@ impl MuxelApp {
         )
         .detach();
 
-        let profile_name_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("New profile name"));
+        let workspace_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("New workspace name"));
         cx.subscribe_in(
-            &profile_name_input,
+            &workspace_name_input,
             window,
             |this, _input, ev: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { .. } = ev {
-                    this.create_profile_from_input(window, cx);
+                    this.create_workspace_from_input(window, cx);
                 }
             },
         )
@@ -1771,8 +1771,8 @@ impl MuxelApp {
         let show_terms = settings.accepted_terms_version < muxel_core::CURRENT_TERMS_VERSION;
         let install_kind = crate::update::InstallKind::detect();
 
-        // Ensure a profiles index exists (migrating a legacy workspace once).
-        let profiles = muxel_store::migrate_to_profiles();
+        // Ensure a workspaces index exists (migrating a legacy workspace once).
+        let workspaces = muxel_store::migrate_to_workspaces();
 
         let this = Self {
             workspace: Workspace::default(),
@@ -1807,10 +1807,10 @@ impl MuxelApp {
             collapsed: HashSet::new(),
             settings_scroll: ScrollHandle::new(),
             settings_snapshot: None,
-            current_profile: None,
-            profiles,
-            show_profile_selector: true,
-            profile_name_input,
+            current_workspace: None,
+            workspaces,
+            show_workspace_selector: true,
+            workspace_name_input,
             settings_size: size(px(780.0), px(620.0)),
             settings_pane_w: px(560.0),
             settings_offset: point(px(0.0), px(0.0)),
@@ -1912,8 +1912,8 @@ impl MuxelApp {
                 .unwrap_or(true)
         });
 
-        // No workspace is loaded yet — the profile selector (shown at launch)
-        // calls `enter_profile`, which loads the chosen profile's workspace.
+        // No workspace is loaded yet — the workspace selector (shown at launch)
+        // calls `enter_workspace`, which loads the chosen workspace.
         this
     }
 
@@ -2121,7 +2121,7 @@ impl MuxelApp {
             }
             i
         });
-        let resolved = inst_owned
+        let mut resolved = inst_owned
             .as_ref()
             .map(resolve_launch)
             .unwrap_or(ResolvedLaunch {
@@ -2132,6 +2132,11 @@ impl MuxelApp {
                 submit: true,
                 env: Vec::new(),
             });
+        // The session flag goes ahead of model / system-prompt args.
+        if let Some(mut resume) = resume_args {
+            resume.append(&mut resolved.args);
+            resolved.args = resume;
+        }
         // Classify on the agent program (the matches below consume resolved.program).
         let agent_program = resolved.program.clone();
 
@@ -2431,10 +2436,10 @@ impl MuxelApp {
 
     /// Persist the current workspace to disk (best-effort).
     fn persist(&self) {
-        let Some(id) = self.current_profile else {
-            return; // no profile chosen yet (selector still open)
+        let Some(id) = self.current_workspace else {
+            return; // no workspace chosen yet (selector still open)
         };
-        let Some(path) = muxel_store::profile_workspace_path(id) else {
+        let Some(path) = muxel_store::workspace_doc_path(id) else {
             return;
         };
         if let Err(e) = muxel_store::save_workspace_to(&path, &self.workspace) {
@@ -2442,17 +2447,17 @@ impl MuxelApp {
         }
     }
 
-    /// Tear down the current profile's terminals and load another profile's
-    /// workspace. Used at launch (from the selector) and to switch profiles.
-    fn enter_profile(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    /// Tear down the current workspace's terminals and load another workspace's
+    /// workspace. Used at launch (from the selector) and to switch workspaces.
+    fn enter_workspace(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let views: Vec<_> = self.terminals.drain().map(|(_, v)| v).collect();
         for view in views {
             view.read(cx).session().kill();
         }
-        // Editors just drop (unsaved changes lost on profile switch).
+        // Editors just drop (unsaved changes lost on workspace switch).
         self.editors.clear();
         self.pending_editor_redock.clear();
-        // Close + tear down any popped-out panes from the previous profile.
+        // Close + tear down any popped-out panes from the previous workspace.
         for (_, popout) in self.popouts.drain() {
             if let PaneView::Terminal(view) = &popout.view {
                 view.read(cx).session().kill();
@@ -2466,45 +2471,50 @@ impl MuxelApp {
         self.workspace = Workspace::default();
         self.active_instance = None;
 
-        self.current_profile = Some(id);
-        self.profiles.current = Some(id);
-        let _ = muxel_store::save_profiles_index(&self.profiles);
+        self.current_workspace = Some(id);
+        self.workspaces.current = Some(id);
+        let _ = muxel_store::save_workspaces_index(&self.workspaces);
 
-        let loaded = muxel_store::profile_workspace_path(id)
+        let loaded = muxel_store::workspace_doc_path(id)
             .and_then(|p| muxel_store::load_workspace_from(&p))
             .filter(|w| !w.projects.is_empty());
         if let Some(ws) = loaded {
             self.restore(ws, window, cx);
         }
-        // An empty profile starts with no projects — the user adds one with the
+        // An empty workspace starts with no projects — the user adds one with the
         // sidebar's New Project button (no auto-creation in the current folder).
-        self.show_profile_selector = false;
+        self.show_workspace_selector = false;
         cx.notify();
     }
 
-    /// Create a new (empty) profile and enter it.
-    fn create_profile(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// Create a new (empty) workspace and enter it.
+    fn create_workspace(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let id = Uuid::new_v4();
-        self.profiles.profiles.push(ProfileMeta { id, name });
-        let _ = muxel_store::save_profiles_index(&self.profiles);
-        self.enter_profile(id, window, cx);
+        self.workspaces.workspaces.push(WorkspaceMeta { id, name });
+        let _ = muxel_store::save_workspaces_index(&self.workspaces);
+        self.enter_workspace(id, window, cx);
     }
 
-    /// Read the selector's name field and create a profile if non-empty.
-    fn create_profile_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name = self.profile_name_input.read(cx).value().trim().to_string();
+    /// Read the selector's name field and create a workspace if non-empty.
+    fn create_workspace_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self
+            .workspace_name_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
         if name.is_empty() {
             return;
         }
-        self.profile_name_input
+        self.workspace_name_input
             .update(cx, |s, cx| s.set_value("", window, cx));
-        self.create_profile(name, window, cx);
+        self.create_workspace(name, window, cx);
     }
 
-    /// Reopen the selector to switch profiles (pre-selects the current one).
-    fn open_profile_selector(&mut self, cx: &mut Context<Self>) {
-        self.profiles.current = self.current_profile;
-        self.show_profile_selector = true;
+    /// Reopen the selector to switch workspaces (pre-selects the current one).
+    fn open_workspace_selector(&mut self, cx: &mut Context<Self>) {
+        self.workspaces.current = self.current_workspace;
+        self.show_workspace_selector = true;
         cx.notify();
     }
 
@@ -5242,13 +5252,13 @@ impl MuxelApp {
         );
     }
 
-    /// Save the local layout being replaced to `<profile>/backups/<pid>-<ts>.json`
+    /// Save the local layout being replaced to `<workspace>/backups/<pid>-<ts>.json`
     /// so a newer-remote pull can't silently lose work. Best-effort.
     fn backup_local_layout(&self, pid: Uuid, local: &RemoteLayout, ts: u64) {
-        let Some(profile) = self.current_profile else {
+        let Some(workspace) = self.current_workspace else {
             return;
         };
-        let Some(dir) = muxel_store::profile_workspace_path(profile)
+        let Some(dir) = muxel_store::workspace_doc_path(workspace)
             .and_then(|p| p.parent().map(|d| d.join("backups")))
         else {
             return;
@@ -6212,7 +6222,7 @@ impl MuxelApp {
             return;
         };
         match pending.action {
-            ConfirmAction::DeleteProfile(id) => self.delete_profile(id, cx),
+            ConfirmAction::DeleteWorkspace(id) => self.delete_workspace(id, cx),
             ConfirmAction::DeletePreset(idx) => self.delete_preset(idx, cx),
             ConfirmAction::DeleteProject(pid) => self.delete_project(pid, cx),
             ConfirmAction::DeleteRunner(idx) => self.delete_runner(idx, cx),
@@ -6241,21 +6251,21 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Delete a profile: remove it from the index + delete its workspace file.
-    /// Never deletes the last remaining profile.
-    fn delete_profile(&mut self, id: Uuid, cx: &mut Context<Self>) {
-        if self.profiles.profiles.len() <= 1 {
+    /// Delete a workspace: remove it from the index + delete its workspace file.
+    /// Never deletes the last remaining workspace.
+    fn delete_workspace(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.workspaces.workspaces.len() <= 1 {
             return;
         }
-        self.profiles.profiles.retain(|p| p.id != id);
-        if self.profiles.current == Some(id) {
-            self.profiles.current = self.profiles.profiles.first().map(|p| p.id);
+        self.workspaces.workspaces.retain(|p| p.id != id);
+        if self.workspaces.current == Some(id) {
+            self.workspaces.current = self.workspaces.workspaces.first().map(|p| p.id);
         }
-        if self.current_profile == Some(id) {
-            self.current_profile = None;
+        if self.current_workspace == Some(id) {
+            self.current_workspace = None;
         }
-        let _ = muxel_store::save_profiles_index(&self.profiles);
-        if let Some(path) = muxel_store::profile_workspace_path(id) {
+        let _ = muxel_store::save_workspaces_index(&self.workspaces);
+        if let Some(path) = muxel_store::workspace_doc_path(id) {
             let _ = std::fs::remove_file(&path);
             if let Some(dir) = path.parent() {
                 let _ = std::fs::remove_dir(dir);
@@ -7111,7 +7121,7 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Record the dragged sidebar width into the profile + persist.
+    /// Record the dragged sidebar width into the workspace + persist.
     fn set_sidebar_width(&mut self, width: f32, _cx: &mut Context<Self>) {
         if self.workspace.sidebar_width != Some(width) {
             self.workspace.sidebar_width = Some(width);
@@ -8390,7 +8400,7 @@ impl MuxelApp {
         }
     }
 
-    /// Full-window profile picker, shown at launch and when switching profiles.
+    /// Full-window workspace picker, shown at launch and when switching workspaces.
     /// First-run Terms of Service / Privacy acceptance, shown full-window before
     /// anything else until the current terms version is accepted.
     fn render_terms_screen(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -8510,19 +8520,19 @@ impl MuxelApp {
             .into_any_element()
     }
 
-    fn render_profile_selector(&self, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.profiles.current;
+    fn render_workspace_selector(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.workspaces.current;
         let hover_bg = cx.theme().sidebar_accent.opacity(0.5);
-        let can_delete = self.profiles.profiles.len() > 1;
+        let can_delete = self.workspaces.workspaces.len() > 1;
         let mut list = v_flex().gap_1().w_full();
-        for meta in &self.profiles.profiles {
+        for meta in &self.workspaces.workspaces {
             let id = meta.id;
             let name = meta.name.clone();
             let selected = current == Some(id);
             list =
                 list.child(
                     div()
-                        .id(SharedString::from(format!("profile-{}", id.simple())))
+                        .id(SharedString::from(format!("workspace-{}", id.simple())))
                         .px_3()
                         .py_2()
                         .rounded(cx.theme().radius)
@@ -8544,35 +8554,35 @@ impl MuxelApp {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _ev, window, cx| {
-                                this.enter_profile(id, window, cx)
+                                this.enter_workspace(id, window, cx)
                             }),
                         )
                         .child(Icon::new(IconName::Folder).small())
                         .child(div().flex_1().text_sm().child(meta.name.clone()))
                         .children(can_delete.then(|| {
                             let label = name.clone();
-                            // stop_propagation so the click doesn't also enter the profile.
+                            // stop_propagation so the click doesn't also enter the workspace.
                             div()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(
                                     Button::new(SharedString::from(format!(
-                                        "del-profile-{}",
+                                        "del-workspace-{}",
                                         id.simple()
                                     )))
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Close)
-                                    .tooltip("Delete profile")
+                                    .tooltip("Delete workspace")
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
                                         this.request_confirm(
-                                            "Delete profile?",
-                                            format!(
-                                                "Profile “{label}” and its layout will be deleted."
-                                            ),
-                                            "Delete",
-                                            ConfirmAction::DeleteProfile(id),
-                                            cx,
-                                        )
+                                        "Delete workspace?",
+                                        format!(
+                                            "Workspace “{label}” and its layout will be deleted."
+                                        ),
+                                        "Delete",
+                                        ConfirmAction::DeleteWorkspace(id),
+                                        cx,
+                                    )
                                     })),
                                 )
                         })),
@@ -8588,16 +8598,16 @@ impl MuxelApp {
             .border_color(cx.theme().border)
             .bg(cx.theme().background)
             .shadow_lg()
-            .child(div().text_xl().font_semibold().child("Choose a profile"))
+            .child(div().text_xl().font_semibold().child("Choose a workspace"))
             .child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Each profile keeps its own projects and terminal layout."),
+                    .child("Each workspace keeps its own projects and terminal layout."),
             )
             .child(
                 div()
-                    .id("profiles-list")
+                    .id("workspaces-list")
                     .max_h(px(320.0))
                     .overflow_y_scroll()
                     .child(list),
@@ -8610,18 +8620,18 @@ impl MuxelApp {
                     .pt_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(div().flex_1().child(Input::new(&self.profile_name_input)))
+                    .child(div().flex_1().child(Input::new(&self.workspace_name_input)))
                     .child(
-                        Button::new("create-profile")
+                        Button::new("create-workspace")
                             .primary()
                             .label("Create")
                             .on_click(cx.listener(|this, _e, window, cx| {
-                                this.create_profile_from_input(window, cx)
+                                this.create_workspace_from_input(window, cx)
                             })),
                     ),
             );
 
-        // Always offer a way out (otherwise first-run users with no profile yet
+        // Always offer a way out (otherwise first-run users with no workspace yet
         // are trapped); when switching at runtime, also allow backing out.
         card =
             card.child(
@@ -8635,12 +8645,12 @@ impl MuxelApp {
                             cx.quit();
                         }),
                     ))
-                    .children(self.current_profile.is_some().then(|| {
+                    .children(self.current_workspace.is_some().then(|| {
                         Button::new("cancel-selector")
                             .ghost()
                             .label("Cancel")
                             .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.show_profile_selector = false;
+                                this.show_workspace_selector = false;
                                 cx.notify();
                             }))
                     })),
@@ -10188,7 +10198,7 @@ impl MuxelApp {
             )
     }
 
-    fn render_titlebar(&self, project_name: String, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_titlebar(&self, workspace_name: String, cx: &mut Context<Self>) -> impl IntoElement {
         // The TitleBar registers the whole bar as a window-drag region (mouse-down
         // then start_window_move on the next move). A button click with the
         // slightest movement would start a window move and swallow the click — so
@@ -10227,7 +10237,7 @@ impl MuxelApp {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(project_name),
+                            .child(workspace_name),
                     )
                     .child(div().flex_1())
                     .child(nodrag(
@@ -10259,15 +10269,13 @@ impl MuxelApp {
                             ),
                     ))
                     .child(nodrag(
-                        Button::new("profiles")
+                        Button::new("workspaces")
                             .ghost()
                             .icon(IconName::CircleUser)
-                            .tooltip("Switch profile")
-                            .on_click(
-                                cx.listener(|this, _ev, _window, cx| {
-                                    this.open_profile_selector(cx)
-                                }),
-                            ),
+                            .tooltip("Switch workspace")
+                            .on_click(cx.listener(|this, _ev, _window, cx| {
+                                this.open_workspace_selector(cx)
+                            })),
                     ))
                     .child(nodrag(
                         Button::new("dashboard")
@@ -14246,7 +14254,7 @@ impl Render for MuxelApp {
                 )
                 .into_any_element();
         }
-        if self.show_profile_selector {
+        if self.show_workspace_selector {
             return div()
                 .size_full()
                 .flex()
@@ -14258,7 +14266,7 @@ impl Render for MuxelApp {
                         .flex_1()
                         .min_h_0()
                         .relative()
-                        .child(self.render_profile_selector(cx))
+                        .child(self.render_workspace_selector(cx))
                         .children(
                             self.confirm
                                 .is_some()
@@ -14270,10 +14278,12 @@ impl Render for MuxelApp {
         // Rebuild any editors awaiting re-dock (needs the main window).
         self.drain_editor_redocks(window, cx);
 
+        // The title bar shows the active *workspace* name (next to "muxel"), not
+        // the highlighted project.
         let active_name = self
-            .workspace
-            .active()
-            .map(|p| p.name.clone())
+            .current_workspace
+            .and_then(|id| self.workspaces.workspaces.iter().find(|w| w.id == id))
+            .map(|w| w.name.clone())
             .unwrap_or_default();
         let active_layout = self.workspace.active().and_then(|p| p.layout.clone());
 
@@ -14328,7 +14338,7 @@ impl Render for MuxelApp {
                 .clamp(180.0, fb_half);
             let fb_key = SharedString::from(format!(
                 "fb-split-{}",
-                self.current_profile
+                self.current_workspace
                     .map(|p| p.simple().to_string())
                     .unwrap_or_default()
             ));
@@ -14363,10 +14373,10 @@ impl Render for MuxelApp {
                 .sidebar_width
                 .unwrap_or(232.0)
                 .clamp(160.0, half);
-            // Key the resize state by profile so each profile's saved width seeds.
+            // Key the resize state by workspace so each workspace's saved width seeds.
             let key = SharedString::from(format!(
                 "sidebar-split-{}",
-                self.current_profile
+                self.current_workspace
                     .map(|p| p.simple().to_string())
                     .unwrap_or_default()
             ));

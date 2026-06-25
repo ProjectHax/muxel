@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use muxel_core::{ProfileMeta, ProfilesIndex, Settings, Uuid, WindowGeom, Workspace};
+use muxel_core::{Settings, Uuid, WindowGeom, Workspace, WorkspaceMeta, WorkspacesIndex};
 use std::path::{Path, PathBuf};
 
 /// The muxel config directory (e.g. `~/.config/muxel` on Linux).
@@ -149,87 +149,99 @@ pub fn save_window_geom(geom: &WindowGeom) -> Result<()> {
     Ok(())
 }
 
-// ---- Profiles: each profile owns a workspace; UI settings stay global. ----
+// ---- Workspaces: each owns its own projects + layout; settings stay global. ----
 
-/// The profiles directory (`<data_dir>/profiles`).
-pub fn profiles_dir() -> Option<PathBuf> {
-    data_dir().map(|d| d.join("profiles"))
+/// The workspaces directory (`<data_dir>/workspaces`).
+pub fn workspaces_dir() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("workspaces"))
 }
 
-/// Path to a profile's workspace document.
-pub fn profile_workspace_path(id: Uuid) -> Option<PathBuf> {
-    profiles_dir().map(|d| d.join(id.to_string()).join("workspace.json"))
+/// Path to a workspace's saved document.
+pub fn workspace_doc_path(id: Uuid) -> Option<PathBuf> {
+    workspaces_dir().map(|d| d.join(id.to_string()).join("workspace.json"))
 }
 
-/// Path to the profiles index document.
-pub fn profiles_index_path() -> Option<PathBuf> {
-    data_dir().map(|d| d.join("profiles.json"))
+/// Path to the workspaces index document.
+pub fn workspaces_index_path() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("workspaces.json"))
 }
 
-/// Load the profiles index (empty if missing/invalid).
-pub fn load_profiles_index() -> ProfilesIndex {
-    profiles_index_path()
-        .map(|p| load_profiles_index_from(&p))
+/// Load the workspaces index (empty if missing/invalid).
+pub fn load_workspaces_index() -> WorkspacesIndex {
+    workspaces_index_path()
+        .map(|p| load_workspaces_index_from(&p))
         .unwrap_or_default()
 }
 
-/// Load a profiles index from an explicit path.
-pub fn load_profiles_index_from(path: &Path) -> ProfilesIndex {
+/// Load a workspaces index from an explicit path.
+pub fn load_workspaces_index_from(path: &Path) -> WorkspacesIndex {
     match std::fs::read_to_string(path) {
         Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-            log::warn!("ignoring invalid profiles index at {}: {e}", path.display());
-            ProfilesIndex::default()
+            log::warn!(
+                "ignoring invalid workspaces index at {}: {e}",
+                path.display()
+            );
+            WorkspacesIndex::default()
         }),
-        Err(_) => ProfilesIndex::default(),
+        Err(_) => WorkspacesIndex::default(),
     }
 }
 
-/// Save the profiles index to the default location.
-pub fn save_profiles_index(index: &ProfilesIndex) -> Result<()> {
-    let path = profiles_index_path().context("could not determine data directory")?;
-    save_profiles_index_to(&path, index)
+/// Save the workspaces index to the default location.
+pub fn save_workspaces_index(index: &WorkspacesIndex) -> Result<()> {
+    let path = workspaces_index_path().context("could not determine data directory")?;
+    save_workspaces_index_to(&path, index)
 }
 
-/// Save a profiles index to an explicit path, atomically (temp file + rename).
-pub fn save_profiles_index_to(path: &Path, index: &ProfilesIndex) -> Result<()> {
+/// Save a workspaces index to an explicit path, atomically (temp file + rename).
+pub fn save_workspaces_index_to(path: &Path, index: &WorkspacesIndex) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating data dir {}", parent.display()))?;
     }
-    let json = serde_json::to_string_pretty(index).context("serializing profiles index")?;
+    let json = serde_json::to_string_pretty(index).context("serializing workspaces index")?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
 
-/// Ensure a profiles index exists. On first run, migrate a legacy single
-/// `workspace.json` into a "Default" profile (or seed an empty one).
-pub fn migrate_to_profiles() -> ProfilesIndex {
+/// Ensure a workspaces index exists. On first run, migrate a legacy single
+/// `workspace.json` into a "Default" workspace (or seed an empty one).
+pub fn migrate_to_workspaces() -> WorkspacesIndex {
     match data_dir() {
-        Some(base) => migrate_profiles_at(&base),
-        None => ProfilesIndex::default(),
+        Some(base) => migrate_workspaces_at(&base),
+        None => WorkspacesIndex::default(),
     }
 }
 
 /// Migration core, parameterized by the data dir for testability.
-fn migrate_profiles_at(base: &Path) -> ProfilesIndex {
-    let index_path = base.join("profiles.json");
+fn migrate_workspaces_at(base: &Path) -> WorkspacesIndex {
+    // Carry the pre-rename on-disk layout (`profiles.json` + `profiles/`) over to
+    // the new names, once, so existing setups aren't lost. Each is independent in
+    // case only one moved last time.
+    if base.join("profiles.json").exists() && !base.join("workspaces.json").exists() {
+        let _ = std::fs::rename(base.join("profiles.json"), base.join("workspaces.json"));
+    }
+    if base.join("profiles").is_dir() && !base.join("workspaces").exists() {
+        let _ = std::fs::rename(base.join("profiles"), base.join("workspaces"));
+    }
+    let index_path = base.join("workspaces.json");
     if index_path.exists() {
-        return load_profiles_index_from(&index_path);
+        return load_workspaces_index_from(&index_path);
     }
     let id = Uuid::new_v4();
-    let index = ProfilesIndex {
-        profiles: vec![ProfileMeta {
+    let index = WorkspacesIndex {
+        workspaces: vec![WorkspaceMeta {
             id,
             name: "Default".to_string(),
         }],
         current: Some(id),
     };
-    // Move the legacy single workspace.json into the new profile, if present.
+    // Move the legacy single workspace.json into the new workspace, if present.
     let legacy = base.join("workspace.json");
     let dest = base
-        .join("profiles")
+        .join("workspaces")
         .join(id.to_string())
         .join("workspace.json");
     if legacy.exists() {
@@ -241,7 +253,7 @@ fn migrate_profiles_at(base: &Path) -> ProfilesIndex {
             let _ = std::fs::remove_file(&legacy);
         }
     }
-    let _ = save_profiles_index_to(&index_path, &index);
+    let _ = save_workspaces_index_to(&index_path, &index);
     index
 }
 
@@ -249,8 +261,8 @@ fn migrate_profiles_at(base: &Path) -> ProfilesIndex {
 mod tests {
     use super::*;
     use muxel_core::{
-        AgentPreset, EnvVar, Instance, InstanceKind, PaneNode, ProfileMeta, ProfilesIndex, Project,
-        Settings, Uuid, WindowGeom,
+        AgentPreset, EnvVar, Instance, InstanceKind, PaneNode, Project, Settings, Uuid, WindowGeom,
+        WorkspaceMeta, WorkspacesIndex,
     };
 
     #[test]
@@ -483,24 +495,63 @@ mod tests {
     }
 
     #[test]
-    fn profiles_index_round_trips() {
-        let dir = std::env::temp_dir().join("muxel-store-test-profiles-rt");
+    fn workspaces_index_round_trips() {
+        let dir = std::env::temp_dir().join("muxel-store-test-workspaces-rt");
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("profiles.json");
+        let path = dir.join("workspaces.json");
         let id = Uuid::new_v4();
-        let index = ProfilesIndex {
-            profiles: vec![ProfileMeta {
+        let index = WorkspacesIndex {
+            workspaces: vec![WorkspaceMeta {
                 id,
                 name: "Work".to_string(),
             }],
             current: Some(id),
         };
-        save_profiles_index_to(&path, &index).expect("save");
-        let loaded = load_profiles_index_from(&path);
-        assert_eq!(loaded.profiles.len(), 1);
-        assert_eq!(loaded.profiles[0].name, "Work");
+        save_workspaces_index_to(&path, &index).expect("save");
+        let loaded = load_workspaces_index_from(&path);
+        assert_eq!(loaded.workspaces.len(), 1);
+        assert_eq!(loaded.workspaces[0].name, "Work");
         assert_eq!(loaded.current, Some(id));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_renames_legacy_profiles_dir_and_index() {
+        let base = std::env::temp_dir().join("muxel-store-test-migrate-rename");
+        let _ = std::fs::remove_dir_all(&base);
+        let id = Uuid::new_v4();
+        // Lay down the pre-rename on-disk shape (profiles.json + profiles/<id>/).
+        std::fs::create_dir_all(base.join("profiles").join(id.to_string())).unwrap();
+        std::fs::write(
+            base.join("profiles.json"),
+            format!(r#"{{"profiles":[{{"id":"{id}","name":"Legacy"}}],"current":"{id}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("profiles")
+                .join(id.to_string())
+                .join("workspace.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let index = migrate_workspaces_at(&base);
+
+        // Renamed on disk; the old paths are gone.
+        assert!(base.join("workspaces.json").exists());
+        assert!(
+            base.join("workspaces")
+                .join(id.to_string())
+                .join("workspace.json")
+                .exists()
+        );
+        assert!(!base.join("profiles.json").exists());
+        assert!(!base.join("profiles").exists());
+        // The legacy "profiles" key was read through the alias — list preserved.
+        assert_eq!(index.workspaces.len(), 1);
+        assert_eq!(index.workspaces[0].name, "Legacy");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -513,22 +564,22 @@ mod tests {
         ws.add_project(Project::new("legacy", "/tmp/legacy"));
         save_workspace_to(&base.join("workspace.json"), &ws).expect("seed legacy");
 
-        let index = migrate_profiles_at(&base);
-        assert_eq!(index.profiles.len(), 1);
-        assert_eq!(index.profiles[0].name, "Default");
-        let id = index.profiles[0].id;
+        let index = migrate_workspaces_at(&base);
+        assert_eq!(index.workspaces.len(), 1);
+        assert_eq!(index.workspaces[0].name, "Default");
+        let id = index.workspaces[0].id;
         assert_eq!(index.current, Some(id));
 
-        // Legacy file moved into the profile directory.
+        // Legacy file moved into the workspace directory.
         assert!(!base.join("workspace.json").exists());
         let moved = base
-            .join("profiles")
+            .join("workspaces")
             .join(id.to_string())
             .join("workspace.json");
         assert_eq!(load_workspace_from(&moved).unwrap().projects.len(), 1);
 
         // Re-running is idempotent (index already exists).
-        assert_eq!(migrate_profiles_at(&base).profiles[0].id, id);
+        assert_eq!(migrate_workspaces_at(&base).workspaces[0].id, id);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

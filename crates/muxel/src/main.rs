@@ -18,7 +18,7 @@ mod update;
 
 use app::MuxelApp;
 use gpui::*;
-use gpui_component::{Root, TitleBar, *};
+use gpui_component::{Root, TitleBar, button::*, *};
 use std::borrow::Cow;
 
 /// muxel's own bundled SVG assets: agent logos under `icons/agent-*.svg`, plus

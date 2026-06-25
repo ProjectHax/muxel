@@ -18,7 +18,7 @@ Cargo workspace, four crates (depend downward only):
   (`PaneNode`), agent presets (`AgentPreset`), worktree naming, tmux arg helpers,
   and the persisted `Workspace` / `Project` / `Instance` / `Settings` types. No UI,
   no I/O — fully unit-tested. Most logic that *can* live here, should.
-- `crates/muxel-store` — persistence: profiles, `workspace.json`, and settings,
+- `crates/muxel-store` — persistence: workspaces, `workspace.json`, and settings,
   loaded/saved under the platform config/data dirs (XDG on Linux).
 - `crates/muxel-terminal` — the PTY child + `alacritty_terminal` emulator
   (`TerminalSession`, `session.rs`), its GPUI view + custom paint element
@@ -41,7 +41,7 @@ Cargo workspace, four crates (depend downward only):
   persisted.
 - **Back-compat persistence** — every new field on a persisted struct gets
   `#[serde(default)]` so older `workspace.json` / settings still load. Bump
-  `PRESET_SEED_VERSION` when adding a built-in preset so existing profiles merge it.
+  `PRESET_SEED_VERSION` when adding a built-in preset so existing workspaces merge it.
 - **GPUI patterns** — render builds an element tree with `div()…`; handlers use
   `cx.listener(|this, ev, window, cx| …)`; the terminal is a custom `Element`
   (manual layout/paint). Mouse `on_drag_move` fires for all listeners — guard with
@@ -74,7 +74,7 @@ cargo build -p muxel                                     # the GUI binary
 Unit tests can't see the UI, so for anything visual:
 
 - **Smoke test** (does it launch without panicking?) — run the binary against an
-  isolated profile with a timeout; exit code `124` means it stayed up (good):
+  isolated workspace with a timeout; exit code `124` means it stayed up (good):
 
   ```sh
   s=$(mktemp -d); XDG_CONFIG_HOME="$s/config" XDG_DATA_HOME="$s/data" \
@@ -82,7 +82,7 @@ Unit tests can't see the UI, so for anything visual:
   ```
 
 - **Interactive** — `scripts/dev.sh` runs muxel against an isolated sandbox
-  (`.muxel-dev/`) so testing never touches the real profile. A fresh profile shows
+  (`.muxel-dev/`) so testing never touches the real workspace. A fresh workspace shows
   the first-run welcome dialog; accepted-terms / window geometry / layout live
   under the sandbox's data dir.
 - State each visual behavior that needs a human's eyes — the harness can build and
