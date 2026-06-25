@@ -9737,7 +9737,7 @@ impl MuxelApp {
                         .ghost()
                         .small()
                         .icon(agent_icon_obj(current_program.as_deref()))
-                        .label(format!("New: {current_name}"))
+                        .label(current_name.clone())
                         .tooltip("New pane with the current preset")
                         .on_click(cx.listener(|this, _ev, window, cx| {
                             this.add_agent(SplitDirection::Horizontal, window, cx)
