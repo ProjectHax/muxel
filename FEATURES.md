@@ -60,6 +60,12 @@ feature is added or changed, update the matching entry here in the same change**
   detected and spawnable the same as from a terminal.
 - **Graceful launch failure** — if an agent can't be spawned, the pane falls back
   to a shell showing the underlying error instead of crashing.
+- **Session resume** — resume-capable agents (Claude out of the box) get a stable
+  per-pane session id: muxel launches with `--session-id` the first time and
+  `--resume` on restart, so a pane reopens its previous conversation instead of
+  starting fresh. If the saved session is gone, it quietly starts a new one in the
+  same slot. Configurable per preset (`session_id_flag` / `resume_flag`), so other
+  agents can opt in.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Shared project memory** — opt-in per project: agents are told (via their system

@@ -216,6 +216,30 @@ fn shell_dir_title(osc: &str) -> &str {
     }
 }
 
+/// Best-effort: does a resume-capable agent's saved session still exist on disk?
+/// Only Claude's layout is known (`~/.claude/projects/<slug>/<id>.jsonl`); since
+/// the id is globally unique we just scan for `<id>.jsonl` and ignore the slug.
+/// For any other program, assume it exists (let the agent decide on launch).
+fn session_exists_on_disk(program: Option<&str>, id: &str) -> bool {
+    let is_claude = program.is_some_and(|p| {
+        std::path::Path::new(p)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("claude"))
+    });
+    if !is_claude || id.is_empty() {
+        return true;
+    }
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERWORKSPACE")) else {
+        return true;
+    };
+    let projects = std::path::Path::new(&home).join(".claude").join("projects");
+    let file = format!("{id}.jsonl");
+    std::fs::read_dir(&projects)
+        .map(|dirs| dirs.flatten().any(|e| e.path().join(&file).is_file()))
+        .unwrap_or(false)
+}
+
 /// Instance a clicked desktop notification wants muxel to jump to. Set from the
 /// notification's D-Bus action thread (off the UI thread); drained on the UI
 /// thread by `handle_notification_click` each tick.
@@ -2029,7 +2053,41 @@ impl MuxelApp {
 
     /// Build the launch command for an instance (program/args + system-prompt
     /// injection, rooted at its project).
-    fn command_for(&self, instance_id: Uuid) -> CommandSpec {
+    /// Session-resume args for a resume-capable agent, doing the `&mut`
+    /// bookkeeping: generate a stable session id on first launch, flip
+    /// `session_started`, and persist. Returns the CLI args to inject, or `None`
+    /// for agents/instances without resume. First launch starts the session with
+    /// `--session-id <id>`; later launches `--resume <id>`, falling back to a fresh
+    /// `--session-id <id>` if the saved session is gone.
+    fn session_resume_for(&mut self, iid: Uuid) -> Option<Vec<String>> {
+        let inst = self.workspace.instance(iid)?;
+        let preset = inst
+            .preset_id
+            .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
+            .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
+        if preset.session_id_flag.is_none() || preset.resume_flag.is_none() {
+            return None;
+        }
+        let preset = preset.clone();
+        let inst = self.workspace.instance_mut(iid)?;
+        if inst.session_id.is_none() {
+            inst.session_id = Some(Uuid::new_v4().to_string());
+        }
+        let snapshot = inst.clone();
+        inst.session_started = true;
+        self.persist();
+        let exists = session_exists_on_disk(
+            snapshot.program.as_deref(),
+            snapshot.session_id.as_deref().unwrap_or_default(),
+        );
+        muxel_core::session_resume_args(&preset, &snapshot, exists)
+    }
+
+    fn command_for(&mut self, instance_id: Uuid) -> CommandSpec {
+        // Resume-capable agents (e.g. Claude): give the pane a stable session id and
+        // resolve the --session-id / --resume flag *before* anything borrows the
+        // instance. Mutates + persists the instance's session bookkeeping.
+        let resume_args = self.session_resume_for(instance_id);
         let inst = self.workspace.instance(instance_id);
         let project = inst.and_then(|i| self.workspace.project(i.project_id));
         // Shared project memory: for an agent in a memory-enabled project, append an

@@ -79,6 +79,15 @@ pub struct AgentPreset {
     /// draw (e.g. opencode). 0 = auto: wait until output goes quiet instead.
     #[serde(default)]
     pub startup_delay_ms: u32,
+    /// CLI flag that starts a conversation with a chosen session ID (e.g. Claude's
+    /// `--session-id <uuid>`). Paired with `resume_flag`, it lets muxel give each
+    /// pane a stable session and resume it on restart. `None` = no resume support.
+    #[serde(default)]
+    pub session_id_flag: Option<String>,
+    /// CLI flag that resumes a conversation by session ID (e.g. Claude's
+    /// `--resume <uuid>`). Only meaningful alongside `session_id_flag`.
+    #[serde(default)]
+    pub resume_flag: Option<String>,
 }
 
 impl AgentPreset {
@@ -98,6 +107,8 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            session_id_flag: None,
+            resume_flag: None,
         }
     }
 
@@ -119,6 +130,8 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            session_id_flag: Some("--session-id".to_string()),
+            resume_flag: Some("--resume".to_string()),
         }
     }
 
@@ -139,6 +152,8 @@ impl AgentPreset {
             blocked_markers: Vec::new(),
             // opencode keeps loading well after its first draw; wait before typing.
             startup_delay_ms: 6000,
+            session_id_flag: None,
+            resume_flag: None,
         }
     }
 
@@ -159,6 +174,8 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            session_id_flag: None,
+            resume_flag: None,
         }
     }
 
@@ -179,6 +196,8 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            session_id_flag: None,
+            resume_flag: None,
         }
     }
 
@@ -198,6 +217,8 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            session_id_flag: None,
+            resume_flag: None,
         }
     }
 
@@ -218,6 +239,8 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            session_id_flag: None,
+            resume_flag: None,
         }
     }
 
@@ -238,6 +261,8 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            session_id_flag: None,
+            resume_flag: None,
         }
     }
 
@@ -325,6 +350,29 @@ pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
     }
 }
 
+/// The CLI arguments to start or resume a session for a resume-capable agent.
+///
+/// `None` when the preset has no resume support (`session_id_flag` / `resume_flag`
+/// unset) or the instance has no session id yet. Otherwise `[resume_flag, id]` when
+/// the session was already started and still exists on disk, else
+/// `[session_id_flag, id]` — so a fresh or vanished session starts anew while
+/// keeping the same id (the pane's stable slot).
+pub fn session_resume_args(
+    preset: &AgentPreset,
+    instance: &Instance,
+    session_exists: bool,
+) -> Option<Vec<String>> {
+    let id_flag = preset.session_id_flag.as_deref()?;
+    let resume_flag = preset.resume_flag.as_deref()?;
+    let id = instance.session_id.as_deref()?;
+    let flag = if instance.session_started && session_exists {
+        resume_flag
+    } else {
+        id_flag
+    };
+    Some(vec![flag.to_string(), id.to_string()])
+}
+
 /// Directory (under the project root) holding muxel's per-project files.
 pub const MEMORY_DIR: &str = ".muxel";
 /// The shared per-project agent memory file, inside [`MEMORY_DIR`].
@@ -358,6 +406,45 @@ mod tests {
         let mut i = Instance::from_preset(Uuid::new_v4(), preset);
         i.system_prompt = prompt.map(|p| p.to_string());
         i
+    }
+
+    #[test]
+    fn claude_preset_supports_resume() {
+        let c = AgentPreset::claude();
+        assert_eq!(c.session_id_flag.as_deref(), Some("--session-id"));
+        assert_eq!(c.resume_flag.as_deref(), Some("--resume"));
+        assert!(AgentPreset::shell().session_id_flag.is_none());
+    }
+
+    #[test]
+    fn session_resume_args_session_id_then_resume() {
+        let preset = AgentPreset::claude();
+        let mut inst = instance(&preset, None);
+        // No session id yet → nothing to add.
+        assert_eq!(session_resume_args(&preset, &inst, true), None);
+        // First launch (not started): start the session with a chosen id.
+        inst.session_id = Some("abc".to_string());
+        assert_eq!(
+            session_resume_args(&preset, &inst, true),
+            Some(vec!["--session-id".to_string(), "abc".to_string()])
+        );
+        // Started + still on disk: resume it.
+        inst.session_started = true;
+        assert_eq!(
+            session_resume_args(&preset, &inst, true),
+            Some(vec!["--resume".to_string(), "abc".to_string()])
+        );
+        // Started but the session vanished: start fresh with the same id.
+        assert_eq!(
+            session_resume_args(&preset, &inst, false),
+            Some(vec!["--session-id".to_string(), "abc".to_string()])
+        );
+        // A non-resume agent (shell) never gets resume args.
+        let shell = AgentPreset::shell();
+        let mut s = instance(&shell, None);
+        s.session_id = Some("abc".to_string());
+        s.session_started = true;
+        assert_eq!(session_resume_args(&shell, &s, true), None);
     }
 
     #[test]

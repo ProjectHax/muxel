@@ -11,7 +11,7 @@ pub mod worktree;
 
 pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, ResolvedLaunch, memory_header,
-    memory_instruction, resolve_launch,
+    memory_instruction, resolve_launch, session_resume_args,
 };
 pub use gui_path::augmented_macos_path;
 pub use pane::{
@@ -109,6 +109,15 @@ pub struct Instance {
     /// legacy instance before migration).
     #[serde(default)]
     pub worktree_id: Option<Uuid>,
+    /// Stable session ID for a resume-capable agent (e.g. Claude). muxel launches
+    /// the first time with `--session-id <this>` and resumes with `--resume <this>`
+    /// on restart. `None` until first launch / for agents without resume support.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Whether this instance's session has been launched at least once, so a
+    /// respawn resumes it instead of starting a new conversation.
+    #[serde(default)]
+    pub session_started: bool,
 }
 
 impl Instance {
@@ -145,6 +154,8 @@ impl Instance {
             auto_submit: true,
             pinned: false,
             worktree_id: None,
+            session_id: None,
+            session_started: false,
         }
     }
 
@@ -189,6 +200,8 @@ impl Instance {
             auto_submit: false,
             pinned: false,
             worktree_id: None,
+            session_id: None,
+            session_started: false,
         }
     }
 }
@@ -971,6 +984,21 @@ impl Settings {
                 for p in self.presets.iter_mut() {
                     if p.name == builtin.name && p.startup_delay_ms == 0 {
                         p.startup_delay_ms = builtin.startup_delay_ms;
+                    }
+                }
+            }
+        }
+        // Give matching built-in presets the session-resume flags (new fields)
+        // without overwriting user edits, so e.g. an existing Claude preset gains
+        // resume-on-restart after upgrading.
+        for builtin in AgentPreset::defaults() {
+            for p in self.presets.iter_mut() {
+                if p.name == builtin.name {
+                    if p.session_id_flag.is_none() {
+                        p.session_id_flag = builtin.session_id_flag.clone();
+                    }
+                    if p.resume_flag.is_none() {
+                        p.resume_flag = builtin.resume_flag.clone();
                     }
                 }
             }
