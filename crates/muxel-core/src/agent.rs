@@ -91,11 +91,38 @@ pub struct AgentPreset {
 }
 
 impl AgentPreset {
+    /// The default-shell preset: `program: None` flows through
+    /// [`CommandSpec::shell`], the OS default shell. Named "PowerShell" on Windows
+    /// (where that's the default), "Shell" elsewhere.
     pub fn shell() -> Self {
         Self {
             id: Uuid::new_v4(),
-            name: "Shell".to_string(),
+            name: if cfg!(windows) { "PowerShell" } else { "Shell" }.to_string(),
             program: None,
+            model: None,
+            model_flag: None,
+            effort: None,
+            effort_flag: None,
+            args: Vec::new(),
+            system_prompt: None,
+            injection: InjectionMode::None,
+            env: Vec::new(),
+            working_markers: Vec::new(),
+            blocked_markers: Vec::new(),
+            startup_delay_ms: 0,
+            session_id_flag: None,
+            resume_flag: None,
+        }
+    }
+
+    /// The Windows `cmd.exe` shell, offered alongside PowerShell. Runs `cmd.exe`
+    /// explicitly (PowerShell is the `program: None` default). Only seeded on
+    /// Windows (see [`AgentPreset::defaults`]).
+    pub fn cmd() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: "Cmd".to_string(),
+            program: Some("cmd.exe".to_string()),
             model: None,
             model_flag: None,
             effort: None,
@@ -267,8 +294,11 @@ impl AgentPreset {
     }
 
     pub fn defaults() -> Vec<AgentPreset> {
-        vec![
-            Self::shell(),
+        let mut presets = vec![Self::shell()];
+        // On Windows, offer cmd.exe alongside the PowerShell default.
+        #[cfg(windows)]
+        presets.push(Self::cmd());
+        presets.extend([
             Self::claude(),
             Self::opencode(),
             Self::amp(),
@@ -276,7 +306,8 @@ impl AgentPreset {
             Self::hermes(),
             Self::ollama(),
             Self::pi(),
-        ]
+        ]);
+        presets
     }
 
     /// Compose the full argument list: `model_flag model`, then
@@ -414,6 +445,33 @@ mod tests {
         assert_eq!(c.session_id_flag.as_deref(), Some("--session-id"));
         assert_eq!(c.resume_flag.as_deref(), Some("--resume"));
         assert!(AgentPreset::shell().session_id_flag.is_none());
+    }
+
+    #[test]
+    fn cmd_preset_runs_cmd_exe() {
+        let c = AgentPreset::cmd();
+        assert_eq!(c.name, "Cmd");
+        assert_eq!(c.program.as_deref(), Some("cmd.exe"));
+    }
+
+    #[test]
+    fn windows_shell_presets() {
+        // The default-shell preset is PowerShell on Windows, Shell elsewhere; it
+        // always runs via CommandSpec::shell (program: None). Cmd is seeded only
+        // on Windows, where the user gets both PowerShell and Cmd.
+        let defaults = AgentPreset::defaults();
+        let names: Vec<&str> = defaults.iter().map(|p| p.name.as_str()).collect();
+        assert!(AgentPreset::shell().program.is_none());
+        if cfg!(windows) {
+            assert_eq!(AgentPreset::shell().name, "PowerShell");
+            assert!(names.contains(&"PowerShell"));
+            assert!(names.contains(&"Cmd"));
+            assert!(!names.contains(&"Shell"));
+        } else {
+            assert_eq!(AgentPreset::shell().name, "Shell");
+            assert!(names.contains(&"Shell"));
+            assert!(!names.contains(&"Cmd"));
+        }
     }
 
     #[test]

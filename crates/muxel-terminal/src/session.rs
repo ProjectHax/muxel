@@ -56,10 +56,11 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
-    /// Run the user's default shell.
+    /// Run the user's default shell. On Windows that's PowerShell (`cmd.exe` is
+    /// available as a separate preset); elsewhere it's `$SHELL`.
     pub fn shell() -> Self {
         #[cfg(windows)]
-        let program = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        let program = "powershell.exe".to_string();
         #[cfg(not(windows))]
         let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         Self {

@@ -965,7 +965,7 @@ impl Default for Settings {
 /// v4: added the Amp (ampcode) preset.
 /// v5: added the Grok (x.ai) preset.
 /// v6: opencode default runner startup delay.
-pub const PRESET_SEED_VERSION: u32 = 7;
+pub const PRESET_SEED_VERSION: u32 = 8;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
