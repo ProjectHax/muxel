@@ -432,6 +432,11 @@ actions!(
 #[action(namespace = muxel, no_json)]
 struct JumpToTab(usize);
 
+/// Switch to the Nth project (1-based) in the sidebar order. Bound to Ctrl+1..9.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = muxel, no_json)]
+struct JumpToProject(usize);
+
 fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Option<KeyBinding> {
     Some(match action {
         "NewPane" => KeyBinding::new(keystroke, NewPane, context),
@@ -468,6 +473,16 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
                 .and_then(|n| n.parse::<usize>().ok())
             {
                 Some(n) => KeyBinding::new(keystroke, JumpToTab(n), context),
+                None => return None,
+            }
+        }
+        // JumpToProject1..9 — the trailing digit is the project index.
+        a if a.starts_with("JumpToProject") => {
+            match a
+                .strip_prefix("JumpToProject")
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                Some(n) => KeyBinding::new(keystroke, JumpToProject(n), context),
                 None => return None,
             }
         }
@@ -7468,6 +7483,21 @@ impl MuxelApp {
             });
         if let Some(iid) = tab {
             self.focus_instance(iid, window, cx);
+        }
+    }
+
+    /// Switch to the Nth project (1-based) in the sidebar order. No-op if `n` is
+    /// out of range or that project is already active.
+    fn jump_to_project(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pid) = n
+            .checked_sub(1)
+            .and_then(|i| self.workspace.projects.get(i))
+            .map(|p| p.id)
+        else {
+            return;
+        };
+        if self.workspace.active_project != Some(pid) {
+            self.select_project(pid, window, cx);
         }
     }
 
@@ -16156,6 +16186,9 @@ impl Render for MuxelApp {
             .on_action(
                 cx.listener(|this, a: &JumpToTab, window, cx| this.jump_to_tab(a.0, window, cx)),
             )
+            .on_action(cx.listener(|this, a: &JumpToProject, window, cx| {
+                this.jump_to_project(a.0, window, cx)
+            }))
             .child(self.render_titlebar(active_name, cx))
             .child(div().flex_1().min_h_0().flex().child(outer))
             .children(

@@ -310,9 +310,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Sizing** — whole-app zoom plus independent UI, terminal, and code/diff font
   sizes.
 - **Keybindings** — configurable shortcuts with a rebind UI, a cheat-sheet overlay
-  (`Ctrl+Shift+/`), `Alt+1–9` to jump to a pane's Nth tab, `Ctrl+Shift+A` to
-  focus the next agent needing attention (blocked, then done), and `Cmd+Q`
-  (`Ctrl+Q` elsewhere) to quit from any focus.
+  (`Ctrl+Shift+/`), `Alt+1–9` to jump to a pane's Nth tab, `Ctrl+1–9` to switch to
+  the Nth project, `Ctrl+Shift+A` to focus the next agent needing attention
+  (blocked, then done), and `Cmd+Q` (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, per-kind close confirmation (terminal on, editor/diff off by
   default), and auto-close a pane when its process exits.

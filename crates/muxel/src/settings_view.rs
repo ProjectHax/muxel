@@ -62,6 +62,15 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("JumpToTab7", "alt-7", None),
     ("JumpToTab8", "alt-8", None),
     ("JumpToTab9", "alt-9", None),
+    ("JumpToProject1", "ctrl-1", None),
+    ("JumpToProject2", "ctrl-2", None),
+    ("JumpToProject3", "ctrl-3", None),
+    ("JumpToProject4", "ctrl-4", None),
+    ("JumpToProject5", "ctrl-5", None),
+    ("JumpToProject6", "ctrl-6", None),
+    ("JumpToProject7", "ctrl-7", None),
+    ("JumpToProject8", "ctrl-8", None),
+    ("JumpToProject9", "ctrl-9", None),
 ];
 
 /// Which settings section is shown.
