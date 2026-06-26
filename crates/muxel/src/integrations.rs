@@ -1403,6 +1403,9 @@ mod tests {
         git(&["init", "-q"]);
         git(&["config", "user.email", "test@muxel"]);
         git(&["config", "user.name", "muxel test"]);
+        // Keep line endings deterministic: Windows git defaults to
+        // core.autocrlf=true, which would restore the file as "one\r\n".
+        git(&["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("a.txt"), "one\n").unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "init"]);
