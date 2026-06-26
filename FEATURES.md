@@ -226,7 +226,8 @@ feature is added or changed, update the matching entry here in the same change**
     worktree + its branch (enabled only when no instance is loaded in it).
   Works for local and remote (SSH) projects; panel width persists per workspace.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
-  directory (from the project menu / worktree "View changes").
+  directory; opens as a **new tab** in the pane it's diffing (from a pane's "View
+  changes", the project menu, or a worktree) rather than splitting off a new pane.
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.

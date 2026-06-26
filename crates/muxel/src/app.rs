@@ -4693,8 +4693,8 @@ impl MuxelApp {
         self.open_diff_for_dir(pid, dir, anchor, window, cx);
     }
 
-    /// Open (or refresh + focus) a read-only git-diff pane for `dir`, split beside
-    /// `anchor` (or seeding the layout if the project is empty).
+    /// Open (or refresh + focus) a read-only git-diff pane for `dir`, as a new tab
+    /// in `anchor`'s pane (or seeding the layout if the project is empty).
     fn open_diff_for_dir(
         &mut self,
         pid: Uuid,
@@ -4724,7 +4724,9 @@ impl MuxelApp {
             .workspace
             .project_mut(pid)
             .is_some_and(|p| match anchor {
-                Some(a) => split(&mut p.layout, a, SplitDirection::Horizontal, iid),
+                // Add the diff as a new tab in the anchor's pane (beside the agent
+                // it's diffing) rather than splitting off a whole new pane.
+                Some(a) => add_tab(&mut p.layout, a, iid),
                 None => {
                     if p.is_empty() {
                         p.layout = Some(PaneNode::leaf(iid));
