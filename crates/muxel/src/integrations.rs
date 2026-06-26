@@ -750,6 +750,39 @@ pub fn git_discard_path(loc: &RepoLoc, path: &str) -> Result<String> {
     .or_else(|_| git_run_loc(loc, &["clean", "-fd", "--", path]))
 }
 
+/// Merge `branch` into whatever is checked out at `loc` (the base). `RepoLoc`
+/// (local + remote) variant of [`merge_worktree_branch`]; aborts a failed merge
+/// so the repo isn't left mid-merge.
+pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
+    let out = git_output(loc, &["merge", "--no-edit", branch]).context("running `git merge`")?;
+    if !out.status.success() {
+        let _ = git_output(loc, &["merge", "--abort"]);
+        bail!("git merge: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Remove the worktree at `worktree_path` (force) and prune stale entries, at
+/// `loc`. `RepoLoc` (local + remote) variant of [`remove_worktree`].
+pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String> {
+    let out = git_output(loc, &["worktree", "remove", "--force", worktree_path])
+        .context("running `git worktree remove`")?;
+    if !out.status.success() {
+        bail!(
+            "git worktree remove: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let _ = git_output(loc, &["worktree", "prune"]);
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Delete `branch` (force, `git branch -D`) at `loc`. `RepoLoc` (local + remote)
+/// variant of [`delete_branch`].
+pub fn delete_branch_loc(loc: &RepoLoc, branch: &str) -> Result<String> {
+    git_run_loc(loc, &["branch", "-D", branch])
+}
+
 /// Stage exactly `paths` (their additions, modifications, and deletions, via
 /// `git add -A -- <paths>`) and commit only those paths at `loc` (`git commit
 /// --only`). Files outside `paths` are left untouched — even if already staged.

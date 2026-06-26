@@ -15,6 +15,7 @@ use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis};
 use gpui_component::tag::Tag;
+use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
 use muxel_core::{
     AgentPreset, FocusDir, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule, MEMORY_DIR,
@@ -801,16 +802,26 @@ pub struct MuxelApp {
     sidebar_collapsed: bool,
     /// Whether the right-side git-diff panel is shown.
     show_git_diff: bool,
+    /// Which tab of the git-diff panel is active (Files vs Worktrees).
+    git_diff_tab: GitDiffTab,
     /// Cached changed-file list for the active project's git-diff panel
     /// (refreshed off the UI thread). `None` = not yet loaded / no git repo.
     git_diff_files: Option<Vec<integrations::GitChange>>,
+    /// Cached changed-file lists per worktree (keyed by worktree id), for the
+    /// Worktrees tab; refreshed off the UI thread.
+    git_diff_worktree_files: HashMap<Uuid, Vec<integrations::GitChange>>,
+    /// Which worktree rows are expanded to show their changed files.
+    git_diff_worktrees_expanded: std::collections::HashSet<Uuid>,
+    /// Cached branch names for the active project (the "Merge into…" picker),
+    /// refreshed off the UI thread so the menu doesn't run `git branch` per frame.
+    git_diff_branches: Vec<String>,
     /// Guards against overlapping git-status refreshes for the panel.
     git_diff_loading: bool,
     /// The git-diff panel's commit-message input.
     git_diff_commit_input: Entity<InputState>,
     /// Open per-file diff windows, keyed by (project id, repo-relative path), so
     /// re-clicking a file focuses its window instead of opening a duplicate.
-    diff_file_windows: HashMap<(Uuid, String), WindowHandle<gpui_component::Root>>,
+    diff_file_windows: HashMap<(GitSource, String), WindowHandle<gpui_component::Root>>,
     /// File-browser (second sidebar) state.
     show_file_browser: bool,
     file_browser_pid: Option<Uuid>,
@@ -830,6 +841,10 @@ pub struct MuxelApp {
     notifications: Vec<Notification>,
     /// Last seen status per instance, to fire notifications on transitions.
     last_status: HashMap<Uuid, AgentStatus>,
+    /// Per-instance launch tracking: `(spawn time, launched-with-resume)`. A
+    /// resume launch that exits almost immediately means the saved session was
+    /// invalid — we recover by re-spawning the agent with a fresh session.
+    terminal_launches: HashMap<Uuid, (std::time::Instant, bool)>,
     /// Per-split id nonce, bumped to reset a split's resizable state when its
     /// panes are evened out (double-click a divider).
     split_even_nonce: HashMap<String, u32>,
@@ -1235,8 +1250,12 @@ enum ConfirmAction {
     },
     /// Discard all changes to one file from the git-diff panel (destructive).
     DiscardFilePath {
-        pid: Uuid,
+        src: GitSource,
         path: String,
+    },
+    /// Delete a worktree from the panel (only when no instance is loaded in it).
+    DeleteWorktreeFromPanel {
+        wid: Uuid,
     },
     /// Apply + remove the latest stash (can conflict).
     StashPop(Uuid),
@@ -1377,14 +1396,11 @@ impl Render for PopoutView {
                 // Intercept the title-bar X to confirm before closing (which
                 // terminates the terminal).
                 //
-                // POSSIBLE KNOWN BUG (unconfirmed): double-clicking this bar over a
-                // popped-out editor *sometimes* leaves its text selection "stuck"
-                // (keeps highlighting as the mouse moves). Suspected gpui-component
-                // quirk — TitleBar is the only interactive component that doesn't
-                // claim its press via `GlobalState::suppress_text_selection` like
-                // Button/Input do, so a title-bar press can start the window-level
-                // text selection. A patch to add that was tried but the bug couldn't
-                // be reliably reproduced, so this is a note rather than a fix.
+                // gpui-component's TitleBar doesn't claim its press via
+                // `GlobalState::suppress_text_selection` the way Button/Input do, so
+                // dragging/maximizing it starts a window-level text selection in any
+                // selectable popped-out content (e.g. a rendered-markdown editor).
+                // The mouse-down on the title-content row below claims the press.
                 TitleBar::new()
                     .on_close_window(cx.listener(|this, _ev, _window, cx| {
                         this.show_close_confirm = true;
@@ -1397,6 +1413,10 @@ impl Render for PopoutView {
                             .flex()
                             .items_center()
                             .gap_2()
+                            .on_mouse_down(MouseButton::Left, |_e, window, cx| {
+                                window.prevent_default();
+                                gpui_component::GlobalState::suppress_text_selection(cx);
+                            })
                             .child(
                                 div()
                                     .flex_1()
@@ -1511,48 +1531,231 @@ impl Render for PopoutView {
 /// v1 shows the diff as of when the window was opened — re-clicking the file in
 /// the panel reopens/refocuses it with the latest.
 struct FileDiffView {
-    input: Entity<InputState>,
-    config: EditorConfig,
+    title: SharedString,
+    unified_src: SharedString,
+    rows: std::rc::Rc<Vec<muxel_core::SplitRow>>,
+    empty: bool,
+    split: bool,
+    /// Last seen viewport size, to detect a window resize (which would otherwise
+    /// start a stray text selection in the unified view).
+    last_size: Option<gpui::Size<Pixels>>,
+    focus_handle: FocusHandle,
 }
 
 impl FileDiffView {
-    fn new(
-        content: String,
-        config: EditorConfig,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("diff")
-                .line_number(false)
-                .indent_guides(false)
-                .soft_wrap(config.soft_wrap)
-                .default_value(content)
-        });
-        Self { input, config }
+    /// Build both layouts so the in-window toggle switches instantly: the unified
+    /// `diff`-grammar block (colored, selectable, read-only) for copying, and the
+    /// side-by-side colored rows (green added / red removed, line numbers) for
+    /// clear at-a-glance viewing. `split` is the initial mode.
+    fn new(title: String, content: String, split: bool, cx: &mut Context<Self>) -> Self {
+        let rows = muxel_core::split_diff(&content);
+        Self {
+            title: title.into(),
+            unified_src: SharedString::from(format!("```diff\n{content}\n```")),
+            empty: rows.is_empty(),
+            rows: std::rc::Rc::new(rows),
+            split,
+            last_size: None,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn toggle_split(&mut self, cx: &mut Context<Self>) {
+        self.split = !self.split;
+        // Persist the choice so the next diff window opens the same way.
+        let split = self.split;
+        if let Some(app) = cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade()) {
+            app.update(cx, |app, _cx| app.set_diff_split(split));
+        }
+        cx.notify();
     }
 }
 
 impl Focusable for FileDiffView {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.input.read(cx).focus_handle(cx)
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+/// Render one side-by-side diff row (old line left, new line right). Removed cells
+/// tint red, added green, padding cells are muted; line numbers sit in a gutter.
+fn render_split_row(
+    row: &muxel_core::SplitRow,
+    mono: &SharedString,
+    size: Pixels,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    match row {
+        muxel_core::SplitRow::Hunk(text) => div()
+            .w_full()
+            .px_2()
+            .bg(theme.muted)
+            .text_color(theme.muted_foreground)
+            .font_family(mono.clone())
+            .text_size(size)
+            .child(SharedString::from(text.clone()))
+            .into_any_element(),
+        muxel_core::SplitRow::Line {
+            left,
+            right,
+            changed,
+        } => {
+            let cell = |side: &Option<(u32, String)>, add: bool| {
+                let (no, text, bg) = match side {
+                    Some((n, txt)) => {
+                        let bg = if *changed {
+                            if add {
+                                theme.success.opacity(0.13)
+                            } else {
+                                theme.danger.opacity(0.13)
+                            }
+                        } else {
+                            theme.background
+                        };
+                        (Some(*n), txt.clone(), bg)
+                    }
+                    None => (None, String::new(), theme.muted.opacity(0.25)),
+                };
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .bg(bg)
+                    .child(
+                        div()
+                            .w(px(44.0))
+                            .flex_none()
+                            .px_1()
+                            .text_color(theme.muted_foreground)
+                            .font_family(mono.clone())
+                            .text_size(size)
+                            .child(SharedString::from(
+                                no.map(|n| n.to_string()).unwrap_or_default(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_1()
+                            .font_family(mono.clone())
+                            .text_size(size)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(SharedString::from(text)),
+                    )
+            };
+            div()
+                .w_full()
+                .flex()
+                .items_stretch()
+                .child(cell(left, false))
+                .child(div().w(px(1.0)).flex_none().bg(theme.border))
+                .child(cell(right, true))
+                .into_any_element()
+        }
     }
 }
 
 impl Render for FileDiffView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let family: SharedString = if self.config.font_family.trim().is_empty() {
-            cx.theme().mono_font_family.clone()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // gpui routes a window-resize-edge drag through the text-selection
+        // controller, which starts a selection in the (selectable) unified view.
+        // On a size change, drop any selection the resize started — deferred, since
+        // the Root is mid-render here. Clearing sets `is_selecting = false`, so the
+        // rest of the resize drag no-ops and nothing accumulates.
+        let size = window.viewport_size();
+        if self.last_size.is_some_and(|s| s != size) {
+            cx.defer_in(window, |_this, window, cx| {
+                gpui_component::Root::update(window, cx, |root, _w, cx| {
+                    root.clear_text_selection(cx);
+                });
+            });
+        }
+        self.last_size = Some(size);
+        let body: AnyElement = if self.empty {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(cx.theme().muted_foreground)
+                .child(t("No changes."))
+                .into_any_element()
+        } else if self.split {
+            // Side-by-side: colored rows (green added / red removed, line numbers).
+            // Non-selectable on purpose — the columns stay aligned, the change
+            // colors read clearly, and dragging/resizing can't start a selection.
+            // (Toggle to Unified to highlight + copy.)
+            let mono = cx.theme().mono_font_family.clone();
+            let size = px(13.0);
+            let rows = self.rows.clone();
+            uniform_list("diff-split-rows", rows.len(), move |range, _window, cx| {
+                range
+                    .map(|i| render_split_row(&rows[i], &mono, size, cx))
+                    .collect()
+            })
+            .flex_1()
+            .into_any_element()
         } else {
-            self.config.font_family.clone().into()
+            // Unified: the `diff`-grammar block, colored green/red.
+            div()
+                .id("diff-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(markdown(self.unified_src.clone()).selectable(true))
+                .into_any_element()
         };
-        Input::new(&self.input)
-            .h_full()
-            .bordered(false)
-            .focus_bordered(false)
-            .font_family(family)
-            .text_size(px(self.config.font_size))
+        let toggle_label = if self.split { t("Unified") } else { t("Split") };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .track_focus(&self.focus_handle)
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .on_mouse_down(MouseButton::Left, |_e, window, cx| {
+                        // Claim the title-bar press so dragging/maximizing doesn't
+                        // start a text selection in the selectable diff below.
+                        window.prevent_default();
+                        gpui_component::GlobalState::suppress_text_selection(cx);
+                    })
+                    .child(
+                        TitleBar::new().child(
+                            div()
+                                .w_full()
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(self.title.clone()),
+                                )
+                                .child(
+                                    Button::new("diff-view-toggle")
+                                        .ghost()
+                                        .xsmall()
+                                        .label(toggle_label)
+                                        .tooltip(t("Toggle split / unified diff"))
+                                        .on_click(
+                                            cx.listener(|this, _e, _w, cx| this.toggle_split(cx)),
+                                        ),
+                                ),
+                        ),
+                    ),
+            )
+            .child(body)
     }
 }
 
@@ -1605,6 +1808,23 @@ fn git_status_glyph_label(xy: &str) -> (&'static str, GlyphKind) {
     }
 }
 
+/// What a git-diff file row / diff window operates on: the active project's repo,
+/// or one of its worktrees. Lets the Files and Worktrees tabs share the row +
+/// per-file diff window, each resolving its own `RepoLoc` at action time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum GitSource {
+    Project(Uuid),
+    Worktree(Uuid),
+}
+
+/// Which view the git-diff panel is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum GitDiffTab {
+    #[default]
+    Files,
+    Worktrees,
+}
+
 impl MuxelApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // `spawn_in` so the closure has a window: `tick` updates agent status, and
@@ -1617,7 +1837,7 @@ impl MuxelApp {
                     .await;
                 if view
                     .update_in(cx, |this, window, cx| {
-                        this.tick(cx);
+                        this.tick(window, cx);
                         this.handle_notification_click(window, cx);
                     })
                     .is_err()
@@ -1996,7 +2216,11 @@ impl MuxelApp {
             git_modal: None,
             git_action_input,
             show_git_diff: false,
+            git_diff_tab: GitDiffTab::Files,
             git_diff_files: None,
+            git_diff_worktree_files: HashMap::new(),
+            git_diff_worktrees_expanded: std::collections::HashSet::new(),
+            git_diff_branches: Vec::new(),
             git_diff_loading: false,
             git_diff_commit_input,
             diff_file_windows: HashMap::new(),
@@ -2020,6 +2244,7 @@ impl MuxelApp {
             notifications_enabled: settings.notifications_enabled,
             notifications: Vec::new(),
             last_status: HashMap::new(),
+            terminal_launches: HashMap::new(),
             split_even_nonce: HashMap::new(),
             memory_ensured: HashSet::new(),
             remote_synced: HashSet::new(),
@@ -2382,6 +2607,13 @@ impl MuxelApp {
             self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
             return;
         }
+        // Whether this launch will `--resume` a saved session (true on every
+        // launch after the first, for resume-capable agents). Captured before
+        // `command_for`, which flips `session_started` to true.
+        let was_resume = self
+            .workspace
+            .instance(instance_id)
+            .is_some_and(|i| i.session_started);
         let spec = self.command_for(instance_id);
         let palette = theme::palette_from_theme(cx);
         let font_family: SharedString = self.settings.font_family.clone().into();
@@ -2395,6 +2627,8 @@ impl MuxelApp {
             view
         });
         self.terminals.insert(instance_id, view);
+        self.terminal_launches
+            .insert(instance_id, (std::time::Instant::now(), was_resume));
         // A runner submits only on its first launch; clear auto_submit afterward
         // so reopening the app re-types the prompt but doesn't auto-submit it.
         if let Some(inst) = self.workspace.instance_mut(instance_id)
@@ -3057,8 +3291,39 @@ impl MuxelApp {
 
     /// Open a per-file diff in its own OS window — or focus the existing one for
     /// this file so re-clicking doesn't spawn duplicates.
-    fn open_file_diff_window(&mut self, pid: Uuid, path: String, cx: &mut Context<Self>) {
-        let key = (pid, path.clone());
+    /// Resolve a [`GitSource`] to its `RepoLoc`: the active project's repo, or a
+    /// worktree's local checkout.
+    fn git_source_loc(&self, src: GitSource) -> Option<integrations::RepoLoc> {
+        match src {
+            GitSource::Project(pid) => self.repo_loc(pid),
+            GitSource::Worktree(wid) => self
+                .workspace
+                .worktree(wid)
+                .map(|w| integrations::RepoLoc::Local(w.path.clone())),
+        }
+    }
+
+    /// Run a git op on a [`GitSource`]'s repo off the UI thread — like
+    /// `run_project_git`, but for either the project or one of its worktrees.
+    fn run_git_source<F>(
+        &mut self,
+        src: GitSource,
+        ok: String,
+        err: String,
+        op: F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: FnOnce(&integrations::RepoLoc) -> anyhow::Result<String> + Send + 'static,
+    {
+        let Some(loc) = self.git_source_loc(src) else {
+            return;
+        };
+        self.run_git_task(window, cx, ok, err, move || op(&loc));
+    }
+
+    fn open_file_diff_window(&mut self, src: GitSource, path: String, cx: &mut Context<Self>) {
+        let key = (src, path.clone());
         if let Some(handle) = self.diff_file_windows.get(&key).copied() {
             if handle
                 .update(cx, |_root, window, _cx| window.activate_window())
@@ -3068,14 +3333,14 @@ impl MuxelApp {
             }
             self.diff_file_windows.remove(&key);
         }
-        let Some(loc) = self.repo_loc(pid) else {
+        let Some(loc) = self.git_source_loc(src) else {
             return;
         };
-        let config = self.editor_config();
         let fname = Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
+        let split = self.settings.diff_split_view;
         let title = format!("diff — {fname}");
         let opened = cx.open_window(
             gpui::WindowOptions {
@@ -3086,7 +3351,7 @@ impl MuxelApp {
             move |window, cx| {
                 window.set_window_title(&title);
                 let content = integrations::git_diff_for(&loc, &path);
-                let view = cx.new(|cx| FileDiffView::new(content, config, window, cx));
+                let view = cx.new(|cx| FileDiffView::new(title.clone(), content, split, cx));
                 let fh = view.read(cx).focus_handle(cx);
                 window.focus(&fh, cx);
                 cx.new(|cx| gpui_component::Root::new(view, window, cx).bg(cx.theme().background))
@@ -3122,6 +3387,162 @@ impl MuxelApp {
         self.git_diff_commit_input
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.refresh_git_diff_panel(cx);
+    }
+
+    fn set_git_diff_tab(&mut self, tab: GitDiffTab, cx: &mut Context<Self>) {
+        if self.git_diff_tab != tab {
+            self.git_diff_tab = tab;
+            match tab {
+                GitDiffTab::Files => self.refresh_git_diff_panel(cx),
+                GitDiffTab::Worktrees => self.refresh_git_diff_worktrees(cx),
+            }
+            cx.notify();
+        }
+    }
+
+    fn toggle_worktree_expanded(&mut self, wid: Uuid, cx: &mut Context<Self>) {
+        if !self.git_diff_worktrees_expanded.remove(&wid) {
+            self.git_diff_worktrees_expanded.insert(wid);
+        }
+        cx.notify();
+    }
+
+    /// Refresh each active-project worktree's changed-file list off the UI thread.
+    fn refresh_git_diff_worktrees(&mut self, cx: &mut Context<Self>) {
+        let Some(pid) = self.workspace.active_project else {
+            self.git_diff_worktree_files.clear();
+            return;
+        };
+        let paths: Vec<(Uuid, PathBuf)> = self
+            .workspace
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == pid)
+            .map(|w| (w.id, w.path.clone()))
+            .collect();
+        if paths.is_empty() {
+            self.git_diff_worktree_files.clear();
+            self.git_diff_branches.clear();
+            return;
+        }
+        let loc = self.repo_loc(pid);
+        cx.spawn(async move |this, cx| {
+            let (results, branches): (Vec<(Uuid, Vec<integrations::GitChange>)>, Vec<String>) = cx
+                .background_executor()
+                .spawn(async move {
+                    let files = paths
+                        .into_iter()
+                        .map(|(wid, path)| {
+                            (
+                                wid,
+                                integrations::git_status_files(&integrations::RepoLoc::Local(path)),
+                            )
+                        })
+                        .collect();
+                    let branches = loc
+                        .map(|l| integrations::list_branches(&l))
+                        .unwrap_or_default();
+                    (files, branches)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.git_diff_worktree_files = results.into_iter().collect();
+                this.git_diff_branches = branches;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Merge worktree `wid`'s branch into `target`: check out `target` in the main
+    /// repo, merge the worktree branch, and on a clean merge offer to remove it.
+    fn worktree_merge_into(
+        &mut self,
+        wid: Uuid,
+        target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(w) = self.workspace.worktree(wid) else {
+            return;
+        };
+        let Some(loc) = self.repo_loc(w.project_id) else {
+            return;
+        };
+        let branch = w.branch.clone();
+        let name = w.name.clone();
+        let target_for_op = target.clone();
+        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    integrations::checkout_branch(&loc, &target_for_op)?;
+                    integrations::merge_branch(&loc, &branch)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(out) => {
+                        this.add_event(
+                            NotifKind::Success,
+                            tf(
+                                "Merged {name} into {target}",
+                                &[("name", &name), ("target", &target)],
+                            ),
+                            git_notify_detail(&out),
+                        );
+                        this.request_confirm(
+                            tf("Remove {name}?", &[("name", &name)]),
+                            t("The merge succeeded. Remove this worktree and its branch?"),
+                            t("Remove"),
+                            ConfirmAction::DiscardWorktree(wid),
+                            cx,
+                        );
+                    }
+                    Err(e) => {
+                        this.add_event(
+                            NotifKind::Error,
+                            t("Merge failed").to_string(),
+                            format!("{e}"),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Delete worktree `wid` — only when no instance is loaded in it. Removes the
+    /// worktree dir + its branch (local or remote) and drops the registry entry.
+    fn worktree_delete(&mut self, wid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(w) = self.workspace.worktree(wid) else {
+            return;
+        };
+        if !self.workspace.instances_using(wid).is_empty() {
+            return;
+        }
+        let pid = w.project_id;
+        let path = w.path.to_string_lossy().into_owned();
+        let branch = w.branch.clone();
+        let name = w.name.clone();
+        self.run_project_git(
+            pid,
+            tf("Deleted worktree {name}", &[("name", &name)]),
+            t("Delete worktree failed").into(),
+            move |loc| {
+                let out = integrations::remove_worktree_loc(loc, &path)?;
+                let _ = integrations::delete_branch_loc(loc, &branch);
+                Ok(out)
+            },
+            window,
+            cx,
+        );
+        self.workspace.worktrees.retain(|w| w.id != wid);
+        self.git_diff_worktree_files.remove(&wid);
+        self.git_diff_worktrees_expanded.remove(&wid);
+        self.persist();
+        cx.notify();
     }
 
     fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
@@ -3275,10 +3696,13 @@ impl MuxelApp {
     /// so they run on the background executor and post results back. Remote
     /// project branches are handled separately by `poll_remote_branches`.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
-        // Keep the git-diff panel's file list current while it's open (covers
-        // edits and active-project switches; the call self-guards re-entrancy).
+        // Keep the git-diff panel current while it's open (covers edits and
+        // active-project switches; the calls self-guard re-entrancy).
         if self.show_git_diff {
-            self.refresh_git_diff_panel(cx);
+            match self.git_diff_tab {
+                GitDiffTab::Files => self.refresh_git_diff_panel(cx),
+                GitDiffTab::Worktrees => self.refresh_git_diff_worktrees(cx),
+            }
         }
         let presets = self.presets.clone();
         let locals: Vec<(Uuid, PathBuf)> = self
@@ -3380,7 +3804,7 @@ impl MuxelApp {
     /// unfocused agents when they finish or ring the terminal bell. The bell is
     /// the agent's deliberate "I need you" signal (e.g. Claude on a permission
     /// prompt), so it's precise — no guessing from idle time.
-    fn tick(&mut self, cx: &mut Context<Self>) {
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Program availability (installed agents / gh / sshpass) + git status are
         // refreshed off the UI thread so they don't stutter the render loop.
         self.refresh_status(cx);
@@ -3390,30 +3814,32 @@ impl MuxelApp {
         }
         self.remote_poll_count = (self.remote_poll_count + 1) % 5;
         let focused = self.active_instance;
-        let snapshot: Vec<(Uuid, AgentStatus, bool, String, String)> = self
+        let snapshot: Vec<(Uuid, AgentStatus, bool, Option<i32>, String, String)> = self
             .terminals
             .iter()
             .map(|(iid, view)| {
                 let v = view.read(cx);
                 let status = v.status();
                 let exited = v.exited();
+                let exit_code = v.exit_code();
                 let inst = self.workspace.instance(*iid);
                 let title = inst.map(|i| i.title.clone()).unwrap_or_default();
                 let project = inst
                     .and_then(|i| self.workspace.project(i.project_id))
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
-                (*iid, status, exited, title, project)
+                (*iid, status, exited, exit_code, title, project)
             })
             .collect();
 
         let mut to_close = Vec::new();
+        let mut to_recover: Vec<(Uuid, String)> = Vec::new();
         // Only re-render when something visible actually changed. Re-rendering
         // every second (rebuilding every button) is what strands gpui-component
         // tooltips: a repaint landing as the cursor leaves a button drops the
         // hover-out event, leaving the tooltip stuck until another one shows.
         let mut dirty = false;
-        for (iid, status, exited, title, project) in snapshot {
+        for (iid, status, exited, exit_code, title, project) in snapshot {
             let changed = self.last_status.insert(iid, status) != Some(status);
             dirty |= changed;
             // A pane counts as attended only if it's active AND the window is
@@ -3434,13 +3860,40 @@ impl MuxelApp {
                     }
                 }
             }
-            // Close-on-exit keys off the actual process exit, not the display
-            // state (Done also means "finished a turn" while still running).
-            if exited && self.settings.close_on_exit {
+            // A `--resume` launch that errors out almost immediately means the
+            // saved session was invalid (deleted/expired): recover by re-spawning
+            // the same agent with a fresh session, rather than closing it. A clean
+            // exit (code 0) is a deliberate quit — leave it to close-on-exit.
+            const RECOVER_WITHIN_SECS: u64 = 10;
+            if exited
+                && exit_code != Some(0)
+                && let Some(&(at, true)) = self.terminal_launches.get(&iid)
+                && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
+            {
+                to_recover.push((iid, title));
+            } else if exited && self.settings.close_on_exit {
+                // Close-on-exit keys off the actual process exit, not the display
+                // state (Done also means "finished a turn" while still running).
                 to_close.push(iid);
             }
         }
+        for (iid, title) in to_recover {
+            // Reset to a brand-new session so the relaunch uses `--session-id`
+            // (not the invalid `--resume`), then re-spawn the agent in place.
+            if let Some(inst) = self.workspace.instance_mut(iid) {
+                inst.session_id = Some(Uuid::new_v4().to_string());
+                inst.session_started = false;
+            }
+            self.persist();
+            self.add_event(
+                NotifKind::Success,
+                tf("{title}: session expired", &[("title", &title)]),
+                t("Started a fresh session.").to_string(),
+            );
+            self.spawn_terminal(iid, window, cx);
+        }
         for iid in to_close {
+            self.terminal_launches.remove(&iid);
             // Auto-close on process exit: keep a remote tmux session alive (a
             // dropped SSH connection should be reconnectable, not torn down).
             self.close_instance_inner(iid, false, cx); // re-renders on its own
@@ -6589,10 +7042,10 @@ impl MuxelApp {
             ConfirmAction::StashDrop(pid) => self.do_stash_drop(pid, window, cx),
             ConfirmAction::DiscardWorktreeChanges(wid) => self.discard_worktree_changes(wid, cx),
             ConfirmAction::DiscardWorktree(wid) => self.discard_worktree(wid, cx),
-            ConfirmAction::DiscardFilePath { pid, path } => {
+            ConfirmAction::DiscardFilePath { src, path } => {
                 let p = path.clone();
-                self.run_project_git(
-                    pid,
+                self.run_git_source(
+                    src,
                     tf("Discarded {path}", &[("path", &path)]),
                     t("Discard failed").into(),
                     move |loc| integrations::git_discard_path(loc, &p),
@@ -6601,6 +7054,7 @@ impl MuxelApp {
                 );
                 self.refresh_git_diff_panel(cx);
             }
+            ConfirmAction::DeleteWorktreeFromPanel { wid } => self.worktree_delete(wid, window, cx),
         }
         cx.notify();
     }
@@ -9493,10 +9947,44 @@ impl MuxelApp {
                     .xsmall()
                     .icon(IconName::Redo)
                     .tooltip(t("Refresh"))
-                    .on_click(cx.listener(|this, _e, _w, cx| this.refresh_git_diff_panel(cx))),
+                    .on_click(cx.listener(|this, _e, _w, cx| match this.git_diff_tab {
+                        GitDiffTab::Files => this.refresh_git_diff_panel(cx),
+                        GitDiffTab::Worktrees => this.refresh_git_diff_worktrees(cx),
+                    })),
             );
 
-        let body: AnyElement = if !is_repo {
+        // Files / Worktrees tab toggle.
+        let tabs =
+            div()
+                .flex()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .flex_none()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(
+                    Button::new("gd-tab-files")
+                        .ghost()
+                        .xsmall()
+                        .selected(self.git_diff_tab == GitDiffTab::Files)
+                        .label(t("Files"))
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.set_git_diff_tab(GitDiffTab::Files, cx)
+                        })),
+                )
+                .child(
+                    Button::new("gd-tab-worktrees")
+                        .ghost()
+                        .xsmall()
+                        .selected(self.git_diff_tab == GitDiffTab::Worktrees)
+                        .label(t("Worktrees"))
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.set_git_diff_tab(GitDiffTab::Worktrees, cx)
+                        })),
+                );
+
+        let files_body: AnyElement = if !is_repo {
             self.gitdiff_empty(t("Not a git repository."), cx)
         } else {
             match &self.git_diff_files {
@@ -9512,7 +10000,11 @@ impl MuxelApp {
                         .flex_col();
                     if let Some(p) = pid {
                         for f in files {
-                            list = list.child(self.render_git_diff_file_row(f, p, cx));
+                            list = list.child(self.render_git_diff_file_row(
+                                f,
+                                GitSource::Project(p),
+                                cx,
+                            ));
                         }
                     }
                     list.into_any_element()
@@ -9520,25 +10012,33 @@ impl MuxelApp {
             }
         };
 
-        let footer = div()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_2()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .child(Input::new(&self.git_diff_commit_input).w_full())
-            .child(
-                Button::new("gitdiff-commit-all")
-                    .primary()
-                    .w_full()
-                    .label(t("Commit all"))
-                    .disabled(pid.is_none())
-                    .on_click(cx.listener(|this, _e, window, cx| {
-                        this.git_diff_panel_commit_all(window, cx)
-                    })),
-            );
+        let body = match self.git_diff_tab {
+            GitDiffTab::Files => files_body,
+            GitDiffTab::Worktrees => self.render_worktrees_body(pid, is_repo, cx),
+        };
+
+        // The commit footer is only meaningful on the Files tab.
+        let footer = matches!(self.git_diff_tab, GitDiffTab::Files).then(|| {
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_2()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(Input::new(&self.git_diff_commit_input).w_full())
+                .child(
+                    Button::new("gitdiff-commit-all")
+                        .primary()
+                        .w_full()
+                        .label(t("Commit all"))
+                        .disabled(pid.is_none())
+                        .on_click(cx.listener(|this, _e, window, cx| {
+                            this.git_diff_panel_commit_all(window, cx)
+                        })),
+                )
+        });
 
         div()
             .size_full()
@@ -9547,14 +10047,15 @@ impl MuxelApp {
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().sidebar_foreground)
             .child(header)
+            .child(tabs)
             .child(body)
-            .child(footer)
+            .children(footer)
     }
 
     fn render_git_diff_file_row(
         &self,
         f: &integrations::GitChange,
-        pid: Uuid,
+        src: GitSource,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let entity = cx.entity();
@@ -9578,7 +10079,7 @@ impl MuxelApp {
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
             .on_click(cx.listener(move |this, _e, _w, cx| {
-                this.open_file_diff_window(pid, open_path.clone(), cx)
+                this.open_file_diff_window(src, open_path.clone(), cx)
             }))
             .child(
                 div()
@@ -9610,7 +10111,7 @@ impl MuxelApp {
                     PopupMenuItem::new(t("View diff"))
                         .icon(Icon::empty().path("icons/diff.svg"))
                         .on_click(window.listener_for(&entity, move |this, _, _w, cx| {
-                            this.open_file_diff_window(pid, view_p.clone(), cx)
+                            this.open_file_diff_window(src, view_p.clone(), cx)
                         })),
                 )
                 .separator()
@@ -9619,8 +10120,8 @@ impl MuxelApp {
                         .icon(IconName::Plus)
                         .on_click(window.listener_for(&entity, move |this, _, window, cx| {
                             let p = stage_p.clone();
-                            this.run_project_git(
-                                pid,
+                            this.run_git_source(
+                                src,
                                 t("Staged").into(),
                                 t("Stage failed").into(),
                                 move |loc| integrations::git_stage_path(loc, &p),
@@ -9634,8 +10135,8 @@ impl MuxelApp {
                         .icon(IconName::Undo)
                         .on_click(window.listener_for(&entity, move |this, _, window, cx| {
                             let p = unstage_p.clone();
-                            this.run_project_git(
-                                pid,
+                            this.run_git_source(
+                                src,
                                 t("Unstaged").into(),
                                 t("Unstage failed").into(),
                                 move |loc| integrations::git_unstage_path(loc, &p),
@@ -9657,7 +10158,7 @@ impl MuxelApp {
                                 ),
                                 t("Discard"),
                                 ConfirmAction::DiscardFilePath {
-                                    pid,
+                                    src,
                                     path: discard_p.clone(),
                                 },
                                 cx,
@@ -9668,14 +10169,184 @@ impl MuxelApp {
                     PopupMenuItem::new(t("Open file"))
                         .icon(IconName::File)
                         .on_click(window.listener_for(&entity, move |this, _, window, cx| {
-                            if let Some(proj) = this.workspace.project(pid) {
-                                let full = proj.root_path.join(&open_p);
-                                let target = this.active_instance;
-                                this.open_editor_at(pid, Some(full), target, window, cx);
+                            let target = match src {
+                                GitSource::Project(pid) => this
+                                    .workspace
+                                    .project(pid)
+                                    .map(|p| (pid, p.root_path.join(&open_p))),
+                                GitSource::Worktree(wid) => this
+                                    .workspace
+                                    .worktree(wid)
+                                    .map(|w| (w.project_id, w.path.join(&open_p))),
+                            };
+                            if let Some((pid, full)) = target {
+                                let active = this.active_instance;
+                                this.open_editor_at(pid, Some(full), active, window, cx);
                             }
                         })),
                 )
             })
+    }
+
+    fn render_worktrees_body(
+        &self,
+        pid: Option<Uuid>,
+        is_repo: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !is_repo {
+            return self.gitdiff_empty(t("Not a git repository."), cx);
+        }
+        let Some(pid) = pid else {
+            return self.gitdiff_empty(t("Loading…"), cx);
+        };
+        let wids: Vec<Uuid> = self
+            .workspace
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == pid)
+            .map(|w| w.id)
+            .collect();
+        if wids.is_empty() {
+            return self.gitdiff_empty(t("No worktrees for this project."), cx);
+        }
+        let mut list = div()
+            .id("gitdiff-worktrees")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        for wid in wids {
+            list = list.child(self.render_worktree_row(wid, cx));
+        }
+        list.into_any_element()
+    }
+
+    fn render_worktree_row(&self, wid: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let Some(w) = self.workspace.worktree(wid) else {
+            return div().into_any_element();
+        };
+        let name = w.name.clone();
+        let branch = w.branch.clone();
+        let dot = worktree_color(w.color);
+        let expanded = self.git_diff_worktrees_expanded.contains(&wid);
+        let loaded = !self.workspace.instances_using(wid).is_empty();
+        let files = self.git_diff_worktree_files.get(&wid);
+        let count = files.map(|f| f.len()).unwrap_or(0);
+        let hover_bg = cx.theme().sidebar_accent;
+        let branches = self.git_diff_branches.clone();
+        let chevron = if expanded {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+
+        let header = div()
+            .id(SharedString::from(format!("wt-row-{}", wid.simple())))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .on_click(cx.listener(move |this, _e, _w, cx| this.toggle_worktree_expanded(wid, cx)))
+            .child(Icon::new(chevron).small())
+            .child(div().size(px(7.0)).rounded_full().flex_none().bg(dot))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(name.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(branch),
+            )
+            .children((count > 0).then(|| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{count}"))
+            }))
+            .context_menu(move |menu, window, cx| {
+                let bs = branches.clone();
+                let nm = name.clone();
+                let entity_sub = entity.clone();
+                let entity_del = entity.clone();
+                let menu = menu.submenu_with_icon(
+                    Some(Icon::empty().path("icons/git-branch.svg")),
+                    t("Merge into…"),
+                    window,
+                    cx,
+                    move |mut sm, window, _c| {
+                        for b in &bs {
+                            let bn = b.clone();
+                            sm = sm.item(PopupMenuItem::new(b.clone()).on_click(
+                                window.listener_for(&entity_sub, move |this, _, window, cx| {
+                                    this.worktree_merge_into(wid, bn.clone(), window, cx)
+                                }),
+                            ));
+                        }
+                        sm
+                    },
+                );
+                let mut delete_item =
+                    PopupMenuItem::new(t("Delete worktree")).icon(IconName::Delete);
+                if loaded {
+                    delete_item = delete_item.disabled(true);
+                }
+                menu.separator().item(delete_item.on_click(window.listener_for(
+                    &entity_del,
+                    move |this, _, _w, cx| {
+                        this.request_confirm(
+                            tf("Delete {name}?", &[("name", &nm)]),
+                            t("This removes the worktree and its branch. No instance is loaded in it."),
+                            t("Delete"),
+                            ConfirmAction::DeleteWorktreeFromPanel { wid },
+                            cx,
+                        );
+                    },
+                )))
+            });
+
+        let mut col = div().flex().flex_col().child(header);
+        if expanded {
+            let indented = |msg: SharedString| {
+                div()
+                    .pl_6()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(msg)
+            };
+            match files {
+                None => col = col.child(indented(t("Loading…"))),
+                Some(files) if files.is_empty() => {
+                    col = col.child(indented(t("Clean — no changes.")))
+                }
+                Some(files) => {
+                    let mut inner = div().flex().flex_col().pl_4();
+                    for f in files {
+                        inner = inner.child(self.render_git_diff_file_row(
+                            f,
+                            GitSource::Worktree(wid),
+                            cx,
+                        ));
+                    }
+                    col = col.child(inner);
+                }
+            }
+        }
+        col.into_any_element()
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -11274,6 +11945,15 @@ impl MuxelApp {
         self.refresh_terminal_config(cx);
         self.persist_settings();
         cx.notify();
+    }
+
+    /// Persist the diff-window layout (split vs unified) chosen via a diff window's
+    /// toggle, so the next one opens the same way.
+    fn set_diff_split(&mut self, split: bool) {
+        if self.settings.diff_split_view != split {
+            self.settings.diff_split_view = split;
+            self.persist_settings();
+        }
     }
 
     fn terminal_mouse_btn(

@@ -98,6 +98,9 @@ pub struct TerminalView {
     font_size: f32,
     mouse_mode: TerminalMouseMode,
     exited: bool,
+    /// The child's exit code once it has exited (`None` = still running or the
+    /// code wasn't reported by the OS/PTY).
+    exit_code: Option<i32>,
     /// On-screen markers that classify the agent's status (per-agent).
     working_markers: Vec<String>,
     blocked_markers: Vec<String>,
@@ -245,8 +248,9 @@ impl TerminalView {
                         if !output.is_empty() {
                             view.session.process_output(&output);
                         }
-                        if exit.is_some() {
+                        if let Some(code) = exit {
                             view.exited = true;
+                            view.exit_code = code;
                         }
                         cx.notify();
                         exit.is_some()
@@ -266,6 +270,7 @@ impl TerminalView {
             font_size: 14.0,
             mouse_mode: TerminalMouseMode::default(),
             exited: false,
+            exit_code: None,
             working_markers,
             blocked_markers,
             _drain: drain,
@@ -283,6 +288,12 @@ impl TerminalView {
 
     pub fn exited(&self) -> bool {
         self.exited
+    }
+
+    /// The child's exit code if it has exited and the OS reported one. `None`
+    /// while running or when the code is unknown (e.g. a bare PTY close).
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
     }
 
     /// The agent's lifecycle state, from its per-agent on-screen markers, the

@@ -3,6 +3,7 @@
 //! unit-tested so the GPUI app and persistence layer can build on it.
 
 mod agent;
+pub mod diff;
 mod gui_path;
 mod pane;
 pub mod ssh;
@@ -13,6 +14,7 @@ pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, ResolvedLaunch, memory_header,
     memory_instruction, resolve_launch, session_resume_args,
 };
+pub use diff::{SplitRow, split_diff};
 pub use gui_path::augmented_macos_path;
 pub use pane::{
     FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
@@ -869,6 +871,9 @@ pub struct Settings {
     /// Terminal mouse copy/paste mode: "copy_paste" | "menu" | "copy_on_select".
     #[serde(default = "default_terminal_mouse")]
     pub terminal_mouse: String,
+    /// Diff window layout: `true` = side-by-side split, `false` = unified.
+    #[serde(default)]
+    pub diff_split_view: bool,
     /// Keybinding overrides.
     #[serde(default)]
     pub keybindings: Vec<KeyBindingCfg>,
@@ -947,6 +952,7 @@ impl Default for Settings {
             zoom: 1.0,
             pane_border: "subtle".to_string(),
             terminal_mouse: "copy_paste".to_string(),
+            diff_split_view: false,
             keybindings: Vec::new(),
             runners: Runner::defaults(),
             loops: Vec::new(),

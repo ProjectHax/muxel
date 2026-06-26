@@ -202,12 +202,21 @@ feature is added or changed, update the matching entry here in the same change**
   images, both by default, with a header **Raw / Rendered** toggle to view the
   source (e.g. an SVG's XML or the markdown text).
 - **Git diff panel** — a toolbar button (far right) toggles a collapsible
-  right-side panel listing the active project's changed files (added / modified /
-  deleted / renamed / untracked, color-coded). Click a file to open its diff in a
-  dedicated OS window; re-clicking focuses the existing one. Per-file context menu:
-  View diff, Stage, Unstage, Discard (with confirmation), Open file. A footer
-  commits **all** changes with a message. Works for local and remote (SSH)
-  projects; panel width persists per workspace.
+  right-side panel with two tabs:
+  - **Files** — the active project's changed files (added / modified / deleted /
+    renamed / untracked, color-coded). Click a file to open its diff in a dedicated
+    OS window with its own title bar and a **Split / Unified toggle** (remembered):
+    **Unified** is a colored diff (green additions / red deletions) whose text is
+    selectable + copyable (read-only); **Split** is a side-by-side view (old left /
+    new right, aligned, changed rows tinted green/red with line numbers) for quick
+    at-a-glance reading. Re-clicking focuses the existing window. Per-file context menu:
+    View diff, Stage, Unstage, Discard (with confirmation), Open file. A footer
+    commits **all** changes with a message.
+  - **Worktrees** — every worktree of the active project, expandable to its changed
+    files (same rows + diff windows). Per worktree: **Merge into…** any branch
+    (checks it out + merges, then offers to remove the worktree), and **Delete** the
+    worktree + its branch (enabled only when no instance is loaded in it).
+  Works for local and remote (SSH) projects; panel width persists per workspace.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
   directory (from the project menu / worktree "View changes").
 - **Command palette / global search** — quick navigation and search across the
