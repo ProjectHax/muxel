@@ -269,6 +269,13 @@ fn notify(summary: String, body: String, focus: Option<Uuid>) {
             .icon("muxel")
             .summary(&summary)
             .body(&body)
+            // Tie the notification to muxel's window: the desktop-entry hint names
+            // the .desktop ("muxel"), whose StartupWMClass matches the window's
+            // app_id ("muxel"). GNOME Shell then raises the existing window itself
+            // when the notification is clicked — with its own privilege, so it
+            // doesn't trip focus-stealing prevention (and the "muxel is ready"
+            // hand-off notification) the way an app self-raise does.
+            .hint(notify_rust::Hint::DesktopEntry("muxel".to_string()))
             .timeout(notify_rust::Timeout::Milliseconds(10_000));
         // "default" is the action GNOME invokes when the notification *body* is
         // clicked; only register it when there's a pane to jump to.
@@ -6965,8 +6972,13 @@ impl MuxelApp {
             return;
         };
         if self.workspace.instance(iid).is_some() {
+            // Switch to the pane the notification pointed at. We deliberately do
+            // NOT call `window.activate_window()`: a background app raising itself
+            // trips GNOME/Wayland focus-stealing prevention, which posts the
+            // "muxel is ready" hand-off notification. The notification's
+            // desktop-entry hint (see `notify`) lets the shell raise muxel's
+            // window itself on click instead.
             self.select_instance(iid, window, cx);
-            window.activate_window();
         }
     }
 
