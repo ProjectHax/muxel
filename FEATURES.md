@@ -201,8 +201,15 @@ feature is added or changed, update the matching entry here in the same change**
   markdown and image files (`png`, `jpg`, `gif`, `webp`, `bmp`, `svg`, …) render as
   images, both by default, with a header **Raw / Rendered** toggle to view the
   source (e.g. an SVG's XML or the markdown text).
-- **Git diff viewer** — a read-only pane showing the working-tree diff for a
-  directory.
+- **Git diff panel** — a toolbar button (far right) toggles a collapsible
+  right-side panel listing the active project's changed files (added / modified /
+  deleted / renamed / untracked, color-coded). Click a file to open its diff in a
+  dedicated OS window; re-clicking focuses the existing one. Per-file context menu:
+  View diff, Stage, Unstage, Discard (with confirmation), Open file. A footer
+  commits **all** changes with a message. Works for local and remote (SSH)
+  projects; panel width persists per workspace.
+- **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
+  directory (from the project menu / worktree "View changes").
 - **Command palette / global search** — quick navigation and search across the
   workspace.
 - **Find in project** — search within the active project.

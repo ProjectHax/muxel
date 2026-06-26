@@ -799,6 +799,18 @@ pub struct MuxelApp {
     show_dashboard: bool,
     /// Whether the project sidebar is collapsed.
     sidebar_collapsed: bool,
+    /// Whether the right-side git-diff panel is shown.
+    show_git_diff: bool,
+    /// Cached changed-file list for the active project's git-diff panel
+    /// (refreshed off the UI thread). `None` = not yet loaded / no git repo.
+    git_diff_files: Option<Vec<integrations::GitChange>>,
+    /// Guards against overlapping git-status refreshes for the panel.
+    git_diff_loading: bool,
+    /// The git-diff panel's commit-message input.
+    git_diff_commit_input: Entity<InputState>,
+    /// Open per-file diff windows, keyed by (project id, repo-relative path), so
+    /// re-clicking a file focuses its window instead of opening a duplicate.
+    diff_file_windows: HashMap<(Uuid, String), WindowHandle<gpui_component::Root>>,
     /// File-browser (second sidebar) state.
     show_file_browser: bool,
     file_browser_pid: Option<Uuid>,
@@ -1221,6 +1233,11 @@ enum ConfirmAction {
         pid: Uuid,
         branch: String,
     },
+    /// Discard all changes to one file from the git-diff panel (destructive).
+    DiscardFilePath {
+        pid: Uuid,
+        path: String,
+    },
     /// Apply + remove the latest stash (can conflict).
     StashPop(Uuid),
     /// Permanently discard the latest stash.
@@ -1489,6 +1506,105 @@ impl Render for PopoutView {
     }
 }
 
+/// A read-only per-file git diff shown in its own OS window. Self-contained: the
+/// diff text lives in a "diff"-grammar editor (green additions / red deletions).
+/// v1 shows the diff as of when the window was opened — re-clicking the file in
+/// the panel reopens/refocuses it with the latest.
+struct FileDiffView {
+    input: Entity<InputState>,
+    config: EditorConfig,
+}
+
+impl FileDiffView {
+    fn new(
+        content: String,
+        config: EditorConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .code_editor("diff")
+                .line_number(false)
+                .indent_guides(false)
+                .soft_wrap(config.soft_wrap)
+                .default_value(content)
+        });
+        Self { input, config }
+    }
+}
+
+impl Focusable for FileDiffView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input.read(cx).focus_handle(cx)
+    }
+}
+
+impl Render for FileDiffView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let family: SharedString = if self.config.font_family.trim().is_empty() {
+            cx.theme().mono_font_family.clone()
+        } else {
+            self.config.font_family.clone().into()
+        };
+        Input::new(&self.input)
+            .h_full()
+            .bordered(false)
+            .focus_bordered(false)
+            .font_family(family)
+            .text_size(px(self.config.font_size))
+    }
+}
+
+/// Visual category for a git-status glyph. Kept separate from the color lookup so
+/// the XY→glyph mapping stays unit-testable without a theme/`cx`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlyphKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Untracked,
+    Conflict,
+    Other,
+}
+
+impl GlyphKind {
+    fn to_color(self, cx: &App) -> Hsla {
+        let theme = cx.theme();
+        match self {
+            GlyphKind::Added => theme.success,
+            GlyphKind::Modified => theme.primary,
+            GlyphKind::Deleted => theme.danger,
+            GlyphKind::Renamed | GlyphKind::Conflict => theme.warning,
+            GlyphKind::Untracked | GlyphKind::Other => theme.muted_foreground,
+        }
+    }
+}
+
+/// Map a two-char `git status --porcelain` XY code to a one-char glyph + a
+/// [`GlyphKind`]. Conflicts win (`U` anywhere, or `DD`/`AA`); then untracked;
+/// then the index status (X) takes priority over the worktree status (Y). Pure.
+fn git_status_glyph_label(xy: &str) -> (&'static str, GlyphKind) {
+    let x = xy.chars().next().unwrap_or(' ');
+    let y = xy.chars().nth(1).unwrap_or(' ');
+    if x == 'U' || y == 'U' || (x == 'D' && y == 'D') || (x == 'A' && y == 'A') {
+        return ("!", GlyphKind::Conflict);
+    }
+    if x == '?' || y == '?' {
+        return ("?", GlyphKind::Untracked);
+    }
+    let s = if x != ' ' { x } else { y };
+    match s {
+        'A' => ("A", GlyphKind::Added),
+        'M' | 'T' => ("M", GlyphKind::Modified),
+        'D' => ("D", GlyphKind::Deleted),
+        'R' => ("R", GlyphKind::Renamed),
+        'C' => ("C", GlyphKind::Other),
+        _ => ("·", GlyphKind::Other),
+    }
+}
+
 impl MuxelApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // `spawn_in` so the closure has a window: `tick` updates agent status, and
@@ -1745,6 +1861,8 @@ impl MuxelApp {
         .detach();
 
         let git_action_input = cx.new(|cx| InputState::new(window, cx));
+        let git_diff_commit_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("Commit message…")));
         cx.subscribe_in(
             &git_action_input,
             window,
@@ -1877,6 +1995,11 @@ impl MuxelApp {
             dispose_commit_input,
             git_modal: None,
             git_action_input,
+            show_git_diff: false,
+            git_diff_files: None,
+            git_diff_loading: false,
+            git_diff_commit_input,
+            diff_file_windows: HashMap::new(),
             show_new_remote: false,
             nr_host: None,
             nr_dir,
@@ -2887,6 +3010,120 @@ impl MuxelApp {
         cx.notify();
     }
 
+    fn toggle_git_diff(&mut self, cx: &mut Context<Self>) {
+        self.show_git_diff = !self.show_git_diff;
+        if self.show_git_diff {
+            self.refresh_git_diff_panel(cx);
+        }
+        cx.notify();
+    }
+
+    /// Kick off a background `git_status_files` for the active project, caching the
+    /// result in `git_diff_files`. Guarded so refreshes never pile up (matters for
+    /// remote/SSH projects, where each call is an SSH round-trip).
+    fn refresh_git_diff_panel(&mut self, cx: &mut Context<Self>) {
+        if self.git_diff_loading {
+            return;
+        }
+        let Some(pid) = self.workspace.active_project else {
+            self.git_diff_files = None;
+            return;
+        };
+        let Some(loc) = self.repo_loc(pid) else {
+            self.git_diff_files = None;
+            return;
+        };
+        self.git_diff_loading = true;
+        cx.spawn(async move |this, cx| {
+            let files = cx
+                .background_executor()
+                .spawn(async move { integrations::git_status_files(&loc) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.git_diff_loading = false;
+                this.git_diff_files = Some(files);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn set_git_diff_panel_width(&mut self, width: f32) {
+        if self.workspace.gitdiff_panel_width != Some(width) {
+            self.workspace.gitdiff_panel_width = Some(width);
+            self.persist();
+        }
+    }
+
+    /// Open a per-file diff in its own OS window — or focus the existing one for
+    /// this file so re-clicking doesn't spawn duplicates.
+    fn open_file_diff_window(&mut self, pid: Uuid, path: String, cx: &mut Context<Self>) {
+        let key = (pid, path.clone());
+        if let Some(handle) = self.diff_file_windows.get(&key).copied() {
+            if handle
+                .update(cx, |_root, window, _cx| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.diff_file_windows.remove(&key);
+        }
+        let Some(loc) = self.repo_loc(pid) else {
+            return;
+        };
+        let config = self.editor_config();
+        let fname = Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        let title = format!("diff — {fname}");
+        let opened = cx.open_window(
+            gpui::WindowOptions {
+                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                window_min_size: Some(size(px(400.0), px(300.0))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                window.set_window_title(&title);
+                let content = integrations::git_diff_for(&loc, &path);
+                let view = cx.new(|cx| FileDiffView::new(content, config, window, cx));
+                let fh = view.read(cx).focus_handle(cx);
+                window.focus(&fh, cx);
+                cx.new(|cx| gpui_component::Root::new(view, window, cx).bg(cx.theme().background))
+            },
+        );
+        if let Ok(handle) = opened {
+            self.diff_file_windows.insert(key, handle);
+        }
+    }
+
+    fn git_diff_panel_commit_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let msg = self
+            .git_diff_commit_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if msg.is_empty() {
+            return;
+        }
+        let Some(pid) = self.workspace.active_project else {
+            return;
+        };
+        let commit_msg = msg.clone();
+        self.run_project_git(
+            pid,
+            t("Committed all changes").into(),
+            t("Commit failed").into(),
+            move |loc| integrations::git_commit(loc, &commit_msg),
+            window,
+            cx,
+        );
+        self.git_diff_commit_input
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.refresh_git_diff_panel(cx);
+    }
+
     fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
         self.notifications_enabled = !self.notifications_enabled;
         self.persist_settings();
@@ -3038,6 +3275,11 @@ impl MuxelApp {
     /// so they run on the background executor and post results back. Remote
     /// project branches are handled separately by `poll_remote_branches`.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        // Keep the git-diff panel's file list current while it's open (covers
+        // edits and active-project switches; the call self-guards re-entrancy).
+        if self.show_git_diff {
+            self.refresh_git_diff_panel(cx);
+        }
         let presets = self.presets.clone();
         let locals: Vec<(Uuid, PathBuf)> = self
             .workspace
@@ -6347,6 +6589,18 @@ impl MuxelApp {
             ConfirmAction::StashDrop(pid) => self.do_stash_drop(pid, window, cx),
             ConfirmAction::DiscardWorktreeChanges(wid) => self.discard_worktree_changes(wid, cx),
             ConfirmAction::DiscardWorktree(wid) => self.discard_worktree(wid, cx),
+            ConfirmAction::DiscardFilePath { pid, path } => {
+                let p = path.clone();
+                self.run_project_git(
+                    pid,
+                    tf("Discarded {path}", &[("path", &path)]),
+                    t("Discard failed").into(),
+                    move |loc| integrations::git_discard_path(loc, &p),
+                    window,
+                    cx,
+                );
+                self.refresh_git_diff_panel(cx);
+            }
         }
         cx.notify();
     }
@@ -9180,6 +9434,250 @@ impl MuxelApp {
         section
     }
 
+    /// A centered muted message for the git-diff panel's empty/loading states.
+    fn gitdiff_empty(&self, msg: impl Into<SharedString>, cx: &Context<Self>) -> AnyElement {
+        div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(msg.into())
+            .into_any_element()
+    }
+
+    fn render_git_diff_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let pid = self.workspace.active_project;
+        let project_name = pid
+            .and_then(|p| self.workspace.project(p))
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let branch = pid
+            .and_then(|p| self.project_branches.get(&p).cloned())
+            .flatten();
+        // A `project_branches` entry means we've probed it and it's a git repo
+        // (the value is `None` only when HEAD is detached).
+        let is_repo = pid.is_some_and(|p| self.project_branches.contains_key(&p));
+
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .h(rems(2.25))
+            .flex_none()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .font_semibold()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(project_name),
+            )
+            .children(branch.map(|b| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(b)
+            }))
+            .child(
+                Button::new("gitdiff-refresh")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Redo)
+                    .tooltip(t("Refresh"))
+                    .on_click(cx.listener(|this, _e, _w, cx| this.refresh_git_diff_panel(cx))),
+            );
+
+        let body: AnyElement = if !is_repo {
+            self.gitdiff_empty(t("Not a git repository."), cx)
+        } else {
+            match &self.git_diff_files {
+                None => self.gitdiff_empty(t("Loading…"), cx),
+                Some(files) if files.is_empty() => self.gitdiff_empty(t("Clean — no changes."), cx),
+                Some(files) => {
+                    let mut list = div()
+                        .id("gitdiff-list")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col();
+                    if let Some(p) = pid {
+                        for f in files {
+                            list = list.child(self.render_git_diff_file_row(f, p, cx));
+                        }
+                    }
+                    list.into_any_element()
+                }
+            }
+        };
+
+        let footer = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(Input::new(&self.git_diff_commit_input).w_full())
+            .child(
+                Button::new("gitdiff-commit-all")
+                    .primary()
+                    .w_full()
+                    .label(t("Commit all"))
+                    .disabled(pid.is_none())
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        this.git_diff_panel_commit_all(window, cx)
+                    })),
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().sidebar)
+            .text_color(cx.theme().sidebar_foreground)
+            .child(header)
+            .child(body)
+            .child(footer)
+    }
+
+    fn render_git_diff_file_row(
+        &self,
+        f: &integrations::GitChange,
+        pid: Uuid,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entity = cx.entity();
+        let path = f.path.clone();
+        let (glyph, kind) = git_status_glyph_label(&f.status);
+        let color = kind.to_color(cx);
+        let hover_bg = cx.theme().sidebar_accent;
+        let display = match &f.orig {
+            Some(orig) => format!("{orig} → {}", f.path),
+            None => f.path.clone(),
+        };
+        let open_path = path.clone();
+        let menu_path = path.clone();
+        div()
+            .id(SharedString::from(format!("gdiff-{path}")))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.open_file_diff_window(pid, open_path.clone(), cx)
+            }))
+            .child(
+                div()
+                    .w(px(12.0))
+                    .flex_none()
+                    .text_xs()
+                    .font_bold()
+                    .text_color(color)
+                    .child(glyph),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(cx.theme().sidebar_foreground)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(display),
+            )
+            .context_menu(move |menu, window, _cx| {
+                let view_p = menu_path.clone();
+                let stage_p = menu_path.clone();
+                let unstage_p = menu_path.clone();
+                let discard_p = menu_path.clone();
+                let open_p = menu_path.clone();
+                menu.item(
+                    PopupMenuItem::new(t("View diff"))
+                        .icon(Icon::empty().path("icons/diff.svg"))
+                        .on_click(window.listener_for(&entity, move |this, _, _w, cx| {
+                            this.open_file_diff_window(pid, view_p.clone(), cx)
+                        })),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(t("Stage"))
+                        .icon(IconName::Plus)
+                        .on_click(window.listener_for(&entity, move |this, _, window, cx| {
+                            let p = stage_p.clone();
+                            this.run_project_git(
+                                pid,
+                                t("Staged").into(),
+                                t("Stage failed").into(),
+                                move |loc| integrations::git_stage_path(loc, &p),
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+                .item(
+                    PopupMenuItem::new(t("Unstage"))
+                        .icon(IconName::Undo)
+                        .on_click(window.listener_for(&entity, move |this, _, window, cx| {
+                            let p = unstage_p.clone();
+                            this.run_project_git(
+                                pid,
+                                t("Unstaged").into(),
+                                t("Unstage failed").into(),
+                                move |loc| integrations::git_unstage_path(loc, &p),
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(t("Discard changes"))
+                        .icon(IconName::Delete)
+                        .on_click(window.listener_for(&entity, move |this, _, _w, cx| {
+                            this.request_confirm(
+                                t("Discard changes?"),
+                                tf(
+                                    "This permanently discards your changes to {path}.",
+                                    &[("path", &discard_p)],
+                                ),
+                                t("Discard"),
+                                ConfirmAction::DiscardFilePath {
+                                    pid,
+                                    path: discard_p.clone(),
+                                },
+                                cx,
+                            );
+                        })),
+                )
+                .item(
+                    PopupMenuItem::new(t("Open file"))
+                        .icon(IconName::File)
+                        .on_click(window.listener_for(&entity, move |this, _, window, cx| {
+                            if let Some(proj) = this.workspace.project(pid) {
+                                let full = proj.root_path.join(&open_p);
+                                let target = this.active_instance;
+                                this.open_editor_at(pid, Some(full), target, window, cx);
+                            }
+                        })),
+                )
+            })
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_pid = self.workspace.active_project;
         let entity = cx.entity();
@@ -9996,6 +10494,16 @@ impl MuxelApp {
                     .icon(IconName::Close)
                     .tooltip(t("Close pane"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.close_active(window, cx))),
+            )
+            // Spacer pushes the git-diff toggle to the far right of the toolbar.
+            .child(div().flex_1())
+            .child(
+                Button::new("toggle-git-diff")
+                    .ghost()
+                    .icon(Icon::empty().path("icons/diff.svg"))
+                    .selected(self.show_git_diff)
+                    .tooltip(t("Git diff"))
+                    .on_click(cx.listener(|this, _ev, _w, cx| this.toggle_git_diff(cx))),
             )
     }
 
@@ -14631,6 +15139,42 @@ impl Render for MuxelApp {
                 .into_any_element()
         };
 
+        // Optional right-side git-diff panel, wrapping everything to its left.
+        let outer: AnyElement = if self.show_git_diff {
+            let gd_half = (f32::from(window.viewport_size().width) * 0.4).max(220.0);
+            let gd_saved = self
+                .workspace
+                .gitdiff_panel_width
+                .unwrap_or(300.0)
+                .clamp(200.0, gd_half);
+            let gd_key = SharedString::from(format!(
+                "gitdiff-split-{}",
+                self.current_workspace
+                    .map(|p| p.simple().to_string())
+                    .unwrap_or_default()
+            ));
+            h_resizable(gd_key)
+                .child(resizable_panel().child(body))
+                .child(
+                    resizable_panel()
+                        .size(px(gd_saved))
+                        .size_range(px(200.0)..px(gd_half))
+                        .child(self.render_git_diff_panel(cx)),
+                )
+                .on_resize(|state, _window, cx| {
+                    let width = state.read(cx).sizes().last().map(|p| f32::from(*p));
+                    if let Some(width) = width
+                        && let Some(app) =
+                            cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade())
+                    {
+                        app.update(cx, |app, _cx| app.set_git_diff_panel_width(width));
+                    }
+                })
+                .into_any_element()
+        } else {
+            body
+        };
+
         div()
             .size_full()
             .flex()
@@ -14739,7 +15283,7 @@ impl Render for MuxelApp {
                 cx.listener(|this, a: &JumpToTab, window, cx| this.jump_to_tab(a.0, window, cx)),
             )
             .child(self.render_titlebar(active_name, cx))
-            .child(div().flex_1().min_h_0().flex().child(body))
+            .child(div().flex_1().min_h_0().flex().child(outer))
             .children(
                 self.show_settings
                     .then(|| self.render_settings_modal(window, cx)),
@@ -14813,5 +15357,28 @@ mod shell_title_tests {
         assert_eq!(shell_dir_title("make build"), "make build");
         // A colon but no `@` before it → unchanged.
         assert_eq!(shell_dir_title("12:34"), "12:34");
+    }
+}
+
+#[cfg(test)]
+mod git_glyph_tests {
+    use super::{GlyphKind, git_status_glyph_label};
+
+    #[test]
+    fn maps_porcelain_xy_codes() {
+        // Untracked.
+        assert_eq!(git_status_glyph_label("??"), ("?", GlyphKind::Untracked));
+        // Worktree-modified vs staged-modified both read as Modified.
+        assert_eq!(git_status_glyph_label(" M"), ("M", GlyphKind::Modified));
+        assert_eq!(git_status_glyph_label("M "), ("M", GlyphKind::Modified));
+        // Staged add / delete / rename.
+        assert_eq!(git_status_glyph_label("A "), ("A", GlyphKind::Added));
+        assert_eq!(git_status_glyph_label(" D"), ("D", GlyphKind::Deleted));
+        assert_eq!(git_status_glyph_label("R "), ("R", GlyphKind::Renamed));
+        // Conflict markers win over the per-column status.
+        assert_eq!(git_status_glyph_label("UU"), ("!", GlyphKind::Conflict));
+        assert_eq!(git_status_glyph_label("DD"), ("!", GlyphKind::Conflict));
+        // Index status takes priority over worktree status (staged + re-modified).
+        assert_eq!(git_status_glyph_label("MM"), ("M", GlyphKind::Modified));
     }
 }

@@ -694,6 +694,62 @@ fn parse_status_z(bytes: &[u8]) -> Vec<GitChange> {
     out
 }
 
+/// Unified diff for a single file at `loc`, vs HEAD (staged + unstaged combined).
+/// `path` is the repo-relative path from [`git_status_files`]. For a brand-new
+/// staged file (empty `diff HEAD`) it falls back to the staged (`--cached`) diff.
+/// Returns display-ready diff text, truncated at [`MAX_DIFF_BYTES`], or a short
+/// message when there's nothing to show. Works for local and remote `loc`.
+pub fn git_diff_for(loc: &RepoLoc, path: &str) -> String {
+    let run = |args: &[&str]| {
+        git_output(loc, args)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let mut out = run(&["diff", "HEAD", "--no-color", "--", path]).unwrap_or_default();
+    if out.trim().is_empty() {
+        // New/staged file: HEAD has nothing for it, so show the staged diff.
+        out = run(&["diff", "--cached", "--no-color", "--", path]).unwrap_or_default();
+    }
+    if out.len() > MAX_DIFF_BYTES {
+        out.truncate(MAX_DIFF_BYTES);
+        out.push_str(&t("\n… diff truncated …\n"));
+    }
+    if out.trim().is_empty() {
+        tf("# {path}\n\nNo diff available.\n", &[("path", path)])
+    } else {
+        out
+    }
+}
+
+/// Stage a single file at `loc` (`git add -- <path>`).
+pub fn git_stage_path(loc: &RepoLoc, path: &str) -> Result<String> {
+    git_run_loc(loc, &["add", "--", path])
+}
+
+/// Unstage a single file at `loc` (`git restore --staged -- <path>`).
+pub fn git_unstage_path(loc: &RepoLoc, path: &str) -> Result<String> {
+    git_run_loc(loc, &["restore", "--staged", "--", path])
+}
+
+/// Discard all changes to a single file at `loc`: revert a tracked file's index
+/// and worktree to HEAD, or delete it if untracked. DESTRUCTIVE — the caller must
+/// confirm first.
+pub fn git_discard_path(loc: &RepoLoc, path: &str) -> Result<String> {
+    git_run_loc(
+        loc,
+        &[
+            "restore",
+            "--source=HEAD",
+            "--staged",
+            "--worktree",
+            "--",
+            path,
+        ],
+    )
+    .or_else(|_| git_run_loc(loc, &["clean", "-fd", "--", path]))
+}
+
 /// Stage exactly `paths` (their additions, modifications, and deletions, via
 /// `git add -A -- <paths>`) and commit only those paths at `loc` (`git commit
 /// --only`). Files outside `paths` are left untouched — even if already staged.
@@ -1294,6 +1350,60 @@ mod tests {
 
         // An empty selection is rejected rather than producing an empty commit.
         assert!(git_commit_paths(&loc, "noop", &[]).is_err());
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn stage_unstage_discard_and_diff_single_file() {
+        let repo = std::env::temp_dir().join("muxel-it-per-file-ops");
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@muxel"]);
+        git(&["config", "user.name", "muxel test"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let loc = RepoLoc::Local(repo.clone());
+
+        // Modify the file: its single-file diff shows the change.
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        let diff = git_diff_for(&loc, "a.txt");
+        assert!(diff.contains("-one"), "diff shows removed line:\n{diff}");
+        assert!(diff.contains("+two"), "diff shows added line:\n{diff}");
+
+        // Stage → X column M (staged-modified, worktree clean).
+        git_stage_path(&loc, "a.txt").expect("stage");
+        assert_eq!(git_status_files(&loc)[0].status, "M ");
+
+        // Unstage → back to worktree-modified.
+        git_unstage_path(&loc, "a.txt").expect("unstage");
+        assert_eq!(git_status_files(&loc)[0].status, " M");
+
+        // Discard reverts a tracked file to HEAD: clean tree, original content.
+        git_discard_path(&loc, "a.txt").expect("discard tracked");
+        assert!(
+            git_status_files(&loc).is_empty(),
+            "tree clean after discard"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "one\n"
+        );
+
+        // Discard also removes an untracked file.
+        std::fs::write(repo.join("junk.txt"), "x\n").unwrap();
+        git_discard_path(&loc, "junk.txt").expect("discard untracked");
+        assert!(!repo.join("junk.txt").exists(), "untracked file removed");
 
         let _ = std::fs::remove_dir_all(&repo);
     }
