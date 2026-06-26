@@ -283,6 +283,18 @@ impl TerminalSession {
         self.write_raw(data);
     }
 
+    /// Paste text into the PTY, honoring bracketed-paste mode (so the program
+    /// receives it as a paste, not as typed keystrokes). Shared by the keyboard
+    /// shortcut and the mouse copy/paste modes.
+    pub fn paste(&self, text: &str) {
+        let payload = if self.is_bracketed_paste() {
+            format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
+        } else {
+            text.replace("\r\n", "\r").replace('\n', "\r")
+        };
+        self.write_input(payload.as_bytes());
+    }
+
     /// Write bytes to the PTY without touching the scroll position (used for
     /// non-input writes like focus reports).
     fn write_raw(&self, data: &[u8]) {

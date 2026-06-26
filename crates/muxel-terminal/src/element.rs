@@ -7,6 +7,7 @@
 
 use crate::colors::{TerminalPalette, brighten};
 use crate::session::TerminalSession;
+use crate::view::TerminalMouseMode;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -21,6 +22,7 @@ pub struct TerminalElement {
     palette: TerminalPalette,
     font_family: SharedString,
     font_size: Pixels,
+    mouse_mode: TerminalMouseMode,
 }
 
 impl TerminalElement {
@@ -30,6 +32,7 @@ impl TerminalElement {
         palette: TerminalPalette,
         font_family: SharedString,
         font_size: Pixels,
+        mouse_mode: TerminalMouseMode,
     ) -> Self {
         Self {
             session,
@@ -37,6 +40,7 @@ impl TerminalElement {
             palette,
             font_family,
             font_size,
+            mouse_mode,
         }
     }
 }
@@ -318,9 +322,18 @@ impl Element for TerminalElement {
         }
         {
             let session = self.session.clone();
-            window.on_mouse_event(move |e: &MouseUpEvent, phase, _window, _cx| {
+            let mouse_mode = self.mouse_mode;
+            window.on_mouse_event(move |e: &MouseUpEvent, phase, _window, cx| {
                 if phase == DispatchPhase::Bubble && e.button == MouseButton::Left {
                     session.stop_selecting();
+                    // "Copy on select": the moment a drag-selection ends, put it on
+                    // the clipboard (the highlight stays so it's clear what copied).
+                    if mouse_mode == TerminalMouseMode::CopyOnSelect
+                        && let Some(text) = session.selection_to_string()
+                        && !text.is_empty()
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
                 }
             });
         }
@@ -397,10 +410,13 @@ impl Element for TerminalElement {
                 }
             });
         }
-        // Right-click copies the current selection to the clipboard.
+        // Right-click behavior depends on the mouse mode. (In RightClickMenu mode
+        // this handler is a no-op — the muxel crate wraps the view in a Copy/Paste
+        // context menu, which owns right-click. We must not consume the event here.)
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
+            let mouse_mode = self.mouse_mode;
             window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble
                     || e.button != MouseButton::Right
@@ -408,12 +424,30 @@ impl Element for TerminalElement {
                 {
                     return;
                 }
-                if let Some(text) = session.selection_to_string()
-                    && !text.is_empty()
-                {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    session.clear_selection();
-                    window.refresh();
+                match mouse_mode {
+                    // Copy the selection if there is one, otherwise paste.
+                    TerminalMouseMode::CopyPaste => {
+                        if let Some(text) = session.selection_to_string().filter(|t| !t.is_empty())
+                        {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            session.clear_selection();
+                            window.refresh();
+                        } else if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                            session.paste(&text);
+                        }
+                    }
+                    // The selection already auto-copied; right-click pastes and
+                    // drops the (now stale) selection highlight.
+                    TerminalMouseMode::CopyOnSelect => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                            session.paste(&text);
+                        }
+                        if session.clear_selection() {
+                            window.refresh();
+                        }
+                    }
+                    // Handled by the context menu in the muxel crate.
+                    TerminalMouseMode::RightClickMenu => {}
                 }
             });
         }

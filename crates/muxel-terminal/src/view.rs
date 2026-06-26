@@ -66,12 +66,37 @@ fn classify(
     AgentStatus::Idle
 }
 
+/// How the mouse copies/pastes in a terminal pane (a global setting parsed from
+/// `Settings.terminal_mouse`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalMouseMode {
+    /// Right-click copies the selection, or pastes when nothing is selected.
+    #[default]
+    CopyPaste,
+    /// Right-click opens a Copy/Paste menu; selection stays manual.
+    RightClickMenu,
+    /// Selecting text copies it immediately; right-click pastes.
+    CopyOnSelect,
+}
+
+impl TerminalMouseMode {
+    /// Parse the persisted setting string; unknown values fall back to the default.
+    pub fn from_setting(s: &str) -> Self {
+        match s {
+            "menu" => Self::RightClickMenu,
+            "copy_on_select" => Self::CopyOnSelect,
+            _ => Self::CopyPaste,
+        }
+    }
+}
+
 pub struct TerminalView {
     session: Arc<TerminalSession>,
     focus_handle: FocusHandle,
     palette: TerminalPalette,
     font_family: SharedString,
     font_size: f32,
+    mouse_mode: TerminalMouseMode,
     exited: bool,
     /// On-screen markers that classify the agent's status (per-agent).
     working_markers: Vec<String>,
@@ -239,6 +264,7 @@ impl TerminalView {
             palette: TerminalPalette::default(),
             font_family: SharedString::default(),
             font_size: 14.0,
+            mouse_mode: TerminalMouseMode::default(),
             exited: false,
             working_markers,
             blocked_markers,
@@ -295,6 +321,16 @@ impl TerminalView {
         self.font_size = font_size;
     }
 
+    /// The active mouse copy/paste mode.
+    pub fn mouse_mode(&self) -> TerminalMouseMode {
+        self.mouse_mode
+    }
+
+    /// Set the mouse copy/paste mode (pushed from settings).
+    pub fn set_mouse_mode(&mut self, mode: TerminalMouseMode) {
+        self.mouse_mode = mode;
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let m = &event.keystroke.modifiers;
 
@@ -315,12 +351,7 @@ impl TerminalView {
                 }
                 "v" => {
                     if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                        let payload = if self.session.is_bracketed_paste() {
-                            format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
-                        } else {
-                            text.replace("\r\n", "\r").replace('\n', "\r")
-                        };
-                        self.session.write_input(payload.as_bytes());
+                        self.session.paste(&text);
                     }
                     self.session.clear_selection();
                     cx.notify();
@@ -381,6 +412,7 @@ impl Render for TerminalView {
                 self.palette.clone(),
                 self.font_family.clone(),
                 px(self.font_size),
+                self.mouse_mode,
             ))
     }
 }
@@ -389,11 +421,26 @@ impl Render for TerminalView {
 mod tests {
     // Import specifically (not `super::*`) so `#[test]` resolves to the built-in
     // macro, not gpui's glob-imported `test` attribute.
-    use super::{AgentStatus, classify};
+    use super::{AgentStatus, TerminalMouseMode, classify};
     use std::time::Duration;
 
     fn m(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn mouse_mode_from_setting() {
+        use TerminalMouseMode::*;
+        assert_eq!(TerminalMouseMode::from_setting("copy_paste"), CopyPaste);
+        assert_eq!(TerminalMouseMode::from_setting("menu"), RightClickMenu);
+        assert_eq!(
+            TerminalMouseMode::from_setting("copy_on_select"),
+            CopyOnSelect
+        );
+        // Unknown / empty falls back to the default.
+        assert_eq!(TerminalMouseMode::from_setting(""), CopyPaste);
+        assert_eq!(TerminalMouseMode::from_setting("bogus"), CopyPaste);
+        assert_eq!(TerminalMouseMode::default(), CopyPaste);
     }
 
     #[test]

@@ -610,6 +610,10 @@ fn default_pane_border() -> String {
     "subtle".to_string()
 }
 
+fn default_terminal_mouse() -> String {
+    "copy_paste".to_string()
+}
+
 /// A user keybinding override: an action name bound to a keystroke string.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyBindingCfg {
@@ -859,6 +863,9 @@ pub struct Settings {
     /// Pane border intensity: "off" | "subtle" | "bold".
     #[serde(default = "default_pane_border")]
     pub pane_border: String,
+    /// Terminal mouse copy/paste mode: "copy_paste" | "menu" | "copy_on_select".
+    #[serde(default = "default_terminal_mouse")]
+    pub terminal_mouse: String,
     /// Keybinding overrides.
     #[serde(default)]
     pub keybindings: Vec<KeyBindingCfg>,
@@ -936,6 +943,7 @@ impl Default for Settings {
             ui_font_size: 16.0,
             zoom: 1.0,
             pane_border: "subtle".to_string(),
+            terminal_mouse: "copy_paste".to_string(),
             keybindings: Vec::new(),
             runners: Runner::defaults(),
             loops: Vec::new(),
@@ -1111,6 +1119,28 @@ mod settings_tests {
         let idx: WorkspacesIndex = serde_json::from_str(json).unwrap();
         assert_eq!(idx.workspaces.len(), 1);
         assert_eq!(idx.workspaces[0].name, "Default");
+    }
+
+    #[test]
+    fn settings_terminal_mouse_default_and_round_trip() {
+        assert_eq!(Settings::default().terminal_mouse, "copy_paste");
+        // An old config missing the key still loads, defaulting to copy_paste.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("terminal_mouse");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.terminal_mouse, "copy_paste");
+        // A non-default value round-trips.
+        let s2 = Settings {
+            terminal_mouse: "copy_on_select".to_string(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s2).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .terminal_mouse,
+            "copy_on_select"
+        );
     }
 }
 

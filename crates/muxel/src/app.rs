@@ -25,7 +25,7 @@ use muxel_core::{
     resolve_launch, set_active_tab, set_split_sizes, set_tab_order, split, split_beside,
     swap_instances, swap_panes,
 };
-use muxel_terminal::{AgentStatus, CommandSpec, TerminalSession, TerminalView};
+use muxel_terminal::{AgentStatus, CommandSpec, TerminalMouseMode, TerminalSession, TerminalView};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -215,6 +215,42 @@ fn shell_dir_title(osc: &str) -> &str {
         Some((prefix, path)) if prefix.contains('@') && !path.is_empty() => path,
         _ => osc,
     }
+}
+
+/// Render a terminal pane. In `RightClickMenu` mouse mode it wraps the view in a
+/// right-click Copy/Paste context menu (the menu component lives in this crate, not
+/// in muxel-terminal); the other modes handle the mouse inside the terminal element
+/// itself. Shared by the main pane and pop-out windows.
+fn terminal_pane_element(view: &Entity<TerminalView>, cx: &App) -> AnyElement {
+    if view.read(cx).mouse_mode() != TerminalMouseMode::RightClickMenu {
+        return view.clone().into_any_element();
+    }
+    let view = view.clone();
+    div()
+        .size_full()
+        .child(view.clone())
+        .context_menu(move |menu, window, _cx| {
+            menu.item(PopupMenuItem::new(t("Copy")).icon(IconName::Copy).on_click(
+                window.listener_for(&view, |this, _e, _w, cx| {
+                    if let Some(text) = this
+                        .session()
+                        .selection_to_string()
+                        .filter(|t| !t.is_empty())
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                }),
+            ))
+            .item(PopupMenuItem::new(t("Paste")).on_click(window.listener_for(
+                &view,
+                |this, _e, _w, cx| {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                        this.session().paste(&text);
+                    }
+                },
+            )))
+        })
+        .into_any_element()
 }
 
 /// Instance a clicked desktop notification wants muxel to jump to. Set from the
@@ -1143,9 +1179,9 @@ impl PopoutView {
         }
     }
 
-    fn content(&self) -> AnyElement {
+    fn content(&self, cx: &App) -> AnyElement {
         match &self.view {
-            PaneView::Terminal(v) => v.clone().into_any_element(),
+            PaneView::Terminal(v) => terminal_pane_element(v, cx),
             PaneView::Editor(v) => v.clone().into_any_element(),
         }
     }
@@ -1373,7 +1409,7 @@ impl Render for PopoutView {
                             ),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(self.content()))
+            .child(div().flex_1().min_h_0().child(self.content(cx)))
             .children(self.show_close_confirm.then(|| {
                 div()
                     .absolute()
@@ -2219,10 +2255,12 @@ impl MuxelApp {
         let palette = theme::palette_from_theme(cx);
         let font_family: SharedString = self.settings.font_family.clone().into();
         let font_size = self.settings.font_size * self.settings.zoom;
+        let mouse_mode = TerminalMouseMode::from_setting(&self.settings.terminal_mouse);
         let view = cx.new(move |cx| {
             let mut view = TerminalView::new(spec, window, cx);
             view.set_palette(palette);
             view.set_config(font_family, font_size);
+            view.set_mouse_mode(mouse_mode);
             view
         });
         self.terminals.insert(instance_id, view);
@@ -7642,7 +7680,7 @@ impl MuxelApp {
                 };
                 let is_active = pane_has_focus;
                 let content: AnyElement = if let Some(view) = self.terminals.get(&iid) {
-                    view.clone().into_any_element()
+                    terminal_pane_element(view, cx)
                 } else if let Some(ed) = self.editors.get(&iid) {
                     // Clicking the editor makes it the active pane (so toolbar
                     // actions like Restart target it correctly).
@@ -10522,9 +10560,11 @@ impl MuxelApp {
     fn refresh_terminal_config(&mut self, cx: &mut Context<Self>) {
         let font_family: SharedString = self.settings.font_family.clone().into();
         let font_size = self.settings.font_size * self.settings.zoom;
+        let mouse_mode = TerminalMouseMode::from_setting(&self.settings.terminal_mouse);
         for view in self.terminals.values() {
             view.update(cx, |view, _cx| {
-                view.set_config(font_family.clone(), font_size)
+                view.set_config(font_family.clone(), font_size);
+                view.set_mouse_mode(mouse_mode);
             });
         }
     }
@@ -10705,6 +10745,28 @@ impl MuxelApp {
             .selected(self.settings.pane_border == value)
             .label(label.to_string())
             .on_click(cx.listener(move |this, _e, _w, cx| this.set_pane_border(value, cx)))
+    }
+
+    fn set_terminal_mouse(&mut self, value: &str, cx: &mut Context<Self>) {
+        self.settings.terminal_mouse = value.to_string();
+        // Push to live panes so the new behavior takes effect immediately.
+        self.refresh_terminal_config(cx);
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn terminal_mouse_btn(
+        &self,
+        value: &'static str,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        Button::new(SharedString::from(format!("tm-{value}")))
+            .ghost()
+            .small()
+            .selected(self.settings.terminal_mouse == value)
+            .label(label.to_string())
+            .on_click(cx.listener(move |this, _e, _w, cx| this.set_terminal_mouse(value, cx)))
     }
 
     fn set_global_default_preset(&mut self, id: Uuid, cx: &mut Context<Self>) {
@@ -13193,6 +13255,16 @@ impl MuxelApp {
                         })),
                     &t("Confirm before closing a git-diff pane"),
                 ),
+            )
+            .child(self.settings_label(&t("Terminal copy & paste"), cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(self.terminal_mouse_btn("copy_paste", &t("Right-click copy/paste"), cx))
+                    .child(self.terminal_mouse_btn("menu", &t("Right-click menu"), cx))
+                    .child(self.terminal_mouse_btn("copy_on_select", &t("Copy on select"), cx)),
             )
             .child(
                 self.check_row(
