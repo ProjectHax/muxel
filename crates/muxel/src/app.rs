@@ -269,14 +269,15 @@ fn notify(summary: String, body: String, focus: Option<Uuid>) {
             .icon("muxel")
             .summary(&summary)
             .body(&body)
-            // Tie the notification to muxel's window: the desktop-entry hint names
-            // the .desktop ("muxel"), whose StartupWMClass matches the window's
-            // app_id ("muxel"). GNOME Shell then raises the existing window itself
-            // when the notification is clicked — with its own privilege, so it
-            // doesn't trip focus-stealing prevention (and the "muxel is ready"
-            // hand-off notification) the way an app self-raise does.
-            .hint(notify_rust::Hint::DesktopEntry("muxel".to_string()))
             .timeout(notify_rust::Timeout::Milliseconds(10_000));
+        // Tie the notification to muxel's window: the desktop-entry hint names the
+        // .desktop ("muxel"), whose StartupWMClass matches the window's app_id, so
+        // GNOME Shell raises the existing window itself on click — with its own
+        // privilege, dodging focus-stealing prevention (and the "muxel is ready"
+        // hand-off). XDG-only: notify-rust's `hint`/`Hint` don't exist on the macOS
+        // (NSUserNotification) or Windows (WinRT) backends.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        builder.hint(notify_rust::Hint::DesktopEntry("muxel".to_string()));
         // "default" is the action GNOME invokes when the notification *body* is
         // clicked; only register it when there's a pane to jump to.
         if focus.is_some() {
