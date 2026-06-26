@@ -3954,7 +3954,7 @@ dependencies = [
 
 [[package]]
 name = "muxel"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3981,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-core"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -3990,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-store"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "directories",
@@ -4002,7 +4002,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-terminal"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

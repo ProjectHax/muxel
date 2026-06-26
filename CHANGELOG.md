@@ -3,6 +3,34 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [0.0.5] — 2026-06-26
+
+### Added
+- **Git diff panel** — a toolbar toggle opens a right-side panel listing the
+  active project's changed files, color-coded by status. Click a file to open its
+  diff in a dedicated window with a remembered Split / Unified toggle: Unified is
+  a colored diff whose text is selectable + copyable, Split is a side-by-side view
+  (green/red, line numbers). Per-file Stage / Unstage / Discard / Open, plus
+  commit-all with a message. Works for local and remote (SSH) projects.
+- **Worktrees tab** — alongside the changed files, list a project's git
+  worktrees, browse each one's changes, merge a worktree into a chosen branch, and
+  delete a worktree (local or remote) once no instance is using it.
+- **Terminal mouse modes** — three global copy/paste behaviors for terminal
+  panes: copy/paste keys, a right-click menu, or copy-on-select.
+- **PowerShell and Cmd presets on Windows** — the shell launcher offers
+  PowerShell and Cmd as first-class options.
+- **Drag-install on macOS** — the DMG now includes an Applications shortcut.
+
+### Changed
+- **Agent recovery** — when an instance exits with an invalid or failed session,
+  muxel automatically respawns a fresh instance of the same type instead of
+  leaving the pane dead.
+
+### Fixed
+- **Notification click** — clicking a muxel desktop notification now raises the
+  existing muxel window via its app association, instead of popping a second
+  "muxel is ready" notification.
+
 ## [0.0.4] — 2026-06-25
 
 ### Added
