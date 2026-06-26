@@ -874,6 +874,10 @@ pub struct Settings {
     /// Diff window layout: `true` = side-by-side split, `false` = unified.
     #[serde(default)]
     pub diff_split_view: bool,
+    /// Hide muxel to a system-tray icon (instead of quitting) when the window is
+    /// closed, minimized, or exited. Restore from the tray menu.
+    #[serde(default)]
+    pub minimize_to_tray: bool,
     /// Keybinding overrides.
     #[serde(default)]
     pub keybindings: Vec<KeyBindingCfg>,
@@ -953,6 +957,7 @@ impl Default for Settings {
             pane_border: "subtle".to_string(),
             terminal_mouse: "copy_paste".to_string(),
             diff_split_view: false,
+            minimize_to_tray: false,
             keybindings: Vec::new(),
             runners: Runner::defaults(),
             loops: Vec::new(),

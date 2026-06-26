@@ -156,6 +156,14 @@ feature is added or changed, update the matching entry here in the same change**
   click-to-navigate (jump to the pane + dismiss); all rows are individually
   dismissable, with a clear-all. Collected even when desktop notifications are off.
 - **Controls** — an enable/disable toggle and a "send test notification" button.
+- **System tray** (Settings → Behavior → "Minimize to the system tray on close") —
+  closing the window iconifies muxel to a tray icon instead of quitting. The tray
+  menu lists every agent with its live status and the most recent notifications;
+  clicking one restores muxel and focuses that project + pane, and "Quit" exits for
+  real. Linux uses StatusNotifierItem (needs an AppIndicator/SNI host — standard on
+  KDE, the AppIndicator extension on GNOME); Windows/macOS use the notification-area
+  / status-bar item. (Stock GPUI can only iconify, so the window still appears in the
+  taskbar; restoring from the tray is best-effort on Wayland — the dash always works.)
 
 ## Terminal
 

@@ -19,12 +19,15 @@ gpui-component-assets.workspace = true
 muxel-core.workspace = true
 muxel-terminal.workspace = true
 muxel-store.workspace = true
+muxel-tray.workspace = true
 anyhow.workspace = true
 log.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
 notify-rust = "4"
 rust-embed = "8"
+# Decode the embedded app icon (PNG) to RGBA for the Windows/macOS tray icon.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Detect the OS UI locale at startup for i18n (already resolved transitively).
 sys-locale = "0.3"
 # Gitignore-aware file walk for the Ctrl+P search palette.

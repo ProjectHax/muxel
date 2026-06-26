@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/muxel", "crates/muxel-core", "crates/muxel-store", "crates/muxel-terminal"]
+members = ["crates/muxel", "crates/muxel-core", "crates/muxel-store", "crates/muxel-terminal", "crates/muxel-tray"]
 
 [workspace.package]
 version = "0.0.5"
@@ -34,6 +34,7 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 muxel-core = { path = "crates/muxel-core" }
 muxel-terminal = { path = "crates/muxel-terminal" }
 muxel-store = { path = "crates/muxel-store" }
+muxel-tray = { path = "crates/muxel-tray" }
 
 # --- shared third-party deps ---
 anyhow = "1"

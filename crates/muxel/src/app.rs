@@ -841,6 +841,10 @@ pub struct MuxelApp {
     notifications: Vec<Notification>,
     /// Last seen status per instance, to fire notifications on transitions.
     last_status: HashMap<Uuid, AgentStatus>,
+    /// System-tray handle (when `minimize_to_tray` is on and a tray is available).
+    tray: Option<muxel_tray::TrayController>,
+    /// Last tray menu we pushed, so we only update on change.
+    last_tray_model: muxel_tray::TrayModel,
     /// Per-instance launch tracking: `(spawn time, launched-with-resume)`. A
     /// resume launch that exits almost immediately means the saved session was
     /// invalid — we recover by re-spawning the agent with a fresh session.
@@ -1839,6 +1843,7 @@ impl MuxelApp {
                     .update_in(cx, |this, window, cx| {
                         this.tick(window, cx);
                         this.handle_notification_click(window, cx);
+                        this.pump_tray(window, cx);
                     })
                     .is_err()
                 {
@@ -2244,6 +2249,8 @@ impl MuxelApp {
             notifications_enabled: settings.notifications_enabled,
             notifications: Vec::new(),
             last_status: HashMap::new(),
+            tray: None,
+            last_tray_model: muxel_tray::TrayModel::default(),
             terminal_launches: HashMap::new(),
             split_even_nonce: HashMap::new(),
             memory_ensured: HashSet::new(),
@@ -2285,12 +2292,18 @@ impl MuxelApp {
 
         // Confirm before quitting: veto the first close request + show a modal.
         let weak = cx.weak_entity();
-        window.on_window_should_close(cx, move |_window, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
             weak.upgrade()
                 .map(|app| {
                     app.update(cx, |this, cx| {
                         if this.confirm_quit {
                             return true;
+                        }
+                        // Minimize-to-tray: iconify and keep running (the tray is
+                        // the way back) instead of prompting to quit.
+                        if this.minimize_to_tray_active() {
+                            window.minimize_window();
+                            return false;
                         }
                         this.show_quit_confirm = true;
                         cx.notify();
@@ -7691,6 +7704,170 @@ impl MuxelApp {
         }
     }
 
+    /// Spawn or drop the system tray to match the `minimize_to_tray` setting.
+    /// Idempotent; called from `tick` and the settings setter.
+    fn sync_tray(&mut self) {
+        let want = self.settings.minimize_to_tray;
+        if want && self.tray.is_none() {
+            // Linux uses the themed icon name; Windows/macOS need RGBA pixels.
+            let rgba = image::load_from_memory(include_bytes!("../assets/muxel.png"))
+                .ok()
+                .map(|img| {
+                    let img = img.to_rgba8();
+                    let (width, height) = img.dimensions();
+                    muxel_tray::TrayIconRgba {
+                        bytes: img.into_raw(),
+                        width,
+                        height,
+                    }
+                });
+            let icon = muxel_tray::TrayIcon {
+                name: "muxel".to_string(),
+                tooltip: "muxel".to_string(),
+                rgba,
+            };
+            let labels = muxel_tray::TrayLabels {
+                show: t("Show muxel").to_string(),
+                quit: t("Quit muxel").to_string(),
+                agents: t("Agents").to_string(),
+                notifications: t("Notifications").to_string(),
+            };
+            self.tray = muxel_tray::TrayController::spawn(icon, labels);
+            self.last_tray_model = muxel_tray::TrayModel::default();
+        } else if !want && self.tray.is_some() {
+            self.tray = None;
+        }
+    }
+
+    /// Whether a close should iconify to the tray (setting on + a live tray).
+    fn minimize_to_tray_active(&self) -> bool {
+        self.settings.minimize_to_tray && self.tray.is_some()
+    }
+
+    /// Build the current tray menu model: every agent (with status) + the most
+    /// recent notifications. Labels are formatted + localized here so the tray
+    /// crate stays i18n-free.
+    fn build_tray_model(&self) -> muxel_tray::TrayModel {
+        let agents = self
+            .terminals
+            .keys()
+            .filter_map(|iid| {
+                let inst = self.workspace.instance(*iid)?;
+                let project = self
+                    .workspace
+                    .project(inst.project_id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                let name = inst
+                    .custom_name
+                    .clone()
+                    .unwrap_or_else(|| inst.title.clone());
+                let status = self
+                    .last_status
+                    .get(iid)
+                    .copied()
+                    .unwrap_or(AgentStatus::Idle);
+                // Show the status so you can spot at a glance which agents are
+                // waiting on you ("needs input") or done.
+                let status_word = match status {
+                    AgentStatus::Working => t("working"),
+                    AgentStatus::Idle => t("idle"),
+                    AgentStatus::Blocked => t("needs input"),
+                    AgentStatus::Done => t("finished"),
+                };
+                Some(muxel_tray::TrayAgent {
+                    iid: *iid,
+                    label: format!(
+                        "{} — {status_word}",
+                        muxel_tray::truncate_label(&format!("{project} / {name}"), 32)
+                    ),
+                    status: match status {
+                        AgentStatus::Working => muxel_tray::TrayStatus::Working,
+                        AgentStatus::Idle => muxel_tray::TrayStatus::Idle,
+                        AgentStatus::Blocked => muxel_tray::TrayStatus::Blocked,
+                        AgentStatus::Done => muxel_tray::TrayStatus::Done,
+                    },
+                })
+            })
+            .collect();
+        let notifications = self
+            .notifications
+            .iter()
+            .rev()
+            .take(10)
+            .map(|n| muxel_tray::TrayNotif {
+                id: n.id,
+                instance: n.instance,
+                label: muxel_tray::truncate_label(&format!("{} — {}", n.title, n.subtitle), 56),
+                kind: match n.kind {
+                    NotifKind::Blocked => muxel_tray::TrayKind::Blocked,
+                    NotifKind::Done => muxel_tray::TrayKind::Done,
+                    NotifKind::Success => muxel_tray::TrayKind::Success,
+                    NotifKind::Error => muxel_tray::TrayKind::Error,
+                },
+            })
+            .collect();
+        muxel_tray::TrayModel {
+            agents,
+            notifications,
+        }
+    }
+
+    /// Keep the tray in sync and run any clicks queued on its background thread.
+    /// Called each `tick`.
+    fn pump_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_tray();
+        if self.tray.is_none() {
+            return;
+        }
+        let model = self.build_tray_model();
+        if model != self.last_tray_model {
+            if let Some(t) = &self.tray {
+                t.update(model.clone());
+            }
+            self.last_tray_model = model;
+        }
+        // Collect first to satisfy the borrow checker, then dispatch with `&mut self`.
+        let actions: Vec<muxel_tray::TrayAction> = self
+            .tray
+            .as_ref()
+            .map(|t| std::iter::from_fn(|| t.take_action()).collect())
+            .unwrap_or_default();
+        for action in actions {
+            self.handle_tray_action(action, window, cx);
+        }
+    }
+
+    fn handle_tray_action(
+        &mut self,
+        action: muxel_tray::TrayAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            // Best-effort raise — reliable on X11, may no-op under Wayland's
+            // focus-stealing prevention (the dash still restores the window).
+            muxel_tray::TrayAction::ShowWindow => window.activate_window(),
+            muxel_tray::TrayAction::Focus(iid) => {
+                window.activate_window();
+                if self.workspace.instance(iid).is_some() {
+                    self.select_instance(iid, window, cx);
+                }
+            }
+            muxel_tray::TrayAction::Quit => {
+                self.confirm_quit = true;
+                cx.quit();
+            }
+        }
+    }
+
+    fn set_minimize_to_tray(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.minimize_to_tray = on;
+        self.persist_settings();
+        self.sync_tray();
+        cx.notify();
+    }
+
     /// Swap two terminals' positions (sidebar or pane drag). Only within one project.
     fn swap_terminals(&mut self, a: Uuid, b: Uuid, cx: &mut Context<Self>) {
         let Some(pid) = self.workspace.instance(a).map(|i| i.project_id) else {
@@ -11517,11 +11694,16 @@ impl MuxelApp {
                 .child(el)
         }
         // Intercept the title-bar X (which otherwise calls remove_window directly,
-        // bypassing on_window_should_close) so quitting asks for confirmation.
+        // bypassing on_window_should_close) so quitting asks for confirmation —
+        // or, with minimize-to-tray on, iconifies to the tray instead.
         TitleBar::new()
-            .on_close_window(cx.listener(|this, _ev, _window, cx| {
-                this.show_quit_confirm = true;
-                cx.notify();
+            .on_close_window(cx.listener(|this, _ev, window, cx| {
+                if this.minimize_to_tray_active() {
+                    window.minimize_window();
+                } else {
+                    this.show_quit_confirm = true;
+                    cx.notify();
+                }
             }))
             .child(
                 div()
@@ -14392,6 +14574,16 @@ impl MuxelApp {
                             cx.notify();
                         })),
                     &t("Desktop notifications"),
+                ),
+            )
+            .child(
+                self.check_row(
+                    Checkbox::new("b-minimize-tray")
+                        .checked(self.settings.minimize_to_tray)
+                        .on_click(
+                            cx.listener(|this, c: &bool, _w, cx| this.set_minimize_to_tray(*c, cx)),
+                        ),
+                    &t("Minimize to the system tray on close"),
                 ),
             )
             .child(
