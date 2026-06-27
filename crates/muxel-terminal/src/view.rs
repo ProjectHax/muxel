@@ -123,6 +123,9 @@ pub struct TerminalView {
     /// The child's exit code once it has exited (`None` = still running or the
     /// code wasn't reported by the OS/PTY).
     exit_code: Option<i32>,
+    /// Error from a failed launch (e.g. the agent program isn't on PATH), captured
+    /// for the dev console. `None` when the program launched fine.
+    launch_error: Option<String>,
     /// On-screen markers that classify the agent's status (per-agent).
     working_markers: Vec<String>,
     blocked_markers: Vec<String>,
@@ -141,9 +144,12 @@ impl TerminalView {
         // Try the requested program; if it can't be launched (e.g. the agent
         // isn't installed), fall back to a shell that shows the error rather than
         // crashing the whole app.
+        let mut launch_error: Option<String> = None;
         let (spec, session, rx) = match TerminalSession::spawn(spec.clone(), 80, 24) {
             Ok((session, rx)) => (spec, session, rx),
             Err(e) => {
+                // Capture the full error (incl. the OS code) for the dev console.
+                launch_error = Some(format!("{e:#}"));
                 let prog = spec.program.replace(['\'', '"'], "");
                 // `{e:#}` includes the full anyhow context chain (e.g. the real
                 // OS error: "No such file or directory"), not just the top context.
@@ -299,6 +305,7 @@ impl TerminalView {
             mouse_mode: TerminalMouseMode::default(),
             exited: false,
             exit_code: None,
+            launch_error,
             working_markers,
             blocked_markers,
             prev_raw: std::cell::Cell::new(None),
@@ -324,6 +331,12 @@ impl TerminalView {
     /// while running or when the code is unknown (e.g. a bare PTY close).
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    /// The error from a failed launch (program not on PATH, etc.), for the dev
+    /// console. `None` when the program launched (a fallback shell still ran).
+    pub fn launch_error(&self) -> Option<&str> {
+        self.launch_error.as_deref()
     }
 
     /// The agent's lifecycle state, from its per-agent on-screen markers, the

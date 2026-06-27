@@ -165,6 +165,11 @@ feature is added or changed, update the matching entry here in the same change**
   KDE, the AppIndicator extension on GNOME); Windows/macOS use the notification-area
   / status-bar item. (Stock GPUI can only iconify, so the window still appears in the
   taskbar; restoring from the tray is best-effort on Wayland — the dash always works.)
+- **Developer console** (Settings → Behavior → "Developer console", toggled with F12) —
+  an opt-in popped-out window logging errors as they happen. A failed agent launch
+  shows the program it tried, the working directory, and the OS error/code; git, save,
+  and SSH errors land here too. Timestamped, newest first, selectable/copyable, with a
+  Clear button. F12 is a no-op until the setting is enabled.
 
 ## Terminal
 

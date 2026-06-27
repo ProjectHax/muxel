@@ -878,6 +878,9 @@ pub struct Settings {
     /// closed, minimized, or exited. Restore from the tray menu.
     #[serde(default)]
     pub minimize_to_tray: bool,
+    /// Enable the developer console (a popped-out error log toggled with F12).
+    #[serde(default)]
+    pub dev_console_enabled: bool,
     /// Keybinding overrides.
     #[serde(default)]
     pub keybindings: Vec<KeyBindingCfg>,
@@ -958,6 +961,7 @@ impl Default for Settings {
             terminal_mouse: "copy_paste".to_string(),
             diff_split_view: false,
             minimize_to_tray: false,
+            dev_console_enabled: false,
             keybindings: Vec::new(),
             runners: Runner::defaults(),
             loops: Vec::new(),

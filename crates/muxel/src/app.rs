@@ -418,6 +418,8 @@ actions!(
         ShowKeys,
         // Toggle the broadcast bar (send one line to every agent in the project).
         ToggleBroadcast,
+        // Toggle the developer console (error log) — only when enabled in settings.
+        ToggleDevConsole,
         // Search the active terminal's scrollback (Terminal context only).
         SearchTerminal,
         // Tab / Shift+Tab while a terminal is focused: send to the PTY instead
@@ -466,6 +468,7 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
         "FocusDown" => KeyBinding::new(keystroke, FocusDown, context),
         "ShowKeys" => KeyBinding::new(keystroke, ShowKeys, context),
         "ToggleBroadcast" => KeyBinding::new(keystroke, ToggleBroadcast, context),
+        "ToggleDevConsole" => KeyBinding::new(keystroke, ToggleDevConsole, context),
         // JumpToTab1..9 — the trailing digit is the tab index.
         a if a.starts_with("JumpToTab") => {
             match a
@@ -884,6 +887,11 @@ pub struct MuxelApp {
     /// In-app notification feed shown in the sidebar (collected regardless of the
     /// desktop toggle). Session-only; newest pushed last. One entry per instance.
     notifications: Vec<Notification>,
+    /// Error log for the developer console (newest pushed last; capped). Fed by
+    /// `add_event` errors + failed instance launches.
+    dev_log: Vec<DevLogEntry>,
+    /// The popped-out dev-console window, when open (toggled by F12).
+    dev_console_window: Option<WindowHandle<gpui_component::Root>>,
     /// Last seen status per instance, to fire notifications on transitions.
     last_status: HashMap<Uuid, AgentStatus>,
     /// System-tray handle (when `minimize_to_tray` is on and a tray is available).
@@ -1421,6 +1429,34 @@ struct Notification {
     subtitle: String,
 }
 
+/// One line in the developer console — a timestamped error/event with details
+/// (e.g. a failed launch's program, cwd, and OS error). Session-only.
+struct DevLogEntry {
+    /// Local wall-clock time, pre-formatted (`HH:MM:SS`).
+    time: String,
+    kind: NotifKind,
+    title: String,
+    detail: String,
+}
+
+impl DevLogEntry {
+    /// One copy-pasteable block: `[HH:MM:SS] TAG title` then the indented detail.
+    fn render_text(&self) -> String {
+        let tag = match self.kind {
+            NotifKind::Error => "ERROR",
+            NotifKind::Blocked => "BLOCKED",
+            NotifKind::Done => "DONE",
+            NotifKind::Success => "OK",
+        };
+        let mut out = format!("[{}] {tag} {}", self.time, self.title);
+        for line in self.detail.lines() {
+            out.push_str("\n    ");
+            out.push_str(line);
+        }
+        out
+    }
+}
+
 impl Render for PopoutView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.title(cx);
@@ -1572,6 +1608,138 @@ impl Render for PopoutView {
                             ),
                     )
             }))
+    }
+}
+
+/// The developer console: a popped-out window showing `MuxelApp.dev_log` (errors +
+/// failed launches), newest first, as selectable monospace text. It observes the
+/// app so it refreshes as the log grows. Toggled with F12 (see `toggle_dev_console`).
+struct DevConsoleView {
+    /// Snapshot of the log text (newest first), rebuilt from `MuxelApp.dev_log` by
+    /// the observe callback. Kept local so `render` never reads `MuxelApp` — the
+    /// first render runs *inside* the app update that opens this window, where
+    /// reading the app would panic ("already being updated").
+    log: String,
+    /// Last seen viewport size, to drop a stray selection from a resize drag.
+    last_size: Option<gpui::Size<Pixels>>,
+    focus_handle: FocusHandle,
+}
+
+impl DevConsoleView {
+    fn new(app: WeakEntity<MuxelApp>, cx: &mut Context<Self>) -> Self {
+        // Refresh the snapshot whenever the app changes (each tick + when it logs).
+        // Reading the app here is safe — observe callbacks run after the update,
+        // not during it.
+        if let Some(entity) = app.upgrade() {
+            cx.observe(&entity, |this, app, cx| {
+                this.log = app.read(cx).dev_log_text();
+                cx.notify();
+            })
+            .detach();
+        }
+        Self {
+            log: String::new(),
+            last_size: None,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl Focusable for DevConsoleView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for DevConsoleView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Resizing shouldn't start a stray text selection (same fix as the diff view).
+        let vp = window.viewport_size();
+        if self.last_size.is_some_and(|s| s != vp) {
+            cx.defer_in(window, |_this, window, cx| {
+                gpui_component::Root::update(window, cx, |root, _w, cx| {
+                    root.clear_text_selection(cx);
+                });
+            });
+        }
+        self.last_size = Some(vp);
+
+        // Render from the local snapshot — never read MuxelApp here (the first
+        // render runs inside the app update that opened this window).
+        let body = if self.log.is_empty() {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(cx.theme().muted_foreground)
+                .child(t("No errors yet."))
+                .into_any_element()
+        } else {
+            div()
+                .id("dev-console-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(
+                    markdown(SharedString::from(format!("```\n{}\n```", self.log)))
+                        .selectable(true),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .track_focus(&self.focus_handle)
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .on_mouse_down(MouseButton::Left, |_e, window, cx| {
+                        // Claim the title-bar press so dragging doesn't start a
+                        // selection in the selectable log below.
+                        window.prevent_default();
+                        gpui_component::GlobalState::suppress_text_selection(cx);
+                    })
+                    .child(
+                        TitleBar::new().child(
+                            div()
+                                .w_full()
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(t("Dev Console")),
+                                )
+                                .child(
+                                    Button::new("dev-console-clear")
+                                        .ghost()
+                                        .xsmall()
+                                        .label(t("Clear"))
+                                        .tooltip(t("Clear the log"))
+                                        .on_click(cx.listener(|_this, _e, _w, cx| {
+                                            if let Some(app) = cx
+                                                .try_global::<MuxelHandle>()
+                                                .and_then(|h| h.0.upgrade())
+                                            {
+                                                app.update(cx, |app, cx| app.clear_dev_log(cx));
+                                            }
+                                        })),
+                                ),
+                        ),
+                    ),
+            )
+            .child(body)
     }
 }
 
@@ -2293,6 +2461,8 @@ impl MuxelApp {
             runner_input,
             notifications_enabled: settings.notifications_enabled,
             notifications: Vec::new(),
+            dev_log: Vec::new(),
+            dev_console_window: None,
             last_status: HashMap::new(),
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
@@ -2330,7 +2500,16 @@ impl MuxelApp {
         let weak = cx.weak_entity();
         cx.on_window_closed(move |cx, window_id| {
             if let Some(app) = weak.upgrade() {
-                app.update(cx, |this, cx| this.close_popout(window_id, cx));
+                app.update(cx, |this, cx| {
+                    this.close_popout(window_id, cx);
+                    // Forget the dev-console handle if its window was just closed.
+                    if this
+                        .dev_console_window
+                        .is_some_and(|h| gpui::AnyWindowHandle::from(h).window_id() == window_id)
+                    {
+                        this.dev_console_window = None;
+                    }
+                });
             }
         })
         .detach();
@@ -2692,6 +2871,10 @@ impl MuxelApp {
             .instance(instance_id)
             .is_some_and(|i| i.session_started);
         let spec = self.command_for(instance_id);
+        // Capture program + cwd before `spec` moves into the view, so a failed
+        // launch can be reported with the path it tried.
+        let prog = spec.program.clone();
+        let cwd = spec.cwd.clone().unwrap_or_default();
         let palette = theme::palette_from_theme(cx);
         let font_family: SharedString = self.settings.font_family.clone().into();
         let font_size = self.settings.font_size * self.settings.zoom;
@@ -2703,6 +2886,14 @@ impl MuxelApp {
             view.set_mouse_mode(mouse_mode);
             view
         });
+        // A failed launch (program not on PATH, etc.) goes to the dev console.
+        if let Some(err) = view.read(cx).launch_error().map(str::to_string) {
+            self.add_event(
+                NotifKind::Error,
+                tf("Launch failed: {prog}", &[("prog", &prog)]),
+                format!("tried `{prog}` in `{cwd}` — {err}"),
+            );
+        }
         self.terminals.insert(instance_id, view);
         self.terminal_launches
             .insert(instance_id, (std::time::Instant::now(), was_resume));
@@ -3438,6 +3629,60 @@ impl MuxelApp {
         if let Ok(handle) = opened {
             self.diff_file_windows.insert(key, handle);
         }
+    }
+
+    /// F12: open the dev console if closed, close it if open.
+    fn toggle_dev_console(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.dev_console_window.take() {
+            // If the window is still live, this closes it (and returns). A stale
+            // handle (closed via its X) falls through and reopens.
+            if handle
+                .update(cx, |_root, window, _cx| window.remove_window())
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.open_dev_console(cx);
+    }
+
+    fn open_dev_console(&mut self, cx: &mut Context<Self>) {
+        let app = cx.weak_entity();
+        let opened = cx.open_window(
+            gpui::WindowOptions {
+                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                window_min_size: Some(size(px(420.0), px(280.0))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                window.set_window_title("muxel — dev console");
+                let view = cx.new(|cx| DevConsoleView::new(app.clone(), cx));
+                let fh = view.read(cx).focus_handle(cx);
+                window.focus(&fh, cx);
+                cx.new(|cx| gpui_component::Root::new(view, window, cx).bg(cx.theme().background))
+            },
+        );
+        if let Ok(handle) = opened {
+            self.dev_console_window = Some(handle);
+            // Nudge the app so the console's observe fires once and fills in the
+            // current log (the first render is intentionally empty).
+            cx.notify();
+        }
+    }
+
+    fn clear_dev_log(&mut self, cx: &mut Context<Self>) {
+        self.dev_log.clear();
+        cx.notify();
+    }
+
+    /// The dev-console log as one text block, newest entry first.
+    fn dev_log_text(&self) -> String {
+        self.dev_log
+            .iter()
+            .rev()
+            .map(DevLogEntry::render_text)
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     fn git_diff_panel_commit_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4200,12 +4445,28 @@ impl MuxelApp {
         title: impl Into<String>,
         subtitle: impl Into<String>,
     ) {
+        let title = title.into();
+        let subtitle = subtitle.into();
+        // Errors also land in the developer console — a persistent, detailed log.
+        if matches!(kind, NotifKind::Error) {
+            self.dev_log.push(DevLogEntry {
+                time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                kind,
+                title: title.clone(),
+                detail: subtitle.clone(),
+            });
+            const DEV_MAX: usize = 200;
+            let len = self.dev_log.len();
+            if len > DEV_MAX {
+                self.dev_log.drain(0..len - DEV_MAX);
+            }
+        }
         self.notifications.push(Notification {
             id: Uuid::new_v4(),
             instance: None,
             kind,
-            title: title.into(),
-            subtitle: subtitle.into(),
+            title,
+            subtitle,
         });
         const MAX: usize = 50;
         let len = self.notifications.len();
@@ -14759,6 +15020,18 @@ impl MuxelApp {
                     &t("Confirm before closing a git-diff pane"),
                 ),
             )
+            .child(
+                self.check_row(
+                    Checkbox::new("b-dev-console")
+                        .checked(self.settings.dev_console_enabled)
+                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
+                            this.settings.dev_console_enabled = *c;
+                            this.persist_settings();
+                            cx.notify();
+                        })),
+                    &t("Developer console (toggle with F12)"),
+                ),
+            )
             .child(self.settings_label(&t("Terminal copy & paste"), cx))
             .child(
                 div()
@@ -16267,6 +16540,13 @@ impl Render for MuxelApp {
             .on_action(cx.listener(|this, a: &JumpToProject, window, cx| {
                 this.jump_to_project(a.0, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleDevConsole, _window, cx| {
+                // Gated on the setting — F12 is bound globally, so it's a no-op when
+                // the developer console is disabled.
+                if this.settings.dev_console_enabled {
+                    this.toggle_dev_console(cx);
+                }
+            }))
             .child(self.render_titlebar(active_name, cx))
             .child(div().flex_1().min_h_0().flex().child(outer))
             .children(
@@ -16365,5 +16645,25 @@ mod git_glyph_tests {
         assert_eq!(git_status_glyph_label("DD"), ("!", GlyphKind::Conflict));
         // Index status takes priority over worktree status (staged + re-modified).
         assert_eq!(git_status_glyph_label("MM"), ("M", GlyphKind::Modified));
+    }
+}
+
+#[cfg(test)]
+mod dev_log_tests {
+    use super::{DevLogEntry, NotifKind};
+
+    #[test]
+    fn render_text_tags_and_indents() {
+        let e = DevLogEntry {
+            time: "12:34:56".to_string(),
+            kind: NotifKind::Error,
+            title: "Launch failed: claude".to_string(),
+            detail: "tried `claude` in `/tmp`\nNo such file or directory (os error 2)".to_string(),
+        };
+        assert_eq!(
+            e.render_text(),
+            "[12:34:56] ERROR Launch failed: claude\n    tried `claude` in `/tmp`\n    \
+             No such file or directory (os error 2)"
+        );
     }
 }

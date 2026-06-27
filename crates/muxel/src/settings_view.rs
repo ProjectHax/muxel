@@ -51,6 +51,7 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("FocusAttention", "ctrl-shift-a", None),
     ("ShowKeys", "ctrl-shift-/", None),
     ("ToggleBroadcast", "ctrl-shift-i", None),
+    ("ToggleDevConsole", "f12", None),
     ("SaveFile", "ctrl-s", None),
     ("SaveFileAs", "ctrl-shift-s", None),
     ("JumpToTab1", "alt-1", None),
