@@ -8107,6 +8107,15 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Move a project one slot up (`up`) or down in the sidebar order (the explicit
+    /// alternative to drag-and-drop). Persists + re-renders only when it moved.
+    fn move_project(&mut self, pid: Uuid, up: bool, cx: &mut Context<Self>) {
+        if self.workspace.move_project(pid, up) {
+            self.persist();
+            cx.notify();
+        }
+    }
+
     fn toggle_collapse(&mut self, pid: Uuid, cx: &mut Context<Self>) {
         if !self.collapsed.remove(&pid) {
             self.collapsed.insert(pid);
@@ -10987,6 +10996,7 @@ impl MuxelApp {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_pid = self.workspace.active_project;
+        let project_count = self.workspace.projects.len();
         let entity = cx.entity();
         let mut list = div()
             .id("sidebar-scroll")
@@ -11011,6 +11021,8 @@ impl MuxelApp {
         for (ix, project) in self.workspace.projects.iter().enumerate() {
             let pid = project.id;
             let active = Some(pid) == active_pid;
+            let is_first = ix == 0;
+            let is_last = ix + 1 == project_count;
             let collapsed = self.collapsed.contains(&pid);
             let renaming = self.rename == Some(RenameTarget::Project(pid));
             let name: SharedString = project.name.clone().into();
@@ -11194,6 +11206,31 @@ impl MuxelApp {
                                             &entity,
                                             move |this, _, window, cx| {
                                                 this.start_rename_project(pid, window, cx)
+                                            },
+                                        )),
+                                )
+                                .separator()
+                                // Reorder the project in the sidebar (the explicit
+                                // alternative to dragging the row). Disabled at the ends.
+                                .item(
+                                    PopupMenuItem::new(t("Move up"))
+                                        .icon(IconName::ArrowUp)
+                                        .disabled(is_first)
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, _window, cx| {
+                                                this.move_project(pid, true, cx)
+                                            },
+                                        )),
+                                )
+                                .item(
+                                    PopupMenuItem::new(t("Move down"))
+                                        .icon(IconName::ArrowDown)
+                                        .disabled(is_last)
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, _window, cx| {
+                                                this.move_project(pid, false, cx)
                                             },
                                         )),
                                 )

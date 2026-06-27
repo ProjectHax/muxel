@@ -419,6 +419,27 @@ impl Workspace {
         id
     }
 
+    /// Move project `id` one slot toward the front (`up`) or back of the sidebar
+    /// order. Returns whether anything moved (false if `id` is unknown or already
+    /// at the relevant end). Pure index math, so it's unit-testable.
+    pub fn move_project(&mut self, id: Uuid, up: bool) -> bool {
+        let Some(i) = self.projects.iter().position(|p| p.id == id) else {
+            return false;
+        };
+        let j = if up {
+            i.checked_sub(1)
+        } else {
+            (i + 1 < self.projects.len()).then_some(i + 1)
+        };
+        match j {
+            Some(j) => {
+                self.projects.swap(i, j);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn add_instance(&mut self, instance: Instance) {
         self.instances.push(instance);
     }
@@ -1433,5 +1454,47 @@ mod worktree_registry_tests {
         let w: Worktree = serde_json::from_str(json).unwrap();
         assert!(!w.detached);
         assert_eq!(w.color, 3);
+    }
+}
+
+#[cfg(test)]
+mod project_order_tests {
+    use super::{Project, Workspace};
+
+    fn ws_with(names: &[&str]) -> Workspace {
+        let mut ws = Workspace::default();
+        for n in names {
+            ws.add_project(Project::new(*n, format!("/tmp/{n}")));
+        }
+        ws
+    }
+
+    fn order(ws: &Workspace) -> Vec<String> {
+        ws.projects.iter().map(|p| p.name.clone()).collect()
+    }
+
+    #[test]
+    fn move_project_swaps_adjacent() {
+        let mut ws = ws_with(&["a", "b", "c"]);
+        let b = ws.projects[1].id;
+        // Down moves one slot back, not to the end.
+        assert!(ws.move_project(b, false));
+        assert_eq!(order(&ws), ["a", "c", "b"]);
+        // Up brings it back.
+        assert!(ws.move_project(b, true));
+        assert_eq!(order(&ws), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn move_project_is_noop_at_the_ends() {
+        let mut ws = ws_with(&["a", "b", "c"]);
+        let first = ws.projects[0].id;
+        let last = ws.projects[2].id;
+        assert!(!ws.move_project(first, true), "first can't go up");
+        assert!(!ws.move_project(last, false), "last can't go down");
+        assert_eq!(order(&ws), ["a", "b", "c"]);
+        // Unknown id never moves anything.
+        assert!(!ws.move_project(super::Uuid::new_v4(), true));
+        assert_eq!(order(&ws), ["a", "b", "c"]);
     }
 }

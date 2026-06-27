@@ -260,8 +260,10 @@ feature is added or changed, update the matching entry here in the same change**
   a checkbox (all checked by default); only the checked files are committed, so
   stray files are never swept in. The button shows the count (e.g. *Commit (3)*),
   and a clean tree just toasts “Nothing to commit”.
-- **Reorder & rearrange** — drag-reorder projects; swap/move instances between
-  panes from the sidebar.
+- **Reorder & rearrange** — reorder projects by dragging a row, or right-click a
+  project → **Move up** / **Move down** (disabled at the ends) for an explicit,
+  discoverable alternative; the order persists. Swap/move instances between panes
+  from the sidebar.
 - **Instance names** — custom names with inline rename and right-click menus.
 - **Resizable sidebar** — drag to resize (up to half the window); width persists.
 - **No auto-created project** — start empty; add projects via a folder picker.
