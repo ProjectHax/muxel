@@ -3,6 +3,32 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [0.0.6] — 2026-06-26
+
+### Added
+- **System tray** — a "Minimize to the system tray on close" setting: closing the
+  window iconifies muxel to a tray icon instead of quitting. The tray menu lists
+  every agent with its live status and the most recent notifications; clicking an
+  entry restores muxel and focuses that project + pane, and "Quit" exits. Linux
+  (StatusNotifierItem), Windows, and macOS.
+- **Jump to project** — `Ctrl+1`–`Ctrl+9` switches to the Nth project in the
+  sidebar (rebindable; shown in the `Ctrl+Shift+/` cheat sheet).
+
+### Changed
+- **Working-tree diff opens as a tab** — a pane's "View changes" (and the project /
+  worktree diffs) now opens the read-only diff as a new tab in the pane it's
+  diffing, instead of splitting off a separate pane.
+- **Agent status detection** — Claude's working state is read from its
+  "esc to interrupt" status line (reliable through long "Computing…" phases)
+  rather than an output-activity timer, and a finished turn shows **done** (held
+  until you attend the pane) even when the agent never rang the bell.
+
+### Fixed
+- **Session resume** — a deleted or expired session no longer hangs the pane. muxel
+  checks whether the session still exists on disk before resuming (and recovers
+  from a "No conversation found" hang or a non-zero exit), starting a fresh session
+  instead.
+
 ## [0.0.5] — 2026-06-26
 
 ### Added
