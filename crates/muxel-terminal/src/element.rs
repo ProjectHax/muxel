@@ -11,6 +11,7 @@ use crate::view::TerminalMouseMode;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use gpui::*;
 use std::sync::Arc;
@@ -693,10 +694,16 @@ impl Element for TerminalElement {
                 run.paint(origin, cell_width, line_height, font_size, window, cx);
             }
 
-            // Cursor.
+            // Cursor — only when the app hasn't hidden it (DECTCEM / CSI ?25l).
+            // Apps hide the cursor while repainting; drawing it anyway makes it
+            // flicker between the write position and the prompt — worst under
+            // Windows ConPTY, which repositions the cursor aggressively.
             let cursor = term.grid().cursor.point;
             let cursor_visual = cursor.line.0 + display_offset;
-            if cursor_visual >= 0 && cursor_visual < screen_lines as i32 {
+            if term.mode().contains(TermMode::SHOW_CURSOR)
+                && cursor_visual >= 0
+                && cursor_visual < screen_lines as i32
+            {
                 let x = px((f32::from(origin.x) + cursor.column.0 as f32 * cell_w).floor());
                 let y = px((f32::from(origin.y) + cursor_visual as f32 * line_h).floor());
                 let mut color = palette.cursor_hsla();
