@@ -31,3 +31,4 @@
 
 # Python bytecode (scripts/)
 __pycache__/
+.muxel/
