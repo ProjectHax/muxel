@@ -77,18 +77,24 @@ feature is added or changed, update the matching entry here in the same change**
   project's working dir on whichever host). Enable it on a project (sidebar
   right-click or Settings → Projects); a memory button on the project row opens the
   file in the editor. Plain shells are skipped.
+- **View/edit memory anytime** — open a project's `.muxel/MEMORY.md` in the built-in
+  editor without enabling injection: right-click the project → **Open shared memory**,
+  or the command palette → **Open project memory** (for the active project). The file
+  (and `.muxel/`) is created on demand, so there's always something to edit.
 
 ## Agent status
 
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots. A turn that finishes is held at **done**
-  until you attend the pane — even if the agent never rang the bell.
+  icon, dashboard, and notification dots. A marker-based agent whose turn finishes
+  is held at **done** until you attend the pane — even if it never rang the bell.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
   defaults per agent and **editable working/blocked markers per preset**.
 - **Heuristic fallback** — agents without markers fall back to bell + output
-  activity (working / idle / done).
+  activity. They reach **done** only from the bell or process exit, never from a
+  quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
+  pane) can't fake a finished turn.
 
 ## Git worktrees
 
@@ -148,9 +154,11 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Notifications
 
-- **Desktop notifications** — bell-driven (an agent rings the terminal bell when it
-  needs attention or finishes); fired only when the pane isn't focused. Clicking the
-  notification raises muxel and jumps to the pane that fired it.
+- **Desktop notifications** — fired when an agent finishes a turn or needs attention
+  (a blocked prompt / the terminal bell), but only while muxel's window isn't
+  focused — no toast pops over the app you're already looking at (the in-app feed
+  still records it). Clicking the notification raises muxel and jumps to the pane
+  that fired it.
 - **In-app NOTIFICATIONS sidebar** — a category above PROJECTS collecting agent
   events **and** all app messages (git results, SSH connections, save errors —
   everything that used to be a pop-up toast goes here instead). Agent rows are
@@ -299,11 +307,12 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Workspaces** — multiple workspaces, each with its own projects + layout; a startup workspace
   selector.
-- **Single instance per workspace** — if a workspace is already open in another muxel
-  window, launching again with the same workspace refuses to load it and shows an
-  alert, so the two can't overwrite each other's workspace + settings. Different
-  workspaces still run side by side, and the lock releases on exit (even a crash), so
-  no stale lock blocks the next launch.
+- **Single instance per workspace** — each workspace is locked while open, so two
+  muxel windows can run side by side on **different** workspaces but never the same
+  one (which would clobber its layout). Picking a workspace another window already
+  holds is refused in the selector with an inline "in use" note; pick a different one
+  or close the other window. The lock releases when you switch workspaces or on exit
+  (even a crash), so no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
 

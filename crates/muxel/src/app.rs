@@ -939,6 +939,15 @@ pub struct MuxelApp {
     workspaces: WorkspacesIndex,
     /// Whether the workspace selector screen is shown (always true at launch).
     show_workspace_selector: bool,
+    /// Single-instance lock for the *current* workspace, held while it's open
+    /// (dropped — releasing it — when we switch workspaces or the process exits).
+    /// Keeps two muxel processes from opening the same workspace and clobbering
+    /// its `workspace.json`; different workspaces lock independently.
+    workspace_lock: Option<std::fs::File>,
+    /// A workspace the user tried to enter that another muxel process already
+    /// holds open — surfaced as an inline note in the selector. Cleared on a
+    /// successful entry or when the selector is dismissed.
+    workspace_busy: Option<Uuid>,
     /// "New workspace" name editor used in the selector.
     workspace_name_input: Entity<InputState>,
     /// Settings modal size (resizable via the bottom-right corner).
@@ -1101,6 +1110,7 @@ enum PaletteCommand {
     ToggleSidebar,
     ToggleDashboard,
     OpenSettings,
+    OpenMemory,
     RunRunner(usize),
 }
 
@@ -2406,6 +2416,8 @@ impl MuxelApp {
             current_workspace: None,
             workspaces,
             show_workspace_selector: true,
+            workspace_lock: None,
+            workspace_busy: None,
             workspace_name_input,
             settings_size: size(px(780.0), px(620.0)),
             settings_pane_w: px(560.0),
@@ -3126,6 +3138,29 @@ impl MuxelApp {
     /// Tear down the current workspace's terminals and load another workspace's
     /// workspace. Used at launch (from the selector) and to switch workspaces.
     fn enter_workspace(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        // Re-entering the current workspace is a no-op except for closing the
+        // selector — don't tear it down and re-lock (we already hold the lock).
+        if self.current_workspace == Some(id) {
+            self.workspace_busy = None;
+            self.show_workspace_selector = false;
+            cx.notify();
+            return;
+        }
+        // Take the per-workspace lock *before* tearing anything down. If another
+        // muxel process already has this workspace open, refuse: keep the current
+        // workspace intact and flag it in the selector. A failed lock leaves our
+        // existing `workspace_lock` (and current workspace) untouched.
+        let Some(lock) = muxel_store::try_lock_workspace(id) else {
+            self.workspace_busy = Some(id);
+            self.show_workspace_selector = true;
+            cx.notify();
+            return;
+        };
+        self.workspace_busy = None;
+        // Replacing the handle drops the previous workspace's lock, freeing it for
+        // another process to open.
+        self.workspace_lock = Some(lock);
+
         let views: Vec<_> = self.terminals.drain().map(|(_, v)| v).collect();
         for view in views {
             view.read(cx).session().kill();
@@ -3190,6 +3225,7 @@ impl MuxelApp {
     /// Reopen the selector to switch workspaces (pre-selects the current one).
     fn open_workspace_selector(&mut self, cx: &mut Context<Self>) {
         self.workspaces.current = self.current_workspace;
+        self.workspace_busy = None;
         self.show_workspace_selector = true;
         cx.notify();
     }
@@ -4190,7 +4226,7 @@ impl MuxelApp {
             let changed = self.last_status.insert(iid, status) != Some(status);
             dirty |= changed;
             // A pane counts as attended only if it's active AND the window is
-            // focused; otherwise its agent's bell/exit is worth a notification.
+            // focused; otherwise its agent's bell/exit is worth recording.
             let attended = self.window_active && Some(iid) == focused;
             if changed && !attended {
                 let kind = match status {
@@ -4202,7 +4238,10 @@ impl MuxelApp {
                     // Collect the in-app entry regardless of the desktop toggle;
                     // only the OS popup respects `notifications_enabled`.
                     self.add_notification(iid, kind, &title, &project);
-                    if self.notifications_enabled {
+                    // Skip the OS popup while the window is focused — no point
+                    // raising a desktop toast over the app you're already looking
+                    // at; the in-app feed already records it.
+                    if self.notifications_enabled && !self.window_active {
                         notify(format!("{title} {}", kind.label()), project, Some(iid));
                     }
                 }
@@ -5172,6 +5211,10 @@ impl MuxelApp {
             ToggleDashboard,
             OpenSettings,
         ];
+        // Only meaningful with an active project to open the memory for.
+        if self.workspace.active_project.is_some() {
+            cmds.push(OpenMemory);
+        }
         cmds.extend((0..self.runners.len()).map(RunRunner));
         cmds
     }
@@ -5189,6 +5232,7 @@ impl MuxelApp {
             PaletteCommand::ToggleSidebar => "Toggle sidebar".into(),
             PaletteCommand::ToggleDashboard => t("Toggle dashboard (all agents)").into(),
             PaletteCommand::OpenSettings => t("Open settings").into(),
+            PaletteCommand::OpenMemory => t("Open project memory (.muxel/MEMORY.md)").into(),
             PaletteCommand::RunRunner(i) => self
                 .runners
                 .get(i)
@@ -5215,6 +5259,11 @@ impl MuxelApp {
             PaletteCommand::ToggleSidebar => self.toggle_sidebar(cx),
             PaletteCommand::ToggleDashboard => self.toggle_dashboard(cx),
             PaletteCommand::OpenSettings => self.toggle_settings(window, cx),
+            PaletteCommand::OpenMemory => {
+                if let Some(pid) = self.workspace.active_project {
+                    self.open_project_memory(pid, window, cx);
+                }
+            }
             PaletteCommand::RunRunner(i) => self.run_runner(i, String::new(), window, cx),
         }
     }
@@ -6157,17 +6206,30 @@ impl MuxelApp {
     }
 
     /// Open the project's shared `.muxel/MEMORY.md` in the editor (local or remote;
-    /// `open_editor_at` handles fetching remote contents over SSH).
+    /// `open_editor_at` handles fetching remote contents over SSH). Works whether or
+    /// not shared-memory injection is enabled: the file (and `.muxel/`) is created on
+    /// demand so there's always something to view/edit and saves land in the right
+    /// place. Local creation is synchronous (so the editor reads the seeded header);
+    /// remote creation goes over SSH off the UI thread.
     fn open_project_memory(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.workspace.project(pid) else {
             return;
         };
+        let is_remote = p.remote.is_some();
         let root = match &p.remote {
             Some(r) => r.remote_root.clone(),
             None => p.root_path.display().to_string(),
         };
         let path = PathBuf::from(format!("{root}/{MEMORY_DIR}/{MEMORY_FILE}"));
         let target = self.active_instance;
+        // Seed the file if it doesn't exist yet (e.g. memory injection never on).
+        if is_remote {
+            self.ensure_project_memory(pid, cx);
+        } else if let Some(loc) = self.repo_loc(pid)
+            && let Err(e) = integrations::ensure_memory_file(&loc)
+        {
+            self.add_event(NotifKind::Error, t("Project memory"), format!("{e}"));
+        }
         self.open_editor_at(pid, Some(path), target, window, cx);
     }
 
@@ -7440,6 +7502,11 @@ impl MuxelApp {
         }
         if self.current_workspace == Some(id) {
             self.current_workspace = None;
+            // Release the lock so the now-deleted workspace's id is free.
+            self.workspace_lock = None;
+        }
+        if self.workspace_busy == Some(id) {
+            self.workspace_busy = None;
         }
         let _ = muxel_store::save_workspaces_index(&self.workspaces);
         if let Some(path) = muxel_store::workspace_doc_path(id) {
@@ -9927,6 +9994,12 @@ impl MuxelApp {
                         )
                         .child(Icon::new(IconName::Folder).small())
                         .child(div().flex_1().text_sm().child(meta.name.clone()))
+                        .children((self.workspace_busy == Some(id)).then(|| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().warning)
+                                .child(t("in use"))
+                        }))
                         .children(can_delete.then(|| {
                             let label = name.clone();
                             // stop_propagation so the click doesn't also enter the workspace.
@@ -9981,6 +10054,20 @@ impl MuxelApp {
                         "Each workspace keeps its own projects and terminal layout.",
                     )),
             )
+            .children(self.workspace_busy.map(|_| {
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().warning.opacity(0.15))
+                    .border_1()
+                    .border_color(cx.theme().warning.opacity(0.4))
+                    .text_sm()
+                    .text_color(cx.theme().foreground)
+                    .child(t(
+                        "That workspace is already open in another muxel window. Pick a different one, or close the other window first.",
+                    ))
+            }))
             .child(
                 div()
                     .id("workspaces-list")
@@ -10028,6 +10115,7 @@ impl MuxelApp {
                         .ghost()
                         .label(t("Cancel"))
                         .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.workspace_busy = None;
                             this.show_workspace_selector = false;
                             cx.notify();
                         }))
@@ -11117,6 +11205,17 @@ impl MuxelApp {
                                             &entity,
                                             move |this, _, window, cx| {
                                                 this.save_project_startup(pid, window, cx)
+                                            },
+                                        )),
+                                )
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new(t("Open shared memory"))
+                                        .icon(IconName::File)
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, window, cx| {
+                                                this.open_project_memory(pid, window, cx)
                                             },
                                         )),
                                 )

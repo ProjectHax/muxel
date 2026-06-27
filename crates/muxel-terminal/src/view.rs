@@ -70,16 +70,24 @@ fn classify(
 /// again or the pane is attended. Returns `(displayed status, new latch state)`.
 /// Pure half of [`TerminalView::status`]'s done-latch, so a finished turn shows
 /// Done even when the agent never rang the bell.
+///
+/// `can_latch` gates the whole mechanism to agents whose `Working` state comes
+/// from a reliable on-screen marker. For marker-less terminals (plain shells, or
+/// agents with no configured markers) `Working` is inferred from recent output
+/// alone — and incidental output (a focus-change redraw when you click the pane,
+/// a prompt repaint, …) would otherwise flip them Working→Idle and latch a bogus
+/// `Done`. Those terminals report `Done` only from the bell or process exit.
 fn latch_done(
     prev_raw: Option<AgentStatus>,
     raw: AgentStatus,
     latched: bool,
+    can_latch: bool,
 ) -> (AgentStatus, bool) {
     match raw {
         // Active again, blocked, or already Done (bell/exit) — no latch needed.
         AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done => (raw, false),
         AgentStatus::Idle => {
-            if latched || prev_raw == Some(AgentStatus::Working) {
+            if can_latch && (latched || prev_raw == Some(AgentStatus::Working)) {
                 (AgentStatus::Done, true)
             } else {
                 (AgentStatus::Idle, false)
@@ -357,8 +365,17 @@ impl TerminalView {
             self.session.has_bell(),
             self.session.idle_for(),
         );
-        let (status, latch) =
-            latch_done(self.prev_raw.replace(Some(raw)), raw, self.done_latch.get());
+        // Only agents with a real working marker may latch Done from a
+        // working→idle transition; marker-less terminals infer Working from raw
+        // output activity, which incidental redraws (e.g. a focus-change repaint
+        // when you click the pane) would otherwise misread as a finished turn.
+        let can_latch = !self.working_markers.is_empty();
+        let (status, latch) = latch_done(
+            self.prev_raw.replace(Some(raw)),
+            raw,
+            self.done_latch.get(),
+            can_latch,
+        );
         self.done_latch.set(latch);
         status
     }
@@ -582,16 +599,35 @@ mod tests {
     fn done_latch_holds_a_finished_turn() {
         use AgentStatus::{Blocked, Done, Idle, Working};
         // Working → idle (no bell) latches Done...
-        assert_eq!(latch_done(Some(Working), Idle, false), (Done, true));
+        assert_eq!(latch_done(Some(Working), Idle, false, true), (Done, true));
         // ...and holds it across later idle ticks.
-        assert_eq!(latch_done(Some(Idle), Idle, true), (Done, true));
+        assert_eq!(latch_done(Some(Idle), Idle, true, true), (Done, true));
         // Working again clears the latch.
-        assert_eq!(latch_done(Some(Idle), Working, true), (Working, false));
+        assert_eq!(
+            latch_done(Some(Idle), Working, true, true),
+            (Working, false)
+        );
         // A bell/exit Done passes straight through (no latch needed).
-        assert_eq!(latch_done(Some(Working), Done, false), (Done, false));
+        assert_eq!(latch_done(Some(Working), Done, false, true), (Done, false));
         // Idle not preceded by working stays idle (a fresh pane).
-        assert_eq!(latch_done(None, Idle, false), (Idle, false));
+        assert_eq!(latch_done(None, Idle, false, true), (Idle, false));
         // Blocked passes through and clears the latch.
-        assert_eq!(latch_done(Some(Idle), Blocked, true), (Blocked, false));
+        assert_eq!(
+            latch_done(Some(Idle), Blocked, true, true),
+            (Blocked, false)
+        );
+    }
+
+    #[test]
+    fn marker_less_terminals_never_latch_done() {
+        use AgentStatus::{Done, Idle, Working};
+        // With `can_latch` false (a shell / marker-less agent), a working→idle
+        // transition stays Idle instead of latching Done — incidental output
+        // (e.g. a focus-change redraw on click) must not fake a finished turn.
+        assert_eq!(latch_done(Some(Working), Idle, false, false), (Idle, false));
+        // A stuck latch can't survive once latching is disallowed.
+        assert_eq!(latch_done(Some(Idle), Idle, true, false), (Idle, false));
+        // The bell/exit `Done` still passes straight through (precise signals).
+        assert_eq!(latch_done(Some(Working), Done, false, false), (Done, false));
     }
 }

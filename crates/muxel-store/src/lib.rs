@@ -66,16 +66,24 @@ pub fn workspace_path() -> Option<PathBuf> {
     data_dir().map(|d| d.join("workspace.json"))
 }
 
-/// Try to take the single-instance lock for this workspace's data dir. Returns the
-/// locked file on success — **keep it alive for the process lifetime** (the OS
-/// releases the advisory lock when the process exits, even on a crash, so no
-/// stale lock survives). `None` means another muxel already holds it, so this
-/// instance should refuse to open and not clobber the shared workspace/settings.
-/// A lock that the platform can't support is treated as "available" rather than
-/// blocking the user.
-pub fn try_lock_workspace() -> Option<std::fs::File> {
-    let dir = data_dir()?;
-    let _ = std::fs::create_dir_all(&dir);
+/// Try to take the single-instance lock for one **workspace** (keyed by its id).
+/// Returns the locked file on success — **keep it alive while that workspace is
+/// open** (the OS releases the advisory lock when the file is dropped or the
+/// process exits, even on a crash, so no stale lock survives). `None` means
+/// another muxel already has *this* workspace open, so the caller should refuse
+/// to open it and not clobber its `workspace.json`. Locking is per-workspace, so
+/// two muxel processes can run side by side on different workspaces. A lock the
+/// platform can't support is treated as "available" rather than blocking the user.
+pub fn try_lock_workspace(id: Uuid) -> Option<std::fs::File> {
+    let dir = workspaces_dir()?.join(id.to_string());
+    try_lock_dir(&dir)
+}
+
+/// Lock core, parameterized by the workspace dir for testability. Creates the dir
+/// and takes an advisory lock on its `instance.lock`; `None` if another open file
+/// handle already holds it.
+fn try_lock_dir(dir: &Path) -> Option<std::fs::File> {
+    let _ = std::fs::create_dir_all(dir);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -513,6 +521,29 @@ mod tests {
         assert_eq!(loaded.workspaces[0].name, "Work");
         assert_eq!(loaded.current, Some(id));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_lock_is_per_workspace() {
+        let base = std::env::temp_dir().join("muxel-store-test-lock");
+        let _ = std::fs::remove_dir_all(&base);
+        let a = base.join("ws-a");
+        let b = base.join("ws-b");
+
+        // Hold workspace A's lock.
+        let lock_a = try_lock_dir(&a).expect("first lock on A succeeds");
+        // A second muxel can't take A while it's held...
+        assert!(try_lock_dir(&a).is_none(), "A is already locked");
+        // ...but a *different* workspace locks independently.
+        let lock_b = try_lock_dir(&b).expect("B locks despite A being held");
+
+        // Releasing A (process exit / workspace switch drops the handle) frees it.
+        drop(lock_a);
+        let lock_a2 = try_lock_dir(&a).expect("A is lockable again once released");
+
+        drop(lock_b);
+        drop(lock_a2);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
