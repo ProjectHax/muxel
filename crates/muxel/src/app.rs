@@ -534,6 +534,36 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     cx.bind_keys(bindings);
 }
 
+/// The user's home directory (`HOME` on Unix, `USERPROFILE` on Windows).
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
+
+/// Whether a Claude agent's saved session transcript is missing from disk (so a
+/// `--resume` would just hang on "No conversation found"). Only Claude's session
+/// path is known, so other agents — or an undeterminable home/cwd — return `false`
+/// and keep their resume, leaving any failure to the runtime recovery.
+fn claude_session_gone(
+    preset: &muxel_core::AgentPreset,
+    cwd: Option<&std::path::Path>,
+    session_id: &str,
+) -> bool {
+    if !preset
+        .program
+        .as_deref()
+        .unwrap_or_default()
+        .contains("claude")
+    {
+        return false;
+    }
+    let (Some(home), Some(cwd)) = (home_dir(), cwd) else {
+        return false;
+    };
+    !muxel_core::claude_session_path(&home, cwd, session_id).exists()
+}
+
 /// "NewPane" -> "New Pane" for the shortcut cheat-sheet.
 fn humanize_action(name: &str) -> String {
     let mut out = String::new();
@@ -2493,9 +2523,28 @@ impl MuxelApp {
             return None;
         }
         let preset = preset.clone();
+        // The cwd the agent runs in (worktree or project root) — to locate its
+        // on-disk session before we decide resume vs. fresh.
+        let cwd = inst.worktree_path.clone().or_else(|| {
+            self.workspace
+                .project(inst.project_id)
+                .map(|p| p.root_path.clone())
+        });
         let inst = self.workspace.instance_mut(iid)?;
         if inst.session_id.is_none() {
             inst.session_id = Some(Uuid::new_v4().to_string());
+        }
+        // Proactive resume: if we'd `--resume` an already-started session but its
+        // transcript is gone from disk (deleted/expired), start a *fresh* session
+        // instead of a doomed resume that just hangs. A missing file means there's
+        // nothing to resume anyway, and a fresh id avoids the "id already in use"
+        // collision that reusing the old id would risk.
+        if inst.session_started
+            && let Some(sid) = inst.session_id.clone()
+            && claude_session_gone(&preset, cwd.as_deref(), &sid)
+        {
+            inst.session_id = Some(Uuid::new_v4().to_string());
+            inst.session_started = false;
         }
         let snapshot = inst.clone();
         inst.session_started = true;
@@ -3184,8 +3233,9 @@ impl MuxelApp {
             set_active_tab(&mut p.layout, iid);
         }
         if let Some(view) = self.terminals.get(&iid) {
-            // Attending to a pane clears its "awaiting input" bell.
+            // Attending to a pane clears its "awaiting input" bell + "done" latch.
             view.read(cx).session().clear_bell();
+            view.read(cx).clear_done();
             let handle = view.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
         } else if let Some(ed) = self.editors.get(&iid) {
@@ -3842,7 +3892,12 @@ impl MuxelApp {
         }
         self.remote_poll_count = (self.remote_poll_count + 1) % 5;
         let focused = self.active_instance;
-        let snapshot: Vec<(Uuid, AgentStatus, bool, Option<i32>, String, String)> = self
+        // A `--resume` launch has this long to prove its saved session is valid;
+        // past that we stop watching it for recovery signals.
+        const RECOVER_WITHIN_SECS: u64 = 10;
+        // (iid, status, exited, exit_code, title, project, resume_error)
+        type Snap = (Uuid, AgentStatus, bool, Option<i32>, String, String, bool);
+        let snapshot: Vec<Snap> = self
             .terminals
             .iter()
             .map(|(iid, view)| {
@@ -3850,13 +3905,32 @@ impl MuxelApp {
                 let status = v.status();
                 let exited = v.exited();
                 let exit_code = v.exit_code();
+                // A resume launch whose saved session is gone may *hang* on the
+                // agent's "No conversation found …" error instead of exiting —
+                // detect it on screen (only while the resume launch is still fresh)
+                // so we recover the same way as the exit case.
+                let resume_error =
+                    self.terminal_launches
+                        .get(iid)
+                        .is_some_and(|&(at, was_resume)| {
+                            was_resume && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
+                        })
+                        && v.screen_has("No conversation found");
                 let inst = self.workspace.instance(*iid);
                 let title = inst.map(|i| i.title.clone()).unwrap_or_default();
                 let project = inst
                     .and_then(|i| self.workspace.project(i.project_id))
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
-                (*iid, status, exited, exit_code, title, project)
+                (
+                    *iid,
+                    status,
+                    exited,
+                    exit_code,
+                    title,
+                    project,
+                    resume_error,
+                )
             })
             .collect();
 
@@ -3867,7 +3941,7 @@ impl MuxelApp {
         // tooltips: a repaint landing as the cursor leaves a button drops the
         // hover-out event, leaving the tooltip stuck until another one shows.
         let mut dirty = false;
-        for (iid, status, exited, exit_code, title, project) in snapshot {
+        for (iid, status, exited, exit_code, title, project, resume_error) in snapshot {
             let changed = self.last_status.insert(iid, status) != Some(status);
             dirty |= changed;
             // A pane counts as attended only if it's active AND the window is
@@ -3888,16 +3962,20 @@ impl MuxelApp {
                     }
                 }
             }
-            // A `--resume` launch that errors out almost immediately means the
-            // saved session was invalid (deleted/expired): recover by re-spawning
-            // the same agent with a fresh session, rather than closing it. A clean
-            // exit (code 0) is a deliberate quit — leave it to close-on-exit.
-            const RECOVER_WITHIN_SECS: u64 = 10;
-            if exited
+            // A `--resume` launch whose saved session is invalid (deleted/expired)
+            // recovers by re-spawning the same agent with a fresh session, rather
+            // than closing it — whether the agent exited non-zero on the bad resume
+            // or is hanging on its "No conversation found" error (`resume_error`).
+            // A clean exit (code 0) is a deliberate quit — left to close-on-exit.
+            let exit_recover = exited
                 && exit_code != Some(0)
-                && let Some(&(at, true)) = self.terminal_launches.get(&iid)
-                && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
-            {
+                && self
+                    .terminal_launches
+                    .get(&iid)
+                    .is_some_and(|&(at, was_resume)| {
+                        was_resume && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
+                    });
+            if resume_error || exit_recover {
                 to_recover.push((iid, title));
             } else if exited && self.settings.close_on_exit {
                 // Close-on-exit keys off the actual process exit, not the display

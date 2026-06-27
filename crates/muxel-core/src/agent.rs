@@ -7,6 +7,7 @@
 
 use crate::Instance;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// How an instance's system prompt is delivered to the agent.
@@ -154,7 +155,11 @@ impl AgentPreset {
                 flag: "--append-system-prompt".to_string(),
             },
             env: Vec::new(),
-            working_markers: Vec::new(),
+            // Claude prints "esc to interrupt" on its status line for the whole
+            // duration of a turn, so it's a reliable "working" signal — far more so
+            // than the output-activity timer, which the long "Computing…" phase
+            // (quiet output / a stalled spinner) trips into a false "idle".
+            working_markers: vec!["esc to interrupt".to_string()],
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             session_id_flag: Some("--session-id".to_string()),
@@ -390,8 +395,9 @@ pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
 /// than probing the agent's on-disk session avoids a flush race: the session file
 /// may not be visible yet right after a restart, which would wrongly force a fresh
 /// `--session-id` and collide with the still-existing session ("id already in
-/// use"). If the session was genuinely deleted, the agent surfaces its own
-/// "session not found" on resume.
+/// use"). When the session was genuinely deleted, the caller probes the disk and
+/// restarts with a *fresh* id (so there's no collision — see [`claude_session_path`]),
+/// and the runtime recovery catches any resume that still slips through and hangs.
 pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<Vec<String>> {
     let id_flag = preset.session_id_flag.as_deref()?;
     let resume_flag = preset.resume_flag.as_deref()?;
@@ -402,6 +408,25 @@ pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<
         id_flag
     };
     Some(vec![flag.to_string(), id.to_string()])
+}
+
+/// Path to Claude's on-disk session transcript for an agent running in `cwd`:
+/// `<home>/.claude/projects/<slug>/<session_id>.jsonl`, where `slug` is `cwd` with
+/// every non-ASCII-alphanumeric character replaced by `-` — Claude's project-dir
+/// encoding (e.g. `/home/u/Proj` → `-home-u-Proj`, `/home/u/.local` →
+/// `-home-u--local`). Pure path-building; the caller does the existence check. The
+/// caller must start a *fresh* session id when the file is missing, never reuse the
+/// old one (that would collide with a still-live session — see `session_resume_args`).
+pub fn claude_session_path(home: &Path, cwd: &Path, session_id: &str) -> PathBuf {
+    let slug: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    home.join(".claude")
+        .join("projects")
+        .join(slug)
+        .join(format!("{session_id}.jsonl"))
 }
 
 /// Directory (under the project root) holding muxel's per-project files.
@@ -499,6 +524,30 @@ mod tests {
         s.session_id = Some("abc".to_string());
         s.session_started = true;
         assert_eq!(session_resume_args(&shell, &s), None);
+    }
+
+    #[test]
+    fn claude_session_path_encodes_cwd() {
+        use std::path::Path;
+        let p = super::claude_session_path(
+            Path::new("/home/u"),
+            Path::new("/home/ryan/Projects/muxel"),
+            "abc-123",
+        );
+        assert_eq!(
+            p,
+            Path::new("/home/u/.claude/projects/-home-ryan-Projects-muxel/abc-123.jsonl")
+        );
+        // A worktree path: '/' and '.' both collapse to '-' (so '/.' becomes '--').
+        let w = super::claude_session_path(
+            Path::new("/h"),
+            Path::new("/home/ryan/.local/share/x"),
+            "id",
+        );
+        assert_eq!(
+            w,
+            Path::new("/h/.claude/projects/-home-ryan--local-share-x/id.jsonl")
+        );
     }
 
     #[test]

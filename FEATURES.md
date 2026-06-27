@@ -82,7 +82,8 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots.
+  icon, dashboard, and notification dots. A turn that finishes is held at **done**
+  until you attend the pane — even if the agent never rang the bell.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
   defaults per agent and **editable working/blocked markers per preset**.

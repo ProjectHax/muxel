@@ -11,8 +11,8 @@ pub mod tmux;
 pub mod worktree;
 
 pub use agent::{
-    AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, ResolvedLaunch, memory_header,
-    memory_instruction, resolve_launch, session_resume_args,
+    AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, ResolvedLaunch,
+    claude_session_path, memory_header, memory_instruction, resolve_launch, session_resume_args,
 };
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::augmented_macos_path;
@@ -979,7 +979,7 @@ impl Default for Settings {
 /// v4: added the Amp (ampcode) preset.
 /// v5: added the Grok (x.ai) preset.
 /// v6: opencode default runner startup delay.
-pub const PRESET_SEED_VERSION: u32 = 8;
+pub const PRESET_SEED_VERSION: u32 = 9;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
@@ -1032,6 +1032,19 @@ impl Settings {
                 }
             }
         }
+        // Adopt the built-in status markers (e.g. Claude's "esc to interrupt"
+        // working marker) for matching presets that have none, so existing configs
+        // get reliable status detection without overwriting a user's own markers.
+        for builtin in AgentPreset::defaults() {
+            if builtin.working_markers.is_empty() {
+                continue;
+            }
+            for p in self.presets.iter_mut() {
+                if p.name == builtin.name && p.working_markers.is_empty() {
+                    p.working_markers = builtin.working_markers.clone();
+                }
+            }
+        }
         self.preset_seed_version = PRESET_SEED_VERSION;
         true
     }
@@ -1078,6 +1091,33 @@ mod settings_tests {
         };
         assert!(!s.seed_builtin_presets());
         assert!(!s.presets.iter().any(|p| p.name == "Ollama"));
+    }
+
+    #[test]
+    fn seed_adopts_working_markers_when_missing() {
+        // An old Claude preset with no status markers gains the built-in one.
+        let mut bare = AgentPreset::claude();
+        bare.working_markers.clear();
+        let mut s = Settings {
+            preset_seed_version: 0,
+            presets: vec![bare],
+            ..Settings::default()
+        };
+        assert!(s.seed_builtin_presets());
+        let claude = s.presets.iter().find(|p| p.name == "Claude").unwrap();
+        assert_eq!(claude.working_markers, vec!["esc to interrupt".to_string()]);
+
+        // A user's own markers are never overwritten.
+        let mut custom = AgentPreset::claude();
+        custom.working_markers = vec!["mine".to_string()];
+        let mut s2 = Settings {
+            preset_seed_version: 0,
+            presets: vec![custom],
+            ..Settings::default()
+        };
+        s2.seed_builtin_presets();
+        let claude2 = s2.presets.iter().find(|p| p.name == "Claude").unwrap();
+        assert_eq!(claude2.working_markers, vec!["mine".to_string()]);
     }
 
     #[test]

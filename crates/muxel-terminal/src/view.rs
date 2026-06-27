@@ -66,6 +66,28 @@ fn classify(
     AgentStatus::Idle
 }
 
+/// Promote a working→idle transition to `Done`, latching it until the agent works
+/// again or the pane is attended. Returns `(displayed status, new latch state)`.
+/// Pure half of [`TerminalView::status`]'s done-latch, so a finished turn shows
+/// Done even when the agent never rang the bell.
+fn latch_done(
+    prev_raw: Option<AgentStatus>,
+    raw: AgentStatus,
+    latched: bool,
+) -> (AgentStatus, bool) {
+    match raw {
+        // Active again, blocked, or already Done (bell/exit) — no latch needed.
+        AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done => (raw, false),
+        AgentStatus::Idle => {
+            if latched || prev_raw == Some(AgentStatus::Working) {
+                (AgentStatus::Done, true)
+            } else {
+                (AgentStatus::Idle, false)
+            }
+        }
+    }
+}
+
 /// How the mouse copies/pastes in a terminal pane (a global setting parsed from
 /// `Settings.terminal_mouse`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -104,6 +126,12 @@ pub struct TerminalView {
     /// On-screen markers that classify the agent's status (per-agent).
     working_markers: Vec<String>,
     blocked_markers: Vec<String>,
+    /// Latches `Done` from a working→finished transition so a completed turn shows
+    /// Done (and notifies) even when the agent didn't ring the bell. `prev_raw` is
+    /// the previous *raw* classification; the latch clears when the agent works
+    /// again or the pane is attended (see `clear_done`).
+    prev_raw: std::cell::Cell<Option<AgentStatus>>,
+    done_latch: std::cell::Cell<bool>,
     _drain: Task<()>,
 }
 
@@ -273,6 +301,8 @@ impl TerminalView {
             exit_code: None,
             working_markers,
             blocked_markers,
+            prev_raw: std::cell::Cell::new(None),
+            done_latch: std::cell::Cell::new(false),
             _drain: drain,
         }
     }
@@ -306,14 +336,30 @@ impl TerminalView {
         } else {
             self.session.visible_text()
         };
-        classify(
+        let raw = classify(
             self.exited,
             &screen,
             &self.working_markers,
             &self.blocked_markers,
             self.session.has_bell(),
             self.session.idle_for(),
-        )
+        );
+        let (status, latch) =
+            latch_done(self.prev_raw.replace(Some(raw)), raw, self.done_latch.get());
+        self.done_latch.set(latch);
+        status
+    }
+
+    /// Clear the `Done` latch — called when the pane is attended, so a finished
+    /// turn drops back to Idle once you've looked at it.
+    pub fn clear_done(&self) {
+        self.done_latch.set(false);
+    }
+
+    /// Whether `needle` appears in the current visible grid — used by the app to
+    /// spot an agent's "session not found" error for resume recovery.
+    pub fn screen_has(&self, needle: &str) -> bool {
+        self.session.visible_text().contains(needle)
     }
 
     pub fn title(&self) -> Option<String> {
@@ -432,7 +478,7 @@ impl Render for TerminalView {
 mod tests {
     // Import specifically (not `super::*`) so `#[test]` resolves to the built-in
     // macro, not gpui's glob-imported `test` attribute.
-    use super::{AgentStatus, TerminalMouseMode, classify};
+    use super::{AgentStatus, TerminalMouseMode, classify, latch_done};
     use std::time::Duration;
 
     fn m(s: &[&str]) -> Vec<String> {
@@ -517,5 +563,22 @@ mod tests {
             classify(false, "", &none, &none, false, Duration::from_secs(10)),
             AgentStatus::Idle
         );
+    }
+
+    #[test]
+    fn done_latch_holds_a_finished_turn() {
+        use AgentStatus::{Blocked, Done, Idle, Working};
+        // Working → idle (no bell) latches Done...
+        assert_eq!(latch_done(Some(Working), Idle, false), (Done, true));
+        // ...and holds it across later idle ticks.
+        assert_eq!(latch_done(Some(Idle), Idle, true), (Done, true));
+        // Working again clears the latch.
+        assert_eq!(latch_done(Some(Idle), Working, true), (Working, false));
+        // A bell/exit Done passes straight through (no latch needed).
+        assert_eq!(latch_done(Some(Working), Done, false), (Done, false));
+        // Idle not preceded by working stays idle (a fresh pane).
+        assert_eq!(latch_done(None, Idle, false), (Idle, false));
+        // Blocked passes through and clears the latch.
+        assert_eq!(latch_done(Some(Idle), Blocked, true), (Blocked, false));
     }
 }
