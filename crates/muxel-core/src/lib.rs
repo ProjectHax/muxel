@@ -697,6 +697,47 @@ impl Runner {
     }
 }
 
+/// A reusable snippet of text typed into an **already-running** pane on demand
+/// (unlike a [`Runner`], which spawns a new agent). `submit` decides whether
+/// Enter is pressed after the text — so a snippet can either run immediately or
+/// just be dropped into the input for you to review and send.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Snippet {
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    pub name: String,
+    /// The text typed into the pane.
+    #[serde(default)]
+    pub text: String,
+    /// Press Enter after typing (run it) vs. leave it unsubmitted in the input.
+    #[serde(default)]
+    pub submit: bool,
+}
+
+impl Snippet {
+    fn new(name: &str, text: &str, submit: bool) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            text: text.to_string(),
+            submit,
+        }
+    }
+
+    /// Built-in example snippets (seeded once; users can edit or delete them).
+    pub fn defaults() -> Vec<Snippet> {
+        vec![
+            Snippet::new("Continue", "continue", true),
+            Snippet::new("Yes", "yes", true),
+            Snippet::new(
+                "Plan first",
+                "Before you start, outline your plan and wait for my confirmation.",
+                false,
+            ),
+        ]
+    }
+}
+
 /// When a [`Loop`] fires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -908,6 +949,9 @@ pub struct Settings {
     /// Reusable task launchers.
     #[serde(default = "default_runners")]
     pub runners: Vec<Runner>,
+    /// Reusable text snippets typed into an existing pane on demand.
+    #[serde(default = "default_snippets")]
+    pub snippets: Vec<Snippet>,
     /// Scheduled task launchers (run a prompt on a timer).
     #[serde(default)]
     pub loops: Vec<Loop>,
@@ -951,6 +995,10 @@ fn default_runners() -> Vec<Runner> {
     Runner::defaults()
 }
 
+fn default_snippets() -> Vec<Snippet> {
+    Snippet::defaults()
+}
+
 fn default_passthrough_keys() -> Vec<String> {
     // Ctrl+P is handled directly (palette only when no terminal is focused), so the
     // general pass-through list starts empty; add other conflicting chords as needed.
@@ -985,6 +1033,7 @@ impl Default for Settings {
             dev_console_enabled: false,
             keybindings: Vec::new(),
             runners: Runner::defaults(),
+            snippets: Snippet::defaults(),
             loops: Vec::new(),
             terminal_passthrough_keys: default_passthrough_keys(),
             remotes: Vec::new(),
@@ -1104,6 +1153,17 @@ mod settings_tests {
         let counts = (s.presets.len(), s.runners.len());
         assert!(!s.seed_builtin_presets());
         assert_eq!((s.presets.len(), s.runners.len()), counts);
+    }
+
+    #[test]
+    fn snippets_default_when_absent_but_respect_empty() {
+        // An old config with no `snippets` key falls back to the defaults.
+        let s: Settings = serde_json::from_str("{}").expect("parse");
+        assert!(s.snippets.iter().any(|sn| sn.name == "Continue"));
+        // A user who deleted every snippet keeps an empty list (serde default only
+        // fills an *absent* field, not an explicitly empty one).
+        let s2: Settings = serde_json::from_str(r#"{"snippets": []}"#).expect("parse");
+        assert!(s2.snippets.is_empty());
     }
 
     #[test]

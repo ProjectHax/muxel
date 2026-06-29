@@ -20,11 +20,11 @@ use gpui_component::{button::*, *};
 use muxel_core::{
     AgentPreset, FocusDir, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule, MEMORY_DIR,
     MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteRef,
-    ResolvedLaunch, Runner, SplitDirection, SshAuth, StartupAgent, Workspace, WorkspaceMeta,
-    WorkspacesIndex, Worktree, add_tab, add_tab_at, focus_in_direction, memory_instruction,
-    migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove,
-    resolve_launch, set_active_tab, set_split_sizes, set_tab_order, split, split_beside,
-    swap_instances, swap_panes,
+    ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace,
+    WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, focus_in_direction,
+    memory_instruction, migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside,
+    move_tab_to, remove, resolve_launch, set_active_tab, set_split_sizes, set_tab_order, split,
+    split_beside, swap_instances, swap_panes,
 };
 use muxel_terminal::{AgentStatus, CommandSpec, TerminalMouseMode, TerminalSession, TerminalView};
 use std::collections::{HashMap, HashSet};
@@ -1016,6 +1016,8 @@ pub struct MuxelApp {
     nr_verify: RemoteTestState,
     /// Reusable task launchers.
     runners: Vec<Runner>,
+    /// Reusable text snippets typed into an existing pane on demand.
+    snippets: Vec<Snippet>,
     /// Scheduled task launchers (run a prompt on a timer).
     loops: Vec<Loop>,
     /// Live loop runs: spawned instance id → run state (for post-run handling).
@@ -1033,6 +1035,8 @@ pub struct MuxelApp {
     runners_menu: Option<Point<Pixels>>,
     /// Anchor point for the toolbar "Loops" popup, when open.
     loops_menu: Option<Point<Pixels>>,
+    /// Anchor point for the toolbar "Snippets" popup, when open.
+    snippets_menu: Option<Point<Pixels>>,
     /// The runner whose run-dialog is open (index into `runners`).
     active_runner: Option<usize>,
     /// Whether the run-dialog (collect details) is shown.
@@ -1112,6 +1116,7 @@ enum PaletteCommand {
     OpenSettings,
     OpenMemory,
     RunRunner(usize),
+    SendSnippet(usize),
 }
 
 /// The live view backing a pane — a terminal or a code editor. Lets the shared
@@ -1300,6 +1305,7 @@ enum ConfirmAction {
     DeletePreset(usize),
     DeleteProject(Uuid),
     DeleteRunner(usize),
+    DeleteSnippet(usize),
     DeleteLoop(usize),
     DeleteRemote(usize),
     CloseInstance(Uuid),
@@ -2358,6 +2364,7 @@ impl MuxelApp {
         .detach();
 
         let runners = settings.runners.clone();
+        let snippets = settings.snippets.clone();
         let mut loops = settings.loops.clone();
         // Arm interval loops on load: an interval loop with no recorded last_run
         // should fire one interval from now, not immediately. (Daily-at uses the
@@ -2460,6 +2467,7 @@ impl MuxelApp {
             nr_name,
             nr_verify: RemoteTestState::Idle,
             runners,
+            snippets,
             loops,
             running_loops: HashMap::new(),
             remotes,
@@ -2468,6 +2476,7 @@ impl MuxelApp {
             password_prompt_input,
             runners_menu: None,
             loops_menu: None,
+            snippets_menu: None,
             active_runner: None,
             show_run_dialog: false,
             runner_input,
@@ -3918,6 +3927,7 @@ impl MuxelApp {
             notifications_enabled: self.notifications_enabled,
             presets: self.presets.clone(),
             runners: self.runners.clone(),
+            snippets: self.snippets.clone(),
             loops: self.loops.clone(),
             remotes: self.remotes.clone(),
             theme: self.theme.clone(),
@@ -5216,6 +5226,14 @@ impl MuxelApp {
             cmds.push(OpenMemory);
         }
         cmds.extend((0..self.runners.len()).map(RunRunner));
+        // Snippets target the focused pane, so only offer them when one is a live
+        // terminal ready to receive typed text.
+        if self
+            .active_instance
+            .is_some_and(|iid| self.terminals.contains_key(&iid))
+        {
+            cmds.extend((0..self.snippets.len()).map(SendSnippet));
+        }
         cmds
     }
 
@@ -5237,6 +5255,11 @@ impl MuxelApp {
                 .runners
                 .get(i)
                 .map(|r| tf("Run: {name}", &[("name", &r.name.to_string())]))
+                .unwrap_or_default(),
+            PaletteCommand::SendSnippet(i) => self
+                .snippets
+                .get(i)
+                .map(|s| tf("Send snippet: {name}", &[("name", &s.name.to_string())]))
                 .unwrap_or_default(),
         }
     }
@@ -5265,6 +5288,7 @@ impl MuxelApp {
                 }
             }
             PaletteCommand::RunRunner(i) => self.run_runner(i, String::new(), window, cx),
+            PaletteCommand::SendSnippet(i) => self.send_snippet_to_active(i, window, cx),
         }
     }
 
@@ -7452,6 +7476,7 @@ impl MuxelApp {
             ConfirmAction::DeletePreset(idx) => self.delete_preset(idx, cx),
             ConfirmAction::DeleteProject(pid) => self.delete_project(pid, cx),
             ConfirmAction::DeleteRunner(idx) => self.delete_runner(idx, cx),
+            ConfirmAction::DeleteSnippet(idx) => self.delete_snippet(idx, cx),
             ConfirmAction::DeleteLoop(idx) => self.delete_loop(idx, cx),
             ConfirmAction::DeleteRemote(idx) => self.delete_remote(idx, cx),
             ConfirmAction::CloseInstance(iid) => {
@@ -7868,6 +7893,42 @@ impl MuxelApp {
         self.broadcast_input
             .update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
+    }
+
+    /// Type saved snippet `idx` into pane `iid` (an already-running terminal),
+    /// pressing Enter afterward when the snippet auto-submits. Text goes in via
+    /// `paste` (bracketed-paste-aware) so a multi-line snippet doesn't submit on
+    /// its own internal newlines. Focuses the pane so the result is visible.
+    fn send_snippet_to(
+        &mut self,
+        iid: Uuid,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snip) = self.snippets.get(idx).cloned() else {
+            return;
+        };
+        // Only live terminal panes are in `terminals`; editors/missing → no-op.
+        let Some(session) = self
+            .terminals
+            .get(&iid)
+            .map(|v| v.read(cx).session().clone())
+        else {
+            return;
+        };
+        session.paste(&snip.text);
+        if snip.submit {
+            session.write_input(b"\r");
+        }
+        self.focus_instance(iid, window, cx);
+    }
+
+    /// Send snippet `idx` to the active pane (toolbar / command-palette entry).
+    fn send_snippet_to_active(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(iid) = self.active_instance {
+            self.send_snippet_to(iid, idx, window, cx);
+        }
     }
 
     /// Select the Nth tab (1-based) of the active pane.
@@ -9348,7 +9409,14 @@ impl MuxelApp {
                             // Right-click: per-tab menu.
                             .context_menu({
                                 let entity = entity.clone();
-                                move |menu, window, _cx| {
+                                // Snippet (idx, name) pairs captured for the submenu.
+                                let snippets: Vec<(usize, SharedString)> = self
+                                    .snippets
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, s)| (i, SharedString::from(s.name.clone())))
+                                    .collect();
+                                move |menu, window, cx| {
                                     let pin_label = if tab_pinned { t("Unpin") } else { t("Pin") };
                                     let menu = menu
                                         .item(
@@ -9391,6 +9459,37 @@ impl MuxelApp {
                                                         this.clear_terminal_scrollback(tab, cx)
                                                     },
                                                 )),
+                                        )
+                                    } else {
+                                        menu
+                                    };
+                                    // Type a saved snippet into this pane (terminals only).
+                                    let menu = if tab_is_terminal && !snippets.is_empty() {
+                                        let entity_sn = entity.clone();
+                                        let snips = snippets.clone();
+                                        menu.submenu_with_icon(
+                                            Some(Icon::new(IconName::SquareTerminal)),
+                                            t("Send snippet"),
+                                            window,
+                                            cx,
+                                            move |mut sm, window, _c| {
+                                                for (idx, name) in &snips {
+                                                    let idx = *idx;
+                                                    sm = sm.item(
+                                                        PopupMenuItem::new(name.clone()).on_click(
+                                                            window.listener_for(
+                                                                &entity_sn,
+                                                                move |this, _, window, cx| {
+                                                                    this.send_snippet_to(
+                                                                        tab, idx, window, cx,
+                                                                    )
+                                                                },
+                                                            ),
+                                                        ),
+                                                    );
+                                                }
+                                                sm
+                                            },
                                         )
                                     } else {
                                         menu
@@ -11799,6 +11898,21 @@ impl MuxelApp {
                         }),
                     ),
             )
+            .child(
+                Button::new("snippets-btn")
+                    .ghost()
+                    .small()
+                    .icon(IconName::SquareTerminal)
+                    .label(t("Snippets"))
+                    .tooltip(t("Type a saved snippet into the active pane"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &MouseDownEvent, _w, cx| {
+                            this.snippets_menu = Some(e.position);
+                            cx.notify();
+                        }),
+                    ),
+            )
             .child(div().w(px(6.0)))
             .child(
                 Button::new("toggle-tmux")
@@ -12922,6 +13036,69 @@ impl MuxelApp {
         cx.notify();
     }
 
+    // --- Snippets (text typed into an existing pane) ---
+
+    fn open_snippet_editor(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(s) = self.snippets.get(idx).cloned() else {
+            return;
+        };
+        self.settings_ui.selected_snippet = Some(idx);
+        self.settings_ui.sn_submit = s.submit;
+        self.settings_ui
+            .sn_name
+            .update(cx, |st, cx| st.set_value(s.name.clone(), window, cx));
+        self.settings_ui
+            .sn_text
+            .update(cx, |st, cx| st.set_value(s.text.clone(), window, cx));
+        cx.notify();
+    }
+
+    fn save_snippet(&mut self, cx: &mut Context<Self>) {
+        let Some(idx) = self.settings_ui.selected_snippet else {
+            return;
+        };
+        let name = self.settings_ui.sn_name.read(cx).value().trim().to_string();
+        let text = self.settings_ui.sn_text.read(cx).value().to_string();
+        let submit = self.settings_ui.sn_submit;
+        if let Some(s) = self.snippets.get_mut(idx) {
+            if !name.is_empty() {
+                s.name = name;
+            }
+            s.text = text;
+            s.submit = submit;
+        }
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn add_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.snippets.push(Snippet {
+            id: Uuid::new_v4(),
+            name: t("New snippet").to_string(),
+            text: String::new(),
+            submit: false,
+        });
+        let idx = self.snippets.len() - 1;
+        self.persist_settings();
+        self.open_snippet_editor(idx, window, cx);
+    }
+
+    fn delete_snippet(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.snippets.len() {
+            return;
+        }
+        self.snippets.remove(idx);
+        self.settings_ui.selected_snippet = None;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Toggle the open snippet editor's "press Enter after typing" flag.
+    fn toggle_snippet_submit(&mut self, cx: &mut Context<Self>) {
+        self.settings_ui.sn_submit = !self.settings_ui.sn_submit;
+        cx.notify();
+    }
+
     // --- Loops (scheduled task launchers) ---
 
     fn open_loop_editor(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -13690,6 +13867,150 @@ impl MuxelApp {
                 .with_priority(1),
             )
             .into_any_element()
+    }
+
+    /// The toolbar "Snippets" popup: pick a saved snippet to type into the active
+    /// pane. Rows are inert (and a hint shows) when no terminal pane is focused.
+    fn render_snippets_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(pos) = self.snippets_menu else {
+            return div().into_any_element();
+        };
+        let target = self
+            .active_instance
+            .filter(|iid| self.terminals.contains_key(iid));
+        let has_target = target.is_some();
+        let target_label = target
+            .and_then(|iid| self.workspace.instance(iid))
+            .map(|i| {
+                i.custom_name
+                    .clone()
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or_else(|| i.title.clone())
+            })
+            .unwrap_or_default();
+        let mut list = v_flex().gap_px().w_full();
+        if self.snippets.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t("No snippets — add one in Settings → Snippets.")),
+            );
+        } else if !has_target {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t("Focus a terminal pane to send a snippet.")),
+            );
+        }
+        for (idx, snip) in self.snippets.iter().enumerate() {
+            let name = snip.name.clone();
+            let submit = snip.submit;
+            let fg = if has_target {
+                cx.theme().foreground
+            } else {
+                cx.theme().muted_foreground
+            };
+            let mut item = div()
+                .id(SharedString::from(format!("snippet-item-{idx}")))
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded(cx.theme().radius)
+                .text_color(fg)
+                .child(Icon::new(IconName::SquareTerminal).small())
+                .child(div().flex_1().min_w_0().text_sm().child(name))
+                // A small return glyph marks snippets that auto-submit (press Enter).
+                .children(submit.then(|| {
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("↵")
+                }));
+            if has_target {
+                item = item
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().accent))
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.send_snippet_to_active(idx, window, cx)
+                    }));
+            }
+            list = list.child(
+                div().flex().items_center().w_full().child(item).child(
+                    self.menu_edit_button(format!("snippet-edit-{idx}"), cx)
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            this.open_snippet_settings(idx, window, cx)
+                        })),
+                ),
+            );
+        }
+        let header = if has_target {
+            tf("Send to {name}", &[("name", &target_label)])
+        } else {
+            t("Send snippet").to_string()
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _w, cx| {
+                    this.snippets_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                deferred(
+                    anchored()
+                        .position(pos)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(
+                            div()
+                                .occlude()
+                                .w(px(260.0))
+                                .flex()
+                                .flex_col()
+                                .gap_px()
+                                .p_1()
+                                .bg(cx.theme().popover)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .rounded(cx.theme().radius)
+                                .shadow_lg()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(header),
+                                )
+                                .child(list),
+                        ),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
+
+    /// Open Settings → Snippets with snippet `idx` selected for editing.
+    fn open_snippet_settings(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.snippets_menu = None;
+        if !self.show_settings {
+            self.toggle_settings(window, cx);
+        }
+        self.set_section(SettingsSection::Snippets, cx);
+        self.open_snippet_editor(idx, window, cx);
     }
 
     fn render_loops_menu(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -14609,7 +14930,9 @@ impl MuxelApp {
         let editing_agent = (self.settings_ui.selected_preset.is_some()
             && self.settings_ui.section == SettingsSection::Agents)
             || (self.settings_ui.selected_runner.is_some()
-                && self.settings_ui.section == SettingsSection::Runners);
+                && self.settings_ui.section == SettingsSection::Runners)
+            || (self.settings_ui.selected_snippet.is_some()
+                && self.settings_ui.section == SettingsSection::Snippets);
         div()
             .absolute()
             .inset_0()
@@ -14813,6 +15136,9 @@ impl MuxelApp {
             .child(nav_item(t("Runners"), SettingsSection::Runners).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Runners, cx)),
             ))
+            .child(nav_item(t("Snippets"), SettingsSection::Snippets).on_click(
+                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Snippets, cx)),
+            ))
             .child(nav_item(t("Loops"), SettingsSection::Loops).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Loops, cx)),
             ))
@@ -14835,6 +15161,7 @@ impl MuxelApp {
             SettingsSection::Behavior => self.render_settings_behavior(cx),
             SettingsSection::Agents => self.render_settings_agents(cx),
             SettingsSection::Runners => self.render_settings_runners(cx),
+            SettingsSection::Snippets => self.render_settings_snippets(cx),
             SettingsSection::Loops => self.render_settings_loops(cx),
             SettingsSection::Remotes => self.render_settings_remotes(cx),
             SettingsSection::Projects => self.render_settings_projects(cx),
@@ -15272,6 +15599,120 @@ impl MuxelApp {
             .gap_4()
             .child(list)
             .child(div().flex_1().min_w_0().child(editor))
+            .into_any_element()
+    }
+
+    fn render_settings_snippets(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
+        for (idx, s) in self.snippets.iter().enumerate() {
+            let selected = self.settings_ui.selected_snippet == Some(idx);
+            let fg = if selected {
+                cx.theme().sidebar_accent_foreground
+            } else {
+                cx.theme().foreground
+            };
+            let mut row = div()
+                .id(SharedString::from(format!("snippet-row-{idx}")))
+                .flex()
+                .items_center()
+                .gap_2()
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded(cx.theme().radius)
+                .cursor_pointer()
+                .text_color(fg)
+                .on_click(cx.listener(move |this, _e, window, cx| {
+                    this.open_snippet_editor(idx, window, cx)
+                }))
+                .child(Icon::new(IconName::SquareTerminal).small())
+                .child(div().flex_1().min_w_0().text_sm().child(s.name.clone()))
+                .children(s.submit.then(|| {
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("↵")
+                }));
+            if selected {
+                row = row.bg(cx.theme().sidebar_accent);
+            } else {
+                row = row.hover(|s| s.bg(cx.theme().accent));
+            }
+            list = list.child(row);
+        }
+        list = list.child(
+            Button::new("add-snippet")
+                .ghost()
+                .icon(IconName::Plus)
+                .label(t("Add snippet"))
+                .on_click(cx.listener(|this, _e, window, cx| this.add_snippet(window, cx))),
+        );
+
+        let editor = match self.settings_ui.selected_snippet {
+            Some(idx) if idx < self.snippets.len() => self.render_snippet_editor(idx, cx),
+            _ => div()
+                .p_4()
+                .text_color(cx.theme().muted_foreground)
+                .child(t("Select a snippet to edit, or add one."))
+                .into_any_element(),
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .gap_4()
+            .child(list)
+            .child(div().flex_1().min_w_0().child(editor))
+            .into_any_element()
+    }
+
+    fn render_snippet_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
+        let ui = &self.settings_ui;
+        v_flex()
+            .gap_2()
+            .max_w(px(560.0))
+            .child(self.settings_label(&t("Name"), cx))
+            .child(Self::wide_input(Input::new(&ui.sn_name)))
+            .child(self.settings_label(&t("Text — typed into the focused pane"), cx))
+            .child(Self::wide_input(Input::new(&ui.sn_text).h(px(120.0))))
+            .child(self.check_row(
+                Checkbox::new("sn-submit").checked(ui.sn_submit).on_click(
+                    cx.listener(|this, _c: &bool, _w, cx| this.toggle_snippet_submit(cx)),
+                ),
+                &t("Press Enter after typing (run it)"),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .pt_2()
+                    .child(
+                        Button::new("save-snippet")
+                            .primary()
+                            .label(t("Save"))
+                            .on_click(cx.listener(|this, _e, _w, cx| this.save_snippet(cx))),
+                    )
+                    .child(
+                        Button::new("del-snippet")
+                            .ghost()
+                            .label(t("Delete"))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                let name = this
+                                    .snippets
+                                    .get(idx)
+                                    .map(|s| s.name.clone())
+                                    .unwrap_or_default();
+                                this.request_confirm(
+                                    t("Delete snippet?"),
+                                    tf("The “{name}” snippet will be deleted.", &[("name", &name)]),
+                                    t("Delete"),
+                                    ConfirmAction::DeleteSnippet(idx),
+                                    cx,
+                                )
+                            })),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -16731,6 +17172,11 @@ impl Render for MuxelApp {
                 self.loops_menu
                     .is_some()
                     .then(|| self.render_loops_menu(cx)),
+            )
+            .children(
+                self.snippets_menu
+                    .is_some()
+                    .then(|| self.render_snippets_menu(cx)),
             )
             .children(self.show_run_dialog.then(|| self.render_run_dialog(cx)))
             .children(

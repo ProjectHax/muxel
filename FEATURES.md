@@ -135,6 +135,17 @@ feature is added or changed, update the matching entry here in the same change**
 - **Ephemeral + restore-safe** — on app restore a runner re-types its prompt but
   does not auto-submit.
 
+## Snippets
+
+- **Type saved text into an existing pane** — reusable snippets (a managed list in
+  Settings → Snippets) are typed straight into an already-running pane, unlike
+  runners (which spawn a new agent). Each snippet records whether it **auto-submits**
+  (presses Enter) or just drops the text into the input for you to review.
+- **Three ways to send** — the toolbar **Snippets** dropdown (sends to the active
+  pane), the command palette (*Send snippet: …*), or right-click a terminal tab →
+  **Send snippet** (sends to that specific pane). Multi-line text goes in via a
+  bracketed-paste-aware insert so it won't submit on its own newlines.
+
 ## Loops
 
 - **Scheduled task launchers** — run a saved prompt on a chosen agent in a chosen
@@ -321,7 +332,7 @@ feature is added or changed, update the matching entry here in the same change**
 ## Settings & theming
 
 - **Settings modal** — sections for Appearance, Editor, Behavior, Agents, Runners,
-  Projects, and Keybindings.
+  Snippets, Loops, Remotes, Projects, and Keybindings.
 - **Themes** — ~22 bundled themes with a switcher (Catppuccin, Gruvbox, Tokyo
   Night, Solarized, Ayu, Everforest, and more).
 - **Sizing** — whole-app zoom plus independent UI, terminal, and code/diff font

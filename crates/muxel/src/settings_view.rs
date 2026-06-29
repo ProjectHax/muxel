@@ -82,6 +82,7 @@ pub enum SettingsSection {
     Behavior,
     Agents,
     Runners,
+    Snippets,
     Loops,
     Remotes,
     Projects,
@@ -115,6 +116,12 @@ pub struct SettingsUi {
     pub r_presses: u8,
     pub r_name: Entity<InputState>,
     pub r_prompt: Entity<InputState>,
+
+    // Snippet editor.
+    pub selected_snippet: Option<usize>,
+    pub sn_submit: bool,
+    pub sn_name: Entity<InputState>,
+    pub sn_text: Entity<InputState>,
 
     // Loop editor.
     pub selected_loop: Option<usize>,
@@ -212,6 +219,14 @@ impl SettingsUi {
                 InputState::new(window, cx)
                     .multi_line(true)
                     .placeholder(t("Task prompt — use {{input}} for the run-time details"))
+            }),
+            selected_snippet: None,
+            sn_submit: false,
+            sn_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
+            sn_text: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .multi_line(true)
+                    .placeholder(t("Text typed into the pane"))
             }),
             selected_loop: None,
             l_preset_id: None,
