@@ -348,7 +348,10 @@ feature is added or changed, update the matching entry here in the same change**
   (blocked, then done), and `Cmd+Q` (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, per-kind close confirmation (terminal on, editor/diff off by
-  default), and auto-close a pane when its process exits.
+  default), and auto-close a pane when its process exits. The terminal
+  confirmation is skipped for an untouched **shell** pane — one sitting idle at
+  its prompt with no foreground command and no other tabs — since closing it
+  loses nothing.
 
 ## Localization
 

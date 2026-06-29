@@ -147,6 +147,10 @@ pub struct TerminalSession {
     writer: SharedWriter,
     master: Box<dyn MasterPty + Send>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
+    /// The PTY child's pid (the shell/agent), captured at spawn. Compared against
+    /// the terminal's foreground process group to tell whether the child is idle
+    /// at its prompt vs. running a foreground command (see `is_idle_foreground`).
+    child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
     bell: Arc<AtomicBool>,
     /// True while a left-drag text selection started in this terminal.
@@ -209,6 +213,7 @@ impl TerminalSession {
         }
 
         let child = pair.slave.spawn_command(builder).context("spawn command")?;
+        let child_pid = child.process_id();
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let writer: SharedWriter = Arc::new(Mutex::new(
             pair.master.take_writer().context("take pty writer")?,
@@ -243,6 +248,7 @@ impl TerminalSession {
             writer,
             master: pair.master,
             child: Mutex::new(child),
+            child_pid,
             title,
             bell,
             selecting: AtomicBool::new(false),
@@ -619,6 +625,29 @@ impl TerminalSession {
         self.last_output.lock().elapsed()
     }
 
+    /// Whether the child is sitting idle at its prompt with no foreground command
+    /// running — i.e. the terminal's foreground process group *is* the child
+    /// itself. A shell that's running `vim`/`make`/etc. puts that command in a new
+    /// foreground group, so this returns `false`. Used to skip the close
+    /// confirmation for an untouched shell pane.
+    ///
+    /// `false` when it can't be determined — no foreground group, an unknown child
+    /// pid, or a platform without `tcgetpgrp` (Windows) — so callers stay safe and
+    /// confirm as usual.
+    pub fn is_idle_foreground(&self) -> bool {
+        #[cfg(unix)]
+        {
+            match (self.master.process_group_leader(), self.child_pid) {
+                (Some(fg), Some(pid)) => fg == pid as libc::pid_t,
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     /// Kill the child process.
     pub fn kill(&self) {
         let _ = self.child.lock().kill();
@@ -927,5 +956,24 @@ mod tests {
         }
         session.kill();
         assert!(seen, "child did not echo written input back into the grid");
+    }
+
+    #[test]
+    fn direct_child_reads_as_idle_foreground() {
+        // The direct child (`cat`) is the terminal's foreground process group with
+        // nothing running under it, so it reads as idle-foreground. (A shell running
+        // a sub-command would put that command in a different group → false.)
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn");
+        // The kernel sets the foreground group as the child takes the pty; poll.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !session.is_idle_foreground() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            session.is_idle_foreground(),
+            "the direct child should be the foreground process group"
+        );
+        session.kill();
     }
 }

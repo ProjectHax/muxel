@@ -7417,7 +7417,20 @@ impl MuxelApp {
                 .editors
                 .get(&iid)
                 .is_none_or(|e| !e.read(cx).is_dirty());
-        if self.confirm_close_for(kind) && !clean_editor {
+        // A default-shell pane sitting idle at its prompt (no foreground command),
+        // alone in its pane, has nothing to lose either — skip the prompt. A running
+        // command, another tab in the pane, or an agent (non-shell program) all keep
+        // the confirmation.
+        let idle_lone_shell = self
+            .workspace
+            .instance(iid)
+            .is_some_and(|i| i.kind == InstanceKind::Terminal && i.program.is_none())
+            && self.other_tabs_in_pane(iid).is_empty()
+            && self
+                .terminals
+                .get(&iid)
+                .is_some_and(|v| v.read(cx).session().is_idle_foreground());
+        if self.confirm_close_for(kind) && !clean_editor && !idle_lone_shell {
             let (noun, verb) = match kind {
                 InstanceKind::Terminal => (t("terminal"), t("terminated")),
                 InstanceKind::Editor => (t("editor"), t("closed")),
