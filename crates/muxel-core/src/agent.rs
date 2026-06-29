@@ -233,6 +233,40 @@ impl AgentPreset {
         }
     }
 
+    /// Run a coding agent backed by an Ollama model via `ollama launch <agent>
+    /// --model <model>` (e.g. `ollama launch opencode --model glm-5.2:cloud`). The
+    /// whole launch line lives in `args` because the `--model` flag has to follow
+    /// the `launch` subcommand and its agent — change the agent or model there.
+    /// Markers default to opencode's TUI (the seeded agent); adjust them if you
+    /// point it at a different agent.
+    pub fn ollama_code() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: "Ollama Code".to_string(),
+            program: Some("ollama".to_string()),
+            model: None,
+            model_flag: None,
+            effort: None,
+            effort_flag: None,
+            args: vec![
+                "launch".to_string(),
+                "opencode".to_string(),
+                "--model".to_string(),
+                "glm-5.2:cloud".to_string(),
+            ],
+            system_prompt: None,
+            injection: InjectionMode::TypeIn,
+            env: Vec::new(),
+            working_markers: vec!["esc interrupt".to_string()],
+            blocked_markers: vec!["Permission required".to_string()],
+            // The launched agent (opencode) keeps loading after its first draw, on
+            // top of ollama's own connect — wait before any runner types into it.
+            startup_delay_ms: 6000,
+            session_id_flag: None,
+            resume_flag: None,
+        }
+    }
+
     pub fn pi() -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -310,6 +344,7 @@ impl AgentPreset {
             Self::grok(),
             Self::hermes(),
             Self::ollama(),
+            Self::ollama_code(),
             Self::pi(),
         ]);
         presets
@@ -617,6 +652,23 @@ mod tests {
     fn compose_args_skips_unset_model_and_effort() {
         // Claude has a model_flag but no model set, and no effort_flag.
         assert!(AgentPreset::claude().compose_args().is_empty());
+    }
+
+    #[test]
+    fn ollama_code_runs_an_agent_with_a_model() {
+        let p = AgentPreset::ollama_code();
+        assert_eq!(p.program.as_deref(), Some("ollama"));
+        // `--model` must follow the `launch` subcommand + agent, so the whole line
+        // lives in args (the model field can't place the flag after them).
+        let r = resolve_launch(&instance(&p, None));
+        assert_eq!(r.program.as_deref(), Some("ollama"));
+        assert_eq!(r.args, ["launch", "opencode", "--model", "glm-5.2:cloud"]);
+        // It's part of the seeded defaults so existing users get it on upgrade.
+        assert!(
+            AgentPreset::defaults()
+                .iter()
+                .any(|p| p.name == "Ollama Code")
+        );
     }
 
     #[test]

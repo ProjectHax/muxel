@@ -47,9 +47,12 @@ feature is added or changed, update the matching entry here in the same change**
 ## Agents
 
 - **Built-in agent presets** — Shell, Claude, opencode, Amp (ampcode), Grok
-  (x.ai), Hermes, Ollama, and Pi, each with its own icon. On Windows the default
-  shell is **PowerShell**, with **Cmd** offered as a second preset (instead of the
-  single "Shell").
+  (x.ai), Hermes, Ollama, **Ollama Code**, and Pi, each with its own icon. On
+  Windows the default shell is **PowerShell**, with **Cmd** offered as a second
+  preset (instead of the single "Shell").
+- **Ollama Code** — runs a coding agent backed by an Ollama model via
+  `ollama launch <agent> --model <model>` (seeded as `ollama launch opencode
+  --model glm-5.2:cloud`); change the agent or model in the preset's args.
 - **Configurable launch** — per agent: program, model + model flag, effort +
   effort flag, extra args, environment variables, system-prompt injection
   (via a CLI flag or by typing it in at startup), and a runner startup delay
