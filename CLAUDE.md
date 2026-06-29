@@ -29,6 +29,12 @@ Cargo workspace, four crates (depend downward only):
   editor (`editor.rs`), git/tmux side effects (`integrations.rs`), and embedded
   assets (icons, themes) wired up in `main.rs`.
 
+`ios/` — a separate **Swift/SwiftUI iOS companion app** (remote-only; peers with
+desktop muxel over SSH/tmux). It is **not** a cargo crate — the `cargo` gate does
+not build it. It re-implements a versioned slice of `muxel-core`'s *remote protocol*
+(tmux session naming, `RemoteLayout` `.muxel/workspace.json`, `classify`/markers); if
+you change those Rust contracts, update the matching Swift port. See `ios/README.md`.
+
 ### Key concepts
 
 - **Pane tree** — a project's layout is `Option<PaneNode>`: `Leaf(LeafData {

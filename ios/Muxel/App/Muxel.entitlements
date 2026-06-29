@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  No special entitlements are required for v1: on-device Keychain access and
+	  BGTaskScheduler need no entitlement (Background Modes is declared in
+	  Info.plist). Add keychain-access-groups here if credential sharing across a
+	  future extension is needed; add aps-environment when the push upgrade lands.
+	-->
+</dict>
+</plist>

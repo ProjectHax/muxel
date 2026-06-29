@@ -1,0 +1,18 @@
+# Xcode / Swift build artifacts for the muxel iOS companion app.
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+*.xcuserstate
+
+# XcodeGen generates the .xcodeproj from project.yml — don't commit it.
+Muxel.xcodeproj/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store

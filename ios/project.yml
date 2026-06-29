@@ -1,0 +1,61 @@
+# XcodeGen project definition for the muxel iOS companion app.
+#
+# The .xcodeproj is generated (and git-ignored). To build:
+#   brew install xcodegen
+#   cd ios && xcodegen generate && open Muxel.xcodeproj
+#
+# This app is independent of the Rust cargo workspace; `cargo` does not build it.
+name: Muxel
+options:
+  bundleIdPrefix: dev.muxel
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+# Pin/adjust versions on first resolve if a tag is unavailable.
+# v1 only needs Citadel (exec channels). The live-PTY terminal enhancement adds
+# SwiftTerm later; v1's terminal uses tmux capture-pane + send-keys over `run`.
+packages:
+  Citadel:
+    url: https://github.com/orlandos-nl/Citadel
+    from: "0.7.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: "" # set your Apple Developer team id (or in Xcode signing)
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  Muxel:
+    type: application
+    platform: iOS
+    sources:
+      - path: Muxel
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.muxel.ios
+        PRODUCT_NAME: muxel
+        PRODUCT_MODULE_NAME: muxel
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Muxel/App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Muxel/App/Muxel.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2" # iPhone + iPad
+        ENABLE_PREVIEWS: YES
+    dependencies:
+      - package: Citadel
+
+  MuxelTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: MuxelTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.muxel.ios.tests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: Muxel
