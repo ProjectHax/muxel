@@ -57,9 +57,11 @@ feature is added or changed, update the matching entry here in the same change**
   starters like opencode; 0 = auto-wait until output goes quiet).
 - **Installed-binary autodetect** — agents whose binary isn't on `PATH` are hidden
   from the new-agent menus and marked "not installed" in settings; they reappear
-  automatically once installed. On macOS, a Dock/Finder launch reconstructs the
-  Homebrew and `~/.local/bin` dirs that launchd otherwise omits, so agents are
-  detected and spawnable the same as from a terminal.
+  automatically once installed. A GUI launch reconstructs the bin dirs the desktop
+  environment otherwise omits — on macOS a Dock/Finder launch restores Homebrew and
+  `~/.local/bin`; on Linux a desktop-entry / AppImage launch restores `~/.local/bin`,
+  `~/.opencode/bin` (opencode's installer default), Linuxbrew, and friends — so
+  agents are detected and spawnable the same as from a terminal.
 - **Graceful launch failure** — if an agent can't be spawned, the pane falls back
   to a shell showing the underlying error instead of crashing.
 - **Session resume** — resume-capable agents (Claude out of the box) get a stable

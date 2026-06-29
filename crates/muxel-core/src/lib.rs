@@ -15,7 +15,7 @@ pub use agent::{
     claude_session_path, memory_header, memory_instruction, resolve_launch, session_resume_args,
 };
 pub use diff::{SplitRow, split_diff};
-pub use gui_path::augmented_macos_path;
+pub use gui_path::{augmented_linux_path, augmented_macos_path};
 pub use pane::{
     FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
     move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove, set_active_tab,

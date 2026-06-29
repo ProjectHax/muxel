@@ -65,6 +65,20 @@ fn main() {
         }
     }
 
+    // A Linux desktop-entry / AppImage launch likewise inherits a minimal PATH
+    // missing ~/.local/bin, ~/.opencode/bin (opencode's installer default),
+    // Linuxbrew, etc. — so agents like opencode go undetected and fail to spawn.
+    // Same fix: reconstruct the common dirs before any thread starts.
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME").ok();
+        let current = std::env::var("PATH").ok();
+        if let Some(path) = muxel_core::augmented_linux_path(current.as_deref(), home.as_deref()) {
+            // SAFETY: still single-threaded here (before the GPUI app starts).
+            unsafe { std::env::set_var("PATH", path) };
+        }
+    }
+
     gpui_platform::application()
         // Serves muxel's agent icons + gpui-component's bundled SVG icons.
         .with_assets(AppAssets)
