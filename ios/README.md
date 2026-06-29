@@ -95,3 +95,10 @@ background notifications, secrets in Keychain.
 Future: APNs push via a remote watcher daemon (instant background alerts); tmux
 **control mode** (`-C`) for structured multi-pane multiplexing; split-tree
 rendering/editing; worktree creation; editor/diff panes.
+
+## License
+
+The iOS app is licensed under **GPL-3.0** (the repo-root `LICENSE`), with an
+**additional permission under GPLv3 section 7** allowing distribution through the
+Apple App Store / TestFlight — see `ios/LICENSE`. This resolves the usual GPLv3 ↔
+App Store terms conflict for the iOS target; the rest of muxel stays plain GPL-3.0.

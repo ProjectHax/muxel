@@ -41,7 +41,7 @@ struct ProjectDetailView: View {
             }
         }
         .sheet(isPresented: $showLaunch) { LaunchInstanceView(project: project) }
-        .onChange(of: state.layout?.orderedTerminalInstances.map(\.id) ?? []) { ids in
+        .onChange(of: state.layout?.orderedTerminalInstances.map(\.id) ?? []) { _, ids in
             if selectedTab == nil || !ids.contains(selectedTab!) {
                 selectedTab = ids.first
             }

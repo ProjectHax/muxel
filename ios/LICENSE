@@ -1,0 +1,39 @@
+muxel iOS companion app — Licensing
+===================================
+
+The muxel iOS app (all files in this `ios/` directory) is part of muxel and is
+distributed under the terms of the GNU General Public License, version 3, as
+published by the Free Software Foundation. The full license text is in the
+`LICENSE` file at the root of this repository.
+
+  muxel iOS — Copyright (C) ProjectHax LLC.
+
+  This program is free software: you can redistribute it and/or modify it under
+  the terms of the GNU General Public License as published by the Free Software
+  Foundation, version 3.
+
+  This program is distributed in the hope that it will be useful, but WITHOUT ANY
+  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+  PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+
+Additional permission under GNU GPL version 3 section 7
+-------------------------------------------------------
+
+As an additional permission under section 7 of the GNU General Public License
+version 3, the copyright holders grant you permission to convey the Program (the
+muxel iOS app, or a work based on it) to users through the Apple App Store, Apple
+TestFlight, or any comparable application-distribution service (an "App Store"),
+and to agree to and comply with that App Store's standard terms of service for
+such distribution, notwithstanding that those terms impose further restrictions
+that section 6 of the GNU General Public License would otherwise prohibit.
+
+This additional permission applies solely to conveying the Program through an App
+Store; in every other respect the GNU General Public License version 3 governs.
+
+You may remove this additional permission from your copy, or from any copy you
+convey, as provided in section 7 of the GNU General Public License version 3.
+
+This additional permission applies only to the muxel iOS app in this `ios/`
+directory. It does not apply to the rest of muxel, which remains under the GNU
+General Public License version 3 without this additional permission.

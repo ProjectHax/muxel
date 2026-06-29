@@ -9,7 +9,7 @@ name: Muxel
 options:
   bundleIdPrefix: dev.muxel
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "17.0" # Citadel requires iOS 17+
   createIntermediateGroups: true
   groupSortPosition: top
 
