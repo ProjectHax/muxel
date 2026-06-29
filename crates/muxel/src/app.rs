@@ -418,6 +418,8 @@ actions!(
         ShowKeys,
         // Toggle the broadcast bar (send one line to every agent in the project).
         ToggleBroadcast,
+        // Toggle the "new agents get a git worktree" toolbar switch.
+        ToggleWorktree,
         // Toggle the developer console (error log) — only when enabled in settings.
         ToggleDevConsole,
         // Search the active terminal's scrollback (Terminal context only).
@@ -438,6 +440,12 @@ struct JumpToTab(usize);
 #[derive(Action, Clone, PartialEq)]
 #[action(namespace = muxel, no_json)]
 struct JumpToProject(usize);
+
+/// Open a new pane running the Nth agent preset (1-based, in the preset list
+/// order). Bound to Ctrl+Alt+1..9.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = muxel, no_json)]
+struct NewAgent(usize);
 
 fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Option<KeyBinding> {
     Some(match action {
@@ -468,7 +476,18 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
         "FocusDown" => KeyBinding::new(keystroke, FocusDown, context),
         "ShowKeys" => KeyBinding::new(keystroke, ShowKeys, context),
         "ToggleBroadcast" => KeyBinding::new(keystroke, ToggleBroadcast, context),
+        "ToggleWorktree" => KeyBinding::new(keystroke, ToggleWorktree, context),
         "ToggleDevConsole" => KeyBinding::new(keystroke, ToggleDevConsole, context),
+        // NewAgent1..9 — the trailing digit is the 1-based preset index.
+        a if a.starts_with("NewAgent") => {
+            match a
+                .strip_prefix("NewAgent")
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                Some(n) => KeyBinding::new(keystroke, NewAgent(n), context),
+                None => return None,
+            }
+        }
         // JumpToTab1..9 — the trailing digit is the tab index.
         a if a.starts_with("JumpToTab") => {
             match a
@@ -567,14 +586,25 @@ fn claude_session_gone(
     !muxel_core::claude_session_path(&home, cwd, session_id).exists()
 }
 
-/// "NewPane" -> "New Pane" for the shortcut cheat-sheet.
+/// "NewPane" -> "New Pane", "NewAgent1" -> "New Agent 1" for the shortcut
+/// cheat-sheet. Splits before each uppercase letter and before a digit that
+/// starts a new run (so a trailing index reads as its own word).
 fn humanize_action(name: &str) -> String {
     let mut out = String::new();
-    for (i, ch) in name.char_indices() {
-        if i > 0 && ch.is_uppercase() {
+    let mut prev: Option<char> = None;
+    for ch in name.chars() {
+        let boundary = if ch.is_uppercase() {
+            prev.is_some()
+        } else if ch.is_ascii_digit() {
+            prev.is_some_and(|p| !p.is_ascii_digit())
+        } else {
+            false
+        };
+        if boundary {
             out.push(' ');
         }
         out.push(ch);
+        prev = Some(ch);
     }
     out
 }
@@ -4634,6 +4664,22 @@ impl MuxelApp {
             target,
             PlacementMode::Split(direction),
             preset_idx,
+            window,
+            cx,
+        );
+    }
+
+    /// Open a new pane running preset number `n` (1-based, in the preset list
+    /// order) beside the active pane — the keyboard counterpart to the toolbar's
+    /// preset picker (bound to Ctrl+Alt+1..9). Out-of-range `n` is ignored.
+    fn new_agent_preset(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(idx) = n.checked_sub(1).filter(|i| *i < self.presets.len()) else {
+            return;
+        };
+        self.add_agent_at(
+            self.active_instance,
+            SplitDirection::Horizontal,
+            idx,
             window,
             cx,
         );
@@ -17125,11 +17171,19 @@ impl Render for MuxelApp {
                 this.toggle_broadcast(window, cx)
             }))
             .on_action(
+                cx.listener(|this, _: &ToggleWorktree, _window, cx| this.toggle_worktree(cx)),
+            )
+            .on_action(
                 cx.listener(|this, a: &JumpToTab, window, cx| this.jump_to_tab(a.0, window, cx)),
             )
             .on_action(cx.listener(|this, a: &JumpToProject, window, cx| {
                 this.jump_to_project(a.0, window, cx)
             }))
+            .on_action(
+                cx.listener(|this, a: &NewAgent, window, cx| {
+                    this.new_agent_preset(a.0, window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &ToggleDevConsole, _window, cx| {
                 // Gated on the setting — F12 is bound globally, so it's a no-op when
                 // the developer console is disabled.
@@ -17217,6 +17271,20 @@ mod shell_title_tests {
         assert_eq!(shell_dir_title("make build"), "make build");
         // A colon but no `@` before it → unchanged.
         assert_eq!(shell_dir_title("12:34"), "12:34");
+    }
+}
+
+#[cfg(test)]
+mod humanize_tests {
+    use super::humanize_action;
+
+    #[test]
+    fn splits_camel_case_and_trailing_index() {
+        assert_eq!(humanize_action("NewPane"), "New Pane");
+        assert_eq!(humanize_action("ToggleWorktree"), "Toggle Worktree");
+        // A trailing index reads as its own word, and stays one number.
+        assert_eq!(humanize_action("NewAgent1"), "New Agent 1");
+        assert_eq!(humanize_action("JumpToProject9"), "Jump To Project 9");
     }
 }
 

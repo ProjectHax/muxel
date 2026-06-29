@@ -51,6 +51,8 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("FocusAttention", "ctrl-shift-a", None),
     ("ShowKeys", "ctrl-shift-/", None),
     ("ToggleBroadcast", "ctrl-shift-i", None),
+    // Toggle the toolbar's "new agents get a git worktree" switch.
+    ("ToggleWorktree", "ctrl-shift-g", None),
     ("ToggleDevConsole", "f12", None),
     ("SaveFile", "ctrl-s", None),
     ("SaveFileAs", "ctrl-shift-s", None),
@@ -72,6 +74,16 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("JumpToProject7", "ctrl-7", None),
     ("JumpToProject8", "ctrl-8", None),
     ("JumpToProject9", "ctrl-9", None),
+    // New pane running the Nth agent preset (in the preset-list order).
+    ("NewAgent1", "ctrl-alt-1", None),
+    ("NewAgent2", "ctrl-alt-2", None),
+    ("NewAgent3", "ctrl-alt-3", None),
+    ("NewAgent4", "ctrl-alt-4", None),
+    ("NewAgent5", "ctrl-alt-5", None),
+    ("NewAgent6", "ctrl-alt-6", None),
+    ("NewAgent7", "ctrl-alt-7", None),
+    ("NewAgent8", "ctrl-alt-8", None),
+    ("NewAgent9", "ctrl-alt-9", None),
 ];
 
 /// Which settings section is shown.
