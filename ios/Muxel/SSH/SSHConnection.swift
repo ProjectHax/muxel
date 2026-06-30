@@ -1,9 +1,11 @@
 import Foundation
+import Citadel
 
 /// Errors surfaced by the SSH layer.
 enum SSHError: LocalizedError {
     case notConnected
     case auth(String)
+    case connection(String)
     case hostKeyChanged(expected: String, got: String)
     case command(String)
     case missingCredential
@@ -12,6 +14,7 @@ enum SSHError: LocalizedError {
         switch self {
         case .notConnected: return "Not connected."
         case let .auth(m): return "Authentication failed: \(m)"
+        case let .connection(m): return m
         case let .hostKeyChanged(expected, got):
             return "Host key changed!\nExpected \(expected)\nGot \(got)\nConnection refused for safety."
         case let .command(m): return "Command failed: \(m)"
@@ -27,13 +30,16 @@ enum SSHError: LocalizedError {
 /// logic can run against `MockSSHConnection` in previews and tests while the real
 /// Citadel transport is finalized by the SSH spike.
 protocol SSHConnection: AnyObject {
-    var isConnected: Bool { get }
-
     /// Establish (or verify) the connection. Performs TOFU host-key validation.
     func connect() async throws
 
     /// Run a one-shot remote command over an exec channel; returns combined stdout.
     func run(_ command: String) async throws -> String
+
+    /// The connected Citadel client, for opening a live PTY channel (the terminal
+    /// view). Returns nil when there's no real transport (e.g. `MockSSHConnection`),
+    /// so previews/tests degrade gracefully instead of opening a PTY.
+    func sshClient() async throws -> SSHClient?
 
     /// Tear down the transport.
     func close() async

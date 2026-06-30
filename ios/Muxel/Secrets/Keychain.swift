@@ -26,7 +26,8 @@ enum Keychain {
 
     // MARK: Typed helpers
 
-    static func setPassword(_ password: String, for host: UUID) {
+    @discardableResult
+    static func setPassword(_ password: String, for host: UUID) -> Bool {
         setData(Data(password.utf8), slot: .password(host))
     }
     static func password(for host: UUID) -> String? {
@@ -34,14 +35,16 @@ enum Keychain {
     }
 
     /// Store the raw private-key bytes (PEM/OpenSSH format) for `host`.
-    static func setPrivateKey(_ key: Data, for host: UUID) {
+    @discardableResult
+    static func setPrivateKey(_ key: Data, for host: UUID) -> Bool {
         setData(key, slot: .privateKey(host))
     }
     static func privateKey(for host: UUID) -> Data? {
         data(slot: .privateKey(host))
     }
 
-    static func setKeyPassphrase(_ passphrase: String, for host: UUID) {
+    @discardableResult
+    static func setKeyPassphrase(_ passphrase: String, for host: UUID) -> Bool {
         setData(Data(passphrase.utf8), slot: .keyPassphrase(host))
     }
     static func keyPassphrase(for host: UUID) -> String? {
@@ -65,13 +68,17 @@ enum Keychain {
         ]
     }
 
-    static func setData(_ data: Data, slot: Slot) {
+    /// Write `data` to `slot`, replacing any existing item. Returns whether the write
+    /// succeeded (so callers can surface a Keychain failure instead of silently
+    /// dropping the secret).
+    @discardableResult
+    static func setData(_ data: Data, slot: Slot) -> Bool {
         var query = baseQuery(slot)
         // Replace any existing item.
         SecItemDelete(query as CFDictionary)
         query[kSecValueData as String] = data
         query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(query as CFDictionary, nil)
+        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
     }
 
     static func data(slot: Slot) -> Data? {

@@ -10,14 +10,33 @@ final class AppState: ObservableObject {
     @Published var selectedProject: RemoteProject?
     @Published var layout: RemoteLayout?
     @Published var statuses: [String: AgentStatus] = [:]
+    /// Instance ids with a live tmux session right now (from the latest poll of the
+    /// selected project).
+    @Published var running: Set<String> = []
     @Published var errorMessage: String?
     @Published var isBusy = false
+    /// Id of the most recently launched instance — the detail view selects it so its
+    /// live terminal opens (and creates the session attached).
+    @Published var lastLaunched: String?
+    /// Result of a one-off "Test connection" — drives a confirmation alert.
+    @Published var testResult: ConnectionTest?
+
+    /// Outcome of testing a host's saved credential.
+    struct ConnectionTest: Identifiable {
+        let id = UUID()
+        let hostName: String
+        let ok: Bool
+        let message: String
+    }
 
     /// Injectable so previews/tests use `MockSSHConnection`.
     var connectionFactory: (Host) -> SSHConnection = { CitadelSSHConnection(host: $0) }
 
     private let store: LocalStore
     private var connections: [UUID: SSHConnection] = [:]
+    /// Live PTY terminals, owned here (not by the SwiftUI views) so a pane stays
+    /// connected across navigation until the instance is closed or the app quits.
+    let terminals = TerminalStore()
     private let poll = PollService()
     private var pollLoop: Task<Void, Never>?
 
@@ -32,19 +51,53 @@ final class AppState: ObservableObject {
     func host(id: UUID) -> Host? { doc.hosts.first { $0.id == id } }
     func projects(for host: Host) -> [RemoteProject] { doc.projects.filter { $0.hostId == host.id } }
     func status(_ instanceId: String) -> AgentStatus { statuses[instanceId] ?? .idle }
+    func isRunning(_ instanceId: String) -> Bool { running.contains(instanceId) }
+
+    /// Live instance count for `project` — known only for the selected project (the
+    /// one the foreground poller is watching); `nil` for others.
+    func runningCount(for project: RemoteProject) -> Int? {
+        selectedProject?.id == project.id ? running.count : nil
+    }
 
     // MARK: Host / project CRUD
 
     func addHost(_ host: Host, password: String?, keyData: Data?, passphrase: String?) {
-        if let password { Keychain.setPassword(password, for: host.id) }
-        if let keyData { Keychain.setPrivateKey(keyData, for: host.id) }
-        if let passphrase, !passphrase.isEmpty { Keychain.setKeyPassphrase(passphrase, for: host.id) }
+        var saved = true
+        if let password { saved = Keychain.setPassword(password, for: host.id) && saved }
+        if let keyData { saved = Keychain.setPrivateKey(keyData, for: host.id) && saved }
+        if let passphrase, !passphrase.isEmpty {
+            saved = Keychain.setKeyPassphrase(passphrase, for: host.id) && saved
+        }
         doc.hosts.append(host)
         persist()
+        if !saved {
+            errorMessage = "Couldn't save the credential to the Keychain. The host was added, but " +
+                "you may need to re-add it or check the device's Keychain access."
+        }
+    }
+
+    /// Connect to `host` with a *fresh* connection (re-reading its Keychain secret) to
+    /// verify the saved credential authenticates. Surfaces the result via `testResult`.
+    func testConnection(_ host: Host) async {
+        isBusy = true
+        defer { isBusy = false }
+        let conn = connectionFactory(host)
+        do {
+            try await conn.connect()
+            _ = try await conn.run("true")
+            await conn.close()
+            testResult = ConnectionTest(hostName: host.name, ok: true,
+                                        message: "Connected and authenticated successfully.")
+        } catch {
+            await conn.close()
+            testResult = ConnectionTest(hostName: host.name, ok: false,
+                                        message: error.localizedDescription)
+        }
     }
 
     func deleteHost(_ host: Host) {
         Keychain.deleteAll(for: host.id)
+        terminals.disconnect(forHost: host.id)
         connections[host.id] = nil
         doc.projects.removeAll { $0.hostId == host.id }
         doc.hosts.removeAll { $0.id == host.id }
@@ -53,6 +106,29 @@ final class AppState: ObservableObject {
 
     func addProject(_ project: RemoteProject) {
         doc.projects.append(project)
+        persist()
+    }
+
+    // MARK: Project discovery (scan the host for `.muxel/` markers)
+
+    /// Connect to `host` and scan its filesystem for muxel projects, excluding ones
+    /// already added under this host. Throws so the scan sheet can show connection
+    /// errors inline (it's presented over the shared error alert).
+    func scanProjects(on host: Host) async throws -> [ProjectDiscovery.Found] {
+        isBusy = true
+        defer { isBusy = false }
+        let conn = connection(for: host)
+        try await conn.connect()
+        let existing = Set(projects(for: host).map(\.remoteRoot))
+        return try await ProjectDiscovery.scan(conn).filter { !existing.contains($0.remoteRoot) }
+    }
+
+    /// Add the chosen discovered roots as projects under `host` (skips duplicates).
+    func importDiscovered(_ found: [ProjectDiscovery.Found], on host: Host) {
+        let existing = Set(projects(for: host).map(\.remoteRoot))
+        for item in found where !existing.contains(item.remoteRoot) {
+            doc.projects.append(RemoteProject(name: item.name, hostId: host.id, remoteRoot: item.remoteRoot))
+        }
         persist()
     }
 
@@ -79,8 +155,22 @@ final class AppState: ObservableObject {
         selectedProject = project
         layout = nil
         statuses = [:]
+        running = []
         Task { await refreshLayout() }
         startPolling()
+    }
+
+    /// Leave the active project (the detail was popped on iPhone). Clearing the
+    /// selection is what lets the *same* project be re-selected: the sidebar binds
+    /// navigation to `selectedProject?.id`, so if it stays set, the row reads as
+    /// already-selected and tapping it again does nothing. Stops the foreground poll;
+    /// background notifications stay on the `StatusPoller`.
+    func deselect() {
+        selectedProject = nil
+        layout = nil
+        statuses = [:]
+        running = []
+        stopPolling()
     }
 
     func refreshLayout() async {
@@ -114,6 +204,7 @@ final class AppState: ObservableObject {
         let conn = connection(for: host)
         let results = await poll.poll(conn, instances: layout.orderedTerminalInstances)
         for r in results { statuses[r.instanceId] = r.status }
+        running = Set(results.filter(\.running).map(\.instanceId))
     }
 
     /// The user viewed a pane — clear its done latch so it stops showing done.
@@ -143,18 +234,22 @@ final class AppState: ObservableObject {
         // Reuse the project's existing instance project_id so iOS-launched panes
         // group with the rest; seed a fresh one for an empty project.
         let projectId = layout?.instances.first?.projectId ?? UUID().uuidString.lowercased()
-        let instance = Instance(id: instanceId, projectId: projectId,
+        var instance = Instance(id: instanceId, projectId: projectId,
                                 title: title, program: program, args: args)
-        let session = TmuxSession.name(hostName: host.name, instanceId: instanceId)
+        // Record the authoritative tmux session name in the shared layout so a peer
+        // (desktop muxel) adopts this instance into tmux under the same name rather
+        // than spawning a second session for it.
+        instance.tmuxSession = TmuxSession.name(hostName: host.name, instanceId: instanceId)
 
         do {
             let conn = connection(for: host)
             try await conn.connect()
-            // Create the session detached so it persists; then record it in the
-            // shared layout so desktop sees the new pane.
-            _ = try await conn.tmux(TmuxCommands.newSession(
-                session: session, cwd: project.remoteRoot, program: program, args: args))
+            // Record the instance in the shared layout (so it appears + desktop sees
+            // it). We deliberately do NOT create the tmux session here: a detached
+            // session crashes a TUI agent at init. The live terminal creates it
+            // ATTACHED (`new-session -A` over a PTY) when the pane opens.
             layout = try await RemoteLayoutStore.appendInstance(conn, root: project.remoteRoot, instance: instance)
+            lastLaunched = instanceId
             await runPollOnce()
         } catch {
             errorMessage = error.localizedDescription
@@ -164,14 +259,71 @@ final class AppState: ObservableObject {
     /// Kill an instance's tmux session and drop it from the layout.
     func close(_ instance: Instance, in project: RemoteProject) async {
         guard let host = host(for: project) else { return }
-        let session = TmuxSession.name(hostName: host.name, instanceId: instance.id)
         do {
             let conn = connection(for: host)
             try await conn.connect()
-            _ = try? await conn.tmux(TmuxCommands.killSession(session))
+            // Resolve the *live* session by uuid8 suffix so we kill the real one (which
+            // may carry desktop's host slug), not a phone-slug name that doesn't exist.
+            if let session = await liveSessionName(instance.id, on: host) {
+                _ = try? await conn.tmux(TmuxCommands.killSession(session))
+            }
+            terminals.disconnect(instance.id)
             layout = try await RemoteLayoutStore.removeInstance(conn, root: project.remoteRoot, instanceId: instance.id)
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Rename an instance (its tab label) in the shared layout. A blank name clears
+    /// the custom name, reverting to the program-derived title.
+    func rename(_ instance: Instance, to name: String, in project: RemoteProject) async {
+        guard let host = host(for: project) else { return }
+        do {
+            let conn = connection(for: host)
+            try await conn.connect()
+            if let updated = try await RemoteLayoutStore.renameInstance(
+                conn, root: project.remoteRoot, instanceId: instance.id, name: name)
+            {
+                layout = updated
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Duplicate an instance: a new pane running the same program/args, with a fresh
+    /// id + tmux session (and no inherited worktree binding). Like `launch`, it only
+    /// records the instance — the live terminal creates the session attached on open.
+    func duplicate(_ instance: Instance, in project: RemoteProject) async {
+        guard let host = host(for: project) else { return }
+        let newId = UUID().uuidString.lowercased()
+        var copy = instance
+        copy.id = newId
+        copy.tmuxSession = TmuxSession.name(hostName: host.name, instanceId: newId)
+        copy.sessionStarted = true
+        // A fresh pane shouldn't share the original's worktree/session bindings.
+        copy.worktreeId = nil
+        copy.worktreePath = nil
+        copy.worktreeBranch = nil
+        copy.sessionId = nil
+        do {
+            let conn = connection(for: host)
+            try await conn.connect()
+            layout = try await RemoteLayoutStore.appendInstance(
+                conn, root: project.remoteRoot, instance: copy)
+            lastLaunched = newId
+            await runPollOnce()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// The live tmux session name for `instanceId` on `host`, matched by uuid8 suffix
+    /// (so it finds sessions created by any peer — desktop or phone). nil if none.
+    private func liveSessionName(_ instanceId: String, on host: Host) async -> String? {
+        let conn = connection(for: host)
+        let out = (try? await conn.run(TmuxCommands.commandLine(TmuxCommands.listSessions()))) ?? ""
+        return out.split(separator: "\n").map(String.init)
+            .first { TmuxSession.session($0, matchesInstanceId: instanceId) }
     }
 }

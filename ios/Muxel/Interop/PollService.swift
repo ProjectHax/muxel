@@ -11,10 +11,19 @@ struct InstanceStatus: Equatable {
 /// Computes per-instance `AgentStatus` over an SSH connection without an attached
 /// PTY — the engine behind status badges and background notifications.
 ///
-/// Per muxel session it reads four tmux signals (capture-pane text, `pane_dead`,
-/// `window_bell_flag`, `window_activity`) and feeds them into the ported
-/// `classify` + a per-instance `PaneStatusTracker` (so the done-latch persists
-/// across polls). Markers come from `defaultMarkers(instance.program)`.
+/// Per muxel session it reads three tmux signals via one `display-message`
+/// (`pane_dead`, `window_bell_flag`, `window_activity`) and feeds them into the
+/// ported `classify` + a per-instance `PaneStatusTracker` (so the latch persists
+/// across polls).
+///
+/// It intentionally does **not** scrape the screen with `capture-pane -p`: some
+/// tmux builds crash the entire server on that command (a stock AlmaLinux/RHEL 10
+/// `tmux 3.3a-…el10` build does, killing every session), and desktop muxel never
+/// uses it — desktop reads markers from its live PTY grid. The cost here is
+/// marker-based `working`/`blocked` detection in the background: with no screen
+/// text, status degrades to `done` (exit/bell) and `working`/`idle` (recent
+/// activity), and marker-less panes never latch. The attached `LiveTerminalView`
+/// still shows full agent state when a pane is open.
 final class PollService {
     private var trackers: [String: PaneStatusTracker] = [:]
 
@@ -34,17 +43,17 @@ final class PollService {
                 continue
             }
 
-            async let screenTask = conn.run(TmuxCommands.commandLine(TmuxCommands.capturePane(session: session)))
-            async let metaTask = conn.run(TmuxCommands.commandLine(TmuxCommands.paneStatus(session: session)))
-            let screen = (try? await screenTask) ?? ""
-            let meta = (try? await metaTask) ?? ""
+            let meta = (try? await conn.run(TmuxCommands.commandLine(TmuxCommands.paneStatus(session: session)))) ?? ""
 
             let (exited, bell, idle) = Self.parseMeta(meta)
-            let markers = defaultMarkers(program: inst.program)
+            // No screen scrape (see the type doc) — pass an empty screen + no markers.
+            // classify then falls back to exit/bell + activity, and the tracker
+            // can't latch (canLatch == !working.isEmpty), which is the intended
+            // marker-less behaviour.
             var tracker = trackers[inst.id] ?? PaneStatusTracker()
             let status = tracker.update(
-                exited: exited, screen: screen,
-                working: markers.working, blocked: markers.blocked,
+                exited: exited, screen: "",
+                working: [], blocked: [],
                 bell: bell, idle: idle
             )
             trackers[inst.id] = tracker

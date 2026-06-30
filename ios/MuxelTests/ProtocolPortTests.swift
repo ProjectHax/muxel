@@ -58,9 +58,40 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(TmuxCommands.killSession("s"), ["kill-session", "-t", "=s"])
     }
 
+    // iOS must launch the agent through a login+interactive shell so it's on the
+    // user's PATH (a no-PTY SSH exec has a bare PATH → the agent exits instantly).
+    func testLaunchAgentWrapsInLoginShell() {
+        let cmd = TmuxCommands.launchAgent(
+            session: "muxel_h_abcdef12", cwd: "/work", program: "claude", args: ["--model", "opus"])
+        XCTAssertTrue(cmd.hasPrefix(
+            "tmux new-session -d -s 'muxel_h_abcdef12' -c '/work' -- \"${SHELL:-/bin/sh}\" -ilc "))
+        XCTAssertTrue(cmd.contains("exec"))
+        XCTAssertTrue(cmd.contains("claude"))
+        XCTAssertTrue(cmd.contains("opus"))
+        // No program → tmux's own default login shell, no wrapping.
+        XCTAssertEqual(
+            TmuxCommands.launchAgent(session: "s", cwd: "/w", program: nil, args: []),
+            "tmux new-session -d -s 's' -c '/w'")
+    }
+
     func testCommandLineShellQuotes() {
         let line = TmuxCommands.commandLine(TmuxCommands.capturePane(session: "muxel_h_abcdef12"))
-        XCTAssertEqual(line, "'tmux' 'capture-pane' '-p' '-t' '=muxel_h_abcdef12'")
+        XCTAssertEqual(line, "'tmux' 'capture-pane' '-p' '-t' '=muxel_h_abcdef12:'")
+    }
+
+    // Pane/window-target commands must use `=session:` (active pane of the session).
+    // The bare `=session` form fails on real tmux ("can't find pane" / "no such
+    // window") and makes display-message return empty fields; session-target commands
+    // (kill/attach) keep the bare `=session`.
+    func testPaneTargetsUseTrailingColon() {
+        let s = "muxel_h_abcdef12"
+        XCTAssertEqual(TmuxCommands.capturePane(session: s).suffix(1), ["=\(s):"])
+        XCTAssertEqual(TmuxCommands.paneStatus(session: s)[3], "=\(s):")
+        XCTAssertTrue(TmuxCommands.sendKey(session: s, key: "Enter").contains("=\(s):"))
+        XCTAssertTrue(TmuxCommands.sendLiteral(session: s, text: "x").contains("=\(s):"))
+        XCTAssertTrue(TmuxCommands.clearBell(session: s).contains("=\(s):"))
+        // Session-target commands stay on the bare `=session` (no colon).
+        XCTAssertEqual(TmuxCommands.killSession(s), ["kill-session", "-t", "=\(s)"])
     }
 
     // MARK: classify (port of view.rs classify_priority)

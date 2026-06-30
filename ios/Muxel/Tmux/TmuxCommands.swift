@@ -48,12 +48,62 @@ enum TmuxCommands {
         ["kill-session", "-t", "=\(session)"]
     }
 
+    /// Raw `tmux new-session` command line that launches `program` inside the user's
+    /// **login + interactive** shell (`$SHELL -ilc 'exec …'`), so the agent resolves
+    /// on the user's real PATH (nvm / npm-global / `~/.local/bin`, …).
+    ///
+    /// iOS runs commands over a *no-PTY* SSH exec, which has only a bare login PATH —
+    /// so launching the agent directly (`-- claude`) fails to find it and the pane
+    /// exits instantly, taking the session (and, if it's the only one, the server)
+    /// with it. With no `program`, tmux starts its own default login shell, so no
+    /// wrapping is needed. Returned as a shell string (not a quoted arg array) because
+    /// it relies on the remote shell expanding `$SHELL`.
+    static func launchAgent(session: String, cwd: String, program: String?, args: [String]) -> String {
+        var cmd = "tmux new-session -d -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
+        if let program {
+            let inner = "exec " + Shell.command([program] + args)
+            cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"
+        }
+        return cmd
+    }
+
     /// Attach to a session interactively (used on a PTY channel for live view).
     static func attach(session: String) -> [String] {
         ["attach-session", "-t", "=\(session)"]
     }
 
+    /// Raw PTY command: `exec tmux attach` to an existing session, so the PTY's shell
+    /// *becomes* tmux (the pane is the live terminal). For a session that already
+    /// exists (created by desktop or a prior launch). The PTY is opened at the phone's
+    /// real grid size (see `TerminalSession`), so the attaching client is correctly
+    /// sized from the start. `clear;` wipes the login banner + echoed command so they
+    /// don't bleed through under tmux's redraw.
+    static func attachPTYCommand(session: String) -> String {
+        "clear; exec tmux attach-session -t \(Shell.quote("=\(session)"))"
+    }
+
+    /// Raw PTY command: `exec tmux new-session -A` **attached** (no `-d`), running
+    /// `program` in a login shell. Attached-at-init is the whole point: interactive
+    /// TUI agents (claude) crash if they initialize with no client; over a live PTY
+    /// they get one, exactly like desktop's `ssh -t`. `program == nil` → default shell.
+    static func newAttachedPTYCommand(session: String, cwd: String, program: String?, args: [String]) -> String {
+        // `clear;` wipes the login banner + echoed command before tmux takes over.
+        var cmd = "clear; exec tmux new-session -A -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
+        if let program {
+            let inner = "exec " + Shell.command([program] + args)
+            cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"
+        }
+        return cmd
+    }
+
     // MARK: Read-only status (for polling without an attached PTY)
+
+    /// Pane/window target for an existing session: exact-match the session (`=`) and
+    /// resolve its active window + pane (trailing `:`). The bare `=name` form fails
+    /// for pane/window targets ("can't find pane" / "no such window") and makes
+    /// `display-message` return empty fields — the `:` is required. Session-target
+    /// commands (kill/attach) use the bare `=name` instead.
+    static func paneTarget(_ session: String) -> String { "=\(session):" }
 
     /// List muxel-owned session names, one per line.
     static func listSessions() -> [String] {
@@ -63,19 +113,19 @@ enum TmuxCommands {
     /// The visible pane content as plain text — the marker-scan input
     /// (`visible_text` equivalent).
     static func capturePane(session: String) -> [String] {
-        ["capture-pane", "-p", "-t", "=\(session)"]
+        ["capture-pane", "-p", "-t", paneTarget(session)]
     }
 
     /// Tab-delimited `pane_dead<TAB>window_bell_flag<TAB>window_activity` for a
     /// session: exited flag, bell flag, and last-activity unix seconds.
     static func paneStatus(session: String) -> [String] {
-        ["display-message", "-p", "-t", "=\(session)",
+        ["display-message", "-p", "-t", paneTarget(session),
          "#{pane_dead}\t#{window_bell_flag}\t#{window_activity}"]
     }
 
     /// Clear a window's bell flag once we've acted on it (attend equivalent).
     static func clearBell(session: String) -> [String] {
-        ["set-option", "-w", "-t", "=\(session)", "monitor-bell", "off"]
+        ["set-option", "-w", "-t", paneTarget(session), "monitor-bell", "off"]
     }
 
     // MARK: Input
@@ -83,11 +133,11 @@ enum TmuxCommands {
     /// Send literal text to a session's active pane (`-l` = literal, no key-name
     /// translation). Used when driving a pane without a full PTY attach.
     static func sendLiteral(session: String, text: String) -> [String] {
-        ["send-keys", "-t", "=\(session)", "-l", text]
+        ["send-keys", "-t", paneTarget(session), "-l", text]
     }
 
     /// Send a named key (e.g. "Enter", "Escape", "C-c") to a session's pane.
     static func sendKey(session: String, key: String) -> [String] {
-        ["send-keys", "-t", "=\(session)", key]
+        ["send-keys", "-t", paneTarget(session), key]
     }
 }

@@ -60,4 +60,13 @@ enum RemoteLayoutStore {
         try await write(conn, layout)
         return layout
     }
+
+    /// Read-modify-write: set an instance's custom display name (nil/blank clears it).
+    @discardableResult
+    static func renameInstance(_ conn: SSHConnection, root: String, instanceId: String, name: String?) async throws -> RemoteLayout? {
+        guard var layout = try await read(conn, root: root) else { return nil }
+        layout.renameInstance(id: instanceId, name: name, now: unixNow())
+        try await write(conn, layout)
+        return layout
+    }
 }

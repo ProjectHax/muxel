@@ -94,6 +94,15 @@ struct RemoteLayout: Codable, Equatable {
         layout = layout?.removingTab(id)
         updatedAt = now
     }
+
+    /// Set an instance's custom display name (a nil/blank name clears it, falling
+    /// back to the title). Stamps `updatedAt` so newer-wins picks it up.
+    mutating func renameInstance(id: String, name: String?, now: Int) {
+        guard let idx = instances.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        instances[idx].customName = (trimmed?.isEmpty ?? true) ? nil : trimmed
+        updatedAt = now
+    }
 }
 
 extension PaneNode {

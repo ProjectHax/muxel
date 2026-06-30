@@ -9,17 +9,22 @@ name: Muxel
 options:
   bundleIdPrefix: dev.muxel
   deploymentTarget:
-    iOS: "17.0" # Citadel requires iOS 17+
+    iOS: "17.0" # Citadel 0.12+ requires iOS 17 / macOS 14; also AsyncStream.makeStream()
   createIntermediateGroups: true
   groupSortPosition: top
 
-# Pin/adjust versions on first resolve if a tag is unavailable.
-# v1 only needs Citadel (exec channels). The live-PTY terminal enhancement adds
-# SwiftTerm later; v1's terminal uses tmux capture-pane + send-keys over `run`.
+# Dependencies tracked at their latest releases (`from:` = that version up to the
+# next major, so SPM picks up patch/minor updates). Citadel 0.12+ raised its floor to
+# iOS 17 / macOS 14 — hence the deployment target above.
 packages:
   Citadel:
     url: https://github.com/orlandos-nl/Citadel
-    from: "0.7.0"
+    from: "0.12.1"
+  # Terminal emulator for the live SSH PTY terminal (renders the tmux/agent UI,
+  # handles VT/ANSI, input, resize).
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    from: "1.13.0"
 
 settings:
   base:
@@ -47,6 +52,11 @@ targets:
         ENABLE_PREVIEWS: YES
     dependencies:
       - package: Citadel
+      - package: SwiftTerm
+    scheme:
+      testTargets:
+        - MuxelTests
+      gatherCoverageData: false
 
   MuxelTests:
     type: bundle.unit-test
@@ -57,5 +67,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.muxel.ios.tests
         GENERATE_INFOPLIST_FILE: YES
+        # The app's PRODUCT_NAME is lowercase `muxel`, so the host app bundle is
+        # `muxel.app/muxel` (not the target-named `Muxel.app/Muxel` XcodeGen assumes).
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/muxel.app/muxel"
+        BUNDLE_LOADER: "$(TEST_HOST)"
     dependencies:
       - target: Muxel

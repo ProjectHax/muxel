@@ -20,14 +20,24 @@ extension AgentStatus {
     }
 }
 
-/// A small colored status dot.
+/// A small colored status dot. When `running` is supplied (the pane tabs), the color
+/// reflects liveness — green for an active session, orange when it's blocked on input,
+/// gray when no live tmux session exists — instead of the raw status color.
 struct StatusDot: View {
     let status: AgentStatus
+    var running: Bool?
+
     var body: some View {
         Circle()
-            .fill(status.color)
+            .fill(color)
             .frame(width: 9, height: 9)
-            .accessibilityLabel(status.label)
+            .accessibilityLabel(running == false ? "stopped" : status.label)
+    }
+
+    private var color: Color {
+        guard let running else { return status.color }
+        if !running { return .secondary }      // no live session
+        return status == .blocked ? .orange : .green   // active (orange flags needs-input)
     }
 }
 

@@ -11,7 +11,7 @@ struct MuxelApp: App {
             RootView()
                 .environmentObject(state)
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase) { phase in
             switch phase {
             case .background:
                 state.stopPolling()

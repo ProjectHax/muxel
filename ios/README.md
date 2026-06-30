@@ -16,7 +16,8 @@ it (see the contract below).
 ## Build
 
 Requires macOS + Xcode 15+ and an Apple Developer account (for background
-entitlements + TestFlight).
+entitlements + TestFlight). The app deploys to **iOS 17+** (Citadel 0.12+ requires
+it).
 
 ```sh
 brew install xcodegen
@@ -28,18 +29,37 @@ open Muxel.xcodeproj
 In Xcode: set your signing team, then run on a **real device** (Keychain,
 background refresh, and notifications don't behave correctly in the Simulator).
 
-Dependencies (Swift Package Manager, resolved by Xcode):
-- [Citadel](https://github.com/orlandos-nl/Citadel) — SSH client (SwiftNIO SSH).
+Dependencies (Swift Package Manager, resolved by Xcode; tracked at their latest
+releases via `from:` in `project.yml`):
+- [Citadel](https://github.com/orlandos-nl/Citadel) — SSH client (SwiftNIO SSH);
+  0.12+, which sets the iOS 17 floor.
+- [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) — terminal emulator for the
+  live PTY terminal (1.13+).
 
-> v1 needs only Citadel's **exec** channel (`run`). The terminal is a polled
-> `capture-pane` viewer + `send-keys` input bar (`TerminalPaneView`), so the live
-> PTY / SwiftTerm work is **not** on the v1 critical path. The remaining Citadel
-> spike items for v1 are **private-key auth parsing** and the **TOFU host-key
-> validator** (both flagged in `CitadelSSHConnection.swift`); password auth + exec
-> are implemented. If a pinned version fails to resolve, bump it to the latest tag.
-
-> Post-MVP: add [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) fed by a
-> Citadel PTY channel for a smooth live terminal (replaces the polled view).
+> The terminal is a **live SSH PTY** (`LiveTerminalView` + SwiftTerm), fed by a
+> Citadel `withPTY` channel that runs `exec tmux attach` / `new-session -A`
+> **attached** (`TerminalPaneView` resolves which). This replaced the earlier polled
+> `capture-pane` viewer — interactive TUI agents (claude) crash if they initialize
+> in a *detached* session, so the pane must be a real attached terminal, exactly like
+> desktop's `ssh -t`. Live terminals are owned by an app-level `TerminalStore`
+> (`AppState.terminals`), keyed by instance id — **not** by the SwiftUI view — so a
+> pane stays connected as you navigate away and back (the iOS analogue of desktop's
+> `MuxelApp.terminals`). A session is torn down only by Close instance, host delete,
+> or quitting the app; it auto-reconnects on foreground if a background suspend
+> dropped the transport. The PTY is opened at SwiftTerm's **actual** grid size (the
+> attach is deferred until the view reports its first size) rather than a fixed 80×24
+> that a later resize had to correct — opening at the wrong size made tmux position
+> the cursor for an 80-column screen inside the phone's narrower grid, garbling
+> full-width TUI output. It also switches on SwiftTerm's **Metal GPU renderer**
+> (`setUseMetal(true)`, available in 1.13+) once the view is in a window: the default
+> CoreGraphics path composites cached row "stripes" and left stale glyphs stacked on
+> cell redraws (text drawn over itself); the Metal path rasterizes the current grid
+> each frame. The background poll
+> (`PollService`) still drives status badges +
+> notifications. Password auth, exec, and **SSH key auth** (ed25519 / RSA, with
+> passphrase — ECDSA is detected but not parseable by Citadel) are implemented in
+> `CitadelSSHConnection.swift`. Remaining spikes: the **TOFU host-key validator**
+> (still `.acceptAnything()`) and **jump-host** support.
 
 ## The muxel remote protocol (keep in sync with `muxel-core`)
 
@@ -59,13 +79,24 @@ the matching Swift port and the `RemoteLayout` version handling.
 
 ### Status without an attached terminal (the polling enabler)
 
-Background polling can't hold a live PTY, so per muxel tmux session we read four
-tmux format vars in one round-trip and feed them into the ported `classify`:
+Background polling can't hold a live PTY, so per muxel tmux session we read three
+tmux format vars in one `display-message` round-trip and feed them into the ported
+`classify`:
 
-- screen text → `tmux capture-pane -p -t =<session>` (the marker scan / `visible_text`)
 - exited → `#{pane_dead}`
 - bell → `#{window_bell_flag}`
 - idle seconds → `now - #{window_activity}` (the `idle_for` equivalent)
+
+We deliberately do **not** scrape the screen with `capture-pane -p` (the would-be
+`visible_text` marker input). Some tmux builds crash the whole server on that
+command — a stock AlmaLinux/RHEL 10 package (`tmux 3.3a-…el10`) reliably segfaults
+the server on `capture-pane`, taking every session down — and desktop muxel never
+calls it (it reads markers from its live PTY grid). The cost is marker-based
+`working`/`blocked` detection while *backgrounded*: with no screen text, status
+degrades to `done` (exit/bell) and `working`/`idle` (recent activity), and
+marker-less panes never latch. The attached `LiveTerminalView` still shows full
+agent state when a pane is open. (`TmuxCommands.capturePane` and `defaultMarkers`
+remain as tested protocol-port builders for a future live-grid status path.)
 
 ### Auth differences vs desktop
 
@@ -88,9 +119,14 @@ iOS has no ssh-agent and no `ssh`/`sshpass`/ControlMaster CLI. So:
 
 ## Status / roadmap
 
-v1 (lean MVP): connect, collapsible sidebar of hosts/projects, add hosts/projects,
-view + attach panes/tabs, launch instances, live status badges, on-device
-background notifications, secrets in Keychain.
+v1 (lean MVP): connect, collapsible sidebar of hosts/projects, add hosts/projects
+(by path or by **scanning the host** for `.muxel/` markers — `ProjectDiscovery`),
+**live SSH PTY terminal** for every pane (SwiftTerm + Citadel `withPTY`, attached so
+TUI agents work), panes/tabs resolved by uuid8 suffix (so desktop-created panes show
+up too), launch instances (long-press a tab to rename / duplicate / close, with a
+close confirmation), live status badges + a running-count on the selected
+project, **Test connection** to verify a saved credential, on-device background
+notifications, secrets in the Keychain.
 
 Future: APNs push via a remote watcher daemon (instant background alerts); tmux
 **control mode** (`-C`) for structured multi-pane multiplexing; split-tree

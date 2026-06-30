@@ -8,6 +8,9 @@ struct ProjectDetailView: View {
     let project: RemoteProject
     @State private var selectedTab: String?
     @State private var showLaunch = false
+    @State private var renameTarget: Instance?
+    @State private var renameText = ""
+    @State private var closeTarget: Instance?
 
     private var instances: [Instance] { state.layout?.orderedTerminalInstances ?? [] }
 
@@ -41,10 +44,49 @@ struct ProjectDetailView: View {
             }
         }
         .sheet(isPresented: $showLaunch) { LaunchInstanceView(project: project) }
-        .onChange(of: state.layout?.orderedTerminalInstances.map(\.id) ?? []) { _, ids in
+        .onChange(of: state.layout?.orderedTerminalInstances.map(\.id) ?? []) { ids in
             if selectedTab == nil || !ids.contains(selectedTab!) {
                 selectedTab = ids.first
             }
+        }
+        .onChange(of: state.lastLaunched) { id in
+            // Auto-open a freshly launched instance's terminal.
+            if let id, instances.contains(where: { $0.id == id }) { selectedTab = id }
+        }
+        .alert(
+            "Rename pane",
+            isPresented: Binding(
+                get: { renameTarget != nil },
+                set: { if !$0 { renameTarget = nil } }
+            ),
+            presenting: renameTarget
+        ) { inst in
+            TextField("Name", text: $renameText)
+            Button("Cancel", role: .cancel) { renameTarget = nil }
+            Button("Rename") {
+                let name = renameText
+                Task { await state.rename(inst, to: name, in: project) }
+                renameTarget = nil
+            }
+        } message: { _ in
+            Text("Leave blank to reset to the default name.")
+        }
+        .confirmationDialog(
+            closeTarget.map { "Close “\($0.displayName)”?" } ?? "Close pane?",
+            isPresented: Binding(
+                get: { closeTarget != nil },
+                set: { if !$0 { closeTarget = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: closeTarget
+        ) { inst in
+            Button("Close pane", role: .destructive) {
+                Task { await state.close(inst, in: project) }
+                closeTarget = nil
+            }
+            Button("Cancel", role: .cancel) { closeTarget = nil }
+        } message: { _ in
+            Text("This ends its tmux session on \(project.name). This can't be undone.")
         }
     }
 
@@ -52,32 +94,52 @@ struct ProjectDetailView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(instances) { inst in
-                    let isActive = inst.id == current?.id
-                    Button {
-                        selectedTab = inst.id
-                        state.attend(inst.id)
-                    } label: {
-                        HStack(spacing: 6) {
-                            StatusDot(status: state.status(inst.id))
-                            Text(inst.displayName).lineLimit(1)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .background(isActive ? Color.accentColor.opacity(0.18) : Color(.secondarySystemBackground))
-                        .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        Button(role: .destructive) {
-                            Task { await state.close(inst, in: project) }
-                        } label: {
-                            Label("Close instance", systemImage: "xmark.circle")
-                        }
-                    }
+                    tabChip(inst)
                 }
             }
             .padding(.horizontal)
             .padding(.vertical, 8)
+        }
+    }
+
+    @ViewBuilder
+    private func tabChip(_ inst: Instance) -> some View {
+        let isActive = inst.id == current?.id
+        Button {
+            selectedTab = inst.id
+            state.attend(inst.id)
+        } label: {
+            HStack(spacing: 6) {
+                StatusDot(status: state.status(inst.id), running: state.isRunning(inst.id))
+                Text(inst.displayName).lineLimit(1)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(isActive ? Color.accentColor.opacity(0.18) : Color(.secondarySystemBackground))
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .contextMenu { tabMenu(inst) }
+    }
+
+    @ViewBuilder
+    private func tabMenu(_ inst: Instance) -> some View {
+        Button {
+            renameText = inst.displayName
+            renameTarget = inst
+        } label: {
+            Label("Rename", systemImage: "pencil")
+        }
+        Button {
+            Task { await state.duplicate(inst, in: project) }
+        } label: {
+            Label("Duplicate", systemImage: "plus.square.on.square")
+        }
+        Divider()
+        Button(role: .destructive) {
+            closeTarget = inst
+        } label: {
+            Label("Close", systemImage: "xmark.circle")
         }
     }
 

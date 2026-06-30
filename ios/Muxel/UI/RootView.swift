@@ -7,10 +7,13 @@ struct RootView: View {
     @EnvironmentObject var state: AppState
     @State private var showAddHost = false
     @State private var addProjectForHost: Host?
+    @State private var discoverForHost: Host?
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(showAddHost: $showAddHost, addProjectForHost: $addProjectForHost)
+            SidebarView(showAddHost: $showAddHost,
+                        addProjectForHost: $addProjectForHost,
+                        discoverForHost: $discoverForHost)
                 .navigationTitle("muxel")
         } detail: {
             if let project = state.selectedProject {
@@ -21,6 +24,7 @@ struct RootView: View {
         }
         .sheet(isPresented: $showAddHost) { AddHostView() }
         .sheet(item: $addProjectForHost) { host in AddProjectView(host: host) }
+        .sheet(item: $discoverForHost) { host in DiscoverProjectsView(host: host) }
         .alert(
             "Something went wrong",
             isPresented: Binding(
@@ -31,6 +35,18 @@ struct RootView: View {
             Button("OK", role: .cancel) { state.errorMessage = nil }
         } message: {
             Text(state.errorMessage ?? "")
+        }
+        .alert(
+            (state.testResult?.ok == true) ? "Connection OK" : "Connection failed",
+            isPresented: Binding(
+                get: { state.testResult != nil },
+                set: { if !$0 { state.testResult = nil } }
+            ),
+            presenting: state.testResult
+        ) { _ in
+            Button("OK", role: .cancel) { state.testResult = nil }
+        } message: { result in
+            Text("\(result.hostName): \(result.message)")
         }
     }
 
