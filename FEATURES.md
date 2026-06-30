@@ -313,6 +313,12 @@ feature is added or changed, update the matching entry here in the same change**
   connect, loads whichever copy — local or remote — is newer; the replaced copy is
   kept as a one-level backup on each side. Automatic for every remote project; no
   setup required.
+- **Shareable local projects** — a *local* project also mirrors its layout to
+  `<root>/.muxel/workspace.json` (and git-ignores `.muxel/`) when tmux mode is on,
+  so its panes are tmux sessions a peer can attach to. The iOS companion app can
+  then SSH into the machine, read that file, and bring up / drive the same panes —
+  the desktop didn't need to be opened as a "remote" project. The shared
+  `tmux_session` name keeps a pane addressing the same session from either side.
 - **Remote git** — the branch label and the project git menu (switch/new branch,
   commit, pull, push, fetch, stash) operate on the remote repo over the shared
   connection; remote status is polled off the UI thread.

@@ -3011,10 +3011,11 @@ impl MuxelApp {
             self.ensure_project_memory(pid, cx);
         }
         let is_remote = self.workspace.project(pid).is_some_and(|p| p.is_remote());
-        // The first time we reach a remote project this session, reconcile its
-        // layout with the host even if it has no local panes yet — an empty local
-        // layout is exactly when another machine's session should be pulled in.
-        let first_sync = is_remote && !self.remote_synced.contains(&pid);
+        // The first time we reach a layout-synced project this session, reconcile its
+        // layout with the shared `.muxel/workspace.json` even if it has no local panes
+        // yet — an empty local layout is exactly when another machine's session should
+        // be pulled in. Remote projects always sync; local projects sync under tmux.
+        let first_sync = self.project_syncs_layout(pid) && !self.remote_synced.contains(&pid);
 
         // Nothing to do if every pane already has a live view (and we've already
         // reconciled the remote layout this session).
@@ -3096,6 +3097,14 @@ impl MuxelApp {
             })
             .detach();
             return;
+        }
+        // Local layout-synced project: its `.muxel/workspace.json` is on this machine,
+        // so reconcile it synchronously (a fast local read) before spawning panes.
+        if first_sync && !is_remote {
+            let fetched = self
+                .repo_loc(pid)
+                .and_then(|loc| integrations::fetch_remote_layout(&loc));
+            self.apply_remote_layout_sync(pid, fetched, window, cx);
         }
         self.spawn_project_terminals_now(pid, window, cx);
     }
@@ -6258,6 +6267,17 @@ impl MuxelApp {
         }
     }
 
+    /// Whether a project's pane layout should be synced to a `.muxel/workspace.json`
+    /// that an SSH peer (the iOS app) can read and attach to: always for a remote
+    /// project, and for a local project when tmux mode is on (so its panes are tmux
+    /// sessions a peer can attach to over SSH). Without tmux a local project has no
+    /// attachable sessions, so there's nothing to share.
+    fn project_syncs_layout(&self, pid: Uuid) -> bool {
+        self.workspace
+            .project(pid)
+            .is_some_and(|p| p.remote.is_some() || self.use_tmux)
+    }
+
     /// Toggle shared project memory; on enable, create the `.muxel/MEMORY.md` +
     /// gitignore entry. Agents launched into the project then get the memory
     /// instruction (see `command_for`).
@@ -6337,12 +6357,12 @@ impl MuxelApp {
         let synced: Vec<Uuid> = self.remote_synced.iter().copied().collect();
         let mut changed = false;
         for pid in synced {
+            if !self.project_syncs_layout(pid) {
+                continue;
+            }
             let Some(proj) = self.workspace.project(pid) else {
                 continue;
             };
-            if proj.remote.is_none() {
-                continue;
-            }
             let key = RemoteLayout::capture(proj, &self.workspace, now_epoch).content_key();
             if self.layout_keys.get(&pid) != Some(&key) {
                 self.layout_keys.insert(pid, key);
@@ -6370,15 +6390,16 @@ impl MuxelApp {
         }
     }
 
-    /// Push a remote project's current pane layout to `<root>/.muxel/workspace.json`
-    /// off the UI thread (backs up the previous remote copy first).
+    /// Push a layout-synced project's current pane layout to
+    /// `<root>/.muxel/workspace.json` off the UI thread (backs up the previous copy
+    /// first) — over SSH for a remote project, on the local filesystem for a local one.
     fn push_remote_layout_now(&mut self, pid: Uuid, cx: &mut Context<Self>) {
+        if !self.project_syncs_layout(pid) {
+            return;
+        }
         let Some(loc) = self.repo_loc(pid) else {
             return;
         };
-        if !matches!(loc, integrations::RepoLoc::Remote(_)) {
-            return;
-        }
         let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
         let Some(proj) = self.workspace.project(pid) else {
             return;
@@ -6415,15 +6436,18 @@ impl MuxelApp {
         let Some(proj) = self.workspace.project(pid) else {
             return;
         };
-        let Some(remote_root) = proj.remote.as_ref().map(|r| r.remote_root.clone()) else {
-            return;
+        // Identity root for validating the stored doc: the remote path, or the local
+        // root path for a local (tmux) project synced for an SSH peer.
+        let layout_root = match &proj.remote {
+            Some(r) => r.remote_root.clone(),
+            None => proj.root_path.display().to_string(),
         };
         let local = RemoteLayout::capture(proj, &self.workspace, now_epoch);
         let local_key = local.content_key();
         let local_rev = proj.layout_updated_at.unwrap_or(0);
         let remote = fetched
             .as_deref()
-            .and_then(|j| RemoteLayout::parse(j, &remote_root));
+            .and_then(|j| RemoteLayout::parse(j, &layout_root));
 
         match remote {
             // Remote is strictly newer and actually different → adopt it.

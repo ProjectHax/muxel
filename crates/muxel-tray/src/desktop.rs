@@ -89,10 +89,10 @@ impl TrayBackend for DesktopBackend {
 
 pub fn spawn(icon: TraySpec, labels: TrayLabels) -> Option<Box<dyn TrayBackend>> {
     let mut builder = TrayIconBuilder::new().with_tooltip(icon.tooltip.as_str());
-    if let Some(rgba) = icon.rgba {
-        if let Ok(ic) = Icon::from_rgba(rgba.bytes, rgba.width, rgba.height) {
-            builder = builder.with_icon(ic);
-        }
+    if let Some(rgba) = icon.rgba
+        && let Ok(ic) = Icon::from_rgba(rgba.bytes, rgba.width, rgba.height)
+    {
+        builder = builder.with_icon(ic);
     }
     // Start with an empty menu; the first `update` fills it in.
     let tray = builder.with_menu(Box::new(Menu::new())).build().ok()?;

@@ -175,6 +175,27 @@ pub fn write_remote_file(loc: &RepoLoc, abs_path: &str, content: &str) -> Result
     Ok(())
 }
 
+/// Add `ignore_line` to `<root>/.gitignore` if not already present (the bare
+/// `MEMORY_DIR` form counts too). Idempotent; shared by the memory-file and
+/// layout-sync writers.
+fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
+    let gitignore = root.join(".gitignore");
+    let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    let ignored = current
+        .lines()
+        .any(|l| l.trim() == ignore_line || l.trim() == MEMORY_DIR);
+    if ignored {
+        return Ok(());
+    }
+    let mut next = current;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(ignore_line);
+    next.push('\n');
+    std::fs::write(&gitignore, next).with_context(|| format!("updating {}", gitignore.display()))
+}
+
 /// Ensure a project's shared memory file exists and is git-ignored, idempotently:
 /// create `<root>/.muxel/`, seed `MEMORY.md` if absent, and add `.muxel/` to the
 /// repo's `.gitignore` if not already there. Works for a local or remote `loc`.
@@ -189,22 +210,7 @@ pub fn ensure_memory_file(loc: &RepoLoc) -> Result<()> {
                 std::fs::write(&file, memory_header())
                     .with_context(|| format!("writing {}", file.display()))?;
             }
-            let gitignore = root.join(".gitignore");
-            let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
-            let ignored = current
-                .lines()
-                .any(|l| l.trim() == ignore_line || l.trim() == MEMORY_DIR);
-            if !ignored {
-                let mut next = current;
-                if !next.is_empty() && !next.ends_with('\n') {
-                    next.push('\n');
-                }
-                next.push_str(&ignore_line);
-                next.push('\n');
-                std::fs::write(&gitignore, next)
-                    .with_context(|| format!("updating {}", gitignore.display()))?;
-            }
-            Ok(())
+            ensure_gitignored(root, &ignore_line)
         }
         RepoLoc::Remote(c) => {
             let root = c.remote_path.trim_end_matches('/');
@@ -251,6 +257,26 @@ fn remote_layout_abs(root: &str) -> String {
     )
 }
 
+/// Path of the synced layout file inside a local project root.
+fn local_layout_abs(root: &Path) -> PathBuf {
+    root.join(MEMORY_DIR).join(REMOTE_LAYOUT_FILE)
+}
+
+/// Write the layout JSON to `<root>/.muxel/workspace.json` on the local filesystem,
+/// backing up any current copy to `workspace.bak.json` and git-ignoring `.muxel/`.
+/// The local-project mirror of the remote push, so an SSH peer (the iOS app) can
+/// read a local project's panes.
+fn push_local_layout(root: &Path, json: &str) -> Result<()> {
+    let dir = root.join(MEMORY_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let file = dir.join(REMOTE_LAYOUT_FILE);
+    if file.exists() {
+        let _ = std::fs::copy(&file, dir.join(REMOTE_LAYOUT_BAK));
+    }
+    let _ = ensure_gitignored(root, &format!("{MEMORY_DIR}/"));
+    std::fs::write(&file, json).with_context(|| format!("writing {}", file.display()))
+}
+
 /// The shell command that prepares the remote for a layout push: ensure
 /// `<root>/.muxel/` exists, back up any current `workspace.json` to
 /// `workspace.bak.json`, and git-ignore `.muxel/`. Pure (no I/O) so its shape is
@@ -270,22 +296,30 @@ fn remote_push_prep_cmd(root: &str) -> String {
     )
 }
 
-/// Read the remote project's synced layout JSON (`<root>/.muxel/workspace.json`),
-/// or `None` for a local loc / missing / oversized / unreachable.
+/// Read a project's synced layout JSON (`<root>/.muxel/workspace.json`) — over SSH
+/// for a remote project, or from the local filesystem for a local one. `None` if
+/// missing, oversized, or unreadable.
 pub fn fetch_remote_layout(loc: &RepoLoc) -> Option<String> {
-    let RepoLoc::Remote(c) = loc else {
-        return None;
-    };
-    read_remote_file(loc, &remote_layout_abs(&c.remote_path))
+    match loc {
+        RepoLoc::Remote(c) => read_remote_file(loc, &remote_layout_abs(&c.remote_path)),
+        RepoLoc::Local(root) => {
+            let path = local_layout_abs(root);
+            if std::fs::metadata(&path).ok()?.len() > MAX_REMOTE_BYTES {
+                return None;
+            }
+            std::fs::read_to_string(&path).ok()
+        }
+    }
 }
 
-/// Push the project's pane-layout JSON to `<root>/.muxel/workspace.json` on the
-/// remote, backing up the previous copy to `workspace.bak.json` first and
-/// ensuring `.muxel/` is git-ignored. `json` is produced by
-/// `muxel_core::RemoteLayout::to_json`.
+/// Push the project's pane-layout JSON to `<root>/.muxel/workspace.json`, backing up
+/// the previous copy to `workspace.bak.json` first and ensuring `.muxel/` is
+/// git-ignored — over SSH for a remote project, on the local filesystem for a local
+/// one. `json` is produced by `muxel_core::RemoteLayout::to_json`.
 pub fn push_remote_layout(loc: &RepoLoc, json: &str) -> Result<()> {
-    let RepoLoc::Remote(c) = loc else {
-        bail!("not a remote project");
+    let c = match loc {
+        RepoLoc::Remote(c) => c,
+        RepoLoc::Local(root) => return push_local_layout(root, json),
     };
     let root = c.remote_path.trim_end_matches('/');
     let out = remote_ssh_command(c, remote_push_prep_cmd(root))
@@ -1253,6 +1287,35 @@ mod tests {
         let gi2 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gi2.matches(".muxel/").count(), 1, "no duplicate ignore");
         assert_eq!(std::fs::read_to_string(&mem).unwrap(), "kept user notes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_layout_push_fetch_roundtrip() {
+        let root = std::env::temp_dir().join("muxel-it-local-layout");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let loc = RepoLoc::Local(root.clone());
+
+        // Nothing synced yet.
+        assert!(fetch_remote_layout(&loc).is_none());
+
+        // Push writes <root>/.muxel/workspace.json and git-ignores .muxel/.
+        push_remote_layout(&loc, "{\"v\":1}").expect("push local layout");
+        assert_eq!(fetch_remote_layout(&loc).as_deref(), Some("{\"v\":1}"));
+        let gi = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(
+            gi.lines().any(|l| l.trim() == ".muxel/"),
+            "gitignored: {gi}"
+        );
+
+        // A second push backs up the previous copy to workspace.bak.json.
+        push_remote_layout(&loc, "{\"v\":2}").expect("push again");
+        assert_eq!(fetch_remote_layout(&loc).as_deref(), Some("{\"v\":2}"));
+        let bak =
+            std::fs::read_to_string(root.join(MEMORY_DIR).join("workspace.bak.json")).unwrap();
+        assert_eq!(bak, "{\"v\":1}", "previous copy backed up");
 
         let _ = std::fs::remove_dir_all(&root);
     }

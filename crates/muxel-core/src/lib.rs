@@ -499,8 +499,10 @@ pub const REMOTE_LAYOUT_VERSION: u32 = 1;
 pub struct RemoteLayout {
     pub version: u32,
     pub updated_at: u64,
-    /// The project's root on the remote host; a mismatch on load means the doc was
-    /// captured for a different project and is ignored.
+    /// The project's identity root: its path on the remote host, or — for a local
+    /// project synced so a remote peer (the iOS app) can attach over SSH — its local
+    /// root path. A mismatch on load means the doc was captured for a different
+    /// project and is ignored.
     pub remote_root: String,
     pub layout: Option<PaneNode>,
     #[serde(default)]
@@ -515,11 +517,13 @@ impl RemoteLayout {
     /// captures of identical content compare equal. `updated_at` is the project's
     /// `layout_updated_at`, falling back to `now` when it has never been stamped.
     pub fn capture(project: &Project, workspace: &Workspace, now: u64) -> Self {
+        // A remote project is identified by its path on the host; a local project
+        // (synced for an SSH peer like the iOS app) by its local root path.
         let remote_root = project
             .remote
             .as_ref()
             .map(|r| r.remote_root.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| project.root_path.display().to_string());
 
         let mut instances: Vec<Instance> = project
             .instances()
@@ -1353,6 +1357,22 @@ mod remote_layout_tests {
         proj.layout_updated_at = Some(999);
         ws.projects = vec![proj.clone()];
         assert_eq!(RemoteLayout::capture(&proj, &ws, 123).updated_at, 999);
+    }
+
+    #[test]
+    fn capture_uses_local_root_for_local_project() {
+        // A local project (no `remote`) is synced so an SSH peer can attach; its
+        // identity root is the local path, so the doc validates on load instead of
+        // carrying an empty `remote_root`.
+        let mut ws = Workspace::default();
+        let proj = Project::new("proj", "/local/proj");
+        assert!(proj.remote.is_none());
+        ws.projects = vec![proj.clone()];
+        let doc = RemoteLayout::capture(&proj, &ws, 1);
+        assert_eq!(doc.remote_root, "/local/proj");
+        // And a doc captured for it parses back only against that same root.
+        assert!(RemoteLayout::parse(&doc.to_json(), "/local/proj").is_some());
+        assert!(RemoteLayout::parse(&doc.to_json(), "/other").is_none());
     }
 
     #[test]
