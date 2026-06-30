@@ -54,7 +54,12 @@ releases via `from:` in `project.yml`):
 > (`setUseMetal(true)`, available in 1.13+) once the view is in a window: the default
 > CoreGraphics path composites cached row "stripes" and left stale glyphs stacked on
 > cell redraws (text drawn over itself); the Metal path rasterizes the current grid
-> each frame. The background poll
+> each frame. **Scrollback:** the panes are full-screen (alternate screen) so there's
+> no terminal-native scrollback — history lives in tmux. On attach we enable tmux
+> `mouse on`, and a one-finger **vertical** swipe sends mouse-wheel events to scroll it,
+> with momentum on lift (`TerminalSession`). The scroll gesture only begins for
+> vertical pans (so the edge back-swipe passes through) and SwiftTerm's pans wait for
+> it to fail, so a swipe scrolls rather than selecting. The background poll
 > (`PollService`) still drives status badges +
 > notifications. Password auth, exec, and **SSH key auth** (ed25519 / RSA, with
 > passphrase — ECDSA is detected but not parseable by Citadel) are implemented in

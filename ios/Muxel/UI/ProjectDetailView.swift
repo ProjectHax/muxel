@@ -1,16 +1,23 @@
 import SwiftUI
+import UIKit
 
 /// The active project: a horizontal tab bar of its panes (with status dots) and the
 /// selected pane's terminal. MVP renders the active leaf's tabs; full split-tree
 /// rendering is a later phase.
 struct ProjectDetailView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.verticalSizeClass) private var vSizeClass
     let project: RemoteProject
     @State private var selectedTab: String?
     @State private var showLaunch = false
     @State private var renameTarget: Instance?
     @State private var renameText = ""
     @State private var closeTarget: Instance?
+    @State private var keyboardUp = false
+
+    /// Landscape on iPhone (compact height) with the keyboard up leaves almost no room
+    /// for the terminal — reclaim the nav bar + tab bar for the terminal in that case.
+    private var hideChrome: Bool { keyboardUp && vSizeClass == .compact }
 
     private var instances: [Instance] { state.layout?.orderedTerminalInstances ?? [] }
 
@@ -20,8 +27,10 @@ struct ProjectDetailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            tabBar
-            Divider()
+            if !hideChrome {
+                tabBar
+                Divider()
+            }
             if let inst = current, let host = state.host(for: project) {
                 TerminalPaneView(host: host, project: project, instance: inst)
                     .id(inst.id)
@@ -31,6 +40,12 @@ struct ProjectDetailView: View {
         }
         .navigationTitle(project.name)
         .navigationBarTitleDisplayMode(.inline)
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.2)) { keyboardUp = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.2)) { keyboardUp = false }
+        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button { showLaunch = true } label: {

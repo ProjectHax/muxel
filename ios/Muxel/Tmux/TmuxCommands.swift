@@ -128,6 +128,15 @@ enum TmuxCommands {
         ["set-option", "-w", "-t", paneTarget(session), "monitor-bell", "off"]
     }
 
+    /// Enable tmux mouse mode for the session so a touch drag scrolls the pane's
+    /// scrollback (tmux copy mode) — the panes run full-screen (alternate screen), so
+    /// there's no terminal-native scrollback to swipe; the history lives in tmux.
+    /// `mouse` is a session option; the `=name:` target resolves it to that session (a
+    /// bare `=name` fails with "no such session" for set-option).
+    static func setMouseOn(session: String) -> [String] {
+        ["set-option", "-t", paneTarget(session), "mouse", "on"]
+    }
+
     // MARK: Input
 
     /// Send literal text to a session's active pane (`-l` = literal, no key-name

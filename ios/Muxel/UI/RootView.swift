@@ -22,6 +22,7 @@ struct RootView: View {
                 placeholder
             }
         }
+        .onAppear { KeyboardPrewarmer.warmOnce() }
         .sheet(isPresented: $showAddHost) { AddHostView() }
         .sheet(item: $addProjectForHost) { host in AddProjectView(host: host) }
         .sheet(item: $discoverForHost) { host in DiscoverProjectsView(host: host) }

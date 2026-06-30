@@ -20,7 +20,6 @@ struct TerminalPaneView: View {
             if let session {
                 LiveTerminalView(session: session)
                     .background(Color.black)
-                    .ignoresSafeArea(.container, edges: .bottom)
             } else if let error {
                 errorState(error)
             } else {
@@ -56,11 +55,11 @@ struct TerminalPaneView: View {
             try await conn.connect()
             let names = try await listSessionNames(conn)
             let command: String
+            let sessionName: String
             if let live = names.first(where: { TmuxSession.session($0, matchesInstanceId: instance.id) }) {
                 // A live session for this instance already exists (created by desktop or
                 // a prior attach) — attach to its real name, whatever slug it carries.
-                // The attach detaches any other client (see `attachPTYCommand`), so the
-                // phone is the sole client and the window fits it.
+                sessionName = live
                 command = TmuxCommands.attachPTYCommand(session: live)
             } else {
                 // Creating it: prefer the authoritative name recorded in the shared
@@ -72,12 +71,18 @@ struct TerminalPaneView: View {
                 } else {
                     name = TmuxSession.name(hostName: host.name, instanceId: instance.id)
                 }
+                sessionName = name
                 command = TmuxCommands.newAttachedPTYCommand(
                     session: name, cwd: project.remoteRoot,
                     program: instance.program, args: instance.args)
             }
             session = state.terminals.session(
                 for: instance.id, hostId: host.id, connection: conn, command: command)
+            // Enable tmux mouse mode so a touch drag scrolls the pane's scrollback
+            // (copy mode). Best-effort + separate from the attach so it can't break it;
+            // a freshly-created session may not exist yet when this runs, but it has no
+            // history to scroll anyway and picks it up on the next open.
+            Task { _ = try? await conn.tmux(TmuxCommands.setMouseOn(session: sessionName)) }
         } catch {
             self.error = error.localizedDescription
         }

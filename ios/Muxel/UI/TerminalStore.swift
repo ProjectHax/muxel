@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import SwiftTerm
 import Citadel
 import NIOCore
@@ -10,7 +11,7 @@ import NIOCore
 ///
 /// The `view` is created and handed in by the store on the main actor; `feed`/`feedText`
 /// stay `@MainActor` (UIView access), while `run()`/`withPTY` run off-main like before.
-final class TerminalSession: NSObject, TerminalViewDelegate {
+final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizerDelegate {
     let view: TerminalView
     /// True while the PTY task is live; flips false when the channel ends or
     /// `disconnect()` is called, so the store can recycle a dead session (e.g. after
@@ -26,6 +27,15 @@ final class TerminalSession: NSObject, TerminalViewDelegate {
     /// The most recent grid size SwiftTerm reported, used to open the PTY at the right
     /// size (and as the latest size for resizes once running).
     private var lastSize: (cols: Int, rows: Int)?
+    /// Single-finger scroll gesture, the pan translation already converted to wheel
+    /// ticks, and the post-lift momentum loop.
+    private weak var scrollGesture: UIPanGestureRecognizer?
+    private var scrollConsumedY: CGFloat = 0
+    private var momentumTask: Task<Void, Never>?
+    private let pointsPerTick: CGFloat = 18
+    /// Focuses the terminal (shows the keyboard) on the first tap without waiting for
+    /// SwiftTerm's double/triple-tap disambiguation.
+    private weak var focusTap: UITapGestureRecognizer?
 
     enum Event {
         case send(ByteBuffer)
@@ -37,6 +47,110 @@ final class TerminalSession: NSObject, TerminalViewDelegate {
         self.connection = connection
         self.command = command
         super.init()
+        installScrollGesture()
+    }
+
+    // MARK: Single-finger fluid scroll → tmux mouse wheel
+
+    /// A one-finger **vertical** swipe scrolls the pane's tmux scrollback by sending
+    /// mouse wheel events (tmux `mouse on` is enabled on attach — see
+    /// `TmuxCommands.setMouseOn`), with momentum on lift. It only begins for vertical
+    /// pans (`gestureRecognizerShouldBegin`) so horizontal swipes — the edge back-swipe
+    /// — pass through, and SwiftTerm's own pans are made to wait for it
+    /// (`shouldBeRequiredToFailBy`), so a swipe scrolls instead of selecting.
+    private func installScrollGesture() {
+        let g = UIPanGestureRecognizer(target: self, action: #selector(handleScrollPan(_:)))
+        g.minimumNumberOfTouches = 1
+        g.maximumNumberOfTouches = 1
+        g.delaysTouchesEnded = false // don't hold touch-end back from SwiftTerm's taps
+        g.delegate = self
+        view.addGestureRecognizer(g)
+        scrollGesture = g
+
+        // Bring up the keyboard on the first tap. SwiftTerm's own single-tap is delayed
+        // because it requires the double/triple-tap gestures to fail first; this fires
+        // immediately and coexists with them, so focusing the terminal feels instant.
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleFocusTap(_:)))
+        tap.delegate = self
+        view.addGestureRecognizer(tap)
+        focusTap = tap
+    }
+
+    @objc private func handleFocusTap(_ g: UITapGestureRecognizer) {
+        if !view.isFirstResponder { _ = view.becomeFirstResponder() }
+    }
+
+    @objc private func handleScrollPan(_ g: UIPanGestureRecognizer) {
+        switch g.state {
+        case .began:
+            momentumTask?.cancel(); momentumTask = nil
+            scrollConsumedY = 0
+        case .changed:
+            emitTicks(forTranslation: g.translation(in: view).y)
+        case .ended:
+            startMomentum(velocity: g.velocity(in: view).y)
+        default:
+            break
+        }
+    }
+
+    /// Emit one wheel tick per `pointsPerTick` of finger travel not yet consumed.
+    /// iOS-natural direction: dragging down reveals older output (tmux scroll up).
+    private func emitTicks(forTranslation y: CGFloat) {
+        while y - scrollConsumedY >= pointsPerTick { sendWheel(up: true);  scrollConsumedY += pointsPerTick }
+        while y - scrollConsumedY <= -pointsPerTick { sendWheel(up: false); scrollConsumedY -= pointsPerTick }
+    }
+
+    /// After lift, keep scrolling with a decaying velocity so a flick coasts to a stop.
+    private func startMomentum(velocity: CGFloat) {
+        guard abs(velocity) > 250 else { return } // ignore slow releases
+        momentumTask = Task { @MainActor in
+            var v = velocity
+            var carry: CGFloat = 0
+            while !Task.isCancelled, abs(v) > 80 {
+                carry += v / 60 // distance covered in one ~1/60s frame
+                while carry >= pointsPerTick { sendWheel(up: true);  carry -= pointsPerTick }
+                while carry <= -pointsPerTick { sendWheel(up: false); carry += pointsPerTick }
+                v *= 0.94 // deceleration
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+        }
+    }
+
+    /// Send one SGR mouse wheel event. tmux (mouse on) treats button 64 as wheel-up
+    /// (into scrollback / copy mode) and 65 as wheel-down. Position is the grid centre,
+    /// which lands inside the pane for any single-pane session.
+    private func sendWheel(up: Bool) {
+        let cols = lastSize?.cols ?? 80
+        let rows = lastSize?.rows ?? 24
+        let col = max(1, cols / 2)
+        let row = max(1, rows / 2)
+        let seq = "\u{1b}[<\(up ? 64 : 65);\(col);\(row)M"
+        events.continuation.yield(.send(ByteBuffer(string: seq)))
+    }
+
+    /// Only begin for predominantly-vertical pans, so horizontal swipes (the edge
+    /// back-swipe) and taps fall through to the navigation / SwiftTerm.
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === scrollGesture,
+              let pan = gestureRecognizer as? UIPanGestureRecognizer else { return true }
+        let v = pan.velocity(in: view)
+        return abs(v.y) > abs(v.x)
+    }
+
+    /// SwiftTerm's pan/selection gestures wait for our scroll to fail, so a vertical
+    /// swipe scrolls rather than selecting. The screen-edge back-swipe is left alone.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === scrollGesture, other is UIPanGestureRecognizer else { return false }
+        return !(other is UIScreenEdgePanGestureRecognizer)
+    }
+
+    /// The focus tap coexists with SwiftTerm's tap/selection gestures (it only calls
+    /// `becomeFirstResponder`), so it never blocks them.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        gestureRecognizer === focusTap || other === focusTap
     }
 
     /// Request the PTY attach. The PTY is opened at SwiftTerm's real grid size, so we
@@ -67,6 +181,8 @@ final class TerminalSession: NSObject, TerminalViewDelegate {
     /// the remote session lives on), and mark dead. Called on the main actor.
     func disconnect() {
         isConnected = false
+        momentumTask?.cancel()
+        momentumTask = nil
         events.continuation.finish()
         task?.cancel()
         task = nil
@@ -144,10 +260,10 @@ final class TerminalSession: NSObject, TerminalViewDelegate {
             // and leaves stale glyphs stacked on redraw (the overlapping-text glitch).
             // Best-effort — falls back to CoreGraphics if Metal is unavailable.
             try? source.setUseMetal(true)
-            // Aggregate all visible rows into one GPU buffer per frame: smoother for
-            // the full-screen TUI agents (claude) that repaint most of the screen each
-            // frame, vs the per-row default tuned for few-rows-change interactive use.
-            source.metalBufferingMode = .perFrameAggregated
+            // Keep the default `.perRowPersistent` buffering — `.perFrameAggregated`
+            // was a smoothness tweak but its per-frame glyph aggregation shifted the
+            // cursor/cells by one; the per-row default renders the cursor correctly.
+            source.metalBufferingMode = .perRowPersistent
             // …then open the PTY at the real size.
             launch(cols: newCols, rows: newRows)
         } else {
