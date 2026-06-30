@@ -214,8 +214,6 @@ final class AppState: ObservableObject {
 
     func launch(preset: Preset, customCommand: String?, into project: RemoteProject) async {
         guard let host = host(for: project) else { return }
-        isBusy = true
-        defer { isBusy = false }
 
         let program: String?
         let args: [String]
@@ -241,18 +239,29 @@ final class AppState: ObservableObject {
         // than spawning a second session for it.
         instance.tmuxSession = TmuxSession.name(hostName: host.name, instanceId: instanceId)
 
-        do {
-            let conn = connection(for: host)
-            try await conn.connect()
-            // Record the instance in the shared layout (so it appears + desktop sees
-            // it). We deliberately do NOT create the tmux session here: a detached
-            // session crashes a TUI agent at init. The live terminal creates it
-            // ATTACHED (`new-session -A` over a PTY) when the pane opens.
-            layout = try await RemoteLayoutStore.appendInstance(conn, root: project.remoteRoot, instance: instance)
-            lastLaunched = instanceId
-            await runPollOnce()
-        } catch {
-            errorMessage = error.localizedDescription
+        // Show the pane immediately: add it to the in-memory layout and select it, so
+        // the click feels instant. The live terminal creates the tmux session itself
+        // (`new-session -A` over a PTY) when the pane opens — it doesn't need the shared
+        // layout written first. We deliberately don't create a detached session here (it
+        // crashes a TUI agent at init).
+        var next = layout ?? RemoteLayout(remoteRoot: project.remoteRoot)
+        next.addInstanceAsTab(instance, now: unixNow())
+        layout = next
+        lastLaunched = instanceId
+
+        // Persist `.muxel/workspace.json` to the remote in the background (read-modify-
+        // write over SSH) rather than blocking the UI on those round-trips; reassign the
+        // authoritative layout when it returns (newer-wins also picks up peer changes).
+        Task {
+            do {
+                let conn = self.connection(for: host)
+                try await conn.connect()
+                self.layout = try await RemoteLayoutStore.appendInstance(
+                    conn, root: project.remoteRoot, instance: instance)
+                await self.runPollOnce()
+            } catch {
+                self.errorMessage = error.localizedDescription
+            }
         }
     }
 
