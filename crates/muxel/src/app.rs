@@ -17,6 +17,7 @@ use gpui_component::scroll::{Scrollbar, ScrollbarAxis};
 use gpui_component::tag::Tag;
 use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
+use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::{
     AgentPreset, FocusDir, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule, MEMORY_DIR,
     MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteRef,
@@ -30,7 +31,7 @@ use muxel_terminal::{AgentStatus, CommandSpec, TerminalMouseMode, TerminalSessio
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
@@ -840,6 +841,14 @@ impl Render for DragGhost {
     }
 }
 
+/// Current unix time in seconds (0 if the clock is somehow before the epoch).
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// State of the remote-project wizard's "Scan for projects" action: scanning a
 /// host for `.muxel/workspace.json` markers, then the found roots (or an error).
 #[derive(Clone)]
@@ -918,6 +927,17 @@ pub struct MuxelApp {
     file_browser_input: Entity<InputState>,
     /// Cached browser rows (recomputed only on change, not per render).
     file_browser_rows: Arc<Vec<crate::filetree::Row>>,
+    /// Project-memory manager modal (`.muxel/MEMORY.md`) state.
+    show_memory: bool,
+    memory_pid: Option<Uuid>,
+    /// The maintained (ordered/purged/capped) entries currently shown.
+    memory_entries: Vec<MemoryEntry>,
+    memory_search: Entity<InputState>,
+    memory_title_input: Entity<InputState>,
+    memory_note_input: Entity<InputState>,
+    memory_tags_input: Entity<InputState>,
+    /// Id of the entry showing an inline "delete?" confirm, if any.
+    memory_confirm_delete: Option<Uuid>,
     /// Whether the settings page is shown.
     show_settings: bool,
     /// Settings-page widgets + selection state.
@@ -2405,6 +2425,24 @@ impl MuxelApp {
         )
         .detach();
 
+        let memory_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("Search memory…")));
+        cx.subscribe_in(
+            &memory_search,
+            window,
+            |_this, _input, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        let memory_title_input = cx.new(|cx| InputState::new(window, cx).placeholder(t("Title")));
+        let memory_note_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("Note (one line)")));
+        let memory_tags_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("tags (comma-separated)")));
+
         let runners = settings.runners.clone();
         let snippets = settings.snippets.clone();
         let mut loops = settings.loops.clone();
@@ -2455,6 +2493,14 @@ impl MuxelApp {
             file_browser_expanded: HashSet::new(),
             file_browser_input,
             file_browser_rows: Arc::new(Vec::new()),
+            show_memory: false,
+            memory_pid: None,
+            memory_entries: Vec::new(),
+            memory_search,
+            memory_title_input,
+            memory_note_input,
+            memory_tags_input,
+            memory_confirm_delete: None,
             show_settings: false,
             settings_ui,
             rename: None,
@@ -2894,6 +2940,21 @@ impl MuxelApp {
         spec = spec.with_submit(resolved.submit);
         spec.env = resolved.env.clone();
         spec.env.extend(extra_env);
+        // Point a memory-enabled *local* project's agent at its memory file so tools
+        // can find it without being told the path. Remote agents get the path via the
+        // system-prompt instruction instead (env vars don't cross the ssh boundary).
+        if let Some(p) = project
+            && p.memory_enabled
+            && p.remote.is_none()
+        {
+            let dir = p.root_path.join(MEMORY_DIR);
+            spec.env.push((
+                "MUXEL_MEMORY_FILE".into(),
+                dir.join(MEMORY_FILE).display().to_string(),
+            ));
+            spec.env
+                .push(("MUXEL_MEMORY_DIR".into(), dir.display().to_string()));
+        }
 
         // Status markers: the preset's overrides per field, else the program's
         // built-in defaults (empty → bell/activity heuristic).
@@ -6349,6 +6410,118 @@ impl MuxelApp {
             .is_some_and(|p| p.remote.is_some() || self.use_tmux)
     }
 
+    /// Open the project-memory manager modal for `pid`, loading + maintaining the
+    /// `.muxel/MEMORY.md` entries.
+    fn open_memory_modal(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_memory = true;
+        self.memory_pid = Some(pid);
+        self.memory_confirm_delete = None;
+        for input in [
+            &self.memory_title_input,
+            &self.memory_note_input,
+            &self.memory_tags_input,
+            &self.memory_search,
+        ] {
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        self.reload_memory(window, cx);
+        cx.notify();
+    }
+
+    fn close_memory_modal(&mut self, cx: &mut Context<Self>) {
+        self.show_memory = false;
+        self.memory_confirm_delete = None;
+        cx.notify();
+    }
+
+    /// Load the project's memory off-thread, run maintenance (order/purge/cap),
+    /// persist the maintained result if it changed, and show it.
+    fn reload_memory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pid) = self.memory_pid else { return };
+        let Some(loc) = self.repo_loc(pid) else {
+            return;
+        };
+        let now = now_secs();
+        cx.spawn_in(window, async move |this, cx| {
+            let kept = cx
+                .background_executor()
+                .spawn(async move {
+                    let entries = integrations::load_memory(&loc);
+                    let before: Vec<Uuid> = entries.iter().map(|e| e.id).collect();
+                    let m = memory::maintain(entries, now);
+                    let after: Vec<Uuid> = m.kept.iter().map(|e| e.id).collect();
+                    // Only write back when maintenance actually changed the set/order.
+                    if m.removed > 0 || before != after {
+                        let _ = integrations::save_memory(&loc, &m.kept);
+                    }
+                    m.kept
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.memory_entries = kept;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Re-order/purge/cap the in-memory entries and persist them off-thread.
+    fn maintain_and_persist_memory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let es = std::mem::take(&mut self.memory_entries);
+        self.memory_entries = memory::maintain(es, now_secs()).kept;
+        if let Some(loc) = self.memory_pid.and_then(|pid| self.repo_loc(pid)) {
+            let entries = self.memory_entries.clone();
+            cx.spawn_in(window, async move |_this, cx| {
+                let _ = cx
+                    .background_executor()
+                    .spawn(async move { integrations::save_memory(&loc, &entries) })
+                    .await;
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Add a new memory entry from the modal's title/note/tags inputs.
+    fn add_memory_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.memory_title_input.read(cx).value().trim().to_string();
+        if title.is_empty() {
+            return;
+        }
+        let note = self.memory_note_input.read(cx).value().trim().to_string();
+        let tags: Vec<String> = self
+            .memory_tags_input
+            .read(cx)
+            .value()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self.memory_entries
+            .push(MemoryEntry::new(title, note, tags, now_secs()));
+        for input in [
+            &self.memory_title_input,
+            &self.memory_note_input,
+            &self.memory_tags_input,
+        ] {
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        self.maintain_and_persist_memory(window, cx);
+    }
+
+    fn toggle_memory_pin(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(e) = self.memory_entries.iter_mut().find(|e| e.id == id) {
+            e.pinned = !e.pinned;
+        }
+        self.maintain_and_persist_memory(window, cx);
+    }
+
+    fn delete_memory_entry(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.memory_entries.retain(|e| e.id != id);
+        self.memory_confirm_delete = None;
+        self.maintain_and_persist_memory(window, cx);
+    }
+
     /// Toggle shared project memory; on enable, create the `.muxel/MEMORY.md` +
     /// gitignore entry. Agents launched into the project then get the memory
     /// instruction (see `command_for`).
@@ -7063,6 +7236,240 @@ impl MuxelApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _w, cx| this.close_remote_project_modal(cx)),
+            )
+            .child(card)
+            .into_any_element()
+    }
+
+    /// The project-memory manager modal: search, the maintained (ordered) entry
+    /// list with pin / delete, an add form, and an "open raw file" escape hatch.
+    fn render_memory_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pname = self
+            .memory_pid
+            .and_then(|pid| self.workspace.project(pid))
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let muted = cx.theme().muted_foreground;
+        let query = self.memory_search.read(cx).value().trim().to_lowercase();
+
+        // Grep-like filter by title / content / tags.
+        let visible: Vec<&MemoryEntry> = self
+            .memory_entries
+            .iter()
+            .filter(|e| {
+                query.is_empty()
+                    || e.title.to_lowercase().contains(&query)
+                    || e.content.to_lowercase().contains(&query)
+                    || e.tags.iter().any(|t| t.to_lowercase().contains(&query))
+            })
+            .collect();
+
+        let mut list = div()
+            .id("memory-list")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .max_h(px(360.0))
+            .overflow_y_scroll();
+
+        if self.memory_entries.is_empty() {
+            list = list.child(div().py_4().text_sm().text_color(muted).child(t(
+                "No memories yet — add one below. Agents also add entries as they work here.",
+            )));
+        } else if visible.is_empty() {
+            list = list.child(
+                div()
+                    .py_4()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(t("No entries match your search.")),
+            );
+        } else {
+            for e in visible {
+                let id = e.id;
+                let pinned = e.pinned;
+                let confirming = self.memory_confirm_delete == Some(id);
+
+                let mut actions = div().flex().items_center().gap_1().child(
+                    Button::new(SharedString::from(format!("mem-pin-{}", id.simple())))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Star)
+                        .selected(pinned)
+                        .tooltip(if pinned {
+                            t("Unpin")
+                        } else {
+                            t("Pin (keep, exempt from purge)")
+                        })
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            this.toggle_memory_pin(id, window, cx)
+                        })),
+                );
+                if confirming {
+                    actions = actions
+                        .child(div().text_xs().text_color(muted).child(t("Delete?")))
+                        .child(
+                            Button::new(SharedString::from(format!("mem-del-yes-{}", id.simple())))
+                                .danger()
+                                .xsmall()
+                                .icon(IconName::Check)
+                                .tooltip(t("Confirm delete"))
+                                .on_click(cx.listener(move |this, _e, window, cx| {
+                                    this.delete_memory_entry(id, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("mem-del-no-{}", id.simple())))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip(t("Cancel"))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.memory_confirm_delete = None;
+                                    cx.notify();
+                                })),
+                        );
+                } else {
+                    actions = actions.child(
+                        Button::new(SharedString::from(format!("mem-del-{}", id.simple())))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Delete)
+                            .tooltip(t("Delete"))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.memory_confirm_delete = Some(id);
+                                cx.notify();
+                            })),
+                    );
+                }
+
+                let mut row = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().secondary);
+                row = row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .font_semibold()
+                                .child(e.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(memory::fmt_date(e.accessed)),
+                        )
+                        .child(actions),
+                );
+                let summary = e.summary();
+                if !summary.is_empty() && summary != e.title {
+                    row = row.child(div().text_xs().text_color(muted).child(summary.to_string()));
+                }
+                if !e.tags.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("tags: {}", e.tags.join(", "))),
+                    );
+                }
+                list = list.child(row);
+            }
+        }
+
+        let add_form = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .pt_2()
+            .child(self.settings_label(&t("Add a memory"), cx))
+            .child(Input::new(&self.memory_title_input))
+            .child(Input::new(&self.memory_note_input))
+            .child(Input::new(&self.memory_tags_input))
+            .child(
+                div().flex().justify_end().child(
+                    Button::new("mem-add")
+                        .primary()
+                        .icon(IconName::Plus)
+                        .label(t("Add"))
+                        .on_click(
+                            cx.listener(|this, _e, window, cx| this.add_memory_entry(window, cx)),
+                        ),
+                ),
+            );
+
+        let card = div()
+            .w(px(520.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .bg(cx.theme().background)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius_lg)
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_lg().font_semibold().child(t("Project memory")))
+                    .child(div().flex_1())
+                    .child(div().text_xs().text_color(muted).child(pname)),
+            )
+            .child(Input::new(&self.memory_search))
+            .child(list)
+            .child(add_form)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pt_2()
+                    .child(
+                        Button::new("mem-open-file")
+                            .ghost()
+                            .icon(IconName::File)
+                            .label(t("Open MEMORY.md"))
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                if let Some(pid) = this.memory_pid {
+                                    this.close_memory_modal(cx);
+                                    this.open_project_memory(pid, window, cx);
+                                }
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("mem-close")
+                            .primary()
+                            .label(t("Done"))
+                            .on_click(cx.listener(|this, _e, _w, cx| this.close_memory_modal(cx))),
+                    ),
+            );
+
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x0000_0099))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _w, cx| this.close_memory_modal(cx)),
             )
             .child(card)
             .into_any_element()
@@ -11477,10 +11884,10 @@ impl MuxelApp {
                                 Button::new(SharedString::from(format!("memory-{ix}")))
                                     .ghost()
                                     .xsmall()
-                                    .icon(IconName::File)
-                                    .tooltip(t("Project memory (.muxel/MEMORY.md)"))
+                                    .icon(IconName::Star)
+                                    .tooltip(t("Project memory"))
                                     .on_click(cx.listener(move |this, _e, window, cx| {
-                                        this.open_project_memory(pid, window, cx)
+                                        this.open_memory_modal(pid, window, cx)
                                     })),
                             )
                     }))
@@ -17367,6 +17774,7 @@ impl Render for MuxelApp {
                 self.show_new_remote
                     .then(|| self.render_remote_project_modal(cx)),
             )
+            .children(self.show_memory.then(|| self.render_memory_modal(cx)))
             .children(
                 self.password_prompt
                     .is_some()

@@ -76,16 +76,24 @@ feature is added or changed, update the matching entry here in the same change**
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Shared project memory** — opt-in per project: agents are told (via their system
-  prompt) to read and append durable lessons to a `.muxel/MEMORY.md` file shared
+  prompt) to `grep` and add durable lessons to a `.muxel/MEMORY.md` file shared
   across every agent and run in that project. muxel creates the file, git-ignores
   `.muxel/`, and works for local and remote SSH projects (the file lives in the
-  project's working dir on whichever host). Enable it on a project (sidebar
-  right-click or Settings → Projects); a memory button on the project row opens the
-  file in the editor. Plain shells are skipped.
-- **View/edit memory anytime** — open a project's `.muxel/MEMORY.md` in the built-in
-  editor without enabling injection: right-click the project → **Open shared memory**,
-  or the command palette → **Open project memory** (for the active project). The file
-  (and `.muxel/`) is created on demand, so there's always something to edit.
+  project's working dir on whichever host). Local agents also get its path in a
+  `MUXEL_MEMORY_FILE` env var. Enable it on a project (sidebar right-click or
+  Settings → Projects); a memory button on the project row opens the manager. Plain
+  shells are skipped.
+- **Self-maintaining memory** — each fact is one `##` section carrying a machine
+  meta line (id, dates, tags). muxel keeps the file **most-relevant-first** (recently
+  used entries and 📌 pinned ones rise to the top), **timestamps** every entry,
+  **auto-purges** un-pinned entries unused for 30 days, and **caps** it at 40
+  un-pinned entries (evicting the least-recently-used) — so it stays small and
+  greppable and never needs hand-pruning. A legacy flat `MEMORY.md` is imported, not
+  lost, on first open.
+- **Memory manager** — the project row's memory button opens a manager: search/grep
+  the entries, add one (title + note + tags), pin/unpin (pinned entries are exempt
+  from purge and cap), delete (with confirm), or open the raw `MEMORY.md` in the
+  editor. Entries load and persist over SSH for remote projects too.
 
 ## Agent status
 

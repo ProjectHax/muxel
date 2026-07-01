@@ -5,6 +5,7 @@
 mod agent;
 pub mod diff;
 mod gui_path;
+pub mod memory;
 mod pane;
 pub mod ssh;
 pub mod tmux;

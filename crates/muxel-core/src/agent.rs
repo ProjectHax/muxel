@@ -474,18 +474,22 @@ pub const MEMORY_FILE: &str = "MEMORY.md";
 /// `.muxel/MEMORY.md` on whichever host the agent runs.
 pub fn memory_instruction(path: &str) -> String {
     format!(
-        "This project has a shared memory file at `{path}`, persisted across every \
-agent and run here. At the start of a task, read it for prior lessons, decisions, \
-and gotchas about this project. Whenever you learn something durable — a fix, a \
-convention, a pitfall, an important detail — append a short entry to it. Keep \
-entries concise and don't repeat what's already there."
+        "This project has a shared, muxel-maintained memory file at `{path}`, \
+persisted across every agent and run here. At the start of a task, `grep -i` it for \
+prior lessons, decisions, and gotchas relevant to what you're doing (each entry is a \
+`##` section with a `tags=` line, so one grep finds it), then read that section. \
+Whenever you learn something durable — a fix, a convention, a pitfall, an important \
+detail — record it by adding a new `## Short Title` section with a concise note (a \
+few keywords help future greps). muxel timestamps, orders (most-recently-used \
+first), de-dupes, and prunes the file automatically, so don't renumber, reorder, or \
+delete other entries, and don't repeat what's already there."
     )
 }
 
-/// Seed contents written when a project's `MEMORY.md` is first created.
+/// Seed contents written when a project's `MEMORY.md` is first created. Delegates to
+/// the memory model so the seeded file matches muxel's maintained format exactly.
 pub fn memory_header() -> &'static str {
-    "# Project memory\n\nShared notes for agents working on this project. Append \
-durable lessons, decisions, and gotchas below.\n"
+    crate::memory::document_header()
 }
 
 #[cfg(test)]
@@ -686,7 +690,7 @@ mod tests {
     fn memory_instruction_carries_path_and_guidance() {
         let s = memory_instruction("/srv/app/.muxel/MEMORY.md");
         assert!(s.contains("/srv/app/.muxel/MEMORY.md"));
-        assert!(s.contains("read it"));
-        assert!(s.contains("append"));
+        assert!(s.contains("grep"));
+        assert!(s.contains("## "));
     }
 }

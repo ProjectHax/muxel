@@ -3,6 +3,7 @@
 
 use crate::i18n::{t, tf};
 use anyhow::{Context, Result, bail};
+use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::{MEMORY_DIR, MEMORY_FILE, RemoteHost, SshAuth, memory_header, ssh};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -241,6 +242,48 @@ pub fn ensure_memory_file(loc: &RepoLoc) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// Absolute path of a project's `.muxel/MEMORY.md`, local or remote.
+fn memory_abs(loc: &RepoLoc) -> String {
+    match loc {
+        RepoLoc::Local(root) => root
+            .join(MEMORY_DIR)
+            .join(MEMORY_FILE)
+            .display()
+            .to_string(),
+        RepoLoc::Remote(c) => format!(
+            "{}/{MEMORY_DIR}/{MEMORY_FILE}",
+            c.remote_path.trim_end_matches('/')
+        ),
+    }
+}
+
+/// Read and parse a project's memory file into entries. Missing/empty/unreadable →
+/// an empty list (the file is optional and created on first save). Works local or
+/// remote.
+pub fn load_memory(loc: &RepoLoc) -> Vec<MemoryEntry> {
+    let text = match loc {
+        RepoLoc::Local(root) => {
+            std::fs::read_to_string(root.join(MEMORY_DIR).join(MEMORY_FILE)).unwrap_or_default()
+        }
+        RepoLoc::Remote(_) => read_remote_file(loc, &memory_abs(loc)).unwrap_or_default(),
+    };
+    memory::parse_document(&text)
+}
+
+/// Render `entries` to the project's `.muxel/MEMORY.md` (overwriting). Ensures the
+/// `.muxel/` dir exists and is git-ignored first. Works local or remote.
+pub fn save_memory(loc: &RepoLoc, entries: &[MemoryEntry]) -> Result<()> {
+    let text = memory::render_document(entries);
+    ensure_memory_file(loc)?; // dir + .gitignore (+ seed if absent)
+    match loc {
+        RepoLoc::Local(root) => {
+            let file = root.join(MEMORY_DIR).join(MEMORY_FILE);
+            std::fs::write(&file, text).with_context(|| format!("writing {}", file.display()))
+        }
+        RepoLoc::Remote(_) => write_remote_file(loc, &memory_abs(loc), &text),
     }
 }
 
