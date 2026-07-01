@@ -16,19 +16,17 @@ struct AddProjectView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Project") {
+                MuxelSection("Project") {
                     TextField("Name", text: $name)
                     TextField("Remote path  /srv/app", text: $remoteRoot)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.asciiCapable)
-                }
-                Section {
+                } footer: {
                     Text("On \(host.name). The path must be the project root on the remote (where its .muxel/ lives).")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
                 }
             }
+            .muxelSheet()
             .navigationTitle("Add project")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

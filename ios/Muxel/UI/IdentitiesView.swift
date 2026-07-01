@@ -6,34 +6,46 @@ import UniformTypeIdentifiers
 /// sheet from the sidebar. Secrets go to the Keychain via `AppState`.
 struct IdentitiesView: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var appLock: AppLock
+    @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     @State private var editing: Identity?
     @State private var addingNew = false
+    @State private var deleteTarget: Identity?
 
     var body: some View {
         NavigationStack {
             List {
-                if state.doc.identities.isEmpty {
-                    Text("No identities yet. Add one to reuse a login across hosts.")
-                        .foregroundStyle(.secondary)
-                }
-                ForEach(state.doc.identities) { id in
-                    Button { editing = id } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: "person.badge.key").foregroundStyle(.secondary)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(id.name)
-                                Text("\(id.user.isEmpty ? "default user" : id.user) · \(id.auth.label)")
-                                    .font(.caption).foregroundStyle(.secondary)
+                MuxelSection {
+                    if state.doc.identities.isEmpty {
+                        Text("No identities yet. Add one to reuse a login across hosts.")
+                            .font(.mono(.footnote))
+                            .foregroundStyle(theme.mutedColor)
+                    }
+                    ForEach(state.doc.identities) { id in
+                        Button { editing = id } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: "person.badge.key")
+                                    .foregroundStyle(theme.mutedColor)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(id.name)
+                                        .font(.mono(.callout))
+                                    Text("\(id.user.isEmpty ? "default user" : id.user) · \(id.auth.label)")
+                                        .font(.mono(.caption))
+                                        .foregroundStyle(theme.mutedColor)
+                                }
                             }
                         }
+                        .tint(theme.textColor)
                     }
-                    .tint(.primary)
+                    .onDelete { offsets in
+                        // Confirm one at a time (swipe-delete passes a single offset).
+                        deleteTarget = offsets.map { state.doc.identities[$0] }.first
+                    }
                 }
-                .onDelete { offsets in
-                    offsets.map { state.doc.identities[$0] }.forEach(state.deleteIdentity)
-                }
+                securitySection
             }
+            .muxelSheet()
             .navigationTitle("Identities")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -44,7 +56,55 @@ struct IdentitiesView: View {
             }
             .sheet(isPresented: $addingNew) { IdentityEditorView(existing: nil) }
             .sheet(item: $editing) { id in IdentityEditorView(existing: id) }
+            .confirmationDialog(
+                deleteTarget.map {
+                    ConfirmationCopy.deleteIdentity($0, hostCount: state.doc.hosts(using: $0).count).title
+                } ?? "Delete identity?",
+                isPresented: Binding(
+                    get: { deleteTarget != nil },
+                    set: { if !$0 { deleteTarget = nil } }
+                ),
+                titleVisibility: .visible,
+                presenting: deleteTarget
+            ) { identity in
+                Button("Delete identity", role: .destructive) {
+                    state.deleteIdentity(identity)
+                    deleteTarget = nil
+                }
+                Button("Cancel", role: .cancel) { deleteTarget = nil }
+            } message: { identity in
+                Text(ConfirmationCopy.deleteIdentity(
+                    identity, hostCount: state.doc.hosts(using: identity).count).message)
+            }
         }
+    }
+
+    /// App Lock lives here: this sheet is the app's credential manager, the natural
+    /// home for the toggle that protects those credentials' UI.
+    private var securitySection: some View {
+        MuxelSection("Security") {
+            Toggle("Require Face ID / passcode to open muxel", isOn: appLockBinding)
+                .disabled(!appLock.isAvailable)
+        } footer: {
+            Text(appLock.isAvailable
+                ? "Protects the app UI. Background status polling and notifications "
+                    + "keep working while locked."
+                : "Set a device passcode to use App Lock.")
+        }
+    }
+
+    private var appLockBinding: Binding<Bool> {
+        Binding(
+            get: { appLock.isEnabled },
+            set: { on in
+                appLock.isEnabled = on
+                if on {
+                    // Prove the user can pass before the lock can ever engage;
+                    // a failed/canceled check rolls the toggle back.
+                    Task { await appLock.confirmEnable() }
+                }
+            }
+        )
     }
 }
 
@@ -67,19 +127,24 @@ struct IdentityEditorView: View {
     private var isEdit: Bool { existing != nil }
 
     private var canSave: Bool {
-        // On edit the secret already exists, so a name change alone is savable.
-        !name.isEmpty && (isEdit || (auth == .password ? !password.isEmpty : keyData != nil))
+        // On edit the stored secret still applies — but only for the *same* auth
+        // method; switching methods needs a new secret (the stored one lives in
+        // the other Keychain slot).
+        guard !name.isEmpty else { return false }
+        let hasNewSecret = auth == .password ? !password.isEmpty : keyData != nil
+        if let existing { return auth == existing.auth || hasNewSecret }
+        return hasNewSecret
     }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Identity") {
+                MuxelSection("Identity") {
                     TextField("Name", text: $name)
                     TextField("User", text: $user)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                 }
-                Section("Authentication") {
+                MuxelSection("Authentication") {
                     Picker("Method", selection: $auth) {
                         ForEach(SshAuthKind.allCases) { Text($0.label).tag($0) }
                     }
@@ -96,6 +161,7 @@ struct IdentityEditorView: View {
                     }
                 }
             }
+            .muxelSheet()
             .navigationTitle(isEdit ? "Edit identity" : "Add identity")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -106,11 +172,9 @@ struct IdentityEditorView: View {
             }
             .fileImporter(isPresented: $importingKey,
                           allowedContentTypes: [.data, .text, .item]) { result in
-                guard case let .success(url) = result else { return }
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                keyData = try? Data(contentsOf: url)
-                keyName = url.lastPathComponent
+                guard let file = ImportedFile.read(result) else { return }
+                keyData = file.data
+                keyName = file.name
             }
             .onAppear {
                 if let e = existing {

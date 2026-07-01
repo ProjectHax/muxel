@@ -10,6 +10,7 @@ struct RootView: View {
     @State private var showAddHost = false
     @State private var addProjectForHost: Host?
     @State private var discoverForHost: Host?
+    @State private var editHost: Host?
     /// Persisted sidebar width (iPad/regular width). Dragged via the edge handle.
     @AppStorage("muxel.sidebarWidth") private var sidebarWidth: Double = 320
     @State private var dragStartWidth: Double?
@@ -21,7 +22,8 @@ struct RootView: View {
         NavigationSplitView {
             SidebarView(showAddHost: $showAddHost,
                         addProjectForHost: $addProjectForHost,
-                        discoverForHost: $discoverForHost)
+                        discoverForHost: $discoverForHost,
+                        editHost: $editHost)
                 .navigationTitle("muxel")
                 .navigationBarTitleDisplayMode(.inline)
                 .navigationSplitViewColumnWidth(min: sidebarMin, ideal: sidebarWidth, max: sidebarMax)
@@ -34,20 +36,13 @@ struct RootView: View {
             }
         }
         .onAppear { KeyboardPrewarmer.warmOnce() }
-        .sheet(isPresented: $showAddHost) { AddHostView() }
+        .sheet(isPresented: $showAddHost) { HostEditorView(existing: nil) }
+        .sheet(item: $editHost) { host in HostEditorView(existing: host) }
         .sheet(item: $addProjectForHost) { host in AddProjectView(host: host) }
         .sheet(item: $discoverForHost) { host in DiscoverProjectsView(host: host) }
-        .alert(
-            "Something went wrong",
-            isPresented: Binding(
-                get: { state.errorMessage != nil },
-                set: { if !$0 { state.errorMessage = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) { state.errorMessage = nil }
-        } message: {
-            Text(state.errorMessage ?? "")
-        }
+        .sheet(item: $state.hostKeyPrompt) { prompt in HostKeyPromptView(prompt: prompt) }
+        .overlay(alignment: .top) { noticeOverlay }
+        .animation(.snappy, value: state.notice)
         .alert(
             (state.testResult?.ok == true) ? "Connection OK" : "Connection failed",
             isPresented: Binding(
@@ -59,6 +54,20 @@ struct RootView: View {
             Button("OK", role: .cancel) { state.testResult = nil }
         } message: { result in
             Text("\(result.hostName): \(result.message)")
+        }
+    }
+
+    /// The transient notice banner (errors and confirmations that don't need a
+    /// decision). Auto-dismisses after the notice's duration; tap dismisses early.
+    @ViewBuilder private var noticeOverlay: some View {
+        if let notice = state.notice {
+            NoticeBanner(notice: notice) { state.notice = nil }
+                .padding(.horizontal)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .task(id: notice.id) {
+                    try? await Task.sleep(for: .seconds(notice.duration))
+                    if state.notice?.id == notice.id { state.notice = nil }
+                }
         }
     }
 
@@ -89,7 +98,6 @@ struct RootView: View {
 
     private var placeholder: some View {
         ZStack {
-            theme.background.ignoresSafeArea()
             GridBackground().opacity(0.5)
             VStack(spacing: 14) {
                 Image("MuxelMark")
@@ -99,11 +107,7 @@ struct RootView: View {
                 Text("muxel")
                     .font(.mono(.largeTitle, weight: .bold))
                     .foregroundStyle(theme.textColor)
-                HStack(spacing: 6) {
-                    Text("❯").foregroundStyle(theme.accentColor)
-                    Text("select a project").foregroundStyle(theme.mutedColor)
-                }
-                .font(.mono(.callout))
+                PromptLabel(text: "select a project")
                 Text("Add a host and a project from the sidebar to get started.")
                     .font(.footnote)
                     .foregroundStyle(theme.mutedColor)
@@ -111,5 +115,6 @@ struct RootView: View {
                     .padding(.horizontal, 40)
             }
         }
+        .muxelBackground()
     }
 }

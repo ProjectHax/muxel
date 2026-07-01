@@ -19,12 +19,21 @@ extension MuxelTheme {
         ]
     }
 
-    /// Recolor a live terminal to this theme (bg/fg/cursor + ANSI palette).
+    /// Recolor a live terminal to this theme (bg/fg/cursor + ANSI palette), plus
+    /// its input chrome: keyboard appearance and the muxel accessory row.
     func apply(to view: TerminalView) {
         view.nativeBackgroundColor = UIColor(muxelHex: bg)
         view.nativeForegroundColor = UIColor(muxelHex: fg)
         view.caretColor = UIColor(muxelHex: accent)
         view.installColors(ansi16)
+        (view.inputAccessoryView as? TerminalAccessoryRow)?.apply(theme: self)
+        // keyboardAppearance is only re-read on reloadInputViews(); guard so the
+        // reload happens once per actual change, not on every updateUIView pass.
+        let appearance: UIKeyboardAppearance = isDark ? .dark : .light
+        if view.keyboardAppearance != appearance {
+            view.keyboardAppearance = appearance
+            if view.isFirstResponder { view.reloadInputViews() }
+        }
     }
 }
 

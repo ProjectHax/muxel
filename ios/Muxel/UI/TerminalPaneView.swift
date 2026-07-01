@@ -22,14 +22,15 @@ struct TerminalPaneView: View {
                 LiveTerminalView(session: session, theme: theme)
                     .background(theme.background)
             } else if let error {
-                errorState(error)
-            } else {
-                centered {
-                    ProgressView()
-                    Text("attaching to \(host.name)…")
-                        .font(.mono(.footnote))
-                        .foregroundStyle(theme.mutedColor)
+                CenteredState(icon: "wifi.exclamationmark",
+                              iconColor: theme.blockedColor,
+                              title: "can't reach \(host.name)",
+                              message: error) {
+                    Button("Try again") { Task { await resolve() } }
+                        .buttonStyle(.bordered)
                 }
+            } else {
+                CenteredState(spinner: true, title: "attaching to \(host.name)…")
             }
         }
         .task { await resolve() }
@@ -82,12 +83,18 @@ struct TerminalPaneView: View {
             session = state.terminals.session(
                 for: instance.id, hostId: host.id, connection: conn, command: command)
             // Enable tmux mouse mode so a touch drag scrolls the pane's scrollback
-            // (copy mode). Best-effort + separate from the attach so it can't break it;
-            // a freshly-created session may not exist yet when this runs, but it has no
-            // history to scroll anyway and picks it up on the next open.
-            Task { _ = try? await conn.tmux(TmuxCommands.setMouseOn(session: sessionName)) }
+            // (copy mode), and OSC-52 forwarding so remote copies land on the phone
+            // clipboard. Best-effort + separate from the attach so they can't break
+            // it; a freshly-created session may not exist yet when this runs, but it
+            // has no history to scroll anyway and picks it up on the next open.
+            Task {
+                _ = try? await conn.tmux(TmuxCommands.setMouseOn(session: sessionName))
+                _ = try? await conn.tmux(TmuxCommands.setClipboardOn())
+            }
         } catch {
             self.error = error.localizedDescription
+            // A changed host key needs the trust-prompt sheet, not just inline text.
+            state.surface(error, host: host)
         }
     }
 
@@ -103,25 +110,4 @@ struct TerminalPaneView: View {
         }
     }
 
-    private func errorState(_ message: String) -> some View {
-        centered {
-            Image(systemName: "wifi.exclamationmark")
-                .font(.largeTitle)
-                .foregroundStyle(theme.blockedColor)
-            Text("can't reach \(host.name)")
-                .font(.mono(.callout, weight: .semibold))
-                .foregroundStyle(theme.textColor)
-            Text(message)
-                .font(.mono(.caption))
-                .foregroundStyle(theme.mutedColor)
-                .multilineTextAlignment(.center)
-            Button("Try again") { Task { await resolve() } }.buttonStyle(.bordered)
-        }
-    }
-
-    private func centered<C: View>(@ViewBuilder _ content: () -> C) -> some View {
-        VStack(spacing: 10) { content() }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding()
-    }
 }

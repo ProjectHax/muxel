@@ -5,6 +5,7 @@ import SwiftUI
 /// new pane in the shared `.muxel/workspace.json` so desktop sees it too.
 struct LaunchInstanceView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     let project: RemoteProject
 
@@ -15,7 +16,7 @@ struct LaunchInstanceView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Agent") {
+                MuxelSection("Agent") {
                     Picker("Preset", selection: $selected) {
                         ForEach(Preset.builtins) { preset in
                             Text(preset.name).tag(preset)
@@ -28,16 +29,22 @@ struct LaunchInstanceView: View {
                         TextField("e.g. claude --model opus", text: $customCommand)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
+                        if !commandParses {
+                            Label("unbalanced quote", systemImage: "exclamationmark.triangle")
+                                .font(.mono(.caption))
+                                .foregroundStyle(theme.blockedColor)
+                        }
                     }
                 }
-                Section {
+                MuxelSection("Command") {
                     Text(previewCommand)
-                        .font(.system(.footnote, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                } header: {
-                    Text("Will run in \(project.remoteRoot)")
+                        .font(.mono(.footnote))
+                        .foregroundStyle(theme.mutedColor)
+                } footer: {
+                    Text("Runs in \(project.remoteRoot).")
                 }
             }
+            .muxelSheet()
             .navigationTitle("New instance")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -53,10 +60,18 @@ struct LaunchInstanceView: View {
                             dismiss()
                         }
                     }
-                    .disabled(useCustom && customCommand.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(useCustom
+                        && (customCommand.trimmingCharacters(in: .whitespaces).isEmpty
+                            || !commandParses))
                 }
             }
         }
+    }
+
+    /// Whether the custom command splits into shell words (quotes balanced) — the
+    /// same parse `AppState.launch` uses, so Launch can't submit what launch rejects.
+    private var commandParses: Bool {
+        !useCustom || Shell.splitWords(customCommand) != nil
     }
 
     private var previewCommand: String {

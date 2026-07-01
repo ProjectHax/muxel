@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// The collapsible sidebar: hosts as sections, projects as rows, with add/delete.
 /// Per-project live status across *all* projects is the background poller's job;
@@ -6,11 +7,15 @@ import SwiftUI
 struct SidebarView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.theme) private var theme
+    @Environment(\.openURL) private var openURL
     @Binding var showAddHost: Bool
     @Binding var addProjectForHost: Host?
     @Binding var discoverForHost: Host?
+    @Binding var editHost: Host?
     @State private var showThemePicker = false
     @State private var showIdentities = false
+    @State private var deleteHostTarget: Host?
+    @State private var deleteProjectsTarget: [RemoteProject] = []
 
     /// Drives `NavigationSplitView` navigation: binding the `List` selection to the
     /// selected project's id is what pushes the detail column on iPhone (a plain
@@ -34,13 +39,8 @@ struct SidebarView: View {
     var body: some View {
         List(selection: selection) {
             if state.doc.hosts.isEmpty {
-                HStack(spacing: 6) {
-                    Text("❯").foregroundStyle(theme.accentColor)
-                    Text("no hosts yet — tap + to add one")
-                        .foregroundStyle(theme.mutedColor)
-                }
-                .font(.mono(.footnote))
-                .listRowBackground(Color.clear)
+                PromptLabel(text: "no hosts yet — tap + to add one", style: .footnote)
+                    .listRowBackground(Color.clear)
             }
             ForEach(state.doc.hosts) { host in
                 Section {
@@ -53,7 +53,7 @@ struct SidebarView: View {
                     }
                     .onDelete { offsets in
                         let projects = state.projects(for: host)
-                        offsets.map { projects[$0] }.forEach(state.deleteProject)
+                        deleteProjectsTarget = offsets.map { projects[$0] }
                     }
                     Button {
                         addProjectForHost = host
@@ -67,10 +67,13 @@ struct SidebarView: View {
                     hostHeader(host)
                 }
             }
+            if state.notificationsDenied {
+                notificationsDeniedRow
+            }
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
-        .background(theme.background.ignoresSafeArea())
+        .muxelBackground()
         .toolbar {
             ToolbarItem(placement: .principal) {
                 HStack(spacing: 6) {
@@ -103,6 +106,70 @@ struct SidebarView: View {
         }
         .sheet(isPresented: $showThemePicker) { ThemePickerView() }
         .sheet(isPresented: $showIdentities) { IdentitiesView() }
+        .confirmationDialog(
+            deleteHostTarget.map {
+                ConfirmationCopy.deleteHost($0, projectCount: state.projects(for: $0).count).title
+            } ?? "Delete host?",
+            isPresented: Binding(
+                get: { deleteHostTarget != nil },
+                set: { if !$0 { deleteHostTarget = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: deleteHostTarget
+        ) { host in
+            Button("Delete host", role: .destructive) {
+                state.deleteHost(host)
+                deleteHostTarget = nil
+            }
+            Button("Cancel", role: .cancel) { deleteHostTarget = nil }
+        } message: { host in
+            Text(ConfirmationCopy.deleteHost(host, projectCount: state.projects(for: host).count).message)
+        }
+        .confirmationDialog(
+            deleteProjectsTarget.isEmpty
+                ? "Remove project?"
+                : ConfirmationCopy.deleteProjects(deleteProjectsTarget).title,
+            isPresented: Binding(
+                get: { !deleteProjectsTarget.isEmpty },
+                set: { if !$0 { deleteProjectsTarget = [] } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(deleteProjectsTarget.count == 1 ? "Remove project" : "Remove projects",
+                   role: .destructive) {
+                deleteProjectsTarget.forEach(state.deleteProject)
+                deleteProjectsTarget = []
+            }
+            Button("Cancel", role: .cancel) { deleteProjectsTarget = [] }
+        } message: {
+            if !deleteProjectsTarget.isEmpty {
+                Text(ConfirmationCopy.deleteProjects(deleteProjectsTarget).message)
+            }
+        }
+    }
+
+    /// Quiet pointer shown only when the user has *denied* notifications — the
+    /// blocked/done alerts the background poller posts silently can't arrive.
+    private var notificationsDeniedRow: some View {
+        Section {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "bell.slash")
+                    .foregroundStyle(theme.mutedColor)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("notifications off — blocked/done alerts won't arrive")
+                        .font(.mono(.caption2))
+                        .foregroundStyle(theme.mutedColor)
+                    Button("Open Settings") {
+                        if let url = URL(string: UIApplication.openNotificationSettingsURLString) {
+                            openURL(url)
+                        }
+                    }
+                    .font(.mono(.caption2, weight: .semibold))
+                    .tint(theme.accentColor)
+                }
+            }
+            .listRowBackground(Color.clear)
+        }
     }
 
     private func hostHeader(_ host: Host) -> some View {
@@ -132,9 +199,14 @@ struct SidebarView: View {
                 } label: {
                     Label("Add project by path", systemImage: "plus")
                 }
+                Button {
+                    editHost = host
+                } label: {
+                    Label("Edit host", systemImage: "pencil")
+                }
                 Divider()
                 Button(role: .destructive) {
-                    state.deleteHost(host)
+                    deleteHostTarget = host
                 } label: {
                     Label("Delete host", systemImage: "trash")
                 }

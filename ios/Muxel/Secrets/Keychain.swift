@@ -51,6 +51,26 @@ enum Keychain {
         data(slot: .keyPassphrase(host)).flatMap { String(data: $0, encoding: .utf8) }
     }
 
+    /// Write whichever secrets are provided under `owner` (a host or identity id) —
+    /// nil or an empty string means "keep whatever is stored" and is skipped.
+    /// Returns false if any attempted write failed, so callers can surface a
+    /// Keychain failure instead of silently dropping the secret.
+    @discardableResult
+    static func saveSecrets(for owner: UUID, password: String?, keyData: Data?,
+                            passphrase: String?) -> Bool {
+        var saved = true
+        if let password, !password.isEmpty {
+            saved = setPassword(password, for: owner) && saved
+        }
+        if let keyData {
+            saved = setPrivateKey(keyData, for: owner) && saved
+        }
+        if let passphrase, !passphrase.isEmpty {
+            saved = setKeyPassphrase(passphrase, for: owner) && saved
+        }
+        return saved
+    }
+
     /// Remove every secret for a host (called when the host is deleted).
     static func deleteAll(for host: UUID) {
         for slot in [Slot.password(host), .privateKey(host), .keyPassphrase(host)] {

@@ -137,6 +137,14 @@ enum TmuxCommands {
         ["set-option", "-t", paneTarget(session), "mouse", "on"]
     }
 
+    /// Let apps inside tmux put text on the phone clipboard via OSC 52 — tmux
+    /// forwards the escape to the attached client, where SwiftTerm's
+    /// `clipboardCopy` delegate lands it in `UIPasteboard`. A server option
+    /// (`-s`), enabled best-effort on attach alongside `setMouseOn`.
+    static func setClipboardOn() -> [String] {
+        ["set-option", "-s", "set-clipboard", "on"]
+    }
+
     // MARK: Input
 
     /// Send literal text to a session's active pane (`-l` = literal, no key-name

@@ -9,12 +9,17 @@ final class AppState: ObservableObject {
     @Published var doc: StoreDocument
     @Published var selectedProject: RemoteProject?
     @Published var layout: RemoteLayout?
+    /// Load state of the selected project's shared layout — lets the detail view
+    /// distinguish "can't reach the host" from a genuinely empty project.
+    @Published var layoutLoad: LayoutLoadState = .idle
     @Published var statuses: [String: AgentStatus] = [:]
     /// Instance ids with a live tmux session right now (from the latest poll of the
     /// selected project).
     @Published var running: Set<String> = []
-    @Published var errorMessage: String?
-    @Published var isBusy = false
+    /// The current transient notice (banner). Set via `report`; RootView shows and
+    /// auto-dismisses it. Failures that need a decision (connection tests) have
+    /// their own bespoke paths instead.
+    @Published var notice: AppNotice?
     /// Id of the most recently launched instance — the detail view selects it so its
     /// live terminal opens (and creates the session attached).
     @Published var lastLaunched: String?
@@ -29,11 +34,35 @@ final class AppState: ObservableObject {
         let message: String
     }
 
-    /// Injectable so previews/tests use `MockSSHConnection`. The second argument is
-    /// the host's resolved shared-identity credential (nil = use the host's inline
-    /// fields), so a connection authenticates with the right login + secret owner.
-    var connectionFactory: (Host, ResolvedCredential?) -> SSHConnection = {
-        CitadelSSHConnection(host: $0, credential: $1)
+    enum LayoutLoadState: Equatable {
+        case idle
+        case loading
+        case loaded
+        case failed(String)
+    }
+
+    /// A changed host key awaiting the user's decision — drives the trust-prompt
+    /// sheet (stored vs presented fingerprint). `scope` says whether the target
+    /// host's key changed or its jump host's (bastion's).
+    struct HostKeyPrompt: Identifiable {
+        let id = UUID()
+        let host: Host
+        let expected: String
+        let presented: String
+        let scope: HostKeyStore.Scope
+    }
+
+    @Published var hostKeyPrompt: HostKeyPrompt?
+    /// True when the user has explicitly denied notification permission — the
+    /// sidebar shows a quiet Settings pointer (`.notDetermined` must not nag).
+    @Published var notificationsDenied = false
+
+    /// Injectable so previews/tests use `MockSSHConnection`. The second argument
+    /// carries the host's resolved credentials — target (nil = the host's inline
+    /// fields) and bastion — so a connection authenticates with the right logins
+    /// + secret owners.
+    var connectionFactory: (Host, ConnectionCredentials) -> SSHConnection = {
+        CitadelSSHConnection(host: $0, credentials: $1)
     }
 
     private let store: LocalStore
@@ -48,7 +77,52 @@ final class AppState: ObservableObject {
 
     init(store: LocalStore = LocalStore()) {
         self.store = store
-        self.doc = store.load()
+        self.doc = (try? store.load()) ?? StoreDocument()
+        // A failed load preserved the damaged file and recorded a pending notice
+        // (a background task may also have recorded one before the app launched) —
+        // take it once and tell the user instead of silently starting empty.
+        if let corrupt = LocalStore.takeCorruptNotice() {
+            report(corrupt, duration: 12)
+        }
+        // An in-form connection test killed mid-flight can leave a staged scratch
+        // secret behind; it's meaningless outside that test, so clear it.
+        Keychain.deleteAll(for: Self.scratchSecretOwner)
+    }
+
+    /// Surface a transient notice as a self-dismissing banner.
+    func report(_ text: String, style: AppNotice.Style = .error, duration: TimeInterval = 4) {
+        notice = AppNotice(style: style, text: text, duration: duration)
+    }
+
+    /// Central error router for host-scoped failures: a changed host key becomes
+    /// the trust-prompt sheet (a decision, not a toast); everything else a
+    /// transient banner.
+    func surface(_ error: Error, host: Host?) {
+        if let host, promptIfHostKeyChanged(error, host: host) { return }
+        report(error.localizedDescription)
+    }
+
+    /// If `error` is a refused (changed) host key, show the trust prompt for it.
+    @discardableResult
+    private func promptIfHostKeyChanged(_ error: Error, host: Host) -> Bool {
+        guard case let SSHError.hostKeyChanged(expected, got, scope) = error else { return false }
+        hostKeyPrompt = HostKeyPrompt(host: host, expected: expected,
+                                      presented: got, scope: scope)
+        return true
+    }
+
+    /// The trust-prompt accept path: pin the presented fingerprint, drop the
+    /// host's pooled connection and live terminals (they were refused), and retry
+    /// the layout if this host backs the current selection.
+    func acceptNewHostKey(_ prompt: HostKeyPrompt) {
+        HostKeyStore().setFingerprint(prompt.presented, for: prompt.host.id,
+                                      scope: prompt.scope)
+        terminals.disconnect(forHost: prompt.host.id)
+        connections[prompt.host.id] = nil
+        hostKeyPrompt = nil
+        if let project = selectedProject, project.hostId == prompt.host.id {
+            Task { await refreshLayout() }
+        }
     }
 
     // MARK: Lookups
@@ -68,41 +142,96 @@ final class AppState: ObservableObject {
     // MARK: Host / project CRUD
 
     func addHost(_ host: Host, password: String?, keyData: Data?, passphrase: String?) {
-        var saved = true
-        if let password { saved = Keychain.setPassword(password, for: host.id) && saved }
-        if let keyData { saved = Keychain.setPrivateKey(keyData, for: host.id) && saved }
-        if let passphrase, !passphrase.isEmpty {
-            saved = Keychain.setKeyPassphrase(passphrase, for: host.id) && saved
-        }
+        let saved = Keychain.saveSecrets(for: host.id, password: password,
+                                         keyData: keyData, passphrase: passphrase)
         doc.hosts.append(host)
         persist()
         if !saved {
-            errorMessage = "Couldn't save the credential to the Keychain. The host was added, but " +
-                "you may need to re-add it or check the device's Keychain access."
+            report("Couldn't save the credential to the Keychain. The host was added, but "
+                + "you may need to re-add it or check the device's Keychain access.",
+                duration: 8)
         }
     }
 
     /// Connect to `host` with a *fresh* connection (re-reading its Keychain secret) to
     /// verify the saved credential authenticates. Surfaces the result via `testResult`.
     func testConnection(_ host: Host) async {
-        isBusy = true
-        defer { isBusy = false }
-        let conn = connectionFactory(host, resolvedCredential(for: host))
+        let result = await attemptConnection(
+            host, credentials: host.connectionCredentials(in: doc.identities))
+        if !result.ok, promptIfHostKeyChanged(result.underlying ?? SSHError.notConnected,
+                                              host: host) { return }
+        testResult = ConnectionTest(hostName: host.name, ok: result.ok, message: result.message)
+    }
+
+    /// Well-known scratch Keychain owner for in-form connection tests: inline form
+    /// secrets are staged under it for the duration of one attempt and deleted
+    /// right after (and once at launch, in case a test was killed mid-flight) — so
+    /// canceling the form can never leave secrets behind under a phantom host id.
+    static let scratchSecretOwner = UUID(uuidString: "00000000-0000-0000-0000-4d5558454c01")!
+
+    /// Test a not-yet-saved host built from the editor's current form state,
+    /// without persisting anything. Returns the outcome for inline display in the
+    /// form (unlike `testConnection(_:)`, which publishes the blocking alert).
+    func testConnection(draft host: Host, identityId: UUID?, password: String?,
+                        keyData: Data?, passphrase: String?) async -> ConnectionTest {
+        var draft = host
+        draft.identityId = identityId
+        var credentials = draft.connectionCredentials(in: doc.identities)
+        if credentials.target == nil, password != nil || keyData != nil || passphrase != nil {
+            Keychain.saveSecrets(for: Self.scratchSecretOwner, password: password,
+                                 keyData: keyData, passphrase: passphrase)
+            credentials.target = ResolvedCredential(user: draft.user, auth: draft.auth,
+                                                    keyHasPassphrase: draft.keyHasPassphrase,
+                                                    secretOwner: Self.scratchSecretOwner)
+            // A "same as host" bastion credential points at the (unsaved) host's
+            // slot — redirect it to the staged scratch secret too.
+            if credentials.jump?.secretOwner == draft.id {
+                credentials.jump?.secretOwner = Self.scratchSecretOwner
+            }
+        }
+        // With no identity and no new inline secret (edit mode, keeping the stored
+        // one) the credential stays nil — the connection reads the host's own slot.
+        defer { Keychain.deleteAll(for: Self.scratchSecretOwner) }
+        let result = await attemptConnection(draft, credentials: credentials)
+        return ConnectionTest(hostName: draft.name, ok: result.ok, message: result.message)
+    }
+
+    /// Shared connect-and-verify core for both test paths: a fresh (non-pooled)
+    /// connection, one round-trip, then close.
+    private func attemptConnection(
+        _ host: Host, credentials: ConnectionCredentials
+    ) async -> (ok: Bool, message: String, underlying: Error?) {
+        let conn = connectionFactory(host, credentials)
         do {
             try await conn.connect()
             _ = try await conn.run("true")
             await conn.close()
-            testResult = ConnectionTest(hostName: host.name, ok: true,
-                                        message: "Connected and authenticated successfully.")
+            return (true, "Connected and authenticated successfully.", nil)
         } catch {
             await conn.close()
-            testResult = ConnectionTest(hostName: host.name, ok: false,
-                                        message: error.localizedDescription)
+            return (false, error.localizedDescription, error)
+        }
+    }
+
+    /// Update a host's fields, optionally replacing its stored secrets (nil or
+    /// blank = keep what's stored). Drops its pooled connection + live terminals so
+    /// the next connect re-authenticates with the new settings.
+    func updateHost(_ host: Host, password: String?, keyData: Data?, passphrase: String?) {
+        guard let idx = doc.hosts.firstIndex(where: { $0.id == host.id }) else { return }
+        doc.hosts[idx] = host
+        Keychain.saveSecrets(for: host.id, password: password,
+                             keyData: keyData, passphrase: passphrase)
+        terminals.disconnect(forHost: host.id)
+        connections[host.id] = nil
+        persist()
+        if let project = selectedProject, project.hostId == host.id {
+            Task { await refreshLayout() }
         }
     }
 
     func deleteHost(_ host: Host) {
         Keychain.deleteAll(for: host.id)
+        HostKeyStore().clear(for: host.id)
         terminals.disconnect(forHost: host.id)
         connections[host.id] = nil
         doc.projects.removeAll { $0.hostId == host.id }
@@ -113,16 +242,12 @@ final class AppState: ObservableObject {
     // MARK: Identity CRUD (shared logins, secrets keyed by identity id)
 
     func addIdentity(_ identity: Identity, password: String?, keyData: Data?, passphrase: String?) {
-        var saved = true
-        if let password { saved = Keychain.setPassword(password, for: identity.id) && saved }
-        if let keyData { saved = Keychain.setPrivateKey(keyData, for: identity.id) && saved }
-        if let passphrase, !passphrase.isEmpty {
-            saved = Keychain.setKeyPassphrase(passphrase, for: identity.id) && saved
-        }
+        let saved = Keychain.saveSecrets(for: identity.id, password: password,
+                                         keyData: keyData, passphrase: passphrase)
         doc.identities.append(identity)
         persist()
         if !saved {
-            errorMessage = "Couldn't save the identity's credential to the Keychain."
+            report("Couldn't save the identity's credential to the Keychain.", duration: 8)
         }
     }
 
@@ -131,11 +256,8 @@ final class AppState: ObservableObject {
     func updateIdentity(_ identity: Identity, password: String?, keyData: Data?, passphrase: String?) {
         guard let idx = doc.identities.firstIndex(where: { $0.id == identity.id }) else { return }
         doc.identities[idx] = identity
-        if let password, !password.isEmpty { _ = Keychain.setPassword(password, for: identity.id) }
-        if let keyData { _ = Keychain.setPrivateKey(keyData, for: identity.id) }
-        if let passphrase, !passphrase.isEmpty {
-            _ = Keychain.setKeyPassphrase(passphrase, for: identity.id)
-        }
+        Keychain.saveSecrets(for: identity.id, password: password,
+                             keyData: keyData, passphrase: passphrase)
         // Referencing hosts' pooled connections must re-auth with the new credential.
         dropConnectionsUsing(identity.id)
         persist()
@@ -172,12 +294,17 @@ final class AppState: ObservableObject {
     /// already added under this host. Throws so the scan sheet can show connection
     /// errors inline (it's presented over the shared error alert).
     func scanProjects(on host: Host) async throws -> [ProjectDiscovery.Found] {
-        isBusy = true
-        defer { isBusy = false }
-        let conn = connection(for: host)
-        try await conn.connect()
-        let existing = Set(projects(for: host).map(\.remoteRoot))
-        return try await ProjectDiscovery.scan(conn).filter { !existing.contains($0.remoteRoot) }
+        do {
+            let conn = connection(for: host)
+            try await conn.connect()
+            let existing = Set(projects(for: host).map(\.remoteRoot))
+            return try await ProjectDiscovery.scan(conn).filter { !existing.contains($0.remoteRoot) }
+        } catch {
+            // A changed key needs the trust prompt (it appears once the scan sheet
+            // closes); the sheet still shows the error inline either way.
+            promptIfHostKeyChanged(error, host: host)
+            throw error
+        }
     }
 
     /// Add the chosen discovered roots as projects under `host` (skips duplicates).
@@ -195,21 +322,21 @@ final class AppState: ObservableObject {
         persist()
     }
 
-    private func persist() { store.save(doc) }
+    private func persist() {
+        do {
+            try store.save(doc)
+        } catch {
+            report(error.localizedDescription, duration: 8)
+        }
+    }
 
     // MARK: Connections
 
     func connection(for host: Host) -> SSHConnection {
         if let c = connections[host.id] { return c }
-        let c = connectionFactory(host, resolvedCredential(for: host))
+        let c = connectionFactory(host, host.connectionCredentials(in: doc.identities))
         connections[host.id] = c
         return c
-    }
-
-    /// The effective credential for a host: nil when it uses its own inline fields,
-    /// else the referenced shared identity's user/auth + Keychain secret owner.
-    func resolvedCredential(for host: Host) -> ResolvedCredential? {
-        host.resolvedCredential(in: doc.identities)
     }
 
     /// Instant, no-network snapshot of every instance: the last cached full summary,
@@ -251,6 +378,7 @@ final class AppState: ObservableObject {
     func select(_ project: RemoteProject) {
         selectedProject = project
         layout = nil
+        layoutLoad = .loading
         statuses = [:]
         running = []
         Task { await refreshLayout() }
@@ -265,6 +393,7 @@ final class AppState: ObservableObject {
     func deselect() {
         selectedProject = nil
         layout = nil
+        layoutLoad = .idle
         statuses = [:]
         running = []
         stopPolling()
@@ -272,15 +401,23 @@ final class AppState: ObservableObject {
 
     func refreshLayout() async {
         guard let project = selectedProject, let host = host(for: project) else { return }
-        isBusy = true
-        defer { isBusy = false }
+        // Only show the loading state when nothing is loaded yet — a refresh of
+        // already-visible panes shouldn't flicker the terminal away.
+        if layout == nil { layoutLoad = .loading }
         do {
             let conn = connection(for: host)
             try await conn.connect()
             layout = try await RemoteLayoutStore.read(conn, root: project.remoteRoot)
+            layoutLoad = .loaded
             await runPollOnce()
         } catch {
-            errorMessage = error.localizedDescription
+            if layout == nil {
+                layoutLoad = .failed(error.localizedDescription)
+                // A changed key additionally needs the decision prompt.
+                promptIfHostKeyChanged(error, host: host)
+            } else {
+                surface(error, host: host)
+            }
         }
     }
 
@@ -320,6 +457,12 @@ final class AppState: ObservableObject {
     /// The user viewed a pane — clear its done latch so it stops showing done.
     func attend(_ instanceId: String) { poll.attend(instanceId) }
 
+    /// Refresh `notificationsDenied` (called on foreground, so granting permission
+    /// in Settings clears the sidebar notice on return).
+    func refreshNotificationStatus() async {
+        notificationsDenied = await NotificationManager.authorizationStatus() == .denied
+    }
+
     // MARK: Launch a new instance
 
     func launch(preset: Preset, customCommand: String?, into project: RemoteProject) async {
@@ -328,9 +471,13 @@ final class AppState: ObservableObject {
         let program: String?
         let args: [String]
         if let custom = customCommand, !custom.trimmingCharacters(in: .whitespaces).isEmpty {
-            // Split a custom command line crudely into program + args.
-            let parts = custom.split(separator: " ").map(String.init)
-            program = parts.first
+            // Quote-aware split, so `claude --append-system-prompt "be terse"` works.
+            // The launch sheet live-validates, so nil here is a stale-form edge case.
+            guard let parts = Shell.splitWords(custom), let first = parts.first else {
+                report("Couldn't parse the command — check for an unbalanced quote.")
+                return
+            }
+            program = first
             args = Array(parts.dropFirst())
         } else {
             program = preset.program
@@ -370,7 +517,7 @@ final class AppState: ObservableObject {
                     conn, root: project.remoteRoot, instance: instance)
                 await self.runPollOnce()
             } catch {
-                self.errorMessage = error.localizedDescription
+                self.surface(error, host: host)
             }
         }
     }
@@ -389,7 +536,7 @@ final class AppState: ObservableObject {
             terminals.disconnect(instance.id)
             layout = try await RemoteLayoutStore.removeInstance(conn, root: project.remoteRoot, instanceId: instance.id)
         } catch {
-            errorMessage = error.localizedDescription
+            surface(error, host: host)
         }
     }
 
@@ -406,7 +553,7 @@ final class AppState: ObservableObject {
                 layout = updated
             }
         } catch {
-            errorMessage = error.localizedDescription
+            surface(error, host: host)
         }
     }
 
@@ -433,7 +580,7 @@ final class AppState: ObservableObject {
             lastLaunched = newId
             await runPollOnce()
         } catch {
-            errorMessage = error.localizedDescription
+            surface(error, host: host)
         }
     }
 

@@ -63,12 +63,29 @@ releases via `from:` in `project.yml`):
 > accelerated: iOS repeats `deleteBackward` at a flat rate for a custom key-input view,
 > so `TerminalSession.send` detects a sustained run of backspace bytes and emits extra
 > ones (as raw bytes, not re-entrant `deleteBackward` calls), ramping up the longer
-> it's held. The background poll
+> it's held. A themed **accessory key row** (`TerminalAccessoryRow`) replaces
+> SwiftTerm's stock gray bar above the keyboard: Esc, a sticky **Ctrl** (SwiftTerm's
+> public `controlModifier` — it combines the next typed character and auto-resets,
+> which un-highlights the key), Tab, auto-repeating arrows that honor
+> application-cursor mode (SS3 vs CSI), and paste via SwiftTerm's bracketed-paste-aware
+> `paste(_:)`. **Pinch-to-zoom** resizes the font live (integer snap, 9–24 pt,
+> persisted in `muxel.terminal.fontSize` and applied to every terminal); the font
+> setter drives SwiftTerm's resize → the same PTY window-change path as rotation.
+> **OSC-52** copies from the remote land in the system pasteboard (`set-clipboard on`
+> is enabled on attach alongside `mouse on`). Haptics are deliberately minimal: light
+> ticks on accessory keys, a medium tick on sticky-Ctrl engage, a throttled warning
+> buzz on the terminal bell, and selection ticks on tab-menu actions — nothing on
+> scroll or key auto-repeat. The background poll
 > (`PollService`) still drives status badges +
 > notifications. Password auth, exec, and **SSH key auth** (ed25519 / RSA, with
 > passphrase — ECDSA is detected but not parseable by Citadel) are implemented in
-> `CitadelSSHConnection.swift`. Remaining spikes: the **TOFU host-key validator**
-> (still `.acceptAnything()`) and **jump-host** support.
+> `CitadelSSHConnection.swift`. **Host keys are enforced** with trust-on-first-use
+> (`TOFUHostKeyValidator`, a `.custom` NIOSSH validator over `HostKeyStore`): the
+> first key is pinned silently; a changed key refuses the connection and prompts with
+> the stored vs presented fingerprints ("Trust new key" re-pins). **Jump hosts**
+> tunnel via Citadel's `SSHClient.jump(to:)` — a direct-tcpip channel on the bastion
+> carrying a full SSH session to the target, the `ssh -J` equivalent (single hop;
+> chains are rejected in the form).
 
 ## The muxel remote protocol (keep in sync with `muxel-core`)
 
@@ -117,35 +134,62 @@ iOS has no ssh-agent and no `ssh`/`sshpass`/ControlMaster CLI. So:
 - Multiplexing = **one SSH connection per host with multiple channels** (one exec
   channel for tmux control, one PTY channel per attached pane) — the functional
   equivalent of ControlMaster.
-- Host keys use **TOFU**: the fingerprint is stored on first connect and a change is
-  flagged (mirrors muxel's `accept-new`).
+- Host keys use **TOFU**: the fingerprint is pinned on first connect and a changed
+  key refuses the connection with a stored-vs-presented prompt (mirrors muxel's
+  `accept-new`, plus an explicit re-trust step).
+- **Jump-host auth is explicit**: desktop's `-J` delegates the bastion login to ssh
+  config/agent; iOS has neither, so the bastion authenticates with a picked saved
+  Identity or, by default, the same credential as the target host (`user@` in the
+  jump string overrides the user). The bastion's host key gets its **own TOFU slot**
+  (`HostKeyStore.Scope.jump`), so a bastion swap can't masquerade as the target.
+- **Keepalive is app-level**: Citadel/NIOSSH expose no protocol keepalive, so
+  `keepaliveSecs` runs a serialized `run("true")` ping (clamped ≥5s) — the
+  `ServerAliveInterval` analogue; a failed ping drops the dead transport so the next
+  call reconnects.
 
 ## Where things are stored
 
 - **On device** (this app's own store; the desktop's config lives on the desktop):
   host library + project list as Codable JSON in the app-support dir; SSH
   passwords/keys in the **Keychain** (`kSecAttrAccessibleAfterFirstUnlock`).
+- A damaged `store.json` is never silently reset: it's preserved as
+  `store.json.corrupt` and the app tells you (credentials are unaffected — they live
+  in the Keychain).
+- The optional **App Lock** (Face ID / passcode, toggled in the Identities sheet) is
+  a UI-level gate only — Keychain accessibility deliberately stays
+  `kSecAttrAccessibleAfterFirstUnlock` so background polling and notifications keep
+  working while the phone is locked in a pocket.
 - **On the remote host** (shared with desktop muxel): per-project layout at
   `<remote_root>/.muxel/workspace.json` (`RemoteLayout` v1).
 
 ## Status / roadmap
 
-v1 (lean MVP): connect, collapsible sidebar of hosts/projects, add hosts/projects
-(by path or by **scanning the host** for `.muxel/` markers — `ProjectDiscovery`),
-**live SSH PTY terminal** for every pane (SwiftTerm + Citadel `withPTY`, attached so
-TUI agents work), panes/tabs resolved by uuid8 suffix (so desktop-created panes show
-up too), launch instances (long-press a tab to rename / duplicate / close, with a
-close confirmation), live status badges + a running-count on the selected
-project, **Test connection** to verify a saved credential, on-device background
-notifications, secrets in the Keychain, and a **themeable terminal identity** — a
-mono, prompt-caret chrome over the muxel palette, with a theme picker (Catppuccin,
+v1 (lean MVP): connect, collapsible sidebar of hosts/projects, add + **edit** hosts
+in place (secrets are kept unless replaced, matching identity editing; delete asks
+first — host/project/identity deletion all confirm with what exactly is removed),
+add projects by path or by **scanning the host** for `.muxel/` markers
+(`ProjectDiscovery`), **live SSH PTY terminal** for every pane (SwiftTerm + Citadel
+`withPTY`, attached so TUI agents work), panes/tabs resolved by uuid8 suffix (so
+desktop-created panes show up too), launch instances with quote-aware custom
+commands (long-press a tab to rename / duplicate / close, with a close
+confirmation), live status badges + a running-count on the selected project,
+**Test connection** to verify a saved credential — or the in-form credentials
+*before* saving, right in the host editor — **jump hosts** (single-hop `ssh -J`
+equivalent, with a pickable bastion login), **keepalive**, an optional **App Lock**
+(Face ID / passcode), on-device background notifications (with a quiet sidebar
+pointer when permission is denied), secrets in the Keychain, and a **themeable
+terminal identity** — a mono, prompt-caret chrome over the muxel palette (shared
+`DesignKit` components: prompt headers/labels, themed form sections, one
+`CenteredState` for every empty/loading/error state, and a transient
+`NoticeBanner` instead of blocking error alerts), with a theme picker (Catppuccin,
 Tokyo Night, Gruvbox, Everforest, Solarized, Matrix, …) that recolors the chrome
-**and** the live terminal (bg/fg/cursor + ANSI) together. Palettes are ported from
-the desktop theme JSONs (`Theme/MuxelTheme.swift`); the default is Catppuccin Mocha,
-matching `muxel.svg`. **Login identities** (a sidebar sheet) let you define a reusable
-login once — user + auth + imported key/passphrase or keychain password — and point
-many hosts at it instead of re-entering credentials; the secret is stored in the
-Keychain under the identity id and shared by every host that references it.
+**and** the live terminal (bg/fg/cursor + ANSI + keyboard/accessory row) together.
+Palettes are ported from the desktop theme JSONs (`Theme/MuxelTheme.swift`); the
+default is Catppuccin Mocha, matching `muxel.svg`. **Login identities** (a sidebar
+sheet) let you define a reusable login once — user + auth + imported key/passphrase
+or keychain password — and point many hosts at it instead of re-entering
+credentials; the secret is stored in the Keychain under the identity id and shared
+by every host that references it.
 
 **Live status bar** (a Live Activity): while the app is minimized, a Lock Screen /
 Dynamic Island view lists **each agent instance** and its state — **needs input**

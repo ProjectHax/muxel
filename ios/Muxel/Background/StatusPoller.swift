@@ -28,18 +28,20 @@ struct StatusPoller {
     /// Returns the number of notifications posted.
     @discardableResult
     func run(
-        makeConnection: (Host, ResolvedCredential?) -> SSHConnection = {
-            CitadelSSHConnection(host: $0, credential: $1)
+        makeConnection: (Host, ConnectionCredentials) -> SSHConnection = {
+            CitadelSSHConnection(host: $0, credentials: $1)
         }
     ) async -> Int {
-        let doc = store.load()
+        // Tolerant of a damaged store here (nothing to notify about) — load()
+        // still preserved the file and recorded the notice the app shows next launch.
+        let doc = (try? store.load()) ?? StoreDocument()
         var posted = 0
         var rows: [MuxelActivityAttributes.InstanceRow] = []
         for host in doc.hosts {
             let projects = doc.projects.filter { $0.hostId == host.id }
             guard !projects.isEmpty else { continue }
 
-            let conn = makeConnection(host, host.resolvedCredential(in: doc.identities))
+            let conn = makeConnection(host, host.connectionCredentials(in: doc.identities))
             do { try await conn.connect() } catch { continue }
             defer { Task { await conn.close() } }
 

@@ -9,6 +9,12 @@ enum NotificationManager {
             .requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
+    /// The user's current authorization — `.denied` drives the sidebar's quiet
+    /// "notifications off" pointer (a denial otherwise fails silently forever).
+    static func authorizationStatus() async -> UNAuthorizationStatus {
+        await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
     static func notify(title: String, body: String, identifier: String = UUID().uuidString) {
         let content = UNMutableNotificationContent()
         content.title = title

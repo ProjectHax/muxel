@@ -5,6 +5,7 @@ import SwiftUI
 /// to bringing in projects without typing each absolute path.
 struct DiscoverProjectsView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     let host: Host
 
@@ -34,30 +35,41 @@ struct DiscoverProjectsView: View {
 
     @ViewBuilder
     private var content: some View {
-        if scanning {
-            VStack(spacing: 12) {
-                ProgressView()
-                Text("Scanning \(host.name) for muxel projects…")
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let error {
-            errorState(error)
-        } else if found.isEmpty {
-            emptyState
-        } else {
-            List {
-                Section {
-                    ForEach(found) { item in
-                        row(item)
+        Group {
+            if scanning {
+                CenteredState(spinner: true,
+                              title: "scanning \(host.name)…",
+                              message: "looking for .muxel/ markers under $HOME",
+                              showsGrid: true)
+            } else if let error {
+                CenteredState(icon: "exclamationmark.triangle",
+                              iconColor: theme.blockedColor,
+                              title: "Couldn't scan \(host.name)",
+                              message: error,
+                              showsGrid: true) {
+                    Button("Try again") { Task { await scan() } }
+                        .buttonStyle(.bordered)
+                }
+            } else if found.isEmpty {
+                CenteredState(icon: "folder.badge.questionmark",
+                              title: "No projects found",
+                              message: "Nothing under $HOME on \(host.name) has a .muxel/ "
+                                + "folder yet. Open the project once in desktop muxel, "
+                                + "or add it by path.",
+                              showsGrid: true)
+            } else {
+                List {
+                    MuxelSection("\(found.count) project\(found.count == 1 ? "" : "s") found") {
+                        ForEach(found) { item in
+                            row(item)
+                        }
+                    } footer: {
+                        Text("Each is a directory on \(host.name) containing a .muxel/ folder.")
                     }
-                } header: {
-                    Text("\(found.count) project\(found.count == 1 ? "" : "s") found")
-                } footer: {
-                    Text("Each is a directory on \(host.name) containing a .muxel/ folder.")
                 }
             }
         }
+        .muxelSheet()
     }
 
     private func row(_ item: ProjectDiscovery.Found) -> some View {
@@ -66,53 +78,20 @@ struct DiscoverProjectsView: View {
         } label: {
             HStack(spacing: 12) {
                 Image(systemName: selected.contains(item.id) ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(selected.contains(item.id) ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(selected.contains(item.id) ? theme.accentColor : theme.mutedColor)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(item.name)
+                        .font(.mono(.callout))
                     Text(item.remoteRoot)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .font(.mono(.caption2))
+                        .foregroundStyle(theme.mutedColor)
                         .lineLimit(1)
                         .truncationMode(.head)
                 }
             }
             .contentShape(Rectangle())
         }
-        .tint(.primary)
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "folder.badge.questionmark")
-                .font(.system(size: 40))
-                .foregroundStyle(.secondary)
-            Text("No projects found")
-                .font(.headline)
-            Text("Nothing under $HOME on \(host.name) has a .muxel/ folder yet. Open the project once in desktop muxel, or add it by path.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-        }
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func errorState(_ message: String) -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 40))
-                .foregroundStyle(.orange)
-            Text("Couldn't scan \(host.name)")
-                .font(.headline)
-            Text(message)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Button("Try again") { Task { await scan() } }
-                .buttonStyle(.bordered)
-        }
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .tint(theme.textColor)
     }
 
     private func scan() async {

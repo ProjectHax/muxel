@@ -6,7 +6,7 @@ enum SSHError: LocalizedError {
     case notConnected
     case auth(String)
     case connection(String)
-    case hostKeyChanged(expected: String, got: String)
+    case hostKeyChanged(expected: String, got: String, scope: HostKeyStore.Scope)
     case command(String)
     case missingCredential
 
@@ -15,8 +15,9 @@ enum SSHError: LocalizedError {
         case .notConnected: return "Not connected."
         case let .auth(m): return "Authentication failed: \(m)"
         case let .connection(m): return m
-        case let .hostKeyChanged(expected, got):
-            return "Host key changed!\nExpected \(expected)\nGot \(got)\nConnection refused for safety."
+        case let .hostKeyChanged(expected, got, scope):
+            let which = scope == .jump ? "Jump-host key" : "Host key"
+            return "\(which) changed!\nExpected \(expected)\nGot \(got)\nConnection refused for safety."
         case let .command(m): return "Command failed: \(m)"
         case .missingCredential: return "No saved password or key for this host."
         }
@@ -27,10 +28,11 @@ enum SSHError: LocalizedError {
 /// channels) over a single transport — the iOS equivalent of muxel's ControlMaster.
 ///
 /// The rest of the app depends only on this protocol, so the UI / poll / launch
-/// logic can run against `MockSSHConnection` in previews and tests while the real
-/// Citadel transport is finalized by the SSH spike.
+/// logic can run against `MockSSHConnection` in previews and tests instead of the
+/// real Citadel transport (`CitadelSSHConnection`).
 protocol SSHConnection: AnyObject {
-    /// Establish (or verify) the connection. Performs TOFU host-key validation.
+    /// Establish (or verify) the connection. Real transports perform TOFU host-key
+    /// validation via `HostKeyStore`; a changed key throws `SSHError.hostKeyChanged`.
     func connect() async throws
 
     /// Run a one-shot remote command over an exec channel; returns combined stdout.

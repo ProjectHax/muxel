@@ -39,7 +39,7 @@ struct ProjectDetailView: View {
                 emptyState
             }
         }
-        .background(theme.background.ignoresSafeArea())
+        .muxelBackground()
         .navigationTitle(project.name)
         .navigationBarTitleDisplayMode(.inline)
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
@@ -144,45 +144,55 @@ struct ProjectDetailView: View {
     @ViewBuilder
     private func tabMenu(_ inst: Instance) -> some View {
         Button {
+            UISelectionFeedbackGenerator().selectionChanged()
             renameText = inst.displayName
             renameTarget = inst
         } label: {
             Label("Rename", systemImage: "pencil")
         }
         Button {
+            UISelectionFeedbackGenerator().selectionChanged()
             Task { await state.duplicate(inst, in: project) }
         } label: {
             Label("Duplicate", systemImage: "plus.square.on.square")
         }
         Divider()
         Button(role: .destructive) {
+            UISelectionFeedbackGenerator().selectionChanged()
             closeTarget = inst
         } label: {
             Label("Close", systemImage: "xmark.circle")
         }
     }
 
-    private var emptyState: some View {
-        ZStack {
-            theme.background
-            GridBackground().opacity(0.5)
-            VStack(spacing: 12) {
-                if state.isBusy {
-                    ProgressView()
-                } else {
-                    HStack(spacing: 6) {
-                        Text("❯").foregroundStyle(theme.accentColor)
-                        Text("no panes yet").foregroundStyle(theme.mutedColor)
-                    }
-                    .font(.mono(.callout))
-                    Button { showLaunch = true } label: {
-                        Label("Launch one", systemImage: "plus")
-                            .font(.mono(.footnote, weight: .semibold))
-                    }
-                    .buttonStyle(.borderedProminent)
+    /// The no-terminal states, keyed by the layout's load state so a failed
+    /// connection is distinguishable from a genuinely empty project.
+    @ViewBuilder private var emptyState: some View {
+        switch state.layoutLoad {
+        case .idle, .loading:
+            CenteredState(spinner: true, title: "connecting…", showsGrid: true)
+        case let .failed(message):
+            CenteredState(icon: "wifi.exclamationmark",
+                          iconColor: theme.blockedColor,
+                          title: "can't reach \(state.host(for: project)?.name ?? "the host")",
+                          message: message,
+                          showsGrid: true) {
+                Button {
+                    Task { await state.refreshLayout() }
+                } label: {
+                    Label("Try again", systemImage: "arrow.clockwise")
+                        .font(.mono(.footnote, weight: .semibold))
                 }
+                .buttonStyle(.borderedProminent)
+            }
+        case .loaded:
+            CenteredState(title: "no panes yet", prompt: true, showsGrid: true) {
+                Button { showLaunch = true } label: {
+                    Label("Launch one", systemImage: "plus")
+                        .font(.mono(.footnote, weight: .semibold))
+                }
+                .buttonStyle(.borderedProminent)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

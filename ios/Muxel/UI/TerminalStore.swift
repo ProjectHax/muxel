@@ -36,9 +36,17 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     /// Focuses the terminal (shows the keyboard) on the first tap without waiting for
     /// SwiftTerm's double/triple-tap disambiguation.
     private weak var focusTap: UITapGestureRecognizer?
+    /// Two-finger pinch → live font zoom (see `handlePinch`).
+    private weak var pinchGesture: UIPinchGestureRecognizer?
+    private var pinchBaseSize: CGFloat = 0
+    /// Fires with the final snapped size when a pinch ends; the store persists it
+    /// and re-fonts every other live terminal.
+    var onFontSizeCommitted: ((CGFloat) -> Void)?
     /// Held-backspace acceleration state (see `send`).
     private var deleteStreak = 0
     private var lastDeleteAt: TimeInterval = 0
+    /// Bell-haptic throttle (some TUIs ring BEL per keystroke).
+    private var lastBellAt: TimeInterval = 0
 
     enum Event {
         case send(ByteBuffer)
@@ -50,7 +58,11 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         self.connection = connection
         self.command = command
         super.init()
-        installScrollGesture()
+        installGestures()
+        // Replace SwiftTerm's stock gray accessory bar with the themed muxel row.
+        // Installed before the view can ever become first responder, so no
+        // reloadInputViews() dance is needed.
+        view.inputAccessoryView = TerminalAccessoryRow(session: self)
     }
 
     // MARK: Single-finger fluid scroll → tmux mouse wheel
@@ -61,7 +73,7 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     /// pans (`gestureRecognizerShouldBegin`) so horizontal swipes — the edge back-swipe
     /// — pass through, and SwiftTerm's own pans are made to wait for it
     /// (`shouldBeRequiredToFailBy`), so a swipe scrolls instead of selecting.
-    private func installScrollGesture() {
+    private func installGestures() {
         let g = UIPanGestureRecognizer(target: self, action: #selector(handleScrollPan(_:)))
         g.minimumNumberOfTouches = 1
         g.maximumNumberOfTouches = 1
@@ -77,6 +89,46 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         tap.delegate = self
         view.addGestureRecognizer(tap)
         focusTap = tap
+
+        // Two-finger pinch zooms the font. SwiftTerm ships no pinch of its own; the
+        // 1-finger scroll pan can't see two touches, so they never co-fire (the
+        // finger-added-mid-pan case is cancelled explicitly in handlePinch).
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        pinch.delegate = self
+        view.addGestureRecognizer(pinch)
+        pinchGesture = pinch
+    }
+
+    /// Live font zoom: snap to integer point sizes (bounding re-rasterization and
+    /// the PTY window-change storm to one per point step) between 9 and 24. The
+    /// font setter drives SwiftTerm's `resetFont → resize → sizeChanged`, which
+    /// lands in the existing `.changeSize` → SSH window-change path — tmux reflows
+    /// exactly as it does on rotation.
+    @objc private func handlePinch(_ g: UIPinchGestureRecognizer) {
+        switch g.state {
+        case .began:
+            momentumTask?.cancel()
+            momentumTask = nil
+            // Cancel an in-flight scroll pan so zoom and scroll never fight.
+            scrollGesture?.isEnabled = false
+            scrollGesture?.isEnabled = true
+            pinchBaseSize = view.font.pointSize
+        case .changed:
+            let snapped = TerminalKeys.snappedFontSize(pinchBaseSize * g.scale)
+            if snapped != view.font.pointSize {
+                view.font = .monospacedSystemFont(ofSize: snapped, weight: .regular)
+            }
+        case .ended:
+            onFontSizeCommitted?(view.font.pointSize)
+        default:
+            break
+        }
+    }
+
+    /// Adopt a font size committed on another terminal (or restored at creation).
+    @MainActor func applyFont(size: CGFloat) {
+        guard view.font.pointSize != size else { return }
+        view.font = .monospacedSystemFont(ofSize: size, weight: .regular)
     }
 
     @objc private func handleFocusTap(_ g: UITapGestureRecognizer) {
@@ -247,6 +299,14 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
         view.feed(text: text)
     }
 
+    /// Accessory-key path: raw bytes straight to the PTY, bypassing the delegate
+    /// `send()` heuristics (and resetting the held-backspace streak, so a key tap
+    /// can never extend a delete run).
+    @MainActor func sendKey(_ bytes: [UInt8]) {
+        deleteStreak = 0
+        events.continuation.yield(.send(ByteBuffer(bytes: bytes)))
+    }
+
     // MARK: TerminalViewDelegate
 
     func send(source: TerminalView, data: ArraySlice<UInt8>) {
@@ -299,10 +359,44 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
     func scrolled(source: TerminalView, position: Double) {}
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
-    func bell(source: TerminalView) {}
-    func clipboardCopy(source: TerminalView, content: Data) {}
+
+    /// The remote rang the bell — a warning haptic, throttled so a BEL-per-keystroke
+    /// TUI can't buzz continuously.
+    func bell(source: TerminalView) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastBellAt > 1.5 else { return }
+        lastBellAt = now
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+    }
+
+    /// OSC-52 copy from the remote (tmux `set-clipboard on` forwards it — enabled
+    /// on attach next to `mouse on`). SwiftTerm hands over the already-base64-decoded
+    /// bytes; land them in the system pasteboard.
+    func clipboardCopy(source: TerminalView, content: Data) {
+        guard let text = String(data: content, encoding: .utf8), !text.isEmpty else { return }
+        UIPasteboard.general.string = text
+    }
+
     func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
     func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
+}
+
+/// The persisted terminal font size — pinch-to-zoom sets it, every terminal (live
+/// and future) adopts it. Same UserDefaults convention as `"muxel.theme.id"`.
+enum TerminalFontPreference {
+    static let key = "muxel.terminal.fontSize"
+
+    /// SwiftTerm's default is 12pt; stored values are clamped to the same 9…24
+    /// range the pinch enforces.
+    static var size: CGFloat {
+        get {
+            let stored = UserDefaults.standard.double(forKey: key)
+            return stored > 0 ? TerminalKeys.snappedFontSize(stored) : 12
+        }
+        set { UserDefaults.standard.set(Double(newValue), forKey: key) }
+    }
+
+    static var font: UIFont { .monospacedSystemFont(ofSize: size, weight: .regular) }
 }
 
 /// App-owned cache of live `TerminalSession`s, keyed by instance id, so a pane's SSH
@@ -330,15 +424,29 @@ final class TerminalStore {
     }
 
     /// Get-or-create the session for `instanceId`, starting its PTY on first creation.
+    /// The view is created at the stored font size so the deferred first-size attach
+    /// opens the PTY at the right grid — no post-hoc resize.
     func session(for instanceId: String, hostId: UUID,
                  connection: SSHConnection, command: String) -> TerminalSession {
         if let s = existing(instanceId) { return s }
-        let view = TerminalView(frame: .zero)
+        let view = TerminalView(frame: .zero, font: TerminalFontPreference.font)
         let session = TerminalSession(view: view, connection: connection, command: command)
         view.terminalDelegate = session
+        session.onFontSizeCommitted = { [weak self] size in
+            TerminalFontPreference.size = size
+            self?.applyFontSize(size, except: instanceId)
+        }
         entries[instanceId] = Entry(hostId: hostId, session: session)
         session.start()
         return session
+    }
+
+    /// Re-font every other live terminal after a pinch commits (each one's font
+    /// setter drives its own sizeChanged → SSH window-change).
+    func applyFontSize(_ size: CGFloat, except instanceId: String? = nil) {
+        for (id, e) in entries where id != instanceId {
+            e.session.applyFont(size: size)
+        }
     }
 
     func disconnect(_ instanceId: String) {

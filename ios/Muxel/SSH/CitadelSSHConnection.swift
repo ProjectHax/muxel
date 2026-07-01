@@ -18,19 +18,23 @@ import NIOSSH
 /// Citadel here. ECDSA keys are detected but not yet parseable by the resolved
 /// Citadel; we surface a clear "use ed25519/RSA" error for those.
 ///
-/// SPIKE remaining: host-key validation is still `.acceptAnything()` (the TOFU
-/// validator in `HostKeyStore` is a security follow-up), and jump-host
-/// (`host.jumpHost`) support is unimplemented.
+/// Host keys are enforced with trust-on-first-use (`TOFUHostKeyValidator` over
+/// `HostKeyStore`, mirroring desktop's `accept-new`): a changed key refuses the
+/// connection with `SSHError.hostKeyChanged` until the user explicitly re-trusts.
 actor CitadelSSHConnection: SSHConnection {
     private let host: Host
-    /// Resolved shared-identity credential, if the host references one. When set, it
-    /// overrides the host's inline user/auth and names the Keychain secret owner.
-    private let credential: ResolvedCredential?
+    /// Resolved credentials: the target's (overrides the host's inline user/auth
+    /// and names the Keychain secret owner) and, when `host.jumpHost` is set, the
+    /// bastion's.
+    private let credentials: ConnectionCredentials
     private let hostKeys: HostKeyStore
     private var client: SSHClient?
+    /// The bastion client carrying the tunnel when `host.jumpHost` is set —
+    /// dropped and rebuilt together with `client`.
+    private var bastion: SSHClient?
     /// In-flight connect, so concurrent callers share one handshake (actor isolation
     /// makes the check-and-set of this and `client` race-free).
-    private var connecting: Task<SSHClient, Error>?
+    private var connecting: Task<(client: SSHClient, bastion: SSHClient?), Error>?
     /// Async mutex serializing command execution. Citadel's exec channels don't
     /// tolerate many concurrent commands over one connection (intermittent channel
     /// errors), so the poll loop, terminal capture loops, and launch/layout calls run
@@ -38,9 +42,10 @@ actor CitadelSSHConnection: SSHConnection {
     private var commandBusy = false
     private var commandWaiters: [CheckedContinuation<Void, Never>] = []
 
-    init(host: Host, credential: ResolvedCredential? = nil, hostKeys: HostKeyStore = HostKeyStore()) {
+    init(host: Host, credentials: ConnectionCredentials = .none,
+         hostKeys: HostKeyStore = HostKeyStore()) {
         self.host = host
-        self.credential = credential
+        self.credentials = credentials
         self.hostKeys = hostKeys
     }
 
@@ -58,8 +63,18 @@ actor CitadelSSHConnection: SSHConnection {
             // client so the *next* call reconnects. We fail this call fast rather than
             // awaiting a fresh handshake inline (which can take up to the connect
             // timeout and read as a hang); the caller's poll cadence re-drives.
-            if Self.isTransportFailure(error) { client = nil }
+            if Self.isTransportFailure(error) { dropTransport() }
             throw Self.mapRunError(error)
+        }
+    }
+
+    /// Drop the dead transport — the tunnel's bastion goes with it, since the next
+    /// `connectedClient()` rebuilds bastion-then-tunnel from scratch.
+    private func dropTransport() {
+        client = nil
+        if let b = bastion {
+            bastion = nil
+            Task { try? await b.close() }
         }
     }
 
@@ -85,11 +100,50 @@ actor CitadelSSHConnection: SSHConnection {
     }
 
     func close() async {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
         connecting?.cancel()
         connecting = nil
         try? await client?.close()
         client = nil
+        // A jumped client's session channel doesn't close its bastion — do it here.
+        try? await bastion?.close()
+        bastion = nil
     }
+
+    // MARK: Keepalive (ServerAliveInterval equivalent)
+
+    private var keepaliveTask: Task<Void, Never>?
+
+    /// Interval for the app-level keepalive ping — Citadel/NIOSSH expose no
+    /// protocol-level keepalive, so we ping through the serialized exec path, which
+    /// exercises the full chain (bastion tunnel + transport + a channel round-trip)
+    /// and keeps NAT/firewall entries warm. nil disables; clamped to ≥5s.
+    static func keepaliveInterval(fromSecs secs: Int?) -> Duration? {
+        guard let secs, secs > 0 else { return nil }
+        return .seconds(max(5, secs))
+    }
+
+    /// Start the keepalive loop (idempotent; runs until `close()`). Each tick pings
+    /// only an already-connected client — it never initiates a connect, so
+    /// reconnects stay caller-driven. A failed ping goes through `run()`'s
+    /// transport-failure handling, which drops the dead client so the next caller
+    /// reconnects — exactly the ServerAlive "declare it dead" semantics.
+    private func startKeepaliveIfNeeded() {
+        guard keepaliveTask == nil,
+              let interval = Self.keepaliveInterval(fromSecs: host.keepaliveSecs)
+        else { return }
+        keepaliveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                guard !Task.isCancelled, let self else { return }
+                guard await self.hasLiveClient() else { continue }
+                _ = try? await self.run("true")
+            }
+        }
+    }
+
+    private func hasLiveClient() -> Bool { client != nil }
 
     // MARK: Connect (serialized + reconnecting)
 
@@ -120,63 +174,155 @@ actor CitadelSSHConnection: SSHConnection {
         return stdout.getString(at: stdout.readerIndex, length: stdout.readableBytes) ?? ""
     }
 
-    /// Return a connected client, establishing one if needed. Concurrent callers
-    /// await the same in-flight connect rather than starting a second handshake.
+    /// Return a connected client, establishing one if needed — directly, or through
+    /// the bastion tunnel when `host.jumpHost` is set (Citadel `jump(to:)`, the
+    /// `ssh -J` equivalent: a direct-tcpip channel on the bastion carrying a full
+    /// SSH session to the target). Concurrent callers await the same in-flight
+    /// connect rather than starting a second handshake.
     private func connectedClient() async throws -> SSHClient {
         if let client { return client }
-        if let connecting { return try await connecting.value }
+        if let connecting { return try await connecting.value.client }
 
         // Resolve credentials synchronously so a missing/invalid key fails fast and is
         // never cached behind the connect task.
-        let auth = try authenticationMethod()
+        let targetCred = credentials.target ?? ResolvedCredential(
+            user: host.user, auth: host.auth,
+            keyHasPassphrase: host.keyHasPassphrase, secretOwner: host.id)
+        let targetAuth = try authenticationMethod(for: targetCred, defaultUser: "root")
+        let jump = try resolveJump(targetCred: targetCred)
         let host = self.host
-        let task = Task { () throws -> SSHClient in
+        let hostKeys = self.hostKeys
+
+        let task = Task { () throws -> (client: SSHClient, bastion: SSHClient?) in
+            let targetSettings = SSHClientSettings(
+                host: host.hostname,
+                port: host.displayPort,
+                authenticationMethod: { targetAuth },
+                hostKeyValidator: .custom(TOFUHostKeyValidator(
+                    hostId: host.id, scope: .target, store: hostKeys))
+            )
+
+            guard let jump else {
+                do {
+                    return (try await SSHClient.connect(to: targetSettings), nil)
+                } catch let error as SSHError {
+                    // Our own errors (hostKeyChanged from the TOFU validator) must
+                    // survive verbatim — the UI matches on them.
+                    throw error
+                } catch let error as SSHClientError {
+                    throw SSHError.auth(Self.describe(error, auth: targetCred.auth))
+                } catch {
+                    // The validator's failure can also surface wrapped — unwrap it
+                    // before stringifying the transport error.
+                    if let ssh = Self.unwrapSSHError(error) { throw ssh }
+                    throw SSHError.connection(Self.describeTransport(error))
+                }
+            }
+
+            // Hop 1: the bastion. Its failures name the bastion so the user
+            // doesn't debug the wrong login.
+            let bastionSettings = SSHClientSettings(
+                host: jump.spec.host,
+                port: jump.spec.port,
+                authenticationMethod: { jump.auth },
+                hostKeyValidator: .custom(TOFUHostKeyValidator(
+                    hostId: host.id, scope: .jump, store: hostKeys))
+            )
+            let bastionClient: SSHClient
             do {
-                // SPIKE: replace `.acceptAnything()` with the TOFU validator; wire
-                // `host.jumpHost` for bastion hops.
-                return try await SSHClient.connect(
-                    host: host.hostname,
-                    port: host.displayPort,
-                    authenticationMethod: auth,
-                    hostKeyValidator: .acceptAnything(),
-                    reconnect: .never
-                )
+                bastionClient = try await SSHClient.connect(to: bastionSettings)
+            } catch let error as SSHError {
+                throw error
             } catch let error as SSHClientError {
-                throw SSHError.auth(Self.describe(error, auth: host.auth))
+                throw SSHError.auth("Jump host \(jump.spec.host): "
+                    + Self.describe(error, auth: jump.authKind))
             } catch {
-                throw SSHError.connection(Self.describeTransport(error))
+                if let ssh = Self.unwrapSSHError(error) { throw ssh }
+                throw SSHError.connection("Jump host \(jump.spec.host): "
+                    + Self.describeTransport(error))
+            }
+
+            // Hop 2: the target, tunneled. On any failure the bastion must not
+            // leak — nothing else holds it yet.
+            do {
+                return (try await bastionClient.jump(to: targetSettings), bastionClient)
+            } catch {
+                try? await bastionClient.close()
+                if let ssh = (error as? SSHError) ?? Self.unwrapSSHError(error) { throw ssh }
+                if let e = error as? SSHClientError {
+                    throw SSHError.auth(Self.describe(e, auth: targetCred.auth))
+                }
+                throw SSHError.connection(
+                    "The jump host connected, but couldn't reach "
+                    + "\(host.hostname):\(host.displayPort) through it "
+                    + "(\(Self.describeTransport(error))). "
+                    + "Check AllowTcpForwarding on the bastion.")
             }
         }
         connecting = task
         defer { connecting = nil }
-        let c = try await task.value
-        client = c
-        return c
+        let result = try await task.value
+        client = result.client
+        bastion = result.bastion
+        startKeepaliveIfNeeded()
+        return result.client
+    }
+
+    /// The bastion spec + resolved auth, when the host has a jump host. User
+    /// precedence: `user@` in the jump string > the jump identity's user > the
+    /// target's effective user. Throws on an unparseable spec so a typo fails
+    /// loudly instead of silently connecting direct.
+    private func resolveJump(targetCred: ResolvedCredential)
+        throws -> (spec: JumpHostSpec, auth: SSHAuthenticationMethod, authKind: SshAuthKind)?
+    {
+        guard let raw = host.jumpHost, !raw.isEmpty else { return nil }
+        guard let spec = JumpHostSpec.parse(raw) else {
+            throw SSHError.connection("Couldn't parse the jump host \u{201C}\(raw)\u{201D} — "
+                + "use user@host:port (chains aren't supported).")
+        }
+        var cred = credentials.jump ?? targetCred
+        if let user = spec.user { cred.user = user }
+        let fallbackUser = targetCred.user.isEmpty ? "root" : targetCred.user
+        let auth = try authenticationMethod(for: cred, defaultUser: fallbackUser)
+        return (spec, auth, cred.auth)
+    }
+
+    /// Best-effort recovery of one of our own `SSHError`s from an error that
+    /// crossed the NIO pipeline (the TOFU validator fails the KEX promise with
+    /// `hostKeyChanged`; NIOSSH is expected to deliver it unwrapped, but the UI's
+    /// match must not bet on that).
+    private static func unwrapSSHError(_ error: Error) -> SSHError? {
+        if let e = error as? SSHError { return e }
+        for child in Mirror(reflecting: error).children {
+            if let e = child.value as? SSHError { return e }
+        }
+        return nil
     }
 
     // MARK: Auth
 
-    private func authenticationMethod() throws -> SSHAuthenticationMethod {
-        // Credentials come from the referenced identity when set, else the host's own
-        // inline fields. `owner` is the Keychain id that holds the secret.
-        let rawUser = credential?.user ?? host.user
-        let auth = credential?.auth ?? host.auth
-        let keyHasPassphrase = credential?.keyHasPassphrase ?? host.keyHasPassphrase
-        let owner = credential?.secretOwner ?? host.id
-        let user = rawUser.isEmpty ? "root" : rawUser
-        switch auth {
+    /// Build the Citadel auth method for `cred`, reading its secret from the
+    /// Keychain under `cred.secretOwner`. Shared by the target and bastion hops.
+    private func authenticationMethod(for cred: ResolvedCredential,
+                                      defaultUser: String) throws -> SSHAuthenticationMethod {
+        let user = cred.user.isEmpty ? defaultUser : cred.user
+        switch cred.auth {
         case .password:
-            guard let pw = Keychain.password(for: owner) else { throw SSHError.missingCredential }
+            guard let pw = Keychain.password(for: cred.secretOwner) else {
+                throw SSHError.missingCredential
+            }
             return .passwordBased(username: user, password: pw)
 
         case .key:
-            guard let keyData = Keychain.privateKey(for: owner) else { throw SSHError.missingCredential }
+            guard let keyData = Keychain.privateKey(for: cred.secretOwner) else {
+                throw SSHError.missingCredential
+            }
             guard let keyText = String(data: keyData, encoding: .utf8) else {
                 throw SSHError.auth("The imported key isn't text. Export an OpenSSH private key " +
                                     "(it begins with \u{201C}-----BEGIN OPENSSH PRIVATE KEY-----\u{201D}).")
             }
-            let passphrase: Data? = keyHasPassphrase
-                ? Keychain.keyPassphrase(for: owner).flatMap { $0.data(using: .utf8) }
+            let passphrase: Data? = cred.keyHasPassphrase
+                ? Keychain.keyPassphrase(for: cred.secretOwner).flatMap { $0.data(using: .utf8) }
                 : nil
             return try keyAuth(user: user, keyText: keyText, passphrase: passphrase)
         }

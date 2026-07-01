@@ -18,7 +18,7 @@ struct ThemePickerView: View {
                 }
                 .padding()
             }
-            .background(theme.background.ignoresSafeArea())
+            .muxelBackground()
             .navigationTitle("Theme")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

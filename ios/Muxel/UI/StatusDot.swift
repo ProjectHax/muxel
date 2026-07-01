@@ -49,19 +49,3 @@ struct StatusDot: View {
         return status == .blocked ? theme.blockedColor : theme.runningColor
     }
 }
-
-/// A status pill (dot + text) for the tab bar.
-struct StatusBadge: View {
-    @Environment(\.theme) private var theme
-    let status: AgentStatus
-    var body: some View {
-        HStack(spacing: 4) {
-            StatusDot(status: status)
-            Text(status.label).font(.mono(.caption2))
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(status.color(theme).opacity(0.14))
-        .clipShape(Capsule())
-    }
-}
