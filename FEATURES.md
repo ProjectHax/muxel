@@ -207,7 +207,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Scrollback** — history with a draggable overlay scrollbar; clear it via
   `Ctrl+Shift+K` or the tab's "Clear scrollback" menu item. The mouse wheel
   scrolls history, or — for full-screen apps that enable mouse reporting
-  (opencode, grok, vim) — is forwarded to the app so it scrolls its own content.
+  (opencode, grok, vim, tmux) — is forwarded to the app so it scrolls its own
+  content (tmux mouse mode is turned on automatically for tmux-backed panes).
 - **Scrollback search** — `Ctrl+Shift+F` (while a terminal is focused) opens a
   search bar that highlights matches and jumps through them (Enter / ↑ / ↓),
   scanning the full history.
@@ -293,6 +294,11 @@ feature is added or changed, update the matching entry here in the same change**
   optionally verify it). Shells and agents then run on the remote, in a pane that
   behaves exactly like a local one. Local muxel still owns the UI, layout, and
   settings.
+- **Scan for remote projects** — in the new-remote-project wizard, "Scan for
+  projects" searches the host for existing muxel projects (`.muxel/workspace.json`
+  markers, heavy dirs pruned) and lists the found roots; clicking one fills in the
+  directory and name so you can open it without typing the path. Mirrors the iOS
+  companion app's host scan.
 - **SSH host library** — Settings → Remotes manages saved hosts with the common
   options: hostname/alias, port, user, auth (ssh-agent, key file, or password),
   ProxyJump, agent forwarding, host-key policy, keepalive, and extra `-o` options.
@@ -305,7 +311,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Resilient sessions** — remote panes default to a persistent tmux session on
   the host, so a dropped connection is survivable: reconnecting re-attaches the
   still-running agent. One multiplexed SSH connection per host is shared by the
-  pane and all git calls.
+  pane and all git calls. Launching a tmux session (remote, or a local tmux-mode
+  project) enables tmux `mouse on`, so the pane's scroll wheel scrolls tmux's own
+  copy-mode history instead of just the visible screen.
 - **Roaming layouts** — a remote project's pane layout is mirrored to the host at
   `<remote_root>/.muxel/workspace.json`, so opening the same project from another
   machine restores the whole session (the tmux-backed panes re-attach to their

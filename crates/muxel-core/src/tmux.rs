@@ -45,6 +45,30 @@ pub fn new_session_args(
     v
 }
 
+/// Arguments for a single `tmux …` invocation that turns on mouse mode and then
+/// create-or-attaches the session. tmux runs the `;`-separated commands in order:
+/// `set -g mouse on` first, then `new-session -A …`. Enabling mouse mode is what lets
+/// the terminal's scroll-wheel forwarding reach tmux's own copy-mode scrollback
+/// (without it, tmux never sets the emulator's mouse flag and the wheel only scrolls
+/// the local, tmux-painted screen). `-g` (global) so it applies before the session
+/// exists; it's idempotent, so re-running on every launch is harmless.
+pub fn launch_session_args(
+    session: &str,
+    cwd: Option<&str>,
+    program: Option<&str>,
+    args: &[String],
+) -> Vec<String> {
+    let mut v = vec![
+        "set".to_string(),
+        "-g".to_string(),
+        "mouse".to_string(),
+        "on".to_string(),
+        ";".to_string(),
+    ];
+    v.extend(new_session_args(session, cwd, program, args));
+    v
+}
+
 /// Arguments for `tmux …` to kill a session (exact-match `=` target).
 pub fn kill_session_args(session: &str) -> Vec<String> {
     vec![
@@ -105,5 +129,26 @@ mod tests {
     #[test]
     fn kill_uses_exact_match_target() {
         assert_eq!(kill_session_args("s"), vec!["kill-session", "-t", "=s"]);
+    }
+
+    #[test]
+    fn launch_enables_mouse_then_creates_session() {
+        let args = launch_session_args("muxel_p_123", Some("/work"), None, &[]);
+        assert_eq!(
+            args,
+            vec![
+                "set",
+                "-g",
+                "mouse",
+                "on",
+                ";",
+                "new-session",
+                "-A",
+                "-s",
+                "muxel_p_123",
+                "-c",
+                "/work"
+            ]
+        );
     }
 }

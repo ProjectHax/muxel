@@ -840,6 +840,16 @@ impl Render for DragGhost {
     }
 }
 
+/// State of the remote-project wizard's "Scan for projects" action: scanning a
+/// host for `.muxel/workspace.json` markers, then the found roots (or an error).
+#[derive(Clone)]
+enum RemoteScanState {
+    Idle,
+    Scanning,
+    Found(Vec<String>),
+    Failed(String),
+}
+
 pub struct MuxelApp {
     workspace: Workspace,
     /// Live terminals, keyed by instance id.
@@ -1044,6 +1054,8 @@ pub struct MuxelApp {
     nr_name: Entity<InputState>,
     /// Inline result of the wizard's "Verify" (shown above the buttons).
     nr_verify: RemoteTestState,
+    /// Inline result of the wizard's "Scan for projects" (found remote roots).
+    nr_scan: RemoteScanState,
     /// Reusable task launchers.
     runners: Vec<Runner>,
     /// Reusable text snippets typed into an existing pane on demand.
@@ -2496,6 +2508,7 @@ impl MuxelApp {
             nr_dir,
             nr_name,
             nr_verify: RemoteTestState::Idle,
+            nr_scan: RemoteScanState::Idle,
             runners,
             snippets,
             loops,
@@ -2856,7 +2869,7 @@ impl MuxelApp {
             // so it persists and re-attaches across restarts.
             let spec = match inst.and_then(|i| i.tmux_session.clone()) {
                 Some(session) => {
-                    let args = muxel_core::tmux::new_session_args(
+                    let args = muxel_core::tmux::launch_session_args(
                         &session,
                         cwd.as_deref(),
                         resolved.program.as_deref(),
@@ -3368,6 +3381,7 @@ impl MuxelApp {
         self.show_new_remote = true;
         self.nr_host = self.remotes.first().map(|h| h.id);
         self.nr_verify = RemoteTestState::Idle;
+        self.nr_scan = RemoteScanState::Idle;
         self.nr_dir.update(cx, |s, cx| s.set_value("", window, cx));
         self.nr_name.update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
@@ -3421,6 +3435,63 @@ impl MuxelApp {
             });
         })
         .detach();
+    }
+
+    /// Scan the chosen host for existing muxel projects (background), then show
+    /// the found roots as clickable rows the user can pick to fill the inputs.
+    fn scan_remote_dirs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self
+            .nr_host
+            .and_then(|id| self.remotes.iter().find(|h| h.id == id))
+            .cloned()
+        else {
+            return;
+        };
+        let password = self.remote_password(host.id);
+        // Can't scan a password host without a password (none saved/in session).
+        if host.auth == SshAuth::Password && password.is_none() {
+            self.nr_scan = RemoteScanState::Failed(
+                t("Save a password for this host (or connect once) to scan.").into(),
+            );
+            cx.notify();
+            return;
+        }
+        let control_path = Self::control_path_for(host.id);
+        self.nr_scan = RemoteScanState::Scanning;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    integrations::scan_remote_projects(&host, &control_path, password.as_deref())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.nr_scan = match res {
+                    Ok(roots) => RemoteScanState::Found(roots),
+                    Err(e) => RemoteScanState::Failed(format!("{e}")),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fill the wizard inputs from a scanned root so the user can Create it. The
+    /// root is known to exist (it has a `.muxel/workspace.json`), so mark Verify OK.
+    fn pick_scanned_root(&mut self, root: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.nr_dir
+            .update(cx, |s, cx| s.set_value(root, window, cx));
+        let name = root
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("remote");
+        self.nr_name
+            .update(cx, |s, cx| s.set_value(name, window, cx));
+        self.nr_verify = RemoteTestState::Ok(tf("Found {dir}", &[("dir", root)]));
+        cx.notify();
     }
 
     /// Create the remote project from the wizard inputs.
@@ -6851,6 +6922,69 @@ impl MuxelApp {
             }
             card.child(self.settings_label(&t("Host"), cx))
                 .child(hosts)
+                .child(
+                    div().pt_1().child(
+                        Button::new("nr-scan")
+                            .ghost()
+                            .icon(IconName::Search)
+                            .label(t("Scan for projects"))
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                this.scan_remote_dirs(window, cx)
+                            })),
+                    ),
+                )
+                // Inline scan status / found-project rows (click one to fill the inputs).
+                .children(match &self.nr_scan {
+                    RemoteScanState::Idle => None,
+                    RemoteScanState::Scanning => Some(
+                        div()
+                            .pt_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t("Scanning…"))
+                            .into_any_element(),
+                    ),
+                    RemoteScanState::Failed(msg) => Some(
+                        div()
+                            .pt_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(format!("✗ {msg}"))
+                            .into_any_element(),
+                    ),
+                    RemoteScanState::Found(roots) if roots.is_empty() => Some(
+                        div()
+                            .pt_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t("No muxel projects found on this host."))
+                            .into_any_element(),
+                    ),
+                    RemoteScanState::Found(roots) => {
+                        let mut list = div()
+                            .id("nr-found-list")
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .pt_1()
+                            .max_h(px(180.))
+                            .overflow_y_scroll();
+                        for r in roots {
+                            let root = r.clone();
+                            list = list.child(
+                                Button::new(SharedString::from(format!("nr-found-{root}")))
+                                    .ghost()
+                                    .icon(IconName::Folder)
+                                    .label(root.clone())
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
+                                        this.pick_scanned_root(&root, window, cx)
+                                    })),
+                            );
+                        }
+                        Some(list.into_any_element())
+                    }
+                })
                 .child(self.settings_label(&t("Remote directory"), cx))
                 .child(Input::new(&self.nr_dir))
                 .child(self.settings_label(&t("Project name (optional)"), cx))

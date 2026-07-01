@@ -122,7 +122,7 @@ fn remote_command(spec: &SshSpec) -> String {
         // resumes the running agent. Reuse the local tmux arg builder, run remote.
         let session = spec.tmux_session.unwrap_or("muxel");
         let targs =
-            crate::tmux::new_session_args(session, spec.remote_cwd, spec.program, spec.args);
+            crate::tmux::launch_session_args(session, spec.remote_cwd, spec.program, spec.args);
         let mut cmd = String::from("exec tmux");
         for a in &targs {
             cmd.push(' ');
@@ -307,7 +307,7 @@ mod tests {
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
-            "exec tmux new-session -A -s muxel-abc123 -c /srv/app -- claude"
+            "exec tmux set -g mouse on ';' new-session -A -s muxel-abc123 -c /srv/app -- claude"
         );
     }
 

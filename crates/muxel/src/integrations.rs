@@ -444,6 +444,39 @@ fn is_ssh_transport_failure(auth: SshAuth, code: Option<i32>) -> bool {
     }
 }
 
+/// Scan a remote host for muxel projects: `find $HOME` for the
+/// `.muxel/workspace.json` markers muxel writes on sync, returning the deduped,
+/// sorted project roots. Depth-capped and heavy dirs pruned so it's quick over a
+/// one-shot exec channel — the desktop port of the iOS `ProjectDiscovery` scan. A
+/// non-zero `find` (unreadable dirs) is fine; only an ssh transport/auth failure is
+/// surfaced as an error.
+pub fn scan_remote_projects(
+    host: &RemoteHost,
+    control_path: &str,
+    password: Option<&str>,
+) -> Result<Vec<String>> {
+    const MARKER: &str = "/.muxel/workspace.json";
+    let cmd = format!(
+        "find \"$HOME\" -maxdepth 7 \\( -name node_modules -o -name .git -o -name .cache \
+         -o -name .cargo -o -name .rustup -o -name .npm -o -name target -o -name vendor \
+         -o -name Library -o -name .Trash \\) -prune -o -type f -path '*{MARKER}' -print 2>/dev/null"
+    );
+    let out = ssh_run(host, control_path, password, &cmd)?;
+    if !out.status.success() && is_ssh_transport_failure(host.auth, out.status.code()) {
+        bail!("{}", ssh_error_message(&out));
+    }
+    let mut roots: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.ends_with(MARKER))
+        .map(|l| l[..l.len() - MARKER.len()].to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 /// Map an ssh/sshpass spawn failure to an actionable message: a missing
 /// `sshpass` (saved-password auth, Unix-only) or a missing `ssh`.
 fn ssh_spawn_error(auth: SshAuth, e: std::io::Error) -> anyhow::Error {
