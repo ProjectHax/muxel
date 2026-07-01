@@ -10,13 +10,19 @@ import SwiftTerm
 /// deliberately does nothing.
 struct LiveTerminalView: UIViewRepresentable {
     let session: TerminalSession
+    /// The active theme — applied to the terminal's bg/fg/cursor/ANSI palette, and
+    /// re-applied via `updateUIView` when the user switches themes.
+    var theme: MuxelTheme
 
     func makeUIView(context: Context) -> TerminalView {
         // The same UIView may be re-mounted after navigation; detach from any stale
         // superview so UIKit can re-parent it without asserting.
         session.view.removeFromSuperview()
+        theme.apply(to: session.view)
         return session.view
     }
 
-    func updateUIView(_ uiView: TerminalView, context: Context) {}
+    func updateUIView(_ uiView: TerminalView, context: Context) {
+        theme.apply(to: uiView)
+    }
 }

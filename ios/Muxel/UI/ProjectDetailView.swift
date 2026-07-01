@@ -7,6 +7,7 @@ import UIKit
 struct ProjectDetailView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.verticalSizeClass) private var vSizeClass
+    @Environment(\.theme) private var theme
     let project: RemoteProject
     @State private var selectedTab: String?
     @State private var showLaunch = false
@@ -38,6 +39,7 @@ struct ProjectDetailView: View {
                 emptyState
             }
         }
+        .background(theme.background.ignoresSafeArea())
         .navigationTitle(project.name)
         .navigationBarTitleDisplayMode(.inline)
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
@@ -126,12 +128,14 @@ struct ProjectDetailView: View {
         } label: {
             HStack(spacing: 6) {
                 StatusDot(status: state.status(inst.id), running: state.isRunning(inst.id))
-                Text(inst.displayName).lineLimit(1)
+                Text(inst.displayName)
+                    .font(.mono(.footnote, weight: isActive ? .semibold : .regular))
+                    .foregroundStyle(isActive ? theme.textColor : theme.mutedColor)
+                    .lineLimit(1)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
-            .background(isActive ? Color.accentColor.opacity(0.18) : Color(.secondarySystemBackground))
-            .clipShape(Capsule())
+            .paneCard(theme, active: isActive, radius: 8)
         }
         .buttonStyle(.plain)
         .contextMenu { tabMenu(inst) }
@@ -159,16 +163,24 @@ struct ProjectDetailView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 10) {
-            if state.isBusy {
-                ProgressView()
-            } else {
-                Image(systemName: "rectangle.dashed").font(.largeTitle).foregroundStyle(.secondary)
-                Text("No instances yet").font(.headline)
-                Button { showLaunch = true } label: {
-                    Label("Launch one", systemImage: "plus")
+        ZStack {
+            theme.background
+            GridBackground().opacity(0.5)
+            VStack(spacing: 12) {
+                if state.isBusy {
+                    ProgressView()
+                } else {
+                    HStack(spacing: 6) {
+                        Text("❯").foregroundStyle(theme.accentColor)
+                        Text("no panes yet").foregroundStyle(theme.mutedColor)
+                    }
+                    .font(.mono(.callout))
+                    Button { showLaunch = true } label: {
+                        Label("Launch one", systemImage: "plus")
+                            .font(.mono(.footnote, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

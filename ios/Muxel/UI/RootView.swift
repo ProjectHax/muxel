@@ -5,6 +5,7 @@ import SwiftUI
 /// landscape and a push navigation on iPhone for free.
 struct RootView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.theme) private var theme
     @State private var showAddHost = false
     @State private var addProjectForHost: Host?
     @State private var discoverForHost: Host?
@@ -52,17 +53,24 @@ struct RootView: View {
     }
 
     private var placeholder: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "terminal")
-                .font(.system(size: 44))
-                .foregroundStyle(.secondary)
-            Text("Select a project")
-                .font(.headline)
-            Text("Add a host and a project from the sidebar to get started.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+        ZStack {
+            theme.background.ignoresSafeArea()
+            GridBackground().opacity(0.5)
+            VStack(spacing: 14) {
+                Text("muxel")
+                    .font(.mono(.largeTitle, weight: .bold))
+                    .foregroundStyle(theme.textColor)
+                HStack(spacing: 6) {
+                    Text("❯").foregroundStyle(theme.accentColor)
+                    Text("select a project").foregroundStyle(theme.mutedColor)
+                }
+                .font(.mono(.callout))
+                Text("Add a host and a project from the sidebar to get started.")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedColor)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 40)
+            }
         }
-        .padding()
     }
 }

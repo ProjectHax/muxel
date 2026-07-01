@@ -8,6 +8,7 @@ import SwiftUI
 struct TerminalPaneView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.theme) private var theme
     let host: Host
     let project: RemoteProject
     let instance: Instance
@@ -18,14 +19,16 @@ struct TerminalPaneView: View {
     var body: some View {
         Group {
             if let session {
-                LiveTerminalView(session: session)
-                    .background(Color.black)
+                LiveTerminalView(session: session, theme: theme)
+                    .background(theme.background)
             } else if let error {
                 errorState(error)
             } else {
                 centered {
                     ProgressView()
-                    Text("Attaching to \(host.name)…").foregroundStyle(.secondary)
+                    Text("attaching to \(host.name)…")
+                        .font(.mono(.footnote))
+                        .foregroundStyle(theme.mutedColor)
                 }
             }
         }
@@ -102,9 +105,16 @@ struct TerminalPaneView: View {
 
     private func errorState(_ message: String) -> some View {
         centered {
-            Image(systemName: "wifi.exclamationmark").font(.largeTitle).foregroundStyle(.orange)
-            Text("Can't reach \(host.name)").font(.headline)
-            Text(message).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Image(systemName: "wifi.exclamationmark")
+                .font(.largeTitle)
+                .foregroundStyle(theme.blockedColor)
+            Text("can't reach \(host.name)")
+                .font(.mono(.callout, weight: .semibold))
+                .foregroundStyle(theme.textColor)
+            Text(message)
+                .font(.mono(.caption))
+                .foregroundStyle(theme.mutedColor)
+                .multilineTextAlignment(.center)
             Button("Try again") { Task { await resolve() } }.buttonStyle(.bordered)
         }
     }
