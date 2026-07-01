@@ -381,6 +381,9 @@ pub struct Workspace {
     /// Persisted file-browser sidebar width in pixels (None = default).
     #[serde(default)]
     pub file_browser_width: Option<f32>,
+    /// Persisted memory-panel sidebar width in pixels (None = default).
+    #[serde(default)]
+    pub memory_panel_width: Option<f32>,
     /// Persisted git-diff panel width in pixels (None = default).
     #[serde(default)]
     pub gitdiff_panel_width: Option<f32>,

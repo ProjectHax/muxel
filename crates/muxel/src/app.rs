@@ -6410,10 +6410,17 @@ impl MuxelApp {
             .is_some_and(|p| p.remote.is_some() || self.use_tmux)
     }
 
-    /// Open the project-memory manager modal for `pid`, loading + maintaining the
-    /// `.muxel/MEMORY.md` entries.
-    fn open_memory_modal(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    /// Toggle the project-memory panel for `pid` (hides if already shown for that
+    /// project; otherwise shows it and loads + maintains the `.muxel/MEMORY.md`
+    /// entries). Mirrors [`toggle_file_browser`]; the two docked panels share a slot.
+    fn toggle_memory_panel(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_memory && self.memory_pid == Some(pid) {
+            self.show_memory = false;
+            cx.notify();
+            return;
+        }
         self.show_memory = true;
+        self.show_file_browser = false; // the two docked panels share the slot
         self.memory_pid = Some(pid);
         self.memory_confirm_delete = None;
         for input in [
@@ -6425,12 +6432,6 @@ impl MuxelApp {
             input.update(cx, |s, cx| s.set_value("", window, cx));
         }
         self.reload_memory(window, cx);
-        cx.notify();
-    }
-
-    fn close_memory_modal(&mut self, cx: &mut Context<Self>) {
-        self.show_memory = false;
-        self.memory_confirm_delete = None;
         cx.notify();
     }
 
@@ -7241,12 +7242,16 @@ impl MuxelApp {
             .into_any_element()
     }
 
-    /// The project-memory manager modal: search, the maintained (ordered) entry
-    /// list with pin / delete, an add form, and an "open raw file" escape hatch.
-    fn render_memory_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The docked project-memory panel (second sidebar, like the file browser):
+    /// header, search, the maintained (ordered) entry list with pin / delete, and an
+    /// add form pinned at the bottom.
+    fn render_memory_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(pid) = self.memory_pid else {
+            return div().into_any_element();
+        };
         let pname = self
-            .memory_pid
-            .and_then(|pid| self.workspace.project(pid))
+            .workspace
+            .project(pid)
             .map(|p| p.name.clone())
             .unwrap_or_default();
         let muted = cx.theme().muted_foreground;
@@ -7266,21 +7271,24 @@ impl MuxelApp {
 
         let mut list = div()
             .id("memory-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2()
+            .py_1()
             .flex()
             .flex_col()
-            .gap_2()
-            .max_h(px(360.0))
-            .overflow_y_scroll();
+            .gap_2();
 
         if self.memory_entries.is_empty() {
-            list = list.child(div().py_4().text_sm().text_color(muted).child(t(
+            list = list.child(div().py_2().text_xs().text_color(muted).child(t(
                 "No memories yet — add one below. Agents also add entries as they work here.",
             )));
         } else if visible.is_empty() {
             list = list.child(
                 div()
-                    .py_4()
-                    .text_sm()
+                    .py_2()
+                    .text_xs()
                     .text_color(muted)
                     .child(t("No entries match your search.")),
             );
@@ -7387,91 +7395,88 @@ impl MuxelApp {
             }
         }
 
+        // Add form, pinned at the bottom of the panel.
         let add_form = div()
             .flex()
             .flex_col()
-            .gap_2()
-            .pt_2()
-            .child(self.settings_label(&t("Add a memory"), cx))
-            .child(Input::new(&self.memory_title_input))
-            .child(Input::new(&self.memory_note_input))
-            .child(Input::new(&self.memory_tags_input))
-            .child(
-                div().flex().justify_end().child(
-                    Button::new("mem-add")
-                        .primary()
-                        .icon(IconName::Plus)
-                        .label(t("Add"))
-                        .on_click(
-                            cx.listener(|this, _e, window, cx| this.add_memory_entry(window, cx)),
-                        ),
-                ),
-            );
-
-        let card = div()
-            .w(px(520.0))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_5()
-            .bg(cx.theme().background)
-            .border_1()
+            .gap_1()
+            .p_2()
+            .border_t_1()
             .border_color(cx.theme().border)
-            .rounded(cx.theme().radius_lg)
-            .shadow_lg()
-            .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
+            .child(Input::new(&self.memory_title_input).w_full())
+            .child(Input::new(&self.memory_note_input).w_full())
+            .child(Input::new(&self.memory_tags_input).w_full())
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_lg().font_semibold().child(t("Project memory")))
-                    .child(div().flex_1())
-                    .child(div().text_xs().text_color(muted).child(pname)),
-            )
-            .child(Input::new(&self.memory_search))
-            .child(list)
-            .child(add_form)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("mem-open-file")
-                            .ghost()
-                            .icon(IconName::File)
-                            .label(t("Open MEMORY.md"))
-                            .on_click(cx.listener(|this, _e, window, cx| {
-                                if let Some(pid) = this.memory_pid {
-                                    this.close_memory_modal(cx);
-                                    this.open_project_memory(pid, window, cx);
-                                }
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("mem-close")
-                            .primary()
-                            .label(t("Done"))
-                            .on_click(cx.listener(|this, _e, _w, cx| this.close_memory_modal(cx))),
+                Button::new("mem-add")
+                    .primary()
+                    .xsmall()
+                    .icon(IconName::Plus)
+                    .label(t("Add memory"))
+                    .on_click(
+                        cx.listener(|this, _e, window, cx| this.add_memory_entry(window, cx)),
                     ),
             );
 
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _ev, _w, cx| this.close_memory_modal(cx)),
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .bg(cx.theme().sidebar)
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(px(6.0))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(tf(
+                                "MEMORY · {proj_name}",
+                                &[("proj_name", &pname.to_string())],
+                            )),
+                    )
+                    .child(
+                        Button::new("mem-open-file")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::File)
+                            .tooltip(t("Open MEMORY.md in editor"))
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                this.open_project_memory(pid, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("mem-close")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip(t("Close memory panel"))
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.show_memory = false;
+                                cx.notify();
+                            })),
+                    ),
             )
-            .child(card)
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .child(Input::new(&self.memory_search).w_full()),
+            )
+            .child(list)
+            .child(add_form)
             .into_any_element()
     }
 
@@ -9262,6 +9267,13 @@ impl MuxelApp {
         }
     }
 
+    fn set_memory_panel_width(&mut self, width: f32, _cx: &mut Context<Self>) {
+        if self.workspace.memory_panel_width != Some(width) {
+            self.workspace.memory_panel_width = Some(width);
+            self.persist();
+        }
+    }
+
     /// Toggle the file-browser sidebar for project `pid` (hides if already shown
     /// for that project; otherwise selects it + loads its file list in the
     /// background so a large repo doesn't freeze the UI).
@@ -9284,6 +9296,7 @@ impl MuxelApp {
             return;
         }
         self.show_file_browser = true;
+        self.show_memory = false; // the two docked panels share the slot
         // `select_project` re-points the open browser at `pid` (see its tail).
         self.select_project(pid, window, cx);
     }
@@ -11885,9 +11898,10 @@ impl MuxelApp {
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Star)
+                                    .selected(self.show_memory && self.memory_pid == Some(pid))
                                     .tooltip(t("Project memory"))
                                     .on_click(cx.listener(move |this, _e, window, cx| {
-                                        this.open_memory_modal(pid, window, cx)
+                                        this.toggle_memory_panel(pid, window, cx)
                                     })),
                             )
                     }))
@@ -17555,6 +17569,37 @@ impl Render for MuxelApp {
                     }
                 })
                 .into_any_element()
+        } else if self.show_memory {
+            let mem_half = (f32::from(window.viewport_size().width) * 0.5).max(360.0);
+            let mem_saved = self
+                .workspace
+                .memory_panel_width
+                .unwrap_or(280.0)
+                .clamp(200.0, mem_half);
+            let mem_key = SharedString::from(format!(
+                "mem-split-{}",
+                self.current_workspace
+                    .map(|p| p.simple().to_string())
+                    .unwrap_or_default()
+            ));
+            h_resizable(mem_key)
+                .child(
+                    resizable_panel()
+                        .size(px(mem_saved))
+                        .size_range(px(200.0)..px(mem_half))
+                        .child(self.render_memory_panel(cx)),
+                )
+                .child(resizable_panel().child(main_column))
+                .on_resize(|state, _window, cx| {
+                    let width = state.read(cx).sizes().first().map(|p| f32::from(*p));
+                    if let Some(width) = width
+                        && let Some(app) =
+                            cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade())
+                    {
+                        app.update(cx, |app, cx| app.set_memory_panel_width(width, cx));
+                    }
+                })
+                .into_any_element()
         } else {
             main_column.into_any_element()
         };
@@ -17774,7 +17819,6 @@ impl Render for MuxelApp {
                 self.show_new_remote
                     .then(|| self.render_remote_project_modal(cx)),
             )
-            .children(self.show_memory.then(|| self.render_memory_modal(cx)))
             .children(
                 self.password_prompt
                     .is_some()

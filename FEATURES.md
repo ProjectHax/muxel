@@ -90,10 +90,12 @@ feature is added or changed, update the matching entry here in the same change**
   un-pinned entries (evicting the least-recently-used) — so it stays small and
   greppable and never needs hand-pruning. A legacy flat `MEMORY.md` is imported, not
   lost, on first open.
-- **Memory manager** — the project row's memory button opens a manager: search/grep
-  the entries, add one (title + note + tags), pin/unpin (pinned entries are exempt
-  from purge and cap), delete (with confirm), or open the raw `MEMORY.md` in the
-  editor. Entries load and persist over SSH for remote projects too.
+- **Memory panel** — the project row's memory button toggles a docked, resizable
+  second-sidebar panel (like the file browser, sharing its slot; width persists per
+  workspace): search/grep the entries, add one (title + note + tags), pin/unpin
+  (pinned entries are exempt from purge and cap), delete (with confirm), or open the
+  raw `MEMORY.md` in the editor. Entries load and persist over SSH for remote
+  projects too.
 
 ## Agent status
 
