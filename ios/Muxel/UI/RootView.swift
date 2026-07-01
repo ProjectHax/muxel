@@ -16,6 +16,7 @@ struct RootView: View {
                         addProjectForHost: $addProjectForHost,
                         discoverForHost: $discoverForHost)
                 .navigationTitle("muxel")
+                .navigationBarTitleDisplayMode(.inline)
         } detail: {
             if let project = state.selectedProject {
                 ProjectDetailView(project: project)
@@ -57,6 +58,10 @@ struct RootView: View {
             theme.background.ignoresSafeArea()
             GridBackground().opacity(0.5)
             VStack(spacing: 14) {
+                Image("MuxelMark")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 64, height: 64)
                 Text("muxel")
                     .font(.mono(.largeTitle, weight: .bold))
                     .foregroundStyle(theme.textColor)

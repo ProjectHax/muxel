@@ -72,6 +72,17 @@ struct SidebarView: View {
         .scrollContentBackground(.hidden)
         .background(theme.background.ignoresSafeArea())
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 6) {
+                    Image("MuxelMark")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 20, height: 20)
+                    Text("muxel")
+                        .font(.mono(.headline, weight: .bold))
+                        .foregroundStyle(theme.textColor)
+                }
+            }
             ToolbarItem(placement: .topBarLeading) {
                 Button { showThemePicker = true } label: {
                     Image(systemName: "paintpalette")
