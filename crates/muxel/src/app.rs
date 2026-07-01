@@ -4387,6 +4387,93 @@ impl MuxelApp {
         .detach();
     }
 
+    /// Re-fetch the shared `.muxel/workspace.json` for each already-reconciled synced
+    /// project and adopt a peer's instance renames live (see `reconcile_remote_names`),
+    /// off the UI thread. Runs on the same ~5s throttle as branch polling. This is the
+    /// live counterpart to the connect-time `apply_remote_layout_sync`, but surgical:
+    /// it never tears panes down (structural changes still reconcile on next connect).
+    fn fetch_remote_layouts(&mut self, cx: &mut Context<Self>) {
+        let synced: Vec<Uuid> = self.remote_synced.iter().copied().collect();
+        let jobs: Vec<(Uuid, integrations::RepoLoc)> = synced
+            .into_iter()
+            .filter(|pid| self.project_syncs_layout(*pid))
+            .filter_map(|pid| self.repo_loc(pid).map(|loc| (pid, loc)))
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_executor()
+                .spawn(async move {
+                    jobs.into_iter()
+                        .map(|(pid, loc)| (pid, integrations::fetch_remote_layout(&loc)))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let mut changed = false;
+                for (pid, json) in results {
+                    if let Some(json) = json {
+                        changed |= this.reconcile_remote_names(pid, &json);
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Adopt just the peer-set instance names (`custom_name`) from a fetched remote
+    /// layout, in place — no teardown/respawn (unlike a full `pull_remote_layout`).
+    /// Only existing instances (matched by id) are touched; new/removed panes are left
+    /// to the connect-time reconcile. Returns whether anything changed. Guarded by the
+    /// top-level `updated_at` so a not-yet-pushed local rename isn't clobbered.
+    fn reconcile_remote_names(&mut self, pid: Uuid, json: &str) -> bool {
+        let Some(proj) = self.workspace.project(pid) else {
+            return false;
+        };
+        let layout_root = match &proj.remote {
+            Some(r) => r.remote_root.clone(),
+            None => proj.root_path.display().to_string(),
+        };
+        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
+        let local = RemoteLayout::capture(proj, &self.workspace, now_epoch);
+        let local_rev = proj.layout_updated_at.unwrap_or(0);
+        let Some(remote) = RemoteLayout::parse(json, &layout_root) else {
+            return false;
+        };
+        // Only adopt a strictly-newer, actually-different remote, so a desktop rename
+        // we haven't pushed yet isn't overwritten by a stale read.
+        if remote.updated_at <= local_rev || remote.content_key() == local.content_key() {
+            return false;
+        }
+        let mut changed = false;
+        for r in &remote.instances {
+            if let Some(inst) = self.workspace.instance_mut(r.id)
+                && inst.custom_name != r.custom_name
+            {
+                inst.custom_name = r.custom_name.clone();
+                changed = true;
+            }
+        }
+        if !changed {
+            return false;
+        }
+        if let Some(p) = self.workspace.project_mut(pid) {
+            p.layout_updated_at = Some(remote.updated_at);
+        }
+        // Reseed change detection so we don't immediately push the adopted names back.
+        if let Some(p) = self.workspace.project(pid) {
+            let key = RemoteLayout::capture(p, &self.workspace, now_epoch).content_key();
+            self.layout_keys.insert(pid, key);
+        }
+        self.persist();
+        true
+    }
+
     /// Status-refresh tick: re-render and fire desktop notifications for
     /// unfocused agents when they finish or ring the terminal bell. The bell is
     /// the agent's deliberate "I need you" signal (e.g. Claude on a permission
@@ -4395,9 +4482,10 @@ impl MuxelApp {
         // Program availability (installed agents / gh / sshpass) + git status are
         // refreshed off the UI thread so they don't stutter the render loop.
         self.refresh_status(cx);
-        // Throttle remote (ssh) branch polling to every ~5s.
+        // Throttle remote (ssh) branch polling + layout re-fetch to every ~5s.
         if self.remote_poll_count == 0 {
             self.poll_remote_branches(cx);
+            self.fetch_remote_layouts(cx);
         }
         self.remote_poll_count = (self.remote_poll_count + 1) % 5;
         let focused = self.active_instance;

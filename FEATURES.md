@@ -337,7 +337,10 @@ feature is added or changed, update the matching entry here in the same change**
   still-running agents). muxel pushes the layout as you rearrange panes and, on
   connect, loads whichever copy — local or remote — is newer; the replaced copy is
   kept as a one-level backup on each side. Automatic for every remote project; no
-  setup required.
+  setup required. **Renaming a pane** also syncs live between peers: while connected,
+  each side re-reads the shared file every few seconds and adopts a peer's renamed
+  pane label in place (no teardown), so a rename on desktop or iOS shows up on both.
+  (Structural changes — adding/removing panes — still reconcile on the next connect.)
 - **Shareable local projects** — a *local* project also mirrors its layout to
   `<root>/.muxel/workspace.json` (and git-ignores `.muxel/`) when tmux mode is on,
   so its panes are tmux sessions a peer can attach to. The iOS companion app can

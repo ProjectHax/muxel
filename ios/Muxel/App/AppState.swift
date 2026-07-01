@@ -43,6 +43,8 @@ final class AppState: ObservableObject {
     let terminals = TerminalStore()
     private let poll = PollService()
     private var pollLoop: Task<Void, Never>?
+    /// Foreground poll counter — used to re-read the shared layout only every Nth poll.
+    private var pollTick = 0
 
     init(store: LocalStore = LocalStore()) {
         self.store = store
@@ -295,8 +297,18 @@ final class AppState: ObservableObject {
     func stopPolling() { pollLoop?.cancel(); pollLoop = nil }
 
     private func runPollOnce() async {
-        guard let project = selectedProject, let host = host(for: project), let layout else { return }
+        guard let project = selectedProject, let host = host(for: project) else { return }
         let conn = connection(for: host)
+        // Every ~5th poll (~15s), re-read the shared layout so a peer's rename (and
+        // other edits) show up live while this project is open. Lightweight — a single
+        // file read; the same instance ids keep the selected tab + live terminals.
+        // (Selecting a project / returning to the app still refresh immediately.)
+        pollTick &+= 1
+        if pollTick % 5 == 0,
+           let fresh = try? await RemoteLayoutStore.read(conn, root: project.remoteRoot) {
+            layout = fresh
+        }
+        guard let layout else { return }
         let results = await poll.poll(conn, instances: layout.orderedTerminalInstances)
         for r in results { statuses[r.instanceId] = r.status }
         running = Set(results.filter(\.running).map(\.instanceId))
