@@ -6,9 +6,16 @@ import SwiftUI
 struct RootView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.theme) private var theme
+    @Environment(\.horizontalSizeClass) private var hSizeClass
     @State private var showAddHost = false
     @State private var addProjectForHost: Host?
     @State private var discoverForHost: Host?
+    /// Persisted sidebar width (iPad/regular width). Dragged via the edge handle.
+    @AppStorage("muxel.sidebarWidth") private var sidebarWidth: Double = 320
+    @State private var dragStartWidth: Double?
+
+    private let sidebarMin: Double = 240
+    private let sidebarMax: Double = 480
 
     var body: some View {
         NavigationSplitView {
@@ -17,6 +24,8 @@ struct RootView: View {
                         discoverForHost: $discoverForHost)
                 .navigationTitle("muxel")
                 .navigationBarTitleDisplayMode(.inline)
+                .navigationSplitViewColumnWidth(min: sidebarMin, ideal: sidebarWidth, max: sidebarMax)
+                .overlay(alignment: .trailing) { sidebarResizeHandle }
         } detail: {
             if let project = state.selectedProject {
                 ProjectDetailView(project: project)
@@ -50,6 +59,31 @@ struct RootView: View {
             Button("OK", role: .cancel) { state.testResult = nil }
         } message: { result in
             Text("\(result.hostName): \(result.message)")
+        }
+    }
+
+    /// A draggable strip on the sidebar's trailing edge (iPad/regular width only) that
+    /// resizes the column; the width is persisted in `sidebarWidth`.
+    @ViewBuilder private var sidebarResizeHandle: some View {
+        if hSizeClass == .regular {
+            ZStack {
+                Color.clear.frame(width: 18) // generous hit area over the divider
+                Capsule()
+                    .fill(theme.mutedColor.opacity(0.5))
+                    .frame(width: 4, height: 44)
+            }
+            .frame(width: 18)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 2)
+                    .onChanged { value in
+                        let start = dragStartWidth ?? sidebarWidth
+                        if dragStartWidth == nil { dragStartWidth = start }
+                        sidebarWidth = min(sidebarMax, max(sidebarMin, start + value.translation.width))
+                    }
+                    .onEnded { _ in dragStartWidth = nil }
+            )
+            .accessibilityLabel("Resize sidebar")
         }
     }
 
