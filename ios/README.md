@@ -85,6 +85,8 @@ the matching Swift port and the `RemoteLayout` version handling.
 | `.muxel/` read + write (prep one-liner, backup, gitignore) | `crates/muxel/src/integrations.rs` | `Interop/RemoteLayoutStore.swift` |
 | Status `classify` + `latch_done` | `crates/muxel-terminal/src/view.rs` | `Status/AgentStatus.swift` |
 | Per-agent `default_markers` | `crates/muxel/src/app.rs` | `Status/Markers.swift` |
+| Theme palettes (chrome + terminal) | `crates/muxel/assets/themes/*.json` | `Theme/MuxelTheme.swift` |
+| Login identities (shared credentials) | `crates/muxel-core/src/lib.rs` (`Identity`) | `Models/Store.swift` (`Identity`) |
 
 ### Status without an attached terminal (the polling enabler)
 
@@ -135,7 +137,15 @@ TUI agents work), panes/tabs resolved by uuid8 suffix (so desktop-created panes 
 up too), launch instances (long-press a tab to rename / duplicate / close, with a
 close confirmation), live status badges + a running-count on the selected
 project, **Test connection** to verify a saved credential, on-device background
-notifications, secrets in the Keychain.
+notifications, secrets in the Keychain, and a **themeable terminal identity** — a
+mono, prompt-caret chrome over the muxel palette, with a theme picker (Catppuccin,
+Tokyo Night, Gruvbox, Everforest, Solarized, Matrix, …) that recolors the chrome
+**and** the live terminal (bg/fg/cursor + ANSI) together. Palettes are ported from
+the desktop theme JSONs (`Theme/MuxelTheme.swift`); the default is Catppuccin Mocha,
+matching `muxel.svg`. **Login identities** (a sidebar sheet) let you define a reusable
+login once — user + auth + imported key/passphrase or keychain password — and point
+many hosts at it instead of re-entering credentials; the secret is stored in the
+Keychain under the identity id and shared by every host that references it.
 
 Future: APNs push via a remote watcher daemon (instant background alerts); tmux
 **control mode** (`-C`) for structured multi-pane multiplexing; split-tree

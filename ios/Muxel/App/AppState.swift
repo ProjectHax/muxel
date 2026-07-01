@@ -29,8 +29,12 @@ final class AppState: ObservableObject {
         let message: String
     }
 
-    /// Injectable so previews/tests use `MockSSHConnection`.
-    var connectionFactory: (Host) -> SSHConnection = { CitadelSSHConnection(host: $0) }
+    /// Injectable so previews/tests use `MockSSHConnection`. The second argument is
+    /// the host's resolved shared-identity credential (nil = use the host's inline
+    /// fields), so a connection authenticates with the right login + secret owner.
+    var connectionFactory: (Host, ResolvedCredential?) -> SSHConnection = {
+        CitadelSSHConnection(host: $0, credential: $1)
+    }
 
     private let store: LocalStore
     private var connections: [UUID: SSHConnection] = [:]
@@ -81,7 +85,7 @@ final class AppState: ObservableObject {
     func testConnection(_ host: Host) async {
         isBusy = true
         defer { isBusy = false }
-        let conn = connectionFactory(host)
+        let conn = connectionFactory(host, resolvedCredential(for: host))
         do {
             try await conn.connect()
             _ = try await conn.run("true")
@@ -102,6 +106,57 @@ final class AppState: ObservableObject {
         doc.projects.removeAll { $0.hostId == host.id }
         doc.hosts.removeAll { $0.id == host.id }
         persist()
+    }
+
+    // MARK: Identity CRUD (shared logins, secrets keyed by identity id)
+
+    func addIdentity(_ identity: Identity, password: String?, keyData: Data?, passphrase: String?) {
+        var saved = true
+        if let password { saved = Keychain.setPassword(password, for: identity.id) && saved }
+        if let keyData { saved = Keychain.setPrivateKey(keyData, for: identity.id) && saved }
+        if let passphrase, !passphrase.isEmpty {
+            saved = Keychain.setKeyPassphrase(passphrase, for: identity.id) && saved
+        }
+        doc.identities.append(identity)
+        persist()
+        if !saved {
+            errorMessage = "Couldn't save the identity's credential to the Keychain."
+        }
+    }
+
+    /// Update an identity's fields, optionally replacing its stored secret. Hosts
+    /// referencing it get the new credentials on their next connect.
+    func updateIdentity(_ identity: Identity, password: String?, keyData: Data?, passphrase: String?) {
+        guard let idx = doc.identities.firstIndex(where: { $0.id == identity.id }) else { return }
+        doc.identities[idx] = identity
+        if let password, !password.isEmpty { _ = Keychain.setPassword(password, for: identity.id) }
+        if let keyData { _ = Keychain.setPrivateKey(keyData, for: identity.id) }
+        if let passphrase, !passphrase.isEmpty {
+            _ = Keychain.setKeyPassphrase(passphrase, for: identity.id)
+        }
+        // Referencing hosts' pooled connections must re-auth with the new credential.
+        dropConnectionsUsing(identity.id)
+        persist()
+    }
+
+    func deleteIdentity(_ identity: Identity) {
+        Keychain.deleteAll(for: identity.id)
+        // Detach hosts that referenced it — they fall back to their inline fields.
+        for i in doc.hosts.indices where doc.hosts[i].identityId == identity.id {
+            doc.hosts[i].identityId = nil
+        }
+        dropConnectionsUsing(identity.id)
+        doc.identities.removeAll { $0.id == identity.id }
+        persist()
+    }
+
+    /// Drop pooled SSH connections for every host that references `identityId`, so
+    /// they reconnect with the updated/removed credential.
+    private func dropConnectionsUsing(_ identityId: UUID) {
+        for host in doc.hosts where host.identityId == identityId {
+            terminals.disconnect(forHost: host.id)
+            connections[host.id] = nil
+        }
     }
 
     func addProject(_ project: RemoteProject) {
@@ -144,9 +199,15 @@ final class AppState: ObservableObject {
 
     func connection(for host: Host) -> SSHConnection {
         if let c = connections[host.id] { return c }
-        let c = connectionFactory(host)
+        let c = connectionFactory(host, resolvedCredential(for: host))
         connections[host.id] = c
         return c
+    }
+
+    /// The effective credential for a host: nil when it uses its own inline fields,
+    /// else the referenced shared identity's user/auth + Keychain secret owner.
+    func resolvedCredential(for host: Host) -> ResolvedCredential? {
+        host.resolvedCredential(in: doc.identities)
     }
 
     // MARK: Selecting a project (connect + read layout + poll)

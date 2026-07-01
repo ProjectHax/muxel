@@ -19,8 +19,8 @@ use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::{
-    AgentPreset, FocusDir, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule, MEMORY_DIR,
-    MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteRef,
+    AgentPreset, FocusDir, Identity, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule,
+    MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteRef,
     ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace,
     WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, focus_in_direction,
     memory_instruction, migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside,
@@ -1086,6 +1086,8 @@ pub struct MuxelApp {
     running_loops: HashMap<Uuid, LoopRun>,
     /// Saved SSH remote hosts (the host library; edited in settings).
     remotes: Vec<RemoteHost>,
+    /// Reusable SSH login identities hosts can reference (shared credentials).
+    identities: Vec<Identity>,
     /// In-memory SSH passwords entered this session (host id → password), for
     /// hosts using password auth without a keychain-saved password. Never
     /// persisted; cleared on exit.
@@ -1370,6 +1372,7 @@ enum ConfirmAction {
     DeleteSnippet(usize),
     DeleteLoop(usize),
     DeleteRemote(usize),
+    DeleteIdentity(usize),
     CloseInstance(Uuid),
     /// Close every other tab in the pane holding this instance (keeps it).
     CloseOtherTabs(Uuid),
@@ -1430,7 +1433,12 @@ struct GitModal {
 /// entered password in memory for the session and (re)spawns the project's panes;
 /// `Verify` tests once with the password and forgets it.
 struct PasswordPrompt {
+    /// The host being connected/verified (drives the displayed host name).
     host_id: Uuid,
+    /// Who owns the entered secret — the host's referenced identity, else the host.
+    /// The entered password is cached/reused under this id (shared across hosts on
+    /// the same identity).
+    owner_id: Uuid,
     action: PasswordAction,
 }
 
@@ -2456,6 +2464,7 @@ impl MuxelApp {
             }
         }
         let remotes = settings.remotes.clone();
+        let identities = settings.identities.clone();
         // Dir for per-host SSH ControlMaster sockets (created once; the path is
         // computed purely thereafter by `control_path_for`).
         if let Some(d) = muxel_store::data_dir() {
@@ -2560,6 +2569,7 @@ impl MuxelApp {
             loops,
             running_loops: HashMap::new(),
             remotes,
+            identities,
             session_passwords: HashMap::new(),
             password_prompt: None,
             password_prompt_input,
@@ -2691,18 +2701,30 @@ impl MuxelApp {
 
     /// An SSH password for a host: the in-memory session password first, else the
     /// one saved in the OS keychain. `None` if neither is set.
-    fn remote_password(&self, host_id: Uuid) -> Option<String> {
-        self.session_passwords
-            .get(&host_id)
-            .cloned()
-            .or_else(|| crate::secrets::get_remote_password(host_id))
+    /// The effective SSH password for a (already resolved) host: whoever owns its
+    /// secret — the referenced login identity, else the host itself — resolved first
+    /// from this session's in-memory cache, then the keychain (identity vs host
+    /// namespace). Lets several hosts share one stored password via an identity.
+    fn remote_password(&self, host: &RemoteHost) -> Option<String> {
+        let owner = host.secret_owner(&self.identities);
+        self.session_passwords.get(&owner).cloned().or_else(|| {
+            if owner == host.id {
+                crate::secrets::get_remote_password(owner)
+            } else {
+                crate::secrets::get_identity_password(owner)
+            }
+        })
     }
 
-    /// The configured remote host for an instance's project, if any.
+    /// The configured remote host for an instance's project, if any — with any
+    /// referenced login identity's credentials already overlaid ([`RemoteHost::effective`]).
     fn remote_host_for_instance(&self, iid: Uuid) -> Option<RemoteHost> {
         let inst = self.workspace.instance(iid)?;
         let r = self.workspace.project(inst.project_id)?.remote.as_ref()?;
-        self.remotes.iter().find(|h| h.id == r.host_id).cloned()
+        self.remotes
+            .iter()
+            .find(|h| h.id == r.host_id)
+            .map(|h| h.effective(&self.identities))
     }
 
     /// Program/args (+ extra env) to run an instance's command on a remote host
@@ -2734,7 +2756,7 @@ impl MuxelApp {
         // process list). Without a password, never use `sshpass -e` (it would
         // error); plain ssh can prompt interactively in the pane instead.
         if host.auth == SshAuth::Password
-            && let Some(pw) = self.remote_password(host.id)
+            && let Some(pw) = self.remote_password(host)
         {
             let env = vec![("SSHPASS".to_string(), pw)];
             let mut args = vec!["-e".to_string(), "ssh".to_string()];
@@ -2753,7 +2775,17 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.password_prompt = Some(PasswordPrompt { host_id, action });
+        let owner_id = self
+            .remotes
+            .iter()
+            .find(|h| h.id == host_id)
+            .map(|h| h.secret_owner(&self.identities))
+            .unwrap_or(host_id);
+        self.password_prompt = Some(PasswordPrompt {
+            host_id,
+            owner_id,
+            action,
+        });
         self.password_prompt_input
             .update(cx, |s, cx| s.set_value("", window, cx));
         let handle = self.password_prompt_input.read(cx).focus_handle(cx);
@@ -2783,8 +2815,9 @@ impl MuxelApp {
             .update(cx, |s, cx| s.set_value("", window, cx));
         match p.action {
             PasswordAction::Connect(pid) => {
-                // Hold the password in memory for the session and spawn the panes.
-                self.session_passwords.insert(p.host_id, pw);
+                // Hold the password in memory for the session (keyed by the secret
+                // owner, so every host on this identity reuses it) and spawn the panes.
+                self.session_passwords.insert(p.owner_id, pw);
                 self.ensure_project_terminals(pid, window, cx);
             }
             PasswordAction::Verify(idx) => {
@@ -2891,7 +2924,11 @@ impl MuxelApp {
 
         // Remote (SSH) project? Resolve its configured host.
         let remote = project.and_then(|p| p.remote.as_ref()).and_then(|r| {
-            let host = self.remotes.iter().find(|h| h.id == r.host_id)?;
+            let host = self
+                .remotes
+                .iter()
+                .find(|h| h.id == r.host_id)?
+                .effective(&self.identities);
             Some((host, r))
         });
 
@@ -2903,7 +2940,8 @@ impl MuxelApp {
                 .and_then(|i| i.worktree_path.as_ref())
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| rref.remote_root.clone());
-            let (program, args, env) = self.remote_program_args(inst, host, &remote_cwd, &resolved);
+            let (program, args, env) =
+                self.remote_program_args(inst, &host, &remote_cwd, &resolved);
             (CommandSpec::program(program, args), None, env)
         } else {
             // Local: worktree path wins as the working dir; otherwise project root.
@@ -2982,7 +3020,7 @@ impl MuxelApp {
         // `ensure_project_terminals`. Avoids `sshpass -e` with an empty $SSHPASS.
         if let Some(host) = self.remote_host_for_instance(instance_id)
             && host.auth == SshAuth::Password
-            && self.remote_password(host.id).is_none()
+            && self.remote_password(&host).is_none()
             && let Some(pid) = self.workspace.instance(instance_id).map(|i| i.project_id)
         {
             self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
@@ -3107,14 +3145,14 @@ impl MuxelApp {
         if is_remote && let Some(host) = self.remote_host_for_project(pid) {
             // Need a password and don't have one → prompt; the Connect action
             // re-enters here once it's stored.
-            if host.auth == SshAuth::Password && self.remote_password(host.id).is_none() {
+            if host.auth == SshAuth::Password && self.remote_password(&host).is_none() {
                 self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
                 return;
             }
             // Pre-flight: verify login (and warm the ControlMaster) before opening.
             let control_path = Self::control_path_for(host.id);
-            let password = self.remote_password(host.id);
-            let host_id = host.id;
+            let password = self.remote_password(&host);
+            let owner_id = host.secret_owner(&self.identities);
             let name = host.name.clone();
             // On the first connect, also fetch the host's saved layout so the
             // callback can resolve newer-wins before spawning panes.
@@ -3156,7 +3194,7 @@ impl MuxelApp {
                     }
                     Err(e) => {
                         // Drop a possibly-wrong session password so a retry re-prompts.
-                        this.session_passwords.remove(&host_id);
+                        this.session_passwords.remove(&owner_id);
                         this.add_event(
                             NotifKind::Error,
                             tf(
@@ -3183,10 +3221,14 @@ impl MuxelApp {
         self.spawn_project_terminals_now(pid, window, cx);
     }
 
-    /// The configured remote host for a project, if any.
+    /// The configured remote host for a project, if any — with any referenced login
+    /// identity's credentials already overlaid ([`RemoteHost::effective`]).
     fn remote_host_for_project(&self, pid: Uuid) -> Option<RemoteHost> {
         let r = self.workspace.project(pid)?.remote.as_ref()?;
-        self.remotes.iter().find(|h| h.id == r.host_id).cloned()
+        self.remotes
+            .iter()
+            .find(|h| h.id == r.host_id)
+            .map(|h| h.effective(&self.identities))
     }
 
     /// Spawn any missing terminals/editors for a project's panes (no remote
@@ -3458,7 +3500,7 @@ impl MuxelApp {
         let Some(host) = self
             .nr_host
             .and_then(|id| self.remotes.iter().find(|h| h.id == id))
-            .cloned()
+            .map(|h| h.effective(&self.identities))
         else {
             return;
         };
@@ -3466,7 +3508,7 @@ impl MuxelApp {
         if dir.is_empty() {
             return;
         }
-        let password = self.remote_password(host.id);
+        let password = self.remote_password(&host);
         // Can't verify a password host without a password (none saved/in session).
         if host.auth == SshAuth::Password && password.is_none() {
             self.nr_verify = RemoteTestState::Failed(
@@ -3504,11 +3546,11 @@ impl MuxelApp {
         let Some(host) = self
             .nr_host
             .and_then(|id| self.remotes.iter().find(|h| h.id == id))
-            .cloned()
+            .map(|h| h.effective(&self.identities))
         else {
             return;
         };
-        let password = self.remote_password(host.id);
+        let password = self.remote_password(&host);
         // Can't scan a password host without a password (none saved/in session).
         if host.auth == SshAuth::Password && password.is_none() {
             self.nr_scan = RemoteScanState::Failed(
@@ -4101,6 +4143,7 @@ impl MuxelApp {
             snippets: self.snippets.clone(),
             loops: self.loops.clone(),
             remotes: self.remotes.clone(),
+            identities: self.identities.clone(),
             theme: self.theme.clone(),
             theme_mode: self.theme_mode.clone(),
             ..self.settings.clone()
@@ -4306,7 +4349,11 @@ impl MuxelApp {
             .iter()
             .filter_map(|p| {
                 let r = p.remote.as_ref()?;
-                let host = self.remotes.iter().find(|h| h.id == r.host_id)?.clone();
+                let host = self
+                    .remotes
+                    .iter()
+                    .find(|h| h.id == r.host_id)?
+                    .effective(&self.identities);
                 Some((
                     p.id,
                     integrations::RepoLoc::remote(
@@ -5986,7 +6033,12 @@ impl MuxelApp {
                 self.workspace
                     .project(project_id)
                     .and_then(|p| p.remote.clone())
-                    .and_then(|r| self.remotes.iter().find(|h| h.id == r.host_id).cloned())
+                    .and_then(|r| {
+                        self.remotes
+                            .iter()
+                            .find(|h| h.id == r.host_id)
+                            .map(|h| h.effective(&self.identities))
+                    })
                     .filter(|host| host.default_use_tmux || use_tmux)
             })
             .flatten();
@@ -5994,7 +6046,7 @@ impl MuxelApp {
             let session = muxel_core::tmux::session_name(&host.name, iid);
             let control_path = Self::control_path_for(host.id);
             let password = (host.auth == SshAuth::Password)
-                .then(|| self.remote_password(host.id))
+                .then(|| self.remote_password(&host))
                 .flatten();
             cx.background_executor()
                 .spawn(async move {
@@ -6384,9 +6436,13 @@ impl MuxelApp {
         let p = self.workspace.project(pid)?;
         match &p.remote {
             Some(r) => {
-                let host = self.remotes.iter().find(|h| h.id == r.host_id)?.clone();
+                let host = self
+                    .remotes
+                    .iter()
+                    .find(|h| h.id == r.host_id)?
+                    .effective(&self.identities);
                 let password = (host.auth == SshAuth::Password)
-                    .then(|| self.remote_password(host.id))
+                    .then(|| self.remote_password(&host))
                     .flatten();
                 Some(integrations::RepoLoc::remote(
                     host,
@@ -8108,6 +8164,7 @@ impl MuxelApp {
             ConfirmAction::DeleteSnippet(idx) => self.delete_snippet(idx, cx),
             ConfirmAction::DeleteLoop(idx) => self.delete_loop(idx, cx),
             ConfirmAction::DeleteRemote(idx) => self.delete_remote(idx, cx),
+            ConfirmAction::DeleteIdentity(idx) => self.delete_identity(idx, cx),
             ConfirmAction::CloseInstance(iid) => {
                 self.close_instance(iid, cx);
                 if let Some(next) = self.active_instance {
@@ -11767,11 +11824,15 @@ impl MuxelApp {
             // Where this project's git runs (local, or remote over its host). No
             // keychain read here — menu git ops reuse the pane's ControlMaster.
             let menu_loc: integrations::RepoLoc = match project.remote.as_ref().and_then(|r| {
-                let host = self.remotes.iter().find(|h| h.id == r.host_id)?;
+                let host = self
+                    .remotes
+                    .iter()
+                    .find(|h| h.id == r.host_id)?
+                    .effective(&self.identities);
                 Some((host, r))
             }) {
                 Some((host, r)) => integrations::RepoLoc::remote(
-                    host.clone(),
+                    host,
                     r.remote_root.clone(),
                     Self::control_path_for(r.host_id),
                     None,
@@ -13888,6 +13949,7 @@ impl MuxelApp {
         self.settings_ui.s_auth = h.auth;
         self.settings_ui.s_test = RemoteTestState::Idle;
         self.settings_ui.s_has_password = crate::secrets::has_remote_password(h.id);
+        self.settings_ui.s_identity_id = h.identity_id;
         self.settings_ui.s_forward_agent = h.forward_agent;
         self.settings_ui.s_use_tmux = h.default_use_tmux;
         let set =
@@ -14000,6 +14062,7 @@ impl MuxelApp {
         let auth = ui.s_auth;
         let forward_agent = ui.s_forward_agent;
         let use_tmux = ui.s_use_tmux;
+        let identity_id = ui.s_identity_id;
         let host_id = self.remotes.get(idx).map(|h| h.id);
         if let Some(h) = self.remotes.get_mut(idx) {
             if !name.is_empty() {
@@ -14016,20 +14079,26 @@ impl MuxelApp {
             h.keepalive_secs = keepalive;
             h.extra_options = extra;
             h.default_use_tmux = use_tmux;
+            h.identity_id = identity_id;
         }
-        // Store/replace the password in the OS keychain when one was entered.
-        if let Some(id) = host_id
-            && !password.is_empty()
-        {
-            // The keychain copy is now authoritative; drop any session password.
-            self.session_passwords.remove(&id);
-            match crate::secrets::set_remote_password(id, &password) {
-                Ok(()) => self.settings_ui.s_has_password = true,
-                Err(e) => self.add_event(NotifKind::Error, t("Keychain error"), format!("{e}")),
+        if let Some(id) = host_id {
+            if identity_id.is_some() {
+                // Credentials come from the identity now — drop the host's own secret
+                // so it isn't left orphaned in the keychain.
+                let _ = crate::secrets::delete_remote_password(id);
+                self.session_passwords.remove(&id);
+                self.settings_ui.s_has_password = false;
+            } else if !password.is_empty() {
+                // The keychain copy is now authoritative; drop any session password.
+                self.session_passwords.remove(&id);
+                match crate::secrets::set_remote_password(id, &password) {
+                    Ok(()) => self.settings_ui.s_has_password = true,
+                    Err(e) => self.add_event(NotifKind::Error, t("Keychain error"), format!("{e}")),
+                }
+                self.settings_ui
+                    .s_password
+                    .update(cx, |s, cx| s.set_value(String::new(), window, cx));
             }
-            self.settings_ui
-                .s_password
-                .update(cx, |s, cx| s.set_value(String::new(), window, cx));
         }
         self.persist_settings();
         cx.notify();
@@ -14051,6 +14120,127 @@ impl MuxelApp {
         self.session_passwords.remove(&id);
         self.remotes.remove(idx);
         self.settings_ui.selected_remote = None;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    // --- Shared login identities -------------------------------------------------
+
+    fn open_identity_editor(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.identities.get(idx).cloned() else {
+            return;
+        };
+        self.settings_ui.selected_identity = Some(idx);
+        self.settings_ui.id_auth = id.auth;
+        self.settings_ui.id_has_password = crate::secrets::has_identity_password(id.id);
+        let set =
+            |inp: &Entity<InputState>, v: String, cx: &mut Context<Self>, window: &mut Window| {
+                inp.update(cx, |s, cx| s.set_value(v, window, cx));
+            };
+        set(&self.settings_ui.id_name, id.name.clone(), cx, window);
+        set(&self.settings_ui.id_user, id.user.clone(), cx, window);
+        set(
+            &self.settings_ui.id_identity,
+            id.identity_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            cx,
+            window,
+        );
+        // Never preload the password — it stays in the keychain.
+        set(&self.settings_ui.id_password, String::new(), cx, window);
+        cx.notify();
+    }
+
+    fn set_identity_auth(&mut self, auth: SshAuth, cx: &mut Context<Self>) {
+        self.settings_ui.id_auth = auth;
+        cx.notify();
+    }
+
+    /// Pick an SSH identity file via the OS file dialog, into the identity editor.
+    fn browse_identity_key_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(t("Choose key")),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(mut paths))) = receiver.await
+                && let Some(path) = paths.pop()
+            {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.settings_ui.id_identity.update(cx, |s, cx| {
+                        s.set_value(path.display().to_string(), window, cx)
+                    });
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn save_identity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(idx) = self.settings_ui.selected_identity else {
+            return;
+        };
+        let ui = &self.settings_ui;
+        let name = ui.id_name.read(cx).value().trim().to_string();
+        let user = ui.id_user.read(cx).value().trim().to_string();
+        let identity = {
+            let v = ui.id_identity.read(cx).value().trim().to_string();
+            (!v.is_empty()).then(|| PathBuf::from(v))
+        };
+        let password = ui.id_password.read(cx).value().to_string();
+        let auth = ui.id_auth;
+        let id_uuid = self.identities.get(idx).map(|i| i.id);
+        if let Some(i) = self.identities.get_mut(idx) {
+            if !name.is_empty() {
+                i.name = name;
+            }
+            i.user = user;
+            i.auth = auth;
+            i.identity_file = identity;
+        }
+        if let Some(id) = id_uuid
+            && !password.is_empty()
+        {
+            self.session_passwords.remove(&id);
+            match crate::secrets::set_identity_password(id, &password) {
+                Ok(()) => self.settings_ui.id_has_password = true,
+                Err(e) => self.add_event(NotifKind::Error, t("Keychain error"), format!("{e}")),
+            }
+            self.settings_ui
+                .id_password
+                .update(cx, |s, cx| s.set_value(String::new(), window, cx));
+        }
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn add_identity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.identities.push(Identity::new(t("New identity")));
+        let idx = self.identities.len() - 1;
+        self.persist_settings();
+        self.open_identity_editor(idx, window, cx);
+    }
+
+    fn delete_identity(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.identities.len() {
+            return;
+        }
+        let id = self.identities[idx].id;
+        let _ = crate::secrets::delete_identity_password(id);
+        self.session_passwords.remove(&id);
+        // Detach any hosts that referenced it — they fall back to inline credentials.
+        for h in &mut self.remotes {
+            if h.identity_id == Some(id) {
+                h.identity_id = None;
+            }
+        }
+        self.identities.remove(idx);
+        self.settings_ui.selected_identity = None;
         self.persist_settings();
         cx.notify();
     }
@@ -15783,6 +15973,11 @@ impl MuxelApp {
             .child(nav_item(t("Remotes"), SettingsSection::Remotes).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Remotes, cx)),
             ))
+            .child(
+                nav_item(t("Identities"), SettingsSection::Identities).on_click(cx.listener(
+                    |this, _e, _w, cx| this.set_section(SettingsSection::Identities, cx),
+                )),
+            )
             .child(nav_item(t("Projects"), SettingsSection::Projects).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Projects, cx)),
             ))
@@ -15802,6 +15997,7 @@ impl MuxelApp {
             SettingsSection::Snippets => self.render_settings_snippets(cx),
             SettingsSection::Loops => self.render_settings_loops(cx),
             SettingsSection::Remotes => self.render_settings_remotes(cx),
+            SettingsSection::Identities => self.render_settings_identities(cx),
             SettingsSection::Projects => self.render_settings_projects(cx),
             SettingsSection::Keybindings => self.render_settings_keybindings(content_w, cx),
         };
@@ -16848,6 +17044,35 @@ impl MuxelApp {
                 .on_click(cx.listener(move |this, _e, _w, cx| this.set_remote_auth(val, cx)))
         };
 
+        // Credentials: inline, or drawn from a shared login identity.
+        let cred_picker = {
+            let mut row = div().flex().flex_wrap().gap_1().child(
+                Button::new("cred-inline")
+                    .ghost()
+                    .selected(ui.s_identity_id.is_none())
+                    .label(t("Inline"))
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.settings_ui.s_identity_id = None;
+                        cx.notify();
+                    })),
+            );
+            for id in &self.identities {
+                let iid = id.id;
+                row = row.child(
+                    Button::new(SharedString::from(format!("cred-{}", iid.simple())))
+                        .ghost()
+                        .selected(ui.s_identity_id == Some(iid))
+                        .icon(IconName::CircleUser)
+                        .label(id.name.clone())
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.settings_ui.s_identity_id = Some(iid);
+                            cx.notify();
+                        })),
+                );
+            }
+            row
+        };
+
         let mut form = v_flex()
             .gap_2()
             .w_full()
@@ -16856,80 +17081,94 @@ impl MuxelApp {
             .child(Self::wide_input(Input::new(&ui.s_name)))
             .child(self.settings_label(&t("Host (or ~/.ssh/config alias)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_host)))
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(self.settings_label(&t("Port"), cx))
-                            .child(Input::new(&ui.s_port)),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(self.settings_label(&t("User"), cx))
-                            .child(Input::new(&ui.s_user)),
-                    ),
-            )
-            .child(self.settings_label(&t("Authentication"), cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(auth_btn("ssh-agent", SshAuth::Agent, "remote-auth-agent"))
-                    .child(auth_btn("Key file", SshAuth::Key, "remote-auth-key"))
-                    .child(auth_btn("Password", SshAuth::Password, "remote-auth-pw")),
-            );
+            .child(self.settings_label(&t("Credentials"), cx))
+            .child(cred_picker)
+            .child(self.settings_label(&t("Port"), cx))
+            .child(Input::new(&ui.s_port));
 
-        if auth == SshAuth::Key {
+        if ui.s_identity_id.is_none() {
+            // Inline credentials: user + auth + key/password on the host itself.
             form = form
-                .child(self.settings_label(&t("Identity file"), cx))
+                .child(self.settings_label(&t("User"), cx))
+                .child(Self::wide_input(Input::new(&ui.s_user)))
+                .child(self.settings_label(&t("Authentication"), cx))
                 .child(
                     div()
                         .flex()
-                        .gap_2()
-                        .items_center()
-                        .child(v_flex().flex_1().child(Input::new(&ui.s_identity)))
-                        .child(
-                            Button::new("remote-browse-key")
-                                .ghost()
-                                .icon(IconName::Folder)
-                                .label(t("Browse"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.browse_identity_file(window, cx)
-                                })),
-                        ),
+                        .gap_1()
+                        .child(auth_btn("ssh-agent", SshAuth::Agent, "remote-auth-agent"))
+                        .child(auth_btn("Key file", SshAuth::Key, "remote-auth-key"))
+                        .child(auth_btn("Password", SshAuth::Password, "remote-auth-pw")),
                 );
-        } else if auth == SshAuth::Password {
-            let hint = if ui.s_has_password {
-                t("A password is saved in the OS keychain. Type a new one to replace it.")
-            } else {
-                t("Stored securely in the OS keychain — never in muxel's config.")
-            };
-            form = form
-                .child(self.settings_label(&t("Password"), cx))
-                .child(Self::wide_input(Input::new(&ui.s_password)))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(hint),
-                );
-            // Password auth feeds the secret to ssh via `sshpass`. Warn if it's
-            // unavailable (Windows has no sshpass — use a key or ssh-agent there).
-            if !self.sshpass_available {
-                let warn = if cfg!(target_os = "windows") {
-                    "Password auth needs `sshpass`, which isn't available on Windows. \
-                     Use a key file or ssh-agent instead."
+            if auth == SshAuth::Key {
+                form = form
+                    .child(self.settings_label(&t("Identity file"), cx))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .child(v_flex().flex_1().child(Input::new(&ui.s_identity)))
+                            .child(
+                                Button::new("remote-browse-key")
+                                    .ghost()
+                                    .icon(IconName::Folder)
+                                    .label(t("Browse"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.browse_identity_file(window, cx)
+                                    })),
+                            ),
+                    );
+            } else if auth == SshAuth::Password {
+                let hint = if ui.s_has_password {
+                    t("A password is saved in the OS keychain. Type a new one to replace it.")
                 } else {
-                    "`sshpass` not found on PATH — install it for password auth, or use \
-                     a key file / ssh-agent. (Windows can't use password auth.)"
+                    t("Stored securely in the OS keychain — never in muxel's config.")
                 };
-                form = form.child(div().text_xs().text_color(cx.theme().warning).child(warn));
+                form = form
+                    .child(self.settings_label(&t("Password"), cx))
+                    .child(Self::wide_input(Input::new(&ui.s_password)))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(hint),
+                    );
+                // Password auth feeds the secret to ssh via `sshpass`. Warn if it's
+                // unavailable (Windows has no sshpass — use a key or ssh-agent there).
+                if !self.sshpass_available {
+                    let warn = if cfg!(target_os = "windows") {
+                        "Password auth needs `sshpass`, which isn't available on Windows. \
+                         Use a key file or ssh-agent instead."
+                    } else {
+                        "`sshpass` not found on PATH — install it for password auth, or use \
+                         a key file / ssh-agent. (Windows can't use password auth.)"
+                    };
+                    form = form.child(div().text_xs().text_color(cx.theme().warning).child(warn));
+                }
+            }
+        } else {
+            // Credentials come from a shared identity — show which, or warn if it's gone.
+            match self
+                .identities
+                .iter()
+                .find(|i| Some(i.id) == ui.s_identity_id)
+                .map(|i| i.name.clone())
+            {
+                Some(name) => {
+                    form = form.child(div().text_xs().text_color(cx.theme().muted_foreground).child(
+                        tf(
+                            "User, authentication & key/password come from the “{name}” identity.",
+                            &[("name", &name)],
+                        ),
+                    ));
+                }
+                None => {
+                    form = form.child(div().text_xs().text_color(cx.theme().warning).child(t(
+                        "The selected identity no longer exists — this host falls back to \
+                         ssh-agent until you pick another or switch to Inline.",
+                    )));
+                }
             }
         }
 
@@ -17035,6 +17274,177 @@ impl MuxelApp {
                                 ),
                                 t("Delete"),
                                 ConfirmAction::DeleteRemote(idx),
+                                cx,
+                            )
+                        })),
+                ),
+        )
+        .into_any_element()
+    }
+
+    fn render_settings_identities(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
+        for (idx, id) in self.identities.iter().enumerate() {
+            let selected = self.settings_ui.selected_identity == Some(idx);
+            let fg = if selected {
+                cx.theme().sidebar_accent_foreground
+            } else {
+                cx.theme().foreground
+            };
+            let label = if id.name.is_empty() {
+                "(unnamed)".to_string()
+            } else {
+                id.name.clone()
+            };
+            let mut row = div()
+                .id(SharedString::from(format!("identity-row-{idx}")))
+                .flex()
+                .items_center()
+                .gap_2()
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded(cx.theme().radius)
+                .cursor_pointer()
+                .text_color(fg)
+                .on_click(cx.listener(move |this, _e, window, cx| {
+                    this.open_identity_editor(idx, window, cx)
+                }))
+                .child(Icon::new(IconName::CircleUser).small())
+                .child(div().text_sm().child(label));
+            if selected {
+                row = row.bg(cx.theme().sidebar_accent);
+            } else {
+                row = row.hover(|s| s.bg(cx.theme().accent));
+            }
+            list = list.child(row);
+        }
+        list = list.child(
+            Button::new("add-identity")
+                .ghost()
+                .icon(IconName::Plus)
+                .label(t("Add identity"))
+                .on_click(cx.listener(|this, _e, window, cx| this.add_identity(window, cx))),
+        );
+
+        let editor = match self.settings_ui.selected_identity {
+            Some(idx) if idx < self.identities.len() => self.render_identity_editor(idx, cx),
+            _ => div()
+                .p_4()
+                .text_color(cx.theme().muted_foreground)
+                .child(t(
+                    "Select an identity to edit, or add one. An identity is a reusable login \
+                     (user + auth + key/password) that multiple hosts can share.",
+                ))
+                .into_any_element(),
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .gap_4()
+            .child(list)
+            .child(div().flex_1().min_w_0().child(editor))
+            .into_any_element()
+    }
+
+    fn render_identity_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
+        let ui = &self.settings_ui;
+        let auth = ui.id_auth;
+        let auth_btn = |label: &'static str, val: SshAuth, id: &'static str| {
+            Button::new(id)
+                .ghost()
+                .selected(auth == val)
+                .label(label)
+                .on_click(cx.listener(move |this, _e, _w, cx| this.set_identity_auth(val, cx)))
+        };
+
+        let mut form = v_flex()
+            .gap_2()
+            .w_full()
+            .max_w(px(560.0))
+            .child(self.settings_label(&t("Name"), cx))
+            .child(Self::wide_input(Input::new(&ui.id_name)))
+            .child(self.settings_label(&t("User"), cx))
+            .child(Self::wide_input(Input::new(&ui.id_user)))
+            .child(self.settings_label(&t("Authentication"), cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(auth_btn("ssh-agent", SshAuth::Agent, "id-auth-agent"))
+                    .child(auth_btn("Key file", SshAuth::Key, "id-auth-key"))
+                    .child(auth_btn("Password", SshAuth::Password, "id-auth-pw")),
+            );
+
+        if auth == SshAuth::Key {
+            form = form
+                .child(self.settings_label(&t("Identity file"), cx))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .child(v_flex().flex_1().child(Input::new(&ui.id_identity)))
+                        .child(
+                            Button::new("id-browse-key")
+                                .ghost()
+                                .icon(IconName::Folder)
+                                .label(t("Browse"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.browse_identity_key_file(window, cx)
+                                })),
+                        ),
+                );
+        } else if auth == SshAuth::Password {
+            let hint = if ui.id_has_password {
+                t("A password is saved in the OS keychain. Type a new one to replace it.")
+            } else {
+                t("Stored securely in the OS keychain — never in muxel's config.")
+            };
+            form = form
+                .child(self.settings_label(&t("Password"), cx))
+                .child(Self::wide_input(Input::new(&ui.id_password)))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(hint),
+                );
+        }
+
+        form.child(
+            div()
+                .flex()
+                .gap_2()
+                .pt_2()
+                .child(
+                    Button::new("save-identity")
+                        .primary()
+                        .label(t("Save"))
+                        .on_click(
+                            cx.listener(|this, _e, window, cx| this.save_identity(window, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("del-identity")
+                        .ghost()
+                        .label(t("Delete"))
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            let name = this
+                                .identities
+                                .get(idx)
+                                .map(|i| i.name.clone())
+                                .unwrap_or_default();
+                            this.request_confirm(
+                                t("Delete identity?"),
+                                tf(
+                                    "The “{name}” login identity and its saved password will be \
+                                     removed; hosts using it fall back to inline credentials.",
+                                    &[("name", &name)],
+                                ),
+                                t("Delete"),
+                                ConfirmAction::DeleteIdentity(idx),
                                 cx,
                             )
                         })),

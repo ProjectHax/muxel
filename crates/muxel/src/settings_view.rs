@@ -97,6 +97,7 @@ pub enum SettingsSection {
     Snippets,
     Loops,
     Remotes,
+    Identities,
     Projects,
     Keybindings,
 }
@@ -170,6 +171,17 @@ pub struct SettingsUi {
     pub s_keepalive: Entity<InputState>,
     pub s_strict: Entity<InputState>,
     pub s_extra: Entity<InputState>,
+    /// Shared login identity chosen for the open host (None = inline credentials).
+    pub s_identity_id: Option<Uuid>,
+
+    // Shared login-identity editor.
+    pub selected_identity: Option<usize>,
+    pub id_auth: SshAuth,
+    pub id_has_password: bool,
+    pub id_name: Entity<InputState>,
+    pub id_user: Entity<InputState>,
+    pub id_identity: Entity<InputState>,
+    pub id_password: Entity<InputState>,
 
     // Project editor.
     pub selected_project: Option<Uuid>,
@@ -286,6 +298,20 @@ impl SettingsUi {
                 InputState::new(window, cx)
                     .multi_line(true)
                     .placeholder(t("extra -o options, one KEY=VALUE per line"))
+            }),
+            s_identity_id: None,
+            selected_identity: None,
+            id_auth: SshAuth::Agent,
+            id_has_password: false,
+            id_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
+            id_user: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("login user (optional)"))),
+            id_identity: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("~/.ssh/id_ed25519"))),
+            id_password: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder(t("stored in the OS keychain"))
             }),
             selected_project: None,
             proj_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Project name"))),

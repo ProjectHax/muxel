@@ -243,6 +243,10 @@ pub struct RemoteHost {
     /// Identity file for [`SshAuth::Key`].
     #[serde(default)]
     pub identity_file: Option<PathBuf>,
+    /// When set, this host's credential fields (`user`, `auth`, `identity_file`)
+    /// come from the shared [`Identity`] with this id instead of the inline fields.
+    #[serde(default)]
+    pub identity_id: Option<Uuid>,
     /// ProxyJump host (`-J`), if any.
     #[serde(default)]
     pub jump_host: Option<String>,
@@ -273,12 +277,71 @@ impl RemoteHost {
             user: String::new(),
             auth: SshAuth::Agent,
             identity_file: None,
+            identity_id: None,
             jump_host: None,
             forward_agent: false,
             strict_host_key: String::new(),
             keepalive_secs: None,
             extra_options: Vec::new(),
             default_use_tmux: true,
+        }
+    }
+
+    /// Effective connection settings: when this host references an [`Identity`] that
+    /// exists in `identities`, its credential fields (`user`, `auth`,
+    /// `identity_file`) are overlaid from that identity; otherwise the host's inline
+    /// fields are used unchanged. `id`, `identity_id`, and every transport field
+    /// (port, jump, keepalive, extra options, …) are preserved — so the argv builders
+    /// in [`crate::ssh`] and the per-host ControlMaster socket keep working verbatim.
+    pub fn effective(&self, identities: &[Identity]) -> RemoteHost {
+        let mut h = self.clone();
+        if let Some(iid) = self.identity_id
+            && let Some(id) = identities.iter().find(|i| i.id == iid)
+        {
+            h.user = id.user.clone();
+            h.auth = id.auth;
+            h.identity_file = id.identity_file.clone();
+        }
+        h
+    }
+
+    /// The keychain / session-cache owner of this host's password: the referenced
+    /// identity (only while it still exists), else the host itself. Lets several
+    /// hosts share one stored secret via a common identity.
+    pub fn secret_owner(&self, identities: &[Identity]) -> Uuid {
+        self.identity_id
+            .filter(|iid| identities.iter().any(|i| i.id == *iid))
+            .unwrap_or(self.id)
+    }
+}
+
+/// A reusable, named SSH login identity: the credential half of a host — login
+/// user, auth method, and an optional key file — that many hosts can share via
+/// [`RemoteHost::identity_id`]. The password (for [`SshAuth::Password`]) lives in
+/// the OS keychain keyed by `id`, never in this struct — mirroring [`RemoteHost`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Identity {
+    pub id: Uuid,
+    /// Display label.
+    pub name: String,
+    /// Login user (empty = ssh/config default).
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub auth: SshAuth,
+    /// Identity file for [`SshAuth::Key`].
+    #[serde(default)]
+    pub identity_file: Option<PathBuf>,
+}
+
+impl Identity {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            user: String::new(),
+            auth: SshAuth::Agent,
+            identity_file: None,
         }
     }
 }
@@ -971,6 +1034,9 @@ pub struct Settings {
     /// Saved SSH remote hosts for remote development.
     #[serde(default)]
     pub remotes: Vec<RemoteHost>,
+    /// Reusable SSH login identities that hosts can reference (shared credentials).
+    #[serde(default)]
+    pub identities: Vec<Identity>,
     // --- Code-editor pane settings ---
     /// Editor font family (empty = the theme's monospace font).
     #[serde(default)]
@@ -1045,6 +1111,7 @@ impl Default for Settings {
             loops: Vec::new(),
             terminal_passthrough_keys: default_passthrough_keys(),
             remotes: Vec::new(),
+            identities: Vec::new(),
             editor_font_family: String::new(),
             editor_font_size: default_editor_font_size(),
             editor_tab_size: default_editor_tab_size(),
@@ -1581,5 +1648,74 @@ mod project_order_tests {
         // Unknown id never moves anything.
         assert!(!ws.move_project(super::Uuid::new_v4(), true));
         assert_eq!(order(&ws), ["a", "b", "c"]);
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{Identity, RemoteHost, SshAuth};
+    use std::path::PathBuf;
+
+    fn host_referencing(id: uuid::Uuid) -> RemoteHost {
+        let mut h = RemoteHost::new("web", "example.com");
+        h.user = "inline".into();
+        h.auth = SshAuth::Password;
+        h.port = Some(2222);
+        h.keepalive_secs = Some(30);
+        h.identity_id = Some(id);
+        h
+    }
+
+    fn key_identity(name: &str) -> Identity {
+        let mut i = Identity::new(name);
+        i.user = "deploy".into();
+        i.auth = SshAuth::Key;
+        i.identity_file = Some(PathBuf::from("/keys/id_ed25519"));
+        i
+    }
+
+    #[test]
+    fn effective_overlays_identity_credentials() {
+        let id = key_identity("deploy");
+        let host = host_referencing(id.id);
+        let eff = host.effective(std::slice::from_ref(&id));
+        // Credential fields come from the identity.
+        assert_eq!(eff.user, "deploy");
+        assert_eq!(eff.auth, SshAuth::Key);
+        assert_eq!(eff.identity_file, Some(PathBuf::from("/keys/id_ed25519")));
+        // Identity + transport fields are preserved.
+        assert_eq!(eff.id, host.id);
+        assert_eq!(eff.identity_id, Some(id.id));
+        assert_eq!(eff.port, Some(2222));
+        assert_eq!(eff.keepalive_secs, Some(30));
+    }
+
+    #[test]
+    fn effective_falls_back_when_identity_missing_or_unset() {
+        // References an id that isn't in the list → inline fields kept.
+        let host = host_referencing(uuid::Uuid::new_v4());
+        let eff = host.effective(&[]);
+        assert_eq!(eff.user, "inline");
+        assert_eq!(eff.auth, SshAuth::Password);
+
+        // No identity_id → identical clone.
+        let mut plain = RemoteHost::new("db", "db.example.com");
+        plain.user = "root".into();
+        let eff = plain.effective(&[key_identity("x")]);
+        assert_eq!(eff.user, "root");
+        assert_eq!(eff.identity_id, None);
+    }
+
+    #[test]
+    fn secret_owner_is_identity_when_present_else_host() {
+        let id = key_identity("deploy");
+        let host = host_referencing(id.id);
+        // Identity found → its id owns the secret (shared across hosts).
+        assert_eq!(host.secret_owner(std::slice::from_ref(&id)), id.id);
+        // Identity missing → the host owns its own secret.
+        assert_eq!(host.secret_owner(&[]), host.id);
+        // No reference → host owns it.
+        let plain = RemoteHost::new("db", "db.example.com");
+        assert_eq!(plain.secret_owner(&[id]), plain.id);
     }
 }

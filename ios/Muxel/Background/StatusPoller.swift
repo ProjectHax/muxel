@@ -27,14 +27,18 @@ struct StatusPoller {
     /// Run one poll-and-notify pass. `makeConnection` is injectable for tests.
     /// Returns the number of notifications posted.
     @discardableResult
-    func run(makeConnection: (Host) -> SSHConnection = { CitadelSSHConnection(host: $0) }) async -> Int {
+    func run(
+        makeConnection: (Host, ResolvedCredential?) -> SSHConnection = {
+            CitadelSSHConnection(host: $0, credential: $1)
+        }
+    ) async -> Int {
         let doc = store.load()
         var posted = 0
         for host in doc.hosts {
             let projects = doc.projects.filter { $0.hostId == host.id }
             guard !projects.isEmpty else { continue }
 
-            let conn = makeConnection(host)
+            let conn = makeConnection(host, host.resolvedCredential(in: doc.identities))
             do { try await conn.connect() } catch { continue }
             defer { Task { await conn.close() } }
 

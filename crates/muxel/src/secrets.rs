@@ -37,3 +37,36 @@ pub fn delete_remote_password(host_id: Uuid) -> Result<()> {
         Err(e) => Err(e).context("delete password from keychain"),
     }
 }
+
+// --- Shared login identities ---------------------------------------------------
+// Identities keep their password in a distinct keychain namespace (`identity:{id}`)
+// so a host's inline secret and an identity's shared secret never collide.
+
+fn identity_entry(identity_id: Uuid) -> Result<keyring::Entry> {
+    keyring::Entry::new(SERVICE, &format!("identity:{identity_id}")).context("open keychain entry")
+}
+
+/// Store (or replace) the SSH password for a login identity.
+pub fn set_identity_password(identity_id: Uuid, password: &str) -> Result<()> {
+    identity_entry(identity_id)?
+        .set_password(password)
+        .context("save password to keychain")
+}
+
+/// Fetch the stored SSH password for a login identity, if any.
+pub fn get_identity_password(identity_id: Uuid) -> Option<String> {
+    identity_entry(identity_id).ok()?.get_password().ok()
+}
+
+/// Whether a password is stored for this identity.
+pub fn has_identity_password(identity_id: Uuid) -> bool {
+    get_identity_password(identity_id).is_some()
+}
+
+/// Remove the stored password for a login identity (best-effort).
+pub fn delete_identity_password(identity_id: Uuid) -> Result<()> {
+    match identity_entry(identity_id)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e).context("delete password from keychain"),
+    }
+}

@@ -20,10 +20,13 @@ struct AddHostView: View {
     @State private var jumpHost = ""
     @State private var keepalive = ""
     @State private var importingKey = false
+    @State private var identityId: UUID?
+
+    private var usingIdentity: Bool { identityId != nil }
 
     private var canSave: Bool {
         !name.isEmpty && !hostname.isEmpty
-            && (auth == .password ? !password.isEmpty : keyData != nil)
+            && (usingIdentity || (auth == .password ? !password.isEmpty : keyData != nil))
     }
 
     var body: some View {
@@ -34,21 +37,39 @@ struct AddHostView: View {
                     TextField("Hostname or IP", text: $hostname)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                     TextField("Port (22)", text: $port).keyboardType(.numberPad)
-                    TextField("User", text: $user)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                }
-                Section("Authentication") {
-                    Picker("Method", selection: $auth) {
-                        ForEach(SshAuthKind.allCases) { Text($0.label).tag($0) }
+                    if !usingIdentity {
+                        TextField("User", text: $user)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
                     }
-                    if auth == .password {
-                        SecureField("Password", text: $password)
-                    } else {
-                        Button { importingKey = true } label: {
-                            Label(keyName.isEmpty ? "Import private key" : keyName,
-                                  systemImage: "key.fill")
+                }
+                if !state.doc.identities.isEmpty {
+                    Section("Credentials") {
+                        Picker("Login", selection: $identityId) {
+                            Text("Enter below").tag(UUID?.none)
+                            ForEach(state.doc.identities) { id in
+                                Text(id.name).tag(Optional(id.id))
+                            }
                         }
-                        SecureField("Key passphrase (optional)", text: $passphrase)
+                        if usingIdentity {
+                            Text("Uses the selected identity's user, auth, and key/password.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if !usingIdentity {
+                    Section("Authentication") {
+                        Picker("Method", selection: $auth) {
+                            ForEach(SshAuthKind.allCases) { Text($0.label).tag($0) }
+                        }
+                        if auth == .password {
+                            SecureField("Password", text: $password)
+                        } else {
+                            Button { importingKey = true } label: {
+                                Label(keyName.isEmpty ? "Import private key" : keyName,
+                                      systemImage: "key.fill")
+                            }
+                            SecureField("Key passphrase (optional)", text: $passphrase)
+                        }
                     }
                 }
                 Section("Advanced (optional)") {
@@ -78,17 +99,23 @@ struct AddHostView: View {
     private func save() {
         var host = Host(name: name, hostname: hostname)
         host.port = Int(port)
-        host.user = user
-        host.auth = auth
-        host.keyHasPassphrase = auth == .key && !passphrase.isEmpty
         host.jumpHost = jumpHost.isEmpty ? nil : jumpHost
         host.keepaliveSecs = Int(keepalive)
-        state.addHost(
-            host,
-            password: auth == .password ? password : nil,
-            keyData: auth == .key ? keyData : nil,
-            passphrase: auth == .key ? passphrase : nil
-        )
+        host.identityId = identityId
+        if usingIdentity {
+            // Credentials come from the identity; store no host secrets.
+            state.addHost(host, password: nil, keyData: nil, passphrase: nil)
+        } else {
+            host.user = user
+            host.auth = auth
+            host.keyHasPassphrase = auth == .key && !passphrase.isEmpty
+            state.addHost(
+                host,
+                password: auth == .password ? password : nil,
+                keyData: auth == .key ? keyData : nil,
+                passphrase: auth == .key ? passphrase : nil
+            )
+        }
         dismiss()
     }
 }

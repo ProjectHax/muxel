@@ -5,9 +5,12 @@ import SwiftUI
 /// the sidebar shows live status only for the selected project (via the detail).
 struct SidebarView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.theme) private var theme
     @Binding var showAddHost: Bool
     @Binding var addProjectForHost: Host?
     @Binding var discoverForHost: Host?
+    @State private var showThemePicker = false
+    @State private var showIdentities = false
 
     /// Drives `NavigationSplitView` navigation: binding the `List` selection to the
     /// selected project's id is what pushes the detail column on iPhone (a plain
@@ -31,8 +34,13 @@ struct SidebarView: View {
     var body: some View {
         List(selection: selection) {
             if state.doc.hosts.isEmpty {
-                Text("No hosts yet — tap + to add one.")
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text("❯").foregroundStyle(theme.accentColor)
+                    Text("no hosts yet — tap + to add one")
+                        .foregroundStyle(theme.mutedColor)
+                }
+                .font(.mono(.footnote))
+                .listRowBackground(Color.clear)
             }
             ForEach(state.doc.hosts) { host in
                 Section {
@@ -41,6 +49,7 @@ struct SidebarView: View {
                                    selected: state.selectedProject?.id == project.id,
                                    running: state.runningCount(for: project))
                             .tag(project.id)
+                            .listRowBackground(Color.clear)
                     }
                     .onDelete { offsets in
                         let projects = state.projects(for: host)
@@ -50,58 +59,89 @@ struct SidebarView: View {
                         addProjectForHost = host
                     } label: {
                         Label("Add project", systemImage: "plus.circle")
-                            .font(.callout)
+                            .font(.mono(.footnote))
+                            .foregroundStyle(theme.mutedColor)
                     }
+                    .listRowBackground(Color.clear)
                 } header: {
-                    HStack {
-                        Label(host.name, systemImage: "server.rack")
-                        Spacer()
-                        Menu {
-                            Button {
-                                Task { await state.testConnection(host) }
-                            } label: {
-                                Label("Test connection", systemImage: "bolt.horizontal.circle")
-                            }
-                            Button {
-                                discoverForHost = host
-                            } label: {
-                                Label("Scan for projects", systemImage: "sparkle.magnifyingglass")
-                            }
-                            Button {
-                                addProjectForHost = host
-                            } label: {
-                                Label("Add project by path", systemImage: "plus")
-                            }
-                            Divider()
-                            Button(role: .destructive) {
-                                state.deleteHost(host)
-                            } label: {
-                                Label("Delete host", systemImage: "trash")
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis.circle")
-                                .font(.title2)
-                                .imageScale(.large)
-                                .contentShape(Rectangle())
-                                .padding(.vertical, 6)
-                                .padding(.leading, 12)
-                        }
-                    }
+                    hostHeader(host)
                 }
             }
         }
         .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .background(theme.background.ignoresSafeArea())
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button { showThemePicker = true } label: {
+                    Image(systemName: "paintpalette")
+                }
+                .accessibilityLabel("Theme")
+            }
+            ToolbarItem(placement: .topBarLeading) {
+                Button { showIdentities = true } label: {
+                    Image(systemName: "person.badge.key")
+                }
+                .accessibilityLabel("Login identities")
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button { showAddHost = true } label: {
                     Label("Add host", systemImage: "plus")
                 }
             }
         }
+        .sheet(isPresented: $showThemePicker) { ThemePickerView() }
+        .sheet(isPresented: $showIdentities) { IdentitiesView() }
+    }
+
+    private func hostHeader(_ host: Host) -> some View {
+        HStack {
+            HStack(spacing: 6) {
+                Text("❯")
+                    .font(.mono(.caption, weight: .bold))
+                    .foregroundStyle(theme.accentColor)
+                Text(host.name)
+                    .font(.mono(.subheadline, weight: .semibold))
+                    .foregroundStyle(theme.textColor)
+            }
+            Spacer()
+            Menu {
+                Button {
+                    Task { await state.testConnection(host) }
+                } label: {
+                    Label("Test connection", systemImage: "bolt.horizontal.circle")
+                }
+                Button {
+                    discoverForHost = host
+                } label: {
+                    Label("Scan for projects", systemImage: "sparkle.magnifyingglass")
+                }
+                Button {
+                    addProjectForHost = host
+                } label: {
+                    Label("Add project by path", systemImage: "plus")
+                }
+                Divider()
+                Button(role: .destructive) {
+                    state.deleteHost(host)
+                } label: {
+                    Label("Delete host", systemImage: "trash")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.title2)
+                    .imageScale(.large)
+                    .foregroundStyle(theme.mutedColor)
+                    .contentShape(Rectangle())
+                    .padding(.vertical, 6)
+                    .padding(.leading, 12)
+            }
+        }
     }
 }
 
 private struct ProjectRow: View {
+    @Environment(\.theme) private var theme
     let project: RemoteProject
     let selected: Bool
     /// Live instance count for the selected project (0 / unknown for others, since
@@ -111,26 +151,28 @@ private struct ProjectRow: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "folder")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(selected ? theme.accentColor : theme.mutedColor)
             VStack(alignment: .leading, spacing: 1) {
                 Text(project.name)
-                    .fontWeight(selected ? .semibold : .regular)
+                    .font(.mono(.callout, weight: selected ? .semibold : .regular))
+                    .foregroundStyle(theme.textColor)
                 Text(project.remoteRoot)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(.mono(.caption2))
+                    .foregroundStyle(theme.mutedColor)
                     .lineLimit(1)
                     .truncationMode(.head)
             }
             Spacer()
             if let running, running > 0 {
                 Text("\(running)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .font(.mono(.caption2, weight: .semibold))
+                    .foregroundStyle(theme.runningColor)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 1)
-                    .background(Capsule().fill(Color.green.opacity(0.18)))
+                    .background(Capsule().fill(theme.runningColor.opacity(0.18)))
                     .accessibilityLabel("\(running) running")
             }
         }
+        .padding(.vertical, 2)
     }
 }

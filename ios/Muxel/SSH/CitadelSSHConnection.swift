@@ -23,6 +23,9 @@ import NIOSSH
 /// (`host.jumpHost`) support is unimplemented.
 actor CitadelSSHConnection: SSHConnection {
     private let host: Host
+    /// Resolved shared-identity credential, if the host references one. When set, it
+    /// overrides the host's inline user/auth and names the Keychain secret owner.
+    private let credential: ResolvedCredential?
     private let hostKeys: HostKeyStore
     private var client: SSHClient?
     /// In-flight connect, so concurrent callers share one handshake (actor isolation
@@ -35,8 +38,9 @@ actor CitadelSSHConnection: SSHConnection {
     private var commandBusy = false
     private var commandWaiters: [CheckedContinuation<Void, Never>] = []
 
-    init(host: Host, hostKeys: HostKeyStore = HostKeyStore()) {
+    init(host: Host, credential: ResolvedCredential? = nil, hostKeys: HostKeyStore = HostKeyStore()) {
         self.host = host
+        self.credential = credential
         self.hostKeys = hostKeys
     }
 
@@ -153,20 +157,26 @@ actor CitadelSSHConnection: SSHConnection {
     // MARK: Auth
 
     private func authenticationMethod() throws -> SSHAuthenticationMethod {
-        let user = host.user.isEmpty ? "root" : host.user
-        switch host.auth {
+        // Credentials come from the referenced identity when set, else the host's own
+        // inline fields. `owner` is the Keychain id that holds the secret.
+        let rawUser = credential?.user ?? host.user
+        let auth = credential?.auth ?? host.auth
+        let keyHasPassphrase = credential?.keyHasPassphrase ?? host.keyHasPassphrase
+        let owner = credential?.secretOwner ?? host.id
+        let user = rawUser.isEmpty ? "root" : rawUser
+        switch auth {
         case .password:
-            guard let pw = Keychain.password(for: host.id) else { throw SSHError.missingCredential }
+            guard let pw = Keychain.password(for: owner) else { throw SSHError.missingCredential }
             return .passwordBased(username: user, password: pw)
 
         case .key:
-            guard let keyData = Keychain.privateKey(for: host.id) else { throw SSHError.missingCredential }
+            guard let keyData = Keychain.privateKey(for: owner) else { throw SSHError.missingCredential }
             guard let keyText = String(data: keyData, encoding: .utf8) else {
                 throw SSHError.auth("The imported key isn't text. Export an OpenSSH private key " +
                                     "(it begins with \u{201C}-----BEGIN OPENSSH PRIVATE KEY-----\u{201D}).")
             }
-            let passphrase: Data? = host.keyHasPassphrase
-                ? Keychain.keyPassphrase(for: host.id).flatMap { $0.data(using: .utf8) }
+            let passphrase: Data? = keyHasPassphrase
+                ? Keychain.keyPassphrase(for: owner).flatMap { $0.data(using: .utf8) }
                 : nil
             return try keyAuth(user: user, keyText: keyText, passphrase: passphrase)
         }

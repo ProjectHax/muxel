@@ -28,8 +28,46 @@ struct Host: Codable, Identifiable, Equatable, Hashable {
     var jumpHost: String? = nil
     /// ServerAliveInterval equivalent (seconds) for the SSH keepalive.
     var keepaliveSecs: Int? = nil
+    /// When set, this host's credentials (user, auth, key/password) come from the
+    /// shared [`Identity`] with this id instead of the host's own inline fields.
+    var identityId: UUID? = nil
 
     var displayPort: Int { port ?? 22 }
+}
+
+/// A reusable, named SSH login identity — the credential half of a host (user +
+/// auth + optional passphrase-protected key) that many hosts can share via
+/// `Host.identityId`. Secrets (password, or the imported key + passphrase) live in
+/// the Keychain keyed by `id`, never in this struct — mirroring `Host`.
+struct Identity: Codable, Identifiable, Equatable, Hashable {
+    var id = UUID()
+    var name: String
+    var user: String = ""
+    var auth: SshAuthKind = .password
+    /// Whether the stored key is passphrase-protected (passphrase in the Keychain).
+    var keyHasPassphrase: Bool = false
+}
+
+/// The credential a host connects with, resolved from its referenced identity (or
+/// `nil` for the host's own inline fields). `secretOwner` is the Keychain owner id —
+/// the identity's id, so hosts sharing an identity share one stored secret.
+struct ResolvedCredential: Equatable {
+    var user: String
+    var auth: SshAuthKind
+    var keyHasPassphrase: Bool
+    var secretOwner: UUID
+}
+
+extension Host {
+    /// The effective credential for this host given the identity library: `nil` when
+    /// it uses its own inline fields, else the referenced identity's login + secret
+    /// owner. Shared by the app-state and background-poller connection paths.
+    func resolvedCredential(in identities: [Identity]) -> ResolvedCredential? {
+        guard let iid = identityId, let id = identities.first(where: { $0.id == iid })
+        else { return nil }
+        return ResolvedCredential(user: id.user, auth: id.auth,
+                                  keyHasPassphrase: id.keyHasPassphrase, secretOwner: id.id)
+    }
 }
 
 /// A device-local remote project: a host + the absolute project root on that host.
@@ -70,6 +108,19 @@ struct Preset: Codable, Identifiable, Equatable, Hashable {
 struct StoreDocument: Codable, Equatable {
     var hosts: [Host] = []
     var projects: [RemoteProject] = []
+    var identities: [Identity] = []
+
+    init() {}
+
+    /// Custom decoder so an older `store.json` (written before `identities` existed)
+    /// still loads: synthesized `Decodable` would throw on the missing key and reset
+    /// the whole document to empty. Each field defaults when absent.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        hosts = try c.decodeIfPresent([Host].self, forKey: .hosts) ?? []
+        projects = try c.decodeIfPresent([RemoteProject].self, forKey: .projects) ?? []
+        identities = try c.decodeIfPresent([Identity].self, forKey: .identities) ?? []
+    }
 }
 
 /// Loads/saves `StoreDocument` as JSON under Application Support. Pure file I/O;

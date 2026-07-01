@@ -313,6 +313,13 @@ feature is added or changed, update the matching entry here in the same change**
   options: hostname/alias, port, user, auth (ssh-agent, key file, or password),
   ProxyJump, agent forwarding, host-key policy, keepalive, and extra `-o` options.
   A "Test connection" button verifies a host.
+- **Login identities** — Settings → Identities defines reusable logins (a name +
+  user + auth + key file or keychain password). A host can reference an identity
+  instead of entering credentials inline, so one login is defined once and shared by
+  many hosts (and rotated in one place). Selecting an identity on a host hides its
+  inline credential fields; the password is stored once in the keychain under the
+  identity and reused across every host that references it. Deleting an identity
+  falls its hosts back to inline/ssh-agent.
 - **Secure passwords** — saved SSH passwords are stored in the OS keychain (Secret
   Service / macOS Keychain / Windows Credential Manager), never in muxel's config,
   and fed to ssh via `sshpass`. Password auth requires `sshpass` (Linux/macOS only;
