@@ -57,7 +57,18 @@ final class PollService {
                 bell: bell, idle: idle
             )
             trackers[inst.id] = tracker
-            out.append(InstanceStatus(instanceId: inst.id, status: status, running: true))
+            // With no screen markers on iOS, classify's only route to `.working` is its
+            // activity fallback (output within ~2s). TUI agents (e.g. Claude) constantly
+            // redraw their input line even while idle at the prompt, so that fallback
+            // fires forever — a false "working". We can't distinguish an idle redraw
+            // from real output without scraping the screen, so don't infer working;
+            // report idle instead. (Desktop uses live-grid markers for this.)
+            var effective: AgentStatus = status == .working ? .idle : status
+            // A bell on a still-running pane is our best "needs input" signal (waiting
+            // for you) — surfaced as `.blocked`, distinct from a clean exit (`.done` =
+            // finished). `classify` stays a faithful port; this is an iOS poll-layer read.
+            if bell && !exited { effective = .blocked }
+            out.append(InstanceStatus(instanceId: inst.id, status: effective, running: true))
         }
         return out
     }

@@ -8,21 +8,23 @@ private enum Brand {
     static let accent = Color(.sRGB, red: 0x89 / 255, green: 0xb4 / 255, blue: 0xfa / 255)
     static let attention = Color(.sRGB, red: 0xf3 / 255, green: 0x8b / 255, blue: 0xa8 / 255)
     static let working = Color(.sRGB, red: 0xf9 / 255, green: 0xe2 / 255, blue: 0xaf / 255)
-    static let running = Color(.sRGB, red: 0xa6 / 255, green: 0xe3 / 255, blue: 0xa1 / 255)
+    static let done = Color(.sRGB, red: 0xa6 / 255, green: 0xe3 / 255, blue: 0xa1 / 255)
     static let idle = Color(.sRGB, red: 0x6c / 255, green: 0x70 / 255, blue: 0x86 / 255)
     static let text = Color(.sRGB, red: 0xcd / 255, green: 0xd6 / 255, blue: 0xf4 / 255)
 
     static func color(_ s: MuxelActivityAttributes.InstanceState) -> Color {
         switch s {
-        case .attention: return attention
-        case .working: return running
+        case .needsInput: return attention
+        case .finished: return done
+        case .working: return working
         case .idle: return idle
         }
     }
 }
 
 /// The muxel status bar: a Live Activity listing every agent instance and its state
-/// on the Lock Screen and in the Dynamic Island while the app is minimized.
+/// on the Lock Screen and in the Dynamic Island while the app is minimized. Agents
+/// waiting for you ("needs input") are surfaced first.
 struct MuxelLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: MuxelActivityAttributes.self) { ctx in
@@ -32,12 +34,12 @@ struct MuxelLiveActivity: Widget {
         } dynamicIsland: { ctx in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
-                    CountBadge(n: ctx.state.workingCount, color: Brand.running,
-                               systemImage: "bolt.horizontal.fill")
+                    CountBadge(n: ctx.state.needsInputCount, color: Brand.attention,
+                               systemImage: "bell.fill")
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    CountBadge(n: ctx.state.attentionCount, color: Brand.attention,
-                               systemImage: "bell.fill")
+                    CountBadge(n: ctx.state.workingCount, color: Brand.working,
+                               systemImage: "bolt.horizontal.fill")
                 }
                 DynamicIslandExpandedRegion(.center) {
                     Text("muxel").font(.caption2.weight(.semibold)).foregroundStyle(Brand.accent)
@@ -49,21 +51,21 @@ struct MuxelLiveActivity: Widget {
             } compactLeading: {
                 Image(systemName: "terminal.fill").foregroundStyle(Brand.accent)
             } compactTrailing: {
-                if ctx.state.attentionCount > 0 {
-                    Text("\(ctx.state.attentionCount)").foregroundStyle(Brand.attention).bold()
+                if ctx.state.needsInputCount > 0 {
+                    Text("\(ctx.state.needsInputCount)").foregroundStyle(Brand.attention).bold()
                 } else {
-                    Text("\(ctx.state.workingCount)").foregroundStyle(Brand.running)
+                    Text("\(ctx.state.workingCount)").foregroundStyle(Brand.working)
                 }
             } minimal: {
-                Image(systemName: ctx.state.attentionCount > 0 ? "bell.fill" : "terminal.fill")
-                    .foregroundStyle(ctx.state.attentionCount > 0 ? Brand.attention : Brand.accent)
+                Image(systemName: ctx.state.needsInputCount > 0 ? "bell.fill" : "terminal.fill")
+                    .foregroundStyle(ctx.state.needsInputCount > 0 ? Brand.attention : Brand.accent)
             }
             .keylineTint(Brand.accent)
         }
     }
 }
 
-/// Lock Screen / banner presentation — a per-instance list.
+/// Lock Screen / banner presentation — a per-instance list, needs-input first.
 private struct LockScreenView: View {
     let state: MuxelActivityAttributes.ContentState
     private static let cap = 6
@@ -93,15 +95,19 @@ private struct LockScreenView: View {
 
     @ViewBuilder private var summaryLine: some View {
         HStack(spacing: 10) {
-            if state.attentionCount > 0 {
-                Label("\(state.attentionCount) need attention", systemImage: "bell.fill")
+            if state.needsInputCount > 0 {
+                Label("\(state.needsInputCount) need input", systemImage: "bell.fill")
                     .foregroundStyle(Brand.attention)
             }
             if state.workingCount > 0 {
                 Label("\(state.workingCount) working", systemImage: "bolt.horizontal.fill")
-                    .foregroundStyle(Brand.running)
+                    .foregroundStyle(Brand.working)
             }
-            if state.attentionCount == 0 && state.workingCount == 0 {
+            if state.finishedCount > 0 {
+                Label("\(state.finishedCount) finished", systemImage: "checkmark")
+                    .foregroundStyle(Brand.done)
+            }
+            if state.needsInputCount == 0 && state.workingCount == 0 && state.finishedCount == 0 {
                 Text("all idle").foregroundStyle(Brand.idle)
             }
         }
@@ -132,8 +138,8 @@ private struct InstanceRowView: View {
         HStack(spacing: 7) {
             Circle().fill(Brand.color(row.state)).frame(width: 7, height: 7)
             Text(row.name)
-                .font(.caption2.weight(row.needsAttention ? .semibold : .regular))
-                .foregroundStyle(row.needsAttention ? Brand.attention : Brand.text)
+                .font(.caption2.weight(row.needsInput ? .semibold : .regular))
+                .foregroundStyle(row.needsInput ? Brand.attention : Brand.text)
                 .lineLimit(1)
             Text(row.project)
                 .font(.caption2)

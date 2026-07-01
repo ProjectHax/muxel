@@ -5,11 +5,15 @@ import XCTest
 /// ActivityKit lifecycle itself isn't unit-testable headlessly, so all logic lives here.
 final class ActivitySummaryTests: XCTestCase {
 
-    private typealias State = MuxelActivityAttributes.InstanceState
+    private func row(_ id: String, _ state: MuxelActivityAttributes.InstanceState)
+        -> MuxelActivityAttributes.InstanceRow {
+        .init(id: id, name: id, project: "p", state: state)
+    }
 
     func testStateMapping() {
-        XCTAssertEqual(ActivitySummaryBuilder.state(status: .done, running: true), .attention)
-        XCTAssertEqual(ActivitySummaryBuilder.state(status: .done, running: false), .attention)
+        // A bell/blocked pane is "needs input"; a clean exit is "finished".
+        XCTAssertEqual(ActivitySummaryBuilder.state(status: .blocked, running: true), .needsInput)
+        XCTAssertEqual(ActivitySummaryBuilder.state(status: .done, running: true), .finished)
         XCTAssertEqual(ActivitySummaryBuilder.state(status: .working, running: true), .working)
         XCTAssertEqual(ActivitySummaryBuilder.state(status: .working, running: false), .idle)
         XCTAssertEqual(ActivitySummaryBuilder.state(status: .idle, running: true), .idle)
@@ -18,33 +22,30 @@ final class ActivitySummaryTests: XCTestCase {
     func testRowTruncatesNameAndProject() {
         let long = String(repeating: "x", count: 40)
         let r = ActivitySummaryBuilder.row(
-            id: "i", name: long, project: long, status: .working, running: true)
+            id: "i", name: long, project: long, status: .blocked, running: true)
         XCTAssertEqual(r.name.count, ActivitySummaryBuilder.nameCap)
         XCTAssertEqual(r.project.count, ActivitySummaryBuilder.nameCap)
-        XCTAssertEqual(r.state, .working)
+        XCTAssertEqual(r.state, .needsInput)
     }
 
-    func testContentStateCountsAndAttentionFirstSort() {
+    func testNeedsInputSortsFirstThenFinishedThenWorking() {
         let rows = [
-            MuxelActivityAttributes.InstanceRow(id: "1", name: "idle", project: "p", state: .idle),
-            MuxelActivityAttributes.InstanceRow(id: "2", name: "work", project: "p", state: .working),
-            MuxelActivityAttributes.InstanceRow(id: "3", name: "attn", project: "p", state: .attention),
+            row("idle", .idle),
+            row("work", .working),
+            row("done", .finished),
+            row("input", .needsInput),
         ]
         let cs = ActivitySummaryBuilder.contentState(rows: rows, now: Date())
-        XCTAssertEqual(cs.attentionCount, 1)
+        XCTAssertEqual(cs.instances.map(\.id), ["input", "done", "work", "idle"])
+        XCTAssertEqual(cs.needsInputCount, 1)
+        XCTAssertEqual(cs.finishedCount, 1)
         XCTAssertEqual(cs.workingCount, 1)
-        XCTAssertEqual(cs.instanceCount, 3)
-        XCTAssertEqual(cs.instances.first?.id, "3", "attention sorts first")
-        XCTAssertEqual(cs.instances[1].id, "2", "then working")
-        XCTAssertEqual(cs.instances[2].id, "1", "then idle")
+        XCTAssertEqual(cs.instanceCount, 4)
         XCTAssertFalse(cs.isEmpty)
     }
 
     func testContentStateCapsListButKeepsTrueCount() {
-        let rows = (0..<20).map {
-            MuxelActivityAttributes.InstanceRow(
-                id: "\($0)", name: "a\($0)", project: "p", state: .working)
-        }
+        let rows = (0..<20).map { row("\($0)", .working) }
         let cs = ActivitySummaryBuilder.contentState(rows: rows, now: Date())
         XCTAssertEqual(cs.instances.count, ActivitySummaryBuilder.rowCap)
         XCTAssertEqual(cs.instanceCount, 20)
@@ -54,18 +55,13 @@ final class ActivitySummaryTests: XCTestCase {
     func testEmptyWhenNoInstances() {
         XCTAssertTrue(ActivitySummaryBuilder.contentState(rows: [], now: Date()).isEmpty)
         // Idle instances are NOT empty — the bar stays present.
-        let idle = ActivitySummaryBuilder.contentState(
-            rows: [MuxelActivityAttributes.InstanceRow(
-                id: "1", name: "i", project: "p", state: .idle)],
-            now: Date())
+        let idle = ActivitySummaryBuilder.contentState(rows: [row("1", .idle)], now: Date())
         XCTAssertFalse(idle.isEmpty)
     }
 
     func testContentStateCodableRoundTrip() throws {
         let cs = ActivitySummaryBuilder.contentState(
-            rows: [MuxelActivityAttributes.InstanceRow(
-                id: "1", name: "claude", project: "web", state: .attention)],
-            now: Date(timeIntervalSince1970: 1_700_000_000))
+            rows: [row("1", .needsInput)], now: Date(timeIntervalSince1970: 1_700_000_000))
         let data = try JSONEncoder().encode(cs)
         let back = try JSONDecoder().decode(MuxelActivityAttributes.ContentState.self, from: data)
         XCTAssertEqual(cs, back)

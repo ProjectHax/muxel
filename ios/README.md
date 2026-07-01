@@ -148,9 +148,12 @@ many hosts at it instead of re-entering credentials; the secret is stored in the
 Keychain under the identity id and shared by every host that references it.
 
 **Live status bar** (a Live Activity): while the app is minimized, a Lock Screen /
-Dynamic Island view lists **each agent instance** and its state — working, **needs
-attention** (an agent exited or rang the bell), or idle. It stays present the whole
-time you're backgrounded (idle instances included) and ends when you reopen. The
+Dynamic Island view lists **each agent instance** and its state — **needs input**
+(rang the bell), **finished** (exited), **working**, or idle — with the ones waiting
+for you sorted first. A bell on a live pane is treated as "needs input" (the closest
+background-safe signal; muxel can't scrape the screen for a real prompt marker), and
+a clean exit as "finished". It stays present the whole time you're backgrounded (idle
+instances included) and ends when you reopen. The
 widget lives in a `MuxelWidgets` app-extension target and renders from a shared
 `MuxelActivityAttributes` payload; it's driven by the same `StatusPoller` as the
 notifications. Note "needs attention" is the exit/bell

@@ -12,11 +12,13 @@ struct MuxelActivityAttributes: ActivityAttributes {
     /// Static; set once when the activity starts.
     var startedAt: Date
 
-    /// A pane/agent's coarse state, background-detectable from tmux signals.
+    /// A pane/agent's coarse state, background-detectable from tmux signals. Ordered
+    /// by attention priority — `needsInput` is surfaced first in the list.
     enum InstanceState: String, Codable, Hashable {
-        case working    // recent activity
-        case attention  // exited or rang the bell — "needs you"
-        case idle       // live but quiet, or no live session
+        case needsInput  // rang the bell / blocked — waiting for you
+        case finished    // the agent's process exited
+        case working     // recent activity
+        case idle        // live but quiet, or no live session
     }
 
     /// One row per agent instance (pane).
@@ -26,13 +28,14 @@ struct MuxelActivityAttributes: ActivityAttributes {
         var project: String  // owning project name (truncated), for context
         var state: InstanceState
 
-        var needsAttention: Bool { state == .attention }
+        var needsInput: Bool { state == .needsInput }
     }
 
     /// The dynamic content, refreshed on every poll.
     struct ContentState: Codable, Hashable {
         var instances: [InstanceRow]
-        var attentionCount: Int
+        var needsInputCount: Int
+        var finishedCount: Int
         var workingCount: Int
         /// True total across all projects — may exceed `instances.count` when capped.
         var instanceCount: Int

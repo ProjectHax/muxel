@@ -7,13 +7,17 @@ enum ActivitySummaryBuilder {
     static let rowCap = 16 // payload-size guard (ActivityKit ~4 KB)
 
     /// Coarse per-instance state from its poll signals:
-    /// - `.done` (agent exited or rang the bell) → **attention**
+    /// - `.blocked` (rang the bell / a real prompt marker) → **needsInput**
+    /// - `.done` (agent process exited) → **finished**
     /// - live and working (recent activity) → **working**
     /// - otherwise (live but quiet, or no live session) → **idle**
     static func state(status: AgentStatus, running: Bool) -> MuxelActivityAttributes.InstanceState {
-        if status == .done { return .attention }
-        if running && status == .working { return .working }
-        return .idle
+        switch status {
+        case .blocked: return .needsInput
+        case .done: return .finished
+        case .working: return running ? .working : .idle
+        case .idle: return .idle
+        }
     }
 
     static func row(
@@ -25,20 +29,24 @@ enum ActivitySummaryBuilder {
             state: state(status: status, running: running))
     }
 
-    /// Fold instance rows into a `ContentState`: counts, attention→working→idle sort
-    /// (then project, then name), and cap the list (overflow kept in `instanceCount`).
+    /// Fold instance rows into a `ContentState`: counts, and an attention-priority sort
+    /// (needsInput → finished → working → idle, then project, then name) that puts
+    /// agents waiting for you at the very top. Caps the list (overflow kept in
+    /// `instanceCount`).
     static func contentState(
         rows: [MuxelActivityAttributes.InstanceRow], now: Date
     ) -> MuxelActivityAttributes.ContentState {
         func rank(_ s: MuxelActivityAttributes.InstanceState) -> Int {
             switch s {
-            case .attention: return 0
-            case .working: return 1
-            case .idle: return 2
+            case .needsInput: return 0
+            case .finished: return 1
+            case .working: return 2
+            case .idle: return 3
             }
         }
-        let attention = rows.filter { $0.state == .attention }.count
-        let working = rows.filter { $0.state == .working }.count
+        func count(_ s: MuxelActivityAttributes.InstanceState) -> Int {
+            rows.filter { $0.state == s }.count
+        }
         let sorted = rows.sorted {
             if rank($0.state) != rank($1.state) { return rank($0.state) < rank($1.state) }
             if $0.project != $1.project { return $0.project < $1.project }
@@ -46,7 +54,9 @@ enum ActivitySummaryBuilder {
         }
         return .init(
             instances: Array(sorted.prefix(rowCap)),
-            attentionCount: attention, workingCount: working,
+            needsInputCount: count(.needsInput),
+            finishedCount: count(.finished),
+            workingCount: count(.working),
             instanceCount: rows.count, updatedAt: now)
     }
 }
