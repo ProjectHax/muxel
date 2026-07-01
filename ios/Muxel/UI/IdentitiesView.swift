@@ -86,11 +86,13 @@ struct IdentityEditorView: View {
                     if auth == .password {
                         SecureField(isEdit ? "New password (blank = keep)" : "Password",
                                     text: $password)
+                            .noPasswordAutoFill()
                     } else {
                         Button { importingKey = true } label: {
                             Label(keyLabel, systemImage: "key.fill")
                         }
                         SecureField("Key passphrase (optional)", text: $passphrase)
+                            .noPasswordAutoFill()
                     }
                 }
             }

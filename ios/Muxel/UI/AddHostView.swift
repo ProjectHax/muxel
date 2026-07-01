@@ -21,6 +21,9 @@ struct AddHostView: View {
     @State private var keepalive = ""
     @State private var importingKey = false
     @State private var identityId: UUID?
+    /// After Save with inline credentials, offer to save them as a reusable identity.
+    @State private var askSaveIdentity = false
+    @State private var identityName = ""
 
     private var usingIdentity: Bool { identityId != nil }
 
@@ -63,12 +66,14 @@ struct AddHostView: View {
                         }
                         if auth == .password {
                             SecureField("Password", text: $password)
+                                .noPasswordAutoFill()
                         } else {
                             Button { importingKey = true } label: {
                                 Label(keyName.isEmpty ? "Import private key" : keyName,
                                       systemImage: "key.fill")
                             }
                             SecureField("Key passphrase (optional)", text: $passphrase)
+                                .noPasswordAutoFill()
                         }
                     }
                 }
@@ -83,7 +88,7 @@ struct AddHostView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save", action: save).disabled(!canSave)
+                    Button("Save", action: attemptSave).disabled(!canSave)
                 }
             }
             .fileImporter(isPresented: $importingKey, allowedContentTypes: [.data, .text, .item]) { result in
@@ -93,17 +98,45 @@ struct AddHostView: View {
                 keyData = try? Data(contentsOf: url)
                 keyName = url.lastPathComponent
             }
+            .alert("Reuse this login?", isPresented: $askSaveIdentity) {
+                TextField("Identity name", text: $identityName)
+                Button("Save as identity") { saveAsIdentity(); dismiss() }
+                Button("Just this host") { saveHostOnly(); dismiss() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Save these credentials as a reusable login identity so other "
+                    + "hosts can use them without re-entering.")
+            }
         }
     }
 
-    private func save() {
+    /// Non-credential host fields (shared by both save paths).
+    private func makeHost() -> Host {
         var host = Host(name: name, hostname: hostname)
         host.port = Int(port)
         host.jumpHost = jumpHost.isEmpty ? nil : jumpHost
         host.keepaliveSecs = Int(keepalive)
+        return host
+    }
+
+    private func attemptSave() {
+        if usingIdentity {
+            // Already using a shared identity — nothing new to offer to save.
+            saveHostOnly()
+            dismiss()
+        } else {
+            // Inline credentials entered — offer to make them a reusable identity.
+            identityName = name
+            askSaveIdentity = true
+        }
+    }
+
+    /// Save the host with its own inline credentials (or referencing the picked
+    /// identity, in which case no host secret is stored).
+    private func saveHostOnly() {
+        var host = makeHost()
         host.identityId = identityId
         if usingIdentity {
-            // Credentials come from the identity; store no host secrets.
             state.addHost(host, password: nil, keyData: nil, passphrase: nil)
         } else {
             host.user = user
@@ -116,6 +149,23 @@ struct AddHostView: View {
                 passphrase: auth == .key ? passphrase : nil
             )
         }
-        dismiss()
+    }
+
+    /// Save the entered credentials as a new shared identity, then add the host
+    /// referencing it (so the secret lives once, under the identity).
+    private func saveAsIdentity() {
+        var identity = Identity(name: identityName.isEmpty ? name : identityName)
+        identity.user = user
+        identity.auth = auth
+        identity.keyHasPassphrase = auth == .key && !passphrase.isEmpty
+        state.addIdentity(
+            identity,
+            password: auth == .password ? password : nil,
+            keyData: auth == .key ? keyData : nil,
+            passphrase: auth == .key ? passphrase : nil
+        )
+        var host = makeHost()
+        host.identityId = identity.id
+        state.addHost(host, password: nil, keyData: nil, passphrase: nil)
     }
 }
