@@ -34,6 +34,7 @@ struct StatusPoller {
     ) async -> Int {
         let doc = store.load()
         var posted = 0
+        var rows: [MuxelActivityAttributes.InstanceRow] = []
         for host in doc.hosts {
             let projects = doc.projects.filter { $0.hostId == host.id }
             guard !projects.isEmpty else { continue }
@@ -46,19 +47,29 @@ struct StatusPoller {
             for project in projects {
                 guard let layout = try? await RemoteLayoutStore.read(conn, root: project.remoteRoot) else { continue }
                 let statuses = await poll.poll(conn, instances: layout.orderedTerminalInstances)
-                for s in statuses where s.running {
-                    let prev = lastStatus(s.instanceId)
-                    if (s.status == .blocked || s.status == .done), s.status != prev {
-                        let inst = layout.instances.first { $0.id == s.instanceId }
-                        let name = inst?.displayName ?? "Agent"
-                        let label = s.status == .blocked ? "needs input" : "finished"
-                        NotificationManager.notify(title: "\(name) \(label)", body: project.name)
-                        posted += 1
+                for s in statuses {
+                    let name = layout.instances.first { $0.id == s.instanceId }?.displayName ?? "agent"
+                    if s.running {
+                        let prev = lastStatus(s.instanceId)
+                        if (s.status == .blocked || s.status == .done), s.status != prev {
+                            let label = s.status == .blocked ? "needs input" : "finished"
+                            NotificationManager.notify(title: "\(name) \(label)", body: project.name)
+                            posted += 1
+                        }
+                        setLastStatus(s.status, s.instanceId)
                     }
-                    setLastStatus(s.status, s.instanceId)
+                    rows.append(ActivitySummaryBuilder.row(
+                        id: s.instanceId, name: name, project: project.name,
+                        status: s.status, running: s.running))
                 }
             }
         }
+        // Refresh the Live Activity from the full multi-project scan (updates an
+        // existing one, or ends it when nothing is running). Cache it so the next
+        // background transition can start the activity instantly.
+        let summary = ActivitySummaryBuilder.contentState(rows: rows, now: Date())
+        SummaryCache.save(summary)
+        await LiveActivityController.apply(summary)
         return posted
     }
 }

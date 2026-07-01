@@ -210,6 +210,40 @@ final class AppState: ObservableObject {
         host.resolvedCredential(in: doc.identities)
     }
 
+    /// Instant, no-network snapshot of every instance: the last cached full summary,
+    /// overlaid with fresh live data for the selected project (the only one the
+    /// foreground tracks). `nil` only when there are no instances anywhere. The
+    /// background `StatusPoller` refines it with a full multi-project scan.
+    func currentSummarySnapshot() -> MuxelActivityAttributes.ContentState? {
+        var rows: [MuxelActivityAttributes.InstanceRow] = []
+        var selectedIds = Set<String>()
+        if let sel = selectedProject, let layout {
+            for inst in layout.orderedTerminalInstances {
+                selectedIds.insert(inst.id)
+                rows.append(ActivitySummaryBuilder.row(
+                    id: inst.id, name: inst.displayName, project: sel.name,
+                    status: statuses[inst.id] ?? .idle, running: running.contains(inst.id)))
+            }
+        }
+        // Carry other projects' instances from the last full background scan.
+        for r in SummaryCache.load()?.instances ?? [] where !selectedIds.contains(r.id) {
+            rows.append(r)
+        }
+        let state = ActivitySummaryBuilder.contentState(rows: rows, now: Date())
+        return state.isEmpty ? nil : state
+    }
+
+    /// Reconcile the Live Activity to the current snapshot. Must be driven from the
+    /// FOREGROUND (poll ticks, selecting a project, becoming active): ActivityKit only
+    /// lets an activity be *started* while the app is foreground. Once started it
+    /// persists onto the Lock Screen when the app is minimized; background polls then
+    /// just update it. Applying an empty state ends the activity (no instances left).
+    func syncLiveActivity() {
+        let state = currentSummarySnapshot()
+            ?? ActivitySummaryBuilder.contentState(rows: [], now: Date())
+        Task { await LiveActivityController.apply(state) }
+    }
+
     // MARK: Selecting a project (connect + read layout + poll)
 
     func select(_ project: RemoteProject) {
@@ -266,6 +300,9 @@ final class AppState: ObservableObject {
         let results = await poll.poll(conn, instances: layout.orderedTerminalInstances)
         for r in results { statuses[r.instanceId] = r.status }
         running = Set(results.filter(\.running).map(\.instanceId))
+        // Foreground start/refresh — keeps the Live Activity alive so it's on the
+        // Lock Screen when the app is minimized (starting must happen here).
+        syncLiveActivity()
     }
 
     /// The user viewed a pane — clear its done latch so it stops showing done.

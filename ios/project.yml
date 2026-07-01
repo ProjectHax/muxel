@@ -38,6 +38,7 @@ targets:
     platform: iOS
     sources:
       - path: Muxel
+      - path: Shared # the Live Activity payload, shared with the widget extension
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.muxel.ios
@@ -54,10 +55,32 @@ targets:
     dependencies:
       - package: Citadel
       - package: SwiftTerm
+      - target: MuxelWidgets # embed the widget extension (.appex) in the app bundle
+        embed: true
     scheme:
       testTargets:
         - MuxelTests
       gatherCoverageData: false
+
+  # Widget extension hosting the Live Activity (Lock Screen + Dynamic Island status
+  # bar). Pure SwiftUI/WidgetKit/ActivityKit — no SSH deps; renders from the payload.
+  MuxelWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: MuxelWidgets
+      - path: Shared # same ActivityAttributes file, second target membership
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.muxel.ios.widgets
+        PRODUCT_NAME: MuxelWidgets
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: MuxelWidgets/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: YES
+        ENABLE_PREVIEWS: YES
 
   MuxelTests:
     type: bundle.unit-test

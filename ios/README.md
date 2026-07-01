@@ -147,7 +147,19 @@ login once — user + auth + imported key/passphrase or keychain password — an
 many hosts at it instead of re-entering credentials; the secret is stored in the
 Keychain under the identity id and shared by every host that references it.
 
-Future: APNs push via a remote watcher daemon (instant background alerts); tmux
+**Live status bar** (a Live Activity): while the app is minimized, a Lock Screen /
+Dynamic Island view lists **each agent instance** and its state — working, **needs
+attention** (an agent exited or rang the bell), or idle. It stays present the whole
+time you're backgrounded (idle instances included) and ends when you reopen. The
+widget lives in a `MuxelWidgets` app-extension target and renders from a shared
+`MuxelActivityAttributes` payload; it's driven by the same `StatusPoller` as the
+notifications. Note "needs attention" is the exit/bell
+signal, not true input-blocking (which needs screen scraping the app doesn't do), and
+without APNs the backgrounded activity only refreshes at the OS poll cadence
+(~15 min+) so it's marked stale between updates.
+
+Future: APNs push via a remote watcher daemon (instant background alerts + live
+status-bar updates); tmux
 **control mode** (`-C`) for structured multi-pane multiplexing; split-tree
 rendering/editing; worktree creation; editor/diff panes.
 
