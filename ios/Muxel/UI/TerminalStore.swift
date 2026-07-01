@@ -36,6 +36,9 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     /// Focuses the terminal (shows the keyboard) on the first tap without waiting for
     /// SwiftTerm's double/triple-tap disambiguation.
     private weak var focusTap: UITapGestureRecognizer?
+    /// Held-backspace acceleration state (see `send`).
+    private var deleteStreak = 0
+    private var lastDeleteAt: TimeInterval = 0
 
     enum Event {
         case send(ByteBuffer)
@@ -248,6 +251,26 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
 
     func send(source: TerminalView, data: ArraySlice<UInt8>) {
         events.continuation.yield(.send(ByteBuffer(bytes: data)))
+
+        // Accelerate held backspace. iOS repeats `deleteBackward` at a flat rate for a
+        // custom key-input view (it doesn't apply the delete acceleration it gives
+        // normal text fields), so holding backspace deletes slowly. On a sustained run
+        // of backspace bytes, send extra backspaces straight to the PTY — ramping up the
+        // longer it's held. We send raw bytes rather than calling `deleteBackward()`
+        // again: re-entering it mid-edit corrupts SwiftTerm's text-input range and
+        // crashes ("String index is out of bounds"). The remote deletes the chars and
+        // the screen follows via echo. Single taps reset the streak.
+        guard data.count == 1, let b = data.first, b == 0x7f || b == 0x08 else {
+            deleteStreak = 0
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        deleteStreak = (now - lastDeleteAt < 0.2) ? deleteStreak + 1 : 0
+        lastDeleteAt = now
+        let extra = min(deleteStreak / 3, 5) // 0 at first, ramping to +5 (≈6× on hold)
+        for _ in 0..<extra {
+            events.continuation.yield(.send(ByteBuffer(bytes: [b])))
+        }
     }
 
     func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {

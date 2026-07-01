@@ -59,7 +59,11 @@ releases via `from:` in `project.yml`):
 > `mouse on`, and a one-finger **vertical** swipe sends mouse-wheel events to scroll it,
 > with momentum on lift (`TerminalSession`). The scroll gesture only begins for
 > vertical pans (so the edge back-swipe passes through) and SwiftTerm's pans wait for
-> it to fail, so a swipe scrolls rather than selecting. The background poll
+> it to fail, so a swipe scrolls rather than selecting. **Held backspace** is
+> accelerated: iOS repeats `deleteBackward` at a flat rate for a custom key-input view,
+> so `TerminalSession.send` detects a sustained run of backspace bytes and emits extra
+> ones (as raw bytes, not re-entrant `deleteBackward` calls), ramping up the longer
+> it's held. The background poll
 > (`PollService`) still drives status badges +
 > notifications. Password auth, exec, and **SSH key auth** (ed25519 / RSA, with
 > passphrase — ECDSA is detected but not parseable by Citadel) are implemented in
