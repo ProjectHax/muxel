@@ -12453,6 +12453,9 @@ impl MuxelApp {
                                         .flex()
                                         .items_center()
                                         .gap_1()
+                                        // A little breathing room before the trailing
+                                        // icon buttons (file browser / memory).
+                                        .mr_1()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
                                         .child(
