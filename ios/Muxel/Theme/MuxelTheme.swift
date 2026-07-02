@@ -39,6 +39,20 @@ struct MuxelTheme: Identifiable, Equatable {
     var runningColor: Color { Color(hex: green) }
     var workingColor: Color { Color(hex: yellow) }
     var blockedColor: Color { Color(hex: red) }
+
+    // Terminal grid colors. The grid always renders **dark**, even under a light
+    // chrome theme: remote programs (shells, agents) assume a dark terminal and
+    // hardcode near-white text via 256-color / truecolor, which muxel can't
+    // remap and which vanishes on a light background. For dark themes this is
+    // just `bg`/`fg`; a light theme swaps to its own dark `fg` as the grid
+    // background and light `bg` as the text, keeping the theme's identity while
+    // staying readable.
+    var terminalBgHex: String { isDark ? bg : fg }
+    var terminalFgHex: String { isDark ? fg : bg }
+    /// The dark grid's black (ANSI 0): the near-bg subtle black for dark themes,
+    /// the muted grey (readable on the dark grid) for light themes.
+    var terminalBlackHex: String { isDark ? bg : muted }
+    var terminalBackground: Color { Color(hex: terminalBgHex) }
 }
 
 extension MuxelTheme {

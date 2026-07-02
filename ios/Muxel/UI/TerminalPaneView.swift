@@ -20,7 +20,9 @@ struct TerminalPaneView: View {
         Group {
             if let session {
                 LiveTerminalView(session: session, theme: theme)
-                    .background(theme.background)
+                    // Match the (always-dark) terminal grid so an attach/resize
+                    // gap doesn't flash the light chrome background.
+                    .background(theme.terminalBackground)
             } else if let error {
                 CenteredState(icon: "wifi.exclamationmark",
                               iconColor: theme.blockedColor,
