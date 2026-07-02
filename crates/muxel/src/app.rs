@@ -10570,11 +10570,11 @@ impl MuxelApp {
                             .px_1()
                             .h_full()
                             .max_w(px(180.0));
-                        // The active tab gets a full themed (accent) outline so the
-                        // selection is obvious at a glance; the others keep just the
-                        // right divider between pills.
+                        // The active tab gets a themed (accent) underline so the
+                        // selection is obvious at a glance without an oversized box;
+                        // the others keep just the right divider between pills.
                         let pill = if tab_active {
-                            pill.border_1().border_color(cx.theme().primary)
+                            pill.border_b_2().border_color(cx.theme().primary)
                         } else {
                             pill.border_r_1().border_color(cx.theme().border)
                         };
