@@ -198,7 +198,10 @@ Dynamic Island view lists **each agent instance** and its state — **needs inpu
 for you sorted first. A bell on a live pane is treated as "needs input" (the closest
 background-safe signal; muxel can't scrape the screen for a real prompt marker), and
 a clean exit as "finished". It stays present the whole time you're backgrounded (idle
-instances included) and ends when you reopen. The
+instances included) and ends when you reopen — and fully closing the app
+(`applicationWillTerminate`) ends it too, so nothing lingers in the Dynamic Island /
+Lock Screen after muxel is gone (a long-suspended app that skips that callback falls
+back to the ~20-min stale timeout). The
 widget lives in a `MuxelWidgets` app-extension target and renders from a shared
 `MuxelActivityAttributes` payload; it's driven by the same `StatusPoller` as the
 notifications. Note "needs attention" is the exit/bell

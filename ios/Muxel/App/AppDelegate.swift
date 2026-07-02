@@ -23,6 +23,22 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         return true
     }
 
+    /// Fully closing muxel (swiping it away in the app switcher) should clear its
+    /// Live Activity from the Dynamic Island and Lock Screen — a Live Activity
+    /// otherwise outlives its app until it hits its stale/dismissal timeout.
+    /// `Activity.end` is async, so block briefly here: the system gives a
+    /// terminating app a short window before it's killed, enough for the end to
+    /// land. (For a long-suspended app iOS may skip this callback; the activity's
+    /// ~20-min stale date is the backstop for that case.)
+    func applicationWillTerminate(_ application: UIApplication) {
+        let done = DispatchSemaphore(value: 0)
+        Task {
+            await LiveActivityController.endAll()
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 3)
+    }
+
     /// Ask iOS to run the next poll no sooner than ~15 min out. Call when entering
     /// the background.
     func scheduleNextPoll() {

@@ -52,8 +52,9 @@ enum LiveActivityController {
         }
     }
 
-    /// End every muxel activity — called on foreground return and to clear a stale one
-    /// left by a force-quit (the next cold launch's `.active`).
+    /// End every muxel activity immediately — called when the app is fully closed
+    /// (`applicationWillTerminate`) so nothing lingers in the Dynamic Island /
+    /// Lock Screen after the app is gone.
     static func endAll() async {
         for a in Activity<MuxelActivityAttributes>.activities {
             await a.end(nil, dismissalPolicy: .immediate)
