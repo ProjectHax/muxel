@@ -6,6 +6,8 @@ use crate::colors::TerminalPalette;
 use crate::element::TerminalElement;
 use crate::keymap::{KeyModifiers, key_to_bytes};
 use crate::session::{CommandSpec, PtyChunk, TerminalSession};
+use alacritty_terminal::term::ClipboardType;
+use anyhow::Context as _;
 use gpui::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -146,30 +148,74 @@ pub struct TerminalView {
     _drain: Task<()>,
 }
 
-impl TerminalView {
-    /// Spawn a terminal running `spec` and wire up its output drain.
-    pub fn new(spec: CommandSpec, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // Try the requested program; if it can't be launched (e.g. the agent
-        // isn't installed), fall back to a shell that shows the error rather than
-        // crashing the whole app.
-        let mut launch_error: Option<String> = None;
-        let (spec, session, rx) = match TerminalSession::spawn(spec.clone(), 80, 24) {
-            Ok((session, rx)) => (spec, session, rx),
+/// A spawned terminal not yet wrapped in a view: the spec that actually ran
+/// (the requested one, or the fallback shell), the live session + its output
+/// receiver, and the launch error when the requested program failed to start.
+/// Splitting the fallible spawn from the (infallible) gpui entity construction
+/// is what lets a total launch failure surface as an error instead of a panic.
+pub struct TerminalLaunch {
+    spec: CommandSpec,
+    session: Arc<TerminalSession>,
+    rx: async_channel::Receiver<PtyChunk>,
+    launch_error: Option<String>,
+}
+
+impl TerminalLaunch {
+    /// Spawn `spec`; if it can't be launched (e.g. the agent isn't installed),
+    /// fall back to a shell that prints the error. `Err` only when even the
+    /// fallback shell can't spawn (bogus `$SHELL` and no `/bin/bash`, fd
+    /// exhaustion, …).
+    pub fn spawn(spec: CommandSpec) -> anyhow::Result<Self> {
+        Self::spawn_with_fallback(spec, CommandSpec::shell())
+    }
+
+    /// Testable inner half of [`Self::spawn`]: the fallback spec is injectable.
+    fn spawn_with_fallback(spec: CommandSpec, fallback: CommandSpec) -> anyhow::Result<Self> {
+        match TerminalSession::spawn(spec.clone(), 80, 24) {
+            Ok((session, rx)) => Ok(Self {
+                spec,
+                session,
+                rx,
+                launch_error: None,
+            }),
             Err(e) => {
                 // Capture the full error (incl. the OS code) for the dev console.
-                launch_error = Some(format!("{e:#}"));
+                let launch_error = format!("{e:#}");
                 let prog = spec.program.replace(['\'', '"'], "");
                 // `{e:#}` includes the full anyhow context chain (e.g. the real
                 // OS error: "No such file or directory"), not just the top context.
-                let detail = format!("{e:#}").replace(['\'', '"', '\n', '\r'], " ");
-                let shell = CommandSpec::shell().with_startup_input(format!(
+                let detail = launch_error.replace(['\'', '"', '\n', '\r'], " ");
+                let shell = fallback.with_startup_input(format!(
                     "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
                 ));
                 let (session, rx) = TerminalSession::spawn(shell.clone(), 80, 24)
-                    .expect("failed to spawn fallback shell");
-                (shell, session, rx)
+                    .with_context(|| format!("fallback shell (after `{prog}` failed: {detail})"))?;
+                Ok(Self {
+                    spec: shell,
+                    session,
+                    rx,
+                    launch_error: Some(launch_error),
+                })
             }
-        };
+        }
+    }
+
+    /// The error from a failed launch of the requested program (the fallback
+    /// shell is running instead). `None` when the program launched fine.
+    pub fn launch_error(&self) -> Option<&str> {
+        self.launch_error.as_deref()
+    }
+}
+
+impl TerminalView {
+    /// Wrap a spawned terminal in a view and wire up its output drain.
+    pub fn new(launch: TerminalLaunch, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let TerminalLaunch {
+            spec,
+            session,
+            rx,
+            launch_error,
+        } = launch;
         let startup_input = spec.startup_input.clone();
         let auto_mode_presses = spec.auto_mode_presses;
         let startup_delay_ms = spec.startup_delay_ms;
@@ -289,6 +335,11 @@ impl TerminalView {
                     .update(cx, |view, cx| {
                         if !output.is_empty() {
                             view.session.process_output(&output);
+                            // OSC-52 copies parsed from this batch land on the
+                            // system clipboard here, where a gpui cx exists.
+                            for (ty, text) in view.session.take_clipboard_stores() {
+                                write_clipboard(ty, text, cx);
+                            }
                         }
                         if let Some(code) = exit {
                             view.exited = true;
@@ -320,11 +371,6 @@ impl TerminalView {
             done_latch: std::cell::Cell::new(false),
             _drain: drain,
         }
-    }
-
-    /// Convenience: spawn the user's login shell.
-    pub fn shell(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new(CommandSpec::shell(), window, cx)
     }
 
     pub fn session(&self) -> &Arc<TerminalSession> {
@@ -396,8 +442,10 @@ impl TerminalView {
         self.session.title()
     }
 
-    /// Replace the color palette used to render this terminal.
+    /// Replace the color palette used to render this terminal. Also pushed into
+    /// the session so OSC color queries answer with what's actually painted.
     pub fn set_palette(&mut self, palette: TerminalPalette) {
+        self.session.set_palette(palette.clone());
         self.palette = palette;
     }
 
@@ -475,6 +523,23 @@ impl TerminalView {
     }
 }
 
+/// Land an OSC-52 copy on the system clipboard — the primary selection where
+/// the platform has one, the normal clipboard otherwise.
+fn write_clipboard(ty: ClipboardType, text: String, cx: &mut Context<TerminalView>) {
+    if text.is_empty() {
+        return;
+    }
+    let item = ClipboardItem::new_string(text);
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if ty == ClipboardType::Selection {
+        cx.write_to_primary(item);
+        return;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    let _ = ty;
+    cx.write_to_clipboard(item);
+}
+
 impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -501,6 +566,42 @@ impl Render for TerminalView {
                 px(self.font_size),
                 self.mouse_mode,
             ))
+    }
+}
+
+// These tests spawn real processes, so they are Unix-only.
+#[cfg(all(test, unix))]
+mod launch_tests {
+    // Import specifically (not `super::*`) so `#[test]` resolves to the built-in
+    // macro, not gpui's glob-imported `test` attribute.
+    use super::TerminalLaunch;
+    use crate::session::CommandSpec;
+
+    #[test]
+    fn bad_program_falls_back_to_shell_with_error() {
+        let launch =
+            TerminalLaunch::spawn(CommandSpec::program("/definitely/not/here-muxel", vec![]))
+                .expect("fallback shell should spawn");
+        assert!(
+            launch.launch_error().is_some(),
+            "the original failure is kept for the dev console"
+        );
+        launch.session.kill();
+    }
+
+    #[test]
+    fn double_failure_is_an_error_not_a_panic() {
+        let bogus = CommandSpec::program("/definitely/not/here-muxel", vec![]);
+        let result = TerminalLaunch::spawn_with_fallback(bogus.clone(), bogus);
+        assert!(result.is_err(), "total failure must surface as Err");
+    }
+
+    #[test]
+    fn good_program_has_no_launch_error() {
+        let launch =
+            TerminalLaunch::spawn(CommandSpec::program("/bin/cat", vec![])).expect("spawn cat");
+        assert!(launch.launch_error().is_none());
+        launch.session.kill();
     }
 }
 

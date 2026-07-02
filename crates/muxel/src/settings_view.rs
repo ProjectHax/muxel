@@ -213,7 +213,7 @@ impl SettingsUi {
             p_effort: cx.new(|cx| InputState::new(window, cx).placeholder(t("Effort (optional)"))),
             p_effort_flag: cx.new(|cx| InputState::new(window, cx).placeholder(t("Effort flag"))),
             p_args: cx.new(|cx| {
-                InputState::new(window, cx).placeholder(t("Extra args (space-separated)"))
+                InputState::new(window, cx).placeholder(t("Extra args (quotes group words)"))
             }),
             p_prompt: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -359,9 +359,14 @@ pub fn format_env(env: &[EnvVar]) -> String {
         .join("\n")
 }
 
-/// Split an extra-args string on whitespace (simple; no quote handling).
+/// Split an extra-args string into shell words — quote-aware
+/// ([`muxel_core::split_words`], shared with the iOS companion), so
+/// `--append-system-prompt "be terse"` stays one argument. Unbalanced quotes
+/// degrade to a plain whitespace split (a preset must never fail to save);
+/// `save_preset` warns via the feed in that case.
 pub fn parse_args(text: &str) -> Vec<String> {
-    text.split_whitespace().map(|s| s.to_string()).collect()
+    muxel_core::split_words(text)
+        .unwrap_or_else(|| text.split_whitespace().map(|s| s.to_string()).collect())
 }
 
 /// Split a status-marker string on commas (markers contain spaces), trimming

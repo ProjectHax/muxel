@@ -54,7 +54,10 @@ feature is added or changed, update the matching entry here in the same change**
   `ollama launch <agent> --model <model>` (seeded as `ollama launch opencode
   --model glm-5.2:cloud`); change the agent or model in the preset's args.
 - **Configurable launch** — per agent: program, model + model flag, effort +
-  effort flag, extra args, environment variables, system-prompt injection
+  effort flag, extra args (shell-style quoting: `--append-system-prompt "be terse"`
+  stays one argument, matching the iOS companion's parser; an unbalanced quote
+  falls back to space-splitting with a feed warning), environment variables,
+  system-prompt injection
   (via a CLI flag or by typing it in at startup), and a runner startup delay
   (ms to wait after the agent's first output before a runner types — for slow
   starters like opencode; 0 = auto-wait until output goes quiet).
@@ -66,7 +69,9 @@ feature is added or changed, update the matching entry here in the same change**
   `~/.opencode/bin` (opencode's installer default), Linuxbrew, and friends — so
   agents are detected and spawnable the same as from a terminal.
 - **Graceful launch failure** — if an agent can't be spawned, the pane falls back
-  to a shell showing the underlying error instead of crashing.
+  to a shell showing the underlying error instead of crashing. If even the
+  fallback shell can't start, the pane shows the failure in place (the toolbar
+  Restart retries) and the error lands in the NOTIFICATIONS feed.
 - **Session resume** — resume-capable agents (Claude out of the box) get a stable
   per-pane session id: muxel launches with `--session-id` the first time and
   `--resume` on restart, so a pane reopens its previous conversation instead of
@@ -186,8 +191,10 @@ feature is added or changed, update the matching entry here in the same change**
   still records it). Clicking the notification raises muxel and jumps to the pane
   that fired it.
 - **In-app NOTIFICATIONS sidebar** — a category above PROJECTS collecting agent
-  events **and** all app messages (git results, SSH connections, save errors —
-  everything that used to be a pop-up toast goes here instead). Agent rows are
+  events **and** all app messages (git results, SSH connections, and save errors —
+  workspace, settings, workspace list, project memory, and layout backups —
+  everything that used to be a pop-up toast goes here instead; persistent save
+  failures report once per cause, not on every autosave). Agent rows are
   click-to-navigate (jump to the pane + dismiss); all rows are individually
   dismissable, with a clear-all. Collected even when desktop notifications are off.
 - **Controls** — an enable/disable toggle and a "send test notification" button.
@@ -225,6 +232,15 @@ feature is added or changed, update the matching entry here in the same change**
 - **Clickable URLs** — `Ctrl`/`Cmd`+click opens an `http(s)` URL under the cursor.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
+- **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can
+  copy to the system clipboard via `OSC 52`; clipboard *reads* are answered with
+  an empty reply, so a remote can probe for support but never see your clipboard.
+- **Color queries** — answers `OSC 10/11/12` and `OSC 4` color queries from the
+  active theme's terminal palette, so TUIs detect dark/light mode correctly (and
+  the answer always matches what's painted).
+- **Exit codes** — a pane's child exit status is captured, so close-on-exit and
+  session-resume recovery can tell a clean `exit` from a crash (a deliberate quit
+  no longer triggers resume recovery).
 - **Content inset** — a small margin around the grid so a too-wide TUI truncates
   inside the pane rather than against the border.
 - **Key routing** — `Tab` / `Shift+Tab` go to the focused terminal rather than
@@ -275,6 +291,10 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Sidebar & projects
 
+- **Empty-workspace onboarding** — a fresh workspace shows a centered get-started
+  screen (the muxel mark, an **Add a project** folder picker, a **New remote
+  project (SSH)** shortcut into the wizard, and the keyboard-shortcuts chord) in
+  the work area until the first project is added.
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live).
@@ -313,6 +333,15 @@ feature is added or changed, update the matching entry here in the same change**
   options: hostname/alias, port, user, auth (ssh-agent, key file, or password),
   ProxyJump, agent forwarding, host-key policy, keepalive, and extra `-o` options.
   A "Test connection" button verifies a host.
+- **Changed host key dialog** — when a host's key no longer matches `known_hosts`
+  (a reinstalled server — or a man-in-the-middle), connection tests, project
+  connects, and remote git operations raise an actionable dialog instead of a raw
+  OpenSSH error: the stored and newly presented `SHA256:` fingerprints side by
+  side (mirroring the iOS companion's prompt) with a destructive **Trust new
+  key** button that removes the stale entry via `ssh-keygen -R` (hashed entries
+  and `[host]:port` forms included) and retries — the reconnect then re-pins the
+  new key through ssh's `accept-new`. Cancel keeps refusing. Host-key state lives
+  entirely in OpenSSH's `known_hosts`; muxel keeps no key store of its own.
 - **Login identities** — Settings → Identities defines reusable logins (a name +
   user + auth + key file or keychain password). A host can reference an identity
   instead of entering credentials inline, so one login is defined once and shared by

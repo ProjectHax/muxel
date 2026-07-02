@@ -25,9 +25,11 @@ use muxel_core::{
     WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, focus_in_direction,
     memory_instruction, migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside,
     move_tab_to, remove, resolve_launch, set_active_tab, set_split_sizes, set_tab_order, split,
-    split_beside, swap_instances, swap_panes,
+    split_beside, ssh, swap_instances, swap_panes,
 };
-use muxel_terminal::{AgentStatus, CommandSpec, TerminalMouseMode, TerminalSession, TerminalView};
+use muxel_terminal::{
+    AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -207,6 +209,35 @@ fn git_notify_detail(out: &str) -> String {
         .take(2)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Full-window backdrop for centered modal dialogs: dims the workspace and
+/// occludes it, so clicks/scroll/hover can't fall through to the terminals and
+/// sidebar painted behind the modal.
+fn modal_backdrop() -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x0000_0099))
+}
+
+/// Backdrop for top-anchored palettes (project search, terminal find): a
+/// lighter scrim than [`modal_backdrop`] — the palette floats near the top of
+/// the window and the workspace behind it should stay readable.
+fn palette_backdrop() -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .occlude()
+        .flex()
+        .flex_col()
+        .items_center()
+        .pt(px(80.0))
+        .bg(rgba(0x0000_0066))
 }
 
 /// Display title for a shell pane. A shell's OSC title is usually
@@ -962,6 +993,14 @@ pub struct MuxelApp {
     /// resume launch that exits almost immediately means the saved session was
     /// invalid — we recover by re-spawning the agent with a fresh session.
     terminal_launches: HashMap<Uuid, (std::time::Instant, bool)>,
+    /// Instances whose launch failed *completely* (even the fallback shell
+    /// couldn't spawn), with the error. The pane shows it in place; Restart
+    /// retries. Runtime-only, cleared on success / teardown.
+    failed_launches: HashMap<Uuid, String>,
+    /// Local save failures already reported (per target), so a persistent
+    /// failure (disk full, read-only config dir) notifies once per cause
+    /// instead of on every autosave. Cleared when that target saves again.
+    save_errors: HashMap<SaveTarget, String>,
     /// Per-split id nonce, bumped to reset a split's resizable state when its
     /// panes are evened out (double-click a divider).
     split_even_nonce: HashMap<String, u32>,
@@ -1403,6 +1442,36 @@ enum ConfirmAction {
     DiscardWorktreeChanges(Uuid),
     /// Remove a worktree entirely (close its panes, delete worktree + branch).
     DiscardWorktree(Uuid),
+    /// Remove a stale known_hosts entry (`ssh-keygen -R`) and retry the
+    /// operation that hit the changed host key.
+    TrustHostKey {
+        /// The known_hosts token exactly as ssh reported it (host, `[host]:port`,
+        /// or a config alias).
+        entry: String,
+        /// The known_hosts file holding the stale entry (from ssh's "Offending
+        /// key" line); None = ssh-keygen's default.
+        file: Option<String>,
+        retry: SshRetry,
+    },
+}
+
+/// What to retry after the user trusts a changed host key.
+#[derive(Clone)]
+enum SshRetry {
+    /// Nothing automatic — the success toast says to retry the operation.
+    None,
+    /// Re-run the project connect pre-flight (spawns its panes on success).
+    ConnectProject(Uuid),
+    /// Re-run the settings "Test connection" for host `idx` (the one-shot verify
+    /// password rides along in memory, same trust level as `session_passwords`).
+    VerifyHost {
+        idx: usize,
+        password: Option<String>,
+    },
+    /// Re-run the remote-project wizard's directory verify.
+    VerifyRemoteDir,
+    /// Re-run the remote-project wizard's host scan.
+    ScanRemoteDirs,
 }
 
 /// State for the confirmation modal (title/message + the pending action).
@@ -1410,6 +1479,9 @@ struct PendingConfirm {
     title: SharedString,
     message: SharedString,
     confirm_label: SharedString,
+    /// Optional label/value rows rendered in mono between the message and the
+    /// buttons (host-key fingerprints); empty for plain confirms.
+    details: Vec<(SharedString, SharedString)>,
     action: ConfirmAction,
 }
 
@@ -1477,6 +1549,28 @@ enum NotifKind {
     Done,
     Success,
     Error,
+}
+
+/// Which local save failed — the dedup key for `MuxelApp::report_save_error`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SaveTarget {
+    Workspace,
+    Settings,
+    WorkspaceIndex,
+    Memory,
+    LayoutBackup,
+}
+
+impl SaveTarget {
+    fn title(self) -> SharedString {
+        match self {
+            Self::Workspace => t("Couldn't save workspace"),
+            Self::Settings => t("Couldn't save settings"),
+            Self::WorkspaceIndex => t("Couldn't save workspace list"),
+            Self::Memory => t("Couldn't save project memory"),
+            Self::LayoutBackup => t("Layout backup failed"),
+        }
+    }
 }
 
 impl NotifKind {
@@ -1627,14 +1721,7 @@ impl Render for PopoutView {
             )
             .child(div().flex_1().min_h_0().child(self.content(cx)))
             .children(self.show_close_confirm.then(|| {
-                div()
-                    .absolute()
-                    .inset_0()
-                    .occlude()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(rgba(0x0000_0099))
+                modal_backdrop()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _ev, _w, cx| {
@@ -2262,10 +2349,13 @@ impl MuxelApp {
         .detach();
 
         let mut settings = muxel_store::load_settings();
-        // Merge in any new built-in presets (e.g. Hermes/Ollama) once.
-        if settings.seed_builtin_presets() {
-            let _ = muxel_store::save_settings(&settings);
-        }
+        // Merge in any new built-in presets (e.g. Hermes/Ollama) once. A failed
+        // save is reported after construction, once the feed exists.
+        let seed_save_error = if settings.seed_builtin_presets() {
+            muxel_store::save_settings(&settings).err()
+        } else {
+            None
+        };
         let presets = if settings.presets.is_empty() {
             AgentPreset::defaults()
         } else {
@@ -2476,7 +2566,7 @@ impl MuxelApp {
         // Ensure a workspaces index exists (migrating a legacy workspace once).
         let workspaces = muxel_store::migrate_to_workspaces();
 
-        let this = Self {
+        let mut this = Self {
             workspace: Workspace::default(),
             terminals: HashMap::new(),
             editors: HashMap::new(),
@@ -2587,6 +2677,8 @@ impl MuxelApp {
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
             terminal_launches: HashMap::new(),
+            failed_launches: HashMap::new(),
+            save_errors: HashMap::new(),
             split_even_nonce: HashMap::new(),
             memory_ensured: HashSet::new(),
             remote_synced: HashSet::new(),
@@ -2656,6 +2748,11 @@ impl MuxelApp {
                 })
                 .unwrap_or(true)
         });
+
+        // The preset-seed save ran before the feed existed — report it now.
+        if let Some(e) = seed_save_error {
+            this.report_save_error(SaveTarget::Settings, format!("{e:#}"));
+        }
 
         // No workspace is loaded yet — the workspace selector (shown at launch)
         // calls `enter_workspace`, which loads the chosen workspace.
@@ -3034,29 +3131,49 @@ impl MuxelApp {
             .instance(instance_id)
             .is_some_and(|i| i.session_started);
         let spec = self.command_for(instance_id);
-        // Capture program + cwd before `spec` moves into the view, so a failed
+        // Capture program + cwd before `spec` moves into the launch, so a failed
         // launch can be reported with the path it tried.
         let prog = spec.program.clone();
         let cwd = spec.cwd.clone().unwrap_or_default();
-        let palette = theme::palette_from_theme(cx);
-        let font_family: SharedString = self.settings.font_family.clone().into();
-        let font_size = self.settings.font_size * self.settings.zoom;
-        let mouse_mode = TerminalMouseMode::from_setting(&self.settings.terminal_mouse);
-        let view = cx.new(move |cx| {
-            let mut view = TerminalView::new(spec, window, cx);
-            view.set_palette(palette);
-            view.set_config(font_family, font_size);
-            view.set_mouse_mode(mouse_mode);
-            view
-        });
-        // A failed launch (program not on PATH, etc.) goes to the dev console.
-        if let Some(err) = view.read(cx).launch_error().map(str::to_string) {
+        let launch = match TerminalLaunch::spawn(spec) {
+            Ok(launch) => launch,
+            Err(e) => {
+                // Total failure — even the fallback shell couldn't spawn. Show
+                // it in the pane (Restart retries) and the feed instead of
+                // crashing; drop any stale view (this is "spawn or replace").
+                self.terminals.remove(&instance_id);
+                self.terminal_launches.remove(&instance_id);
+                self.failed_launches.insert(instance_id, format!("{e:#}"));
+                self.add_event(
+                    NotifKind::Error,
+                    tf("Launch failed: {prog}", &[("prog", &prog)]),
+                    format!("tried `{prog}` in `{cwd}` — {e:#}"),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        self.failed_launches.remove(&instance_id);
+        // A failed launch of the requested program (the fallback shell is
+        // running instead) goes to the dev console.
+        if let Some(err) = launch.launch_error().map(str::to_string) {
             self.add_event(
                 NotifKind::Error,
                 tf("Launch failed: {prog}", &[("prog", &prog)]),
                 format!("tried `{prog}` in `{cwd}` — {err}"),
             );
         }
+        let palette = theme::palette_from_theme(cx);
+        let font_family: SharedString = self.settings.font_family.clone().into();
+        let font_size = self.settings.font_size * self.settings.zoom;
+        let mouse_mode = TerminalMouseMode::from_setting(&self.settings.terminal_mouse);
+        let view = cx.new(move |cx| {
+            let mut view = TerminalView::new(launch, window, cx);
+            view.set_palette(palette);
+            view.set_config(font_family, font_size);
+            view.set_mouse_mode(mouse_mode);
+            view
+        });
         self.terminals.insert(instance_id, view);
         self.terminal_launches
             .insert(instance_id, (std::time::Instant::now(), was_resume));
@@ -3157,6 +3274,7 @@ impl MuxelApp {
             // On the first connect, also fetch the host's saved layout so the
             // callback can resolve newer-wins before spawning panes.
             let loc = if first_sync { self.repo_loc(pid) } else { None };
+            let host_for_err = host.clone();
             cx.spawn_in(window, async move |this, cx| {
                 let (res, fetched) = cx
                     .background_executor()
@@ -3193,16 +3311,22 @@ impl MuxelApp {
                         cx.notify();
                     }
                     Err(e) => {
-                        // Drop a possibly-wrong session password so a retry re-prompts.
-                        this.session_passwords.remove(&owner_id);
-                        this.add_event(
-                            NotifKind::Error,
-                            tf(
-                                "Couldn't connect to “{name}”",
-                                &[("name", &name.to_string())],
-                            ),
-                            format!("{e}"),
-                        );
+                        let msg = format!("{e}");
+                        let retry = SshRetry::ConnectProject(pid);
+                        if !this.handle_ssh_error(&msg, Some(&host_for_err), retry, cx) {
+                            // Drop a possibly-wrong session password so a retry
+                            // re-prompts. (A changed host key is NOT an auth
+                            // failure — the dialog path keeps the password.)
+                            this.session_passwords.remove(&owner_id);
+                            this.add_event(
+                                NotifKind::Error,
+                                tf(
+                                    "Couldn't connect to “{name}”",
+                                    &[("name", &name.to_string())],
+                                ),
+                                msg,
+                            );
+                        }
                         cx.notify();
                     }
                 });
@@ -3252,7 +3376,12 @@ impl MuxelApp {
                 .unwrap_or(InstanceKind::Terminal);
             match kind {
                 InstanceKind::Terminal => {
-                    if !self.terminals.contains_key(&iid) {
+                    // A totally-failed launch (fallback shell included) shows an
+                    // error pane; don't respawn/re-notify on every project
+                    // switch — the toolbar Restart is the retry path.
+                    if !self.terminals.contains_key(&iid)
+                        && !self.failed_launches.contains_key(&iid)
+                    {
                         self.spawn_terminal(iid, window, cx);
                     }
                 }
@@ -3286,16 +3415,21 @@ impl MuxelApp {
         }
     }
 
-    /// Persist the current workspace to disk (best-effort).
-    fn persist(&self) {
+    /// Persist the current workspace to disk. A failure lands in the
+    /// NOTIFICATIONS feed (deduped — this runs on nearly every interaction).
+    fn persist(&mut self) {
         let Some(id) = self.current_workspace else {
             return; // no workspace chosen yet (selector still open)
         };
         let Some(path) = muxel_store::workspace_doc_path(id) else {
             return;
         };
-        if let Err(e) = muxel_store::save_workspace_to(&path, &self.workspace) {
-            log::warn!("failed to save workspace: {e}");
+        match muxel_store::save_workspace_to(&path, &self.workspace) {
+            Ok(()) => self.clear_save_error(SaveTarget::Workspace),
+            Err(e) => {
+                log::warn!("failed to save workspace: {e}");
+                self.report_save_error(SaveTarget::Workspace, format!("{}: {e:#}", path.display()));
+            }
         }
     }
 
@@ -3325,6 +3459,7 @@ impl MuxelApp {
         // another process to open.
         self.workspace_lock = Some(lock);
 
+        self.failed_launches.clear();
         let views: Vec<_> = self.terminals.drain().map(|(_, v)| v).collect();
         for view in views {
             view.read(cx).session().kill();
@@ -3348,7 +3483,10 @@ impl MuxelApp {
 
         self.current_workspace = Some(id);
         self.workspaces.current = Some(id);
-        let _ = muxel_store::save_workspaces_index(&self.workspaces);
+        match muxel_store::save_workspaces_index(&self.workspaces) {
+            Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
+            Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
+        }
 
         let loaded = muxel_store::workspace_doc_path(id)
             .and_then(|p| muxel_store::load_workspace_from(&p))
@@ -3366,7 +3504,10 @@ impl MuxelApp {
     fn create_workspace(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let id = Uuid::new_v4();
         self.workspaces.workspaces.push(WorkspaceMeta { id, name });
-        let _ = muxel_store::save_workspaces_index(&self.workspaces);
+        match muxel_store::save_workspaces_index(&self.workspaces) {
+            Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
+            Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
+        }
         self.enter_workspace(id, window, cx);
     }
 
@@ -3521,6 +3662,7 @@ impl MuxelApp {
         // Inline result shown above the wizard buttons (not a sidebar event).
         self.nr_verify = RemoteTestState::Testing;
         cx.notify();
+        let host_for_err = host.clone();
         cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -3532,7 +3674,19 @@ impl MuxelApp {
             let _ = this.update(cx, |this, cx| {
                 this.nr_verify = match res {
                     Ok(dir) => RemoteTestState::Ok(tf("Found {dir}", &[("dir", &dir.to_string())])),
-                    Err(e) => RemoteTestState::Failed(format!("{e}")),
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if this.handle_ssh_error(
+                            &msg,
+                            Some(&host_for_err),
+                            SshRetry::VerifyRemoteDir,
+                            cx,
+                        ) {
+                            RemoteTestState::Failed(t("Host key changed — see dialog").into())
+                        } else {
+                            RemoteTestState::Failed(msg)
+                        }
+                    }
                 };
                 cx.notify();
             });
@@ -3562,6 +3716,7 @@ impl MuxelApp {
         let control_path = Self::control_path_for(host.id);
         self.nr_scan = RemoteScanState::Scanning;
         cx.notify();
+        let host_for_err = host.clone();
         cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -3572,7 +3727,19 @@ impl MuxelApp {
             let _ = this.update(cx, |this, cx| {
                 this.nr_scan = match res {
                     Ok(roots) => RemoteScanState::Found(roots),
-                    Err(e) => RemoteScanState::Failed(format!("{e}")),
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if this.handle_ssh_error(
+                            &msg,
+                            Some(&host_for_err),
+                            SshRetry::ScanRemoteDirs,
+                            cx,
+                        ) {
+                            RemoteScanState::Failed(t("Host key changed — see dialog").into())
+                        } else {
+                            RemoteScanState::Failed(msg)
+                        }
+                    }
                 };
                 cx.notify();
             });
@@ -4081,11 +4248,10 @@ impl MuxelApp {
                         );
                     }
                     Err(e) => {
-                        this.add_event(
-                            NotifKind::Error,
-                            t("Merge failed").to_string(),
-                            format!("{e}"),
-                        );
+                        let msg = format!("{e}");
+                        if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
+                            this.add_event(NotifKind::Error, t("Merge failed").to_string(), msg);
+                        }
                     }
                 }
                 cx.notify();
@@ -4113,8 +4279,12 @@ impl MuxelApp {
             t("Delete worktree failed").into(),
             move |loc| {
                 let out = integrations::remove_worktree_loc(loc, &path)?;
-                let _ = integrations::delete_branch_loc(loc, &branch);
-                Ok(out)
+                match integrations::delete_branch_loc(loc, &branch) {
+                    Ok(_) => Ok(out),
+                    // The worktree removal succeeded; say the branch survived
+                    // instead of silently leaving it dangling.
+                    Err(e) => Ok(format!("branch {branch} not deleted: {e}\n{out}")),
+                }
             },
             window,
             cx,
@@ -4132,8 +4302,9 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Persist the current toolbar preferences to the TOML config.
-    fn persist_settings(&self) {
+    /// Persist the current toolbar preferences to the TOML config. A failure
+    /// lands in the NOTIFICATIONS feed (deduped).
+    fn persist_settings(&mut self) {
         let settings = muxel_core::Settings {
             default_use_tmux: self.use_tmux,
             default_use_worktree: self.use_worktree,
@@ -4148,8 +4319,12 @@ impl MuxelApp {
             theme_mode: self.theme_mode.clone(),
             ..self.settings.clone()
         };
-        if let Err(e) = muxel_store::save_settings(&settings) {
-            log::warn!("failed to save settings: {e}");
+        match muxel_store::save_settings(&settings) {
+            Ok(()) => self.clear_save_error(SaveTarget::Settings),
+            Err(e) => {
+                log::warn!("failed to save settings: {e}");
+                self.report_save_error(SaveTarget::Settings, format!("{e:#}"));
+            }
         }
     }
 
@@ -4828,6 +5003,24 @@ impl MuxelApp {
         if len > MAX {
             self.notifications.drain(0..len - MAX);
         }
+    }
+
+    /// Route a failed local save to the feed + dev console, **once per cause**:
+    /// `persist` runs on nearly every interaction, so a persistent failure
+    /// (disk full, read-only config dir) reports once and re-arms only after
+    /// that target saves successfully again (`clear_save_error`).
+    fn report_save_error(&mut self, target: SaveTarget, err: impl std::fmt::Display) {
+        let msg = format!("{err:#}");
+        if self.save_errors.get(&target) == Some(&msg) {
+            return;
+        }
+        self.save_errors.insert(target, msg.clone());
+        self.add_event(NotifKind::Error, target.title(), msg);
+    }
+
+    /// Re-arm `report_save_error` for `target` after a successful save.
+    fn clear_save_error(&mut self, target: SaveTarget) {
+        self.save_errors.remove(&target);
     }
 
     /// Remove any notification(s) targeting `iid` (attending or closing a pane).
@@ -5856,11 +6049,12 @@ impl MuxelApp {
                                         String::new(),
                                     );
                                 }
-                                Err(e) => this.add_event(
-                                    NotifKind::Error,
-                                    t("Save failed"),
-                                    format!("{e}"),
-                                ),
+                                Err(e) => {
+                                    let msg = format!("{e}");
+                                    if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
+                                        this.add_event(NotifKind::Error, t("Save failed"), msg);
+                                    }
+                                }
                             }
                             cx.notify();
                         });
@@ -6218,6 +6412,7 @@ impl MuxelApp {
             );
         }
         self.last_status.remove(&iid);
+        self.failed_launches.remove(&iid);
         if self.maximized == Some(iid) {
             self.maximized = None;
         }
@@ -6458,7 +6653,14 @@ impl MuxelApp {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(out) => this.add_event(NotifKind::Success, ok, git_notify_detail(&out)),
-                    Err(e) => this.add_event(NotifKind::Error, err_title, format!("{e}")),
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        // A remote git op refused by a changed host key gets the
+                        // trust dialog instead of a raw OpenSSH error event.
+                        if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
+                            this.add_event(NotifKind::Error, err_title, msg);
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -6588,7 +6790,7 @@ impl MuxelApp {
         };
         let now = now_secs();
         cx.spawn_in(window, async move |this, cx| {
-            let kept = cx
+            let (kept, save_err) = cx
                 .background_executor()
                 .spawn(async move {
                     let entries = integrations::load_memory(&loc);
@@ -6596,14 +6798,22 @@ impl MuxelApp {
                     let m = memory::maintain(entries, now);
                     let after: Vec<Uuid> = m.kept.iter().map(|e| e.id).collect();
                     // Only write back when maintenance actually changed the set/order.
-                    if m.removed > 0 || before != after {
-                        let _ = integrations::save_memory(&loc, &m.kept);
-                    }
-                    m.kept
+                    let save_err = if m.removed > 0 || before != after {
+                        integrations::save_memory(&loc, &m.kept)
+                            .err()
+                            .map(|e| format!("{e:#}"))
+                    } else {
+                        None
+                    };
+                    (m.kept, save_err)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.memory_entries = kept;
+                match save_err {
+                    Some(e) => this.report_save_error(SaveTarget::Memory, e),
+                    None => this.clear_save_error(SaveTarget::Memory),
+                }
                 cx.notify();
             });
         })
@@ -6616,11 +6826,15 @@ impl MuxelApp {
         self.memory_entries = memory::maintain(es, now_secs()).kept;
         if let Some(loc) = self.memory_pid.and_then(|pid| self.repo_loc(pid)) {
             let entries = self.memory_entries.clone();
-            cx.spawn_in(window, async move |_this, cx| {
-                let _ = cx
+            cx.spawn_in(window, async move |this, cx| {
+                let result = cx
                     .background_executor()
                     .spawn(async move { integrations::save_memory(&loc, &entries) })
                     .await;
+                let _ = this.update(cx, |this, _cx| match result {
+                    Ok(()) => this.clear_save_error(SaveTarget::Memory),
+                    Err(e) => this.report_save_error(SaveTarget::Memory, format!("{e:#}")),
+                });
             })
             .detach();
         }
@@ -6725,7 +6939,10 @@ impl MuxelApp {
                 .await;
             if let Err(e) = res {
                 let _ = this.update(cx, |this, cx| {
-                    this.add_event(NotifKind::Error, t("Project memory"), format!("{e}"));
+                    let msg = format!("{e}");
+                    if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
+                        this.add_event(NotifKind::Error, t("Project memory"), msg);
+                    }
                     cx.notify();
                 });
             }
@@ -6801,7 +7018,10 @@ impl MuxelApp {
                 .await;
             if let Err(e) = res {
                 let _ = this.update(cx, |this, cx| {
-                    this.add_event(NotifKind::Error, t("Layout sync"), format!("{e}"));
+                    let msg = format!("{e}");
+                    if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
+                        this.add_event(NotifKind::Error, t("Layout sync"), msg);
+                    }
                     cx.notify();
                 });
             }
@@ -6926,8 +7146,9 @@ impl MuxelApp {
     }
 
     /// Save the local layout being replaced to `<workspace>/backups/<pid>-<ts>.json`
-    /// so a newer-remote pull can't silently lose work. Best-effort.
-    fn backup_local_layout(&self, pid: Uuid, local: &RemoteLayout, ts: u64) {
+    /// so a newer-remote pull can't silently lose work. This is the safety net
+    /// that pull relies on, so a failed backup is reported, not swallowed.
+    fn backup_local_layout(&mut self, pid: Uuid, local: &RemoteLayout, ts: u64) {
         let Some(workspace) = self.current_workspace else {
             return;
         };
@@ -6936,13 +7157,17 @@ impl MuxelApp {
         else {
             return;
         };
-        if std::fs::create_dir_all(&dir).is_err() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.report_save_error(SaveTarget::LayoutBackup, format!("{}: {e}", dir.display()));
             return;
         }
-        let _ = std::fs::write(
-            dir.join(format!("{}-{}.json", pid.simple(), ts)),
-            local.to_json(),
-        );
+        let path = dir.join(format!("{}-{}.json", pid.simple(), ts));
+        match std::fs::write(&path, local.to_json()) {
+            Ok(()) => self.clear_save_error(SaveTarget::LayoutBackup),
+            Err(e) => {
+                self.report_save_error(SaveTarget::LayoutBackup, format!("{}: {e}", path.display()))
+            }
+        }
     }
 
     fn run_project_git<F>(
@@ -7370,14 +7595,7 @@ impl MuxelApp {
                 )
         };
 
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
+        modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _w, cx| this.close_remote_project_modal(cx)),
@@ -7642,14 +7860,7 @@ impl MuxelApp {
             ),
             PasswordAction::Verify(_) => (t("Test"), t("Used once to test, then forgotten.")),
         };
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
+        modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, window, cx| this.close_password_prompt(window, cx)),
@@ -7759,14 +7970,7 @@ impl MuxelApp {
             }
             list
         });
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
+        modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _w, cx| this.close_git_modal(cx)),
@@ -8225,10 +8429,25 @@ impl MuxelApp {
         action: ConfirmAction,
         cx: &mut Context<Self>,
     ) {
+        self.request_confirm_with_details(title, message, confirm_label, Vec::new(), action, cx);
+    }
+
+    /// `request_confirm` with extra label/value rows (mono) in the modal —
+    /// used by the changed-host-key dialog for the fingerprint comparison.
+    fn request_confirm_with_details(
+        &mut self,
+        title: impl Into<SharedString>,
+        message: impl Into<SharedString>,
+        confirm_label: impl Into<SharedString>,
+        details: Vec<(SharedString, SharedString)>,
+        action: ConfirmAction,
+        cx: &mut Context<Self>,
+    ) {
         self.confirm = Some(PendingConfirm {
             title: title.into(),
             message: message.into(),
             confirm_label: confirm_label.into(),
+            details,
             action,
         });
         cx.notify();
@@ -8285,8 +8504,180 @@ impl MuxelApp {
                 self.refresh_git_diff_panel(cx);
             }
             ConfirmAction::DeleteWorktreeFromPanel { wid } => self.worktree_delete(wid, window, cx),
+            ConfirmAction::TrustHostKey { entry, file, retry } => {
+                self.trust_host_key(entry, file, retry, window, cx)
+            }
         }
         cx.notify();
+    }
+
+    /// The changed-key dialog's accept path: remove the stale known_hosts entry
+    /// (`ssh-keygen -R` on the background executor) and retry the operation —
+    /// the reconnect re-pins the new key through ssh's `accept-new`.
+    fn trust_host_key(
+        &mut self,
+        entry: String,
+        file: Option<String>,
+        retry: SshRetry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let res = {
+                let entry = entry.clone();
+                cx.background_executor()
+                    .spawn(async move { integrations::forget_host_key(&entry, file.as_deref()) })
+                    .await
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                match res {
+                    Ok(()) => {
+                        let detail = match &retry {
+                            SshRetry::None => t("retry the operation to reconnect").into(),
+                            _ => String::new(),
+                        };
+                        this.add_event(
+                            NotifKind::Success,
+                            tf("Trusted the new key for {host}", &[("host", &entry)]),
+                            detail,
+                        );
+                        this.retry_after_trust(retry, window, cx);
+                    }
+                    Err(e) => {
+                        // e.g. a read-only system known_hosts — surface
+                        // ssh-keygen's own message.
+                        this.add_event(
+                            NotifKind::Error,
+                            t("Couldn't update known_hosts"),
+                            format!("{e:#}"),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Re-run the operation that hit the changed host key, now that its stale
+    /// entry is gone.
+    fn retry_after_trust(&mut self, retry: SshRetry, window: &mut Window, cx: &mut Context<Self>) {
+        match retry {
+            SshRetry::None => {}
+            SshRetry::ConnectProject(pid) => self.ensure_project_terminals(pid, window, cx),
+            SshRetry::VerifyHost { idx, password } => self.run_ssh_check(idx, password, window, cx),
+            SshRetry::VerifyRemoteDir => self.verify_remote_dir(window, cx),
+            SshRetry::ScanRemoteDirs => self.scan_remote_dirs(window, cx),
+        }
+    }
+
+    /// If `err` is OpenSSH's changed-host-key refusal, open the trust dialog
+    /// (fetching the stored fingerprint in the background first) and return
+    /// true — the caller skips its raw error handling. `fallback_host` supplies
+    /// the known_hosts token when ssh's output didn't name the host.
+    fn handle_ssh_error(
+        &mut self,
+        err: &str,
+        fallback_host: Option<&RemoteHost>,
+        retry: SshRetry,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(change) = ssh::HostKeyChange::parse(err) else {
+            return false;
+        };
+        let entry = match change
+            .host
+            .clone()
+            .or_else(|| fallback_host.map(|h| ssh::known_hosts_name(&h.hostname, h.port)))
+        {
+            Some(e) => e,
+            None => return false,
+        };
+        // Concurrent failures for one host (pre-flight + a git poll) race here —
+        // keep the dialog already on screen instead of replacing it.
+        if matches!(
+            self.confirm,
+            Some(PendingConfirm {
+                action: ConfirmAction::TrustHostKey { .. },
+                ..
+            })
+        ) {
+            return true;
+        }
+        let file = change.known_hosts_file.clone();
+        cx.spawn(async move |this, cx| {
+            // The old fingerprint isn't in ssh's error output (only file:line) —
+            // look it up so the dialog can show stored vs presented like iOS.
+            let stored = {
+                let entry = entry.clone();
+                let file = file.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        integrations::stored_host_key_fingerprints(&entry, file.as_deref())
+                    })
+                    .await
+            };
+            let _ = this.update(cx, |this, cx| {
+                let mut details: Vec<(SharedString, SharedString)> = Vec::new();
+                let stored_line = {
+                    // Prefer the key type ssh called "offending"; else show all.
+                    let matching: Vec<_> = match &change.offending_key_type {
+                        Some(t) => {
+                            let filtered: Vec<_> = stored
+                                .iter()
+                                .filter(|(ty, _)| ty.eq_ignore_ascii_case(t))
+                                .cloned()
+                                .collect();
+                            if filtered.is_empty() {
+                                stored.clone()
+                            } else {
+                                filtered
+                            }
+                        }
+                        None => stored.clone(),
+                    };
+                    if matching.is_empty() {
+                        t("(not found)").to_string()
+                    } else {
+                        matching
+                            .iter()
+                            .map(|(ty, fp)| format!("{ty} {fp}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                };
+                details.push((t("Stored"), stored_line.into()));
+                let presented = match (&change.presented_key_type, &change.presented_fingerprint) {
+                    (Some(ty), Some(fp)) => format!("{ty} {fp}"),
+                    (None, Some(fp)) => fp.clone(),
+                    _ => t("(unknown)").to_string(),
+                };
+                details.push((t("Presented now"), presented.into()));
+                if let (Some(f), Some(l)) = (&change.known_hosts_file, change.known_hosts_line) {
+                    details.push((t("known_hosts"), format!("{f}:{l}").into()));
+                }
+                this.request_confirm_with_details(
+                    t("Host key changed"),
+                    tf(
+                        "“{host}” presented a different host key than the one stored in \
+                         known_hosts. This can mean the server was reinstalled — or that \
+                         something is intercepting the connection (man-in-the-middle). \
+                         Only trust the new key if you know why it changed.",
+                        &[("host", &entry)],
+                    ),
+                    t("Trust new key"),
+                    details,
+                    ConfirmAction::TrustHostKey {
+                        entry: entry.clone(),
+                        file,
+                        retry,
+                    },
+                    cx,
+                );
+            });
+        })
+        .detach();
+        true
     }
 
     /// Delete a workspace: remove it from the index + delete its workspace file.
@@ -8307,7 +8698,10 @@ impl MuxelApp {
         if self.workspace_busy == Some(id) {
             self.workspace_busy = None;
         }
-        let _ = muxel_store::save_workspaces_index(&self.workspaces);
+        match muxel_store::save_workspaces_index(&self.workspaces) {
+            Ok(()) => self.clear_save_error(SaveTarget::WorkspaceIndex),
+            Err(e) => self.report_save_error(SaveTarget::WorkspaceIndex, format!("{e:#}")),
+        }
         if let Some(path) = muxel_store::workspace_doc_path(id) {
             let _ = std::fs::remove_file(&path);
             if let Some(dir) = path.parent() {
@@ -9883,6 +10277,36 @@ impl MuxelApp {
                             }),
                         )
                         .child(ed.clone())
+                        .into_any_element()
+                } else if let Some(err) = self.failed_launches.get(&iid) {
+                    // The launch failed completely (fallback shell included):
+                    // show the error in place; the toolbar Restart retries.
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .p_4()
+                        .child(
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(t("(terminal failed to start)")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .max_w(px(560.))
+                                .child(err.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(t("Restart to retry")),
+                        )
                         .into_any_element()
                 } else {
                     div()
@@ -12893,15 +13317,7 @@ impl MuxelApp {
             );
         }
 
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(80.0))
-            .bg(rgba(0x0000_0066))
+        palette_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _e, _w, cx| this.close_search_palette(cx)),
@@ -13009,15 +13425,7 @@ impl MuxelApp {
             );
         }
 
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(80.0))
-            .bg(rgba(0x0000_0066))
+        palette_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _e, _w, cx| this.close_find_panel(cx)),
@@ -13599,8 +14007,11 @@ impl MuxelApp {
         ui.p_effort_flag.update(cx, |s, cx| {
             s.set_value(p.effort_flag.clone().unwrap_or_default(), window, cx)
         });
-        ui.p_args
-            .update(cx, |s, cx| s.set_value(p.args.join(" "), window, cx));
+        // Quote-aware render so a saved `["-p", "be terse"]` round-trips through
+        // the editor instead of silently re-splitting into three words.
+        ui.p_args.update(cx, |s, cx| {
+            s.set_value(muxel_core::join_words(&p.args), window, cx)
+        });
         ui.p_prompt.update(cx, |s, cx| {
             s.set_value(p.system_prompt.clone().unwrap_or_default(), window, cx)
         });
@@ -13677,7 +14088,20 @@ impl MuxelApp {
             .value()
             .trim()
             .to_string();
-        let args = settings_view::parse_args(&self.settings_ui.p_args.read(cx).value());
+        let args_raw = self.settings_ui.p_args.read(cx).value().to_string();
+        if muxel_core::split_words(&args_raw).is_none() {
+            // Unbalanced quote: the preset still saves (whitespace split), but
+            // tell the user their quoting didn't take.
+            self.add_event(
+                NotifKind::Error,
+                t("Unbalanced quote in extra arguments"),
+                tf(
+                    "saved by splitting on spaces: {args}",
+                    &[("args", &args_raw)],
+                ),
+            );
+        }
+        let args = settings_view::parse_args(&args_raw);
         let prompt = self.settings_ui.p_prompt.read(cx).value().to_string();
         let env = settings_view::parse_env(&self.settings_ui.p_env.read(cx).value());
         let working_markers =
@@ -14365,6 +14789,8 @@ impl MuxelApp {
         // password report success.
         self.settings_ui.s_test = RemoteTestState::Testing;
         cx.notify();
+        let host_for_err = host.clone();
+        let password_retry = password.clone();
         cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -14373,7 +14799,18 @@ impl MuxelApp {
             let _ = this.update(cx, |this, cx| {
                 this.settings_ui.s_test = match res {
                     Ok(()) => RemoteTestState::Ok(t("Connected").into()),
-                    Err(e) => RemoteTestState::Failed(format!("{e}")),
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        let retry = SshRetry::VerifyHost {
+                            idx,
+                            password: password_retry,
+                        };
+                        if this.handle_ssh_error(&msg, Some(&host_for_err), retry, cx) {
+                            RemoteTestState::Failed(t("Host key changed — see dialog").into())
+                        } else {
+                            RemoteTestState::Failed(msg)
+                        }
+                    }
                 };
                 cx.notify();
             });
@@ -15070,14 +15507,7 @@ impl MuxelApp {
         };
         let title = tf("Run: {name}", &[("name", &runner.name)]);
         let preview = runner.prompt.replace("{{input}}", "…").trim().to_string();
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
+        modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _w, cx| {
@@ -15142,21 +15572,18 @@ impl MuxelApp {
         let title = pending.title.clone();
         let message = pending.message.clone();
         let confirm_label = pending.confirm_label.clone();
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
+        let details = pending.details.clone();
+        // Fingerprint rows need width; plain confirms keep the compact card.
+        let width = if details.is_empty() { 360.0 } else { 480.0 };
+        let mono = cx.theme().mono_font_family.clone();
+        modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _w, cx| this.cancel_confirm(cx)),
             )
             .child(
                 div()
-                    .w(px(360.0))
+                    .w(px(width))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -15174,6 +15601,25 @@ impl MuxelApp {
                             .text_color(cx.theme().muted_foreground)
                             .child(message),
                     )
+                    .children((!details.is_empty()).then(|| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .children(details.into_iter().map(|(label, value)| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(label),
+                                    )
+                                    .child(div().text_xs().font_family(mono.clone()).child(value))
+                            }))
+                    }))
                     .child(
                         div()
                             .flex()
@@ -15237,14 +15683,7 @@ impl MuxelApp {
             "Merge into {base_label}, then remove the worktree + branch",
             &[("base_label", &base_label)],
         );
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
+        modal_backdrop()
             // Clicking the backdrop keeps the worktree (safe: never destroys work).
             .on_mouse_down(
                 MouseButton::Left,
@@ -15333,14 +15772,7 @@ impl MuxelApp {
     }
 
     fn render_quit_modal(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
+        modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _w, cx| {
@@ -15538,6 +15970,95 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    /// Get-started state for a workspace with **zero projects** (post terms
+    /// screen, a fresh workspace is otherwise blank space): the mark, the two
+    /// ways to add a project, and a pointer to the shortcut cheat sheet. No
+    /// state — it disappears as soon as the first project exists.
+    fn render_empty_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+        // The ShowKeys chord, honoring a user rebind (same resolution as the
+        // keys overlay itself).
+        let keys_chord = self
+            .settings
+            .keybindings
+            .iter()
+            .find(|k| k.action == "ShowKeys")
+            .map(|k| k.keystroke.clone())
+            .or_else(|| {
+                settings_view::DEFAULT_KEYBINDINGS
+                    .iter()
+                    .find(|(name, _, _)| *name == "ShowKeys")
+                    .map(|(_, default, _)| default.to_string())
+            })
+            .map(|ks| prettify_keys(&ks))
+            .unwrap_or_default();
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        img("muxel.svg")
+                            .size(px(64.0))
+                            .flex_none()
+                            .rounded(cx.theme().radius_lg),
+                    )
+                    .child(div().text_xl().font_semibold().child(t("Welcome to muxel")))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t("Add a project to start running agents side by side.")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .pt_2()
+                            .child(
+                                Button::new("onboard-add-project")
+                                    .primary()
+                                    .icon(IconName::Plus)
+                                    .label(t("Add a project"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.new_project_dialog(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("onboard-add-remote")
+                                    .ghost()
+                                    .label(t("New remote project (SSH)"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.open_remote_project_modal(window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .pt_3()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t("Keyboard shortcuts:"))
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(1.0))
+                                    .rounded(cx.theme().radius)
+                                    .bg(cx.theme().secondary)
+                                    .child(keys_chord),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The keyboard-shortcut cheat sheet (toggled by `ShowKeys`).
     fn render_keys_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
         let overrides: std::collections::HashMap<&str, &str> = self
@@ -15591,14 +16112,7 @@ impl MuxelApp {
                 )
             });
 
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
+        modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _w, cx| {
@@ -15770,16 +16284,7 @@ impl MuxelApp {
             UpdateState::Checking | UpdateState::Downloading => {}
         }
 
-        div()
-            .absolute()
-            .inset_0()
-            // Opaque hitbox: block clicks/scroll/hover from falling through the
-            // backdrop to the terminals + sidebar painted behind the modal.
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
+        modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _w, cx| {
@@ -15849,16 +16354,7 @@ impl MuxelApp {
                 && self.settings_ui.section == SettingsSection::Runners)
             || (self.settings_ui.selected_snippet.is_some()
                 && self.settings_ui.section == SettingsSection::Snippets);
-        div()
-            .absolute()
-            .inset_0()
-            // Opaque hitbox: without this, hover/scroll/clicks fall through the
-            // backdrop to the terminals and sidebar painted behind the modal.
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgba(0x0000_0099))
+        modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, _w, cx| this.close_settings(cx)),
@@ -18008,21 +18504,18 @@ impl Render for MuxelApp {
         } else {
             match active_layout {
                 Some(root) => self.render_pane(&root, cx),
-                None => {
-                    let msg = if self.workspace.projects.is_empty() {
-                        t("No projects yet — click New Project in the sidebar.")
-                    } else {
-                        t("No terminals — pick a preset and Split.")
-                    };
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(msg)
-                        .into_any_element()
-                }
+                // A workspace with zero projects gets the full get-started state;
+                // projects-with-no-panes keeps the small transient hint (the
+                // toolbar affordances already cover that case).
+                None if self.workspace.projects.is_empty() => self.render_empty_workspace(cx),
+                None => div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t("No terminals — pick a preset and Split."))
+                    .into_any_element(),
             }
         };
 

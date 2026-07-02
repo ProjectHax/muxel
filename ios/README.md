@@ -104,6 +104,7 @@ the matching Swift port and the `RemoteLayout` version handling.
 | Per-agent `default_markers` | `crates/muxel/src/app.rs` | `Status/Markers.swift` |
 | Theme palettes (chrome + terminal) | `crates/muxel/assets/themes/*.json` | `Theme/MuxelTheme.swift` |
 | Login identities (shared credentials) | `crates/muxel-core/src/lib.rs` (`Identity`) | `Models/Store.swift` (`Identity`) |
+| Quote-aware word split (extra args / custom command) | `crates/muxel-core/src/shell.rs` | `Util/Shell.swift` |
 
 ### Status without an attached terminal (the polling enabler)
 

@@ -101,6 +101,156 @@ pub fn connection_args(host: &RemoteHost, control_path: &str) -> Vec<String> {
     v
 }
 
+/// A "REMOTE HOST IDENTIFICATION HAS CHANGED" refusal parsed from ssh stderr —
+/// the input to the changed-key trust dialog. All fields are best-effort: the
+/// gate is strict (see [`HostKeyChange::parse`]) but individual lines may be
+/// missing or reordered across OpenSSH builds (Debian patches insert extra
+/// lines), so each detail is optional.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostKeyChange {
+    /// Host exactly as ssh matched it in known_hosts — `example.com`,
+    /// `[example.com]:2222` for a non-default port, or a config alias. This is
+    /// definitionally the right token to pass to `ssh-keygen -R`.
+    pub host: Option<String>,
+    /// The newly presented fingerprint (`SHA256:…`, trailing `.` stripped).
+    pub presented_fingerprint: Option<String>,
+    /// Key type on the "fingerprint for the … key" line (the *presented* key).
+    pub presented_key_type: Option<String>,
+    /// Key type on the "Offending … key in" line (the *stored* key — the two
+    /// can differ when a server rotated key algorithms).
+    pub offending_key_type: Option<String>,
+    /// known_hosts file holding the stale entry, and its 1-based line.
+    pub known_hosts_file: Option<String>,
+    pub known_hosts_line: Option<u64>,
+}
+
+impl HostKeyChange {
+    /// Parse ssh stderr; `Some` only when the text is definitely a changed-key
+    /// refusal — the WARNING banner or the "…has changed and you have requested
+    /// strict checking." line. The terse `Host key verification failed.` alone
+    /// is ambiguous (it also appears for unknown-host + `StrictHostKeyChecking=
+    /// yes` and a declined `ask` prompt) and stays `None`. Line-based and
+    /// order-tolerant; prefix noise (e.g. a `git …:` wrapper on the first line)
+    /// is fine because every marker is matched by substring.
+    pub fn parse(stderr: &str) -> Option<HostKeyChange> {
+        const BANNER: &str = "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!";
+        const STRICT: &str = "has changed and you have requested strict checking.";
+        const FP_PREFIX: &str = "The fingerprint for the ";
+        const FP_SUFFIX: &str = " key sent by the remote host is";
+        const OFFENDING: &str = "Offending ";
+        const OFFENDING_IN: &str = " key in ";
+        const HOST_PREFIX: &str = "Host key for ";
+
+        if !stderr
+            .lines()
+            .any(|l| l.contains(BANNER) || l.trim_end().ends_with(STRICT))
+        {
+            return None;
+        }
+
+        let mut change = HostKeyChange {
+            host: None,
+            presented_fingerprint: None,
+            presented_key_type: None,
+            offending_key_type: None,
+            known_hosts_file: None,
+            known_hosts_line: None,
+        };
+
+        let mut lines = stderr.lines().peekable();
+        while let Some(line) = lines.next() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix(FP_PREFIX)
+                && let Some(key_type) = rest.strip_suffix(FP_SUFFIX)
+            {
+                change.presented_key_type = Some(key_type.to_string());
+                // The fingerprint is on the next non-empty line, printed with a
+                // trailing period.
+                for next in lines.by_ref() {
+                    let fp = next.trim().trim_end_matches('.');
+                    if !fp.is_empty() {
+                        change.presented_fingerprint = Some(fp.to_string());
+                        break;
+                    }
+                }
+            } else if let Some(rest) = trimmed.strip_prefix(OFFENDING)
+                && let Some((key_type, location)) = rest.split_once(OFFENDING_IN)
+            {
+                // "Offending key for IP in …" has no " key in " and is skipped
+                // naturally (only relevant under CheckHostIP=yes).
+                change.offending_key_type = Some(key_type.to_string());
+                // rsplit keeps Windows drive letters (`C:\…`) in the path.
+                if let Some((file, line_no)) = location.rsplit_once(':') {
+                    change.known_hosts_file = Some(file.to_string());
+                    change.known_hosts_line = line_no.trim().parse().ok();
+                } else {
+                    change.known_hosts_file = Some(location.to_string());
+                }
+            } else if let Some(rest) = trimmed.strip_prefix(HOST_PREFIX)
+                && let Some(host) = rest.strip_suffix(STRICT)
+            {
+                change.host = Some(host.trim().to_string());
+            }
+        }
+        Some(change)
+    }
+}
+
+/// The known_hosts token for a host + port: the bare hostname for the default
+/// port (or none), OpenSSH's bracketed `[host]:port` form otherwise.
+pub fn known_hosts_name(hostname: &str, port: Option<u16>) -> String {
+    match port {
+        Some(p) if p != 22 => format!("[{hostname}]:{p}"),
+        _ => hostname.to_string(),
+    }
+}
+
+/// argv after `ssh-keygen` to delete a host's stale entry: `[-f <file>,] -R
+/// <entry>`. ssh-keygen handles hashed entries (`HashKnownHosts=yes`) and the
+/// `[host]:port` form itself, and backs the file up to `known_hosts.old` —
+/// which is exactly why muxel delegates instead of editing the file.
+pub fn keygen_remove_args(entry: &str, file: Option<&str>) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some(f) = file {
+        v.push("-f".into());
+        v.push(f.into());
+    }
+    v.push("-R".into());
+    v.push(entry.into());
+    v
+}
+
+/// argv after `ssh-keygen` to look up a host's stored keys:
+/// `-l [-f <file>,] -F <entry>` (fingerprints, not full keys).
+pub fn keygen_find_args(entry: &str, file: Option<&str>) -> Vec<String> {
+    let mut v = vec!["-l".to_string()];
+    if let Some(f) = file {
+        v.push("-f".into());
+        v.push(f.into());
+    }
+    v.push("-F".into());
+    v.push(entry.into());
+    v
+}
+
+/// Parse `ssh-keygen -l -F` stdout into `(key_type, fingerprint)` pairs. The
+/// output interleaves `# Host <h> found: line <n>` comments with
+/// `<host-or-hash> <TYPE> SHA256:<fp>` lines; comments are skipped and the
+/// host/hash column ignored.
+pub fn parse_keygen_lookup(stdout: &str) -> Vec<(String, String)> {
+    stdout
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| {
+            let mut fields = l.split_whitespace();
+            let _host = fields.next()?;
+            let key_type = fields.next()?;
+            let fingerprint = fields.next()?;
+            Some((key_type.to_string(), fingerprint.to_string()))
+        })
+        .collect()
+}
+
 /// Parameters for a remote interactive pane command.
 pub struct SshSpec<'a> {
     pub host: &'a RemoteHost,
@@ -327,5 +477,172 @@ mod tests {
             ssh_args(&spec).last().unwrap(),
             "cd '/srv/my app' && exec bash"
         );
+    }
+
+    // ---- HostKeyChange parsing (fixtures composed from OpenSSH's literal
+    // error() format strings, extracted from the client binary) ----
+
+    /// Full upstream/macOS-style block: presented key type differs from the
+    /// stored (offending) one — a server that rotated ECDSA → ED25519.
+    const CHANGED_FULL: &str = "\
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+Someone could be eavesdropping on you right now (man-in-the-middle attack)!
+It is also possible that a host key has just been changed.
+The fingerprint for the ED25519 key sent by the remote host is
+SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s.
+Please contact your system administrator.
+Add correct host key in /Users/ryan/.ssh/known_hosts to get rid of this message.
+Offending ECDSA key in /Users/ryan/.ssh/known_hosts:42
+Host key for example.com has changed and you have requested strict checking.
+Host key verification failed.";
+
+    #[test]
+    fn host_key_change_parses_full_block() {
+        let c = HostKeyChange::parse(CHANGED_FULL).expect("classified");
+        assert_eq!(c.host.as_deref(), Some("example.com"));
+        assert_eq!(
+            c.presented_fingerprint.as_deref(),
+            Some("SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s"),
+            "trailing period stripped"
+        );
+        assert_eq!(c.presented_key_type.as_deref(), Some("ED25519"));
+        assert_eq!(c.offending_key_type.as_deref(), Some("ECDSA"));
+        assert_eq!(
+            c.known_hosts_file.as_deref(),
+            Some("/Users/ryan/.ssh/known_hosts")
+        );
+        assert_eq!(c.known_hosts_line, Some(42));
+    }
+
+    /// Debian/Ubuntu builds patch in two extra lines after the Offending line.
+    #[test]
+    fn host_key_change_tolerates_debian_extra_lines() {
+        let stderr = CHANGED_FULL.replace(
+            "Host key for example.com has changed",
+            "  remove with:\n  ssh-keygen -f \"/home/u/.ssh/known_hosts\" -R \"example.com\"\nHost key for example.com has changed",
+        );
+        let c = HostKeyChange::parse(&stderr).expect("classified");
+        assert_eq!(c.host.as_deref(), Some("example.com"));
+        assert_eq!(c.known_hosts_line, Some(42));
+    }
+
+    #[test]
+    fn host_key_change_keeps_bracketed_port_form() {
+        let stderr = CHANGED_FULL.replace("example.com", "[example.com]:2222");
+        let c = HostKeyChange::parse(&stderr).expect("classified");
+        assert_eq!(c.host.as_deref(), Some("[example.com]:2222"));
+    }
+
+    /// With CheckHostIP=yes a DNS-spoofing block precedes the main one; its
+    /// "Offending key for IP in …" line must not clobber the host entry.
+    #[test]
+    fn host_key_change_ignores_ip_offending_line() {
+        let stderr = format!(
+            "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+             @       WARNING: POSSIBLE DNS SPOOFING DETECTED!          @\n\
+             @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+             Offending key for IP in /Users/ryan/.ssh/known_hosts:7\n\
+             {CHANGED_FULL}"
+        );
+        let c = HostKeyChange::parse(&stderr).expect("classified");
+        assert_eq!(
+            c.known_hosts_line,
+            Some(42),
+            "host line wins, IP line skipped"
+        );
+        assert_eq!(c.offending_key_type.as_deref(), Some("ECDSA"));
+    }
+
+    /// Remote-git wraps stderr behind a `git …:` prefix on the first line.
+    #[test]
+    fn host_key_change_parses_with_wrapped_first_line() {
+        let stderr = format!("git status --porcelain=v1 -z: {CHANGED_FULL}");
+        assert!(HostKeyChange::parse(&stderr).is_some());
+    }
+
+    #[test]
+    fn host_key_change_keeps_windows_paths() {
+        let stderr = CHANGED_FULL
+            .replace(
+                "/Users/ryan/.ssh/known_hosts",
+                r"C:\Users\ryan\.ssh\known_hosts",
+            )
+            .replace(":42", ":7");
+        let c = HostKeyChange::parse(&stderr).expect("classified");
+        assert_eq!(
+            c.known_hosts_file.as_deref(),
+            Some(r"C:\Users\ryan\.ssh\known_hosts")
+        );
+        assert_eq!(c.known_hosts_line, Some(7));
+    }
+
+    /// The terse tail alone is ambiguous (unknown host + strict, declined
+    /// `ask`) — must NOT classify.
+    #[test]
+    fn host_key_change_rejects_non_changed_key_errors() {
+        assert_eq!(HostKeyChange::parse("Host key verification failed."), None);
+        assert_eq!(
+            HostKeyChange::parse(
+                "No ED25519 host key is known for example.com and you have requested strict checking.\n\
+                 Host key verification failed."
+            ),
+            None
+        );
+        assert_eq!(HostKeyChange::parse("Permission denied (publickey)."), None);
+        assert_eq!(HostKeyChange::parse(""), None);
+    }
+
+    #[test]
+    fn known_hosts_name_brackets_only_nonstandard_ports() {
+        assert_eq!(known_hosts_name("example.com", None), "example.com");
+        assert_eq!(known_hosts_name("example.com", Some(22)), "example.com");
+        assert_eq!(
+            known_hosts_name("example.com", Some(2222)),
+            "[example.com]:2222"
+        );
+    }
+
+    #[test]
+    fn keygen_args_builders() {
+        assert_eq!(
+            keygen_remove_args("example.com", None),
+            ["-R", "example.com"]
+        );
+        assert_eq!(
+            keygen_remove_args("[example.com]:2222", Some("/home/u/.ssh/known_hosts")),
+            ["-f", "/home/u/.ssh/known_hosts", "-R", "[example.com]:2222"]
+        );
+        assert_eq!(
+            keygen_find_args("example.com", None),
+            ["-l", "-F", "example.com"]
+        );
+        assert_eq!(
+            keygen_find_args("h", Some("/kh")),
+            ["-l", "-f", "/kh", "-F", "h"]
+        );
+    }
+
+    #[test]
+    fn parse_keygen_lookup_skips_comments_and_hashes() {
+        // Verbatim shape of `ssh-keygen -l -F` output (note the trailing space
+        // on the comment line), plus a hashed-host entry.
+        let out = "# Host gitlab found: line 1 \n\
+                   gitlab ED25519 SHA256:7DtyCzf8LVX8+TIRg3MId33qzZC44LPfwSk06ZtnKaU\n\
+                   # Host example found: line 3\n\
+                   |1|abc123hash= RSA SHA256:aaaabbbbcccc\n";
+        assert_eq!(
+            parse_keygen_lookup(out),
+            vec![
+                (
+                    "ED25519".to_string(),
+                    "SHA256:7DtyCzf8LVX8+TIRg3MId33qzZC44LPfwSk06ZtnKaU".to_string()
+                ),
+                ("RSA".to_string(), "SHA256:aaaabbbbcccc".to_string()),
+            ]
+        );
+        assert!(parse_keygen_lookup("").is_empty());
     }
 }

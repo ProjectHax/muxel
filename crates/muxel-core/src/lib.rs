@@ -7,6 +7,7 @@ pub mod diff;
 mod gui_path;
 pub mod memory;
 mod pane;
+mod shell;
 pub mod ssh;
 pub mod tmux;
 pub mod worktree;
@@ -22,6 +23,7 @@ pub use pane::{
     move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove, set_active_tab,
     set_split_sizes, set_tab_order, split, split_beside, swap_instances, swap_panes,
 };
+pub use shell::{join_words, split_words};
 pub use worktree::Worktree;
 
 use serde::{Deserialize, Serialize};

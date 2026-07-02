@@ -620,6 +620,44 @@ pub fn ssh_test_dir(
     bail!("directory not found: {dir}");
 }
 
+/// Remove a host's stale known_hosts entry (`ssh-keygen [-f <file>] -R <entry>`)
+/// — the accept path of the changed-host-key dialog. `entry` is the token ssh
+/// itself reported (`example.com`, `[example.com]:2222`, or a config alias);
+/// ssh-keygen handles hashed entries itself and backs the file up to
+/// `known_hosts.old`. The reconnect then re-pins the new key via `accept-new`.
+pub fn forget_host_key(entry: &str, file: Option<&str>) -> Result<()> {
+    let out = command("ssh-keygen")
+        .args(ssh::keygen_remove_args(entry, file))
+        .output()
+        .context("run ssh-keygen")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg = err.trim();
+        bail!(
+            "{}",
+            if msg.is_empty() {
+                "ssh-keygen -R failed"
+            } else {
+                msg
+            }
+        );
+    }
+    Ok(())
+}
+
+/// The stored known_hosts fingerprints for a host (`ssh-keygen -l -F <entry>`),
+/// as `(key type, fingerprint)` pairs — shown as "Stored" in the changed-key
+/// dialog. Best-effort: empty on any failure (the dialog says "not found").
+pub fn stored_host_key_fingerprints(entry: &str, file: Option<&str>) -> Vec<(String, String)> {
+    command("ssh-keygen")
+        .args(ssh::keygen_find_args(entry, file))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| ssh::parse_keygen_lookup(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
 /// Whether `path` is inside a git working tree.
 pub fn is_git_repo(path: &Path) -> bool {
     command("git")

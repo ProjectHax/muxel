@@ -6,14 +6,15 @@
 //! the bytes through the VTE `Processor` into the `Term` (see `process_output`),
 //! so the `Term` is only ever touched from the GPUI thread.
 
+use crate::colors::TerminalPalette;
 use crate::listener::{MuxelListener, SharedWriter};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -146,13 +147,21 @@ pub struct TerminalSession {
     processor: Mutex<Processor>,
     writer: SharedWriter,
     master: Box<dyn MasterPty + Send>,
-    child: Mutex<Box<dyn Child + Send + Sync>>,
+    /// Kill handle for the child. The `Child` itself lives in the reader thread,
+    /// which harvests the exit code after EOF (see `read_loop`).
+    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// The PTY child's pid (the shell/agent), captured at spawn. Compared against
     /// the terminal's foreground process group to tell whether the child is idle
     /// at its prompt vs. running a foreground command (see `is_idle_foreground`).
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
     bell: Arc<AtomicBool>,
+    /// OSC-52 copies parsed from output, pending pickup by the view (which owns
+    /// the gpui context a clipboard write needs).
+    clipboard_store: Arc<Mutex<Vec<(ClipboardType, String)>>>,
+    /// The palette color queries are answered from (see `MuxelListener`); kept
+    /// current with the app theme via [`Self::set_palette`].
+    palette: Arc<Mutex<TerminalPalette>>,
     /// True while a left-drag text selection started in this terminal.
     selecting: AtomicBool,
     /// Sub-line scroll-wheel remainder, carried across wheel events.
@@ -214,6 +223,7 @@ impl TerminalSession {
 
         let child = pair.slave.spawn_command(builder).context("spawn command")?;
         let child_pid = child.process_id();
+        let killer = child.clone_killer();
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let writer: SharedWriter = Arc::new(Mutex::new(
             pair.master.take_writer().context("take pty writer")?,
@@ -224,19 +234,29 @@ impl TerminalSession {
         let (tx, rx) = async_channel::unbounded::<PtyChunk>();
         let reader_handle = std::thread::Builder::new()
             .name("muxel-pty-reader".to_string())
-            .spawn(move || read_loop(reader, tx))
+            .spawn(move || read_loop(reader, child, tx))
             .context("spawn reader thread")?;
 
         let title = Arc::new(Mutex::new(None));
         let bell = Arc::new(AtomicBool::new(false));
+        let clipboard_store = Arc::new(Mutex::new(Vec::new()));
+        let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let listener = MuxelListener {
             writer: writer.clone(),
             title: title.clone(),
             bell: bell.clone(),
+            clipboard_store: clipboard_store.clone(),
+            palette: palette.clone(),
         };
 
         let term = Term::new(
-            TermConfig::default(),
+            // Allow OSC-52 *reads* to reach the listener too — it answers them
+            // with an empty reply (see `MuxelListener`) instead of alacritty's
+            // default silent deny, so probing TUIs don't hang.
+            TermConfig {
+                osc52: Osc52::CopyPaste,
+                ..TermConfig::default()
+            },
             &TermSize::new(cols as usize, rows as usize),
             listener,
         );
@@ -247,10 +267,12 @@ impl TerminalSession {
             processor: Mutex::new(Processor::new()),
             writer,
             master: pair.master,
-            child: Mutex::new(child),
+            killer: Mutex::new(killer),
             child_pid,
             title,
             bell,
+            clipboard_store,
+            palette,
             selecting: AtomicBool::new(false),
             scroll_accum: Mutex::new(0.0),
             scrollbar_drag: Mutex::new(None),
@@ -605,6 +627,18 @@ impl TerminalSession {
         self.title.lock().clone()
     }
 
+    /// Drain the OSC-52 copies parsed since the last call. The view lands them
+    /// on the system clipboard (this crate has no gpui context of its own here).
+    pub(crate) fn take_clipboard_stores(&self) -> Vec<(ClipboardType, String)> {
+        std::mem::take(&mut *self.clipboard_store.lock())
+    }
+
+    /// Replace the palette color queries are answered from — pushed by the view
+    /// whenever the app theme (re)applies, so answers track what's painted.
+    pub(crate) fn set_palette(&self, palette: TerminalPalette) {
+        *self.palette.lock() = palette;
+    }
+
     /// Consume the "bell rang" edge.
     pub fn take_bell(&self) -> bool {
         self.bell.swap(false, Ordering::Relaxed)
@@ -650,7 +684,7 @@ impl TerminalSession {
 
     /// Kill the child process.
     pub fn kill(&self) {
-        let _ = self.child.lock().kill();
+        let _ = self.killer.lock().kill();
     }
 }
 
@@ -738,32 +772,47 @@ fn appimage_env_fixups(
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         // Best-effort: kill the child so the reader thread sees EOF and exits.
-        let _ = self.child.lock().kill();
+        let _ = self.killer.lock().kill();
     }
 }
 
-fn read_loop(mut reader: Box<dyn Read + Send>, tx: async_channel::Sender<PtyChunk>) {
+/// Blocking PTY reader. Owns the `Child` so that after EOF it can harvest the
+/// exit code — letting the app tell a clean `exit` from a crash (resume
+/// recovery must not treat a deliberate quit as recoverable).
+fn read_loop(
+    mut reader: Box<dyn Read + Send>,
+    mut child: Box<dyn Child + Send + Sync>,
+    tx: async_channel::Sender<PtyChunk>,
+) {
     let mut buf = [0u8; 65536];
     loop {
         match reader.read(&mut buf) {
-            Ok(0) => {
-                let _ = tx.send_blocking(PtyChunk::Exit(None));
-                break;
-            }
+            Ok(0) | Err(_) => break, // EOF or PTY error → child is (probably) gone
             Ok(n) => {
                 if tx
                     .send_blocking(PtyChunk::Output(buf[..n].to_vec()))
                     .is_err()
                 {
-                    break; // receiver dropped — UI is gone
+                    return; // receiver dropped — UI is gone
                 }
-            }
-            Err(_) => {
-                let _ = tx.send_blocking(PtyChunk::Exit(None));
-                break;
             }
         }
     }
+    // Bounded poll for the exit status: a daemonized child that closed the PTY
+    // but lives on must not wedge this thread. None after the window (or on a
+    // wait error) simply reports an unknown code.
+    let mut code = None;
+    for _ in 0..20 {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                code = Some(status.exit_code() as i32);
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => break,
+        }
+    }
+    let _ = tx.send_blocking(PtyChunk::Exit(code));
 }
 
 #[cfg(test)]
@@ -956,6 +1005,121 @@ mod tests {
         }
         session.kill();
         assert!(seen, "child did not echo written input back into the grid");
+    }
+
+    /// OSC-52 copy: the base64 payload is decoded by alacritty and queued for
+    /// the view to land on the system clipboard.
+    #[test]
+    fn osc52_store_lands_in_pending_queue() {
+        use alacritty_terminal::term::ClipboardType;
+        let (session, _rx) =
+            TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 80, 24)
+                .expect("spawn");
+        session.process_output(b"\x1b]52;c;aGVsbG8=\x07"); // base64("hello")
+        let stores = session.take_clipboard_stores();
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].0, ClipboardType::Clipboard);
+        assert_eq!(stores[0].1, "hello");
+        assert!(
+            session.take_clipboard_stores().is_empty(),
+            "drained on take"
+        );
+        session.kill();
+    }
+
+    /// Collect raw PTY bytes until `needle` shows up (the reply written to the
+    /// child's stdin is echoed back by the tty/cat). Non-blocking receive with a
+    /// hard deadline — `cat` never exits, so a blocking recv would hang the test
+    /// binary forever if the reply never arrives.
+    fn wait_for_reply(rx: &async_channel::Receiver<PtyChunk>, needle: &[u8]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen: Vec<u8> = Vec::new();
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    seen.extend_from_slice(&bytes);
+                    if seen.windows(needle.len()).any(|w| w == needle) {
+                        return true;
+                    }
+                }
+                Ok(PtyChunk::Exit(_)) => return false,
+                Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(async_channel::TryRecvError::Closed) => return false,
+            }
+        }
+        false
+    }
+
+    /// OSC-52 read probe: answered with a well-formed EMPTY reply — support is
+    /// detectable, but the clipboard never leaks to the child. The needle is the
+    /// reply's printable core: the tty echoes control chars in caret notation
+    /// (`ESC` → `^[`, `BEL` → `^G`), so the raw bytes never appear verbatim.
+    /// Emptiness is the listener's contract (`format("")`); what's asserted here
+    /// is that a reply reaches the PTY at all.
+    #[test]
+    fn osc52_load_answers_empty() {
+        let (session, rx) =
+            TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 80, 24)
+                .expect("spawn");
+        session.process_output(b"\x1b]52;c;?\x07");
+        assert!(
+            wait_for_reply(&rx, b"]52;c;"),
+            "empty OSC-52 reply should reach the PTY"
+        );
+        session.kill();
+    }
+
+    /// OSC 11 (default background) query: answered from the session palette so
+    /// TUIs detect dark/light from what's actually painted.
+    #[test]
+    fn color_query_reports_palette_background() {
+        let (session, rx) =
+            TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 80, 24)
+                .expect("spawn");
+        session.set_palette(crate::colors::TerminalPalette {
+            background: 0x112233,
+            ..Default::default()
+        });
+        session.process_output(b"\x1b]11;?\x07");
+        assert!(
+            wait_for_reply(&rx, b"]11;rgb:1111/2222/3333"),
+            "background query should answer with the set palette"
+        );
+        session.kill();
+    }
+
+    /// The reader thread harvests the child's exit code after EOF, so the app
+    /// can tell a clean exit from a crash.
+    #[test]
+    fn exit_code_is_reported() {
+        let (_session, rx) = TerminalSession::spawn(
+            CommandSpec::program("/bin/sh", vec!["-c".into(), "exit 7".into()]),
+            80,
+            24,
+        )
+        .expect("spawn");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no exit chunk within the deadline"
+            );
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(_)) => {}
+                Ok(PtyChunk::Exit(code)) => {
+                    assert_eq!(code, Some(7));
+                    break;
+                }
+                Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(async_channel::TryRecvError::Closed) => {
+                    panic!("channel closed without an exit chunk")
+                }
+            }
+        }
     }
 
     #[test]
