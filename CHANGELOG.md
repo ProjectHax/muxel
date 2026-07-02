@@ -3,6 +3,101 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [0.0.7] — 2026-07-02
+
+### Added
+- **Self-maintaining project memory** — the flat `.muxel/MEMORY.md` becomes a
+  structured, greppable memory muxel maintains automatically: one `## Title` section
+  per fact with a machine meta line, ordered most-relevant-first, with un-pinned
+  entries auto-purged after 30 days and capped (least-recently-used eviction). A
+  legacy flat file is imported, never lost. The project row's memory button opens a
+  docked, resizable side panel (like the file browser) — search, pin/unpin, add,
+  delete, open raw — with its width persisted per workspace. Local and remote (SSH)
+  projects; local agents also get `MUXEL_MEMORY_FILE` / `MUXEL_MEMORY_DIR`.
+- **Reusable SSH login identities** — a named credential (user + auth + key/password)
+  defined once in Settings → Identities and referenced by many hosts, so a shared
+  login is entered, stored, and rotated in one place. The host editor gains a
+  credentials picker; deleting an identity detaches its hosts.
+- **Snippets** — reusable text typed into an already-running pane (unlike runners,
+  which spawn a new agent). Send one from the toolbar Snippets dropdown, the command
+  palette, or a terminal tab's right-click menu; each snippet chooses whether it
+  auto-submits. Managed in Settings → Snippets.
+- **Developer console** — `F12` opens a popped-out error log (opt-in in settings).
+- **tmux scrollback** — launching a tmux session now turns on tmux mouse mode, so the
+  scroll wheel reaches tmux copy-mode history instead of only the visible screen
+  (remote, remote-tmux, and local tmux-mode projects).
+- **Scan for remote projects** — the new-remote-project wizard can scan a host for
+  `.muxel/workspace.json` markers and list the found roots; click one to fill the path.
+- **Local ↔ mobile peering** — a local project with tmux enabled mirrors its layout to
+  `<root>/.muxel/workspace.json` (newer-wins), so the new iOS companion can SSH into
+  the machine and drive the same panes.
+- **"Ollama Code" preset** — runs a coding agent backed by an Ollama model via
+  `ollama launch <agent> --model <model>` (seeded as opencode + `glm-5.2:cloud`;
+  editable in the preset's args).
+- **Reorder projects** — right-click a project → **Move up** / **Move down**
+  (alongside drag-to-reorder).
+- **More keyboard shortcuts** — `Ctrl+Shift+G` toggles the "new agents get a git
+  worktree" switch, and `Ctrl+Alt+1`–`Ctrl+Alt+9` open a new pane running the Nth
+  agent preset. Both rebindable.
+- **Open project memory anytime** — right-click a project → **Open shared memory** (or
+  a command-palette entry), even when memory injection is off (the file is created on
+  demand).
+- **SSH compression** — an opt-in per-host `Compression=yes`, worth it on slow links.
+
+### Changed
+- **Single instance per workspace** — the instance lock is now per-workspace, so two
+  muxel windows can run side by side on different workspaces; opening a workspace
+  another window already holds is refused in the selector with an inline "in use" note.
+- **Notifications while focused** — a desktop notification is no longer shown while
+  muxel's own window is focused (the in-app NOTIFICATIONS feed still records it).
+- **Untouched shell panes close without a prompt** — closing a default-shell pane
+  idle at its prompt (no foreground command, only tab) skips the confirmation; a
+  running command, another tab, or an agent still asks.
+- **SSH defaults** — every ssh invocation now sets `ConnectTimeout=15` (an unreachable
+  host fails promptly instead of hanging ~2 min) and `IdentitiesOnly=yes` when an
+  explicit key file is set (so ssh doesn't exhaust the server's `MaxAuthTries` before
+  the right key). Both overridable per host.
+- **Changed host key** — a changed remote host key raises an actionable dialog
+  (stored vs presented SHA256 fingerprints side by side) with a destructive
+  **Trust new key** that clears the stale entry and retries the operation, instead of
+  a silent SSH refusal.
+- **Quote-aware preset args** — `--flag "two words"` now stays a single argument;
+  unbalanced quotes degrade to space-splitting with a warning.
+- **Active-tab styling** — the active tab is marked with a thin theme-accent underline
+  in the pane header, plus minor sidebar spacing polish.
+
+### Fixed
+- **Agent detection on Linux GUI / AppImage launches** — a desktop-entry or AppImage
+  launch inherits a minimal `PATH`; muxel now reconstructs `~/.local/bin`,
+  `~/.opencode/bin` (opencode's installer default), Linuxbrew, and friends, so agents
+  are detected and spawnable the same as from a terminal (matching the existing macOS
+  fix).
+- **Spurious "done" notifications** — marker-less terminals (plain shells, agents with
+  no markers) no longer flip to "done" on incidental output such as a focus-change
+  repaint when you click the pane; they reach "done" only from the bell or process
+  exit.
+- **No crash when the fallback shell fails to spawn** — the pane shows the failure in
+  place (Restart retries) and the error lands in the notifications feed, instead of
+  panicking.
+- **Silent save failures surfaced** — a failed local save (workspace, settings,
+  memory, layout backup) is now reported in the notifications feed + dev console
+  rather than lost.
+- **Terminal cursor** — muxel no longer paints the terminal cursor while the app has
+  hidden it.
+
+### iOS companion app (new — distributed via TestFlight / App Store, not in these downloads)
+- A native **SwiftUI iOS app** that connects over SSH and **peers with desktop muxel**
+  — it reads/writes the same per-project `.muxel/workspace.json` and uses muxel's exact
+  tmux session naming, so the phone drives the same sessions. Remote-only.
+- A live **SSH PTY terminal** (SwiftTerm) with a themeable identity, an accessory key
+  row (Esc / Ctrl / Tab / arrows / paste), pinch-to-zoom, OSC-52 copy, and tmux-backed
+  scrollback; a collapsible, resizable sidebar of hosts/projects; status badges;
+  on-device background **notifications** plus a **Live Activity** status bar (Lock
+  Screen + Dynamic Island).
+- **Security**: SSH **key + password** auth and shared login identities, secrets in the
+  **Keychain**, **trust-on-first-use** host keys with a changed-key prompt, jump hosts,
+  and an optional App Lock. Licensed GPL-3.0 with an App Store (GPLv3 §7) exception.
+
 ## [0.0.6] — 2026-06-26
 
 ### Added
