@@ -261,6 +261,10 @@ pub struct RemoteHost {
     /// `ServerAliveInterval` seconds, if set.
     #[serde(default)]
     pub keepalive_secs: Option<u32>,
+    /// Enable SSH compression (`-o Compression=yes`) — worth it on slow / high-
+    /// latency links, a waste of CPU on a fast LAN.
+    #[serde(default)]
+    pub compression: bool,
     /// Extra raw `-o KEY=VALUE` ssh options.
     #[serde(default)]
     pub extra_options: Vec<String>,
@@ -284,6 +288,7 @@ impl RemoteHost {
             forward_agent: false,
             strict_host_key: String::new(),
             keepalive_secs: None,
+            compression: false,
             extra_options: Vec::new(),
             default_use_tmux: true,
         }

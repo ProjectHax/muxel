@@ -160,6 +160,7 @@ pub struct SettingsUi {
     /// (refreshed on open/save, so render doesn't hit the keychain every frame).
     pub s_has_password: bool,
     pub s_forward_agent: bool,
+    pub s_compression: bool,
     pub s_use_tmux: bool,
     pub s_name: Entity<InputState>,
     pub s_host: Entity<InputState>,
@@ -273,6 +274,7 @@ impl SettingsUi {
             s_test: RemoteTestState::Idle,
             s_has_password: false,
             s_forward_agent: false,
+            s_compression: false,
             s_use_tmux: true,
             s_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
             s_host: cx.new(|cx| {

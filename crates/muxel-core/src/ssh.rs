@@ -42,13 +42,29 @@ pub fn target(host: &RemoteHost) -> String {
     }
 }
 
+/// TCP-connect timeout applied to every ssh invocation, so a dead/slow host
+/// fails promptly (the OS default can hang for a minute or more) instead of
+/// wedging a pane or the connection test. Overridable via `extra_options`.
+const CONNECT_TIMEOUT_SECS: u32 = 15;
+
 /// Base connection **options** for a host (port, identity, jump, agent
-/// forwarding, host-key policy, keepalive, extra `-o`s) — everything *except*
-/// ControlMaster multiplexing, the target, and the command. Used directly by the
-/// connection test (which must NOT reuse a shared master) and via
-/// [`connection_args`] (which adds multiplexing) for panes and git.
+/// forwarding, host-key policy, connect timeout, keepalive, compression, extra
+/// `-o`s) — everything *except* ControlMaster multiplexing, the target, and the
+/// command. Used directly by the connection test (which must NOT reuse a shared
+/// master) and via [`connection_args`] (which adds multiplexing) for panes and
+/// git.
 pub fn base_args(host: &RemoteHost) -> Vec<String> {
     let mut v = Vec::new();
+    // Whether the user already set option `key` in `extra_options` — a hand-
+    // written `-o` should win, so we skip emitting our default for that key.
+    let user_set = |key: &str| {
+        host.extra_options.iter().any(|o| {
+            o.split('=')
+                .next()
+                .map(|k| k.trim().eq_ignore_ascii_case(key))
+                .unwrap_or(false)
+        })
+    };
     if let Some(port) = host.port {
         v.push("-p".into());
         v.push(port.to_string());
@@ -58,6 +74,13 @@ pub fn base_args(host: &RemoteHost) -> Vec<String> {
     {
         v.push("-i".into());
         v.push(id.display().to_string());
+        // With an explicit key, don't let ssh offer every agent key first — that
+        // can trip the server's MaxAuthTries ("Too many authentication
+        // failures") before the right key is reached.
+        if !user_set("IdentitiesOnly") {
+            v.push("-o".into());
+            v.push("IdentitiesOnly=yes".into());
+        }
     }
     if let Some(jump) = host.jump_host.as_ref().filter(|j| !j.is_empty()) {
         v.push("-J".into());
@@ -73,9 +96,17 @@ pub fn base_args(host: &RemoteHost) -> Vec<String> {
     };
     v.push("-o".into());
     v.push(format!("StrictHostKeyChecking={strict}"));
+    if !user_set("ConnectTimeout") {
+        v.push("-o".into());
+        v.push(format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"));
+    }
     if let Some(secs) = host.keepalive_secs {
         v.push("-o".into());
         v.push(format!("ServerAliveInterval={secs}"));
+    }
+    if host.compression && !user_set("Compression") {
+        v.push("-o".into());
+        v.push("Compression=yes".into());
     }
     for opt in host.extra_options.iter().filter(|o| !o.is_empty()) {
         v.push("-o".into());
@@ -343,7 +374,12 @@ mod tests {
         let h = host();
         // ControlMaster multiplexing is added on non-Windows only (Windows ssh has
         // no ControlMaster), so the expected args differ by platform.
-        let mut want = vec!["-o", "StrictHostKeyChecking=accept-new"];
+        let mut want = vec![
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=15",
+        ];
         if cfg!(not(target_os = "windows")) {
             want.extend([
                 "-o",
@@ -356,6 +392,54 @@ mod tests {
         }
         assert_eq!(connection_args(&h, "/tmp/s.sock"), want);
         assert_eq!(target(&h), "example.com");
+    }
+
+    #[test]
+    fn key_auth_with_identity_adds_identities_only() {
+        let mut h = host();
+        h.auth = SshAuth::Key;
+        h.identity_file = Some(PathBuf::from("/home/dev/.ssh/id_ed25519"));
+        let a = base_args(&h);
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["-i", "/home/dev/.ssh/id_ed25519"])
+        );
+        assert!(a.contains(&"IdentitiesOnly=yes".to_string()));
+        // Agent auth (no explicit key) must NOT force IdentitiesOnly.
+        assert!(!base_args(&host()).contains(&"IdentitiesOnly=yes".to_string()));
+    }
+
+    #[test]
+    fn compression_is_opt_in() {
+        assert!(!base_args(&host()).contains(&"Compression=yes".to_string()));
+        let mut h = host();
+        h.compression = true;
+        assert!(base_args(&h).contains(&"Compression=yes".to_string()));
+    }
+
+    #[test]
+    fn extra_options_override_the_builtins() {
+        let mut h = host();
+        h.compression = true;
+        h.extra_options = vec![
+            "ConnectTimeout=60".into(),
+            "Compression=no".into(),
+            "IdentitiesOnly=no".into(),
+        ];
+        h.auth = SshAuth::Key;
+        h.identity_file = Some(PathBuf::from("/k"));
+        let a = base_args(&h);
+        // A user-set option wins → we don't also emit our default for that key.
+        assert!(!a.contains(&"ConnectTimeout=15".to_string()));
+        assert!(a.contains(&"ConnectTimeout=60".to_string()));
+        assert_eq!(
+            a.iter()
+                .filter(|o| o.starts_with("ConnectTimeout="))
+                .count(),
+            1
+        );
+        assert!(!a.contains(&"Compression=yes".to_string()));
+        assert!(!a.contains(&"IdentitiesOnly=yes".to_string()));
     }
 
     #[test]

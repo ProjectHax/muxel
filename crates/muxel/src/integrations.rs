@@ -61,8 +61,8 @@ impl RepoLoc {
 /// string) on the connection's host, reusing its ControlMaster.
 fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
     let mut argv = ssh::connection_args(&c.host, &c.control_path);
-    argv.push("-o".into());
-    argv.push("ConnectTimeout=10".into());
+    // `ConnectTimeout` comes from `base_args`; `BatchMode` makes a key/agent
+    // failure fail fast instead of blocking on a password prompt to a non-tty.
     if c.password.is_none() {
         argv.push("-o".into());
         argv.push("BatchMode=yes".into());
@@ -438,8 +438,8 @@ fn ssh_run(
     remote_cmd: &str,
 ) -> Result<std::process::Output> {
     let mut argv = ssh::connection_args(host, control_path);
-    argv.push("-o".into());
-    argv.push("ConnectTimeout=10".into());
+    // `ConnectTimeout` comes from `base_args`; `BatchMode` (non-password) fails
+    // fast instead of blocking on a password prompt to a non-tty.
     if password.is_none() {
         argv.push("-o".into());
         argv.push("BatchMode=yes".into());
@@ -549,11 +549,9 @@ pub fn ssh_check(host: &RemoteHost, control_path: &str, password: Option<&str>) 
 /// so a working key can't mask a wrong password. Returns the ssh error (e.g.
 /// "Permission denied") on failure.
 pub fn ssh_verify(host: &RemoteHost, password: Option<&str>) -> Result<()> {
-    let mut argv = ssh::base_args(host);
+    let mut argv = ssh::base_args(host); // includes ConnectTimeout
     argv.push("-o".into());
     argv.push("ControlPath=none".into()); // never multiplex a credential test
-    argv.push("-o".into());
-    argv.push("ConnectTimeout=10".into());
     argv.push("-o".into());
     argv.push("NumberOfPasswordPrompts=1".into());
     if host.auth == SshAuth::Password {

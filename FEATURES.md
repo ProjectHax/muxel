@@ -331,8 +331,12 @@ feature is added or changed, update the matching entry here in the same change**
   companion app's host scan.
 - **SSH host library** — Settings → Remotes manages saved hosts with the common
   options: hostname/alias, port, user, auth (ssh-agent, key file, or password),
-  ProxyJump, agent forwarding, host-key policy, keepalive, and extra `-o` options.
-  A "Test connection" button verifies a host.
+  ProxyJump, agent forwarding, host-key policy, keepalive, compression (for slow
+  or high-latency links), and extra `-o` options. Two safe defaults are applied
+  automatically: a `ConnectTimeout` so an unreachable host fails promptly instead
+  of hanging a pane, and `IdentitiesOnly` when an explicit key file is set (so ssh
+  doesn't offer every agent key first and trip the server's `MaxAuthTries`) — both
+  overridable via a matching extra `-o`. A "Test connection" button verifies a host.
 - **Changed host key dialog** — when a host's key no longer matches `known_hosts`
   (a reinstalled server — or a man-in-the-middle), connection tests, project
   connects, and remote git operations raise an actionable dialog instead of a raw

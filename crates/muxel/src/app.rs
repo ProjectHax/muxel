@@ -14463,6 +14463,7 @@ impl MuxelApp {
         self.settings_ui.s_has_password = crate::secrets::has_remote_password(h.id);
         self.settings_ui.s_identity_id = h.identity_id;
         self.settings_ui.s_forward_agent = h.forward_agent;
+        self.settings_ui.s_compression = h.compression;
         self.settings_ui.s_use_tmux = h.default_use_tmux;
         let set =
             |inp: &Entity<InputState>, v: String, cx: &mut Context<Self>, window: &mut Window| {
@@ -14573,6 +14574,7 @@ impl MuxelApp {
             .collect();
         let auth = ui.s_auth;
         let forward_agent = ui.s_forward_agent;
+        let compression = ui.s_compression;
         let use_tmux = ui.s_use_tmux;
         let identity_id = ui.s_identity_id;
         let host_id = self.remotes.get(idx).map(|h| h.id);
@@ -14587,6 +14589,7 @@ impl MuxelApp {
             h.identity_file = identity;
             h.jump_host = jump;
             h.forward_agent = forward_agent;
+            h.compression = compression;
             h.strict_host_key = strict;
             h.keepalive_secs = keepalive;
             h.extra_options = extra;
@@ -17757,6 +17760,7 @@ impl MuxelApp {
         }
 
         let forward = ui.s_forward_agent;
+        let compression = ui.s_compression;
         let use_tmux = ui.s_use_tmux;
         form = form
             .child(self.settings_label(&t("Jump host (ProxyJump, optional)"), cx))
@@ -17770,6 +17774,17 @@ impl MuxelApp {
                             cx.notify();
                         })),
                     &t("Forward the ssh-agent (-A)"),
+                ),
+            )
+            .child(
+                self.check_row(
+                    Checkbox::new("remote-compression")
+                        .checked(compression)
+                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
+                            this.settings_ui.s_compression = *c;
+                            cx.notify();
+                        })),
+                    &t("Enable compression (-C) — helps on slow or high-latency links"),
                 ),
             )
             .child(
