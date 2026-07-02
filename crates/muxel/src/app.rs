@@ -12798,6 +12798,11 @@ impl MuxelApp {
             list = list.child(row);
 
             if !collapsed {
+                // A slight gap between the project header and its panes, so the
+                // rows read as a group rather than one flush block.
+                if !project.instances().is_empty() {
+                    list = list.child(div().h(px(4.0)).flex_none());
+                }
                 // Group instances by worktree: plain (no-worktree) panes first,
                 // then a subcategory per worktree (a colored subheader followed by
                 // its instances).
