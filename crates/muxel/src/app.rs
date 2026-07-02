@@ -10562,17 +10562,23 @@ impl MuxelApp {
                         }
 
                         let pill_ghost = tab_title.clone();
-                        div()
+                        let pill = div()
                             .id(SharedString::from(format!("tab-{}", tab.simple())))
                             .flex()
                             .items_center()
                             .gap_1()
                             .px_1()
                             .h_full()
-                            .max_w(px(180.0))
-                            .border_r_1()
-                            .border_color(cx.theme().border)
-                            .bg(pill_bg)
+                            .max_w(px(180.0));
+                        // The active tab gets a full themed (accent) outline so the
+                        // selection is obvious at a glance; the others keep just the
+                        // right divider between pills.
+                        let pill = if tab_active {
+                            pill.border_1().border_color(cx.theme().primary)
+                        } else {
+                            pill.border_r_1().border_color(cx.theme().border)
+                        };
+                        pill.bg(pill_bg)
                             .text_xs()
                             .text_color(if tab_active {
                                 cx.theme().foreground
