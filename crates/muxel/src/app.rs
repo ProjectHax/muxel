@@ -10574,7 +10574,7 @@ impl MuxelApp {
                         // selection is obvious at a glance without an oversized box;
                         // the others keep just the right divider between pills.
                         let pill = if tab_active {
-                            pill.border_b_2().border_color(cx.theme().primary)
+                            pill.border_b_1().border_color(cx.theme().primary)
                         } else {
                             pill.border_r_1().border_color(cx.theme().border)
                         };
