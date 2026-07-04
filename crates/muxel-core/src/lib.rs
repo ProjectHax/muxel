@@ -64,7 +64,7 @@ pub struct Instance {
     /// For browser panes: the current URL (kept fresh so a restart restores it).
     #[serde(default)]
     pub browser_url: Option<String>,
-    /// User-assigned name, shown as "{custom} — {app title}" when set.
+    /// User-assigned name; when set it fully replaces the agent's own title.
     #[serde(default)]
     pub custom_name: Option<String>,
     /// Program to run; `None` means the user's default shell.

@@ -14029,8 +14029,10 @@ impl MuxelApp {
                     } else {
                         (meta, AgentStatus::Idle)
                     };
+                    // A user-assigned name fully replaces the agent's own title
+                    // (no "custom — title" composite).
                     let display = match custom {
-                        Some(c) => format!("{c} — {app_title}"),
+                        Some(c) => c,
                         None => app_title,
                     };
                     let ghost_label: SharedString = display.clone().into();
