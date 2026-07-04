@@ -18034,7 +18034,7 @@ impl MuxelApp {
                             // effect on the next launch.
                             #[cfg(target_os = "windows")]
                             this.add_event(
-                                NotifKind::Info,
+                                NotifKind::Success,
                                 t("Browser"),
                                 t("Restart muxel to fully apply the browser change.").to_string(),
                             );

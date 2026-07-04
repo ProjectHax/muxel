@@ -52,7 +52,7 @@ mod imp {
     use super::*;
     use gpui_component::button::{Button, ButtonVariants as _};
     use gpui_component::input::{Input, InputEvent, InputState};
-    use gpui_component::{IconName, h_flex};
+    use gpui_component::{IconName, Sizable as _, h_flex};
 
     pub struct BrowserView {
         focus_handle: FocusHandle,
@@ -68,16 +68,13 @@ mod imp {
             // Build the native webview as a child of this gpui window. Failure
             // (e.g. WebView2 runtime missing) degrades to a visible error row
             // instead of crashing the pane.
-            let webview = {
-                use raw_window_handle::HasWindowHandle;
-                window.window_handle().ok().and_then(|handle| {
-                    wry::WebViewBuilder::new()
-                        .with_url(&url)
-                        .build_as_child(&handle)
-                        .ok()
-                        .map(|wv| cx.new(|cx2| gpui_wry::WebView::new(wv, window, cx2)))
-                })
-            };
+            // gpui's `Window` implements raw_window_handle::HasWindowHandle,
+            // which is exactly what wry's `build_as_child` wants.
+            let webview = wry::WebViewBuilder::new()
+                .with_url(&url)
+                .build_as_child(&*window)
+                .ok()
+                .map(|wv| cx.new(|cx2| gpui_wry::WebView::new(wv, window, cx2)));
 
             let address = cx.new(|cx| InputState::new(window, cx).default_value(url.clone()));
             cx.subscribe(

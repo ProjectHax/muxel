@@ -54,8 +54,8 @@ keyring = { version = "3", features = [
 # same gpui-component rev so the `gpui` types unify.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "e416af7f4dad861f251d357b6aa677dbc13a500e" }
-# For handing gpui's native window to wry's build_as_child.
-raw-window-handle = "0.6"
+# The same lb-wry release gpui-wry pins, so the `wry` types unify.
+wry = { version = "0.53.3", package = "lb-wry" }
 
 # Linux: gpui can't host a WebKitGTK child (no GTK loop; XEmbed is X11-only), so
 # the browser is a separate muxel-managed window: `muxel --browser <url>` runs a

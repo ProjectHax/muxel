@@ -4642,7 +4642,6 @@ dependencies = [
  "muxel-terminal",
  "muxel-tray",
  "notify-rust",
- "raw-window-handle",
  "rust-embed",
  "self-replace",
  "serde_json",
