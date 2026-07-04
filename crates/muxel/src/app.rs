@@ -452,6 +452,8 @@ actions!(
         ToggleBroadcast,
         // Toggle the "new agents get a git worktree" toolbar switch.
         ToggleWorktree,
+        // OS fullscreen with the sidebar hidden (a floating pill reveals it).
+        ToggleFullScreen,
         // Toggle the developer console (error log) — only when enabled in settings.
         ToggleDevConsole,
         // Search the active terminal's scrollback (Terminal context only).
@@ -509,6 +511,7 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
         "ShowKeys" => KeyBinding::new(keystroke, ShowKeys, context),
         "ToggleBroadcast" => KeyBinding::new(keystroke, ToggleBroadcast, context),
         "ToggleWorktree" => KeyBinding::new(keystroke, ToggleWorktree, context),
+        "ToggleFullScreen" => KeyBinding::new(keystroke, ToggleFullScreen, context),
         "ToggleDevConsole" => KeyBinding::new(keystroke, ToggleDevConsole, context),
         // NewAgent1..9 — the trailing digit is the 1-based preset index.
         a if a.starts_with("NewAgent") => {
@@ -896,6 +899,9 @@ pub struct MuxelApp {
     terminals: HashMap<Uuid, Entity<TerminalView>>,
     /// Live code editors, keyed by instance id (parallel to `terminals`).
     editors: HashMap<Uuid, Entity<EditorView>>,
+    /// Live browser panes, keyed by instance id (parallel to `editors`). On
+    /// Linux these are placeholder views — the real browser is a separate window.
+    browsers: HashMap<Uuid, Entity<crate::browser::BrowserView>>,
     /// The pane the toolbar actions target.
     active_instance: Option<Uuid>,
     /// The agent preset library and the one currently selected for new panes.
@@ -928,6 +934,10 @@ pub struct MuxelApp {
     show_dashboard: bool,
     /// Whether the project sidebar is collapsed.
     sidebar_collapsed: bool,
+    /// While fullscreen (F11): whether the user pulled the sidebar back in with
+    /// the floating reveal pill. Reset on every fullscreen entry; not persisted,
+    /// so `sidebar_collapsed` survives fullscreen round-trips untouched.
+    fullscreen_sidebar_revealed: bool,
     /// Whether the right-side git-diff panel is shown.
     show_git_diff: bool,
     /// Which tab of the git-diff panel is active (Files vs Worktrees).
@@ -1072,6 +1082,14 @@ pub struct MuxelApp {
     maximized: Option<Uuid>,
     /// Panes detached into their own OS windows, keyed by instance id.
     popouts: HashMap<Uuid, PopOut>,
+    /// Secondary (per-monitor) workspace windows, one per pinned project.
+    secondary_windows: Vec<SecondaryWindow>,
+    /// The main window (raise target for main-only chrome + window routing).
+    main_window: Option<AnyWindowHandle>,
+    /// Editors to rebuild bound to the main window after their project moved
+    /// back from a secondary window. Unlike `pending_editor_redock` the instance
+    /// is still in its layout — only the view is re-created.
+    pending_editor_rebuild: Vec<(Uuid, EditorSnapshot)>,
     /// Editors awaiting re-dock into the main window (rebuilt in `render`, which
     /// has the main window — gpui-component input focus is window-bound).
     pending_editor_redock: Vec<(Uuid, EditorSnapshot, RedockAnchor)>,
@@ -1401,6 +1419,124 @@ impl PopoutView {
 
     fn is_editor(&self) -> bool {
         matches!(self.view, PaneView::Editor(_))
+    }
+}
+
+/// The app-side record of one secondary (per-monitor) workspace window.
+struct SecondaryWindow {
+    /// The project this window currently shows (exactly one window per project).
+    pid: Uuid,
+    /// The monitor's stable UUID (geometry persistence + relaunch assignment).
+    display_uuid: Uuid,
+    handle: AnyWindowHandle,
+    window_id: WindowId,
+    view: Entity<WorkspaceWindow>,
+    /// Whether this OS window is focused (notification "attended" + PTY focus).
+    active: bool,
+}
+
+/// Root view of a secondary workspace window: a full sidebar + toolbar + pane
+/// area for one project. All state lives in [`MuxelApp`]; render delegates into
+/// it so every existing `cx.listener` handler works unchanged in this window.
+struct WorkspaceWindow {
+    app: WeakEntity<MuxelApp>,
+    pid: Uuid,
+    display_uuid: Uuid,
+    focus_handle: FocusHandle,
+    bounds_save_task: Option<Task<()>>,
+}
+
+impl WorkspaceWindow {
+    fn new(
+        app: WeakEntity<MuxelApp>,
+        pid: Uuid,
+        display_uuid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Track this window's OS focus for notification gating + PTY focus
+        // reporting (mirrors the main window's observer).
+        cx.observe_window_activation(window, |this, window, cx| {
+            let active = window.is_window_active();
+            let pid = this.pid;
+            if let Some(app) = this.app.upgrade() {
+                app.update(cx, |app, cx| app.set_secondary_active(pid, active, cx));
+            }
+            cx.notify();
+        })
+        .detach();
+        // Persist this window's geometry into the workspace document (debounced),
+        // so reopening the workspace restores every window exactly. Follows the
+        // window if the user drags it to a different monitor.
+        cx.observe_window_bounds(window, |this, window, cx| {
+            if this.bounds_save_task.is_some() {
+                return;
+            }
+            this.bounds_save_task = Some(cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    let (bounds, maximized) = match window.inner_window_bounds() {
+                        WindowBounds::Windowed(b) => (b, false),
+                        WindowBounds::Maximized(b) => (b, true),
+                        WindowBounds::Fullscreen(b) => (b, true),
+                    };
+                    let geom = muxel_core::WindowGeom {
+                        x: f32::from(bounds.origin.x),
+                        y: f32::from(bounds.origin.y),
+                        width: f32::from(bounds.size.width),
+                        height: f32::from(bounds.size.height),
+                        maximized,
+                    };
+                    let display = window
+                        .display(cx)
+                        .and_then(|d| d.uuid().ok())
+                        .unwrap_or(this.display_uuid);
+                    this.display_uuid = display;
+                    let pid = this.pid;
+                    if let Some(app) = this.app.upgrade() {
+                        app.update(cx, |app, _cx| {
+                            if let Some(sec) =
+                                app.secondary_windows.iter_mut().find(|s| s.pid == pid)
+                            {
+                                sec.display_uuid = display;
+                            }
+                            app.workspace.project_windows.insert(
+                                pid,
+                                muxel_core::ProjectWindow {
+                                    display,
+                                    geom: Some(geom),
+                                },
+                            );
+                            app.persist();
+                        });
+                    }
+                    this.bounds_save_task = None;
+                });
+            }));
+        })
+        .detach();
+        Self {
+            app,
+            pid,
+            display_uuid,
+            focus_handle: cx.focus_handle(),
+            bounds_save_task: None,
+        }
+    }
+}
+
+impl Render for WorkspaceWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(app) = self.app.upgrade() else {
+            return div().into_any_element();
+        };
+        let pid = self.pid;
+        let focus = self.focus_handle.clone();
+        app.update(cx, |app, cx| {
+            app.render_secondary_content(pid, &focus, window, cx)
+        })
     }
 }
 
@@ -2573,6 +2709,7 @@ impl MuxelApp {
             workspace: Workspace::default(),
             terminals: HashMap::new(),
             editors: HashMap::new(),
+            browsers: HashMap::new(),
             active_instance: None,
             presets,
             current_preset,
@@ -2589,6 +2726,7 @@ impl MuxelApp {
             window_active: true,
             show_dashboard: false,
             sidebar_collapsed: false,
+            fullscreen_sidebar_revealed: false,
             show_file_browser: false,
             file_browser_pid: None,
             file_browser_files: Vec::new(),
@@ -2625,6 +2763,9 @@ impl MuxelApp {
             update_resize: None,
             maximized: None,
             popouts: HashMap::new(),
+            secondary_windows: Vec::new(),
+            main_window: Some(window.window_handle()),
+            pending_editor_rebuild: Vec::new(),
             pending_editor_redock: Vec::new(),
             show_quit_confirm: false,
             show_keys: false,
@@ -2717,6 +2858,7 @@ impl MuxelApp {
         cx.on_window_closed(move |cx, window_id| {
             if let Some(app) = weak.upgrade() {
                 app.update(cx, |this, cx| {
+                    this.handle_secondary_closed(window_id, cx);
                     this.close_popout(window_id, cx);
                     // Forget the dev-console handle if its window was just closed.
                     if this
@@ -3260,7 +3402,11 @@ impl MuxelApp {
             .map(|p| p.instances())
             .unwrap_or_default()
             .into_iter()
-            .any(|iid| !self.terminals.contains_key(&iid) && !self.editors.contains_key(&iid));
+            .any(|iid| {
+                !self.terminals.contains_key(&iid)
+                    && !self.editors.contains_key(&iid)
+                    && !self.browsers.contains_key(&iid)
+            });
         if !needs && !first_sync {
             return;
         }
@@ -3417,6 +3563,17 @@ impl MuxelApp {
                         }
                     }
                 }
+                InstanceKind::Browser => {
+                    if !self.browsers.contains_key(&iid) {
+                        let url = self
+                            .workspace
+                            .instance(iid)
+                            .and_then(|i| i.browser_url.clone())
+                            .unwrap_or_else(|| "about:blank".to_string());
+                        let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                        self.browsers.insert(iid, view);
+                    }
+                }
             }
         }
     }
@@ -3473,6 +3630,11 @@ impl MuxelApp {
         // Editors just drop (unsaved changes lost on workspace switch).
         self.editors.clear();
         self.pending_editor_redock.clear();
+        // Close any per-monitor project windows from the previous workspace (the
+        // close hook's cleanup no-ops — their records are dropped here first).
+        for sec in std::mem::take(&mut self.secondary_windows) {
+            let _ = sec.handle.update(cx, |_, window, _| window.remove_window());
+        }
         // Close + tear down any popped-out panes from the previous workspace.
         for (_, popout) in self.popouts.drain() {
             if let PaneView::Terminal(view) = &popout.view {
@@ -3499,6 +3661,27 @@ impl MuxelApp {
             .filter(|w| !w.projects.is_empty());
         if let Some(ws) = loaded {
             self.restore(ws, window, cx);
+        }
+        // Reopen per-monitor project windows for saved assignments whose display
+        // is currently connected (a missing monitor keeps the pin for later).
+        let assignments: Vec<(Uuid, Uuid)> = self
+            .workspace
+            .project_windows
+            .iter()
+            .map(|(p, w)| (*p, w.display))
+            .collect();
+        for (pid, display_uuid) in assignments {
+            if self.workspace.project(pid).is_none() {
+                self.workspace.project_windows.remove(&pid);
+                continue;
+            }
+            if let Some(display) = cx
+                .displays()
+                .into_iter()
+                .find(|d| d.uuid().ok() == Some(display_uuid))
+            {
+                self.open_project_on_monitor(pid, display.id(), display_uuid, window, cx);
+            }
         }
         // An empty workspace starts with no projects — the user adds one with the
         // sidebar's New Project button (no auto-creation in the current folder).
@@ -3816,6 +3999,26 @@ impl MuxelApp {
     }
 
     fn select_project(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        // Multi-window routing: a project shown in another window is RAISED, not
+        // stolen (one project renders in exactly one window at a time).
+        let this_window = window.window_handle().window_id();
+        if let Some(sec) = self.secondary_windows.iter().find(|s| s.pid == pid) {
+            if sec.window_id != this_window {
+                let _ = sec
+                    .handle
+                    .update(cx, |_, window, _| window.activate_window());
+            }
+            return;
+        }
+        if !self.is_main_window(window) {
+            if self.workspace.active_project == Some(pid) {
+                // Shown in the main window → raise that instead.
+                self.activate_main_window(window, cx);
+                return;
+            }
+            self.repoint_secondary_window(this_window, pid, window, cx);
+            return;
+        }
         // Leaving a remote project with a pending layout change → flush it now so
         // the remote copy is current even if we don't return for a while.
         if let Some(prev) = self.workspace.active_project
@@ -3862,6 +4065,9 @@ impl MuxelApp {
             window.focus(&handle, cx);
         } else if let Some(ed) = self.editors.get(&iid) {
             let handle = ed.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        } else if let Some(bv) = self.browsers.get(&iid) {
+            let handle = bv.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
         }
         cx.notify();
@@ -3941,6 +4147,17 @@ impl MuxelApp {
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        cx.notify();
+    }
+
+    /// F11: toggle OS fullscreen. Entering always starts with the sidebar fully
+    /// hidden (the floating pill reveals it for the rest of that stint); leaving
+    /// restores whatever `sidebar_collapsed` state the user had before.
+    fn toggle_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.is_fullscreen() {
+            self.fullscreen_sidebar_revealed = false;
+        }
+        window.toggle_fullscreen();
         cx.notify();
     }
 
@@ -4660,6 +4877,25 @@ impl MuxelApp {
     /// the agent's deliberate "I need you" signal (e.g. Claude on a permission
     /// prompt), so it's precise — no guessing from idle time.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Keep browser panes' URL fresh (the user clicks links inside the
+        // webview): syncs the address bar, tab label, and the persisted
+        // `Instance.browser_url` so a restart restores where they ended up.
+        if !self.browsers.is_empty() {
+            let views: Vec<(Uuid, Entity<crate::browser::BrowserView>)> =
+                self.browsers.iter().map(|(i, v)| (*i, v.clone())).collect();
+            let mut changed = false;
+            for (iid, view) in views {
+                if let Some(url) = view.update(cx, |v, cx| v.sync(window, cx))
+                    && let Some(inst) = self.workspace.instance_mut(iid)
+                {
+                    inst.browser_url = Some(url);
+                    changed = true;
+                }
+            }
+            if changed {
+                self.persist();
+            }
+        }
         // Program availability (installed agents / gh / sshpass) + git status are
         // refreshed off the UI thread so they don't stutter the render loop.
         self.refresh_status(cx);
@@ -4747,7 +4983,7 @@ impl MuxelApp {
             }
             // A pane counts as attended only if it's active AND the window is
             // focused; otherwise its agent's bell/exit is worth recording.
-            let attended = self.window_active && Some(iid) == focused;
+            let attended = self.instance_window_active(iid) && Some(iid) == focused;
             if changed && !attended {
                 let kind = match status {
                     AgentStatus::Blocked => Some(NotifKind::Blocked),
@@ -5556,6 +5792,191 @@ impl MuxelApp {
         for ed in editors {
             ed.update(cx, |e, cx| e.set_config(cfg.clone(), window, cx));
         }
+    }
+
+    /// Route a ctrl+clicked terminal link: `file://` URIs and disabled-browser
+    /// setups go to the OS handler; otherwise macOS/Windows open an embedded
+    /// browser pane and Linux spawns the separate muxel browser window.
+    fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings.browser_enabled || url.starts_with("file://") {
+            let _ = window;
+            cx.open_url(url);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if !crate::browser::spawn_browser_window(url) {
+                self.add_event(
+                    NotifKind::Error,
+                    t("Browser"),
+                    t("Couldn't start the browser window — opened in the system browser instead.")
+                        .to_string(),
+                );
+                cx.open_url(url);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if self
+                .open_browser_at(url.to_string(), self.active_instance, window, cx)
+                .is_none()
+            {
+                cx.open_url(url);
+            }
+        }
+    }
+
+    /// Open the embedded browser pane on `url` in the active project, splitting
+    /// beside `target` (or seeding an empty project). Returns the instance id.
+    /// (Linux routes links to the separate browser window instead; restored
+    /// cross-platform browser panes go through spawn_project_terminals_now.)
+    #[cfg(not(target_os = "linux"))]
+    fn open_browser_at(
+        &mut self,
+        url: String,
+        target: Option<Uuid>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
+        let pid = self.workspace.active_project?;
+        let instance = Instance::browser(pid, url.clone());
+        let iid = instance.id;
+        let empty = self.workspace.project(pid).is_some_and(|p| p.is_empty());
+        let split_target = if empty { None } else { target };
+        match split_target {
+            Some(active) => {
+                let ok = self
+                    .workspace
+                    .project_mut(pid)
+                    .is_some_and(|p| split(&mut p.layout, active, SplitDirection::Horizontal, iid));
+                if !ok {
+                    return None;
+                }
+                self.workspace.add_instance(instance);
+            }
+            None => {
+                self.workspace.add_instance(instance);
+                if let Some(project) = self.workspace.project_mut(pid) {
+                    project.layout = Some(PaneNode::leaf(iid));
+                }
+            }
+        }
+        let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+        self.browsers.insert(iid, view);
+        self.focus_instance(iid, window, cx);
+        self.persist();
+        cx.notify();
+        Some(iid)
+    }
+
+    /// Any overlay that draws above the pane area. The native browser webviews
+    /// float above ALL gpui content, so they must hide beneath these.
+    /// NOTE: every new modal/palette/menu flag MUST be added here (see CLAUDE.md).
+    fn any_overlay_open(&self, cx: &App) -> bool {
+        self.show_settings
+            || self.show_search_palette
+            || self.show_find_panel
+            || self.show_update_modal
+            || self.show_quit_confirm
+            || self.show_keys
+            || self.show_terms
+            || self.show_workspace_selector
+            || self.show_new_remote
+            || self.show_run_dialog
+            || self.broadcasting
+            || self.git_modal.is_some()
+            || self.password_prompt.is_some()
+            || self.confirm.is_some()
+            || self.place_menu.is_some()
+            || self.runners_menu.is_some()
+            || self.loops_menu.is_some()
+            || self.snippets_menu.is_some()
+            || self.term_search.is_some()
+            || !self.pending_worktree_dispose.is_empty()
+            || cx.has_active_drag()
+    }
+
+    /// Browser instances whose pane content is actually on screen: the shown tab
+    /// of each leaf in the active project (respecting maximize + dashboard).
+    fn visible_browser_ids(&self) -> Vec<Uuid> {
+        if self.browsers.is_empty() || self.show_dashboard {
+            return Vec::new();
+        }
+        let Some(project) = self.workspace.active() else {
+            return Vec::new();
+        };
+        if let Some(max) = self.maximized {
+            return if self.browsers.contains_key(&max) {
+                vec![max]
+            } else {
+                Vec::new()
+            };
+        }
+        fn walk(
+            node: &PaneNode,
+            active_instance: Option<Uuid>,
+            browsers: &HashMap<Uuid, Entity<crate::browser::BrowserView>>,
+            out: &mut Vec<Uuid>,
+        ) {
+            match node {
+                PaneNode::Leaf(ld) => {
+                    // Mirror render_pane: a pane holding the focused instance
+                    // shows it; others show their own saved active tab.
+                    let leaf_active = ld.active.min(ld.tabs.len().saturating_sub(1));
+                    let iid = match active_instance {
+                        Some(a) if ld.tabs.contains(&a) => a,
+                        _ => ld.tabs[leaf_active],
+                    };
+                    if browsers.contains_key(&iid) {
+                        out.push(iid);
+                    }
+                }
+                PaneNode::Split { children, .. } => {
+                    for child in children {
+                        walk(child, active_instance, browsers, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(layout) = &project.layout {
+            walk(layout, self.active_instance, &self.browsers, &mut out);
+        }
+        // Projects shown in secondary (per-monitor) windows render there.
+        for sec in &self.secondary_windows {
+            if let Some(layout) = self
+                .workspace
+                .project(sec.pid)
+                .and_then(|p| p.layout.as_ref())
+            {
+                walk(layout, self.active_instance, &self.browsers, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Show/hide the native browser webviews to match what's actually visible
+    /// this frame (deferred so it runs right after the render pass).
+    fn sync_browser_visibility(&self, cx: &mut Context<Self>) {
+        if self.browsers.is_empty() {
+            return;
+        }
+        let overlay = self.any_overlay_open(cx);
+        let visible = if overlay {
+            Vec::new()
+        } else {
+            self.visible_browser_ids()
+        };
+        let updates: Vec<_> = self
+            .browsers
+            .iter()
+            .map(|(iid, v)| (v.clone(), visible.contains(iid)))
+            .collect();
+        cx.defer(move |cx| {
+            for (view, show) in updates {
+                view.update(cx, |v, cx| v.set_native_visible(show, cx));
+            }
+        });
     }
 
     /// Open `path` (None = a new Untitled buffer) as an editor pane in `pid`,
@@ -6463,6 +6884,8 @@ impl MuxelApp {
         }
         // Editors just drop (their buffer is in memory); nothing to kill.
         self.editors.remove(&iid);
+        // Dropping a BrowserView hides its native webview (gpui-wry Drop impl).
+        self.browsers.remove(&iid);
 
         // Tear down tmux (local or remote) + worktree (capture info before drop).
         let info = self.workspace.instance(iid).map(|i| {
@@ -7177,6 +7600,7 @@ impl MuxelApp {
                 view.read(cx).session().kill();
             }
             self.editors.remove(&iid);
+            self.browsers.remove(&iid);
             self.last_status.remove(&iid);
             self.workspace.remove_instance_meta(iid);
         }
@@ -8159,6 +8583,539 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Whether `window` is the main muxel window.
+    fn is_main_window(&self, window: &Window) -> bool {
+        self.main_window
+            .as_ref()
+            .is_none_or(|h| h.window_id() == window.window_handle().window_id())
+    }
+
+    /// Raise the main window (used before opening main-window-only chrome like
+    /// the settings modal or command palette from a secondary window).
+    fn activate_main_window(&self, window: &Window, cx: &mut Context<Self>) {
+        if self.is_main_window(window) {
+            return;
+        }
+        if let Some(h) = &self.main_window {
+            let _ = h.update(cx, |_, window, _| window.activate_window());
+        }
+    }
+
+    /// Per-window activation bookkeeping for a secondary window (notification
+    /// "attended" gating + PTY focus reporting for the panes it shows).
+    fn set_secondary_active(&mut self, pid: Uuid, active: bool, cx: &mut Context<Self>) {
+        if let Some(sec) = self.secondary_windows.iter_mut().find(|s| s.pid == pid) {
+            sec.active = active;
+        }
+        if let Some(iid) = self.active_instance
+            && self
+                .workspace
+                .instance(iid)
+                .is_some_and(|i| i.project_id == pid)
+            && let Some(view) = self.terminals.get(&iid)
+        {
+            view.read(cx).session().report_focus(active);
+        }
+        cx.notify();
+    }
+
+    /// Whether the OS window SHOWING `iid`'s project is currently focused
+    /// (the multi-window generalization of `self.window_active`).
+    fn instance_window_active(&self, iid: Uuid) -> bool {
+        let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) else {
+            return self.window_active;
+        };
+        match self.secondary_windows.iter().find(|s| s.pid == pid) {
+            Some(sec) => sec.active,
+            None => self.window_active,
+        }
+    }
+
+    /// Open project `pid` as a full workspace window on `display` (or raise its
+    /// existing window). The project leaves the main window; its editors are
+    /// rebuilt inside the new window (editor input focus is window-bound).
+    fn open_project_on_monitor(
+        &mut self,
+        pid: Uuid,
+        display_id: DisplayId,
+        display_uuid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(sec) = self.secondary_windows.iter().find(|s| s.pid == pid) {
+            let _ = sec
+                .handle
+                .update(cx, |_, window, _| window.activate_window());
+            return;
+        }
+        // Snapshot this project's editors; they're rebuilt inside the new window.
+        let editor_snaps: Vec<(Uuid, EditorSnapshot)> = self
+            .workspace
+            .project(pid)
+            .map(|p| p.instances())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|iid| {
+                self.editors
+                    .remove(&iid)
+                    .map(|ed| (iid, EditorSnapshot::capture(&ed, cx)))
+            })
+            .collect();
+        // The main window falls back to another project when it was showing this one.
+        if self.workspace.active_project == Some(pid) {
+            self.workspace.active_project = self
+                .workspace
+                .projects
+                .iter()
+                .map(|p| p.id)
+                .find(|id| *id != pid);
+            self.active_instance = self.workspace.active().and_then(|p| p.first_instance());
+            if let Some(next) = self.workspace.active_project {
+                self.spawn_project_terminals_now(next, window, cx);
+            }
+        }
+
+        let window_bounds = self
+            .workspace
+            .project_windows
+            .get(&pid)
+            .filter(|w| w.display == display_uuid)
+            .and_then(|w| w.geom)
+            .and_then(|g| {
+                (g.width > 0.0 && g.height > 0.0).then(|| {
+                    let b = Bounds {
+                        origin: point(px(g.x), px(g.y)),
+                        size: size(px(g.width), px(g.height)),
+                    };
+                    if g.maximized {
+                        WindowBounds::Maximized(b)
+                    } else {
+                        WindowBounds::Windowed(b)
+                    }
+                })
+            });
+        let app = cx.weak_entity();
+        let config = self.editor_config();
+        // DEFERRED: `cx.open_window` draws the new window synchronously, and its
+        // render delegates back into this entity — opening it while this update
+        // holds the MuxelApp lease would double-lease and panic. Run after the
+        // current update completes instead.
+        cx.defer(move |cx| {
+            let slot: std::rc::Rc<std::cell::RefCell<Option<Entity<WorkspaceWindow>>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(None));
+            let opened = cx.open_window(
+                gpui::WindowOptions {
+                    titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                    window_bounds,
+                    display_id: Some(display_id),
+                    app_id: Some("muxel".to_string()),
+                    window_min_size: Some(size(px(480.0), px(320.0))),
+                    ..Default::default()
+                },
+                {
+                    let slot = slot.clone();
+                    let app = app.clone();
+                    move |window, cx| {
+                        window.set_window_title("muxel");
+                        // Editors rebuilt bound to THIS window.
+                        for (iid, snap) in editor_snaps {
+                            let ed = snap.build(config.clone(), window, cx);
+                            if let Some(a) = app.upgrade() {
+                                a.update(cx, |a, _| {
+                                    a.editors.insert(iid, ed);
+                                });
+                            }
+                        }
+                        let view = cx.new(|cx| {
+                            WorkspaceWindow::new(app.clone(), pid, display_uuid, window, cx)
+                        });
+                        *slot.borrow_mut() = Some(view.clone());
+                        cx.new(|cx| {
+                            gpui_component::Root::new(view, window, cx).bg(cx.theme().background)
+                        })
+                    }
+                },
+            );
+            let Some(app) = app.upgrade() else { return };
+            app.update(cx, |this, cx| match opened {
+                Ok(handle) => {
+                    let any: AnyWindowHandle = handle.into();
+                    if let Some(view) = slot.borrow_mut().take() {
+                        this.secondary_windows.push(SecondaryWindow {
+                            pid,
+                            display_uuid,
+                            window_id: any.window_id(),
+                            handle: any,
+                            view,
+                            active: true,
+                        });
+                    }
+                    let prev_geom = this
+                        .workspace
+                        .project_windows
+                        .get(&pid)
+                        .filter(|w| w.display == display_uuid)
+                        .and_then(|w| w.geom);
+                    this.workspace.project_windows.insert(
+                        pid,
+                        muxel_core::ProjectWindow {
+                            display: display_uuid,
+                            geom: prev_geom,
+                        },
+                    );
+                    this.persist();
+                    cx.notify();
+                }
+                Err(e) => {
+                    log::warn!("open project window failed: {e}");
+                    this.add_event(
+                        NotifKind::Error,
+                        t("Multi-monitor"),
+                        tf("Couldn't open a window: {err}", &[("err", &format!("{e}"))]),
+                    );
+                }
+            });
+        });
+    }
+
+    /// Close a project's secondary window and show it in the main window again.
+    fn bring_project_to_main(&mut self, pid: Uuid, cx: &mut Context<Self>) {
+        let Some(sec) = self.secondary_windows.iter().find(|s| s.pid == pid) else {
+            return;
+        };
+        let handle = sec.handle;
+        // `remove_window` fires the app-wide on_window_closed hook, which runs
+        // `handle_secondary_closed` for the actual cleanup + editor rebuilds.
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        self.workspace.active_project = Some(pid);
+        self.persist();
+        cx.notify();
+    }
+
+    /// A secondary window is gone (user closed it, or bring-to-main): drop the
+    /// record + monitor pin and queue its editors to rebuild in the main window.
+    fn handle_secondary_closed(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
+        let Some(ix) = self
+            .secondary_windows
+            .iter()
+            .position(|s| s.window_id == window_id)
+        else {
+            return;
+        };
+        let sec = self.secondary_windows.remove(ix);
+        for iid in self
+            .workspace
+            .project(sec.pid)
+            .map(|p| p.instances())
+            .unwrap_or_default()
+        {
+            if let Some(ed) = self.editors.remove(&iid) {
+                let snap = EditorSnapshot::capture(&ed, cx);
+                self.pending_editor_rebuild.push((iid, snap));
+            }
+        }
+        self.workspace.project_windows.remove(&sec.pid);
+        self.persist();
+        cx.notify();
+    }
+
+    /// Repoint a secondary window at a different project (its sidebar click).
+    /// The old project's editors are queued to rebuild in the main window.
+    fn repoint_secondary_window(
+        &mut self,
+        window_id: WindowId,
+        pid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sec) = self
+            .secondary_windows
+            .iter_mut()
+            .find(|s| s.window_id == window_id)
+        else {
+            return;
+        };
+        let old_pid = sec.pid;
+        let display_uuid = sec.display_uuid;
+        sec.pid = pid;
+        sec.view.update(cx, |v, cx| {
+            v.pid = pid;
+            cx.notify();
+        });
+        for iid in self
+            .workspace
+            .project(old_pid)
+            .map(|p| p.instances())
+            .unwrap_or_default()
+        {
+            if let Some(ed) = self.editors.remove(&iid) {
+                let snap = EditorSnapshot::capture(&ed, cx);
+                self.pending_editor_rebuild.push((iid, snap));
+            }
+        }
+        let carried =
+            self.workspace
+                .project_windows
+                .remove(&old_pid)
+                .unwrap_or(muxel_core::ProjectWindow {
+                    display: display_uuid,
+                    geom: None,
+                });
+        self.workspace.project_windows.insert(pid, carried);
+        self.ensure_project_terminals(pid, window, cx);
+        self.active_instance = self.workspace.project(pid).and_then(|p| p.first_instance());
+        if let Some(iid) = self.active_instance {
+            self.focus_instance(iid, window, cx);
+        }
+        self.persist();
+        cx.notify();
+    }
+
+    /// Every workspace action + drag handler, attached to a window root — the
+    /// single source of truth shared by the main window and each secondary
+    /// (per-monitor) window, so shortcuts work wherever focus is. Handlers that
+    /// open main-window-only chrome raise the main window first.
+    fn attach_workspace_actions<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
+        el
+            // While a tab/pane is dragged, this fires first (capture phase) each
+            // move and clears the drop indicators; the element under the cursor
+            // then sets the right one. So indicators vanish over no pane, and the
+            // strip (tab_drop) and body (pane_drop) stay mutually exclusive.
+            .on_drag_move::<DragInstance>(cx.listener(
+                |this, _ev: &DragMoveEvent<DragInstance>, _w, cx| {
+                    this.clear_tab_drop(cx);
+                    this.clear_pane_drop(cx);
+                },
+            ))
+            .on_drag_move::<DragPane>(
+                cx.listener(|this, _ev: &DragMoveEvent<DragPane>, _w, cx| this.clear_pane_drop(cx)),
+            )
+            .on_action(cx.listener(|this, _: &NewPane, window, cx| {
+                this.new_like_active(PlacementMode::Split(SplitDirection::Horizontal), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewTab, window, cx| {
+                this.new_like_active(PlacementMode::Tab, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TabNext, window, cx| this.cycle_tab(1, window, cx)))
+            .on_action(cx.listener(|this, _: &TabPrev, window, cx| this.cycle_tab(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
+                this.add_agent(SplitDirection::Horizontal, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
+                this.add_agent(SplitDirection::Vertical, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ClosePane, window, cx| this.close_active(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &FocusNext, window, cx| this.focus_sibling(1, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &FocusPrev, window, cx| this.focus_sibling(-1, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| this.adjust_zoom(0.1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.adjust_zoom(-0.1, cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &ToggleDashboard, window, cx| {
+                this.activate_main_window(window, cx);
+                this.toggle_dashboard(cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSettings, window, cx| {
+                this.activate_main_window(window, cx);
+                this.toggle_settings(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SendTab, _w, cx| this.send_to_active(b"\t", cx)))
+            .on_action(
+                cx.listener(|this, _: &SendBackTab, _w, cx| this.send_to_active(b"\x1b[Z", cx)),
+            )
+            .on_action(cx.listener(|this, _: &GlobalSearch, window, cx| {
+                this.activate_main_window(window, cx);
+                this.open_search_palette(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FindInProject, window, cx| {
+                this.activate_main_window(window, cx);
+                this.open_find_panel(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &SaveFile, window, cx| this.save_active_editor(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &SaveFileAs, window, cx| {
+                this.save_as_active_editor(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ClearTerminal, _w, cx| this.clear_active_terminal(cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &FocusAttention, window, cx| {
+                    this.focus_attention(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &FocusLeft, window, cx| {
+                this.focus_direction(FocusDir::Left, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusRight, window, cx| {
+                this.focus_direction(FocusDir::Right, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusUp, window, cx| {
+                this.focus_direction(FocusDir::Up, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusDown, window, cx| {
+                this.focus_direction(FocusDir::Down, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowKeys, window, cx| {
+                this.activate_main_window(window, cx);
+                this.show_keys = !this.show_keys;
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &SearchTerminal, window, cx| {
+                    this.open_term_search(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ToggleBroadcast, window, cx| {
+                this.activate_main_window(window, cx);
+                this.toggle_broadcast(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleWorktree, _window, cx| this.toggle_worktree(cx)),
+            )
+            .on_action(cx.listener(|this, _: &ToggleFullScreen, window, cx| {
+                this.toggle_fullscreen(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, a: &JumpToTab, window, cx| this.jump_to_tab(a.0, window, cx)),
+            )
+            .on_action(cx.listener(|this, a: &JumpToProject, window, cx| {
+                this.jump_to_project(a.0, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, a: &NewAgent, window, cx| {
+                    this.new_agent_preset(a.0, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ToggleDevConsole, _window, cx| {
+                // Gated on the setting — F12 is bound globally, so it's a no-op when
+                // the developer console is disabled.
+                if this.settings.dev_console_enabled {
+                    this.toggle_dev_console(cx);
+                }
+            }))
+            // A ctrl+clicked terminal link: URLs go to the built-in browser when
+            // enabled (embedded pane / Linux browser window), files to the OS.
+            .on_action(
+                cx.listener(|this, a: &muxel_terminal::OpenLink, window, cx| {
+                    let url = a.0.clone();
+                    this.open_link(&url, window, cx);
+                }),
+            )
+    }
+
+    /// The full workspace UI for a secondary window: title bar, toolbar, the
+    /// project sidebar, and `pid`'s pane tree. Main-window-only chrome (modals,
+    /// palette, feeds) stays in the main window.
+    fn render_secondary_content(
+        &mut self,
+        pid: Uuid,
+        root_focus: &FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let layout = self.workspace.project(pid).and_then(|p| p.layout.clone());
+        let maximized_here = self.maximized.filter(|id| {
+            self.workspace
+                .project(pid)
+                .map(|p| p.instances().contains(id))
+                .unwrap_or(false)
+        });
+        let main_content: AnyElement = if let Some(iid) = maximized_here {
+            self.render_pane(&PaneNode::leaf(iid), cx)
+        } else {
+            match layout {
+                Some(root) => self.render_pane(&root, cx),
+                None => div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t("No terminals — pick a preset and Split."))
+                    .into_any_element(),
+            }
+        };
+        let main_column = div()
+            .size_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(self.render_toolbar(cx))
+            .child(div().flex_1().min_h_0().child(main_content));
+        let sidebar_hidden =
+            self.sidebar_collapsed || (window.is_fullscreen() && !self.fullscreen_sidebar_revealed);
+        let body: AnyElement = if sidebar_hidden {
+            main_column.into_any_element()
+        } else {
+            let half = (f32::from(window.viewport_size().width) * 0.5).max(440.0);
+            let saved = self
+                .workspace
+                .sidebar_width
+                .unwrap_or(232.0)
+                .clamp(160.0, half);
+            let key = SharedString::from(format!("sidebar-split-w-{}", pid.simple()));
+            h_resizable(key)
+                .child(
+                    resizable_panel()
+                        .size(px(saved))
+                        .size_range(px(160.0)..px(half))
+                        .child(self.render_sidebar(cx)),
+                )
+                .child(resizable_panel().child(main_column))
+                .into_any_element()
+        };
+
+        let root = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .relative()
+            .key_context("muxel")
+            .track_focus(root_focus)
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground);
+        let root = self.attach_workspace_actions(root, cx);
+        root.child(self.render_minimal_titlebar(cx))
+            .child(div().flex_1().min_h_0().flex().child(body))
+            .children((window.is_fullscreen() && sidebar_hidden).then(|| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(26.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .py_2()
+                            .bg(cx.theme().sidebar)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded_r(cx.theme().radius)
+                            .shadow_md()
+                            .child(
+                                Button::new("fullscreen-reveal-sidebar-secondary")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ChevronRight)
+                                    .tooltip(t("Show sidebar"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.fullscreen_sidebar_revealed = true;
+                                        this.sidebar_collapsed = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+            }))
+            .into_any_element()
+    }
+
     /// Detach a pane into its own OS window (kept alive). Closing that window
     /// re-docks it (see `redock_popout`).
     fn pop_out_instance(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -8293,6 +9250,15 @@ impl MuxelApp {
     /// Rebuild any editors awaiting re-dock into the main window. Called from
     /// `render`, which holds the main window.
     fn drain_editor_redocks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Editors whose project moved back to this window: rebuild the view only
+        // (the instance never left its layout).
+        if !self.pending_editor_rebuild.is_empty() {
+            let config = self.editor_config();
+            for (iid, snap) in std::mem::take(&mut self.pending_editor_rebuild) {
+                let ed = snap.build(config.clone(), window, cx);
+                self.editors.insert(iid, ed);
+            }
+        }
         if self.pending_editor_redock.is_empty() {
             return;
         }
@@ -8440,6 +9406,8 @@ impl MuxelApp {
             InstanceKind::Terminal => self.settings.confirm_close_terminal,
             InstanceKind::Editor => self.settings.confirm_close_editor,
             InstanceKind::Diff => self.settings.confirm_close_diff,
+            // Browsers are cheap to reopen (the URL is persisted anyway).
+            InstanceKind::Browser => false,
         }
     }
 
@@ -8474,7 +9442,7 @@ impl MuxelApp {
             let (noun, verb) = match kind {
                 InstanceKind::Terminal => (t("terminal"), t("terminated")),
                 InstanceKind::Editor => (t("editor"), t("closed")),
-                InstanceKind::Diff => (t("diff"), t("closed")),
+                InstanceKind::Diff | InstanceKind::Browser => (t("diff"), t("closed")),
             };
             let name = self
                 .workspace
@@ -10290,6 +11258,9 @@ impl MuxelApp {
         if let Some(ed) = self.editors.get(&iid) {
             return ed.read(cx).title().into();
         }
+        if let Some(bv) = self.browsers.get(&iid) {
+            return bv.read(cx).tab_title().into();
+        }
         // A shell (no agent program) shows its current directory from the live
         // terminal title; an agent keeps its static preset name.
         if inst.is_some_and(|i| i.program.is_none())
@@ -10405,6 +11376,19 @@ impl MuxelApp {
                             }),
                         )
                         .child(ed.clone())
+                        .into_any_element()
+                } else if let Some(bv) = self.browsers.get(&iid) {
+                    div()
+                        .size_full()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _e, window, cx| {
+                                if this.active_instance != Some(iid) {
+                                    this.focus_instance(iid, window, cx);
+                                }
+                            }),
+                        )
+                        .child(bv.clone())
                         .into_any_element()
                 } else if let Some(err) = self.failed_launches.get(&iid) {
                     // The launch failed completely (fallback shell included):
@@ -12719,6 +13703,68 @@ impl MuxelApp {
                                         ),
                                     ),
                                 );
+                            // Multi-monitor: open this project as a full muxel
+                            // window on another display, or pull it back.
+                            let displays = cx.displays();
+                            let on_monitor = entity
+                                .read(cx)
+                                .secondary_windows
+                                .iter()
+                                .any(|s| s.pid == pid);
+                            if displays.len() > 1 || on_monitor {
+                                menu = menu.separator();
+                                for (ix, d) in displays.iter().enumerate() {
+                                    let Ok(display_uuid) = d.uuid() else {
+                                        continue;
+                                    };
+                                    if entity
+                                        .read(cx)
+                                        .secondary_windows
+                                        .iter()
+                                        .any(|s| s.pid == pid && s.display_uuid == display_uuid)
+                                    {
+                                        continue; // already on this display
+                                    }
+                                    let b = d.bounds();
+                                    let label = tf(
+                                        "Open on display {n} ({w}×{h})",
+                                        &[
+                                            ("n", &format!("{}", ix + 1)),
+                                            ("w", &format!("{}", f32::from(b.size.width) as i32)),
+                                            ("h", &format!("{}", f32::from(b.size.height) as i32)),
+                                        ],
+                                    );
+                                    let display_id = d.id();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(label)
+                                            .icon(IconName::ExternalLink)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, window, cx| {
+                                                    this.open_project_on_monitor(
+                                                        pid,
+                                                        display_id,
+                                                        display_uuid,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                },
+                                            )),
+                                    );
+                                }
+                                if on_monitor {
+                                    menu = menu.item(
+                                        PopupMenuItem::new(t("Bring back to main window"))
+                                            .icon(IconName::Replace)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, _window, cx| {
+                                                    this.bring_project_to_main(pid, cx)
+                                                },
+                                            )),
+                                    );
+                                }
+                            }
                             if has_startup {
                                 menu = menu.item(
                                     PopupMenuItem::new(t("Launch startup agents"))
@@ -12978,6 +14024,8 @@ impl MuxelApp {
                         )
                     } else if let Some(ed) = self.editors.get(&iid) {
                         (ed.read(cx).title(), AgentStatus::Idle)
+                    } else if let Some(bv) = self.browsers.get(&iid) {
+                        (bv.read(cx).tab_title(), AgentStatus::Idle)
                     } else {
                         (meta, AgentStatus::Idle)
                     };
@@ -16975,6 +18023,28 @@ impl MuxelApp {
             )
             .child(
                 self.check_row(
+                    Checkbox::new("b-browser")
+                        .checked(self.settings.browser_enabled)
+                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
+                            this.settings.browser_enabled = *c;
+                            this.persist_settings();
+                            // Windows only: the embedded webview needs a
+                            // compositor flag set before gpui starts (see
+                            // main.rs), so a mid-session change takes full
+                            // effect on the next launch.
+                            #[cfg(target_os = "windows")]
+                            this.add_event(
+                                NotifKind::Info,
+                                t("Browser"),
+                                t("Restart muxel to fully apply the browser change.").to_string(),
+                            );
+                            cx.notify();
+                        })),
+                    &t("Open ctrl+clicked links in the built-in browser (off = system browser)"),
+                ),
+            )
+            .child(
+                self.check_row(
                     Checkbox::new("b-minimize-tray")
                         .checked(self.settings.minimize_to_tray)
                         .on_click(
@@ -18591,6 +19661,9 @@ impl Focusable for MuxelApp {
 
 impl Render for MuxelApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Native browser webviews draw above all gpui content in their bounds —
+        // keep them shown/hidden in lockstep with what this frame displays.
+        self.sync_browser_visibility(cx);
         // Cache the settings pane width so deep helpers can size wrapping labels
         // absolutely (their multi-line height is otherwise mis-measured).
         if self.show_settings {
@@ -18751,7 +19824,11 @@ impl Render for MuxelApp {
         } else {
             main_column.into_any_element()
         };
-        let body: AnyElement = if self.sidebar_collapsed {
+        // Fullscreen hides the sidebar outright (until the floating pill reveals
+        // it); the user's normal collapsed state is left untouched underneath.
+        let sidebar_hidden =
+            self.sidebar_collapsed || (window.is_fullscreen() && !self.fullscreen_sidebar_revealed);
+        let body: AnyElement = if sidebar_hidden {
             center
         } else {
             // Allow dragging the sidebar to at least half the window width.
@@ -18824,7 +19901,7 @@ impl Render for MuxelApp {
             body
         };
 
-        div()
+        let root = div()
             .size_full()
             .flex()
             .flex_col()
@@ -18834,122 +19911,9 @@ impl Render for MuxelApp {
             // context) routes muxel shortcuts (incl. Ctrl+P) to the root handlers.
             .track_focus(&self.focus_handle)
             .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            // While a tab/pane is dragged, this fires first (capture phase) each
-            // move and clears the drop indicators; the element under the cursor
-            // then sets the right one. So indicators vanish over no pane, and the
-            // strip (tab_drop) and body (pane_drop) stay mutually exclusive.
-            .on_drag_move::<DragInstance>(cx.listener(
-                |this, _ev: &DragMoveEvent<DragInstance>, _w, cx| {
-                    this.clear_tab_drop(cx);
-                    this.clear_pane_drop(cx);
-                },
-            ))
-            .on_drag_move::<DragPane>(
-                cx.listener(|this, _ev: &DragMoveEvent<DragPane>, _w, cx| this.clear_pane_drop(cx)),
-            )
-            .on_action(cx.listener(|this, _: &NewPane, window, cx| {
-                this.new_like_active(PlacementMode::Split(SplitDirection::Horizontal), window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &NewTab, window, cx| {
-                this.new_like_active(PlacementMode::Tab, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &TabNext, window, cx| this.cycle_tab(1, window, cx)))
-            .on_action(cx.listener(|this, _: &TabPrev, window, cx| this.cycle_tab(-1, window, cx)))
-            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
-                this.add_agent(SplitDirection::Horizontal, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
-                this.add_agent(SplitDirection::Vertical, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ClosePane, window, cx| this.close_active(window, cx)))
-            .on_action(
-                cx.listener(|this, _: &FocusNext, window, cx| this.focus_sibling(1, window, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &FocusPrev, window, cx| this.focus_sibling(-1, window, cx)),
-            )
-            .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| this.adjust_zoom(0.1, cx)))
-            .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.adjust_zoom(-0.1, cx)))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| this.toggle_sidebar(cx)))
-            .on_action(
-                cx.listener(|this, _: &ToggleDashboard, _window, cx| this.toggle_dashboard(cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &ToggleSettings, window, cx| {
-                    this.toggle_settings(window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &SendTab, _w, cx| this.send_to_active(b"\t", cx)))
-            .on_action(
-                cx.listener(|this, _: &SendBackTab, _w, cx| this.send_to_active(b"\x1b[Z", cx)),
-            )
-            .on_action(cx.listener(|this, _: &GlobalSearch, window, cx| {
-                this.open_search_palette(window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &FindInProject, window, cx| this.open_find_panel(window, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &SaveFile, window, cx| this.save_active_editor(window, cx)),
-            )
-            .on_action(cx.listener(|this, _: &SaveFileAs, window, cx| {
-                this.save_as_active_editor(window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &ClearTerminal, _w, cx| this.clear_active_terminal(cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &FocusAttention, window, cx| {
-                    this.focus_attention(window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &FocusLeft, window, cx| {
-                this.focus_direction(FocusDir::Left, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FocusRight, window, cx| {
-                this.focus_direction(FocusDir::Right, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FocusUp, window, cx| {
-                this.focus_direction(FocusDir::Up, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FocusDown, window, cx| {
-                this.focus_direction(FocusDir::Down, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ShowKeys, _w, cx| {
-                this.show_keys = !this.show_keys;
-                cx.notify();
-            }))
-            .on_action(
-                cx.listener(|this, _: &SearchTerminal, window, cx| {
-                    this.open_term_search(window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &ToggleBroadcast, window, cx| {
-                this.toggle_broadcast(window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &ToggleWorktree, _window, cx| this.toggle_worktree(cx)),
-            )
-            .on_action(
-                cx.listener(|this, a: &JumpToTab, window, cx| this.jump_to_tab(a.0, window, cx)),
-            )
-            .on_action(cx.listener(|this, a: &JumpToProject, window, cx| {
-                this.jump_to_project(a.0, window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, a: &NewAgent, window, cx| {
-                    this.new_agent_preset(a.0, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &ToggleDevConsole, _window, cx| {
-                // Gated on the setting — F12 is bound globally, so it's a no-op when
-                // the developer console is disabled.
-                if this.settings.dev_console_enabled {
-                    this.toggle_dev_console(cx);
-                }
-            }))
-            .child(self.render_titlebar(active_name, cx))
+            .text_color(cx.theme().foreground);
+        let root = self.attach_workspace_actions(root, cx);
+        root.child(self.render_titlebar(active_name, cx))
             .child(div().flex_1().min_h_0().flex().child(outer))
             .children(
                 self.show_settings
@@ -19009,6 +19973,39 @@ impl Render for MuxelApp {
                     .is_some()
                     .then(|| self.render_confirm_modal(cx)),
             )
+            // Fullscreen with the sidebar hidden: a floating left-edge pill
+            // brings it back without leaving fullscreen (F11's escape hatch).
+            .children((window.is_fullscreen() && sidebar_hidden).then(|| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(26.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .py_2()
+                            .bg(cx.theme().sidebar)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded_r(cx.theme().radius)
+                            .shadow_md()
+                            .child(
+                                Button::new("fullscreen-reveal-sidebar")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ChevronRight)
+                                    .tooltip(t("Show sidebar"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.fullscreen_sidebar_revealed = true;
+                                        this.sidebar_collapsed = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+            }))
             // No toast layer: all notifications go to the sidebar feed instead.
             .into_any_element()
     }

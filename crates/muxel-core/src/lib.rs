@@ -42,6 +42,10 @@ pub enum InstanceKind {
     /// A read-only git-diff pane. `editor_path` holds the directory to diff
     /// (the agent's worktree, or the project root).
     Diff,
+    /// An embedded web-browser pane (`browser_url` holds the current URL).
+    /// Only macOS/Windows render these embedded; Linux opens links in a
+    /// separate browser window instead.
+    Browser,
 }
 
 /// A single agent/terminal instance's persistent metadata. The live terminal
@@ -57,6 +61,9 @@ pub struct Instance {
     /// For editor panes: the file on disk (None = an unsaved "Untitled" buffer).
     #[serde(default)]
     pub editor_path: Option<PathBuf>,
+    /// For browser panes: the current URL (kept fresh so a restart restores it).
+    #[serde(default)]
+    pub browser_url: Option<String>,
     /// User-assigned name, shown as "{custom} — {app title}" when set.
     #[serde(default)]
     pub custom_name: Option<String>,
@@ -139,6 +146,7 @@ impl Instance {
             title: preset.name.clone(),
             kind: InstanceKind::Terminal,
             editor_path: None,
+            browser_url: None,
             custom_name: None,
             program: preset.program.clone(),
             args: preset.compose_args(),
@@ -174,6 +182,16 @@ impl Instance {
         }
     }
 
+    /// Create an embedded-browser instance showing `url`.
+    pub fn browser(project_id: Uuid, url: String) -> Self {
+        Self {
+            kind: InstanceKind::Browser,
+            browser_url: Some(url),
+            title: "Browser".to_string(),
+            ..Self::editor(project_id, None)
+        }
+    }
+
     /// Create an editor instance for an optional file path (None = Untitled).
     pub fn editor(project_id: Uuid, path: Option<PathBuf>) -> Self {
         let title = path
@@ -187,6 +205,7 @@ impl Instance {
             title,
             kind: InstanceKind::Editor,
             editor_path: path,
+            browser_url: None,
             custom_name: None,
             program: None,
             args: Vec::new(),
@@ -460,6 +479,22 @@ pub struct Workspace {
     /// Named git worktrees, referenced by instances via `Instance.worktree_id`.
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
+    /// Projects pinned to their own full muxel window (project id → monitor +
+    /// last geometry): reopened there when the workspace loads. A missing
+    /// monitor leaves the project in the main window (pin kept).
+    #[serde(default)]
+    pub project_windows: std::collections::HashMap<Uuid, ProjectWindow>,
+}
+
+/// Where a project's dedicated window lives: which monitor (stable UUID) and
+/// the exact window geometry to restore it with.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ProjectWindow {
+    /// The display's stable UUID.
+    pub display: Uuid,
+    /// The window's last position/size on that display (global coordinates).
+    #[serde(default)]
+    pub geom: Option<WindowGeom>,
 }
 
 impl Workspace {
@@ -956,6 +991,11 @@ pub struct Settings {
     pub default_use_worktree: bool,
     #[serde(default = "default_true")]
     pub notifications_enabled: bool,
+    /// Open ctrl+clicked terminal links in the built-in browser (an embedded
+    /// pane on macOS/Windows, a separate muxel-managed window on Linux). Off →
+    /// links open in the system default browser.
+    #[serde(default = "default_true")]
+    pub browser_enabled: bool,
     /// Close a pane automatically when its process exits.
     #[serde(default = "default_true")]
     pub close_on_exit: bool,
@@ -1092,6 +1132,7 @@ impl Default for Settings {
             default_use_tmux: false,
             default_use_worktree: false,
             notifications_enabled: true,
+            browser_enabled: true,
             close_on_exit: true,
             confirm_close_terminal: true,
             confirm_close_editor: false,

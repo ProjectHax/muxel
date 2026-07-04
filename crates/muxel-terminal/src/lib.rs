@@ -19,4 +19,4 @@ mod view;
 
 pub use colors::TerminalPalette;
 pub use session::{CommandSpec, PtyChunk, TerminalSession};
-pub use view::{AgentStatus, TerminalLaunch, TerminalMouseMode, TerminalView};
+pub use view::{AgentStatus, OpenLink, TerminalLaunch, TerminalMouseMode, TerminalView};
