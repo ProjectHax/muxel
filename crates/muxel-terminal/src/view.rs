@@ -22,6 +22,14 @@ const MAX_BYTES_PER_TURN: usize = 256 * 1024;
 /// jamming against it.
 const TERM_INSET: Pixels = px(6.0);
 
+/// Open a link the user ctrl+clicked in a terminal — an `http(s)://` URL or a
+/// `file://` URI for an existing local file. Dispatched by the terminal element
+/// and handled by the app, which routes URLs to the built-in browser (when
+/// enabled) or the OS.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = terminal, no_json)]
+pub struct OpenLink(pub String);
+
 /// Lifecycle state of a terminal/agent, shown as a badge. Inferred from the
 /// agent's TUI (per-agent markers), the bell, output activity, and process exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

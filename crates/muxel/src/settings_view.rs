@@ -53,6 +53,8 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("ToggleBroadcast", "ctrl-shift-i", None),
     // Toggle the toolbar's "new agents get a git worktree" switch.
     ("ToggleWorktree", "ctrl-shift-g", None),
+    // OS fullscreen; the sidebar hides until revealed or fullscreen exits.
+    ("ToggleFullScreen", "f11", None),
     ("ToggleDevConsole", "f12", None),
     ("SaveFile", "ctrl-s", None),
     ("SaveFileAs", "ctrl-shift-s", None),

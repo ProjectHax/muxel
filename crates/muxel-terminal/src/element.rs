@@ -225,10 +225,13 @@ impl Element for TerminalElement {
         let track_top = f32::from(bounds.origin.y);
         let track_h = f32::from(bounds.size.height);
 
-        // ---- Ctrl/Cmd+click: open a URL under the cursor ----
+        // ---- Ctrl/Cmd+click: open the link (OSC 8 / URL / file path) under the
+        // cursor. Dispatched as an action so the app decides where it opens
+        // (built-in browser vs the OS).
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
+            let focus = self.focus_handle.clone();
             window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble
                     || e.button != MouseButton::Left
@@ -239,24 +242,52 @@ impl Element for TerminalElement {
                 if !hitbox.is_hovered(window) {
                     return;
                 }
-                let url = session.with_term(|term| {
-                    let off = term.grid().display_offset() as i32;
-                    let (point, _side) = grid_point(
+                if let Some(link) = link_at(
+                    &session,
+                    e.position - origin,
+                    cell_width,
+                    line_height,
+                    cols,
+                    rows,
+                ) {
+                    focus.dispatch_action(&crate::view::OpenLink(link.url), window, cx);
+                }
+            });
+        }
+        // ---- Ctrl/Cmd+hover: underline the link under the cursor ----
+        {
+            let session = self.session.clone();
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let link = if e.modifiers.secondary()
+                    && e.pressed_button.is_none()
+                    && hitbox.is_hovered(window)
+                {
+                    link_at(
+                        &session,
                         e.position - origin,
                         cell_width,
                         line_height,
                         cols,
                         rows,
-                        off,
-                    );
-                    let grid = term.grid();
-                    let chars: Vec<char> = (0..grid.columns())
-                        .map(|c| grid[GridPoint::new(point.line, Column(c))].c)
-                        .collect();
-                    crate::links::find_url_at(&chars, point.column.0)
-                });
-                if let Some(url) = url {
-                    cx.open_url(&url);
+                    )
+                } else {
+                    None
+                };
+                if session.set_hovered_link(link) {
+                    window.refresh();
+                }
+            });
+        }
+        // Releasing ctrl/cmd drops the underline without waiting for a mouse move.
+        {
+            let session = self.session.clone();
+            window.on_modifiers_changed(move |e: &ModifiersChangedEvent, window, _cx| {
+                if !e.modifiers.secondary() && session.set_hovered_link(None) {
+                    window.refresh();
                 }
             });
         }
@@ -455,6 +486,8 @@ impl Element for TerminalElement {
 
         let scrollbar_dragging = self.session.scrollbar_grab().is_some();
         let search_needle = self.session.search_needle();
+        let hovered_link = self.session.hovered_link();
+        let link_hitbox = hitbox.clone();
         self.session.with_term(|term| {
             let grid = term.grid();
             let screen_lines = grid.screen_lines();
@@ -690,6 +723,23 @@ impl Element for TerminalElement {
             for rect in &search_rects {
                 rect.paint(origin, cell_width, line_height, window);
             }
+            // Ctrl-hover link: a thin underline over the hovered span + a
+            // pointing-hand cursor (the span is in buffer coordinates, so it
+            // stays glued to its text while the history scrolls).
+            if let Some(link) = hovered_link.as_ref() {
+                let visual = link.line + display_offset;
+                if visual >= 0 && visual < screen_lines as i32 {
+                    let x = px((f32::from(origin.x) + link.start as f32 * cell_w).floor());
+                    let y =
+                        px((f32::from(origin.y) + (visual as f32 + 1.0) * line_h - 2.0).floor());
+                    let w = px((cell_w * (link.end - link.start) as f32).ceil());
+                    window.paint_quad(fill(
+                        Bounds::new(point(x, y), size(w, px(1.5))),
+                        hsla(0.58, 0.9, 0.62, 0.95),
+                    ));
+                }
+                window.set_cursor_style(CursorStyle::PointingHand, &link_hitbox);
+            }
             for run in &runs {
                 run.paint(origin, cell_width, line_height, font_size, window, cx);
             }
@@ -785,6 +835,81 @@ fn apply_scrollbar_drag(session: &TerminalSession, track_h: f32, cursor_y: f32, 
     let frac = thumb_top / denom; // 0 top .. 1 bottom
     let offset = ((1.0 - frac) * history as f32).round() as usize;
     session.set_display_offset(offset.min(history));
+}
+
+/// The clickable link under a pixel position (relative to the terminal origin):
+/// an OSC 8 hyperlink on the cell (highest priority), an `http(s)` URL in the
+/// line text, or a file path that resolves to an existing local file (relative
+/// paths resolve against the session's spawn cwd — remote panes have none, so
+/// their paths never match).
+fn link_at(
+    session: &TerminalSession,
+    local: Point<Pixels>,
+    cell_width: Pixels,
+    line_height: Pixels,
+    cols: u16,
+    rows: u16,
+) -> Option<crate::session::HoveredLink> {
+    use crate::session::HoveredLink;
+    session.with_term(|term| {
+        let grid = term.grid();
+        let off = grid.display_offset() as i32;
+        let (point, _side) = grid_point(local, cell_width, line_height, cols, rows, off);
+        let columns = grid.columns();
+
+        // OSC 8 hyperlink: underline the contiguous run of cells carrying the
+        // same URI (the hyperlink id/uri, not the visible text, is the link).
+        if let Some(link) = grid[point].hyperlink() {
+            let uri = link.uri().to_string();
+            let same = |c: usize| {
+                grid[GridPoint::new(point.line, Column(c))]
+                    .hyperlink()
+                    .is_some_and(|h| h.uri() == uri)
+            };
+            let mut start = point.column.0;
+            while start > 0 && same(start - 1) {
+                start -= 1;
+            }
+            let mut end = point.column.0 + 1;
+            while end < columns && same(end) {
+                end += 1;
+            }
+            return Some(HoveredLink {
+                line: point.line.0,
+                start,
+                end,
+                url: uri,
+            });
+        }
+
+        let chars: Vec<char> = (0..columns)
+            .map(|c| grid[GridPoint::new(point.line, Column(c))].c)
+            .collect();
+        if let Some((start, end, url)) = crate::links::url_span_at(&chars, point.column.0) {
+            return Some(HoveredLink {
+                line: point.line.0,
+                start,
+                end,
+                url,
+            });
+        }
+        if let Some((start, end, raw)) = crate::links::path_span_at(&chars, point.column.0) {
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(std::path::PathBuf::from);
+            if let Some(abs) = crate::links::resolve_path(&raw, session.cwd(), home.as_deref())
+                && abs.exists()
+            {
+                return Some(HoveredLink {
+                    line: point.line.0,
+                    start,
+                    end,
+                    url: crate::links::file_uri(&abs),
+                });
+            }
+        }
+        None
+    })
 }
 
 /// Map a pixel position (relative to the terminal origin) to a grid point +

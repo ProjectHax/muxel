@@ -183,6 +183,20 @@ feature is added or changed, update the matching entry here in the same change**
   loop…" to create one. Schedules survive restarts (a daily-at whose time passed
   while closed fires once on next launch). Loops fire only while muxel is running.
 
+## Built-in browser
+
+- **System webview, not bundled Chromium** — preview links agents print (or a
+  locally hosted dev site) without leaving muxel. Uses the OS engine (WKWebView on
+  macOS, WebView2 on Windows, WebKitGTK on Linux), so it's light on disk and memory.
+- **macOS/Windows: an embedded pane** — ctrl+click a URL and it opens as a browser
+  pane beside the terminal, with an address bar, Back, and Reload; the URL persists
+  and restores with the workspace.
+- **Linux: a separate browser window** — gpui can't embed WebKitGTK, so links open
+  in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
+  if WebKit isn't installed it falls back to the system browser with a note.
+- **Optional** — Settings → Behavior → "Open ctrl+clicked links in the built-in
+  browser" (default on); off routes every link to the system browser.
+
 ## Notifications
 
 - **Desktop notifications** — fired when an agent finishes a turn or needs attention
@@ -229,7 +243,12 @@ feature is added or changed, update the matching entry here in the same change**
 - **Scrollback search** — `Ctrl+Shift+F` (while a terminal is focused) opens a
   search bar that highlights matches and jumps through them (Enter / ↑ / ↓),
   scanning the full history.
-- **Clickable URLs** — `Ctrl`/`Cmd`+click opens an `http(s)` URL under the cursor.
+- **Clickable links** — `Ctrl`/`Cmd`+click opens what's under the cursor: an
+  `http(s)` URL, an OSC 8 hyperlink (e.g. `ls --hyperlink`), or a **file path**
+  (absolute, `~/`, or relative to the pane's working directory — opened with the
+  system default app; only paths that actually exist are clickable, and a
+  trailing `:line:col` is understood). `Ctrl`/`Cmd`+hover underlines the link and
+  shows a pointing-hand cursor.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can
@@ -313,6 +332,20 @@ feature is added or changed, update the matching entry here in the same change**
   from the sidebar.
 - **Instance names** — custom names with inline rename and right-click menus.
 - **Resizable sidebar** — drag to resize (up to half the window); width persists.
+- **Fullscreen mode** — `F11` (rebindable) toggles OS fullscreen with the sidebar
+  fully hidden. A floating pill at the left edge brings the sidebar back without
+  leaving fullscreen; `F11` again exits and restores the previous sidebar state.
+- **Multi-monitor** — right-click a project → **Open on display N** to give it a
+  full muxel window (sidebar + toolbar + panes) on that monitor; switch projects
+  and panes there like in the main window. One window per project: selecting a
+  project that's open elsewhere **raises** its window instead of stealing it.
+  Every project window's monitor + exact position/size is saved **in the
+  workspace**, so reopening the workspace restores each window right where it
+  was — dragging a window to another monitor updates its pin, and a
+  disconnected monitor keeps the pin for when it returns. **Bring back to
+  main window** or closing the window returns the project. Heavy chrome
+  (settings, command palette, dialogs, notification feed) stays in the main
+  window, which is raised automatically when needed.
 - **No auto-created project** — start empty; add projects via a folder picker.
 - **Startup agents** — save the project's open agents as a startup set (preset +
   worktree flag) and relaunch them in one click from the project menu.

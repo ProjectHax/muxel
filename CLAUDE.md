@@ -52,6 +52,10 @@ you change those Rust contracts, update the matching Swift port. See `ios/README
   `cx.listener(|this, ev, window, cx| …)`; the terminal is a custom `Element`
   (manual layout/paint). Mouse `on_drag_move` fires for all listeners — guard with
   `ev.bounds.contains(&ev.event.position)`.
+- **Native webview overlay rule** — browser panes (`browser.rs`) are native child
+  windows that draw ABOVE all gpui content. `MuxelApp::any_overlay_open` must list
+  **every** modal/palette/menu/drag flag; when you add a new overlay, add its flag
+  there or the webview will float over it.
 
 ## Building & testing a feature
 

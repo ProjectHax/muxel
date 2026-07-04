@@ -141,6 +141,20 @@ struct ResizeState {
     since: Instant,
 }
 
+/// A clickable link the pointer is ctrl-hovering: a span of columns on one
+/// buffer line (negative = history, so the underline scrolls with the content)
+/// plus the URI a click would open.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HoveredLink {
+    /// Buffer line (alacritty `Line` coordinate; negative = scrollback).
+    pub line: i32,
+    /// Column span `[start, end)` on that line.
+    pub start: usize,
+    pub end: usize,
+    /// What a click opens: an `http(s)://` URL or a `file://` URI.
+    pub url: String,
+}
+
 pub struct TerminalSession {
     pub id: Uuid,
     term: Arc<Mutex<Term<MuxelListener>>>,
@@ -173,6 +187,13 @@ pub struct TerminalSession {
     /// Active search needle (lowercased not required — matching is ASCII-insensitive).
     /// Empty = no search; the element highlights matches of this each paint.
     search: Mutex<Vec<char>>,
+    /// The local working directory the child was spawned in — the base for
+    /// resolving relative file paths on ctrl+click. Remote panes run `ssh`
+    /// locally with no cwd set, so their relative paths stay unresolvable.
+    cwd: Option<std::path::PathBuf>,
+    /// The link span under a ctrl+hover, if any; the element paints an underline
+    /// over it and shows a pointing-hand cursor (mirrors the `search` pattern).
+    hovered_link: Mutex<Option<HoveredLink>>,
     /// When output was last processed (for idle/status detection).
     last_output: Mutex<Instant>,
     /// Whether the child has produced any output yet (vs. still starting up).
@@ -205,6 +226,8 @@ impl TerminalSession {
         for arg in &spec.args {
             builder.arg(arg);
         }
+        // Remembered for resolving relative file paths on ctrl+click.
+        let cwd = spec.cwd.as_ref().map(std::path::PathBuf::from);
         if let Some(cwd) = &spec.cwd {
             builder.cwd(cwd);
         }
@@ -282,6 +305,8 @@ impl TerminalSession {
                 since: Instant::now(),
             }),
             search: Mutex::new(Vec::new()),
+            cwd,
+            hovered_link: Mutex::new(None),
             last_output: Mutex::new(Instant::now()),
             output_seen: AtomicBool::new(false),
             _reader: reader_handle,
@@ -466,6 +491,27 @@ impl TerminalSession {
     /// The current search needle (chars), for the element to highlight.
     pub(crate) fn search_needle(&self) -> Vec<char> {
         self.search.lock().clone()
+    }
+
+    /// The local working directory the child was spawned in, if any.
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.cwd.as_deref()
+    }
+
+    /// The ctrl-hovered link span, if any (painted as an underline).
+    pub(crate) fn hovered_link(&self) -> Option<HoveredLink> {
+        self.hovered_link.lock().clone()
+    }
+
+    /// Replace the hovered-link state; returns whether it actually changed (so
+    /// callers only repaint on transitions, not every mouse move).
+    pub(crate) fn set_hovered_link(&self, link: Option<HoveredLink>) -> bool {
+        let mut cur = self.hovered_link.lock();
+        if *cur == link {
+            return false;
+        }
+        *cur = link;
+        true
     }
 
     /// Buffer-line indices (negative = history) containing `needle`

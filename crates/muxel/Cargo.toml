@@ -48,6 +48,23 @@ keyring = { version = "3", features = [
     "crypto-rust",
 ] }
 
+# --- Built-in browser (system webview via wry; no bundled Chromium) ---
+# macOS/Windows: an embedded in-pane webview via gpui-component's gpui-wry
+# (WKWebView / WebView2 as a native child of the gpui window). Pinned to the
+# same gpui-component rev so the `gpui` types unify.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "e416af7f4dad861f251d357b6aa677dbc13a500e" }
+# For handing gpui's native window to wry's build_as_child.
+raw-window-handle = "0.6"
+
+# Linux: gpui can't host a WebKitGTK child (no GTK loop; XEmbed is X11-only), so
+# the browser is a separate muxel-managed window: `muxel --browser <url>` runs a
+# WebKitGTK window via wry + gtk (see browser_helper.rs). lb-wry is the same wry
+# lineage gpui-wry uses; gtk 0.18 is the matching gtk-rs release.
+[target.'cfg(target_os = "linux")'.dependencies]
+wry = { version = "0.53.3", package = "lb-wry" }
+gtk = "0.18"
+
 # Embeds the .exe icon (see build.rs); Windows build-host only, so it never
 # affects the Linux/macOS builds.
 [target.'cfg(windows)'.build-dependencies]
