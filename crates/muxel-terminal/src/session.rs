@@ -26,8 +26,14 @@ use uuid::Uuid;
 pub enum PtyChunk {
     /// Raw bytes read from the PTY.
     Output(Vec<u8>),
-    /// The child exited (or the PTY closed). Carries an exit code when known.
-    Exit(Option<i32>),
+    /// The child exited (or the PTY closed).
+    Exit {
+        /// Exit code, when the OS reported one within the harvest window.
+        code: Option<i32>,
+        /// Set when the session ended on a PTY read *error* rather than a clean
+        /// EOF — the child may not have exited at all (kept for diagnostics).
+        read_error: Option<String>,
+    },
 }
 
 /// What to run in a terminal.
@@ -785,22 +791,39 @@ fn read_loop(
     tx: async_channel::Sender<PtyChunk>,
 ) {
     let mut buf = [0u8; 65536];
+    // Only a clean EOF or a real error ends the session. EINTR is a signal
+    // interruption, not an exit — retrying it keeps a healthy pane from being
+    // torn down. Any other error is recorded so the app can log/show it.
+    let mut read_error: Option<String> = None;
+    let mut ui_gone = false;
     loop {
         match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break, // EOF or PTY error → child is (probably) gone
+            Ok(0) => break, // EOF → every slave fd closed; child is (probably) gone
             Ok(n) => {
                 if tx
                     .send_blocking(PtyChunk::Output(buf[..n].to_vec()))
                     .is_err()
                 {
-                    return; // receiver dropped — UI is gone
+                    // Receiver dropped — UI is gone. Still fall through to reap
+                    // the child, or it lingers as a zombie.
+                    ui_gone = true;
+                    break;
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                log::warn!("pty read failed (treating as session end): {e}");
+                read_error = Some(format!("{:?}: {e}", e.kind()));
+                break;
             }
         }
     }
-    // Bounded poll for the exit status: a daemonized child that closed the PTY
-    // but lives on must not wedge this thread. None after the window (or on a
-    // wait error) simply reports an unknown code.
+    // The reader's master-fd dup is no longer needed; free it before the
+    // (potentially long) reap below so closed sessions don't hold PTYs open.
+    drop(reader);
+    // Fast bounded poll for the exit status, so a prompt exit reports its code
+    // with the Exit event. None after the window means the code is unknown *so
+    // far* (e.g. the PTY closed before the process finished dying).
     let mut code = None;
     for _ in 0..20 {
         match child.try_wait() {
@@ -812,7 +835,18 @@ fn read_loop(
             Err(_) => break,
         }
     }
-    let _ = tx.send_blocking(PtyChunk::Exit(code));
+    if !ui_gone {
+        let _ = tx.send_blocking(PtyChunk::Exit { code, read_error });
+    }
+    // Keep waiting until the child is actually reaped. A child that outlives
+    // its PTY (daemonized, or slow to die after a kill) parks this thread at a
+    // 1s cadence instead of leaving a permanent zombie when it finally exits;
+    // the thread costs nothing while sleeping and dies with the process.
+    if code.is_none() {
+        while let Ok(None) = child.try_wait() {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -903,7 +937,7 @@ mod tests {
         loop {
             match rx.recv_blocking() {
                 Ok(PtyChunk::Output(bytes)) => session.process_output(&bytes),
-                Ok(PtyChunk::Exit(_)) => break,
+                Ok(PtyChunk::Exit { .. }) => break,
                 Err(_) => break,
             }
             if Instant::now() > deadline {
@@ -948,7 +982,7 @@ mod tests {
         loop {
             match rx.recv_blocking() {
                 Ok(PtyChunk::Output(bytes)) => session.process_output(&bytes),
-                Ok(PtyChunk::Exit(_)) => break,
+                Ok(PtyChunk::Exit { .. }) => break,
                 Err(_) => break,
             }
             if Instant::now() > deadline {
@@ -1000,7 +1034,7 @@ mod tests {
                         seen = true;
                     }
                 }
-                Ok(PtyChunk::Exit(_)) | Err(_) => break,
+                Ok(PtyChunk::Exit { .. }) | Err(_) => break,
             }
         }
         session.kill();
@@ -1042,7 +1076,7 @@ mod tests {
                         return true;
                     }
                 }
-                Ok(PtyChunk::Exit(_)) => return false,
+                Ok(PtyChunk::Exit { .. }) => return false,
                 Err(async_channel::TryRecvError::Empty) => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -1108,8 +1142,9 @@ mod tests {
             );
             match rx.try_recv() {
                 Ok(PtyChunk::Output(_)) => {}
-                Ok(PtyChunk::Exit(code)) => {
+                Ok(PtyChunk::Exit { code, read_error }) => {
                     assert_eq!(code, Some(7));
+                    assert_eq!(read_error, None, "a normal exit is a clean EOF");
                     break;
                 }
                 Err(async_channel::TryRecvError::Empty) => {
@@ -1120,6 +1155,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Closing a pane drops the UI receiver, and the kill may land while output
+    /// is still in flight. The reader must reap the child anyway — it used to
+    /// bail out on the failed send without waiting, leaving a permanent zombie
+    /// (and its exit code unharvested) for every close with pending output.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_is_reaped_after_receiver_drop() {
+        let (session, rx) =
+            TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 80, 24)
+                .expect("spawn");
+        let pid = session.child_pid.expect("child pid");
+        // UI gone first; then trigger output so the reader hits the dead channel.
+        drop(rx);
+        session.write_input(b"ping\n");
+        std::thread::sleep(Duration::from_millis(100));
+        session.kill();
+        let proc_dir = format!("/proc/{pid}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if !std::path::Path::new(&proc_dir).exists() {
+                return; // reaped — pid fully gone
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let stat = std::fs::read_to_string(format!("{proc_dir}/stat")).unwrap_or_default();
+        panic!("child was never reaped; /proc stat: {stat:?}");
     }
 
     #[test]

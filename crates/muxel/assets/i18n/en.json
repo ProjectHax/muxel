@@ -511,5 +511,18 @@
   "“{name}” will be {verb}.": "“{name}” will be {verb}.",
   "→ {n} agent": "→ {n} agent",
   "→ {n} agents": "→ {n} agents",
-  "＋ Create {name}": "＋ Create {name}"
+  "＋ Create {name}": "＋ Create {name}",
+  "process ended — terminal read failed": "process ended — terminal read failed",
+  "process exited": "process exited",
+  "process exited — code {code}": "process exited — code {code}",
+  "process exited — code unknown": "process exited — code unknown",
+  "Restart to relaunch": "Restart to relaunch",
+  "Close a pane when its process exits cleanly (a crash leaves the pane open)": "Close a pane when its process exits cleanly (a crash leaves the pane open)",
+  "{title}: process exited unexpectedly": "{title}: process exited unexpectedly",
+  "{title} exited unexpectedly": "{title} exited unexpectedly",
+  "terminal read failed: {err}": "terminal read failed: {err}",
+  "exit code {code}": "exit code {code}",
+  "exit code unknown": "exit code unknown",
+  "{title}: closed on exit": "{title}: closed on exit",
+  "The process exited cleanly.": "The process exited cleanly."
 }

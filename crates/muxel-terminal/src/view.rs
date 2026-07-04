@@ -133,6 +133,9 @@ pub struct TerminalView {
     /// The child's exit code once it has exited (`None` = still running or the
     /// code wasn't reported by the OS/PTY).
     exit_code: Option<i32>,
+    /// Set when the session ended on a PTY read error rather than a clean EOF —
+    /// the child may still have been healthy (see `PtyChunk::Exit`).
+    exit_read_error: Option<String>,
     /// Error from a failed launch (e.g. the agent program isn't on PATH), captured
     /// for the dev console. `None` when the program launched fine.
     launch_error: Option<String>,
@@ -312,17 +315,17 @@ impl TerminalView {
                 };
 
                 let mut output: Vec<u8> = Vec::new();
-                let mut exit: Option<Option<i32>> = None;
+                let mut exit: Option<(Option<i32>, Option<String>)> = None;
                 match chunk {
                     PtyChunk::Output(b) => output.extend_from_slice(&b),
-                    PtyChunk::Exit(c) => exit = Some(c),
+                    PtyChunk::Exit { code, read_error } => exit = Some((code, read_error)),
                 }
                 // Coalesce whatever else is already buffered.
                 while let Ok(more) = rx.try_recv() {
                     match more {
                         PtyChunk::Output(b) => output.extend_from_slice(&b),
-                        PtyChunk::Exit(c) => {
-                            exit = Some(c);
+                        PtyChunk::Exit { code, read_error } => {
+                            exit = Some((code, read_error));
                             break;
                         }
                     }
@@ -341,12 +344,14 @@ impl TerminalView {
                                 write_clipboard(ty, text, cx);
                             }
                         }
-                        if let Some(code) = exit {
+                        let stop = exit.is_some();
+                        if let Some((code, read_error)) = exit.take() {
                             view.exited = true;
                             view.exit_code = code;
+                            view.exit_read_error = read_error;
                         }
                         cx.notify();
-                        exit.is_some()
+                        stop
                     })
                     .unwrap_or(true);
                 if stop {
@@ -364,6 +369,7 @@ impl TerminalView {
             mouse_mode: TerminalMouseMode::default(),
             exited: false,
             exit_code: None,
+            exit_read_error: None,
             launch_error,
             working_markers,
             blocked_markers,
@@ -385,6 +391,12 @@ impl TerminalView {
     /// while running or when the code is unknown (e.g. a bare PTY close).
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    /// The PTY read error that ended the session, when it wasn't a clean EOF.
+    /// The child may not have exited at all — surfaced for diagnostics.
+    pub fn exit_read_error(&self) -> Option<&str> {
+        self.exit_read_error.as_deref()
     }
 
     /// The error from a failed launch (program not on PATH, etc.), for the dev

@@ -133,6 +133,51 @@ pub fn save_workspace_to(path: &Path, workspace: &Workspace) -> Result<()> {
     Ok(())
 }
 
+/// Path to the append-only event log (pane exits, closes, recoveries). The GUI
+/// often runs with stderr discarded (AppImage/desktop launch), so lifecycle
+/// events that matter after the fact are recorded here.
+pub fn event_log_path() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("muxel.log"))
+}
+
+/// Rotation threshold for the event log: past this size it is renamed to
+/// `muxel.log.1` (replacing the previous rotation) and a fresh file starts.
+const EVENT_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Append a timestamped line to the event log at the default location.
+/// Best-effort by design: diagnostics must never break the app, so failures
+/// are ignored (there is nowhere better to report them).
+pub fn append_event_log(line: &str) {
+    if let Some(path) = event_log_path() {
+        let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z");
+        let _ = append_event_log_to(&path, &format!("{stamp} {line}"));
+    }
+}
+
+/// Append one line to the log at `path`, rotating first when it has grown past
+/// [`EVENT_LOG_MAX_BYTES`].
+pub fn append_event_log_to(path: &Path, line: &str) -> Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating log dir {}", parent.display()))?;
+    }
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() >= EVENT_LOG_MAX_BYTES
+    {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        let _ = std::fs::rename(path, PathBuf::from(rotated));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    writeln!(file, "{line}").with_context(|| format!("appending to {}", path.display()))?;
+    Ok(())
+}
+
 /// Path to the persisted main-window geometry.
 pub fn window_geom_path() -> Option<PathBuf> {
     data_dir().map(|d| d.join("window.json"))
@@ -612,5 +657,28 @@ mod tests {
         // Re-running is idempotent (index already exists).
         assert_eq!(migrate_workspaces_at(&base).workspaces[0].id, id);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn event_log_appends_and_rotates() {
+        let dir = std::env::temp_dir().join("muxel-store-test-eventlog");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("muxel.log");
+
+        append_event_log_to(&path, "first").expect("append creates the file");
+        append_event_log_to(&path, "second").expect("append");
+        let text = std::fs::read_to_string(&path).expect("read log");
+        assert_eq!(text, "first\nsecond\n");
+
+        // Grow past the rotation threshold: the next append moves the old file
+        // to `.1` and starts fresh.
+        std::fs::write(&path, "x".repeat(EVENT_LOG_MAX_BYTES as usize)).expect("grow");
+        append_event_log_to(&path, "fresh").expect("append after rotation");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "fresh\n");
+        let rotated =
+            std::fs::read_to_string(dir.join("muxel.log.1")).expect("rotated file exists");
+        assert!(rotated.starts_with('x'));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

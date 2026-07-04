@@ -985,6 +985,9 @@ pub struct MuxelApp {
     dev_console_window: Option<WindowHandle<gpui_component::Root>>,
     /// Last seen status per instance, to fire notifications on transitions.
     last_status: HashMap<Uuid, AgentStatus>,
+    /// Instances whose process exit has already been logged/flagged, so `tick`
+    /// records each exit exactly once. Cleared on respawn.
+    exit_logged: HashSet<Uuid>,
     /// System-tray handle (when `minimize_to_tray` is on and a tray is available).
     tray: Option<muxel_tray::TrayController>,
     /// Last tray menu we pushed, so we only update on change.
@@ -2674,6 +2677,7 @@ impl MuxelApp {
             dev_log: Vec::new(),
             dev_console_window: None,
             last_status: HashMap::new(),
+            exit_logged: HashSet::new(),
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
             terminal_launches: HashMap::new(),
@@ -3112,6 +3116,8 @@ impl MuxelApp {
 
     /// Spawn (or replace) the live terminal for an instance id.
     fn spawn_terminal(&mut self, instance_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        // A respawn replaces any exited view; its next exit is a fresh event.
+        self.exit_logged.remove(&instance_id);
         // A remote password host with no saved/session password: prompt for it
         // first (storing it in memory), then this spawn is retried via
         // `ensure_project_terminals`. Avoids `sshpass -e` with an empty $SSHPASS.
@@ -4667,8 +4673,17 @@ impl MuxelApp {
         // A `--resume` launch has this long to prove its saved session is valid;
         // past that we stop watching it for recovery signals.
         const RECOVER_WITHIN_SECS: u64 = 10;
-        // (iid, status, exited, exit_code, title, project, resume_error)
-        type Snap = (Uuid, AgentStatus, bool, Option<i32>, String, String, bool);
+        // (iid, status, exited, exit_code, read_error, title, project, resume_error)
+        type Snap = (
+            Uuid,
+            AgentStatus,
+            bool,
+            Option<i32>,
+            Option<String>,
+            String,
+            String,
+            bool,
+        );
         let snapshot: Vec<Snap> = self
             .terminals
             .iter()
@@ -4677,6 +4692,7 @@ impl MuxelApp {
                 let status = v.status();
                 let exited = v.exited();
                 let exit_code = v.exit_code();
+                let read_error = v.exit_read_error().map(str::to_string);
                 // A resume launch whose saved session is gone may *hang* on the
                 // agent's "No conversation found …" error instead of exiting —
                 // detect it on screen (only while the resume launch is still fresh)
@@ -4699,6 +4715,7 @@ impl MuxelApp {
                     status,
                     exited,
                     exit_code,
+                    read_error,
                     title,
                     project,
                     resume_error,
@@ -4713,9 +4730,21 @@ impl MuxelApp {
         // tooltips: a repaint landing as the cursor leaves a button drops the
         // hover-out event, leaving the tooltip stuck until another one shows.
         let mut dirty = false;
-        for (iid, status, exited, exit_code, title, project, resume_error) in snapshot {
+        for (iid, status, exited, exit_code, read_error, title, project, resume_error) in snapshot {
             let changed = self.last_status.insert(iid, status) != Some(status);
             dirty |= changed;
+            // Record each process exit exactly once in the durable event log —
+            // the GUI often runs with stderr discarded, and an auto-closed pane
+            // leaves no other trace to debug "my pane vanished" from.
+            let newly_exited = exited && self.exit_logged.insert(iid);
+            if newly_exited {
+                let code = exit_code.map_or_else(|| "unknown".to_string(), |c| c.to_string());
+                let mut line = format!("exit: \"{title}\" [{project}] code={code}");
+                if let Some(err) = &read_error {
+                    line.push_str(&format!(" read_error=\"{err}\""));
+                }
+                muxel_store::append_event_log(&line);
+            }
             // A pane counts as attended only if it's active AND the window is
             // focused; otherwise its agent's bell/exit is worth recording.
             let attended = self.window_active && Some(iid) == focused;
@@ -4733,7 +4762,11 @@ impl MuxelApp {
                     // raising a desktop toast over the app you're already looking
                     // at; the in-app feed already records it.
                     if self.notifications_enabled && !self.window_active {
-                        notify(format!("{title} {}", kind.label()), project, Some(iid));
+                        notify(
+                            format!("{title} {}", kind.label()),
+                            project.clone(),
+                            Some(iid),
+                        );
                     }
                 }
             }
@@ -4752,10 +4785,35 @@ impl MuxelApp {
                     });
             if resume_error || exit_recover {
                 to_recover.push((iid, title));
-            } else if exited && self.settings.close_on_exit {
+            } else if exited && exit_code == Some(0) && self.settings.close_on_exit {
                 // Close-on-exit keys off the actual process exit, not the display
                 // state (Done also means "finished a turn" while still running).
-                to_close.push(iid);
+                // Only a *clean* exit qualifies: a crash (non-zero) or a bare PTY
+                // close (unknown code) must leave the pane up as evidence — auto-
+                // closing it silently destroys the instance and looks like the
+                // pane randomly vanished.
+                to_close.push((iid, title));
+            } else if newly_exited && exit_code != Some(0) {
+                // Abnormal exit: the pane stays as a tombstone; flag it in the
+                // feed (and as a desktop notification when unattended).
+                let detail = match (&read_error, exit_code) {
+                    (Some(err), _) => tf("terminal read failed: {err}", &[("err", err)]),
+                    (None, Some(code)) => tf("exit code {code}", &[("code", &code.to_string())]),
+                    (None, None) => t("exit code unknown").to_string(),
+                };
+                self.add_event(
+                    NotifKind::Error,
+                    tf("{title}: process exited unexpectedly", &[("title", &title)]),
+                    detail,
+                );
+                if self.notifications_enabled && !self.window_active {
+                    notify(
+                        tf("{title} exited unexpectedly", &[("title", &title)]),
+                        project,
+                        Some(iid),
+                    );
+                }
+                dirty = true;
             }
         }
         for (iid, title) in to_recover {
@@ -4773,8 +4831,15 @@ impl MuxelApp {
             );
             self.spawn_terminal(iid, window, cx);
         }
-        for iid in to_close {
+        for (iid, title) in to_close {
             self.terminal_launches.remove(&iid);
+            // Leave a trace in the feed — a pane that closes itself with no
+            // record anywhere reads as "my pane randomly disappeared".
+            self.add_event(
+                NotifKind::Success,
+                tf("{title}: closed on exit", &[("title", &title)]),
+                t("The process exited cleanly.").to_string(),
+            );
             // Auto-close on process exit: keep a remote tmux session alive (a
             // dropped SSH connection should be reconnectable, not torn down).
             self.close_instance_inner(iid, false, cx); // re-renders on its own
@@ -4782,6 +4847,7 @@ impl MuxelApp {
 
         let live: HashSet<Uuid> = self.terminals.keys().copied().collect();
         self.last_status.retain(|iid, _| live.contains(iid));
+        self.exit_logged.retain(|iid| live.contains(iid));
         // Sync remote projects' layouts to their hosts (change-detect + debounce).
         self.tick_remote_sync(cx);
         if dirty {
@@ -6368,6 +6434,16 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) {
         self.clear_notifications_for(iid);
+        // Durable trace of every close: with stderr often discarded, this log is
+        // what distinguishes "I closed it" from "it vanished" after the fact.
+        if let Some(inst) = self.workspace.instance(iid) {
+            let reason = if kill_remote_session {
+                "close"
+            } else {
+                "auto-close (exit)"
+            };
+            muxel_store::append_event_log(&format!("{reason}: \"{}\" [{iid}]", inst.title));
+        }
         let pid = self.workspace.instance(iid).map(|i| i.project_id);
         // If `iid` is one of several tabs in its pane, which tab survives as
         // active (so we can re-target focus there instead of jumping panes).
@@ -10262,7 +10338,59 @@ impl MuxelApp {
                 };
                 let is_active = pane_has_focus;
                 let content: AnyElement = if let Some(view) = self.terminals.get(&iid) {
-                    terminal_pane_element(view, cx)
+                    let v = view.read(cx);
+                    if v.exited() {
+                        // Tombstone: keep the final screen (crash output and
+                        // all) visible under an explicit banner, so a dead
+                        // process never masquerades as a live pane or a random
+                        // disappearance. The toolbar Restart respawns in place.
+                        let abnormal = v.exit_read_error().is_some() || v.exit_code() != Some(0);
+                        let label: SharedString = match (v.exit_read_error(), v.exit_code()) {
+                            (Some(_), _) => t("process ended — terminal read failed"),
+                            (None, Some(0)) => t("process exited"),
+                            (None, Some(code)) => tf(
+                                "process exited — code {code}",
+                                &[("code", &code.to_string())],
+                            )
+                            .into(),
+                            (None, None) => t("process exited — code unknown"),
+                        };
+                        let (bg, fg) = if abnormal {
+                            (cx.theme().danger.opacity(0.15), cx.theme().danger)
+                        } else {
+                            (cx.theme().muted.opacity(0.5), cx.theme().muted_foreground)
+                        };
+                        div()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .child(terminal_pane_element(view, cx)),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .justify_between()
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .bg(bg)
+                                    .text_color(fg)
+                                    .child(label)
+                                    .child(
+                                        div()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(t("Restart to relaunch")),
+                                    ),
+                            )
+                            .into_any_element()
+                    } else {
+                        terminal_pane_element(view, cx)
+                    }
                 } else if let Some(ed) = self.editors.get(&iid) {
                     // Clicking the editor makes it the active pane (so toolbar
                     // actions like Restart target it correctly).
@@ -16879,7 +17007,7 @@ impl MuxelApp {
                         .on_click(
                             cx.listener(|this, c: &bool, _w, cx| this.set_close_on_exit(*c, cx)),
                         ),
-                    &t("Close a pane when its process exits"),
+                    &t("Close a pane when its process exits cleanly (a crash leaves the pane open)"),
                 ),
             )
             .child(

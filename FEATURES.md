@@ -241,6 +241,15 @@ feature is added or changed, update the matching entry here in the same change**
 - **Exit codes** — a pane's child exit status is captured, so close-on-exit and
   session-resume recovery can tell a clean `exit` from a crash (a deliberate quit
   no longer triggers resume recovery).
+- **Crash tombstones** — a pane whose process dies abnormally (non-zero exit, or
+  the PTY failing outright) is never auto-closed: it keeps its final screen under
+  a "process exited — code N" banner, fires an error in the NOTIFICATIONS feed
+  (plus a desktop notification when unattended), and Restart relaunches in place.
+  Only a clean exit (code 0) qualifies for auto-close.
+- **Event log** — pane lifecycle events (every exit with its code, every close,
+  auto-closes, PTY read errors) are appended to `muxel.log` in the data dir
+  (rotated at 1 MB), so "why did this pane disappear?" is answerable even when
+  the app runs with stderr discarded.
 - **Content inset** — a small margin around the grid so a too-wide TUI truncates
   inside the pane rather than against the border.
 - **Key routing** — `Tab` / `Shift+Tab` go to the focused terminal rather than
@@ -417,7 +426,8 @@ feature is added or changed, update the matching entry here in the same change**
   (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, per-kind close confirmation (terminal on, editor/diff off by
-  default), and auto-close a pane when its process exits. The terminal
+  default), and auto-close a pane when its process exits **cleanly** (an
+  abnormal exit always leaves a tombstone pane instead). The terminal
   confirmation is skipped for an untouched **shell** pane — one sitting idle at
   its prompt with no foreground command and no other tabs — since closing it
   loses nothing.
