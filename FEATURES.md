@@ -422,6 +422,12 @@ feature is added or changed, update the matching entry here in the same change**
   then SSH into the machine, read that file, and bring up / drive the same panes —
   the desktop didn't need to be opened as a "remote" project. The shared
   `tmux_session` name keeps a pane addressing the same session from either side.
+- **Reconnect on failure** — when a remote project's SSH connection fails (or
+  drops), the pane area shows the error with **Reconnect** (re-runs the connect
+  pre-flight, re-syncs the layout, respawns panes) and **Scan for projects**
+  (opens the wizard preset to that host and scans it) buttons; both are also in
+  the project's right-click menu, so a live-but-flaky connection can be retried
+  without reselecting the project.
 - **Remote git** — the branch label and the project git menu (switch/new branch,
   commit, pull, push, fetch, stash) operate on the remote repo over the shared
   connection; remote status is polled off the UI thread.
@@ -464,6 +470,14 @@ feature is added or changed, update the matching entry here in the same change**
   confirmation is skipped for an untouched **shell** pane — one sitting idle at
   its prompt with no foreground command and no other tabs — since closing it
   loses nothing.
+- **tmux lifecycle** — closing a **pane** always kills its tmux session (local or
+  remote); a *dropped* SSH connection never auto-closes — it leaves a tombstone
+  pane, keeping the remote session reconnectable. Quitting the **app** leaves
+  sessions alive by design (they reattach next launch): when any exist, the quit
+  dialog offers two checkboxes — **Also kill local tmux sessions** and **Also
+  kill remote tmux sessions** — both off by default; the kills are
+  fire-and-forget (remote ones reuse the warm SSH connection), so quitting never
+  waits on a slow host.
 
 ## Localization
 

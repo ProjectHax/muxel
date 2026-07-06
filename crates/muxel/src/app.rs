@@ -399,9 +399,14 @@ pub fn register_actions(cx: &mut App) {
                 // screens (nothing running yet), or a second Cmd+Q while the
                 // confirm modal is already up — same as clicking its Quit button.
                 if this.show_terms || this.show_workspace_selector || this.show_quit_confirm {
+                    if this.show_quit_confirm {
+                        this.kill_checked_tmux_sessions();
+                    }
                     this.confirm_quit = true;
                     cx.quit();
                 } else {
+                    this.quit_kill_tmux_local = false;
+                    this.quit_kill_tmux_remote = false;
                     this.show_quit_confirm = true;
                     cx.notify();
                 }
@@ -953,6 +958,10 @@ pub struct MuxelApp {
     /// Cached branch names for the active project (the "Merge into…" picker),
     /// refreshed off the UI thread so the menu doesn't run `git branch` per frame.
     git_diff_branches: Vec<String>,
+    /// Remote projects whose last connect attempt failed (pid → error). Drives
+    /// the pane-area "Reconnect / Scan for projects" state; cleared on retry
+    /// and on a successful connect.
+    remote_connect_failed: HashMap<Uuid, String>,
     /// Guards against overlapping git-status refreshes for the panel.
     git_diff_loading: bool,
     /// The git-diff panel's commit-message input.
@@ -1095,6 +1104,11 @@ pub struct MuxelApp {
     pending_editor_redock: Vec<(Uuid, EditorSnapshot, RedockAnchor)>,
     /// Whether the "Quit?" confirmation modal is shown (close was intercepted).
     show_quit_confirm: bool,
+    /// Quit dialog: also kill muxel's LOCAL tmux sessions (off by default;
+    /// reset each time the dialog opens).
+    quit_kill_tmux_local: bool,
+    /// Quit dialog: also kill muxel's REMOTE (SSH) tmux sessions.
+    quit_kill_tmux_remote: bool,
     /// Whether the keyboard-shortcut cheat-sheet overlay is shown.
     show_keys: bool,
     /// Active terminal scrollback search (None = not searching).
@@ -2718,6 +2732,7 @@ impl MuxelApp {
             worktree_changes: HashMap::new(),
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
+            remote_connect_failed: HashMap::new(),
             remote_poll_count: 0,
             theme: settings.theme.clone(),
             theme_mode: settings.theme_mode.clone(),
@@ -2768,6 +2783,8 @@ impl MuxelApp {
             pending_editor_rebuild: Vec::new(),
             pending_editor_redock: Vec::new(),
             show_quit_confirm: false,
+            quit_kill_tmux_local: false,
+            quit_kill_tmux_remote: false,
             show_keys: false,
             term_search: None,
             term_search_input,
@@ -2887,6 +2904,8 @@ impl MuxelApp {
                             window.minimize_window();
                             return false;
                         }
+                        this.quit_kill_tmux_local = false;
+                        this.quit_kill_tmux_remote = false;
                         this.show_quit_confirm = true;
                         cx.notify();
                         false
@@ -3418,6 +3437,8 @@ impl MuxelApp {
                 self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
                 return;
             }
+            // A fresh attempt hides the failure state until it fails again.
+            self.remote_connect_failed.remove(&pid);
             // Pre-flight: verify login (and warm the ControlMaster) before opening.
             let control_path = Self::control_path_for(host.id);
             let password = self.remote_password(&host);
@@ -3442,6 +3463,7 @@ impl MuxelApp {
                     .await;
                 let _ = this.update_in(cx, |this, window, cx| match res {
                     Ok(()) => {
+                        this.remote_connect_failed.remove(&pid);
                         this.add_event(
                             NotifKind::Success,
                             tf("Connected to “{name}”", &[("name", &name.to_string())]),
@@ -3464,6 +3486,7 @@ impl MuxelApp {
                     }
                     Err(e) => {
                         let msg = format!("{e}");
+                        this.remote_connect_failed.insert(pid, msg.clone());
                         let retry = SshRetry::ConnectProject(pid);
                         if !this.handle_ssh_error(&msg, Some(&host_for_err), retry, cx) {
                             // Drop a possibly-wrong session password so a retry
@@ -3495,6 +3518,148 @@ impl MuxelApp {
             self.apply_remote_layout_sync(pid, fetched, window, cx);
         }
         self.spawn_project_terminals_now(pid, window, cx);
+    }
+
+    /// Every tmux session muxel has launched, `(project, session, is_remote)` —
+    /// they survive a quit by design, so the quit dialog offers to kill them.
+    fn tmux_sessions(&self) -> Vec<(Uuid, String, bool)> {
+        self.workspace
+            .instances
+            .iter()
+            .filter_map(|i| {
+                let s = i.tmux_session.clone()?;
+                let remote = self
+                    .workspace
+                    .project(i.project_id)
+                    .is_some_and(|p| p.is_remote());
+                Some((i.project_id, s, remote))
+            })
+            .collect()
+    }
+
+    /// Kill muxel's tmux sessions in the chosen scopes, fire-and-forget: the
+    /// kill children outlive the app (remote ones ride the still-warm
+    /// ControlMaster), so quitting is never blocked on a slow host.
+    fn kill_tmux_sessions(&self, local: bool, remote: bool) {
+        for (pid, session, is_remote) in self.tmux_sessions() {
+            if is_remote && remote {
+                if let Some(host) = self.remote_host_for_project(pid) {
+                    let control_path = Self::control_path_for(host.id);
+                    let password = self.remote_password(&host);
+                    integrations::kill_remote_tmux_detached(
+                        &host,
+                        &control_path,
+                        password.as_deref(),
+                        &session,
+                    );
+                }
+            } else if !is_remote && local {
+                integrations::kill_local_tmux_detached(&session);
+            }
+        }
+    }
+
+    /// Quit-dialog cleanup per the two checkboxes.
+    fn kill_checked_tmux_sessions(&self) {
+        if self.quit_kill_tmux_local || self.quit_kill_tmux_remote {
+            self.kill_tmux_sessions(self.quit_kill_tmux_local, self.quit_kill_tmux_remote);
+        }
+    }
+
+    /// Retry a remote project's connection: clears the failure state and re-runs
+    /// the connect pre-flight (which respawns the panes on success).
+    fn reconnect_project(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.remote_connect_failed.remove(&pid);
+        // Force the layout re-sync too — a long outage may have left the remote
+        // copy newer than ours.
+        self.remote_synced.remove(&pid);
+        self.ensure_project_terminals(pid, window, cx);
+        cx.notify();
+    }
+
+    /// Open the new-remote-project wizard preset to `host_id` and immediately
+    /// kick off its "Scan for projects" (the reconnect state's second action).
+    fn open_remote_scan(&mut self, host_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_new_remote = true;
+        self.nr_host = Some(host_id);
+        self.nr_verify = RemoteTestState::Idle;
+        self.nr_scan = RemoteScanState::Idle;
+        self.nr_dir.update(cx, |s, cx| s.set_value("", window, cx));
+        self.nr_name.update(cx, |s, cx| s.set_value("", window, cx));
+        self.scan_remote_dirs(window, cx);
+        cx.notify();
+    }
+
+    /// Whether any of a project's panes has a live view (terminal/editor/browser).
+    fn project_has_live_panes(&self, pid: Uuid) -> bool {
+        self.workspace
+            .project(pid)
+            .map(|p| p.instances())
+            .unwrap_or_default()
+            .iter()
+            .any(|iid| {
+                self.terminals.contains_key(iid)
+                    || self.editors.contains_key(iid)
+                    || self.browsers.contains_key(iid)
+            })
+    }
+
+    /// The pane-area state for a remote project whose connection failed: the
+    /// error + Reconnect and Scan-for-projects actions.
+    fn render_remote_connect_failed(
+        &self,
+        pid: Uuid,
+        msg: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let host = self.remote_host_for_project(pid);
+        let host_name = host.as_ref().map(|h| h.name.clone()).unwrap_or_default();
+        let host_id = host.as_ref().map(|h| h.id);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .p_4()
+            .child(
+                div()
+                    .text_lg()
+                    .font_semibold()
+                    .child(tf("Couldn't connect to “{name}”", &[("name", &host_name)])),
+            )
+            .child(
+                div()
+                    .max_w(px(560.0))
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(msg.to_string()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("remote-reconnect")
+                            .primary()
+                            .icon(IconName::Redo)
+                            .label(t("Reconnect"))
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                this.reconnect_project(pid, window, cx)
+                            })),
+                    )
+                    .children(host_id.map(|hid| {
+                        Button::new("remote-scan")
+                            .ghost()
+                            .icon(IconName::Search)
+                            .label(t("Scan for projects"))
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                this.open_remote_scan(hid, window, cx)
+                            }))
+                    })),
+            )
+            .into_any_element()
     }
 
     /// The configured remote host for a project, if any — with any referenced login
@@ -5076,9 +5241,10 @@ impl MuxelApp {
                 tf("{title}: closed on exit", &[("title", &title)]),
                 t("The process exited cleanly.").to_string(),
             );
-            // Auto-close on process exit: keep a remote tmux session alive (a
-            // dropped SSH connection should be reconnectable, not torn down).
-            self.close_instance_inner(iid, false, cx); // re-renders on its own
+            // Closing a pane tears its tmux session down too (a *dropped* SSH
+            // connection exits abnormally and tombstones instead, staying
+            // reconnectable).
+            self.close_instance_inner(iid, "auto-close (exit)", cx); // re-renders on its own
         }
 
         let live: HashSet<Uuid> = self.terminals.keys().copied().collect();
@@ -5150,7 +5316,7 @@ impl MuxelApp {
             self.running_loops.remove(&iid);
         }
         for iid in close {
-            self.close_instance_inner(iid, true, cx);
+            self.close_instance_inner(iid, "loop post-run", cx);
         }
     }
 
@@ -6783,7 +6949,6 @@ impl MuxelApp {
         iid: Uuid,
         project_id: Uuid,
         use_tmux: bool,
-        kill_remote_session: bool,
         local_session: Option<String>,
         worktree_path: Option<PathBuf>,
         worktree_id: Option<Uuid>,
@@ -6793,24 +6958,22 @@ impl MuxelApp {
         if let Some(session) = local_session {
             integrations::kill_tmux_session(&session);
         }
-        // Remote tmux session: a remote project whose pane ran in tmux. Only on a
-        // deliberate close — NOT when the process merely exited (a dropped SSH
-        // connection should leave the session alive for reconnect). Killed over
-        // ssh in the background (reuses the host's still-warm ControlMaster).
-        let remote_host = kill_remote_session
-            .then(|| {
-                self.workspace
-                    .project(project_id)
-                    .and_then(|p| p.remote.clone())
-                    .and_then(|r| {
-                        self.remotes
-                            .iter()
-                            .find(|h| h.id == r.host_id)
-                            .map(|h| h.effective(&self.identities))
-                    })
-                    .filter(|host| host.default_use_tmux || use_tmux)
+        // Remote tmux session: closing a pane always tears its session down —
+        // a *dropped* SSH connection never reaches here (an abnormal exit leaves
+        // a tombstone pane instead of auto-closing), so reconnectability is
+        // preserved where it matters. Killed over ssh in the background
+        // (reuses the host's still-warm ControlMaster).
+        let remote_host = self
+            .workspace
+            .project(project_id)
+            .and_then(|p| p.remote.clone())
+            .and_then(|r| {
+                self.remotes
+                    .iter()
+                    .find(|h| h.id == r.host_id)
+                    .map(|h| h.effective(&self.identities))
             })
-            .flatten();
+            .filter(|host| host.default_use_tmux || use_tmux);
         if let Some(host) = remote_host {
             let session = muxel_core::tmux::session_name(&host.name, iid);
             let control_path = Self::control_path_for(host.id);
@@ -6843,26 +7006,16 @@ impl MuxelApp {
 
     /// Manually close an instance (kills its tmux session, local or remote).
     fn close_instance(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        self.close_instance_inner(iid, true, cx);
+        self.close_instance_inner(iid, "close", cx);
     }
 
     /// Close an instance. `kill_remote_session` is false for auto-close-on-exit,
     /// so a dropped remote connection doesn't tear down a still-running session.
-    fn close_instance_inner(
-        &mut self,
-        iid: Uuid,
-        kill_remote_session: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
         self.clear_notifications_for(iid);
         // Durable trace of every close: with stderr often discarded, this log is
         // what distinguishes "I closed it" from "it vanished" after the fact.
         if let Some(inst) = self.workspace.instance(iid) {
-            let reason = if kill_remote_session {
-                "close"
-            } else {
-                "auto-close (exit)"
-            };
             muxel_store::append_event_log(&format!("{reason}: \"{}\" [{iid}]", inst.title));
         }
         let pid = self.workspace.instance(iid).map(|i| i.project_id);
@@ -6903,7 +7056,6 @@ impl MuxelApp {
                 iid,
                 project_id,
                 use_tmux,
-                kill_remote_session,
                 local_session,
                 worktree_path,
                 worktree_id,
@@ -9025,7 +9177,14 @@ impl MuxelApp {
                 .map(|p| p.instances().contains(id))
                 .unwrap_or(false)
         });
-        let main_content: AnyElement = if let Some(iid) = maximized_here {
+        let failed_remote = self
+            .remote_connect_failed
+            .get(&pid)
+            .filter(|_| !self.project_has_live_panes(pid))
+            .cloned();
+        let main_content: AnyElement = if let Some(msg) = failed_remote {
+            self.render_remote_connect_failed(pid, &msg, cx)
+        } else if let Some(iid) = maximized_here {
             self.render_pane(&PaneNode::leaf(iid), cx)
         } else {
             match layout {
@@ -9321,7 +9480,6 @@ impl MuxelApp {
                 iid,
                 project_id,
                 use_tmux,
-                true,
                 local_session,
                 worktree_path,
                 worktree_id,
@@ -13471,6 +13629,7 @@ impl MuxelApp {
             };
             let is_repo = self.project_branches.get(&pid).is_some_and(|b| b.is_some());
             let is_local = project.remote.is_none();
+            let remote_host_id = project.remote.as_ref().map(|r| r.host_id);
             let current_branch = self.project_branches.get(&pid).cloned().flatten();
             let drop_hl = cx.theme().sidebar_accent;
             let chevron = if collapsed {
@@ -13703,6 +13862,32 @@ impl MuxelApp {
                                         ),
                                     ),
                                 );
+                            // Remote projects: reconnect a dropped/failed SSH
+                            // connection, or scan the host for more projects.
+                            if let Some(hid) = remote_host_id {
+                                menu = menu
+                                    .separator()
+                                    .item(
+                                        PopupMenuItem::new(t("Reconnect"))
+                                            .icon(IconName::Redo)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, window, cx| {
+                                                    this.reconnect_project(pid, window, cx)
+                                                },
+                                            )),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new(t("Scan for projects"))
+                                            .icon(IconName::Search)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _, window, cx| {
+                                                    this.open_remote_scan(hid, window, cx)
+                                                },
+                                            )),
+                                    );
+                            }
                             // Multi-monitor: open this project as a full muxel
                             // window on another display, or pull it back.
                             let displays = cx.displays();
@@ -16995,6 +17180,51 @@ impl MuxelApp {
                             .text_color(cx.theme().muted_foreground)
                             .child(t("Running terminals will be closed.")),
                     )
+                    // tmux-backed panes survive a quit by design; offer cleanup
+                    // per scope (local vs remote sessions).
+                    .children({
+                        let sessions = self.tmux_sessions();
+                        let has_local = sessions.iter().any(|(_, _, remote)| !remote);
+                        let has_remote = sessions.iter().any(|(_, _, remote)| *remote);
+                        [
+                            has_local.then(|| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Checkbox::new("quit-kill-tmux-local")
+                                            .checked(self.quit_kill_tmux_local)
+                                            .on_click(cx.listener(|this, c: &bool, _w, cx| {
+                                                this.quit_kill_tmux_local = *c;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div().text_sm().child(t("Also kill local tmux sessions")),
+                                    )
+                            }),
+                            has_remote.then(|| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Checkbox::new("quit-kill-tmux-remote")
+                                            .checked(self.quit_kill_tmux_remote)
+                                            .on_click(cx.listener(|this, c: &bool, _w, cx| {
+                                                this.quit_kill_tmux_remote = *c;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div().text_sm().child(t("Also kill remote tmux sessions")),
+                                    )
+                            }),
+                        ]
+                        .into_iter()
+                        .flatten()
+                    })
                     .child(
                         div()
                             .flex()
@@ -17015,6 +17245,7 @@ impl MuxelApp {
                                     .danger()
                                     .label(t("Quit"))
                                     .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.kill_checked_tmux_sessions();
                                         this.confirm_quit = true;
                                         cx.quit();
                                     })),
@@ -19729,8 +19960,16 @@ impl Render for MuxelApp {
                 .map(|p| p.instances().contains(id))
                 .unwrap_or(false)
         });
+        let failed_remote = self.workspace.active_project.and_then(|pid| {
+            self.remote_connect_failed
+                .get(&pid)
+                .filter(|_| !self.project_has_live_panes(pid))
+                .map(|m| (pid, m.clone()))
+        });
         let main_content: AnyElement = if self.show_dashboard {
             self.render_dashboard(cx)
+        } else if let Some((fpid, msg)) = failed_remote {
+            self.render_remote_connect_failed(fpid, &msg, cx)
         } else if let Some(iid) = maximized_here {
             self.render_pane(&PaneNode::leaf(iid), cx)
         } else {

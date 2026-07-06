@@ -1122,6 +1122,53 @@ pub fn kill_remote_tmux(
     let _ = ssh_exec(host, control_path, password, &cmd);
 }
 
+/// Fire-and-forget kill of a remote tmux session, for quit-time cleanup: the
+/// spawned ssh child (reusing the warm ControlMaster) outlives muxel, so
+/// quitting is never blocked on the network. Errors are ignored.
+pub fn kill_remote_tmux_detached(
+    host: &RemoteHost,
+    control_path: &str,
+    password: Option<&str>,
+    session: &str,
+) {
+    let target = format!("={session}"); // exact-match target, as in kill_session_args
+    let remote_cmd = format!("tmux kill-session -t {}", ssh::sh_quote(&target));
+    let mut argv = ssh::connection_args(host, control_path);
+    if password.is_none() {
+        argv.push("-o".into());
+        argv.push("BatchMode=yes".into());
+    }
+    argv.push(ssh::target(host));
+    argv.push("--".into());
+    argv.push(remote_cmd);
+    let mut cmd;
+    if host.auth == SshAuth::Password {
+        cmd = command("sshpass");
+        cmd.arg("-e").arg("ssh").args(&argv);
+        if let Some(pw) = password {
+            cmd.env("SSHPASS", pw);
+        }
+    } else {
+        cmd = command("ssh");
+        cmd.args(&argv);
+    }
+    let _ = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Fire-and-forget kill of a local tmux session (quit-time cleanup).
+pub fn kill_local_tmux_detached(session: &str) {
+    let _ = command("tmux")
+        .args(muxel_core::tmux::kill_session_args(session))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 /// Open the OS file manager at (or selecting) `path`. Best-effort, cross-platform.
 pub fn reveal_in_file_manager(path: &Path) {
     #[cfg(target_os = "macos")]
