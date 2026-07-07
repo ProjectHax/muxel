@@ -58,16 +58,30 @@ else
   codesign --force --deep --sign - "$app"
 fi
 
-# Notarize (needs both a cert AND a notary key); staple the ticket onto the app.
+# Notarization is available only with both a cert AND a notary key.
+notarize_enabled=""
 if [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${MACOS_NOTARY_KEY:-}" ]; then
-  echo "==> Notarizing with Apple…"
+  notarize_enabled=1
   printf '%s' "$MACOS_NOTARY_KEY" | openssl base64 -d -A -out "$tmp/notary.p8"
-  ditto -c -k --keepParent "$app" "$tmp/notarize.zip"
-  xcrun notarytool submit "$tmp/notarize.zip" \
+fi
+
+# Submit one artifact (a .zip or .dmg) to Apple's notary service and block until
+# it's Accepted. Each distributed artifact must be notarized in its own right for
+# `stapler staple` to find a ticket — stapling the DMG previously worked only by
+# CloudKit chance, since the DMG itself was never submitted ("Record not found").
+notarize() {
+  xcrun notarytool submit "$1" \
     --key "$tmp/notary.p8" \
     --key-id "${MACOS_NOTARY_KEY_ID:?MACOS_NOTARY_KEY_ID required}" \
     --issuer "${MACOS_NOTARY_ISSUER_ID:?MACOS_NOTARY_ISSUER_ID required}" \
     --wait
+}
+
+# Notarize + staple the app (so the .zip artifact carries a valid ticket offline).
+if [ -n "$notarize_enabled" ]; then
+  echo "==> Notarizing muxel.app…"
+  ditto -c -k --keepParent "$app" "$tmp/notarize.zip"
+  notarize "$tmp/notarize.zip"
   xcrun stapler staple "$app"
 fi
 
@@ -86,7 +100,14 @@ hdiutil create -volname muxel -srcfolder "$dmg_stage" -ov -format UDZO "$out.dmg
 rm -rf "$dmg_stage"
 
 ditto -c -k --keepParent "$app" "$out.zip"
-if [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${MACOS_NOTARY_KEY:-}" ]; then
+
+# Sign, notarize + staple the DMG itself so it passes Gatekeeper offline (and so
+# stapling actually has a ticket to find). The .zip carries the already-stapled
+# app, so it needs no separate ticket.
+if [ -n "$notarize_enabled" ]; then
+  echo "==> Signing + notarizing the DMG…"
+  codesign --force --timestamp --sign "$MACOS_SIGN_IDENTITY" "$out.dmg"
+  notarize "$out.dmg"
   xcrun stapler staple "$out.dmg"
 fi
 echo "==> Wrote $out.dmg and $out.zip"
