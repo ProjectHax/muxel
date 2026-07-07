@@ -3,6 +3,62 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [0.0.8] — 2026-07-06
+
+### Added
+- **Multi-monitor project windows** — right-click a project → **Open on display N**
+  to give it its own full muxel window (sidebar + toolbar + panes) on that monitor;
+  switch projects and panes there just like the main window. One window per project:
+  selecting a project already open elsewhere **raises** its window instead of stealing
+  it. Each window's monitor and exact position/size are saved **in the workspace**, so
+  reopening restores every window where it was — dragging a window to another monitor
+  updates its pin, and a disconnected monitor keeps the pin for when it returns.
+  **Bring back to main window** (or closing the window) returns the project.
+- **Built-in browser** — preview links an agent prints, or a locally hosted dev site,
+  without leaving muxel and without bundling Chromium: it uses the OS webview (WKWebView
+  on macOS, WebView2 on Windows, WebKitGTK on Linux), so it stays light on disk and
+  memory. On macOS/Windows a ctrl+clicked URL opens as an in-pane browser (address bar,
+  Back, Reload; the URL persists and restores with the workspace); on Linux it opens as
+  a separate muxel-managed browser window, falling back to the system browser if WebKit
+  isn't installed. Toggle it in **Settings → Behavior** (default on; off routes every
+  link to the system browser).
+- **Ctrl+click terminal links** — ctrl+click (⌘ on macOS) a URL or file path an agent
+  printed to open it; ctrl+hover underlines the target and shows a pointing-hand cursor.
+  OSC 8 hyperlinks are honored, and file paths (`./src/x.rs:42`, `~/…`, absolute) resolve
+  against the pane's working directory and open in your system default app.
+- **Fullscreen mode** — `F11` (rebindable) toggles OS fullscreen with the sidebar fully
+  hidden; a floating edge pill brings it back without leaving fullscreen, and `F11` again
+  restores your previous sidebar state.
+- **Reconnect a dropped SSH project** — when a remote project's connection fails, the
+  pane area shows the error with **Reconnect** (re-runs the connect, re-syncs the layout,
+  respawns panes) and **Scan for projects** (opens the wizard on that host and scans it);
+  both are also in the project's right-click menu.
+- **Quit-time tmux cleanup** — when muxel-launched tmux sessions exist, the quit dialog
+  offers two opt-in checkboxes (off by default), **Also kill local tmux sessions** and
+  **Also kill remote tmux sessions**; the kills are fire-and-forget, so quitting never
+  waits on a slow host.
+
+### Changed
+- **Panes never vanish on an abnormal exit** — auto-close-on-exit now requires a *clean*
+  exit (code 0). A crash, unknown exit code, or transient PTY read error keeps the pane
+  as a tombstone: the final screen stays under a banner with the exit code, with a feed
+  error and a desktop notification when unattended, and Restart relaunches in place.
+- **Closing a pane always kills its tmux session** — local or remote. A *dropped* SSH
+  connection exits abnormally and tombstones instead of auto-closing, so its remote
+  session stays alive for reconnect; only a deliberate close tears tmux down.
+- **Renamed agents show only their custom name** in the sidebar (previously the live
+  agent title was appended after it).
+
+### Fixed
+- **Reliable child reaping** — the PTY reader retries `EINTR` instead of declaring the
+  child dead, carries real read errors into the exit event, and always reaps the child
+  (fixing permanent zombie processes and leaked PTY file descriptors). Every exit and
+  close is recorded in a new durable event log (`muxel.log`, 1 MB rotation), since the
+  GUI often runs with stderr discarded.
+
+### iOS companion app (distributed via TestFlight / App Store, not in these downloads)
+- App Store submission prep, and the Live Activity now ends when the app is fully closed.
+
 ## [0.0.7] — 2026-07-02
 
 ### Added
