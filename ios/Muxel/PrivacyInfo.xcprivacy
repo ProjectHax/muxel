@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Privacy manifest (required by Apple since 2024-05).
+
+  muxel collects and tracks nothing: no analytics, no advertising, no third-party
+  network traffic. The only network it makes is the user's own SSH connection, and
+  credentials never leave the device (Keychain). Hence NSPrivacyTracking = false and
+  empty NSPrivacyCollectedDataTypes — this backs the "Data Not Collected" nutrition
+  label in App Store Connect.
+
+  It does call two "Required Reason" APIs, declared below:
+    - UserDefaults          (theme id, host-key TOFU store, poll last-status, font size,
+                             app-lock flag) — reason CA92.1: accessed only by this app.
+    - System boot time      (ProcessInfo.systemUptime in TerminalStore for scroll/redraw
+                             timing) — reason 35F9.1: measure elapsed time within the app.
+
+  If you add a Required Reason API (file timestamps, disk space, active keyboard, …),
+  add its category + reason here or the upload will be rejected.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>35F9.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -29,7 +29,7 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    DEVELOPMENT_TEAM: "" # set your Apple Developer team id (or in Xcode signing)
+    DEVELOPMENT_TEAM: "AT4THS99K7" # ProjectHax LLC — Apple Developer Team ID (see AppStore/Submission.md)
     CODE_SIGN_STYLE: Automatic
 
 targets:

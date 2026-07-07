@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Privacy manifest for the Live Activity widget extension. The extension only renders
+  a ContentState handed to it by ActivityKit: no tracking, no data collection, and no
+  Required Reason APIs (no UserDefaults, file-timestamp, disk-space, or boot-time
+  calls). If that changes, mirror the app manifest (Muxel/PrivacyInfo.xcprivacy).
+-->
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array/>
+</dict>
+</plist>

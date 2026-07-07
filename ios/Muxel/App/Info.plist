@@ -48,11 +48,14 @@
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 
-	<!-- Background execution: BGTaskScheduler-driven status polling. -->
+	<!-- Background execution: BGAppRefreshTask-driven status polling. Only the
+	     app-refresh ("fetch") mode is used — the poll runs as a BGAppRefreshTaskRequest
+	     (see AppDelegate). Do NOT add "processing" here unless a BGProcessingTaskRequest
+	     is actually registered and submitted: declaring an unused background mode is an
+	     App Review 2.5.4 rejection. -->
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>
-		<string>processing</string>
 	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
@@ -62,5 +65,14 @@
 	<!-- Face ID gate for revealing stored SSH credentials. -->
 	<key>NSFaceIDUsageDescription</key>
 	<string>muxel uses Face ID to protect your stored SSH passwords and keys.</string>
+
+	<!-- Export compliance. muxel bundles an SSH client (SwiftNIO SSH via Citadel), so
+	     it uses non-exempt encryption (not just Apple's HTTPS/OS crypto) → this is YES.
+	     It qualifies for the mass-market exemption (standard algorithms only, no
+	     proprietary crypto), which requires a one-time-per-year self-classification
+	     report to BIS + Apple's export questionnaire — see AppStore/Submission.md.
+	     Declaring the key here lets App Store Connect skip the per-build prompt. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<true/>
 </dict>
 </plist>
