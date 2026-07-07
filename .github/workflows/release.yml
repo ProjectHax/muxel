@@ -204,6 +204,16 @@ jobs:
               -o "muxel.iconset/icon_${s}x${s}@2x.png"
           done
           iconutil -c icns muxel.iconset -o "$app/Contents/Resources/muxel.icns"
+      # The two per-arch release trees (multi-GB GPUI builds each) are now fused
+      # into muxel.app via lipo, so they're dead weight — deleting them frees the
+      # headroom hdiutil needs to build the .dmg (packaging previously ran the
+      # runner out of disk at `hdiutil create`).
+      - name: Free disk before packaging
+        run: |
+          set -eux
+          df -h /
+          rm -rf target/x86_64-apple-darwin target/aarch64-apple-darwin
+          df -h /
       # Signs with a Developer ID + notarizes when the MACOS_* secrets are set,
       # otherwise ad-hoc signs. Either way, writes the .dmg and .zip.
       - name: Sign, notarize + package
