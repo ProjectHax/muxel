@@ -940,8 +940,16 @@ pub struct MuxelApp {
     window_active: bool,
     /// Whether to show the cross-project dashboard instead of the pane tree.
     show_dashboard: bool,
-    /// Whether the project sidebar is collapsed.
+    /// Whether the project sidebar is collapsed **in the main window**.
     sidebar_collapsed: bool,
+    /// Popped-out project windows whose sidebar the user has pulled back out.
+    /// Keyed by project (one window per project), and absent means hidden — a
+    /// project window exists to show one project on its own monitor, so it starts
+    /// with the project list out of the way. Keyed by pid rather than window id
+    /// because the window's first frame renders before its `SecondaryWindow`
+    /// record exists, and an id lookup would flash the sidebar open.
+    /// Runtime-only: every project window opens hidden again.
+    secondary_sidebar_shown: HashSet<Uuid>,
     /// While fullscreen (F11): whether the user pulled the sidebar back in with
     /// the floating reveal pill. Reset on every fullscreen entry; not persisted,
     /// so `sidebar_collapsed` survives fullscreen round-trips untouched.
@@ -2745,6 +2753,7 @@ impl MuxelApp {
             window_active: true,
             show_dashboard: false,
             sidebar_collapsed: false,
+            secondary_sidebar_shown: HashSet::new(),
             fullscreen_sidebar_revealed: false,
             show_file_browser: false,
             file_browser_pid: None,
@@ -4317,8 +4326,46 @@ impl MuxelApp {
         cx.notify();
     }
 
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_collapsed = !self.sidebar_collapsed;
+    /// The project shown by `window` when it's a popped-out project window;
+    /// `None` for the main window.
+    fn secondary_pid_for(&self, window: &Window) -> Option<Uuid> {
+        let id = window.window_handle().window_id();
+        self.secondary_windows
+            .iter()
+            .find(|s| s.window_id == id)
+            .map(|s| s.pid)
+    }
+
+    /// Whether the sidebar is hidden in the window showing `pid` (`None` = the
+    /// main window) — either collapsed, or forced away by fullscreen until the
+    /// user pulls it back for that stint.
+    fn sidebar_hidden_for(&self, pid: Option<Uuid>, window: &Window) -> bool {
+        let collapsed = match pid {
+            Some(pid) => !self.secondary_sidebar_shown.contains(&pid),
+            None => self.sidebar_collapsed,
+        };
+        collapsed || (window.is_fullscreen() && !self.fullscreen_sidebar_revealed)
+    }
+
+    /// Show/hide the sidebar of whichever window this came from. Toggling on
+    /// *visibility* rather than the collapse flag matters in fullscreen, where the
+    /// sidebar is hidden regardless of the flag: flipping the flag alone would do
+    /// nothing visible.
+    fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pid = self.secondary_pid_for(window);
+        let reveal = self.sidebar_hidden_for(pid, window);
+        match pid {
+            Some(pid) if reveal => {
+                self.secondary_sidebar_shown.insert(pid);
+            }
+            Some(pid) => {
+                self.secondary_sidebar_shown.remove(&pid);
+            }
+            None => self.sidebar_collapsed = !reveal,
+        }
+        if reveal && window.is_fullscreen() {
+            self.fullscreen_sidebar_revealed = true;
+        }
         cx.notify();
     }
 
@@ -6482,7 +6529,7 @@ impl MuxelApp {
             PaletteCommand::ClearScrollback => self.clear_active_terminal(cx),
             PaletteCommand::ToggleWorktree => self.toggle_worktree(cx),
             PaletteCommand::FocusAttention => self.focus_attention(window, cx),
-            PaletteCommand::ToggleSidebar => self.toggle_sidebar(cx),
+            PaletteCommand::ToggleSidebar => self.toggle_sidebar(window, cx),
             PaletteCommand::ToggleDashboard => self.toggle_dashboard(cx),
             PaletteCommand::OpenSettings => self.toggle_settings(window, cx),
             PaletteCommand::OpenMemory => {
@@ -9002,6 +9049,15 @@ impl MuxelApp {
             }
         }
         self.workspace.project_windows.remove(&sec.pid);
+        // Next pop-out of this project starts with its sidebar hidden again.
+        self.secondary_sidebar_shown.remove(&sec.pid);
+        // Bring the project home. Popping it out moved the main window off it
+        // (`open_project_on_monitor`), so without this the project is un-pinned but
+        // left unselected — from the user's side it just disappeared. Doing it here
+        // rather than in `bring_project_to_main` covers every way the window can
+        // close: the title-bar X, the OS close button, and Bring back to main window.
+        self.workspace.active_project = Some(sec.pid);
+        self.active_instance = self.workspace.active().and_then(|p| p.first_instance());
         self.persist();
         cx.notify();
     }
@@ -9049,6 +9105,12 @@ impl MuxelApp {
                     geom: None,
                 });
         self.workspace.project_windows.insert(pid, carried);
+        // The sidebar state belongs to the window, not the project it happens to
+        // show — and the click that got us here came *from* that sidebar, so it was
+        // open. Carry it across rather than snapping shut under the cursor.
+        if self.secondary_sidebar_shown.remove(&old_pid) {
+            self.secondary_sidebar_shown.insert(pid);
+        }
         self.ensure_project_terminals(pid, window, cx);
         self.active_instance = self.workspace.project(pid).and_then(|p| p.first_instance());
         if let Some(iid) = self.active_instance {
@@ -9100,7 +9162,9 @@ impl MuxelApp {
             )
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| this.adjust_zoom(0.1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| this.adjust_zoom(-0.1, cx)))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _window, cx| this.toggle_sidebar(cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ToggleDashboard, window, cx| {
                 this.activate_main_window(window, cx);
                 this.toggle_dashboard(cx)
@@ -9234,6 +9298,8 @@ impl MuxelApp {
                     .into_any_element(),
             }
         };
+        // This window's own sidebar state — a project window starts with it hidden.
+        let sidebar_hidden = self.sidebar_hidden_for(Some(pid), window);
         let main_column = div()
             .size_full()
             .min_w_0()
@@ -9241,8 +9307,6 @@ impl MuxelApp {
             .flex_col()
             .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h_0().child(main_content));
-        let sidebar_hidden =
-            self.sidebar_collapsed || (window.is_fullscreen() && !self.fullscreen_sidebar_revealed);
         let body: AnyElement = if sidebar_hidden {
             main_column.into_any_element()
         } else {
@@ -9274,7 +9338,7 @@ impl MuxelApp {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground);
         let root = self.attach_workspace_actions(root, cx);
-        root.child(self.render_minimal_titlebar(cx))
+        root.child(self.render_secondary_titlebar(sidebar_hidden, cx))
             .child(div().flex_1().min_h_0().flex().child(body))
             .children((window.is_fullscreen() && sidebar_hidden).then(|| {
                 div()
@@ -9299,10 +9363,8 @@ impl MuxelApp {
                                     .xsmall()
                                     .icon(IconName::ChevronRight)
                                     .tooltip(t("Show sidebar"))
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.fullscreen_sidebar_revealed = true;
-                                        this.sidebar_collapsed = false;
-                                        cx.notify();
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.toggle_sidebar(window, cx)
                                     })),
                             ),
                     )
@@ -14897,21 +14959,78 @@ impl MuxelApp {
             .into_any_element()
     }
 
-    /// A minimal draggable title bar (app name + window min/max/close controls)
-    /// for the first-run screens, which otherwise have no bar to move the window.
+    /// The shared body of the minimal title bars: a draggable region plus the app
+    /// name. The caller decides what its close button does.
+    ///
+    /// `on_close_window` is honored on Linux only (gpui-component draws the window
+    /// controls there); elsewhere the OS draws the close button and removes the
+    /// window itself. So every caller's handler must end in the same state the
+    /// native button would produce, or the platforms diverge.
+    fn minimal_titlebar() -> TitleBar {
+        TitleBar::new().child(
+            div()
+                .w_full()
+                .px_2()
+                .flex()
+                .items_center()
+                .child(div().font_semibold().child(t("muxel"))),
+        )
+    }
+
+    /// A minimal draggable title bar for the first-run screens, which otherwise
+    /// have no bar to move the window. **Its close button quits the app** — only
+    /// use it where that's right. A popped-out project window wants
+    /// [`Self::render_secondary_titlebar`] instead.
     fn render_minimal_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Self::minimal_titlebar().on_close_window(cx.listener(|this, _ev, _window, cx| {
+            // Nothing is running yet — quit directly (no confirm needed).
+            this.confirm_quit = true;
+            cx.quit();
+        }))
+    }
+
+    /// The title bar for a popped-out project window: a sidebar toggle plus the app
+    /// name. The toggle isn't optional here — this window starts with its sidebar
+    /// hidden, so the button (or Ctrl+Shift+B) is the only way to the project list.
+    ///
+    /// Its close button closes *that window*, which `on_window_closed` turns into
+    /// [`Self::handle_secondary_closed`] — the project returns to the main window.
+    /// It must never quit the app: this window is one project, not muxel.
+    fn render_secondary_titlebar(
+        &self,
+        sidebar_hidden: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         TitleBar::new()
-            .on_close_window(cx.listener(|this, _ev, _window, cx| {
-                // Nothing is running yet — quit directly (no confirm needed).
-                this.confirm_quit = true;
-                cx.quit();
-            }))
+            .on_close_window(|_ev, window, _cx| window.remove_window())
             .child(
                 div()
                     .w_full()
                     .px_2()
                     .flex()
                     .items_center()
+                    .gap_2()
+                    .child(
+                        // The bar is a window-drag region: swallow the press, or a
+                        // click with the slightest movement starts a window move
+                        // and eats it.
+                        div()
+                            .flex()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("toggle-sidebar")
+                                    .ghost()
+                                    .icon(IconName::PanelLeft)
+                                    .tooltip(if sidebar_hidden {
+                                        t("Show sidebar")
+                                    } else {
+                                        t("Hide sidebar")
+                                    })
+                                    .on_click(cx.listener(|this, _ev, window, cx| {
+                                        this.toggle_sidebar(window, cx)
+                                    })),
+                            ),
+                    )
                     .child(div().font_semibold().child(t("muxel"))),
             )
     }
@@ -14952,7 +15071,9 @@ impl MuxelApp {
                             .icon(IconName::PanelLeft)
                             .tooltip(t("Toggle sidebar"))
                             .on_click(
-                                cx.listener(|this, _ev, _window, cx| this.toggle_sidebar(cx)),
+                                cx.listener(|this, _ev, window, cx| {
+                                    this.toggle_sidebar(window, cx)
+                                }),
                             ),
                     ))
                     .child(div().font_semibold().child(t("muxel")))
@@ -20038,6 +20159,10 @@ impl Render for MuxelApp {
             }
         };
 
+        // Fullscreen hides the sidebar outright (until the floating pill or the
+        // toolbar button reveals it); the user's normal collapsed state is left
+        // untouched underneath.
+        let sidebar_hidden = self.sidebar_hidden_for(None, window);
         // The project sidebar is resizable (a draggable splitter) when shown.
         let main_column = div()
             .size_full()
@@ -20113,10 +20238,6 @@ impl Render for MuxelApp {
         } else {
             main_column.into_any_element()
         };
-        // Fullscreen hides the sidebar outright (until the floating pill reveals
-        // it); the user's normal collapsed state is left untouched underneath.
-        let sidebar_hidden =
-            self.sidebar_collapsed || (window.is_fullscreen() && !self.fullscreen_sidebar_revealed);
         let body: AnyElement = if sidebar_hidden {
             center
         } else {
@@ -20287,10 +20408,8 @@ impl Render for MuxelApp {
                                     .xsmall()
                                     .icon(IconName::ChevronRight)
                                     .tooltip(t("Show sidebar"))
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.fullscreen_sidebar_revealed = true;
-                                        this.sidebar_collapsed = false;
-                                        cx.notify();
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        this.toggle_sidebar(window, cx)
                                     })),
                             ),
                     )

@@ -3,6 +3,23 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Changed
+- **Popped-out project windows open with the sidebar hidden** — the window exists to
+  show one project on its own monitor, so the project list starts out of the way. Its
+  title bar now carries the same sidebar toggle the main window has (the minimal bar it
+  used before had none), and Ctrl+Shift+B works there too. Each window remembers its own
+  sidebar state: hiding it in a project window no longer hides it in the main window.
+
+### Fixed
+- **Closing a popped-out project window quit the whole app** (Linux) — the window drew
+  the *first-run* title bar, whose close button quits outright because nothing is
+  running yet at that point. Its X now closes only that window, and the project returns
+  to the main window and is selected there, exactly as **Bring back to main window**
+  does. macOS and Windows were unaffected (the OS draws the close button), and the
+  return-to-main step now runs on every close path, so all three behave alike.
+
 ## [0.0.9] — 2026-07-09
 
 ### Changed

@@ -200,6 +200,7 @@
   "Forward the ssh-agent (-A)": "Forward the ssh-agent (-A)",
   "Found {dir}": "Found {dir}",
   "Git diff": "Git diff",
+  "Hide sidebar": "Hide sidebar",
   "Host": "Host",
   "Host (or ~/.ssh/config alias)": "Host (or ~/.ssh/config alias)",
   "Host key changed": "Host key changed",

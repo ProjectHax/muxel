@@ -348,9 +348,12 @@ feature is added or changed, update the matching entry here in the same change**
   fully hidden. A floating pill at the left edge brings the sidebar back without
   leaving fullscreen; `F11` again exits and restores the previous sidebar state.
 - **Multi-monitor** — right-click a project → **Open on display N** to give it a
-  full muxel window (sidebar + toolbar + panes) on that monitor; switch projects
-  and panes there like in the main window. One window per project: selecting a
-  project that's open elsewhere **raises** its window instead of stealing it.
+  full muxel window (toolbar + panes) on that monitor; switch projects and panes
+  there like in the main window. It opens with the **sidebar hidden** — the window
+  exists to show one project, so the project list starts out of the way; its title
+  bar's toggle (or Ctrl+Shift+B) brings the sidebar back for that window alone.
+  One window per project: selecting a project that's open elsewhere **raises** its
+  window instead of stealing it.
   Every project window's monitor + exact position/size is saved **in the
   workspace**, so reopening the workspace restores each window right where it
   was — dragging a window to another monitor updates its pin, and a
