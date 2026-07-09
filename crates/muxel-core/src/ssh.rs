@@ -304,7 +304,17 @@ fn remote_command(spec: &SshSpec) -> String {
         let session = spec.tmux_session.unwrap_or("muxel");
         let targs =
             crate::tmux::launch_session_args(session, spec.remote_cwd, spec.program, spec.args);
-        let mut cmd = String::from("exec tmux");
+        // Fork the remote tmux server off a project-less command line first — it's a
+        // separate process, so the server never inherits the argv below. Without this,
+        // a `pkill -f <project>` *on the remote host* matches the shared server and
+        // kills every session on it. See `tmux::start_server_args`. This runs before
+        // the `exec`, so it costs one short-lived process and nothing after.
+        let mut cmd = String::from("tmux");
+        for a in crate::tmux::start_server_args() {
+            cmd.push(' ');
+            cmd.push_str(&sh_quote(&a));
+        }
+        cmd.push_str("; exec tmux");
         for a in &targs {
             cmd.push(' ');
             cmd.push_str(&sh_quote(a));
@@ -541,8 +551,35 @@ mod tests {
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
-            "exec tmux set -g mouse on ';' new-session -A -s muxel-abc123 -c /srv/app -- claude"
+            "tmux start-server ';' set -s exit-empty off; \
+             exec tmux set -g mouse on ';' new-session -A -s muxel-abc123 -c /srv/app -- claude"
         );
+    }
+
+    /// The server must be forked by its own short-lived `tmux` process, *before* the
+    /// `exec`, so the long-lived server never inherits a command line naming the
+    /// project. A `pkill -f <project>` on the remote host would otherwise match the
+    /// shared server and kill every session on it.
+    #[test]
+    fn remote_tmux_starts_the_server_before_naming_the_project() {
+        let h = host();
+        let spec = SshSpec {
+            host: &h,
+            control_path: "/s",
+            remote_cwd: Some("/srv/sro_client"),
+            program: Some("claude"),
+            args: &[],
+            use_tmux: true,
+            tmux_session: Some("muxel_sro_client_abc123"),
+        };
+        let cmd = ssh_args(&spec).last().unwrap().clone();
+        let (server, pane) = cmd.split_once("; exec ").expect("server starts first");
+        assert!(
+            !server.contains("sro_client"),
+            "the server's command line must not name the project: {server}"
+        );
+        assert!(server.starts_with("tmux start-server"));
+        assert!(pane.contains("muxel_sro_client_abc123"));
     }
 
     #[test]

@@ -482,6 +482,19 @@ feature is added or changed, update the matching entry here in the same change**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't
   found. tmux is unix-only, so this never applies on Windows.
+- **Agents survive a stray `pkill`** — muxel starts the tmux server itself, from a
+  command line naming no project, so an agent running `pkill -f <project>` (to clear
+  its own dev server) can't match the *shared* server and kill every session with it.
+  Such a `pkill` reaches only that pane's tmux client: the session and the agent keep
+  running, and muxel **reattaches the pane automatically** — you see it blink, not die.
+  Local and remote alike (SSH panes and the iOS companion do the same), since a host
+  has one tmux server shared by every session on it.
+- **Killed tmux sessions come back** — if the tmux session (or the whole server) dies
+  anyway, the pane doesn't tombstone: muxel recreates the session and relaunches the
+  agent with `--resume`, so a resume-capable agent picks its conversation back up where
+  it left off (tmux scrollback is the only casualty). A deliberate `tmux kill-session`,
+  and an agent simply quitting, still close the pane normally. The feed says which
+  happened — *reattached* (session survived) or *session restored* (agent resumed).
 - **tmux lifecycle** — closing a **pane** always kills its tmux session (local or
   remote); a *dropped* SSH connection never auto-closes — it leaves a tombstone
   pane, keeping the remote session reconnectable. Quitting the **app** leaves

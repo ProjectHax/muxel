@@ -1102,6 +1102,57 @@ pub fn git_diff(dir: &Path) -> String {
     }
 }
 
+/// Start the tmux server *before* any pane creates a session, from this benign
+/// command line. Blocking, best-effort, idempotent.
+///
+/// tmux forks its server from whichever client first needs one, and the server
+/// keeps that client's command line (its `comm` becomes `tmux: server`, but its
+/// argv does not change). If that first client is a pane's
+/// `tmux new-session -A -s muxel_<project>_… `, the argv of the *shared* server
+/// contains the project's name — and one server hosts every session. An agent
+/// then running `pkill -f <project>` to clear its dev server matches the server,
+/// SIGKILLs it, and takes down every muxel session and every agent inside them.
+///
+/// Starting the server from here keeps project names out of its argv, so such a
+/// `pkill` can only reach a pane's own tmux *client*: the session survives, the
+/// agent keeps running, and the pane reattaches.
+///
+/// `exit-empty off` is not optional — by default a server holding no sessions
+/// exits at once, so `start-server` alone would evaporate and the next
+/// `new-session` would re-fork the server with the project name back in its argv.
+/// [`restore_tmux_exit_empty`] puts it back when muxel quits.
+pub fn ensure_tmux_server() {
+    let _ = command("tmux")
+        .args(muxel_core::tmux::start_server_args())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Undo [`ensure_tmux_server`]'s `exit-empty off` so the server goes away with
+/// its last session once muxel is gone. Best-effort, fire-and-forget.
+pub fn restore_tmux_exit_empty() {
+    let _ = command("tmux")
+        .args(muxel_core::tmux::restore_exit_empty_args())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Whether a tmux session is still alive (exact-match target, so `muxel_p_1` never
+/// matches `muxel_p_12`). Fast and blocking; only called for a pane that just died.
+pub fn tmux_session_exists(session: &str) -> bool {
+    command("tmux")
+        .args(["has-session", "-t", &format!("={session}")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Kill a tmux session. Best-effort.
 pub fn kill_tmux_session(session: &str) {
     let _ = command("tmux")

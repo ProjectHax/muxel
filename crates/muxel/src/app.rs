@@ -2897,6 +2897,16 @@ impl MuxelApp {
             find_contents: Vec::new(),
         };
 
+        // muxel keeps the tmux server alive with `exit-empty off` (see
+        // `ensure_tmux_server`); hand it back so it exits with its last session.
+        if cfg!(unix) {
+            cx.on_app_quit(|_this, _cx| {
+                integrations::restore_tmux_exit_empty();
+                async {}
+            })
+            .detach();
+        }
+
         // Terminate a popped-out terminal when the user closes its window.
         let weak = cx.weak_entity();
         cx.on_window_closed(move |cx, window_id| {
@@ -3245,9 +3255,17 @@ impl MuxelApp {
             // so it persists and re-attaches across restarts.
             let spec = match inst.and_then(|i| i.tmux_session.clone()) {
                 Some(session) => {
+                    // Fork the tmux server off a command line that names no project
+                    // *before* this client creates its session — otherwise the shared
+                    // server inherits this argv and a stray `pkill -f <project>` kills
+                    // every agent in every session. See `ensure_tmux_server`.
+                    integrations::ensure_tmux_server();
+                    // No `-c`: the client is spawned with `cwd` already (below), which
+                    // is what tmux uses for a new session anyway. Passing it would put
+                    // the project's path in this client's argv for no gain.
                     let args = muxel_core::tmux::launch_session_args(
                         &session,
-                        cwd.as_deref(),
+                        None,
                         resolved.program.as_deref(),
                         &resolved.args,
                     );
@@ -5200,6 +5218,8 @@ impl MuxelApp {
 
         let mut to_close = Vec::new();
         let mut to_recover: Vec<(Uuid, String)> = Vec::new();
+        // (instance, title, signal name) — panes to reattach to a live tmux session.
+        let mut to_reattach: Vec<(Uuid, String, String)> = Vec::new();
         // Only re-render when something visible actually changed. Re-rendering
         // every second (rebuilding every button) is what strands gpui-component
         // tooltips: a repaint landing as the cursor leaves a button drops the
@@ -5263,21 +5283,54 @@ impl MuxelApp {
                     }
                 }
             }
+            const REATTACH_COOLDOWN_SECS: u64 = 5;
+            let tmux_session = self
+                .workspace
+                .instance(iid)
+                .and_then(|i| i.tmux_session.clone());
             // A `--resume` launch whose saved session is invalid (deleted/expired)
             // recovers by re-spawning the same agent with a fresh session, rather
             // than closing it — whether the agent exited non-zero on the bad resume
             // or is hanging on its "No conversation found" error (`resume_error`).
             // A clean exit (code 0) is a deliberate quit — left to close-on-exit.
+            //
+            // Never for a tmux pane: what exits there is the tmux *client*, and its
+            // status says nothing about the agent's resume (an agent that failed to
+            // resume would end its session and leave the client at 0). Treating a
+            // killed tmux server as a bad resume threw the conversation away — it
+            // reset `session_id` — every time the server died twice inside
+            // `RECOVER_WITHIN_SECS`. Those panes belong to `tmux_lost` below.
             let exit_recover = exited
                 && exit_code != Some(0)
+                && tmux_session.is_none()
                 && self
                     .terminal_launches
                     .get(&iid)
                     .is_some_and(|&(at, was_resume)| {
                         was_resume && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
                     });
+            // A tmux pane died in a way tmux itself never does on purpose. Either the
+            // client was signalled (an agent's `pkill -f <project>` matching the
+            // session name in its argv), or the *server* went away underneath it —
+            // which the client reports as a bare exit 1, no signal. Both are
+            // recoverable: relaunching runs `tmux new-session -A`, which reattaches a
+            // surviving session or recreates it and resumes the agent from its saved
+            // session id. A deliberate `tmux kill-session`, and the agent inside
+            // simply exiting, both leave the client at 0 and fall through to the
+            // normal close/tombstone paths. The cooldown stops a client that dies on
+            // sight (tmux broken, session unusable) from respawning in a tight loop.
+            let tmux_lost = newly_exited
+                && tmux_session.is_some()
+                && (exit_signal.is_some() || exit_code != Some(0))
+                && self
+                    .terminal_launches
+                    .get(&iid)
+                    .is_none_or(|&(at, _)| at.elapsed().as_secs() >= REATTACH_COOLDOWN_SECS);
+
             if resume_error || exit_recover {
                 to_recover.push((iid, title));
+            } else if let Some(session) = tmux_session.filter(|_| tmux_lost) {
+                to_reattach.push((iid, title, session));
             } else if exited && exit_code == Some(0) && self.settings.close_on_exit {
                 // Close-on-exit keys off the actual process exit, not the display
                 // state (Done also means "finished a turn" while still running).
@@ -5311,6 +5364,34 @@ impl MuxelApp {
                 }
                 dirty = true;
             }
+        }
+        for (iid, title, session) in to_reattach {
+            // Deliberately NOT resetting `session_id` the way `to_recover` does. If the
+            // tmux session survived, relaunching reattaches to it and the agent never
+            // noticed. If the whole server was killed, `tmux new-session -A` recreates
+            // the session and the agent relaunches with `--resume <id>`, restoring the
+            // conversation from its transcript — the tmux scrollback is the only
+            // casualty. Resetting the id would throw the conversation away.
+            let alive = integrations::tmux_session_exists(&session);
+            let (heading, detail) = if alive {
+                (
+                    tf("{title}: reattached", &[("title", &title)]),
+                    t("The terminal was killed; its tmux session kept running.").to_string(),
+                )
+            } else {
+                (
+                    tf("{title}: session restored", &[("title", &title)]),
+                    t("The tmux session was killed; the agent was resumed where it left off.")
+                        .to_string(),
+                )
+            };
+            self.add_event(NotifKind::Success, heading, detail);
+            muxel_store::append_event_log(&format!(
+                "{}: \"{title}\" [{session}]",
+                if alive { "reattach" } else { "resume" }
+            ));
+            self.spawn_terminal(iid, window, cx);
+            dirty = true;
         }
         for (iid, title) in to_recover {
             // Reset to a brand-new session so the relaunch uses `--session-id`

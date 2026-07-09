@@ -13,6 +13,27 @@ All notable changes to muxel are documented here. This project adheres to
   sidebar state: hiding it in a project window no longer hides it in the main window.
 
 ### Fixed
+- **An agent's `pkill` could kill every agent in every project** — tmux forks its server
+  from the first client that needs one and the server keeps that client's command line.
+  Since 0.0.9 made local panes default to tmux, that first client was a pane's
+  `tmux new-session -A -s muxel_<project>_… -c <project root>`, so the *shared* server's
+  argv carried a project name. One server hosts every session, so an agent running
+  `pkill -f <project>` to clear its dev server SIGKILLed the server and, with it, every
+  muxel session and every agent inside them.
+  muxel now starts the server itself from a command line naming no project
+  (`tmux start-server ; set -s exit-empty off`, restored on quit), and drops the
+  redundant `-c <project root>` from each pane's client. Such a `pkill` can now reach
+  only that pane's own tmux client — the session and its agent keep running, and the
+  pane **reattaches automatically** instead of leaving a tombstone. The same guard runs
+  on remote hosts, from both the desktop's SSH panes and the iOS companion, since a host
+  has one tmux server shared by everything on it.
+- **A killed tmux session no longer strands the pane** — when the session or the whole
+  server dies (the client reports a bare exit 1, no signal), muxel recreates the session
+  and relaunches the agent with `--resume <session id>`, restoring the conversation from
+  its transcript; only the tmux scrollback is lost. A deliberate `tmux kill-session`, and
+  an agent exiting on its own, both leave the client at 0 and still close/tombstone as
+  before. The feed and `muxel.log` distinguish *reattached* (the tmux session survived)
+  from *session restored* (it didn't, and the agent was resumed).
 - **"Close terminal?" opened on the wrong monitor** — pane confirmations always drew in
   the main window, so closing a pane in a project window popped the prompt up over on
   the main window's display, leaving the project window looking frozen. A confirmation
