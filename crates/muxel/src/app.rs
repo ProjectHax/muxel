@@ -1470,12 +1470,18 @@ impl WorkspaceWindow {
     ) -> Self {
         // Track this window's OS focus for notification gating + PTY focus
         // reporting (mirrors the main window's observer).
+        // Defer the MuxelApp update: activation observers can fire while the App
+        // RefCell is already held (nested paint / COM re-entry on Windows). Updating
+        // MuxelApp immediately has paniced with `RefCell already borrowed`.
         cx.observe_window_activation(window, |this, window, cx| {
             let active = window.is_window_active();
             let pid = this.pid;
-            if let Some(app) = this.app.upgrade() {
-                app.update(cx, |app, cx| app.set_secondary_active(pid, active, cx));
-            }
+            let app = this.app.clone();
+            cx.defer(move |cx| {
+                if let Some(app) = app.upgrade() {
+                    app.update(cx, |app, cx| app.set_secondary_active(pid, active, cx));
+                }
+            });
             cx.notify();
         })
         .detach();
@@ -6088,6 +6094,9 @@ impl MuxelApp {
                 PaneNode::Leaf(ld) => {
                     // Mirror render_pane: a pane holding the focused instance
                     // shows it; others show their own saved active tab.
+                    if ld.tabs.is_empty() {
+                        return;
+                    }
                     let leaf_active = ld.active.min(ld.tabs.len().saturating_sub(1));
                     let iid = match active_instance {
                         Some(a) if ld.tabs.contains(&a) => a,
@@ -8852,9 +8861,19 @@ impl MuxelApp {
         // render delegates back into this entity — opening it while this update
         // holds the MuxelApp lease would double-lease and panic. Run after the
         // current update completes instead.
+        //
+        // Also: never call `MuxelApp::update` from *inside* the window factory.
+        // `open_window` still holds the App RefCell for the initial paint; a nested
+        // `AsyncAppContext`/`Entity::update` of MuxelApp from the factory has
+        // paniced with `RefCell already borrowed` (gpui async_context.rs:65) on
+        // Windows (seen in a field dump after multi-pane use with WebView2 loaded).
+        // Rebuild editors into a slot and install them only in the post-open update.
         cx.defer(move |cx| {
             let slot: std::rc::Rc<std::cell::RefCell<Option<Entity<WorkspaceWindow>>>> =
                 std::rc::Rc::new(std::cell::RefCell::new(None));
+            let rebuilt_editors: std::rc::Rc<
+                std::cell::RefCell<HashMap<Uuid, Entity<EditorView>>>,
+            > = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
             let opened = cx.open_window(
                 gpui::WindowOptions {
                     titlebar: Some(gpui_component::TitleBar::title_bar_options()),
@@ -8867,15 +8886,16 @@ impl MuxelApp {
                 {
                     let slot = slot.clone();
                     let app = app.clone();
+                    let rebuilt_editors = rebuilt_editors.clone();
                     move |window, cx| {
                         window.set_window_title("muxel");
-                        // Editors rebuilt bound to THIS window.
-                        for (iid, snap) in editor_snaps {
-                            let ed = snap.build(config.clone(), window, cx);
-                            if let Some(a) = app.upgrade() {
-                                a.update(cx, |a, _| {
-                                    a.editors.insert(iid, ed);
-                                });
+                        // Editors rebuilt bound to THIS window — stash locally;
+                        // MuxelApp.editors is filled after open_window returns.
+                        {
+                            let mut map = rebuilt_editors.borrow_mut();
+                            for (iid, snap) in editor_snaps {
+                                let ed = snap.build(config.clone(), window, cx);
+                                map.insert(iid, ed);
                             }
                         }
                         let view = cx.new(|cx| {
@@ -8891,6 +8911,8 @@ impl MuxelApp {
             let Some(app) = app.upgrade() else { return };
             app.update(cx, |this, cx| match opened {
                 Ok(handle) => {
+                    // Install editors only once open_window has released its App borrow.
+                    this.editors.extend(rebuilt_editors.borrow_mut().drain());
                     let any: AnyWindowHandle = handle.into();
                     if let Some(view) = slot.borrow_mut().take() {
                         this.secondary_windows.push(SecondaryWindow {

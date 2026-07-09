@@ -68,9 +68,14 @@ pub fn url_span_at(line: &[char], col: usize) -> Option<(usize, usize, String)> 
 
 /// Characters that may appear inside a file path. `:` is included so a trailing
 /// `:line[:col]` suffix stays inside the visual span (it's stripped from the
-/// returned path string).
+/// returned path string). `\` is accepted so Windows paths (`D:\dev\foo.rs`) are
+/// candidates the same way as POSIX paths.
 fn is_path_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '+' | '@' | '%' | '#' | ':')
+    c.is_alphanumeric()
+        || matches!(
+            c,
+            '/' | '\\' | '.' | '_' | '-' | '~' | '+' | '@' | '%' | '#' | ':'
+        )
 }
 
 /// Strip a trailing `:line[:col]` suffix (e.g. `src/x.rs:42:7` → `src/x.rs`).
@@ -115,16 +120,21 @@ pub fn path_spans(line: &[char]) -> Vec<(usize, usize, String)> {
             j -= 1;
         }
         let token = &line[start..j];
-        // Must look like a path: contains '/', isn't a URL (those have "://"),
-        // and starts with a plausible path lead-in.
-        let has_slash = token.contains(&'/');
+        // Must look like a path: contains '/' or '\', isn't a URL (those have
+        // "://"), and starts with a plausible path lead-in (incl. `D:` drives).
+        let has_slash = token.contains(&'/') || token.contains(&'\\');
         let is_url = token.windows(3).any(|w| w == [':', '/', '/']);
         let good_start = token.first().is_some_and(|c| {
-            *c == '/' || *c == '~' || *c == '.' || c.is_alphanumeric() || *c == '_'
+            *c == '/'
+                || *c == '\\'
+                || *c == '~'
+                || *c == '.'
+                || c.is_alphanumeric()
+                || *c == '_'
         });
         if has_slash && !is_url && good_start && token.len() >= 2 {
             let path: String = strip_line_suffix(token).iter().collect();
-            if !path.is_empty() && path != "/" {
+            if !path.is_empty() && path != "/" && path != "\\" {
                 spans.push((start, j, path));
             }
         }
@@ -237,6 +247,13 @@ mod tests {
         assert_eq!(path_span_at(&line, 6).unwrap().2, "~/projects/x.txt");
         assert_eq!(path_span_at(&line, 27).unwrap().2, "./src/lib.rs");
         assert_eq!(path_span_at(&line, 44).unwrap().2, "../up.c");
+    }
+
+    #[test]
+    fn finds_windows_path_with_backslashes() {
+        let line = chars(r"open D:\dev\muxel\src\app.rs please");
+        let p = path_span_at(&line, 10).expect("windows path candidate");
+        assert_eq!(p.2, r"D:\dev\muxel\src\app.rs");
     }
 
     #[test]

@@ -6,6 +6,18 @@ All notable changes to muxel are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- **Windows crash: `RefCell already borrowed` in multi-monitor window open** —
+  opening a project on another monitor rebuilt editors by calling
+  `MuxelApp::update` from inside the `open_window` factory while the App RefCell
+  was still held for the initial paint. That panics at
+  `gpui::async_context::update_entity` (`ext.rs:65` in abort dumps) with
+  `EXCEPTION_STACK_BUFFER_OVERRUN / FAST_FAIL_FATAL_APP_EXIT`. Editors are now
+  staged into a local slot and installed only after `open_window` returns.
+  Secondary-window activation updates are deferred the same way.
+- **Empty leaf tabs no longer index-panic** when scanning visible browser panes.
+- **Ctrl+click Windows paths** — path detection accepts `\` and drive-letter
+  paths (`D:\dev\foo.rs`), not only POSIX `/` paths.
+
 - **Linux AppImage failed to start on modern distros** — the AppImage bundled a
   copy of GLib (and the rest of the GTK/WebKit dependency closure) from the
   Ubuntu 22.04 build runner. It shadowed the host's newer GLib, so the host's
