@@ -113,28 +113,65 @@ struct RemoteProject: Codable, Identifiable, Equatable, Hashable {
     var remoteRoot: String
 }
 
-/// A launch template for the "new instance" sheet — a small on-device subset of
-/// desktop's `AgentPreset` (program + args). Status markers are derived from
-/// `program` via `defaultMarkers`, so they aren't stored here.
+/// A launch template for the "new instance" sheet — an on-device port of desktop's
+/// `AgentPreset` (the fields the launch flow uses). Status markers are still derived
+/// from `program` via `defaultMarkers`, so they aren't stored here.
 struct Preset: Codable, Identifiable, Equatable, Hashable {
     var id = UUID()
     var name: String
     var program: String?   // nil = the remote login shell
     var args: [String] = []
+    /// System-prompt / model / effort / session-resume, mirroring `AgentPreset`.
+    var model: String?
+    var modelFlag: String?
+    var effort: String?
+    var effortFlag: String?
+    var systemPrompt: String?
+    var injection: InjectionMode = .none
+    var startupDelayMs: Int = 0
+    var sessionIdFlag: String?
+    var resumeFlag: String?
 
-    /// Mirrors `AgentPreset::defaults` (names/programs), for the launch picker.
+    /// Mirrors `AgentPreset::defaults` (name/program/flags/injection/resume), for the
+    /// launch picker. Kept in sync with `crates/muxel-core/src/agent.rs`.
     static let builtins: [Preset] = [
         Preset(name: "Shell", program: nil),
-        Preset(name: "Claude", program: "claude"),
-        Preset(name: "opencode", program: "opencode"),
-        Preset(name: "Amp", program: "amp"),
-        Preset(name: "Grok", program: "grok"),
-        Preset(name: "Hermes", program: "hermes"),
-        Preset(name: "Ollama", program: "ollama", args: ["run", "llama3.2"]),
+        Preset(name: "Claude", program: "claude", modelFlag: "--model",
+               injection: .cliFlag(flag: "--append-system-prompt"),
+               sessionIdFlag: "--session-id", resumeFlag: "--resume"),
+        Preset(name: "opencode", program: "opencode", modelFlag: "--model",
+               injection: .typeIn, startupDelayMs: 6000),
+        Preset(name: "Amp", program: "amp", injection: .typeIn),
+        Preset(name: "Grok", program: "grok", modelFlag: "--model", injection: .typeIn),
+        Preset(name: "Hermes", program: "hermes", modelFlag: "--model", injection: .typeIn),
+        Preset(name: "Ollama", program: "ollama", args: ["run", "llama3.2"], injection: .typeIn),
         Preset(name: "Ollama Code", program: "ollama",
-               args: ["launch", "opencode", "--model", "glm-5.2:cloud"]),
-        Preset(name: "Pi", program: "pi"),
+               args: ["launch", "opencode", "--model", "glm-5.2:cloud"],
+               injection: .typeIn, startupDelayMs: 6000),
+        Preset(name: "Pi", program: "pi", modelFlag: "--model", injection: .typeIn),
     ]
+}
+
+extension Preset {
+    /// Defaults-tolerant decode so a persisted custom preset written before a new
+    /// field existed still loads (the synthesized decoder would throw on the missing
+    /// key). Builtins are hardcoded, so this only matters once custom presets persist.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try c.decodeIfPresent(UUID.self, forKey: .id)) ?? UUID()
+        name = try c.decode(String.self, forKey: .name)
+        program = try c.decodeIfPresent(String.self, forKey: .program)
+        args = (try c.decodeIfPresent([String].self, forKey: .args)) ?? []
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        modelFlag = try c.decodeIfPresent(String.self, forKey: .modelFlag)
+        effort = try c.decodeIfPresent(String.self, forKey: .effort)
+        effortFlag = try c.decodeIfPresent(String.self, forKey: .effortFlag)
+        systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt)
+        injection = (try c.decodeIfPresent(InjectionMode.self, forKey: .injection)) ?? .none
+        startupDelayMs = (try c.decodeIfPresent(Int.self, forKey: .startupDelayMs)) ?? 0
+        sessionIdFlag = try c.decodeIfPresent(String.self, forKey: .sessionIdFlag)
+        resumeFlag = try c.decodeIfPresent(String.self, forKey: .resumeFlag)
+    }
 }
 
 /// The persisted on-device document (no secrets — those are in the Keychain).

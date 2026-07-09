@@ -6,7 +6,6 @@ import UniformTypeIdentifiers
 /// sheet from the sidebar. Secrets go to the Keychain via `AppState`.
 struct IdentitiesView: View {
     @EnvironmentObject var state: AppState
-    @EnvironmentObject var appLock: AppLock
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     @State private var editing: Identity?
@@ -43,7 +42,6 @@ struct IdentitiesView: View {
                         deleteTarget = offsets.map { state.doc.identities[$0] }.first
                     }
                 }
-                securitySection
             }
             .muxelSheet()
             .navigationTitle("Identities")
@@ -79,33 +77,6 @@ struct IdentitiesView: View {
         }
     }
 
-    /// App Lock lives here: this sheet is the app's credential manager, the natural
-    /// home for the toggle that protects those credentials' UI.
-    private var securitySection: some View {
-        MuxelSection("Security") {
-            Toggle("Require Face ID / passcode to open muxel", isOn: appLockBinding)
-                .disabled(!appLock.isAvailable)
-        } footer: {
-            Text(appLock.isAvailable
-                ? "Protects the app UI. Background status polling and notifications "
-                    + "keep working while locked."
-                : "Set a device passcode to use App Lock.")
-        }
-    }
-
-    private var appLockBinding: Binding<Bool> {
-        Binding(
-            get: { appLock.isEnabled },
-            set: { on in
-                appLock.isEnabled = on
-                if on {
-                    // Prove the user can pass before the lock can ever engage;
-                    // a failed/canceled check rolls the toggle back.
-                    Task { await appLock.confirmEnable() }
-                }
-            }
-        )
-    }
 }
 
 /// Add or edit a single login identity. On edit, a blank password / no re-imported
@@ -143,6 +114,7 @@ struct IdentityEditorView: View {
                     TextField("Name", text: $name)
                     TextField("User", text: $user)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .noPasswordAutoFill()
                 }
                 MuxelSection("Authentication") {
                     Picker("Method", selection: $auth) {

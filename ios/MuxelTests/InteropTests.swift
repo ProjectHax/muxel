@@ -69,6 +69,99 @@ final class InteropTests: XCTestCase {
         XCTAssertEqual(layout.instances.map(\.id), ["bbbb"])
     }
 
+    func testUnknownInstanceKindDecodesAndRoundTrips() throws {
+        // A desktop that adds a new pane kind (here Browser + a hypothetical future
+        // one) must not break the whole layout decode on an older iOS build, and an
+        // iOS write-back must preserve the raw kind + browser_url verbatim.
+        let json = """
+        {
+          "version": 1,
+          "updated_at": 1719500000,
+          "remote_root": "/srv/app",
+          "layout": { "kind": "leaf", "tabs": ["cccccccc-0000-0000-0000-000000000000"], "active": 0 },
+          "instances": [
+            { "id": "cccccccc-0000-0000-0000-000000000000", "project_id": "11110000-0000-0000-0000-000000000000",
+              "title": "Docs", "kind": "Browser", "browser_url": "https://example.com" },
+            { "id": "dddddddd-0000-0000-0000-000000000000", "project_id": "11110000-0000-0000-0000-000000000000",
+              "title": "Mystery", "kind": "SomethingNew" }
+          ],
+          "worktrees": []
+        }
+        """
+        let layout = try MuxelJSON.decoder.decode(RemoteLayout.self, from: Data(json.utf8))
+        XCTAssertEqual(layout.instances.count, 2)
+        XCTAssertEqual(layout.instances[0].kind, .browser)
+        XCTAssertEqual(layout.instances[0].browserUrl, "https://example.com")
+        XCTAssertEqual(layout.instances[1].kind, .other("SomethingNew"))
+
+        // Round-trip: unknown kind + browser_url survive an encode (an iOS rewrite).
+        let data = try MuxelJSON.encoder.encode(layout.instances[1])
+        let back = try MuxelJSON.decoder.decode(Instance.self, from: data)
+        XCTAssertEqual(back.kind, .other("SomethingNew"))
+        let bdata = try MuxelJSON.encoder.encode(layout.instances[0])
+        let bback = try MuxelJSON.decoder.decode(Instance.self, from: bdata)
+        XCTAssertEqual(bback.kind, .browser)
+        XCTAssertEqual(bback.browserUrl, "https://example.com")
+    }
+
+    func testOrderedPaneInstancesIncludesEditorAndDiff() throws {
+        let json = """
+        {
+          "version": 1, "updated_at": 1, "remote_root": "/srv/app",
+          "layout": { "kind": "leaf", "tabs": [
+            "aaaaaaaa-0000-0000-0000-000000000000",
+            "bbbbbbbb-0000-0000-0000-000000000000",
+            "cccccccc-0000-0000-0000-000000000000" ], "active": 0 },
+          "instances": [
+            { "id": "aaaaaaaa-0000-0000-0000-000000000000", "project_id": "p", "title": "Claude", "program": "claude" },
+            { "id": "bbbbbbbb-0000-0000-0000-000000000000", "project_id": "p", "title": "file.swift", "kind": "Editor", "editor_path": "/srv/app/file.swift" },
+            { "id": "cccccccc-0000-0000-0000-000000000000", "project_id": "p", "title": "diff", "kind": "Diff" }
+          ],
+          "worktrees": []
+        }
+        """
+        let layout = try MuxelJSON.decoder.decode(RemoteLayout.self, from: Data(json.utf8))
+        // Pane list keeps all three; the terminal-only list (poll input) keeps one.
+        XCTAssertEqual(layout.orderedPaneInstances.map(\.kind), [.terminal, .editor, .diff])
+        XCTAssertEqual(layout.orderedTerminalInstances.map(\.kind), [.terminal])
+    }
+
+    func testParseAllPanes() {
+        let now = Int(Date().timeIntervalSince1970)
+        let s = """
+        muxel_host_aaaaaaaa\t0\t0\t\(now - 1)
+        muxel_host_bbbbbbbb\t1\t0\t\(now - 100)
+        muxel_host_cccccccc\t0\t1\t\(now - 3)
+        """
+        let rows = PollService.parseAllPanes(s)
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertEqual(rows[0].session, "muxel_host_aaaaaaaa")
+        XCTAssertFalse(rows[0].exited)
+        XCTAssertLessThan(rows[0].idle, 5)
+        XCTAssertTrue(rows[1].exited)
+        XCTAssertTrue(rows[2].bell)
+        // Empty output (no running server) → no rows.
+        XCTAssertEqual(PollService.parseAllPanes("").count, 0)
+        // A session reporting two panes keeps the first row.
+        let dup = PollService.parseAllPanes("s\t0\t0\t\(now)\ns\t1\t0\t\(now)")
+        XCTAssertEqual(dup.count, 1)
+        XCTAssertFalse(dup[0].exited)
+    }
+
+    func testAggregateProjectActivity() {
+        let results = [
+            InstanceStatus(instanceId: "a", status: .working, running: true),
+            InstanceStatus(instanceId: "b", status: .blocked, running: true),
+            InstanceStatus(instanceId: "c", status: .done, running: true),
+            InstanceStatus(instanceId: "d", status: .idle, running: false),
+        ]
+        let a = AppState.aggregate(results)
+        XCTAssertEqual(a.running, 3)  // "d" has no live session
+        XCTAssertEqual(a.blocked, 1)
+        XCTAssertEqual(a.done, 1)
+        XCTAssertEqual(AppState.aggregate([]).running, 0)
+    }
+
     func testParseMeta() {
         XCTAssertEqual(PollService.parseMeta("0\t0\t0").exited, false)
         XCTAssertEqual(PollService.parseMeta("1\t0\t0").exited, true)

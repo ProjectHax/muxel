@@ -67,6 +67,7 @@ struct DiscoverProjectsView: View {
                         Text("Each is a directory on \(host.name) containing a .muxel/ folder.")
                     }
                 }
+                .refreshable { await scan() }
             }
         }
         .muxelSheet()

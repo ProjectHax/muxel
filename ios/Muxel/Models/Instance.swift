@@ -6,12 +6,48 @@ struct EnvVar: Codable, Equatable {
     var value: String
 }
 
-/// What a pane runs. Port of `InstanceKind` — serialized as the bare variant name.
-/// The iOS app only attaches to `terminal` instances (editor/diff are desktop-only).
-enum InstanceKind: String, Codable, Equatable {
-    case terminal = "Terminal"
-    case editor = "Editor"
-    case diff = "Diff"
+/// What a pane runs. Port of `InstanceKind` (`crates/muxel-core/src/lib.rs`) —
+/// serialized as the bare variant name. A kind the iOS build doesn't know (e.g. a
+/// newer desktop adds one) decodes to `.other(raw)` and re-encodes verbatim, so a
+/// pane iOS can't render can't corrupt the layout or break the whole decode.
+enum InstanceKind: Equatable {
+    case terminal
+    case editor
+    case diff
+    case browser
+    case other(String)
+
+    init(rawValue: String) {
+        switch rawValue {
+        case "Terminal": self = .terminal
+        case "Editor": self = .editor
+        case "Diff": self = .diff
+        case "Browser": self = .browser
+        default: self = .other(rawValue)
+        }
+    }
+
+    var rawValue: String {
+        switch self {
+        case .terminal: return "Terminal"
+        case .editor: return "Editor"
+        case .diff: return "Diff"
+        case .browser: return "Browser"
+        case .other(let raw): return raw
+        }
+    }
+}
+
+extension InstanceKind: Codable {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        self.init(rawValue: try c.decode(String.self))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(rawValue)
+    }
 }
 
 /// Persisted metadata for one pane. Port of `Instance`
@@ -24,6 +60,9 @@ struct Instance: Codable, Equatable, Identifiable {
     var title: String
     var kind: InstanceKind = .terminal
     var editorPath: String?
+    /// For browser panes: the current URL. iOS never renders browser panes, but
+    /// preserves this so an iOS layout write-back doesn't strip it from the peer.
+    var browserUrl: String?
     var customName: String?
     var program: String?
     var args: [String] = []
@@ -50,6 +89,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case projectId = "project_id"
         case title, kind
         case editorPath = "editor_path"
+        case browserUrl = "browser_url"
         case customName = "custom_name"
         case program, args
         case systemPrompt = "system_prompt"
@@ -70,14 +110,15 @@ struct Instance: Codable, Equatable, Identifiable {
         case sessionStarted = "session_started"
     }
 
-    /// Build a fresh terminal instance the iOS app is about to launch.
+    /// Build a fresh terminal instance the iOS app is about to launch. `sessionStarted`
+    /// stays false so a resume-capable agent's first launch uses `--session-id` (later
+    /// re-attaches flip it to `--resume`); it's inert for non-resume presets.
     init(id: String, projectId: String, title: String, program: String?, args: [String]) {
         self.id = id
         self.projectId = projectId
         self.title = title
         self.program = program
         self.args = args
-        self.sessionStarted = true
     }
 
     init(from decoder: Decoder) throws {
@@ -87,6 +128,7 @@ struct Instance: Codable, Equatable, Identifiable {
         title = try c.decode(String.self, forKey: .title)
         kind = (try c.decodeIfPresent(InstanceKind.self, forKey: .kind)) ?? .terminal
         editorPath = try c.decodeIfPresent(String.self, forKey: .editorPath)
+        browserUrl = try c.decodeIfPresent(String.self, forKey: .browserUrl)
         customName = try c.decodeIfPresent(String.self, forKey: .customName)
         program = try c.decodeIfPresent(String.self, forKey: .program)
         args = (try c.decodeIfPresent([String].self, forKey: .args)) ?? []
@@ -116,6 +158,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(title, forKey: .title)
         try c.encode(kind, forKey: .kind)
         try c.encode(editorPath, forKey: .editorPath)
+        try c.encode(browserUrl, forKey: .browserUrl)
         try c.encode(customName, forKey: .customName)
         try c.encode(program, forKey: .program)
         try c.encode(args, forKey: .args)

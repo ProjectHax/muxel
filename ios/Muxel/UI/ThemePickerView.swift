@@ -11,10 +11,12 @@ struct ThemePickerView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                LazyVStack(spacing: 10) {
-                    ForEach(themeStore.all) { candidate in
-                        row(candidate)
-                    }
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    PromptHeader(text: "Dark")
+                    ForEach(themeStore.all.filter(\.isDark)) { row($0) }
+                    PromptHeader(text: "Light")
+                        .padding(.top, 8)
+                    ForEach(themeStore.all.filter { !$0.isDark }) { row($0) }
                 }
                 .padding()
             }

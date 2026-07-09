@@ -28,7 +28,7 @@ final class DraftConnectionTests: XCTestCase {
                      "the staged secret is deleted after the attempt")
         XCTAssertNil(Keychain.password(for: draft.id),
                      "nothing is stored under the (unsaved) host id")
-        XCTAssertNil(state.testResult, "the in-form test never raises the blocking alert")
+        XCTAssertNil(state.notice, "the in-form test returns inline, never raising a banner")
     }
 
     func testEditModeKeepingStoredSecretPassesNoCredential() async {

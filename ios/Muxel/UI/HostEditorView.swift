@@ -49,6 +49,9 @@ struct HostEditorView: View {
     @Environment(\.dismiss) private var dismiss
     /// nil = add a new host.
     let existing: Host?
+    /// Called with the freshly-added host after an add-mode save (not on edit), so
+    /// the caller can chain straight into "Scan for projects".
+    var onSaved: ((Host) -> Void)? = nil
 
     @State private var name = ""
     @State private var hostname = ""
@@ -118,6 +121,7 @@ struct HostEditorView: View {
                     if !usingIdentity {
                         TextField("User", text: $user)
                             .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            .noPasswordAutoFill()
                     }
                 }
                 if !state.doc.identities.isEmpty {
@@ -325,6 +329,7 @@ struct HostEditorView: View {
             state.updateHost(host, password: pw, keyData: kd, passphrase: pp)
         } else {
             state.addHost(host, password: pw, keyData: kd, passphrase: pp)
+            onSaved?(host)
         }
     }
 
@@ -344,5 +349,6 @@ struct HostEditorView: View {
         var host = makeHost(withCredentials: false)
         host.identityId = identity.id
         state.addHost(host, password: nil, keyData: nil, passphrase: nil)
+        onSaved?(host)
     }
 }

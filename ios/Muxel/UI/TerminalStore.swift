@@ -20,6 +20,9 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
 
     private let connection: SSHConnection
     private let command: String
+    /// Bounds concurrent PTY channel opens on this host (nil = unbounded). Held only
+    /// through channel establishment, not the session's lifetime.
+    private let openGate: PTYOpenGate?
     private let events = AsyncStream<Event>.makeStream()
     private var task: Task<Void, Never>?
     /// Set once `start()` is requested; the PTY actually opens on the first real size.
@@ -27,6 +30,10 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     /// The most recent grid size SwiftTerm reported, used to open the PTY at the right
     /// size (and as the latest size for resizes once running).
     private var lastSize: (cols: Int, rows: Int)?
+    /// Debounces the PTY window-change: a pane resize (dragging a split divider) re-frames
+    /// the view every frame, and sending a window-change per frame floods SSH + reflows
+    /// tmux each time. We coalesce to one send once the size settles.
+    private var resizeDebounce: Task<Void, Never>?
     /// Single-finger scroll gesture, the pan translation already converted to wheel
     /// ticks, and the post-lift momentum loop.
     private weak var scrollGesture: UIPanGestureRecognizer?
@@ -42,21 +49,44 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     /// Fires with the final snapped size when a pinch ends; the store persists it
     /// and re-fonts every other live terminal.
     var onFontSizeCommitted: ((CGFloat) -> Void)?
+    /// Fires (main actor) when the PTY ends **unexpectedly** — a transport drop, not a
+    /// user-initiated `disconnect()`. Drives the pane's reconnect overlay + retry.
+    var onConnectionLost: (() -> Void)?
+    /// Fires when the user taps into this terminal — the deterministic focus hook the
+    /// split UI uses to move keyboard/toolbar focus to this pane's leaf.
+    var onFocusRequested: (() -> Void)?
+    /// Set by `disconnect()` so the terminal `run()` completing after a deliberate
+    /// teardown (Close pane / host edit / quit) doesn't read as a drop.
+    private var intentionallyClosed = false
     /// Held-backspace acceleration state (see `send`).
     private var deleteStreak = 0
     private var lastDeleteAt: TimeInterval = 0
     /// Bell-haptic throttle (some TUIs ring BEL per keystroke).
     private var lastBellAt: TimeInterval = 0
+    /// Unix time of the most recent PTY output — the live-status oracle. 0 until the
+    /// first byte arrives (the `has_output` gate for startup injection + classify).
+    private(set) var lastOutputAt: TimeInterval = 0
+
+    /// Seconds since the last PTY output (the `idle_for` equivalent from live output,
+    /// tighter than tmux `window_activity`). `.greatestFiniteMagnitude` before any.
+    var idleFor: TimeInterval {
+        lastOutputAt == 0 ? .greatestFiniteMagnitude : max(0, Date().timeIntervalSince1970 - lastOutputAt)
+    }
+    /// Whether the PTY has produced any output yet (startup-injection readiness).
+    var hasOutput: Bool { lastOutputAt > 0 }
+    /// Whether the pane rang the bell within the last poll interval (~3s).
+    var recentBell: Bool { lastBellAt > 0 && Date().timeIntervalSince1970 - lastBellAt < 3 }
 
     enum Event {
         case send(ByteBuffer)
         case changeSize(cols: Int, rows: Int)
     }
 
-    init(view: TerminalView, connection: SSHConnection, command: String) {
+    init(view: TerminalView, connection: SSHConnection, command: String, openGate: PTYOpenGate? = nil) {
         self.view = view
         self.connection = connection
         self.command = command
+        self.openGate = openGate
         super.init()
         installGestures()
         // Replace SwiftTerm's stock gray accessory bar with the themed muxel row.
@@ -133,6 +163,7 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
 
     @objc private func handleFocusTap(_ g: UITapGestureRecognizer) {
         if !view.isFirstResponder { _ = view.becomeFirstResponder() }
+        onFocusRequested?()
     }
 
     @objc private func handleScrollPan(_ g: UIPanGestureRecognizer) {
@@ -235,9 +266,12 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     /// Tear the session down: end input, cancel the PTY task (detaches the tmux client;
     /// the remote session lives on), and mark dead. Called on the main actor.
     func disconnect() {
+        intentionallyClosed = true
         isConnected = false
         momentumTask?.cancel()
         momentumTask = nil
+        resizeDebounce?.cancel()
+        resizeDebounce = nil
         events.continuation.finish()
         task?.cancel()
         task = nil
@@ -246,6 +280,8 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
     @MainActor private func markDisconnected() {
         isConnected = false
         task = nil
+        // A drop (not a user-initiated teardown) → tell the pane to reconnect.
+        if !intentionallyClosed { onConnectionLost?() }
     }
 
     private func run(cols: Int, rows: Int) async {
@@ -253,13 +289,18 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
             await feedText("\r\n[no live terminal in this build]\r\n")
             return
         }
+        // Bound concurrent channel opens: acquire before opening, release once the
+        // channel is established (top of the withPTY body) or if the open fails.
+        await openGate?.acquire()
+        let releaser = GateReleaser(gate: openGate)
         do {
             try await client.withPTY(
                 .init(wantReply: true, term: "xterm-256color",
                       terminalCharacterWidth: cols, terminalRowHeight: rows,
                       terminalPixelWidth: 0, terminalPixelHeight: 0,
                       terminalModes: .init([.ECHO: 5]))
-            ) { [command, stream = events.stream] inbound, outbound in
+            ) { [command, stream = events.stream, releaser] inbound, outbound in
+                await releaser.release()  // channel established
                 // Replace the PTY's login shell with tmux (attach / new-session -A).
                 try await outbound.write(ByteBuffer(string: command + "\n"))
                 await withThrowingTaskGroup(of: Void.self) { group in
@@ -287,16 +328,35 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
                 }
             }
         } catch {
+            await releaser.release()  // release if the open itself failed
             await feedText("\r\n[disconnected: \(error.localizedDescription)]\r\n")
         }
+        await releaser.release()  // safety: no-op once released
     }
 
     @MainActor private func feed(_ bytes: ArraySlice<UInt8>) {
+        lastOutputAt = Date().timeIntervalSince1970
         view.feed(byteArray: bytes)
     }
 
     @MainActor private func feedText(_ text: String) {
         view.feed(text: text)
+    }
+
+    /// The visible grid as plain text — the marker-scan input, the iOS analogue of
+    /// desktop's `visible_text()` (`session.rs`). Reads only the on-screen rows
+    /// (`0..<rows`, resolved through the display offset by SwiftTerm), never
+    /// scrollback, so it's cheap enough to run every poll. Main actor (SwiftTerm state).
+    @MainActor func visibleText() -> String {
+        let terminal = view.getTerminal()
+        var lines: [String] = []
+        lines.reserveCapacity(terminal.rows)
+        for row in 0..<terminal.rows {
+            if let line = terminal.getLine(row: row) {
+                lines.append(line.translateToString(trimRight: true))
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// Accessory-key path: raw bytes straight to the PTY, bypassing the delegate
@@ -350,8 +410,14 @@ final class TerminalSession: NSObject, TerminalViewDelegate, UIGestureRecognizer
             // …then open the PTY at the real size.
             launch(cols: newCols, rows: newRows)
         } else {
-            // Already running → forward as a live resize.
-            events.continuation.yield(.changeSize(cols: newCols, rows: newRows))
+            // Already running → forward as a live resize, debounced so a divider drag
+            // (many size changes) sends one window-change once it settles, not per frame.
+            resizeDebounce?.cancel()
+            resizeDebounce = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                guard let self, !Task.isCancelled else { return }
+                self.events.continuation.yield(.changeSize(cols: newCols, rows: newRows))
+            }
         }
     }
 
@@ -411,6 +477,36 @@ final class TerminalStore {
         let session: TerminalSession
     }
     private var entries: [String: Entry] = [:]
+    /// One PTY-open gate per host, so cold-starting a multi-pane split layout doesn't
+    /// fire N unbounded channel opens at once.
+    private var gates: [UUID: PTYOpenGate] = [:]
+    /// Fired (main actor) with an instance id when its session drops unexpectedly.
+    /// `AppState` wires this to `deadPanes` so the pane shows a reconnect overlay.
+    var onSessionDied: ((String) -> Void)?
+
+    private func gate(for hostId: UUID) -> PTYOpenGate {
+        if let g = gates[hostId] { return g }
+        let g = PTYOpenGate(limit: 2)
+        gates[hostId] = g
+        return g
+    }
+
+    /// Whether the instance's live session has produced any PTY output yet — the
+    /// readiness oracle for startup injection. False if no session is attached.
+    func hasOutput(for instanceId: String) -> Bool {
+        entries[instanceId]?.session.hasOutput ?? false
+    }
+
+    /// A connected pane's live-screen snapshot for marker classification, or nil if no
+    /// session is attached for `instanceId`. Reading the SwiftTerm grid is cheap; it's
+    /// what gives an attached pane real working/blocked status (unlike the tmux-vars
+    /// poll, which can only see exit/bell/activity).
+    func liveScreen(for instanceId: String) -> LiveScreen? {
+        guard let e = entries[instanceId], e.session.isConnected else { return nil }
+        return LiveScreen(text: e.session.visibleText(),
+                          idle: e.session.idleFor,
+                          bell: e.session.recentBell)
+    }
 
     /// The live session for `instanceId`, or nil if none — recycling (dropping) a
     /// session whose PTY has died so the caller re-creates a fresh attach.
@@ -430,12 +526,14 @@ final class TerminalStore {
                  connection: SSHConnection, command: String) -> TerminalSession {
         if let s = existing(instanceId) { return s }
         let view = TerminalView(frame: .zero, font: TerminalFontPreference.font)
-        let session = TerminalSession(view: view, connection: connection, command: command)
+        let session = TerminalSession(view: view, connection: connection, command: command,
+                                      openGate: gate(for: hostId))
         view.terminalDelegate = session
         session.onFontSizeCommitted = { [weak self] size in
             TerminalFontPreference.size = size
             self?.applyFontSize(size, except: instanceId)
         }
+        session.onConnectionLost = { [weak self] in self?.onSessionDied?(instanceId) }
         entries[instanceId] = Entry(hostId: hostId, session: session)
         session.start()
         return session
@@ -460,9 +558,44 @@ final class TerminalStore {
             entries[id] = nil
         }
     }
+}
 
-    func disconnectAll() {
-        for e in entries.values { e.session.disconnect() }
-        entries.removeAll()
+/// A counting semaphore bounding concurrent PTY channel opens per host. Same
+/// continuation-queue shape as `CitadelSSHConnection`'s command slot.
+actor PTYOpenGate {
+    private let limit: Int
+    private var active = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) { self.limit = limit }
+
+    func acquire() async {
+        if active < limit {
+            active += 1
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if let next = waiters.first {
+            waiters.removeFirst()
+            next.resume()  // hand the slot straight to a waiter (active unchanged)
+        } else {
+            active = max(0, active - 1)
+        }
+    }
+}
+
+/// One-shot gate release, so both the withPTY body (channel established) and the
+/// open-failure catch can call `release()` without double-releasing.
+actor GateReleaser {
+    private let gate: PTYOpenGate?
+    private var done = false
+    init(gate: PTYOpenGate?) { self.gate = gate }
+    func release() async {
+        guard !done else { return }
+        done = true
+        await gate?.release()
     }
 }

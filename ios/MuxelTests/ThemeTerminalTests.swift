@@ -34,6 +34,27 @@ final class ThemeTerminalTests: XCTestCase {
         }
     }
 
+    func testAllThemeIdsAreUnique() {
+        let ids = MuxelTheme.all.map(\.id)
+        XCTAssertEqual(Set(ids).count, ids.count, "theme ids must be unique")
+    }
+
+    func testByIdRoundTripsEveryTheme() {
+        for t in MuxelTheme.all {
+            XCTAssertEqual(MuxelTheme.byId(t.id).id, t.id, "byId should round-trip \(t.name)")
+        }
+        // An unknown id falls back to the default (Mocha).
+        XCTAssertEqual(MuxelTheme.byId("nope").id, MuxelTheme.mocha.id)
+    }
+
+    func testAccentIsNotAParseFallbackForPortedThemes() {
+        // A broken hex parses to pure black; every theme's accent should be a real color.
+        for t in MuxelTheme.all {
+            let (r, g, b, _) = muxelHexComponents(t.accent)
+            XCTAssertFalse(r == 0 && g == 0 && b == 0, "\(t.name) accent looks like a parse fallback")
+        }
+    }
+
     /// Rough relative luminance (0 = black, 1 = white) from a `#rrggbb` hex.
     private func luminance(_ hex: String) -> Double {
         let (r, g, b, _) = muxelHexComponents(hex)

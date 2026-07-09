@@ -98,6 +98,9 @@ the matching Swift port and the `RemoteLayout` version handling.
 | `tmux new-session -A -d -s … -c … -- prog args` | `tmux.rs` | `Tmux/TmuxCommands.swift` |
 | `RemoteLayout` v1 JSON (`.muxel/workspace.json`) | `crates/muxel-core/src/lib.rs` | `Models/RemoteLayout.swift` |
 | Pane tree (`leaf`/`split` tagged enum, legacy `instance` leaf) | `crates/muxel-core/src/pane.rs` | `Models/PaneNode.swift` |
+| Pane-tree mutations (`split`/`move_into_split`/`add_tab`/`remove`/`normalize`) | `pane.rs` | `Models/PaneMutations.swift` |
+| Launch resolution (`compose_args`/`resolve_launch`/`session_resume_args`) | `agent.rs` | `Models/AgentLaunch.swift` |
+| Worktree naming (`slug`/`branch_name`/`dir_name`/`next_worktree_color`) | `worktree.rs`, `lib.rs` | `Models/WorktreeNaming.swift` |
 | `Instance` / `Worktree` / `InjectionMode` | `lib.rs`, `worktree.rs`, `agent.rs` | `Models/*.swift` |
 | `.muxel/` read + write (prep one-liner, backup, gitignore) | `crates/muxel/src/integrations.rs` | `Interop/RemoteLayoutStore.swift` |
 | Status `classify` + `latch_done` | `crates/muxel-terminal/src/view.rs` | `Status/AgentStatus.swift` |
@@ -209,10 +212,23 @@ signal, not true input-blocking (which needs screen scraping the app doesn't do)
 without APNs the backgrounded activity only refreshes at the OS poll cadence
 (~15 min+) so it's marked stale between updates.
 
+**iPad split view** renders the desktop's `PaneNode` split tree with live terminals
+side by side (a recursive `ProportionalSplit` layout over the same tree desktop
+persists), with basic split editing ("open in split right/below" from a tab's
+menu, written back to `workspace.json`) and per-leaf focus; iPhone keeps the flat
+tab strip. **Worktree creation** (a launch toggle) runs `git worktree add` over SSH
+and registers the `Worktree` record so desktop adopts it. **Richer launch**: system
+prompt (CliFlag / TypeIn injection), model, and session resume (`--session-id` →
+`--resume`). **Editor/diff panes** created on desktop render read-only on the phone
+(remote file cat + `git diff` with +/- coloring). **Live-grid status**: an attached
+pane's screen text feeds the ported `classify` + markers, so working/blocked is real
+while a pane is open. **Cross-project status**: the sidebar shows running/needs-input
+badges for every connected project (one batched `list-panes -a` sweep per host).
+
 Future: APNs push via a remote watcher daemon (instant background alerts + live
-status-bar updates); tmux
-**control mode** (`-C`) for structured multi-pane multiplexing; split-tree
-rendering/editing; worktree creation; editor/diff panes.
+status-bar updates); tmux **control mode** (`-C`); interactive split resize + tab
+reorder; worktree deletion/disposal UX; agent-preset editing; editor saving / diff
+staging.
 
 ## License
 

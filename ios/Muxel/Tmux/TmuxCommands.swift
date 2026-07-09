@@ -123,6 +123,17 @@ enum TmuxCommands {
          "#{pane_dead}\t#{window_bell_flag}\t#{window_activity}"]
     }
 
+    /// Tab-delimited status for **every** pane on the host in a single round trip:
+    /// `session_name<TAB>pane_dead<TAB>window_bell_flag<TAB>window_activity`. Since
+    /// muxel sessions are host-global (one tmux server per host user), one call
+    /// classifies every project on the host — the batched replacement for a
+    /// `list-sessions` + N per-session `paneStatus` reads. `list-panes -a` needs no
+    /// target; a host with no running server exits non-zero (treat as empty).
+    static func allPaneStatuses() -> [String] {
+        ["list-panes", "-a", "-F",
+         "#{session_name}\t#{pane_dead}\t#{window_bell_flag}\t#{window_activity}"]
+    }
+
     /// Clear a window's bell flag once we've acted on it (attend equivalent).
     static func clearBell(session: String) -> [String] {
         ["set-option", "-w", "-t", paneTarget(session), "monitor-bell", "off"]

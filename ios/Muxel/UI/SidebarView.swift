@@ -2,8 +2,9 @@ import SwiftUI
 import UIKit
 
 /// The collapsible sidebar: hosts as sections, projects as rows, with add/delete.
-/// Per-project live status across *all* projects is the background poller's job;
-/// the sidebar shows live status only for the selected project (via the detail).
+/// Each project row shows running / needs-input badges: live for the selected
+/// project, and from the foreground cross-project sweep (over already-connected
+/// hosts) for the rest.
 struct SidebarView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.theme) private var theme
@@ -12,8 +13,7 @@ struct SidebarView: View {
     @Binding var addProjectForHost: Host?
     @Binding var discoverForHost: Host?
     @Binding var editHost: Host?
-    @State private var showThemePicker = false
-    @State private var showIdentities = false
+    @State private var showSettings = false
     @State private var deleteHostTarget: Host?
     @State private var deleteProjectsTarget: [RemoteProject] = []
 
@@ -39,30 +39,42 @@ struct SidebarView: View {
     var body: some View {
         List(selection: selection) {
             if state.doc.hosts.isEmpty {
-                PromptLabel(text: "no hosts yet — tap + to add one", style: .footnote)
-                    .listRowBackground(Color.clear)
+                VStack(alignment: .leading, spacing: 10) {
+                    PromptLabel(text: "no hosts yet", style: .footnote)
+                    Button { showAddHost = true } label: {
+                        Label("Add a host", systemImage: "plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+                .padding(.vertical, 4)
+                .listRowBackground(Color.clear)
             }
             ForEach(state.doc.hosts) { host in
                 Section {
-                    ForEach(state.projects(for: host)) { project in
-                        ProjectRow(project: project,
-                                   selected: state.selectedProject?.id == project.id,
-                                   running: state.runningCount(for: project))
-                            .tag(project.id)
-                            .listRowBackground(Color.clear)
+                    if state.projects(for: host).isEmpty {
+                        emptyProjectsHint(host)
+                    } else {
+                        ForEach(state.projects(for: host)) { project in
+                            ProjectRow(project: project,
+                                       selected: state.selectedProject?.id == project.id,
+                                       activity: state.activity(for: project))
+                                .tag(project.id)
+                                .listRowBackground(Color.clear)
+                        }
+                        .onDelete { offsets in
+                            let projects = state.projects(for: host)
+                            deleteProjectsTarget = offsets.map { projects[$0] }
+                        }
+                        Button {
+                            addProjectForHost = host
+                        } label: {
+                            Label("Add project", systemImage: "plus.circle")
+                                .font(.mono(.footnote))
+                                .foregroundStyle(theme.mutedColor)
+                        }
+                        .listRowBackground(Color.clear)
                     }
-                    .onDelete { offsets in
-                        let projects = state.projects(for: host)
-                        deleteProjectsTarget = offsets.map { projects[$0] }
-                    }
-                    Button {
-                        addProjectForHost = host
-                    } label: {
-                        Label("Add project", systemImage: "plus.circle")
-                            .font(.mono(.footnote))
-                            .foregroundStyle(theme.mutedColor)
-                    }
-                    .listRowBackground(Color.clear)
                 } header: {
                     hostHeader(host)
                 }
@@ -74,6 +86,7 @@ struct SidebarView: View {
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
         .muxelBackground()
+        .refreshable { await state.refreshAll() }
         .toolbar {
             ToolbarItem(placement: .principal) {
                 HStack(spacing: 6) {
@@ -84,19 +97,16 @@ struct SidebarView: View {
                     Text("muxel")
                         .font(.mono(.headline, weight: .bold))
                         .foregroundStyle(theme.textColor)
+                        // Never wrap to "mux/el" when the sidebar column is narrow.
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
             }
             ToolbarItem(placement: .topBarLeading) {
-                Button { showThemePicker = true } label: {
-                    Image(systemName: "paintpalette")
+                Button { showSettings = true } label: {
+                    Image(systemName: "gearshape")
                 }
-                .accessibilityLabel("Theme")
-            }
-            ToolbarItem(placement: .topBarLeading) {
-                Button { showIdentities = true } label: {
-                    Image(systemName: "person.badge.key")
-                }
-                .accessibilityLabel("Login identities")
+                .accessibilityLabel("Settings")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { showAddHost = true } label: {
@@ -104,9 +114,10 @@ struct SidebarView: View {
                 }
             }
         }
-        .sheet(isPresented: $showThemePicker) { ThemePickerView() }
-        .sheet(isPresented: $showIdentities) { IdentitiesView() }
-        .confirmationDialog(
+        .sheet(isPresented: $showSettings) { SettingsView() }
+        // An alert, not a confirmationDialog: this is triggered from the host `…` menu,
+        // and a menu-triggered confirmationDialog presents as a stray anchored popover.
+        .alert(
             deleteHostTarget.map {
                 ConfirmationCopy.deleteHost($0, projectCount: state.projects(for: $0).count).title
             } ?? "Delete host?",
@@ -114,7 +125,6 @@ struct SidebarView: View {
                 get: { deleteHostTarget != nil },
                 set: { if !$0 { deleteHostTarget = nil } }
             ),
-            titleVisibility: .visible,
             presenting: deleteHostTarget
         ) { host in
             Button("Delete host", role: .destructive) {
@@ -172,6 +182,26 @@ struct SidebarView: View {
         }
     }
 
+    /// Shown under a host that has no projects yet — a prominent scan CTA (the fastest
+    /// onboarding path) plus the add-by-path fallback.
+    private func emptyProjectsHint(_ host: Host) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            PromptLabel(text: "no projects yet", style: .footnote)
+            Button { discoverForHost = host } label: {
+                Label("Scan for projects", systemImage: "sparkle.magnifyingglass")
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            Button { addProjectForHost = host } label: {
+                Label("Add by path", systemImage: "plus.circle")
+                    .font(.mono(.footnote))
+                    .foregroundStyle(theme.mutedColor)
+            }
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(Color.clear)
+    }
+
     private func hostHeader(_ host: Host) -> some View {
         HStack {
             HStack(spacing: 6) {
@@ -227,9 +257,9 @@ private struct ProjectRow: View {
     @Environment(\.theme) private var theme
     let project: RemoteProject
     let selected: Bool
-    /// Live instance count for the selected project (0 / unknown for others, since
-    /// only the selected project is polled in the foreground).
-    let running: Int?
+    /// Live agent counts for this project. The selected project is derived live; other
+    /// projects come from the cross-project sweep (`nil` = unknown → no badge).
+    let activity: AppState.ProjectActivity?
 
     var body: some View {
         HStack(spacing: 10) {
@@ -239,6 +269,8 @@ private struct ProjectRow: View {
                 Text(project.name)
                     .font(.mono(.callout, weight: selected ? .semibold : .regular))
                     .foregroundStyle(theme.textColor)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 Text(project.remoteRoot)
                     .font(.mono(.caption2))
                     .foregroundStyle(theme.mutedColor)
@@ -246,16 +278,24 @@ private struct ProjectRow: View {
                     .truncationMode(.head)
             }
             Spacer()
-            if let running, running > 0 {
-                Text("\(running)")
-                    .font(.mono(.caption2, weight: .semibold))
-                    .foregroundStyle(theme.runningColor)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(theme.runningColor.opacity(0.18)))
-                    .accessibilityLabel("\(running) running")
+            // Red "needs input" badge first (most urgent), then the running count.
+            if let blocked = activity?.blocked, blocked > 0 {
+                countBadge(blocked, color: theme.blockedColor, label: "\(blocked) need input")
+            }
+            if let running = activity?.running, running > 0 {
+                countBadge(running, color: theme.runningColor, label: "\(running) running")
             }
         }
         .padding(.vertical, 2)
+    }
+
+    private func countBadge(_ n: Int, color: Color, label: String) -> some View {
+        Text("\(n)")
+            .font(.mono(.caption2, weight: .semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(color.opacity(0.18)))
+            .accessibilityLabel(label)
     }
 }

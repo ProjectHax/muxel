@@ -11,6 +11,9 @@ struct RootView: View {
     @State private var addProjectForHost: Host?
     @State private var discoverForHost: Host?
     @State private var editHost: Host?
+    /// A just-added host to auto-scan; consumed when the add-host sheet dismisses (so
+    /// the scan sheet presents cleanly after the first one is fully gone).
+    @State private var pendingScanHost: Host?
     /// Persisted sidebar width (iPad/regular width). Dragged via the edge handle.
     @AppStorage("muxel.sidebarWidth") private var sidebarWidth: Double = 320
     @State private var dragStartWidth: Double?
@@ -36,25 +39,18 @@ struct RootView: View {
             }
         }
         .onAppear { KeyboardPrewarmer.warmOnce() }
-        .sheet(isPresented: $showAddHost) { HostEditorView(existing: nil) }
+        .sheet(isPresented: $showAddHost, onDismiss: {
+            // Chain add-host → scan once the first sheet is fully dismissed.
+            if let host = pendingScanHost { pendingScanHost = nil; discoverForHost = host }
+        }) {
+            HostEditorView(existing: nil, onSaved: { pendingScanHost = $0 })
+        }
         .sheet(item: $editHost) { host in HostEditorView(existing: host) }
         .sheet(item: $addProjectForHost) { host in AddProjectView(host: host) }
         .sheet(item: $discoverForHost) { host in DiscoverProjectsView(host: host) }
         .sheet(item: $state.hostKeyPrompt) { prompt in HostKeyPromptView(prompt: prompt) }
         .overlay(alignment: .top) { noticeOverlay }
         .animation(.snappy, value: state.notice)
-        .alert(
-            (state.testResult?.ok == true) ? "Connection OK" : "Connection failed",
-            isPresented: Binding(
-                get: { state.testResult != nil },
-                set: { if !$0 { state.testResult = nil } }
-            ),
-            presenting: state.testResult
-        ) { _ in
-            Button("OK", role: .cancel) { state.testResult = nil }
-        } message: { result in
-            Text("\(result.hostName): \(result.message)")
-        }
     }
 
     /// The transient notice banner (errors and confirmations that don't need a

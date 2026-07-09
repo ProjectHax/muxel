@@ -12,6 +12,17 @@ struct Worktree: Codable, Equatable, Identifiable {
     var color: Int
     var detached: Bool
 
+    init(id: String, projectId: String, name: String, path: String, branch: String,
+         color: Int, detached: Bool = false) {
+        self.id = id
+        self.projectId = projectId
+        self.name = name
+        self.path = path
+        self.branch = branch
+        self.color = color
+        self.detached = detached
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id
         case projectId = "project_id"

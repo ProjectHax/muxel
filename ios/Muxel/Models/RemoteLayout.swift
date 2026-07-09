@@ -66,32 +66,41 @@ struct RemoteLayout: Codable, Equatable {
         version == RemoteLayout.currentVersion && remoteRoot == root
     }
 
-    /// The terminal instances referenced by the layout, in tab order — what the
-    /// sidebar/detail lists.
+    /// The terminal instances referenced by the layout, in tab order — the input for
+    /// polling / status / Live Activity (terminal-only).
     var orderedTerminalInstances: [Instance] {
         let byId = Dictionary(instances.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         return (layout?.allTabs ?? []).compactMap { byId[$0] }.filter { $0.kind == .terminal }
     }
 
+    /// Every pane instance in tab order, including editor/diff/browser — what the UI
+    /// lists so desktop-created editor/diff panes appear as tabs too.
+    var orderedPaneInstances: [Instance] {
+        let byId = Dictionary(instances.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        return (layout?.allTabs ?? []).compactMap { byId[$0] }
+    }
+
     // MARK: Mutations (for launching/closing from the phone)
 
     /// Append `instance` and add it as a new active tab in the first leaf (or seed
-    /// the layout if empty). Stamps `updatedAt` so newer-wins picks it up. The MVP
-    /// adds to the main pane; rearranging is left to desktop.
-    mutating func addInstanceAsTab(_ instance: Instance, now: Int) {
+    /// the layout if empty). Optionally into a specific `targetLeafAnchor` (any tab in
+    /// the destination leaf). Stamps `updatedAt` so newer-wins picks it up.
+    mutating func addInstanceAsTab(_ instance: Instance, now: Int, targetLeafAnchor: String? = nil) {
         instances.append(instance)
-        if let existing = layout {
-            layout = existing.addingTab(instance.id)
+        // Prefer the requested leaf; else the first leaf; else seed a fresh tree.
+        if let anchor = targetLeafAnchor ?? layout?.firstInstance {
+            _ = PaneTree.addTab(&layout, target: anchor, newInstance: instance.id)
         } else {
             layout = .leaf(tabs: [instance.id], active: 0)
         }
         updatedAt = now
     }
 
-    /// Drop an instance + its tab (e.g. after killing its session).
+    /// Drop an instance + its tab (e.g. after killing its session). Uses the ported
+    /// `remove` so the active-index fixup + split collapse match desktop exactly.
     mutating func removeInstance(id: String, now: Int) {
         instances.removeAll { $0.id == id }
-        layout = layout?.removingTab(id)
+        _ = PaneTree.remove(&layout, target: id)
         updatedAt = now
     }
 
@@ -105,35 +114,3 @@ struct RemoteLayout: Codable, Equatable {
     }
 }
 
-extension PaneNode {
-    /// Add `id` as a new tab in the first leaf (depth-first), made active.
-    func addingTab(_ id: String) -> PaneNode {
-        switch self {
-        case let .leaf(tabs, _):
-            let next = tabs + [id]
-            return .leaf(tabs: next, active: next.count - 1)
-        case let .split(direction, sizes, children):
-            guard let first = children.first else { return .leaf(tabs: [id], active: 0) }
-            return .split(direction: direction, sizes: sizes,
-                          children: [first.addingTab(id)] + children.dropFirst())
-        }
-    }
-
-    /// Remove `id` wherever it appears; returns nil if the subtree becomes empty.
-    func removingTab(_ id: String) -> PaneNode? {
-        switch self {
-        case let .leaf(tabs, active):
-            let next = tabs.filter { $0 != id }
-            if next.isEmpty { return nil }
-            return .leaf(tabs: next, active: min(active, next.count - 1))
-        case let .split(direction, sizes, children):
-            let kept = zip(children, sizes).compactMap { child, size -> (PaneNode, Double)? in
-                guard let pruned = child.removingTab(id) else { return nil }
-                return (pruned, size)
-            }
-            if kept.isEmpty { return nil }
-            if kept.count == 1 { return kept[0].0 }
-            return .split(direction: direction, sizes: kept.map(\.1), children: kept.map(\.0))
-        }
-    }
-}

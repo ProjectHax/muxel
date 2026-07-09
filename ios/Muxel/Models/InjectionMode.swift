@@ -2,7 +2,7 @@ import Foundation
 
 /// How an instance's system prompt is delivered. Port of `InjectionMode`
 /// (`crates/muxel-core/src/agent.rs`), tagged by `"mode"` (snake_case values).
-enum InjectionMode: Equatable {
+enum InjectionMode: Equatable, Hashable {
     case none
     case cliFlag(flag: String)
     case typeIn

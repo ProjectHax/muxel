@@ -48,9 +48,9 @@ struct MuxelApp: App {
                 // Lock Screen when minimized. The poll loop keeps refreshing it.
                 state.syncLiveActivity()
                 Task { await state.refreshNotificationStatus() }
-                if state.selectedProject != nil {
-                    Task { await state.refreshLayout() }
-                }
+                // Restart the foreground poll loop (cancelled on background) and
+                // re-read the layout, so status keeps updating after a return.
+                state.resumeForeground()
             default:
                 break
             }

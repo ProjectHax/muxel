@@ -51,6 +51,14 @@ final class TerminalAccessoryRow: UIInputView, UIInputViewAudioFeedback {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    /// A fixed self-sizing height. Without this, `allowsSelfSizing` derives the height
+    /// from the buttons' intrinsic content (~27pt), which disagrees with the 44pt frame
+    /// the keyboard placeholder was laid out against — the source of the recurring
+    /// "Unable to simultaneously satisfy constraints" (`_UIKBCompatInputView`) log.
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: 44)
+    }
+
     // MARK: Layout
 
     private func setup() {

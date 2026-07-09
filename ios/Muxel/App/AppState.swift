@@ -16,6 +16,14 @@ final class AppState: ObservableObject {
     /// Instance ids with a live tmux session right now (from the latest poll of the
     /// selected project).
     @Published var running: Set<String> = []
+    /// Per-project activity counts for **non-selected** projects, refreshed by the
+    /// cross-project sweep (every ~4th poll tick) over hosts that already have a
+    /// pooled connection. Keyed by `RemoteProject.id`; absent = unknown (host not
+    /// connected or no sessions) → no badge. The selected project uses live `running`.
+    @Published var projectActivity: [UUID: ProjectActivity] = [:]
+    /// Instance ids whose live terminal dropped unexpectedly and hasn't reconnected —
+    /// each such pane shows a reconnect overlay + backoff retry.
+    @Published var deadPanes: Set<String> = []
     /// The current transient notice (banner). Set via `report`; RootView shows and
     /// auto-dismisses it. Failures that need a decision (connection tests) have
     /// their own bespoke paths instead.
@@ -23,10 +31,9 @@ final class AppState: ObservableObject {
     /// Id of the most recently launched instance — the detail view selects it so its
     /// live terminal opens (and creates the session attached).
     @Published var lastLaunched: String?
-    /// Result of a one-off "Test connection" — drives a confirmation alert.
-    @Published var testResult: ConnectionTest?
 
-    /// Outcome of testing a host's saved credential.
+    /// Outcome of testing a host's saved credential. Returned inline by the in-form
+    /// draft test (`testConnection(draft:…)`); the saved-host test reports a banner.
     struct ConnectionTest: Identifiable {
         let id = UUID()
         let hostName: String
@@ -39,6 +46,15 @@ final class AppState: ObservableObject {
         case loading
         case loaded
         case failed(String)
+    }
+
+    /// Live agent counts for one project (sidebar badges). `running` = instances
+    /// with a live tmux session; `blocked` = those signalling needs-input;
+    /// `done` = finished (exited/bell latched).
+    struct ProjectActivity: Equatable {
+        var running: Int
+        var blocked: Int
+        var done: Int
     }
 
     /// A changed host key awaiting the user's decision — drives the trust-prompt
@@ -72,8 +88,16 @@ final class AppState: ObservableObject {
     let terminals = TerminalStore()
     private let poll = PollService()
     private var pollLoop: Task<Void, Never>?
+    /// Serializes the phone's own layout write-backs so two rapid mutations can't
+    /// interleave their read-modify-write pairs (the SSH command mutex serializes
+    /// individual commands, not whole RMW sequences).
+    private var layoutWriteChain: Task<Void, Never>?
     /// Foreground poll counter — used to re-read the shared layout only every Nth poll.
     private var pollTick = 0
+    /// Cache of each non-selected project's terminal instances (`project.id` →
+    /// instances + fetch time) so the cross-project sweep rarely re-reads layouts.
+    private var instanceCache: [UUID: (instances: [Instance], at: TimeInterval)] = [:]
+    private let instanceCacheTTL: TimeInterval = 45
 
     init(store: LocalStore = LocalStore()) {
         self.store = store
@@ -87,7 +111,13 @@ final class AppState: ObservableObject {
         // An in-form connection test killed mid-flight can leave a staged scratch
         // secret behind; it's meaningless outside that test, so clear it.
         Keychain.deleteAll(for: Self.scratchSecretOwner)
+        // A live terminal dropping unexpectedly marks its pane dead so it shows a
+        // reconnect overlay (the pane clears it on a successful re-attach).
+        terminals.onSessionDied = { [weak self] id in self?.deadPanes.insert(id) }
     }
+
+    /// The pane reconnected (or gave up) — stop signalling it as dead.
+    func clearDead(_ instanceId: String) { deadPanes.remove(instanceId) }
 
     /// Surface a transient notice as a self-dismissing banner.
     func report(_ text: String, style: AppNotice.Style = .error, duration: TimeInterval = 4) {
@@ -133,10 +163,30 @@ final class AppState: ObservableObject {
     func status(_ instanceId: String) -> AgentStatus { statuses[instanceId] ?? .idle }
     func isRunning(_ instanceId: String) -> Bool { running.contains(instanceId) }
 
-    /// Live instance count for `project` — known only for the selected project (the
-    /// one the foreground poller is watching); `nil` for others.
+    /// Live running-instance count for `project`. The selected project uses the live
+    /// `running` set; others use the latest cross-project sweep (`nil` = unknown, e.g.
+    /// the host isn't connected yet) so no stale badge is shown.
     func runningCount(for project: RemoteProject) -> Int? {
-        selectedProject?.id == project.id ? running.count : nil
+        if selectedProject?.id == project.id { return running.count }
+        return projectActivity[project.id]?.running
+    }
+
+    /// Full activity counts for `project` (running / blocked / done) for the sidebar.
+    /// The selected project is derived live; others come from the sweep. `nil` when
+    /// unknown so the row shows no badge rather than a misleading zero.
+    func activity(for project: RemoteProject) -> ProjectActivity? {
+        if selectedProject?.id == project.id {
+            var a = ProjectActivity(running: running.count, blocked: 0, done: 0)
+            for id in running {
+                switch statuses[id] {
+                case .blocked: a.blocked += 1
+                case .done: a.done += 1
+                default: break
+                }
+            }
+            return a
+        }
+        return projectActivity[project.id]
     }
 
     // MARK: Host / project CRUD
@@ -154,13 +204,18 @@ final class AppState: ObservableObject {
     }
 
     /// Connect to `host` with a *fresh* connection (re-reading its Keychain secret) to
-    /// verify the saved credential authenticates. Surfaces the result via `testResult`.
+    /// verify the saved credential authenticates. Surfaces the result as a transient
+    /// banner (a changed key still routes to the trust prompt).
     func testConnection(_ host: Host) async {
         let result = await attemptConnection(
             host, credentials: host.connectionCredentials(in: doc.identities))
         if !result.ok, promptIfHostKeyChanged(result.underlying ?? SSHError.notConnected,
                                               host: host) { return }
-        testResult = ConnectionTest(hostName: host.name, ok: result.ok, message: result.message)
+        if result.ok {
+            report("\(host.name): connected and authenticated.", style: .success, duration: 5)
+        } else {
+            report("\(host.name): \(result.message)", duration: 8)
+        }
     }
 
     /// Well-known scratch Keychain owner for in-form connection tests: inline form
@@ -286,6 +341,9 @@ final class AppState: ObservableObject {
     func addProject(_ project: RemoteProject) {
         doc.projects.append(project)
         persist()
+        // Onboarding: land on the project you just added (its empty layout shows the
+        // "Launch one" CTA, completing the add-host → add-project → launch chain).
+        select(project)
     }
 
     // MARK: Project discovery (scan the host for `.muxel/` markers)
@@ -310,10 +368,16 @@ final class AppState: ObservableObject {
     /// Add the chosen discovered roots as projects under `host` (skips duplicates).
     func importDiscovered(_ found: [ProjectDiscovery.Found], on host: Host) {
         let existing = Set(projects(for: host).map(\.remoteRoot))
+        var added: [RemoteProject] = []
         for item in found where !existing.contains(item.remoteRoot) {
-            doc.projects.append(RemoteProject(name: item.name, hostId: host.id, remoteRoot: item.remoteRoot))
+            let project = RemoteProject(name: item.name, hostId: host.id, remoteRoot: item.remoteRoot)
+            doc.projects.append(project)
+            added.append(project)
         }
         persist()
+        // Importing exactly one project opens it; multiple stay in the sidebar (which
+        // one to open is ambiguous, and the fresh badges are the payoff there).
+        if added.count == 1 { select(added[0]) }
     }
 
     func deleteProject(_ project: RemoteProject) {
@@ -337,6 +401,13 @@ final class AppState: ObservableObject {
         let c = connectionFactory(host, host.connectionCredentials(in: doc.identities))
         connections[host.id] = c
         return c
+    }
+
+    /// The pooled connection for a host **if one already exists** — never dials. The
+    /// cross-project sweep uses this so an unreachable host can't add a connect-timeout
+    /// stall to every tick; projects on un-connected hosts just keep no badge.
+    func existingConnection(for hostId: UUID) -> SSHConnection? {
+        connections[hostId]
     }
 
     /// Instant, no-network snapshot of every instance: the last cached full summary,
@@ -433,6 +504,31 @@ final class AppState: ObservableObject {
 
     func stopPolling() { pollLoop?.cancel(); pollLoop = nil }
 
+    /// Foreground return: restart the poll loop and re-read the layout. `startPolling`
+    /// is otherwise only reached via `select`, and `.background` cancels the loop — so
+    /// without this the 3s status loop stays dead after the first backgrounding until
+    /// the user re-selects a project, leaving status dots and the Live Activity stale.
+    func resumeForeground() {
+        guard selectedProject != nil else { return }
+        startPolling()
+        Task { await refreshLayout() }
+    }
+
+    /// Pull-to-refresh from the sidebar: refresh notification permission, re-read the
+    /// selected layout, and force an immediate cross-project badge sweep (not gated on
+    /// the poll tick).
+    func refreshAll() async {
+        await refreshNotificationStatus()
+        if selectedProject != nil { await refreshLayout() }
+        if let host = selectedProject.flatMap({ host(for: $0) }) {
+            let rows = await poll.fetchPaneRows(connection(for: host))
+            await sweepOtherProjects(selectedHostId: host.id, selectedRows: rows)
+        } else {
+            // No selection → sweep every host that already has a pooled connection.
+            await sweepOtherProjects(selectedHostId: UUID(), selectedRows: [])
+        }
+    }
+
     private func runPollOnce() async {
         guard let project = selectedProject, let host = host(for: project) else { return }
         let conn = connection(for: host)
@@ -446,12 +542,97 @@ final class AppState: ObservableObject {
             layout = fresh
         }
         guard let layout else { return }
-        let results = await poll.poll(conn, instances: layout.orderedTerminalInstances)
+        // One batched fetch for the selected host serves both the selected project's
+        // statuses and (on sweep ticks) its sibling projects — no extra round trip.
+        let selectedRows = await poll.fetchPaneRows(conn)
+        let screens = liveScreens(for: layout.orderedTerminalInstances)
+        let results = poll.classify(rows: selectedRows,
+                                    instances: layout.orderedTerminalInstances,
+                                    liveScreens: screens)
         for r in results { statuses[r.instanceId] = r.status }
         running = Set(results.filter(\.running).map(\.instanceId))
         // Foreground start/refresh — keeps the Live Activity alive so it's on the
         // Lock Screen when the app is minimized (starting must happen here).
         syncLiveActivity()
+
+        // Every ~4th tick (~12s), refresh cross-project sidebar badges for other
+        // projects on already-connected hosts. Gentler than the 3s selected-project
+        // cadence and near-free: one `list-panes -a` per other host + TTL-cached
+        // layout reads. Reuses the selected host's rows.
+        if pollTick % 4 == 0 {
+            await sweepOtherProjects(selectedHostId: host.id, selectedRows: selectedRows)
+        }
+    }
+
+    /// Live-screen snapshots for any of `instances` that are currently attached AND
+    /// whose program has status markers — the input that gives `classify` real
+    /// working/blocked state. Marker-less programs are skipped (desktop's same
+    /// optimization: no point scanning a screen with nothing to match).
+    private func liveScreens(for instances: [Instance]) -> [String: LiveScreen] {
+        var screens: [String: LiveScreen] = [:]
+        for inst in instances {
+            let (working, blocked) = defaultMarkers(program: inst.program)
+            guard !(working.isEmpty && blocked.isEmpty) else { continue }
+            if let screen = terminals.liveScreen(for: inst.id) {
+                screens[inst.id] = screen
+            }
+        }
+        return screens
+    }
+
+    /// Aggregate per-instance statuses into a project's badge counts.
+    nonisolated static func aggregate(_ results: [InstanceStatus]) -> ProjectActivity {
+        var a = ProjectActivity(running: 0, blocked: 0, done: 0)
+        for r in results where r.running {
+            a.running += 1
+            switch r.status {
+            case .blocked: a.blocked += 1
+            case .done: a.done += 1
+            default: break
+            }
+        }
+        return a
+    }
+
+    /// Refresh `projectActivity` for every non-selected project on a host we already
+    /// hold a connection to. Never dials (unreachable hosts can't stall the loop); a
+    /// project with no resolvable instances drops its badge.
+    private func sweepOtherProjects(selectedHostId: UUID, selectedRows: [PaneRow]) async {
+        let selectedProjectId = selectedProject?.id
+        let byHost = Dictionary(grouping: doc.projects.filter { $0.id != selectedProjectId },
+                                by: { $0.hostId })
+        for (hostId, projects) in byHost {
+            guard let conn = existingConnection(for: hostId) else { continue }
+            // Reuse the selected host's already-fetched rows; fetch once for others.
+            let rows = hostId == selectedHostId ? selectedRows : await poll.fetchPaneRows(conn)
+            for project in projects {
+                guard let instances = await cachedInstances(for: project, conn: conn),
+                      !instances.isEmpty else {
+                    projectActivity[project.id] = nil
+                    continue
+                }
+                // Attached panes of a backgrounded project still get marker status.
+                let results = poll.classify(rows: rows, instances: instances,
+                                            liveScreens: liveScreens(for: instances))
+                projectActivity[project.id] = Self.aggregate(results)
+            }
+        }
+    }
+
+    /// A non-selected project's terminal instances, cached with a short TTL so a sweep
+    /// is usually one `list-panes` per host plus occasional layout reads. A failed
+    /// read falls back to the stale entry rather than dropping the badge.
+    private func cachedInstances(for project: RemoteProject, conn: SSHConnection) async -> [Instance]? {
+        let now = Date().timeIntervalSince1970
+        if let hit = instanceCache[project.id], now - hit.at < instanceCacheTTL {
+            return hit.instances
+        }
+        guard let fresh = try? await RemoteLayoutStore.read(conn, root: project.remoteRoot) else {
+            return instanceCache[project.id]?.instances
+        }
+        let instances = fresh.orderedTerminalInstances
+        instanceCache[project.id] = (instances, now)
+        return instances
     }
 
     /// The user viewed a pane — clear its done latch so it stops showing done.
@@ -465,11 +646,17 @@ final class AppState: ObservableObject {
 
     // MARK: Launch a new instance
 
-    func launch(preset: Preset, customCommand: String?, into project: RemoteProject) async {
+    func launch(preset: Preset, customCommand: String?, into project: RemoteProject,
+                targetLeafAnchor: String? = nil,
+                newWorktree: Bool = false, worktreeBranch: String? = nil) async {
         guard let host = host(for: project) else { return }
 
-        let program: String?
-        let args: [String]
+        let instanceId = UUID().uuidString.lowercased()
+        // Reuse the project's existing instance project_id so iOS-launched panes
+        // group with the rest; seed a fresh one for an empty project.
+        let projectId = layout?.instances.first?.projectId ?? UUID().uuidString.lowercased()
+
+        var instance: Instance
         if let custom = customCommand, !custom.trimmingCharacters(in: .whitespaces).isEmpty {
             // Quote-aware split, so `claude --append-system-prompt "be terse"` works.
             // The launch sheet live-validates, so nil here is a stale-form edge case.
@@ -477,24 +664,61 @@ final class AppState: ObservableObject {
                 report("Couldn't parse the command — check for an unbalanced quote.")
                 return
             }
-            program = first
-            args = Array(parts.dropFirst())
+            instance = Instance(id: instanceId, projectId: projectId,
+                                title: (first as NSString).lastPathComponent,
+                                program: first, args: Array(parts.dropFirst()))
         } else {
-            program = preset.program
-            args = preset.args
+            let title = preset.program.map { ($0 as NSString).lastPathComponent } ?? "shell"
+            // model/effort/extra go into persisted args; the system prompt does NOT —
+            // it's stored + applied at PTY-build time (CliFlag) or typed in (TypeIn), so
+            // a desktop respawn doesn't double-append it.
+            instance = Instance(id: instanceId, projectId: projectId, title: title,
+                                program: preset.program, args: AgentLaunch.composeArgs(preset))
+            instance.preset = preset.name
+            instance.systemPrompt = preset.systemPrompt
+            instance.injection = preset.injection
+            // Resume-capable presets get a fresh session id, not yet started, so the
+            // first launch uses `--session-id` and later re-attaches use `--resume`.
+            if preset.sessionIdFlag != nil, preset.resumeFlag != nil {
+                instance.sessionId = UUID().uuidString.lowercased()
+                instance.sessionStarted = false
+            }
         }
-
-        let instanceId = UUID().uuidString.lowercased()
-        let title = preset.program.map { ($0 as NSString).lastPathComponent } ?? "shell"
-        // Reuse the project's existing instance project_id so iOS-launched panes
-        // group with the rest; seed a fresh one for an empty project.
-        let projectId = layout?.instances.first?.projectId ?? UUID().uuidString.lowercased()
-        var instance = Instance(id: instanceId, projectId: projectId,
-                                title: title, program: program, args: args)
         // Record the authoritative tmux session name in the shared layout so a peer
         // (desktop muxel) adopts this instance into tmux under the same name rather
         // than spawning a second session for it.
         instance.tmuxSession = TmuxSession.name(hostName: host.name, instanceId: instanceId)
+
+        // Create the git worktree first (the pane's cwd depends on it). On failure,
+        // fall back to the project root with a notice — desktop's `setup_worktree`
+        // parity. The Launch button's Task keeps the sheet up during this brief git op.
+        var worktreeRecord: Worktree?
+        if newWorktree {
+            let repoName = (project.remoteRoot as NSString).lastPathComponent
+            let branch = (worktreeBranch?.isEmpty == false)
+                ? worktreeBranch! : WorktreeNaming.branchName(instanceId: instanceId)
+            let dir = WorktreeNaming.dirName(repoName: repoName, instanceId: instanceId)
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                let path = try await WorktreeService.create(
+                    conn, root: project.remoteRoot, dirName: dir, branch: branch)
+                let wt = Worktree(id: UUID().uuidString.lowercased(), projectId: projectId,
+                                  name: WorktreeNaming.randomName(), path: path, branch: branch,
+                                  color: WorktreeNaming.nextColor(worktrees: layout?.worktrees ?? [],
+                                                                  projectId: projectId),
+                                  detached: false)
+                instance.useWorktree = true
+                instance.worktreeId = wt.id
+                instance.worktreePath = path
+                instance.worktreeBranch = branch
+                worktreeRecord = wt
+            } catch let err as WorktreeError {
+                report("worktree skipped: \(err.message) — launching in the project root", duration: 6)
+            } catch {
+                surface(error, host: host)
+            }
+        }
 
         // Show the pane immediately: add it to the in-memory layout and select it, so
         // the click feels instant. The live terminal creates the tmux session itself
@@ -502,7 +726,8 @@ final class AppState: ObservableObject {
         // layout written first. We deliberately don't create a detached session here (it
         // crashes a TUI agent at init).
         var next = layout ?? RemoteLayout(remoteRoot: project.remoteRoot)
-        next.addInstanceAsTab(instance, now: unixNow())
+        next.addInstanceAsTab(instance, now: unixNow(), targetLeafAnchor: targetLeafAnchor)
+        if let worktreeRecord { next.worktrees.append(worktreeRecord) }
         layout = next
         lastLaunched = instanceId
 
@@ -514,7 +739,8 @@ final class AppState: ObservableObject {
                 let conn = self.connection(for: host)
                 try await conn.connect()
                 self.layout = try await RemoteLayoutStore.appendInstance(
-                    conn, root: project.remoteRoot, instance: instance)
+                    conn, root: project.remoteRoot, instance: instance,
+                    targetLeafAnchor: targetLeafAnchor, worktree: worktreeRecord)
                 await self.runPollOnce()
             } catch {
                 self.surface(error, host: host)
@@ -535,6 +761,32 @@ final class AppState: ObservableObject {
             }
             terminals.disconnect(instance.id)
             layout = try await RemoteLayoutStore.removeInstance(conn, root: project.remoteRoot, instanceId: instance.id)
+        } catch {
+            surface(error, host: host)
+        }
+    }
+
+    /// Close every pane except `keepId`: kill each other terminal's tmux session, then
+    /// drop them all from the layout in ONE write (not N round-trips).
+    func closeOthers(keeping keepId: String, in project: RemoteProject) async {
+        guard let host = host(for: project) else { return }
+        let others = (layout?.orderedPaneInstances ?? []).filter { $0.id != keepId }
+        guard !others.isEmpty else { return }
+        do {
+            let conn = connection(for: host)
+            try await conn.connect()
+            for inst in others where inst.kind == .terminal {
+                if let session = await liveSessionName(inst.id, on: host) {
+                    _ = try? await conn.tmux(TmuxCommands.killSession(session))
+                }
+                terminals.disconnect(inst.id)
+            }
+            let ids = Set(others.map(\.id))
+            layout = try await RemoteLayoutStore.mutate(conn, root: project.remoteRoot, seedIfMissing: false) { layout in
+                layout.instances.removeAll { ids.contains($0.id) }
+                for id in ids { _ = PaneTree.remove(&layout.layout, target: id) }
+                return true
+            }
         } catch {
             surface(error, host: host)
         }
@@ -566,12 +818,11 @@ final class AppState: ObservableObject {
         var copy = instance
         copy.id = newId
         copy.tmuxSession = TmuxSession.name(hostName: host.name, instanceId: newId)
-        copy.sessionStarted = true
-        // A fresh pane shouldn't share the original's worktree/session bindings.
-        copy.worktreeId = nil
-        copy.worktreePath = nil
-        copy.worktreeBranch = nil
+        // Desktop "Inherit" semantics: the duplicate shares the source's worktree
+        // (a worktree can back several panes) but gets a fresh, not-yet-started
+        // session so it doesn't collide on `--resume`.
         copy.sessionId = nil
+        copy.sessionStarted = false
         do {
             let conn = connection(for: host)
             try await conn.connect()
@@ -581,6 +832,215 @@ final class AppState: ObservableObject {
             await runPollOnce()
         } catch {
             surface(error, host: host)
+        }
+    }
+
+    /// Run `op` after any in-flight layout write completes, so the phone's own
+    /// mutations serialize into one RMW-at-a-time queue.
+    func enqueueLayoutWrite(_ op: @escaping @MainActor () async -> Void) {
+        let prev = layoutWriteChain
+        layoutWriteChain = Task { @MainActor in
+            await prev?.value
+            await op()
+        }
+    }
+
+    /// iPad basic split editing: pull `instance`'s tab out of its group into a new pane
+    /// split beside the rest. Optimistic local apply, then a serialized write-back so
+    /// desktop adopts it. No-op if `instance` is already the sole tab of its pane.
+    func openInSplit(_ instance: Instance, direction: SplitDirection, before: Bool = false,
+                     in project: RemoteProject) {
+        guard let host = host(for: project),
+              let current = layout, let root = current.layout,
+              let path = root.findPath(instance.id),
+              case let .leaf(tabs, _)? = root.node(atPath: path),
+              let sibling = tabs.first(where: { $0 != instance.id }) else { return }
+        // Optimistic local apply so the split appears instantly.
+        var next = current
+        guard PaneTree.moveIntoSplit(&next.layout, dragged: instance.id, target: sibling,
+                                     direction: direction, before: before) else { return }
+        guard withinPaneCap(next) else { return }
+        next.updatedAt = max(unixNow(), current.updatedAt + 1)
+        layout = next
+        enqueueLayoutWrite { [self] in
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                if let written = try await RemoteLayoutStore.moveIntoSplit(
+                    conn, root: project.remoteRoot, dragged: instance.id, target: sibling,
+                    direction: direction, before: before) {
+                    layout = written
+                }
+            } catch {
+                surface(error, host: host)
+                await refreshLayout()
+            }
+        }
+    }
+
+    /// The maximum number of side-by-side panes (leaves) allowed.
+    static let maxPanes = 4
+
+    /// True if `layout` is within the pane cap; otherwise reports a notice and returns
+    /// false so the caller can abort a split that would create too many panes.
+    private func withinPaneCap(_ layout: RemoteLayout) -> Bool {
+        guard (layout.layout?.leafCount ?? 0) <= Self.maxPanes else {
+            report("Up to \(Self.maxPanes) split panes. Close one first.", duration: 4)
+            return false
+        }
+        return true
+    }
+
+    /// Persist that a resume-capable instance's session has started (and backfill a
+    /// missing session id), so a later re-attach resumes with `--resume` instead of
+    /// creating a duplicate. Best-effort + serialized with other layout writes.
+    func markSessionStarted(_ instanceId: String, sessionId: String?, in project: RemoteProject) {
+        guard let host = host(for: project) else { return }
+        enqueueLayoutWrite { [self] in
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                if let written = try await RemoteLayoutStore.mutate(
+                    conn, root: project.remoteRoot, seedIfMissing: false, transform: { layout in
+                        guard let idx = layout.instances.firstIndex(where: { $0.id == instanceId }) else { return false }
+                        layout.instances[idx].sessionStarted = true
+                        if let sid = sessionId, layout.instances[idx].sessionId == nil {
+                            layout.instances[idx].sessionId = sid
+                        }
+                        return true
+                    }) {
+                    layout = written
+                }
+            } catch {
+                // Non-fatal: resume just won't engage on the next attach.
+            }
+        }
+    }
+
+    /// TypeIn injection: once the freshly-launched agent has drawn its first output,
+    /// type its system prompt into the pane (and optionally submit). Mirrors desktop's
+    /// timing (`view.rs`): wait for first output, then the preset's startup delay, then
+    /// type via `tmux send-keys`. Owned here (not the view) so it survives navigation.
+    func scheduleStartupInjection(instanceId: String, sessionName: String, host: Host,
+                                  text: String, delayMs: Int, submit: Bool) {
+        guard !text.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            // Wait for the agent's first output (readiness), polling 100ms, cap 30s.
+            let deadline = Date().addingTimeInterval(30)
+            while Date() < deadline, !self.terminals.hasOutput(for: instanceId) {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            // Startup delay (preset's, or a 2s default), then a 300ms settle.
+            let delay = delayMs > 0 ? delayMs : 2000
+            try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000 + 300_000_000)
+            let conn = self.connection(for: host)
+            _ = try? await conn.tmux(TmuxCommands.sendLiteral(session: sessionName, text: text))
+            if submit {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                _ = try? await conn.tmux(TmuxCommands.sendKey(session: sessionName, key: "Enter"))
+            }
+        }
+    }
+
+    /// iPad drag-to-split: pull `dragged` out of its pane into a new split beside the
+    /// leaf anchored at `targetAnchor`. Optimistic local apply + serialized write-back.
+    /// No-op if the move is meaningless (same pane, sole tab dropped on itself).
+    func moveTabIntoSplit(dragged: String, targetAnchor: String,
+                          direction: SplitDirection = .horizontal, before: Bool = false,
+                          in project: RemoteProject) {
+        guard let host = host(for: project), let current = layout, current.layout != nil else { return }
+        var next = current
+        guard PaneTree.moveIntoSplit(&next.layout, dragged: dragged, target: targetAnchor,
+                                     direction: direction, before: before) else { return }
+        guard withinPaneCap(next) else { return }
+        next.updatedAt = max(unixNow(), current.updatedAt + 1)
+        layout = next
+        enqueueLayoutWrite { [self] in
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                if let written = try await RemoteLayoutStore.moveIntoSplit(
+                    conn, root: project.remoteRoot, dragged: dragged, target: targetAnchor,
+                    direction: direction, before: before) {
+                    layout = written
+                }
+            } catch {
+                surface(error, host: host)
+                await refreshLayout()
+            }
+        }
+    }
+
+    /// Persist new sizes for the split identified by `key` (its `stableKey`) after an
+    /// interactive divider drag. Optimistic local apply + serialized write-back.
+    func setSplitSizes(key: String, sizes: [Double], in project: RemoteProject) {
+        guard let host = host(for: project), let current = layout, current.layout != nil else { return }
+        var next = current
+        guard PaneTree.setSplitSizes(&next.layout, key: key, sizes: sizes) else { return }
+        next.updatedAt = max(unixNow(), current.updatedAt + 1)
+        layout = next
+        enqueueLayoutWrite { [self] in
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                if let written = try await RemoteLayoutStore.setSplitSizes(
+                    conn, root: project.remoteRoot, key: key, sizes: sizes) {
+                    layout = written
+                }
+            } catch {
+                surface(error, host: host)
+                await refreshLayout()
+            }
+        }
+    }
+
+    /// Drag-to-reorder: move `dragged` to the slot of `targetChip` — reordering within
+    /// a group, or inserting at that position when dropped on another group's tab.
+    func moveTab(dragged: String, toPositionOf targetChip: String, in project: RemoteProject) {
+        guard let host = host(for: project), let current = layout, let root = current.layout else { return }
+        guard let pt = root.findPath(targetChip) else { return }
+        guard case let .leaf(tabs, _)? = root.node(atPath: pt),
+              let index = tabs.firstIndex(of: targetChip) else { return }
+        var next = current
+        guard PaneTree.moveTabTo(&next.layout, dragged: dragged, targetAnchor: targetChip, index: index) else { return }
+        next.updatedAt = max(unixNow(), current.updatedAt + 1)
+        layout = next
+        enqueueLayoutWrite { [self] in
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                if let written = try await RemoteLayoutStore.moveTabTo(
+                    conn, root: project.remoteRoot, dragged: dragged, targetAnchor: targetChip, index: index) {
+                    layout = written
+                }
+            } catch {
+                surface(error, host: host)
+                await refreshLayout()
+            }
+        }
+    }
+
+    /// iPad drag-to-move: move `dragged`'s tab into `targetAnchor`'s pane (join its tab
+    /// group). Optimistic local apply + serialized write-back. No-op on a same-pane move.
+    func moveTabIntoPane(dragged: String, targetAnchor: String, in project: RemoteProject) {
+        guard let host = host(for: project), let current = layout, current.layout != nil else { return }
+        var next = current
+        guard PaneTree.moveIntoTabs(&next.layout, dragged: dragged, target: targetAnchor) else { return }
+        next.updatedAt = max(unixNow(), current.updatedAt + 1)
+        layout = next
+        enqueueLayoutWrite { [self] in
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                if let written = try await RemoteLayoutStore.moveIntoTabs(
+                    conn, root: project.remoteRoot, dragged: dragged, target: targetAnchor) {
+                    layout = written
+                }
+            } catch {
+                surface(error, host: host)
+                await refreshLayout()
+            }
         }
     }
 
