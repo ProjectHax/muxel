@@ -46,9 +46,11 @@ pub fn key_to_bytes(
 
     match key {
         "enter" | "return" | "kp_enter" => {
-            // Shift+Enter -> newline (multi-line input in TUIs like Claude Code).
-            if mods.shift {
-                return Some(b"\n".to_vec());
+            // Shift/Alt+Enter → ESC CR. Bare CR cannot carry modifiers, so
+            // agents that want a soft newline (Grok, VS Code–style TUIs) look
+            // for this sequence. Plain Enter stays CR (submit / shell).
+            if (mods.shift || mods.alt) && !mods.control && !mods.platform {
+                return Some(b"\x1b\r".to_vec());
             }
             return Some(b"\r".to_vec());
         }
@@ -125,4 +127,48 @@ pub fn key_to_bytes(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mods(shift: bool, alt: bool, control: bool) -> KeyModifiers {
+        KeyModifiers {
+            control,
+            shift,
+            alt,
+            platform: false,
+        }
+    }
+
+    #[test]
+    fn enter_plain_is_cr() {
+        assert_eq!(
+            key_to_bytes("enter", None, &mods(false, false, false), false),
+            Some(b"\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn enter_shift_or_alt_is_esc_cr() {
+        // Soft newline for Grok / VS Code–style agent TUIs.
+        assert_eq!(
+            key_to_bytes("enter", None, &mods(true, false, false), false),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes("enter", None, &mods(false, true, false), false),
+            Some(b"\x1b\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn enter_ctrl_stays_cr() {
+        // Ctrl+Enter is not remapped here (Grok interject needs CSI-u / Ctrl+I).
+        assert_eq!(
+            key_to_bytes("enter", None, &mods(false, false, true), false),
+            Some(b"\r".to_vec())
+        );
+    }
 }

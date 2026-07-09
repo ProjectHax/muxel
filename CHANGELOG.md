@@ -18,6 +18,9 @@ All notable changes to muxel are documented here. This project adheres to
   `ctrl-<letter>` app bindings now default to `!Terminal` (agents get C0);
   muxel chrome stays on `ctrl-shift-*`. `Ctrl+T` new-tab remains global;
   Settings → terminal passthrough still covers other shapes.
+- **Shift+Enter newline in agent TUIs (Grok, etc.)** — bare CR cannot carry
+  modifiers, so Shift/Alt+Enter now send `ESC CR` (the sequence those agents
+  already treat as a soft newline). Plain Enter is still CR.
 - **An agent's `pkill` could kill every agent in every project** — tmux forks its server
   from the first client that needs one and the server keeps that client's command line.
   Since 0.0.9 made local panes default to tmux, that first client was a pane's

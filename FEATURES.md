@@ -275,7 +275,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Content inset** — a small margin around the grid so a too-wide TUI truncates
   inside the pane rather than against the border.
 - **Key routing** — `Tab` / `Shift+Tab` go to the focused terminal rather than
-  moving UI focus.
+  moving UI focus. `Shift+Enter` / `Alt+Enter` send `ESC CR` so agent TUIs
+  (Grok, etc.) can insert a soft newline; plain `Enter` stays CR (submit).
 - **Agent-first plain Ctrl+letter** — muxel app shortcuts that are plain
   `Ctrl+A`…`Ctrl+Z` (no Shift) do **not** fire while a terminal is focused, so
   agents receive them as normal C0 chords (Claude `Ctrl+S` stash, shell
