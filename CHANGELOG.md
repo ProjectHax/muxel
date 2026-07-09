@@ -14,6 +14,9 @@ All notable changes to muxel are documented here. This project adheres to
   Windows is unaffected — muxel's tmux integration is unix-only.
 
 ### Fixed
+- **Shift+Enter newline in agent TUIs (Grok, etc.)** — bare CR cannot carry
+  modifiers, so Shift/Alt+Enter now send `ESC CR` (the sequence those agents
+  already treat as a soft newline). Plain Enter is still CR.
 - **A killed pane was reported as a crash** — the OS gives a signalled child no
   exit code of its own, and `portable-pty` substitutes `1`, so a pane that was
   SIGKILLed or hung up was indistinguishable from one that called `exit(1)`. The

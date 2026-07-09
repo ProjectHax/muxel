@@ -275,7 +275,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Content inset** — a small margin around the grid so a too-wide TUI truncates
   inside the pane rather than against the border.
 - **Key routing** — `Tab` / `Shift+Tab` go to the focused terminal rather than
-  moving UI focus.
+  moving UI focus. `Shift+Enter` / `Alt+Enter` send `ESC CR` so agent TUIs
+  (Grok, etc.) can insert a soft newline; plain `Enter` stays CR (submit).
 - **Ctrl+P shared with the agent** — the command palette is on `Ctrl+Shift+P`
   (always), while `Ctrl+P` opens it only when no terminal is focused — so a focused
   agent (e.g. opencode, which uses `Ctrl+P`) receives it. Click the toolbar to
