@@ -473,6 +473,10 @@ feature is added or changed, update the matching entry here in the same change**
   confirmation is skipped for an untouched **shell** pane — one sitting idle at
   its prompt with no foreground command and no other tabs — since closing it
   loses nothing.
+- **Local tmux by default** — "New agents run in a tmux session" defaults **on**
+  whenever `tmux` is installed, so local panes survive a muxel restart and reattach
+  (matching remote panes); the toggle greys out and has no effect when tmux isn't
+  found. tmux is unix-only, so this never applies on Windows.
 - **tmux lifecycle** — closing a **pane** always kills its tmux session (local or
   remote); a *dropped* SSH connection never auto-closes — it leaves a tombstone
   pane, keeping the remote session reconnectable. Quitting the **app** leaves

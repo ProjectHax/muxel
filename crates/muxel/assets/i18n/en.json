@@ -252,6 +252,7 @@
   "New Project": "New Project",
   "New agent here": "New agent here",
   "New agents run in a tmux session": "New agents run in a tmux session",
+  "New agents run in a tmux session (tmux not installed)": "New agents run in a tmux session (tmux not installed)",
   "New agents use a git worktree": "New agents use a git worktree",
   "New branch": "New branch",
   "New branch…": "New branch…",

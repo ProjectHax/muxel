@@ -986,7 +986,9 @@ pub struct WorkspacesIndex {
 /// User-facing settings, persisted as hand-editable TOML.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
-    #[serde(default)]
+    /// New local panes run in a persistent tmux session by default (gated on
+    /// tmux actually being installed — see `MuxelApp::tmux_available`).
+    #[serde(default = "default_true")]
     pub default_use_tmux: bool,
     #[serde(default)]
     pub default_use_worktree: bool,
@@ -1130,7 +1132,7 @@ fn default_passthrough_keys() -> Vec<String> {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            default_use_tmux: false,
+            default_use_tmux: true,
             default_use_worktree: false,
             notifications_enabled: true,
             browser_enabled: true,

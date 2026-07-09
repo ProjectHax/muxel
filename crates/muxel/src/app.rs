@@ -923,6 +923,9 @@ pub struct MuxelApp {
     gh_available: bool,
     /// Whether `sshpass` is installed (needed for saved-password SSH auth).
     sshpass_available: bool,
+    /// Whether `tmux` is installed on a unix host (gates the local-tmux default;
+    /// refreshed each tick). Always false on Windows — muxel's tmux path is unix.
+    tmux_available: bool,
     /// Tick counter throttling remote branch-label polling (every 5th tick).
     remote_poll_count: u32,
     /// Full persisted settings (source of truth for config not mirrored above).
@@ -2732,6 +2735,7 @@ impl MuxelApp {
             worktree_changes: HashMap::new(),
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
+            tmux_available: cfg!(unix) && program_on_path("tmux"),
             remote_connect_failed: HashMap::new(),
             remote_poll_count: 0,
             theme: settings.theme.clone(),
@@ -4868,12 +4872,13 @@ impl MuxelApp {
             .map(|w| (w.id, w.path.clone()))
             .collect();
         cx.spawn(async move |this, cx| {
-            let (available, gh, sshpass, branches, changes) = cx
+            let (available, gh, sshpass, tmux, branches, changes) = cx
                 .background_executor()
                 .spawn(async move {
                     let available = installed_programs(&presets);
                     let gh = program_on_path("gh");
                     let sshpass = program_on_path("sshpass");
+                    let tmux = cfg!(unix) && program_on_path("tmux");
                     let branches: Vec<(Uuid, Option<String>)> = locals
                         .into_iter()
                         .map(|(id, root)| {
@@ -4885,13 +4890,14 @@ impl MuxelApp {
                         .into_iter()
                         .map(|(id, path)| (id, integrations::worktree_change_count(&path)))
                         .collect();
-                    (available, gh, sshpass, branches, changes)
+                    (available, gh, sshpass, tmux, branches, changes)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.available_programs = available;
                 this.gh_available = gh;
                 this.sshpass_available = sshpass;
+                this.tmux_available = tmux;
                 // Keep only current projects (drop removed ones); overwrite local
                 // branches. Remote ones are maintained by `poll_remote_branches`.
                 let ids: HashSet<Uuid> = this.workspace.projects.iter().map(|p| p.id).collect();
@@ -5749,7 +5755,8 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        instance.use_tmux = self.use_tmux && cfg!(unix);
+        // tmux only when the user wants it AND it's actually installed (unix).
+        instance.use_tmux = self.use_tmux && self.tmux_available;
         let iid = instance.id;
 
         // An empty project ignores the target/placement and just seeds a pane.
@@ -18408,13 +18415,20 @@ impl MuxelApp {
             .child(
                 self.check_row(
                     Checkbox::new("b-tmux")
-                        .checked(self.use_tmux)
+                        // Effectively off (and greyed) when tmux isn't installed,
+                        // even though the preference stays saved.
+                        .checked(self.use_tmux && self.tmux_available)
+                        .disabled(!self.tmux_available)
                         .on_click(cx.listener(|this, c: &bool, _w, cx| {
                             this.use_tmux = *c;
                             this.persist_settings();
                             cx.notify();
                         })),
-                    &t("New agents run in a tmux session"),
+                    &if self.tmux_available {
+                        t("New agents run in a tmux session")
+                    } else {
+                        t("New agents run in a tmux session (tmux not installed)")
+                    },
                 ),
             )
             .child(
