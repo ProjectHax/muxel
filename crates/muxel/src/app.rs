@@ -1619,6 +1619,20 @@ enum ConfirmAction {
     },
 }
 
+impl ConfirmAction {
+    /// The pane this action acts on, for the actions that act on one. Its dialog
+    /// belongs in the window showing that pane — which, for a project opened on
+    /// another monitor, is not the main window. Everything else (settings,
+    /// git-panel, host-key dialogs) is main-window chrome and stays there.
+    fn pane_instance(&self) -> Option<Uuid> {
+        match self {
+            Self::CloseInstance(iid) | Self::CloseOtherTabs(iid) => Some(*iid),
+            Self::CloseTabsSide { anchor, .. } => Some(*anchor),
+            _ => None,
+        }
+    }
+}
+
 /// What to retry after the user trusts a changed host key.
 #[derive(Clone)]
 enum SshRetry {
@@ -9369,6 +9383,11 @@ impl MuxelApp {
                             ),
                     )
             }))
+            // "Close terminal?" and friends act on a pane in *this* window, so the
+            // dialog has to appear here, not over on the main window's monitor.
+            .children(
+                (self.confirm_window_pid() == Some(pid)).then(|| self.render_confirm_modal(cx)),
+            )
             .into_any_element()
     }
 
@@ -9719,6 +9738,20 @@ impl MuxelApp {
         }
     }
 
+    /// Which window the pending confirm dialog belongs in: `Some(pid)` for the
+    /// project window showing the pane it acts on, `None` for the main window.
+    /// A dialog rendered in the wrong window is invisible — a popped-out project
+    /// sits on another monitor, and the modal would open over the main window
+    /// while the pane the user just tried to close is somewhere else entirely.
+    fn confirm_window_pid(&self) -> Option<Uuid> {
+        let iid = self.confirm.as_ref()?.action.pane_instance()?;
+        let pid = self.workspace.instance(iid)?.project_id;
+        self.secondary_windows
+            .iter()
+            .any(|s| s.pid == pid)
+            .then_some(pid)
+    }
+
     /// Show the confirmation modal for a destructive action.
     fn request_confirm(
         &mut self,
@@ -9749,6 +9782,16 @@ impl MuxelApp {
             details,
             action,
         });
+        // The dialog renders in the window owning the pane, which may be a project
+        // window on another monitor — and the action can be triggered from the main
+        // window's sidebar. Raise it, or the dialog is drawn where nobody's looking.
+        if let Some(pid) = self.confirm_window_pid()
+            && let Some(sec) = self.secondary_windows.iter().find(|s| s.pid == pid)
+        {
+            let _ = sec
+                .handle
+                .update(cx, |_, window, _| window.activate_window());
+        }
         cx.notify();
     }
 
@@ -20378,9 +20421,10 @@ impl Render for MuxelApp {
                     .then(|| self.render_snippets_menu(cx)),
             )
             .children(self.show_run_dialog.then(|| self.render_run_dialog(cx)))
+            // A pane-scoped confirm belongs to the window showing that pane; when
+            // that's a project window on another monitor, it draws there instead.
             .children(
-                self.confirm
-                    .is_some()
+                (self.confirm.is_some() && self.confirm_window_pid().is_none())
                     .then(|| self.render_confirm_modal(cx)),
             )
             // Fullscreen with the sidebar hidden: a floating left-edge pill

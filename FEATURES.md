@@ -359,8 +359,10 @@ feature is added or changed, update the matching entry here in the same change**
   was — dragging a window to another monitor updates its pin, and a
   disconnected monitor keeps the pin for when it returns. **Bring back to
   main window** or closing the window returns the project. Heavy chrome
-  (settings, command palette, dialogs, notification feed) stays in the main
-  window, which is raised automatically when needed.
+  (settings, command palette, notification feed) stays in the main window, which
+  is raised automatically when needed — but a confirmation about a *pane*
+  ("Close terminal?", "Close other tabs?") opens in the window showing that
+  pane, and raises it, so the prompt is never stranded on another monitor.
 - **No auto-created project** — start empty; add projects via a folder picker.
 - **Startup agents** — save the project's open agents as a startup set (preset +
   worktree flag) and relaunch them in one click from the project menu.

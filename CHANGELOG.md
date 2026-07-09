@@ -13,6 +13,12 @@ All notable changes to muxel are documented here. This project adheres to
   sidebar state: hiding it in a project window no longer hides it in the main window.
 
 ### Fixed
+- **"Close terminal?" opened on the wrong monitor** — pane confirmations always drew in
+  the main window, so closing a pane in a project window popped the prompt up over on
+  the main window's display, leaving the project window looking frozen. A confirmation
+  about a pane (**Close terminal?**, **Close other tabs?**, **Close tabs to the side?**)
+  now renders in the window showing that pane and raises it. Everything else (settings,
+  git-panel and host-key dialogs) is main-window chrome and stays put.
 - **Closing a popped-out project window quit the whole app** (Linux) — the window drew
   the *first-run* title bar, whose close button quits outright because nothing is
   running yet at that point. Its X now closes only that window, and the project returns
