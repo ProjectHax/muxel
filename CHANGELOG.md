@@ -5,6 +5,12 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Grok session resume** — the built-in Grok preset now sets `--session-id` /
+  `--resume` like Claude, so a Grok pane reopens its prior conversation after a
+  muxel restart. Existing Grok presets pick up the flags on seed upgrade (unless
+  you already set your own).
+
 ### Fixed
 - **Linux AppImage failed to start on modern distros** — the AppImage bundled a
   copy of GLib (and the rest of the GTK/WebKit dependency closure) from the

@@ -311,6 +311,9 @@ impl AgentPreset {
     }
 
     /// xAI's Grok CLI (https://x.ai/cli) — the `grok` command.
+    ///
+    /// Grok speaks the same session flags as Claude (`--session-id` / `--resume`),
+    /// so panes reopen their prior conversation after a muxel restart.
     pub fn grok() -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -327,8 +330,8 @@ impl AgentPreset {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
-            session_id_flag: None,
-            resume_flag: None,
+            session_id_flag: Some("--session-id".to_string()),
+            resume_flag: Some("--resume".to_string()),
         }
     }
 
@@ -509,6 +512,25 @@ mod tests {
         assert_eq!(c.session_id_flag.as_deref(), Some("--session-id"));
         assert_eq!(c.resume_flag.as_deref(), Some("--resume"));
         assert!(AgentPreset::shell().session_id_flag.is_none());
+    }
+
+    #[test]
+    fn grok_preset_supports_resume() {
+        let g = AgentPreset::grok();
+        assert_eq!(g.session_id_flag.as_deref(), Some("--session-id"));
+        assert_eq!(g.resume_flag.as_deref(), Some("--resume"));
+        // Same flag shape as Claude, so the shared session_resume_args path applies.
+        let mut inst = instance(&g, None);
+        inst.session_id = Some("abc".to_string());
+        assert_eq!(
+            session_resume_args(&g, &inst),
+            Some(vec!["--session-id".to_string(), "abc".to_string()])
+        );
+        inst.session_started = true;
+        assert_eq!(
+            session_resume_args(&g, &inst),
+            Some(vec!["--resume".to_string(), "abc".to_string()])
+        );
     }
 
     #[test]
