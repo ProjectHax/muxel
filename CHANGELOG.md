@@ -3,7 +3,15 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.0.9] — 2026-07-09
+
+### Changed
+- **Local panes use tmux by default** — "New agents run in a tmux session" now defaults
+  **on** wherever `tmux` is installed, so a local pane survives a muxel restart and
+  reattaches, the way remote panes already did. On a host without tmux the toggle greys
+  out (reading "tmux not installed") and nothing changes; your saved preference is left
+  alone, so installing tmux later restores your choice rather than silently flipping it.
+  Windows is unaffected — muxel's tmux integration is unix-only.
 
 ### Fixed
 - **A killed pane was reported as a crash** — the OS gives a signalled child no
@@ -32,6 +40,15 @@ All notable changes to muxel are documented here. This project adheres to
   Ubuntu 24.04). muxel links the *system* GTK/WebKitGTK, so the whole stack now
   comes from the host — which also drops ~60 MB of bundled GTK/WebKit libraries
   (ICU, GStreamer, Pango, Cairo, …) that were never loaded.
+
+### iOS companion app (distributed via TestFlight / App Store, not in these downloads)
+- Broad polish pass: side-by-side agents on iPad, git worktree support, a richer launch
+  flow, and file/diff viewers. Cross-project sidebar status is now batched into one
+  round trip per host, with running/blocked count badges on project rows, a unified
+  "can't reach host" state with a reconnect overlay, and pull-to-refresh.
+- Fixed: an unknown pane kind (e.g. a browser pane) no longer makes a workspace
+  unreadable, and the foreground poll loop resumes when the app becomes active again,
+  so status dots and the Live Activity no longer go stale after backgrounding.
 
 ## [0.0.8] — 2026-07-06
 
