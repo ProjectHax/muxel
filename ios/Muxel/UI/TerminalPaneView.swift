@@ -172,6 +172,12 @@ struct TerminalPaneView: View {
                 // layout (`tmux_session`) so we converge with the name desktop uses for
                 // this instance; fall back to deriving one from the host name.
                 creating = true
+                // Fork the server off a project-less command line first, or the
+                // `new-session` below (the first client on a host with no server) hands
+                // its own argv to the long-lived server — and a `pkill -f <project>` on
+                // that host then kills every session on it. Idempotent and cheap; a
+                // failure here is not fatal (tmux may already be running).
+                _ = try? await conn.tmux(TmuxCommands.startServer())
                 let name = (instance.tmuxSession?.isEmpty == false)
                     ? instance.tmuxSession!
                     : TmuxSession.name(hostName: host.name, instanceId: instance.id)

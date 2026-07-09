@@ -96,6 +96,7 @@ the matching Swift port and the `RemoteLayout` version handling.
 |---|---|---|
 | tmux session name `muxel_<host-slug>_<uuid8>` | `crates/muxel-core/src/tmux.rs` | `Tmux/TmuxSession.swift` |
 | `tmux new-session -A -d -s … -c … -- prog args` | `tmux.rs` | `Tmux/TmuxCommands.swift` |
+| `tmux start-server ';' set -s exit-empty off` before the first session | `tmux.rs` (`start_server_args`) | `Tmux/TmuxCommands.swift` (`startServer`) |
 | `RemoteLayout` v1 JSON (`.muxel/workspace.json`) | `crates/muxel-core/src/lib.rs` | `Models/RemoteLayout.swift` |
 | Pane tree (`leaf`/`split` tagged enum, legacy `instance` leaf) | `crates/muxel-core/src/pane.rs` | `Models/PaneNode.swift` |
 | Pane-tree mutations (`split`/`move_into_split`/`add_tab`/`remove`/`normalize`) | `pane.rs` | `Models/PaneMutations.swift` |
@@ -108,6 +109,23 @@ the matching Swift port and the `RemoteLayout` version handling.
 | Theme palettes (chrome + terminal) | `crates/muxel/assets/themes/*.json` | `Theme/MuxelTheme.swift` |
 | Login identities (shared credentials) | `crates/muxel-core/src/lib.rs` (`Identity`) | `Models/Store.swift` (`Identity`) |
 | Quote-aware word split (extra args / custom command) | `crates/muxel-core/src/shell.rs` | `Util/Shell.swift` |
+
+### Why we start the tmux server ourselves
+
+tmux forks its server from whichever client first needs one, and **the server keeps
+that client's command line** (only its `comm` becomes `tmux: server`). A host has one
+server for all sessions — shared by this app, desktop's SSH panes, and the user's own
+tmux. If the first client is a pane's `tmux new-session -A -s muxel_<project>_… -c
+<project root>`, then the server's argv names a project, and an agent on that host
+running `pkill -f <project>` to clear its own dev server matches the *server*, kills
+it, and every agent in every session dies with it.
+
+So before creating the first session we run `TmuxCommands.startServer()`, whose argv
+names nothing. `exit-empty off` is part of it because a server holding no sessions
+otherwise exits immediately — `start-server` alone would evaporate and the next
+`new-session` would re-fork the server with the project name back in its argv. Note
+this leaves the remote server running once its last session ends; desktop restores
+`exit-empty on` when it quits, the phone does not.
 
 ### Status without an attached terminal (the polling enabler)
 

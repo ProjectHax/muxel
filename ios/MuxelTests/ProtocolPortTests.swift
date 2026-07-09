@@ -58,6 +58,22 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(TmuxCommands.killSession("s"), ["kill-session", "-t", "=s"])
     }
 
+    // Port of `start_server_args`. The tmux server inherits the command line of the
+    // client that forks it, and one server hosts every session on the host — so it must
+    // be started from an argv that names no project, before any `new-session` runs.
+    func testStartServerNamesNoProject() {
+        XCTAssertEqual(
+            TmuxCommands.startServer(),
+            ["start-server", ";", "set", "-s", "exit-empty", "off"])
+        // The `;` has to reach tmux as a literal argument (tmux's command separator);
+        // if the remote shell ate it, `set -s exit-empty off` would run as a shell
+        // command and the server would exit the moment it had no sessions.
+        XCTAssertEqual(
+            TmuxCommands.commandLine(TmuxCommands.startServer()),
+            "'tmux' 'start-server' ';' 'set' '-s' 'exit-empty' 'off'")
+        XCTAssertFalse(TmuxCommands.commandLine(TmuxCommands.startServer()).contains("muxel"))
+    }
+
     // iOS must launch the agent through a login+interactive shell so it's on the
     // user's PATH (a no-PTY SSH exec has a bare PATH → the agent exits instantly).
     func testLaunchAgentWrapsInLoginShell() {

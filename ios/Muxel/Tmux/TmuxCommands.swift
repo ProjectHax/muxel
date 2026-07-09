@@ -14,6 +14,28 @@ enum TmuxCommands {
 
     // MARK: Lifecycle
 
+    /// Start the remote tmux server *before* any session exists, from a command line
+    /// that names no project. Port of `start_server_args` in `crates/muxel-core/src/tmux.rs`
+    /// — both must produce the same argv.
+    ///
+    /// tmux forks its server from whichever client first needs one, and the server keeps
+    /// that client's command line. One server hosts every session on the host — shared by
+    /// this app, muxel desktop's SSH panes, and the user's own tmux. So if the first
+    /// client is `tmux new-session -A -s muxel_<project>_… -c <project root>`, the shared
+    /// server's argv names a project, and an agent on that host running
+    /// `pkill -f <project>` to clear its dev server SIGKILLs the server and every agent
+    /// in every session with it.
+    ///
+    /// `exit-empty off` is required: by default a server with no sessions exits at once,
+    /// so `start-server` alone would evaporate before the first `new-session` and the
+    /// server would be re-forked with the project name back in its argv.
+    ///
+    /// `Shell.quote(";")` renders as `';'`, so the remote shell hands tmux a literal `;`
+    /// argument (its command separator) rather than splitting the line itself.
+    static func startServer() -> [String] {
+        ["start-server", ";", "set", "-s", "exit-empty", "off"]
+    }
+
     /// Create a session running `program`+`args` in `cwd`.
     ///
     /// - `detached`: add `-d` so the session persists with no attached client
