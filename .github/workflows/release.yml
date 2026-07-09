@@ -129,21 +129,66 @@ jobs:
           wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${arch}.AppImage"
           chmod +x "linuxdeploy-${arch}.AppImage"
           mkdir -p AppDir
-          # Don't bundle WebKitGTK/GTK (the browser helper's deps): WebKit can't
-          # be carried inside an AppImage (it spawns fixed-path helper processes)
-          # and would add hundreds of MB. The helper uses the system WebKit and
-          # falls back to the OS browser when it's missing.
+
+          # muxel hard-links the system GTK3 + WebKitGTK (the `muxel --browser`
+          # helper window). WebKit can't be carried inside an AppImage — it
+          # spawns fixed-path helper processes — so the *whole* GTK/GLib stack
+          # has to come from the host, not just its top layer.
+          #
+          # linuxdeploy flattens the executable's transitive closure, so
+          # excluding only libgtk-3/libwebkit2gtk still bundles everything
+          # underneath them (glib, pango, cairo, ICU, GStreamer, ...). The
+          # bundled libglib-2.0 from this 22.04 runner then shadows the host's
+          # via LD_LIBRARY_PATH, and the host's libgtk-3 -> libjson-glib fails
+          # to resolve symbols added in later glib:
+          #
+          #     symbol lookup error: libjson-glib-1.0.so.0:
+          #     undefined symbol: g_once_init_leave_pointer
+          #
+          # which killed the AppImage at startup on every glib >= 2.80 distro
+          # (RHEL 10, Fedora 40+, Ubuntu 24.04). So exclude every soname in the
+          # system GTK/WebKit closure, keeping only the leaf libraries gpui
+          # itself links (dbus/xcb/xkbcommon + libxcb's X deps), which stay
+          # bundled for hosts that lack them.
+          roots=(libgtk-3.so.0 libgdk-3.so.0 libwebkit2gtk-4.1.so.0
+                 libjavascriptcoregtk-4.1.so.0 libsoup-3.0.so.0)
+          keep='^(libdbus-1|libxcb|libxkbcommon|libXau|libXdmcp)[-.]'
+          {
+            for root in "${roots[@]}"; do
+              echo "$root"
+              path=$(ldconfig -p | awk -v n="$root" '$1 == n { print $NF; exit }')
+              if [ -n "$path" ]; then ldd "$path" | awk '{ print $1 }'; fi
+            done
+          } | grep '^lib.*\.so' | sed 's/\.so.*/.so*/' | sort -u \
+            | grep -Ev "$keep" > appimage-excludes.txt
+          cat appimage-excludes.txt
+
+          # If the closure didn't resolve, the list would be just the roots and
+          # we'd silently ship the bug again.
+          grep -qxF 'libglib-2.0.so*' appimage-excludes.txt \
+            || { echo "::error::could not resolve the system GTK/WebKit closure"; exit 1; }
+
+          exclude_args=()
+          while read -r lib; do
+            exclude_args+=(--exclude-library "$lib")
+          done < appimage-excludes.txt
+
           "./linuxdeploy-${arch}.AppImage" \
             --appdir AppDir \
             --executable target/release/muxel \
             --desktop-file packaging/muxel.desktop \
             --icon-file crates/muxel/assets/muxel.png \
-            --exclude-library "libwebkit2gtk*" \
-            --exclude-library "libjavascriptcoregtk*" \
-            --exclude-library "libsoup-3*" \
-            --exclude-library "libgtk-3*" \
-            --exclude-library "libgdk-3*" \
+            "${exclude_args[@]}" \
             --output appimage
+
+          # Belt and braces: any bundled GLib/GTK library shadows the host's and
+          # breaks startup on newer distros. Fail the build instead of shipping.
+          if ls AppDir/usr/lib 2>/dev/null | grep -Eq '^lib(glib-2\.0|gobject-2\.0|gio-2\.0|gmodule-2\.0|gtk-3|gdk-3|pango|cairo|webkit2gtk)'; then
+            echo "::error::AppImage bundled part of the GTK/GLib stack; it must come from the host"
+            ls AppDir/usr/lib
+            exit 1
+          fi
+
           # linuxdeploy names it after the desktop "Name"; normalize it.
           mv muxel*-"${arch}".AppImage "muxel-linux-${arch}.AppImage" 2>/dev/null \
             || mv muxel*.AppImage "muxel-linux-${arch}.AppImage"

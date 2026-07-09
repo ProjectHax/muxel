@@ -3,6 +3,18 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Fixed
+- **Linux AppImage failed to start on modern distros** — the AppImage bundled a
+  copy of GLib (and the rest of the GTK/WebKit dependency closure) from the
+  Ubuntu 22.04 build runner. It shadowed the host's newer GLib, so the host's
+  own `libgtk-3` → `libjson-glib` could not resolve `g_once_init_leave_pointer`
+  and the app died at startup on any glib ≥ 2.80 system (RHEL 10, Fedora 40+,
+  Ubuntu 24.04). muxel links the *system* GTK/WebKitGTK, so the whole stack now
+  comes from the host — which also drops ~60 MB of bundled GTK/WebKit libraries
+  (ICU, GStreamer, Pango, Cairo, …) that were never loaded.
+
 ## [0.0.8] — 2026-07-06
 
 ### Added
