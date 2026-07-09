@@ -6,6 +6,11 @@ All notable changes to muxel are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- **Windows: npm agents (Codex, etc.) fail to spawn with os error 193** — npm
+  installs an extension-less `#!/bin/sh` shim next to `agent.cmd`. portable-pty's
+  PATH search returns the shim first, and CreateProcessW rejects it as not a
+  valid Win32 application. muxel now resolves bare program names preferring
+  PATHEXT (`.cmd`/`.exe`) and skipping shebang shims before spawn.
 - **Linux AppImage failed to start on modern distros** — the AppImage bundled a
   copy of GLib (and the rest of the GTK/WebKit dependency closure) from the
   Ubuntu 22.04 build runner. It shadowed the host's newer GLib, so the host's
