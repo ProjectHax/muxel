@@ -61,6 +61,7 @@ fn agent_icon_path(program: Option<&str>) -> SharedString {
         Some(p) if p.contains("opencode") => "icons/agent-opencode.svg",
         Some(p) if p == "amp" || p.contains("ampcode") => "icons/agent-ampcode.svg",
         Some(p) if p.contains("grok") => "icons/agent-grok.svg",
+        Some(p) if p.contains("codex") => "icons/agent-generic.svg",
         Some(p) if p.contains("hermes") => "icons/agent-hermes.svg",
         Some(p) if p.contains("ollama") => "icons/agent-ollama.svg",
         Some(p) if p == "pi" || p.contains("pi.dev") || p.contains("pidev") => "icons/agent-pi.svg",
@@ -624,6 +625,32 @@ fn claude_session_gone(
         return false;
     };
     !muxel_core::claude_session_path(&home, cwd, session_id).exists()
+}
+
+/// Whether an agent-minted session id is no longer on disk (Codex today).
+fn agent_minted_session_gone(preset: &muxel_core::AgentPreset, session_id: &str) -> bool {
+    let program = preset.program.as_deref().unwrap_or_default();
+    if !program.contains("codex") {
+        return false;
+    }
+    let Some(home) = home_dir() else {
+        return false;
+    };
+    !muxel_core::codex_session_exists(&home, session_id)
+}
+
+/// Capture the real session id an agent-minted CLI wrote for `cwd` (Codex).
+fn capture_agent_session_id(
+    preset: &muxel_core::AgentPreset,
+    cwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let program = preset.program.as_deref().unwrap_or_default();
+    if !program.contains("codex") {
+        return None;
+    }
+    let home = home_dir()?;
+    let cwd = cwd?;
+    muxel_core::codex_latest_session_id(&home, cwd)
 }
 
 /// "NewPane" -> "New Pane", "NewAgent1" -> "New Agent 1" for the shortcut
@@ -3093,17 +3120,21 @@ impl MuxelApp {
     /// Build the launch command for an instance (program/args + system-prompt
     /// injection, rooted at its project).
     /// Session-resume args for a resume-capable agent, doing the `&mut`
-    /// bookkeeping: generate a stable session id on first launch, flip
-    /// `session_started`, and persist. Returns the CLI args to inject, or `None`
-    /// for agents/instances without resume. First launch starts the session with
-    /// `--session-id <id>`; every later launch `--resume <id>`.
+    /// bookkeeping: mint/capture a session id, flip `session_started`, and
+    /// persist. Returns the CLI args to inject, or `None` for agents without
+    /// resume (or a bare first launch for agent-minted ids).
+    ///
+    /// - **Host-minted** (`session_id_flag` set): first launch
+    ///   `--session-id <id>`; later `--resume <id>` (or the preset's flag).
+    /// - **Agent-minted** (only `resume_flag`, e.g. Codex): first launch bare;
+    ///   on restart, capture the real id from disk then `resume <id>`.
     fn session_resume_for(&mut self, iid: Uuid) -> Option<Vec<String>> {
         let inst = self.workspace.instance(iid)?;
         let preset = inst
             .preset_id
             .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
             .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
-        if preset.session_id_flag.is_none() || preset.resume_flag.is_none() {
+        if preset.resume_flag.is_none() {
             return None;
         }
         let preset = preset.clone();
@@ -3115,20 +3146,35 @@ impl MuxelApp {
                 .map(|p| p.root_path.clone())
         });
         let inst = self.workspace.instance_mut(iid)?;
-        if inst.session_id.is_none() {
-            inst.session_id = Some(Uuid::new_v4().to_string());
-        }
-        // Proactive resume: if we'd `--resume` an already-started session but its
-        // transcript is gone from disk (deleted/expired), start a *fresh* session
-        // instead of a doomed resume that just hangs. A missing file means there's
-        // nothing to resume anyway, and a fresh id avoids the "id already in use"
-        // collision that reusing the old id would risk.
-        if inst.session_started
-            && let Some(sid) = inst.session_id.clone()
-            && claude_session_gone(&preset, cwd.as_deref(), &sid)
-        {
-            inst.session_id = Some(Uuid::new_v4().to_string());
-            inst.session_started = false;
+        let host_minted = preset.session_id_flag.is_some();
+        if host_minted {
+            if inst.session_id.is_none() {
+                inst.session_id = Some(Uuid::new_v4().to_string());
+            }
+            // Proactive resume: if we'd `--resume` an already-started session but its
+            // transcript is gone from disk (deleted/expired), start a *fresh* session
+            // instead of a doomed resume that just hangs.
+            if inst.session_started
+                && let Some(sid) = inst.session_id.clone()
+                && claude_session_gone(&preset, cwd.as_deref(), &sid)
+            {
+                inst.session_id = Some(Uuid::new_v4().to_string());
+                inst.session_started = false;
+            }
+        } else if inst.session_started {
+            // Agent-minted (Codex): adopt the real id from disk before resuming.
+            let need_capture = match inst.session_id.as_deref() {
+                None => true,
+                Some(sid) => agent_minted_session_gone(&preset, sid),
+            };
+            if need_capture {
+                if let Some(id) = capture_agent_session_id(&preset, cwd.as_deref()) {
+                    inst.session_id = Some(id);
+                } else {
+                    inst.session_id = None;
+                    inst.session_started = false;
+                }
+            }
         }
         let snapshot = inst.clone();
         inst.session_started = true;

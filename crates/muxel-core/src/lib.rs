@@ -14,7 +14,8 @@ pub mod worktree;
 
 pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, ResolvedLaunch,
-    claude_session_path, memory_header, memory_instruction, resolve_launch, session_resume_args,
+    claude_session_path, codex_latest_session_id, codex_session_exists, memory_header,
+    memory_instruction, resolve_launch, session_resume_args,
 };
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
@@ -1177,7 +1178,7 @@ impl Default for Settings {
 /// v5: added the Grok (x.ai) preset.
 /// v6: opencode default runner startup delay.
 /// v10: added the "Ollama Code" preset (`ollama launch <agent> --model <model>`).
-pub const PRESET_SEED_VERSION: u32 = 10;
+pub const PRESET_SEED_VERSION: u32 = 11;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see

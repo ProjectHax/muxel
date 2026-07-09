@@ -5,6 +5,13 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Codex preset + session resume** — built-in Codex agent preset. Codex mints its
+  own session id (no create-time flag), so muxel starts bare, then on restart
+  captures the latest `~/.codex/sessions` rollout for the project cwd and launches
+  `codex resume <id>`. Resume support now allows `resume_flag` without
+  `session_id_flag` for agent-minted CLIs.
+
 ### Fixed
 - **Linux AppImage failed to start on modern distros** — the AppImage bundled a
   copy of GLib (and the rest of the GTK/WebKit dependency closure) from the
