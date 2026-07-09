@@ -5,6 +5,12 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Grok session resume** — the built-in Grok preset now sets `--session-id` /
+  `--resume` like Claude, so a Grok pane reopens its prior conversation after a
+  muxel restart. Existing Grok presets pick up the flags on seed upgrade (unless
+  you already set your own).
+
 ### Changed
 - **Popped-out project windows open with the sidebar hidden** — the window exists to
   show one project on its own monitor, so the project list starts out of the way. Its

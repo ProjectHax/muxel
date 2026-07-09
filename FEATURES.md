@@ -72,8 +72,8 @@ feature is added or changed, update the matching entry here in the same change**
   to a shell showing the underlying error instead of crashing. If even the
   fallback shell can't start, the pane shows the failure in place (the toolbar
   Restart retries) and the error lands in the NOTIFICATIONS feed.
-- **Session resume** — resume-capable agents (Claude out of the box) get a stable
-  per-pane session id: muxel launches with `--session-id` the first time and
+- **Session resume** — resume-capable agents (Claude and Grok out of the box) get a
+  stable per-pane session id: muxel launches with `--session-id` the first time and
   `--resume` on restart, so a pane reopens its previous conversation instead of
   starting fresh. If the saved session is gone, it quietly starts a new one in the
   same slot. Configurable per preset (`session_id_flag` / `resume_flag`), so other

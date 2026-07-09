@@ -1209,7 +1209,7 @@ impl Default for Settings {
 /// v5: added the Grok (x.ai) preset.
 /// v6: opencode default runner startup delay.
 /// v10: added the "Ollama Code" preset (`ollama launch <agent> --model <model>`).
-pub const PRESET_SEED_VERSION: u32 = 10;
+pub const PRESET_SEED_VERSION: u32 = 11;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
