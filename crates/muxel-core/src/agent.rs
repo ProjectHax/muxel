@@ -469,9 +469,31 @@ pub const MEMORY_DIR: &str = ".muxel";
 /// The shared per-project agent memory file, inside [`MEMORY_DIR`].
 pub const MEMORY_FILE: &str = "MEMORY.md";
 
+/// How to refer to a project's `.muxel/MEMORY.md` from inside an agent's system
+/// prompt, given the project `root` and the `cwd` the agent will run in.
+///
+/// This lands in the agent's **argv** (via `--append-system-prompt`), and argv is
+/// what `pkill -f <pattern>` matches. An absolute path puts the project's name in
+/// every one of its agents' command lines, so an agent running a routine cleanup
+/// like `pkill -f myproject` SIGKILLs every pane in the project — including its
+/// own. Prefer a path relative to the agent's cwd, which names nothing.
+///
+/// Falls back to the absolute path when the memory file isn't under the cwd (an
+/// instance running in a worktree), where a relative path simply wouldn't resolve.
+pub fn memory_reference(root: &str, cwd: Option<&str>) -> String {
+    let trimmed = root.trim_end_matches('/');
+    let relative = format!("{MEMORY_DIR}/{MEMORY_FILE}");
+    match cwd {
+        Some(cwd) if cwd.trim_end_matches('/') != trimmed => {
+            format!("{trimmed}/{relative}")
+        }
+        _ => relative,
+    }
+}
+
 /// The system-prompt snippet appended to an agent's prompt when a project has
-/// shared memory enabled. `path` is the absolute path to the project's
-/// `.muxel/MEMORY.md` on whichever host the agent runs.
+/// shared memory enabled. `path` is how the agent should refer to its project's
+/// `.muxel/MEMORY.md` — see [`memory_reference`].
 pub fn memory_instruction(path: &str) -> String {
     format!(
         "This project has a shared, muxel-maintained memory file at `{path}`, \
@@ -692,5 +714,44 @@ mod tests {
         assert!(s.contains("/srv/app/.muxel/MEMORY.md"));
         assert!(s.contains("grep"));
         assert!(s.contains("## "));
+    }
+
+    #[test]
+    fn memory_reference_is_relative_when_the_agent_starts_at_the_project_root() {
+        assert_eq!(
+            memory_reference("/srv/app", Some("/srv/app")),
+            ".muxel/MEMORY.md"
+        );
+        // No cwd recorded → the agent runs at the root by default.
+        assert_eq!(memory_reference("/srv/app", None), ".muxel/MEMORY.md");
+        // A trailing slash on either side is still the same directory.
+        assert_eq!(
+            memory_reference("/srv/app/", Some("/srv/app")),
+            ".muxel/MEMORY.md"
+        );
+    }
+
+    #[test]
+    fn memory_reference_stays_absolute_for_a_worktree_cwd() {
+        // The memory file lives at the project root, outside the worktree, so a
+        // relative path would not resolve from there.
+        assert_eq!(
+            memory_reference("/srv/app", Some("/srv/worktrees/app-feature")),
+            "/srv/app/.muxel/MEMORY.md"
+        );
+    }
+
+    /// Regression: the instruction goes into the agent's argv, and `pkill -f` matches
+    /// argv. If the project's path is in there, an agent running `pkill -f <project>`
+    /// (a routine "kill my dev server" cleanup) SIGKILLs every pane in the project,
+    /// its own included — four at once, indistinguishable from four crashes.
+    #[test]
+    fn memory_instruction_keeps_the_project_name_out_of_argv() {
+        let root = "/home/me/Projects/sro_client";
+        let s = memory_instruction(&memory_reference(root, Some(root)));
+        assert!(
+            !s.contains("sro_client"),
+            "project name leaked into the agent's argv: {s}"
+        );
     }
 }

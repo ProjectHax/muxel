@@ -29,7 +29,17 @@ pub enum PtyChunk {
     /// The child exited (or the PTY closed).
     Exit {
         /// Exit code, when the OS reported one within the harvest window.
+        ///
+        /// Beware: `portable_pty` reports a *signalled* child as `code = 1`
+        /// (`ExitStatus::code()` is `None` for a signal, and it falls back to
+        /// 1), so this alone cannot distinguish `exit(1)` from "killed". Read
+        /// it together with `signal`.
         code: Option<i32>,
+        /// The signal name that killed the child (`"Hangup"`, `"Killed"`, …),
+        /// when it died on one. This is the field that says *who* ended the
+        /// process: a `Hangup` means its PTY master closed, while `Killed`
+        /// means something sent SIGKILL.
+        signal: Option<String>,
         /// Set when the session ended on a PTY read *error* rather than a clean
         /// EOF — the child may not have exited at all (kept for diagnostics).
         read_error: Option<String>,
@@ -871,10 +881,16 @@ fn read_loop(
     // with the Exit event. None after the window means the code is unknown *so
     // far* (e.g. the PTY closed before the process finished dying).
     let mut code = None;
+    let mut signal = None;
     for _ in 0..20 {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // A signalled child has no exit code of its own; portable_pty
+                // substitutes 1. Keep the signal name so the app can tell a
+                // real `exit(1)` from a SIGHUP/SIGKILL — without it every
+                // killed pane is indistinguishable from a crashed one.
                 code = Some(status.exit_code() as i32);
+                signal = status.signal().map(str::to_string);
                 break;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
@@ -882,7 +898,11 @@ fn read_loop(
         }
     }
     if !ui_gone {
-        let _ = tx.send_blocking(PtyChunk::Exit { code, read_error });
+        let _ = tx.send_blocking(PtyChunk::Exit {
+            code,
+            signal,
+            read_error,
+        });
     }
     // Keep waiting until the child is actually reaped. A child that outlives
     // its PTY (daemonized, or slow to die after a kill) parks this thread at a
@@ -1188,9 +1208,57 @@ mod tests {
             );
             match rx.try_recv() {
                 Ok(PtyChunk::Output(_)) => {}
-                Ok(PtyChunk::Exit { code, read_error }) => {
+                Ok(PtyChunk::Exit {
+                    code,
+                    signal,
+                    read_error,
+                }) => {
                     assert_eq!(code, Some(7));
+                    assert_eq!(signal, None, "a normal exit carries no signal");
                     assert_eq!(read_error, None, "a normal exit is a clean EOF");
+                    break;
+                }
+                Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(async_channel::TryRecvError::Closed) => {
+                    panic!("channel closed without an exit chunk")
+                }
+            }
+        }
+    }
+
+    /// A signalled child reports `code = 1` (portable_pty substitutes 1 when the
+    /// OS gives no exit code), which is indistinguishable from a real `exit(1)`
+    /// unless the signal name comes with it. Dropping the signal is what left a
+    /// pane full of dead agents looking exactly like four crashed ones.
+    #[test]
+    fn signal_is_reported_alongside_the_substituted_code() {
+        let (_session, rx) = TerminalSession::spawn(
+            // The shell SIGKILLs itself: no exit code, only a signal.
+            CommandSpec::program("/bin/sh", vec!["-c".into(), "kill -9 $$".into()]),
+            80,
+            24,
+        )
+        .expect("spawn");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no exit chunk within the deadline"
+            );
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(_)) => {}
+                Ok(PtyChunk::Exit { code, signal, .. }) => {
+                    assert_eq!(
+                        code,
+                        Some(1),
+                        "portable_pty substitutes 1 for a signalled child"
+                    );
+                    assert!(
+                        signal.is_some(),
+                        "the signal name must survive, or `code=1` is ambiguous"
+                    );
                     break;
                 }
                 Err(async_channel::TryRecvError::Empty) => {

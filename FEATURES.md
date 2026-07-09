@@ -264,9 +264,12 @@ feature is added or changed, update the matching entry here in the same change**
   the PTY failing outright) is never auto-closed: it keeps its final screen under
   a "process exited — code N" banner, fires an error in the NOTIFICATIONS feed
   (plus a desktop notification when unattended), and Restart relaunches in place.
-  Only a clean exit (code 0) qualifies for auto-close.
-- **Event log** — pane lifecycle events (every exit with its code, every close,
-  auto-closes, PTY read errors) are appended to `muxel.log` in the data dir
+  Only a clean exit (code 0) qualifies for auto-close. A process that was *killed*
+  is named as such — "process killed — signal Hangup/Killed/Terminated" — instead
+  of being reported as a crash, since the OS gives a signalled child no exit code
+  of its own and it would otherwise be indistinguishable from `exit(1)`.
+- **Event log** — pane lifecycle events (every exit with its code and signal, every
+  close, auto-closes, PTY read errors) are appended to `muxel.log` in the data dir
   (rotated at 1 MB), so "why did this pane disappear?" is answerable even when
   the app runs with stderr discarded.
 - **Content inset** — a small margin around the grid so a too-wide TUI truncates

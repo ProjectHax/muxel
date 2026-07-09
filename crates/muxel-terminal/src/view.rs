@@ -130,6 +130,14 @@ impl TerminalMouseMode {
     }
 }
 
+/// How a child ended, carried from `PtyChunk::Exit` to the view in one piece so
+/// the three same-typed optionals can't be transposed at a call site.
+struct ExitInfo {
+    code: Option<i32>,
+    signal: Option<String>,
+    read_error: Option<String>,
+}
+
 pub struct TerminalView {
     session: Arc<TerminalSession>,
     focus_handle: FocusHandle,
@@ -139,8 +147,11 @@ pub struct TerminalView {
     mouse_mode: TerminalMouseMode,
     exited: bool,
     /// The child's exit code once it has exited (`None` = still running or the
-    /// code wasn't reported by the OS/PTY).
+    /// code wasn't reported by the OS/PTY). `Some(1)` may mean a signal — see
+    /// `exit_signal`.
     exit_code: Option<i32>,
+    /// The signal that killed the child, when one did (see `PtyChunk::Exit`).
+    exit_signal: Option<String>,
     /// Set when the session ended on a PTY read error rather than a clean EOF —
     /// the child may still have been healthy (see `PtyChunk::Exit`).
     exit_read_error: Option<String>,
@@ -323,17 +334,35 @@ impl TerminalView {
                 };
 
                 let mut output: Vec<u8> = Vec::new();
-                let mut exit: Option<(Option<i32>, Option<String>)> = None;
+                let mut exit: Option<ExitInfo> = None;
                 match chunk {
                     PtyChunk::Output(b) => output.extend_from_slice(&b),
-                    PtyChunk::Exit { code, read_error } => exit = Some((code, read_error)),
+                    PtyChunk::Exit {
+                        code,
+                        signal,
+                        read_error,
+                    } => {
+                        exit = Some(ExitInfo {
+                            code,
+                            signal,
+                            read_error,
+                        });
+                    }
                 }
                 // Coalesce whatever else is already buffered.
                 while let Ok(more) = rx.try_recv() {
                     match more {
                         PtyChunk::Output(b) => output.extend_from_slice(&b),
-                        PtyChunk::Exit { code, read_error } => {
-                            exit = Some((code, read_error));
+                        PtyChunk::Exit {
+                            code,
+                            signal,
+                            read_error,
+                        } => {
+                            exit = Some(ExitInfo {
+                                code,
+                                signal,
+                                read_error,
+                            });
                             break;
                         }
                     }
@@ -353,10 +382,11 @@ impl TerminalView {
                             }
                         }
                         let stop = exit.is_some();
-                        if let Some((code, read_error)) = exit.take() {
+                        if let Some(info) = exit.take() {
                             view.exited = true;
-                            view.exit_code = code;
-                            view.exit_read_error = read_error;
+                            view.exit_code = info.code;
+                            view.exit_signal = info.signal;
+                            view.exit_read_error = info.read_error;
                         }
                         cx.notify();
                         stop
@@ -377,6 +407,7 @@ impl TerminalView {
             mouse_mode: TerminalMouseMode::default(),
             exited: false,
             exit_code: None,
+            exit_signal: None,
             exit_read_error: None,
             launch_error,
             working_markers,
@@ -399,6 +430,13 @@ impl TerminalView {
     /// while running or when the code is unknown (e.g. a bare PTY close).
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    /// The signal that killed the child (`"Hangup"`, `"Killed"`, …), when one
+    /// did. A pane whose child was signalled reports `exit_code() == Some(1)`,
+    /// so this is the only way to tell it apart from a genuine `exit(1)`.
+    pub fn exit_signal(&self) -> Option<&str> {
+        self.exit_signal.as_deref()
     }
 
     /// The PTY read error that ended the session, when it wasn't a clean EOF.

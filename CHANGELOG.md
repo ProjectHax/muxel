@@ -6,6 +6,24 @@ All notable changes to muxel are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- **A killed pane was reported as a crash** — the OS gives a signalled child no
+  exit code of its own, and `portable-pty` substitutes `1`, so a pane that was
+  SIGKILLed or hung up was indistinguishable from one that called `exit(1)`. The
+  signal name was available and thrown away. muxel now records it: `muxel.log`
+  gets `signal=Killed`, and the tombstone reads "process killed — signal Killed"
+  rather than "process exited — code 1". This is what tells "muxel closed the
+  PTY" (`Hangup`) apart from "something killed the agent" (`Killed`).
+- **An agent's `pkill` could wipe out every pane in its project** — with shared
+  memory enabled, muxel appended the project's *absolute* path to each agent's
+  `--append-system-prompt`, and that lands in the process's argv, which is what
+  `pkill -f <pattern>` matches. So an agent running a routine `pkill -f myproject`
+  to clear its dev server also SIGKILLed every muxel pane in that project,
+  including its own — all in the same second, looking exactly like a mass crash.
+  The prompt now refers to `.muxel/MEMORY.md` relative to the agent's working
+  directory, naming nothing. (Agents in a worktree, whose cwd isn't the project
+  root, still get the absolute path since a relative one wouldn't resolve; local
+  agents also still receive it out-of-band via `$MUXEL_MEMORY_FILE`, which argv
+  matching can't see.)
 - **Linux AppImage failed to start on modern distros** — the AppImage bundled a
   copy of GLib (and the rest of the GTK/WebKit dependency closure) from the
   Ubuntu 22.04 build runner. It shadowed the host's newer GLib, so the host's

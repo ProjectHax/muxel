@@ -23,9 +23,9 @@ use muxel_core::{
     MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteRef,
     ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace,
     WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, focus_in_direction,
-    memory_instruction, migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside,
-    move_tab_to, remove, resolve_launch, set_active_tab, set_split_sizes, set_tab_order, split,
-    split_beside, ssh, swap_instances, swap_panes,
+    memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
+    move_pane_beside, move_tab_to, remove, resolve_launch, set_active_tab, set_split_sizes,
+    set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
@@ -3156,8 +3156,11 @@ impl MuxelApp {
                     Some(r) => r.remote_root.clone(),
                     None => p.root_path.display().to_string(),
                 };
-                let path = format!("{root}/{MEMORY_DIR}/{MEMORY_FILE}");
-                let instruction = memory_instruction(&path);
+                // Refer to the file relatively when the agent starts at the project
+                // root: this string ends up in the agent's argv, and an absolute path
+                // there makes every pane of the project match `pkill -f <project>`.
+                let cwd = i.worktree_path.as_ref().map(|w| w.display().to_string());
+                let instruction = memory_instruction(&memory_reference(&root, cwd.as_deref()));
                 i.system_prompt = Some(match i.system_prompt.take() {
                     Some(base) if !base.is_empty() => format!("{base}\n\n{instruction}"),
                     _ => instruction,
@@ -5074,17 +5077,19 @@ impl MuxelApp {
         // A `--resume` launch has this long to prove its saved session is valid;
         // past that we stop watching it for recovery signals.
         const RECOVER_WITHIN_SECS: u64 = 10;
-        // (iid, status, exited, exit_code, read_error, title, project, resume_error)
-        type Snap = (
-            Uuid,
-            AgentStatus,
-            bool,
-            Option<i32>,
-            Option<String>,
-            String,
-            String,
-            bool,
-        );
+        struct Snap {
+            iid: Uuid,
+            status: AgentStatus,
+            exited: bool,
+            exit_code: Option<i32>,
+            /// `Some` when a signal killed the child — the only way to tell a
+            /// killed pane from one that genuinely called `exit(1)`.
+            exit_signal: Option<String>,
+            read_error: Option<String>,
+            title: String,
+            project: String,
+            resume_error: bool,
+        }
         let snapshot: Vec<Snap> = self
             .terminals
             .iter()
@@ -5093,6 +5098,7 @@ impl MuxelApp {
                 let status = v.status();
                 let exited = v.exited();
                 let exit_code = v.exit_code();
+                let exit_signal = v.exit_signal().map(str::to_string);
                 let read_error = v.exit_read_error().map(str::to_string);
                 // A resume launch whose saved session is gone may *hang* on the
                 // agent's "No conversation found …" error instead of exiting —
@@ -5111,16 +5117,17 @@ impl MuxelApp {
                     .and_then(|i| self.workspace.project(i.project_id))
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
-                (
-                    *iid,
+                Snap {
+                    iid: *iid,
                     status,
                     exited,
                     exit_code,
+                    exit_signal,
                     read_error,
                     title,
                     project,
                     resume_error,
-                )
+                }
             })
             .collect();
 
@@ -5131,7 +5138,18 @@ impl MuxelApp {
         // tooltips: a repaint landing as the cursor leaves a button drops the
         // hover-out event, leaving the tooltip stuck until another one shows.
         let mut dirty = false;
-        for (iid, status, exited, exit_code, read_error, title, project, resume_error) in snapshot {
+        for Snap {
+            iid,
+            status,
+            exited,
+            exit_code,
+            exit_signal,
+            read_error,
+            title,
+            project,
+            resume_error,
+        } in snapshot
+        {
             let changed = self.last_status.insert(iid, status) != Some(status);
             dirty |= changed;
             // Record each process exit exactly once in the durable event log —
@@ -5141,6 +5159,13 @@ impl MuxelApp {
             if newly_exited {
                 let code = exit_code.map_or_else(|| "unknown".to_string(), |c| c.to_string());
                 let mut line = format!("exit: \"{title}\" [{project}] code={code}");
+                // A signalled child always reports code=1, so the code alone
+                // can't say whether the process failed or was killed (and by
+                // what). Record the signal name: `Hangup` means muxel closed
+                // its PTY, `Killed` means something SIGKILLed it.
+                if let Some(sig) = &exit_signal {
+                    line.push_str(&format!(" signal={sig}"));
+                }
                 if let Some(err) = &read_error {
                     line.push_str(&format!(" read_error=\"{err}\""));
                 }
@@ -5197,10 +5222,13 @@ impl MuxelApp {
             } else if newly_exited && exit_code != Some(0) {
                 // Abnormal exit: the pane stays as a tombstone; flag it in the
                 // feed (and as a desktop notification when unattended).
-                let detail = match (&read_error, exit_code) {
-                    (Some(err), _) => tf("terminal read failed: {err}", &[("err", err)]),
-                    (None, Some(code)) => tf("exit code {code}", &[("code", &code.to_string())]),
-                    (None, None) => t("exit code unknown").to_string(),
+                let detail = match (&read_error, &exit_signal, exit_code) {
+                    (Some(err), _, _) => tf("terminal read failed: {err}", &[("err", err)]),
+                    (None, Some(sig), _) => tf("killed by signal {sig}", &[("sig", sig)]),
+                    (None, None, Some(code)) => {
+                        tf("exit code {code}", &[("code", &code.to_string())])
+                    }
+                    (None, None, None) => t("exit code unknown").to_string(),
                 };
                 self.add_event(
                     NotifKind::Error,
@@ -11474,16 +11502,22 @@ impl MuxelApp {
                         // process never masquerades as a live pane or a random
                         // disappearance. The toolbar Restart respawns in place.
                         let abnormal = v.exit_read_error().is_some() || v.exit_code() != Some(0);
-                        let label: SharedString = match (v.exit_read_error(), v.exit_code()) {
-                            (Some(_), _) => t("process ended — terminal read failed"),
-                            (None, Some(0)) => t("process exited"),
-                            (None, Some(code)) => tf(
-                                "process exited — code {code}",
-                                &[("code", &code.to_string())],
-                            )
-                            .into(),
-                            (None, None) => t("process exited — code unknown"),
-                        };
+                        // A signalled child reports code 1; say "killed by
+                        // <signal>" rather than mislabelling it a crash.
+                        let label: SharedString =
+                            match (v.exit_read_error(), v.exit_signal(), v.exit_code()) {
+                                (Some(_), _, _) => t("process ended — terminal read failed"),
+                                (None, Some(sig), _) => {
+                                    tf("process killed — signal {sig}", &[("sig", sig)]).into()
+                                }
+                                (None, None, Some(0)) => t("process exited"),
+                                (None, None, Some(code)) => tf(
+                                    "process exited — code {code}",
+                                    &[("code", &code.to_string())],
+                                )
+                                .into(),
+                                (None, None, None) => t("process exited — code unknown"),
+                            };
                         let (bg, fg) = if abnormal {
                             (cx.theme().danger.opacity(0.15), cx.theme().danger)
                         } else {
