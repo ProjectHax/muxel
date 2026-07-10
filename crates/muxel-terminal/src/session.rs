@@ -990,15 +990,12 @@ fn resolve_program_for_spawn_windows(program: &str) -> String {
         }
         // CreateProcess runs .exe/.com and host scripts for .cmd/.bat.
         // Extension-less npm shims are `#!/bin/sh` and are not.
-        match path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| {
-                e.eq_ignore_ascii_case("exe")
-                    || e.eq_ignore_ascii_case("com")
-                    || e.eq_ignore_ascii_case("cmd")
-                    || e.eq_ignore_ascii_case("bat")
-            }) {
+        match path.extension().and_then(|e| e.to_str()).map(|e| {
+            e.eq_ignore_ascii_case("exe")
+                || e.eq_ignore_ascii_case("com")
+                || e.eq_ignore_ascii_case("cmd")
+                || e.eq_ignore_ascii_case("bat")
+        }) {
             Some(true) => true,
             _ => !is_shebang(path),
         }
