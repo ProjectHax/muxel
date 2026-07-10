@@ -329,6 +329,7 @@ impl Element for TerminalElement {
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
+            let mouse_mode = self.mouse_mode;
             let cw = f32::from(cell_width);
             let lh = f32::from(line_height);
             window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
@@ -358,7 +359,12 @@ impl Element for TerminalElement {
                     _ => return,
                 };
                 // Mouse-reporting apps get the click (Shift forces local select).
-                if session.mouse_reporting() && !e.modifiers.shift {
+                // In RightClickMenu mode, right-click is reserved for the local
+                // Copy/Paste menu (the muxel crate's context-menu wrapper owns it),
+                // so don't *also* forward it to the app — that double-fires.
+                let right_click_owned_by_menu =
+                    button == 2 && mouse_mode == TerminalMouseMode::RightClickMenu;
+                if session.mouse_reporting() && !e.modifiers.shift && !right_click_owned_by_menu {
                     let _ = session.clear_selection();
                     session.report_mouse_button(
                         col,
@@ -450,25 +456,18 @@ impl Element for TerminalElement {
         }
         {
             let session = self.session.clone();
-            let hitbox = hitbox.clone();
             let mouse_mode = self.mouse_mode;
             let cw = f32::from(cell_width);
             let lh = f32::from(line_height);
-            window.on_mouse_event(move |e: &MouseUpEvent, phase, window, cx| {
+            window.on_mouse_event(move |e: &MouseUpEvent, phase, _window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
-                // Release report for mouse-reporting apps.
-                if session.mouse_reporting() && !e.modifiers.shift && hitbox.is_hovered(window) {
-                    let button = match e.button {
-                        MouseButton::Left => 0u8,
-                        MouseButton::Middle => 1,
-                        MouseButton::Right => 2,
-                        _ => {
-                            session.stop_selecting();
-                            return;
-                        }
-                    };
+                // Release report: if we forwarded this button's *press* to the app,
+                // always send the release — even if the pointer has left the pane or
+                // Shift is now held — or the app is stranded with a phantom held
+                // button (e.g. a vim visual-drag that ends in a sibling split).
+                if let Some(button) = session.mouse_press_pending() {
                     let local = e.position - origin;
                     let col = ((f32::from(local.x).max(0.0) / cw) as usize)
                         .min(cols.saturating_sub(1) as usize);

@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -149,6 +149,9 @@ impl CommandSpec {
 /// leave duplicated static output, e.g. a reprinted banner).
 const RESIZE_SETTLE: Duration = Duration::from_millis(60);
 
+/// Sentinel for `mouse_pressed_button` meaning "no button press is outstanding".
+const NO_MOUSE_PRESS: u8 = u8::MAX;
+
 /// Debounce state for resizing: the last-applied size, the size currently being
 /// requested, and when that request first appeared.
 struct ResizeState {
@@ -209,6 +212,11 @@ pub struct TerminalSession {
     palette: Arc<Mutex<TerminalPalette>>,
     /// True while a left-drag text selection started in this terminal.
     selecting: AtomicBool,
+    /// The mouse button (0/1/2) whose *press* we last forwarded to a mouse-
+    /// reporting app, or `NO_MOUSE_PRESS` for none. Lets the release always be
+    /// sent (even if the pointer left the pane or Shift is now held) so the app
+    /// isn't stranded with a phantom held button.
+    mouse_pressed_button: AtomicU8,
     /// Sub-line scroll-wheel remainder, carried across wheel events.
     scroll_accum: Mutex<f32>,
     /// While dragging the scrollbar thumb: the grab offset within the thumb.
@@ -330,6 +338,7 @@ impl TerminalSession {
             clipboard_store,
             palette,
             selecting: AtomicBool::new(false),
+            mouse_pressed_button: AtomicU8::new(NO_MOUSE_PRESS),
             scroll_accum: Mutex::new(0.0),
             scrollbar_drag: Mutex::new(None),
             resize: Mutex::new(ResizeState {
@@ -831,6 +840,20 @@ impl TerminalSession {
         let mut buf = Vec::with_capacity(24);
         push_mouse_report(&mut buf, button + mods, col, row, pressed, sgr);
         self.write_raw(&buf);
+        // Remember an outstanding press so the matching release is guaranteed.
+        self.mouse_pressed_button.store(
+            if pressed { button } else { NO_MOUSE_PRESS },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The button (0/1/2) whose press was forwarded and not yet released, if any.
+    /// The mouse-up handler uses this to always send the release.
+    pub fn mouse_press_pending(&self) -> Option<u8> {
+        match self.mouse_pressed_button.load(Ordering::Relaxed) {
+            NO_MOUSE_PRESS => None,
+            b => Some(b),
+        }
     }
 
     /// Send a mouse motion event. `button` is the pressed button (0/1/2) or `None`
@@ -1185,6 +1208,22 @@ mod tests {
         assert_eq!(quote_path_for_shell("a'b"), "'a'\\''b'");
         // Ordinary paths pass through unwrapped (sh_quote fast path).
         assert_eq!(quote_path_for_shell("/home/u/file.txt"), "/home/u/file.txt");
+    }
+
+    /// A forwarded mouse press must be remembered so the mouse-up handler can
+    /// always emit the matching release (even if the pointer left the pane),
+    /// and the release must clear it — otherwise the child app is left with a
+    /// phantom held button.
+    #[test]
+    fn mouse_press_release_pairing() {
+        let (session, _rx) =
+            TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 80, 24)
+                .expect("spawn");
+        assert_eq!(session.mouse_press_pending(), None);
+        session.report_mouse_button(3, 4, 0, true, false, false, false);
+        assert_eq!(session.mouse_press_pending(), Some(0));
+        session.report_mouse_button(3, 4, 0, false, false, false, false);
+        assert_eq!(session.mouse_press_pending(), None);
     }
 
     /// End-to-end check of the backend: spawn a process, drain its PTY output
