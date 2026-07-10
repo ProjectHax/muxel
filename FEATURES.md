@@ -276,14 +276,17 @@ feature is added or changed, update the matching entry here in the same change**
   inside the pane rather than against the border.
 - **Key routing** — `Tab` / `Shift+Tab` go to the focused terminal rather than
   moving UI focus.
+- **Agent-first plain Ctrl+letter** — muxel app shortcuts that are plain
+  `Ctrl+A`…`Ctrl+Z` (no Shift) do **not** fire while a terminal is focused, so
+  agents receive them as normal C0 chords (Claude `Ctrl+S` stash, shell
+  `Ctrl+R`, …). Muxel chrome prefers `Ctrl+Shift+*`. Exceptions that stay global
+  in a terminal: `Ctrl+T` (new tab). `Ctrl+P` is special-cased (palette only when
+  no terminal is focused). Extra chords can still be listed under Settings →
+  Keybindings → terminal passthrough.
 - **Ctrl+P shared with the agent** — the command palette is on `Ctrl+Shift+P`
   (always), while `Ctrl+P` opens it only when no terminal is focused — so a focused
-  agent (e.g. opencode, which uses `Ctrl+P`) receives it. Click the toolbar to
-  **deselect** the active pane (move focus off the terminal) and `Ctrl+P` reaches
-  muxel again.
-- **Terminal pass-through keys** — additional chords listed in Settings →
-  Keybindings are sent to the focused terminal instead of triggering muxel's
-  shortcut, for other agent key conflicts.
+  agent (e.g. opencode) receives it. Deselect the pane (click the toolbar) and
+  `Ctrl+P` reaches muxel again.
 
 ## Editor & tools
 

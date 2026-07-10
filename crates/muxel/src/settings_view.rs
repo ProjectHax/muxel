@@ -22,8 +22,14 @@ pub enum RemoteTestState {
 /// Configurable actions: `(action, default keystroke, key context)`. The names
 /// are matched in `app::keybinding_for` to the corresponding gpui actions; the
 /// context (e.g. `Some("Terminal")`) scopes a binding to a focus region.
+///
+/// **Terminal vs app chords.** Plain `ctrl-<letter>` is claimed by agents as C0
+/// (Claude Ctrl+S stash, shells Ctrl+R, …). `install_keybindings` auto-scopes
+/// those to `!Terminal` unless the action is in [`KEEP_GLOBAL_WHILE_TERMINAL`].
+/// Prefer `ctrl-shift-*` for muxel chrome.
 pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("NewPane", "ctrl-shift-t", None),
+    // Keep global while a terminal is focused (see KEEP_GLOBAL_WHILE_TERMINAL).
     ("NewTab", "ctrl-t", None),
     ("TabNext", "ctrl-tab", None),
     ("TabPrev", "ctrl-shift-tab", None),
@@ -56,6 +62,7 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     // OS fullscreen; the sidebar hides until revealed or fullscreen exits.
     ("ToggleFullScreen", "f11", None),
     ("ToggleDevConsole", "f12", None),
+    // Editor save — auto !Terminal so Claude stash (Ctrl+S) reaches the PTY.
     ("SaveFile", "ctrl-s", None),
     ("SaveFileAs", "ctrl-shift-s", None),
     ("JumpToTab1", "alt-1", None),
@@ -86,6 +93,12 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("NewAgent7", "ctrl-alt-7", None),
     ("NewAgent8", "ctrl-alt-8", None),
     ("NewAgent9", "ctrl-alt-9", None),
+];
+
+/// Actions whose plain `ctrl-<letter>` binding stays live while a terminal is
+/// focused. Everything else with that shape is scoped to `!Terminal`.
+pub const KEEP_GLOBAL_WHILE_TERMINAL: &[&str] = &[
+    "NewTab", // ctrl-t — open a tab without leaving the agent
 ];
 
 /// Which settings section is shown.

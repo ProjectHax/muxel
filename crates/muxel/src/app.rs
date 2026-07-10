@@ -560,9 +560,7 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
         .iter()
         .map(|k| (k.action.as_str(), k.keystroke.as_str()))
         .collect();
-    // Globally-bound chords the user wants the focused terminal to receive (e.g.
-    // ctrl-p for opencode): scope them out of the "Terminal" context so they fall
-    // through to the PTY's key handler instead of firing muxel's shortcut.
+    // Extra chords under Settings → Keybindings → terminal passthrough.
     let passthrough: Vec<&str> = settings
         .terminal_passthrough_keys
         .iter()
@@ -573,11 +571,7 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
         .iter()
         .filter_map(|(name, default, context)| {
             let ks = overrides.get(name).copied().unwrap_or(default);
-            let ctx: Option<&str> = if context.is_none() && passthrough.contains(&ks) {
-                Some("!Terminal")
-            } else {
-                *context
-            };
+            let ctx = resolve_binding_context(name, ks, *context, &passthrough);
             keybinding_for(name, ks, ctx)
         })
         .collect();
@@ -594,6 +588,36 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     // focused terminal — `secondary` resolves to the platform's quit modifier.
     bindings.push(KeyBinding::new("secondary-q", Quit, None));
     cx.bind_keys(bindings);
+}
+
+/// Pick the gpui key context for a binding.
+///
+/// - Explicit context from the table wins (e.g. `Terminal`-only search).
+/// - User passthrough list forces `!Terminal`.
+/// - Plain `ctrl-<letter>` defaults to `!Terminal` so agents receive C0 chords
+///   (Ctrl+S stash, Ctrl+R, …), unless the action is in
+///   [`settings_view::KEEP_GLOBAL_WHILE_TERMINAL`].
+fn resolve_binding_context<'a>(
+    action: &str,
+    keystroke: &str,
+    explicit: Option<&'a str>,
+    passthrough: &[&str],
+) -> Option<&'a str> {
+    if let Some(ctx) = explicit {
+        return Some(ctx);
+    }
+    if passthrough
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(keystroke.trim()))
+    {
+        return Some("!Terminal");
+    }
+    if muxel_core::is_plain_ctrl_letter(keystroke)
+        && !settings_view::KEEP_GLOBAL_WHILE_TERMINAL.contains(&action)
+    {
+        return Some("!Terminal");
+    }
+    None
 }
 
 /// The user's home directory (`HOME` on Unix, `USERPROFILE` on Windows).
@@ -20101,9 +20125,9 @@ impl MuxelApp {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(
-                        "Comma-separated chords sent to the terminal instead of muxel (e.g. ctrl-p \
-                 for opencode's commands). They won't trigger muxel's shortcut while a \
-                 terminal is focused.",
+                        "Comma-separated extra chords (e.g. ctrl-shift-p). Plain ctrl+letter app \
+                 shortcuts already yield to the terminal by default so agents get them \
+                 (Ctrl+S stash, etc.).",
                     ),
             )
             .child(
