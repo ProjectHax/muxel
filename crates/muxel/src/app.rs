@@ -907,6 +907,9 @@ pub struct MuxelApp {
     /// Live browser panes, keyed by instance id (parallel to `editors`). On
     /// Linux these are placeholder views — the real browser is a separate window.
     browsers: HashMap<Uuid, Entity<crate::browser::BrowserView>>,
+    /// Browser instances with a spawn in flight (async, post-update). Avoids
+    /// double-scheduling while the view is not in `browsers` yet.
+    browsers_pending: HashSet<Uuid>,
     /// The pane the toolbar actions target.
     active_instance: Option<Uuid>,
     /// The agent preset library and the one currently selected for new panes.
@@ -2749,6 +2752,7 @@ impl MuxelApp {
             terminals: HashMap::new(),
             editors: HashMap::new(),
             browsers: HashMap::new(),
+            browsers_pending: HashSet::new(),
             active_instance: None,
             presets,
             current_preset,
@@ -3462,8 +3466,7 @@ impl MuxelApp {
         let first_sync = self.project_syncs_layout(pid) && !self.remote_synced.contains(&pid);
 
         // Nothing to do if every pane already has a live view (and we've already
-        // reconciled the remote layout this session). Browser panes are lazy —
-        // they don't count as "needs spawn" here (see ensure_browser_view).
+        // reconciled the remote layout this session).
         let needs = self
             .workspace
             .project(pid)
@@ -3477,7 +3480,10 @@ impl MuxelApp {
                     .map(|i| i.kind)
                     .unwrap_or(InstanceKind::Terminal);
                 match kind {
-                    InstanceKind::Browser => false,
+                    InstanceKind::Browser => {
+                        !self.browsers.contains_key(&iid)
+                            && !self.browsers_pending.contains(&iid)
+                    }
                     InstanceKind::Terminal => {
                         !self.terminals.contains_key(&iid)
                             && !self.failed_launches.contains_key(&iid)
@@ -3790,10 +3796,9 @@ impl MuxelApp {
                     }
                 }
                 InstanceKind::Browser => {
-                    // Lazy: do not build WebView during workspace restore. Opening
-                    // Default (browser tab in the active project) aborted with
-                    // 0xc0000409 even when deferred one frame. Spawn on first
-                    // focus via ensure_browser_view.
+                    // Eager but async: schedule construction after this update
+                    // fully unwinds (see schedule_browser_view).
+                    self.schedule_browser_view(iid, window, cx);
                 }
             }
         }
@@ -3855,6 +3860,7 @@ impl MuxelApp {
         // new workspace reuses wrong instance ids and has crashed WebView2 on
         // Windows when Default (browser pane) was re-opened after Test.
         self.browsers.clear();
+        self.browsers_pending.clear();
         // Close any per-monitor project windows from the previous workspace (the
         // close hook's cleanup no-ops — their records are dropped here first).
         for sec in std::mem::take(&mut self.secondary_windows) {
@@ -4299,15 +4305,22 @@ impl MuxelApp {
             .instance(iid)
             .is_some_and(|i| i.kind == InstanceKind::Browser)
         {
-            self.ensure_browser_view(iid, window, cx);
+            // Fallback if the eager schedule has not landed yet.
+            self.schedule_browser_view(iid, window, cx);
         }
         cx.notify();
     }
 
-    /// Build the native browser view for `iid` if missing. Deferred on
-    /// macOS/Windows so construction never runs under a held App RefCell.
-    fn ensure_browser_view(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if self.browsers.contains_key(&iid) {
+    /// Build the native browser view for `iid` if missing.
+    ///
+    /// WebView2/WKWebView as a native child must not run inside the same App
+    /// update / OS message that opens a workspace or handles a mouse click —
+    /// that re-enters gpui under a held RefCell and aborts with `0xc0000409` on
+    /// Windows. `cx.defer_in` alone is still in that turn; we yield to the async
+    /// executor first, then construct. Eager (all browser panes of a project are
+    /// scheduled as soon as the project is opened), not click-to-load.
+    fn schedule_browser_view(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browsers.contains_key(&iid) || self.browsers_pending.contains(&iid) {
             return;
         }
         let Some(url) = self
@@ -4322,25 +4335,40 @@ impl MuxelApp {
         else {
             return;
         };
+        self.browsers_pending.insert(iid);
         #[cfg(not(target_os = "linux"))]
         {
-            cx.defer_in(window, move |this, window, cx| {
-                if this.browsers.contains_key(&iid) || this.workspace.instance(iid).is_none() {
-                    return;
-                }
-                let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
-                this.browsers.insert(iid, view);
-                if this.active_instance == Some(iid)
-                    && let Some(bv) = this.browsers.get(&iid)
-                {
-                    let handle = bv.read(cx).focus_handle(cx);
-                    window.focus(&handle, cx);
-                }
-                cx.notify();
-            });
+            cx.spawn_in(window, async move |this, cx| {
+                // One zero-delay tick is enough for the selector/click update to
+                // finish; a second tick covers COM/WebView2 re-entry on Windows.
+                cx.background_executor()
+                    .timer(Duration::from_millis(0))
+                    .await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(0))
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.browsers_pending.remove(&iid);
+                    if this.browsers.contains_key(&iid) || this.workspace.instance(iid).is_none()
+                    {
+                        return;
+                    }
+                    let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                    this.browsers.insert(iid, view);
+                    if this.active_instance == Some(iid)
+                        && let Some(bv) = this.browsers.get(&iid)
+                    {
+                        let handle = bv.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         #[cfg(target_os = "linux")]
         {
+            self.browsers_pending.remove(&iid);
             let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
             self.browsers.insert(iid, view);
             if let Some(bv) = self.browsers.get(&iid) {
@@ -6300,33 +6328,9 @@ impl MuxelApp {
                 }
             }
         }
-        // Defer WebView construction. Building a native child from inside an
-        // update re-enters gpui under a held App RefCell (0xc0000409 on Windows).
-        // Tab focus is applied immediately; keyboard focus lands once the view
-        // exists.
-        #[cfg(not(target_os = "linux"))]
-        {
-            let view_url = url;
-            self.focus_instance(iid, window, cx);
-            cx.defer_in(window, move |this, window, cx| {
-                if this.browsers.contains_key(&iid) || this.workspace.instance(iid).is_none() {
-                    return;
-                }
-                let view =
-                    cx.new(|cx| crate::browser::BrowserView::new(view_url, window, cx));
-                this.browsers.insert(iid, view);
-                if this.active_instance == Some(iid) {
-                    this.focus_instance(iid, window, cx);
-                }
-                cx.notify();
-            });
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
-            self.browsers.insert(iid, view);
-            self.focus_instance(iid, window, cx);
-        }
+        // Tab focus now; WebView lands after an async yield (schedule_browser_view).
+        self.focus_instance(iid, window, cx);
+        self.schedule_browser_view(iid, window, cx);
         self.persist();
         cx.notify();
         Some(iid)
@@ -7336,6 +7340,7 @@ impl MuxelApp {
         self.editors.remove(&iid);
         // Dropping a BrowserView hides its native webview (gpui-wry Drop impl).
         self.browsers.remove(&iid);
+        self.browsers_pending.remove(&iid);
 
         // Tear down tmux (local or remote) + worktree (capture info before drop).
         let info = self.workspace.instance(iid).map(|i| {
@@ -8050,6 +8055,7 @@ impl MuxelApp {
             }
             self.editors.remove(&iid);
             self.browsers.remove(&iid);
+        self.browsers_pending.remove(&iid);
             self.last_status.remove(&iid);
             self.workspace.remove_instance_meta(iid);
         }
@@ -11930,7 +11936,7 @@ impl MuxelApp {
                     .instance(iid)
                     .is_some_and(|i| i.kind == InstanceKind::Browser)
                 {
-                    // Lazy browser: view is built on first focus.
+                    // Brief placeholder while schedule_browser_view lands.
                     div()
                         .size_full()
                         .flex()

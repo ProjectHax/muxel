@@ -20,8 +20,9 @@ All notable changes to muxel are documented here. This project adheres to
   another WebView2.
 - **Opening a workspace whose active project has a browser pane crashed** (e.g.
   Default with GitHub next to Grok) — WebView2 during `enter_workspace` aborted
-  with `0xc0000409`. Browser views now spawn lazily on first focus; workspace
-  switch clears leftover browser entities.
+  with `0xc0000409`. Browser panes still open eagerly, but construction runs on
+  the async executor after two zero-delay yields so it never sits under the
+  workspace-open App update. Workspace switch clears leftover browser entities.
 - **An agent's `pkill` could kill every agent in every project** — tmux forks its server
   from the first client that needs one and the server keeps that client's command line.
   Since 0.0.9 made local panes default to tmux, that first client was a pane's

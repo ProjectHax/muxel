@@ -183,6 +183,8 @@ pub struct TerminalSession {
     /// The PTY child's pid (the shell/agent), captured at spawn. Compared against
     /// the terminal's foreground process group to tell whether the child is idle
     /// at its prompt vs. running a foreground command (see `is_idle_foreground`).
+    /// Only read on Unix (`tcgetpgrp`); kept on all platforms for spawn symmetry.
+    #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
     bell: Arc<AtomicBool>,
