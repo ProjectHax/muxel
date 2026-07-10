@@ -3462,7 +3462,8 @@ impl MuxelApp {
         let first_sync = self.project_syncs_layout(pid) && !self.remote_synced.contains(&pid);
 
         // Nothing to do if every pane already has a live view (and we've already
-        // reconciled the remote layout this session).
+        // reconciled the remote layout this session). Browser panes are lazy —
+        // they don't count as "needs spawn" here (see ensure_browser_view).
         let needs = self
             .workspace
             .project(pid)
@@ -3470,9 +3471,21 @@ impl MuxelApp {
             .unwrap_or_default()
             .into_iter()
             .any(|iid| {
-                !self.terminals.contains_key(&iid)
-                    && !self.editors.contains_key(&iid)
-                    && !self.browsers.contains_key(&iid)
+                let kind = self
+                    .workspace
+                    .instance(iid)
+                    .map(|i| i.kind)
+                    .unwrap_or(InstanceKind::Terminal);
+                match kind {
+                    InstanceKind::Browser => false,
+                    InstanceKind::Terminal => {
+                        !self.terminals.contains_key(&iid)
+                            && !self.failed_launches.contains_key(&iid)
+                    }
+                    InstanceKind::Editor | InstanceKind::Diff => {
+                        !self.editors.contains_key(&iid)
+                    }
+                }
             });
         if !needs && !first_sync {
             return;
@@ -3777,42 +3790,10 @@ impl MuxelApp {
                     }
                 }
                 InstanceKind::Browser => {
-                    if !self.browsers.contains_key(&iid) {
-                        let url = self
-                            .workspace
-                            .instance(iid)
-                            .and_then(|i| i.browser_url.clone())
-                            .unwrap_or_else(|| "about:blank".to_string());
-                        // Defer WebView construction. Building WKWebView/WebView2
-                        // as a native child from inside restore / select_project /
-                        // the mouse path re-enters gpui while the App RefCell is
-                        // held and aborts with 0xc0000409 on Windows (same class
-                        // as open_link / multi-monitor open_window).
-                        #[cfg(not(target_os = "linux"))]
-                        {
-                            cx.defer_in(window, move |this, window, cx| {
-                                if this.browsers.contains_key(&iid)
-                                    || this.workspace.instance(iid).is_none()
-                                {
-                                    return;
-                                }
-                                let view = cx.new(|cx| {
-                                    crate::browser::BrowserView::new(url, window, cx)
-                                });
-                                this.browsers.insert(iid, view);
-                                if this.active_instance == Some(iid) {
-                                    this.focus_instance(iid, window, cx);
-                                }
-                                cx.notify();
-                            });
-                        }
-                        #[cfg(target_os = "linux")]
-                        {
-                            let view =
-                                cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
-                            self.browsers.insert(iid, view);
-                        }
-                    }
+                    // Lazy: do not build WebView during workspace restore. Opening
+                    // Default (browser tab in the active project) aborted with
+                    // 0xc0000409 even when deferred one frame. Spawn on first
+                    // focus via ensure_browser_view.
                 }
             }
         }
@@ -3870,6 +3851,10 @@ impl MuxelApp {
         // Editors just drop (unsaved changes lost on workspace switch).
         self.editors.clear();
         self.pending_editor_redock.clear();
+        // Drop native webviews with the workspace — leaving them alive under a
+        // new workspace reuses wrong instance ids and has crashed WebView2 on
+        // Windows when Default (browser pane) was re-opened after Test.
+        self.browsers.clear();
         // Close any per-monitor project windows from the previous workspace (the
         // close hook's cleanup no-ops — their records are dropped here first).
         for sec in std::mem::take(&mut self.secondary_windows) {
@@ -4309,8 +4294,60 @@ impl MuxelApp {
         } else if let Some(bv) = self.browsers.get(&iid) {
             let handle = bv.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
+        } else if self
+            .workspace
+            .instance(iid)
+            .is_some_and(|i| i.kind == InstanceKind::Browser)
+        {
+            self.ensure_browser_view(iid, window, cx);
         }
         cx.notify();
+    }
+
+    /// Build the native browser view for `iid` if missing. Deferred on
+    /// macOS/Windows so construction never runs under a held App RefCell.
+    fn ensure_browser_view(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browsers.contains_key(&iid) {
+            return;
+        }
+        let Some(url) = self
+            .workspace
+            .instance(iid)
+            .filter(|i| i.kind == InstanceKind::Browser)
+            .map(|i| {
+                i.browser_url
+                    .clone()
+                    .unwrap_or_else(|| "about:blank".to_string())
+            })
+        else {
+            return;
+        };
+        #[cfg(not(target_os = "linux"))]
+        {
+            cx.defer_in(window, move |this, window, cx| {
+                if this.browsers.contains_key(&iid) || this.workspace.instance(iid).is_none() {
+                    return;
+                }
+                let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                this.browsers.insert(iid, view);
+                if this.active_instance == Some(iid)
+                    && let Some(bv) = this.browsers.get(&iid)
+                {
+                    let handle = bv.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
+                cx.notify();
+            });
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+            self.browsers.insert(iid, view);
+            if let Some(bv) = self.browsers.get(&iid) {
+                let handle = bv.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+        }
     }
 
     /// Move keyboard focus off the active pane onto the app root (the "muxel" key
@@ -11887,6 +11924,20 @@ impl MuxelApp {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(t("Restart to retry")),
                         )
+                        .into_any_element()
+                } else if self
+                    .workspace
+                    .instance(iid)
+                    .is_some_and(|i| i.kind == InstanceKind::Browser)
+                {
+                    // Lazy browser: view is built on first focus.
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t("Browser"))
                         .into_any_element()
                 } else {
                     div()
