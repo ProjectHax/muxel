@@ -240,6 +240,11 @@ feature is added or changed, update the matching entry here in the same change**
   Claude Code on Windows uses `Alt+V` (sent as `ESC v`) for images.
   `Shift+Insert` pastes and `Ctrl+Insert` copies. File **drag-and-drop** pastes
   shell-quoted paths into the focused terminal.
+- **Mouse reporting** — when an app enables mouse mode (Grok, Claude, vim, …),
+  clicks, drags, and motion are forwarded as SGR/X10 mouse events so the app can
+  focus its prompt, scroll its own pane, set the cursor, etc. Hold **Shift** to
+  force local text selection instead. The wheel already forwarded to mouse-aware
+  apps; button reports complete that path.
 - **Scrollback** — history with a draggable overlay scrollbar; clear it via
   `Ctrl+Shift+K` or the tab's "Clear scrollback" menu item. The mouse wheel
   scrolls history, or — for full-screen apps that enable mouse reporting

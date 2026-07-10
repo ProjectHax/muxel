@@ -795,6 +795,85 @@ impl TerminalSession {
     pub fn kill(&self) {
         let _ = self.killer.lock().kill();
     }
+
+    /// Whether the child enabled any mouse-reporting mode (clicks / drag / motion).
+    /// When true, left-clicks should be forwarded as mouse reports instead of
+    /// starting a local text selection (unless Shift is held).
+    pub fn mouse_reporting(&self) -> bool {
+        self.term.lock().mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Whether motion events should be reported (any-event or cell-motion / drag).
+    pub fn mouse_motion_reporting(&self) -> bool {
+        self.term
+            .lock()
+            .mode()
+            .intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG)
+    }
+
+    /// Send a mouse button press/release at 0-based cell (`col`, `row`).
+    /// `button`: 0 left, 1 middle, 2 right.
+    #[allow(clippy::too_many_arguments)]
+    pub fn report_mouse_button(
+        &self,
+        col: usize,
+        row: usize,
+        button: u8,
+        pressed: bool,
+        shift: bool,
+        alt: bool,
+        control: bool,
+    ) {
+        let sgr = self.term.lock().mode().contains(TermMode::SGR_MOUSE);
+        let mods = (if shift { 4 } else { 0 })
+            + (if alt { 8 } else { 0 })
+            + (if control { 16 } else { 0 });
+        let mut buf = Vec::with_capacity(24);
+        push_mouse_report(&mut buf, button + mods, col, row, pressed, sgr);
+        self.write_raw(&buf);
+    }
+
+    /// Send a mouse motion event. `button` is the pressed button (0/1/2) or `None`
+    /// for motion with no button. Only emitted when the app asked for drag/motion
+    /// reports. Button-held motion uses code 32+button (SGR motion encoding).
+    #[allow(clippy::too_many_arguments)]
+    pub fn report_mouse_motion(
+        &self,
+        col: usize,
+        row: usize,
+        button: Option<u8>,
+        shift: bool,
+        alt: bool,
+        control: bool,
+    ) {
+        let (sgr, base) = {
+            let term = self.term.lock();
+            let mode = term.mode();
+            if !mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG) {
+                return;
+            }
+            // Drag mode only reports motion while a button is held.
+            if mode.contains(TermMode::MOUSE_DRAG)
+                && !mode.contains(TermMode::MOUSE_MOTION)
+                && button.is_none()
+            {
+                return;
+            }
+            let sgr = mode.contains(TermMode::SGR_MOUSE);
+            let base = match button {
+                Some(b) => 32 + b, // button-held motion
+                None => 35,        // motion with no button
+            };
+            (sgr, base)
+        };
+        let mods = (if shift { 4 } else { 0 })
+            + (if alt { 8 } else { 0 })
+            + (if control { 16 } else { 0 });
+        let mut buf = Vec::with_capacity(24);
+        // Motion is always "press" encoding in SGR (`M`).
+        push_mouse_report(&mut buf, base + mods, col, row, true, sgr);
+        self.write_raw(&buf);
+    }
 }
 
 /// Quote a filesystem path so pasting it into the PTY's shell/agent can't inject
@@ -820,13 +899,28 @@ fn quote_path_for_shell(path: &str) -> String {
 /// events are press-only (no release), so the SGR form always ends in `M`.
 fn push_wheel_report(buf: &mut Vec<u8>, up: bool, col: usize, row: usize, sgr: bool) {
     let cb = if up { 64 } else { 65 };
+    push_mouse_report(buf, cb, col, row, true, sgr);
+}
+
+/// Encode one mouse event at 0-based (`col`, `row`) with SGR or X10 encoding.
+fn push_mouse_report(
+    buf: &mut Vec<u8>,
+    button: u8,
+    col: usize,
+    row: usize,
+    pressed: bool,
+    sgr: bool,
+) {
     if sgr {
-        // ESC [ < Cb ; Cx ; Cy M   (1-based coordinates)
-        buf.extend_from_slice(format!("\x1b[<{};{};{}M", cb, col + 1, row + 1).as_bytes());
+        // ESC [ < Cb ; Cx ; Cy M/m   (1-based coordinates)
+        let c = if pressed { 'M' } else { 'm' };
+        buf.extend_from_slice(format!("\x1b[<{};{};{}{c}", button, col + 1, row + 1).as_bytes());
     } else {
         // ESC [ M  Cb+32  Cx+32  Cy+32   (1-based coords, classic 223-cell ceiling)
+        // Release uses button 3 in normal encoding.
+        let cb = if pressed { button } else { 3 };
         let enc = |v: usize| -> u8 { ((v + 1).min(223) + 32) as u8 };
-        buf.extend_from_slice(&[0x1b, b'[', b'M', cb + 32, enc(col), enc(row)]);
+        buf.extend_from_slice(&[0x1b, b'[', b'M', cb.saturating_add(32), enc(col), enc(row)]);
     }
 }
 
@@ -982,7 +1076,7 @@ fn read_loop(
 
 #[cfg(test)]
 mod wheel_report_tests {
-    use super::{appimage_env_fixups, push_wheel_report};
+    use super::{appimage_env_fixups, push_mouse_report, push_wheel_report};
 
     #[test]
     fn appimage_env_fixups_strip_leakage_keep_the_rest() {
@@ -1046,6 +1140,24 @@ mod wheel_report_tests {
         b.clear();
         push_wheel_report(&mut b, false, 1, 2, false);
         assert_eq!(b, &[0x1b, b'[', b'M', 97, 34, 35]);
+    }
+
+    #[test]
+    fn sgr_button_press_release() {
+        let mut b = Vec::new();
+        push_mouse_report(&mut b, 0, 2, 3, true, true);
+        assert_eq!(b, b"\x1b[<0;3;4M");
+        b.clear();
+        push_mouse_report(&mut b, 0, 2, 3, false, true);
+        assert_eq!(b, b"\x1b[<0;3;4m");
+    }
+
+    #[test]
+    fn legacy_button_release_uses_code_3() {
+        let mut b = Vec::new();
+        push_mouse_report(&mut b, 0, 0, 0, false, false);
+        // ESC [ M, release button 3+32=35, cell (1,1) → 33,33
+        assert_eq!(b, &[0x1b, b'[', b'M', 35, 33, 33]);
     }
 }
 

@@ -324,23 +324,55 @@ impl Element for TerminalElement {
                 }
             });
         }
-        // ---- Mouse text selection (drag to select; copy via the view's keys) ----
+        // ---- Mouse: forward to the app when it enabled mouse reporting
+        // (Grok/Claude/vim); otherwise (or with Shift held) do local selection. ----
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
+            let cw = f32::from(cell_width);
+            let lh = f32::from(line_height);
             window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble
-                    || e.button != MouseButton::Left
-                    || e.modifiers.secondary()
-                    || cx.has_active_drag()
+                if phase != DispatchPhase::Bubble || e.modifiers.secondary() || cx.has_active_drag()
                 {
                     return;
                 }
                 if !hitbox.is_hovered(window) {
                     return;
                 }
-                // A press on the scrollbar starts a scrollbar drag, not a selection.
-                if f32::from(e.position.x) >= bar_x && session.grid_metrics().0 > 0 {
+                // Scrollbar owns left-click in its strip.
+                if e.button == MouseButton::Left
+                    && f32::from(e.position.x) >= bar_x
+                    && session.grid_metrics().0 > 0
+                {
+                    return;
+                }
+                let local = e.position - origin;
+                let col = ((f32::from(local.x).max(0.0) / cw) as usize)
+                    .min(cols.saturating_sub(1) as usize);
+                let row = ((f32::from(local.y).max(0.0) / lh) as usize)
+                    .min(rows.saturating_sub(1) as usize);
+                let button = match e.button {
+                    MouseButton::Left => 0u8,
+                    MouseButton::Middle => 1,
+                    MouseButton::Right => 2,
+                    _ => return,
+                };
+                // Mouse-reporting apps get the click (Shift forces local select).
+                if session.mouse_reporting() && !e.modifiers.shift {
+                    let _ = session.clear_selection();
+                    session.report_mouse_button(
+                        col,
+                        row,
+                        button,
+                        true,
+                        e.modifiers.shift,
+                        e.modifiers.alt,
+                        e.modifiers.control,
+                    );
+                    return;
+                }
+                // Local text selection (left button only).
+                if e.button != MouseButton::Left {
                     return;
                 }
                 session.with_term_mut(|term| {
@@ -361,8 +393,39 @@ impl Element for TerminalElement {
         }
         {
             let session = self.session.clone();
+            let hitbox = hitbox.clone();
+            let cw = f32::from(cell_width);
+            let lh = f32::from(line_height);
             window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || cx.has_active_drag() {
+                    return;
+                }
+                // Forward motion to mouse-aware apps (drag / any-event).
+                if session.mouse_reporting()
+                    && session.mouse_motion_reporting()
+                    && hitbox.is_hovered(window)
+                    && !e.modifiers.shift
+                    && !session.is_selecting()
+                {
+                    let local = e.position - origin;
+                    let col = ((f32::from(local.x).max(0.0) / cw) as usize)
+                        .min(cols.saturating_sub(1) as usize);
+                    let row = ((f32::from(local.y).max(0.0) / lh) as usize)
+                        .min(rows.saturating_sub(1) as usize);
+                    let button = match e.pressed_button {
+                        Some(MouseButton::Left) => Some(0u8),
+                        Some(MouseButton::Middle) => Some(1),
+                        Some(MouseButton::Right) => Some(2),
+                        _ => None,
+                    };
+                    session.report_mouse_motion(
+                        col,
+                        row,
+                        button,
+                        e.modifiers.shift,
+                        e.modifiers.alt,
+                        e.modifiers.control,
+                    );
                     return;
                 }
                 if e.pressed_button != Some(MouseButton::Left) || !session.is_selecting() {
@@ -387,9 +450,41 @@ impl Element for TerminalElement {
         }
         {
             let session = self.session.clone();
+            let hitbox = hitbox.clone();
             let mouse_mode = self.mouse_mode;
-            window.on_mouse_event(move |e: &MouseUpEvent, phase, _window, cx| {
-                if phase == DispatchPhase::Bubble && e.button == MouseButton::Left {
+            let cw = f32::from(cell_width);
+            let lh = f32::from(line_height);
+            window.on_mouse_event(move |e: &MouseUpEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                // Release report for mouse-reporting apps.
+                if session.mouse_reporting() && !e.modifiers.shift && hitbox.is_hovered(window) {
+                    let button = match e.button {
+                        MouseButton::Left => 0u8,
+                        MouseButton::Middle => 1,
+                        MouseButton::Right => 2,
+                        _ => {
+                            session.stop_selecting();
+                            return;
+                        }
+                    };
+                    let local = e.position - origin;
+                    let col = ((f32::from(local.x).max(0.0) / cw) as usize)
+                        .min(cols.saturating_sub(1) as usize);
+                    let row = ((f32::from(local.y).max(0.0) / lh) as usize)
+                        .min(rows.saturating_sub(1) as usize);
+                    session.report_mouse_button(
+                        col,
+                        row,
+                        button,
+                        false,
+                        e.modifiers.shift,
+                        e.modifiers.alt,
+                        e.modifiers.control,
+                    );
+                }
+                if e.button == MouseButton::Left {
                     session.stop_selecting();
                     // "Copy on select": the moment a drag-selection ends, put it on
                     // the clipboard (the highlight stays so it's clear what copied).
@@ -487,6 +582,11 @@ impl Element for TerminalElement {
                     || e.button != MouseButton::Right
                     || !hitbox.is_hovered(window)
                 {
+                    return;
+                }
+                // When the app owns the mouse, don't steal right-click for paste
+                // (already reported as a mouse event by the click handler).
+                if session.mouse_reporting() && !e.modifiers.shift {
                     return;
                 }
                 match mouse_mode {
