@@ -3193,9 +3193,7 @@ impl MuxelApp {
             .preset_id
             .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
             .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
-        if preset.resume_flag.is_none() {
-            return None;
-        }
+        preset.resume_flag.as_ref()?;
         let preset = preset.clone();
         // The cwd the agent runs in (worktree or project root) — to locate its
         // on-disk session before we decide resume vs. fresh.

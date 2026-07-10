@@ -506,22 +506,23 @@ pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
     }
     let mut found = false;
     walk_jsonl(&root, &mut |path| {
-        if found {
-            return;
-        }
+        // The rollout filename embeds the session id, so a name match settles it
+        // without opening the file (and works for compressed `.jsonl.zst` too).
         if path
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.contains(session_id))
         {
             found = true;
-            return;
+            return true; // stop the walk
         }
-        if let Some((id, _)) = codex_session_meta(path) {
-            if id == session_id {
-                found = true;
-            }
+        if let Some((id, _)) = codex_session_meta(path)
+            && id == session_id
+        {
+            found = true;
+            return true;
         }
+        false
     });
     found
 }
@@ -540,36 +541,48 @@ pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
     let mut best: Option<(std::time::SystemTime, String)> = None;
     walk_jsonl(&root, &mut |path| {
         let Ok(meta) = std::fs::metadata(path) else {
-            return;
+            return false;
         };
         let Ok(mtime) = meta.modified() else {
-            return;
+            return false;
         };
         let Some((id, session_cwd)) = codex_session_meta(path) else {
-            return;
+            return false;
         };
         if !paths_loosely_equal(Path::new(&session_cwd), cwd) {
-            return;
+            return false;
         }
         if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
             best = Some((mtime, id));
         }
+        false // scan every rollout to find the newest
     });
     best.map(|(_, id)| id)
 }
 
-fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path)) {
+/// Walk Codex rollout files (`*.jsonl` and compressed `*.jsonl.zst`) under `dir`,
+/// calling `visit` on each. `visit` returns `true` to stop the walk early (used by
+/// existence checks); returns whether the walk was stopped.
+fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return false;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            walk_jsonl(&path, visit);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            visit(&path);
+            if walk_jsonl(&path, visit) {
+                return true;
+            }
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".jsonl") || n.ends_with(".jsonl.zst"))
+            && visit(&path)
+        {
+            return true;
         }
     }
+    false
 }
 
 /// First `session_meta` line in a Codex rollout → `(session_id, cwd)`.
@@ -598,10 +611,23 @@ fn paths_loosely_equal(a: &Path, b: &Path) -> bool {
     if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
         return ca == cb;
     }
+    // Fallback when a recorded cwd no longer exists on disk (canonicalize fails).
+    // Normalize per the platform's own path semantics — Windows is case-
+    // insensitive and separator-agnostic; Unix is case-sensitive with `/`. The
+    // previous unconditional Windows-shaped normalization wrongly treated
+    // `/x/ProjA` and `/x/proja` as equal on Linux.
     fn norm(p: &Path) -> String {
         let s = p.to_string_lossy();
-        let s = s.replace('/', "\\");
-        s.trim_end_matches(['\\', '/']).to_ascii_lowercase()
+        #[cfg(windows)]
+        {
+            s.replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_ascii_lowercase()
+        }
+        #[cfg(not(windows))]
+        {
+            s.trim_end_matches('/').to_string()
+        }
     }
     norm(a) == norm(b)
 }
@@ -770,7 +796,12 @@ mod tests {
     fn codex_latest_session_id_picks_matching_cwd() {
         use std::io::Write;
         let tmp = std::env::temp_dir().join(format!("muxel-codex-test-{}", Uuid::new_v4()));
-        let day = tmp.join(".codex").join("sessions").join("2026").join("07").join("09");
+        let day = tmp
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("09");
         std::fs::create_dir_all(&day).unwrap();
         let cwd = if cfg!(windows) {
             PathBuf::from(r"D:\dev\proj")
@@ -819,6 +850,24 @@ mod tests {
         assert!(codex_session_exists(&tmp, "id-new"));
         assert!(!codex_session_exists(&tmp, "missing"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn paths_loosely_equal_respects_platform_case() {
+        use std::path::Path;
+        // A trailing separator is ignored on both platforms.
+        assert!(super::paths_loosely_equal(
+            Path::new("/x/proj/"),
+            Path::new("/x/proj")
+        ));
+        // Case sensitivity follows the platform: Unix distinguishes `ProjA` from
+        // `proja` (the old fallback wrongly lowercased and merged them); Windows
+        // treats them as the same path. These paths don't exist, so this exercises
+        // the canonicalize-failure fallback specifically.
+        assert_eq!(
+            super::paths_loosely_equal(Path::new("/x/ProjA"), Path::new("/x/proja")),
+            cfg!(windows)
+        );
     }
 
     #[test]
