@@ -171,6 +171,19 @@ pub(crate) struct HoveredLink {
     pub url: String,
 }
 
+/// Last known pointer position inside the terminal grid (for re-hit-testing when
+/// Ctrl/Cmd is pressed without a mouse move).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PointerHit {
+    /// Position relative to the terminal origin, in pixels.
+    pub local_x: f32,
+    pub local_y: f32,
+    pub cell_width: f32,
+    pub line_height: f32,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 pub struct TerminalSession {
     pub id: Uuid,
     term: Arc<Mutex<Term<MuxelListener>>>,
@@ -212,6 +225,8 @@ pub struct TerminalSession {
     /// The link span under a ctrl+hover, if any; the element paints an underline
     /// over it and shows a pointing-hand cursor (mirrors the `search` pattern).
     hovered_link: Mutex<Option<HoveredLink>>,
+    /// Latest pointer position over this terminal (for Ctrl-down re-hit-test).
+    pointer_hit: Mutex<Option<PointerHit>>,
     /// When output was last processed (for idle/status detection).
     last_output: Mutex<Instant>,
     /// Whether the child has produced any output yet (vs. still starting up).
@@ -325,6 +340,7 @@ impl TerminalSession {
             search: Mutex::new(Vec::new()),
             cwd,
             hovered_link: Mutex::new(None),
+            pointer_hit: Mutex::new(None),
             last_output: Mutex::new(Instant::now()),
             output_seen: AtomicBool::new(false),
             _reader: reader_handle,
@@ -550,6 +566,15 @@ impl TerminalSession {
         }
         *cur = link;
         true
+    }
+
+    /// Remember the last pointer position over the grid (updated on every move).
+    pub(crate) fn set_pointer_hit(&self, hit: Option<PointerHit>) {
+        *self.pointer_hit.lock() = hit;
+    }
+
+    pub(crate) fn pointer_hit(&self) -> Option<PointerHit> {
+        *self.pointer_hit.lock()
     }
 
     /// Buffer-line indices (negative = history) containing `needle`

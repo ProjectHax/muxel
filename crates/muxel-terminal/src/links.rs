@@ -68,9 +68,14 @@ pub fn url_span_at(line: &[char], col: usize) -> Option<(usize, usize, String)> 
 
 /// Characters that may appear inside a file path. `:` is included so a trailing
 /// `:line[:col]` suffix stays inside the visual span (it's stripped from the
-/// returned path string).
+/// returned path string). `\` is accepted so Windows paths (`D:\dev\foo.rs`) are
+/// candidates the same way as POSIX paths.
 fn is_path_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '+' | '@' | '%' | '#' | ':')
+    c.is_alphanumeric()
+        || matches!(
+            c,
+            '/' | '\\' | '.' | '_' | '-' | '~' | '+' | '@' | '%' | '#' | ':'
+        )
 }
 
 /// Strip a trailing `:line[:col]` suffix (e.g. `src/x.rs:42:7` → `src/x.rs`).
@@ -115,16 +120,16 @@ pub fn path_spans(line: &[char]) -> Vec<(usize, usize, String)> {
             j -= 1;
         }
         let token = &line[start..j];
-        // Must look like a path: contains '/', isn't a URL (those have "://"),
-        // and starts with a plausible path lead-in.
-        let has_slash = token.contains(&'/');
+        // Must look like a path: contains '/' or '\', isn't a URL (those have
+        // "://"), and starts with a plausible path lead-in (incl. `D:` drives).
+        let has_slash = token.contains(&'/') || token.contains(&'\\');
         let is_url = token.windows(3).any(|w| w == [':', '/', '/']);
         let good_start = token.first().is_some_and(|c| {
-            *c == '/' || *c == '~' || *c == '.' || c.is_alphanumeric() || *c == '_'
+            *c == '/' || *c == '\\' || *c == '~' || *c == '.' || c.is_alphanumeric() || *c == '_'
         });
         if has_slash && !is_url && good_start && token.len() >= 2 {
             let path: String = strip_line_suffix(token).iter().collect();
-            if !path.is_empty() && path != "/" {
+            if !path.is_empty() && path != "/" && path != "\\" {
                 spans.push((start, j, path));
             }
         }
@@ -152,17 +157,37 @@ pub fn resolve_path(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Optio
     if raw.starts_with('/') {
         return Some(PathBuf::from(raw));
     }
+    // Windows absolute: `D:\…` or `D:/…`.
+    if is_windows_drive_abs(raw) {
+        return Some(PathBuf::from(raw));
+    }
     cwd.map(|c| c.join(raw))
 }
 
+fn is_windows_drive_abs(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
 /// A `file://` URI for an absolute path, percent-encoding everything outside
-/// the unreserved set + `/` (so spaces etc. survive the trip through xdg-open).
+/// the unreserved set + `/` (so spaces etc. survive the trip through xdg-open /
+/// ShellExecute). On Windows, drive paths become `file:///D:/…` with forward
+/// slashes — the form Windows handlers accept (not `file://D%3A%5C…`).
 pub fn file_uri(path: &Path) -> String {
+    let mut s = path.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        s = s.replace('\\', "/");
+    }
+    // `file://` + absolute path: Unix `/tmp/x` → `file:///tmp/x`;
+    // Windows `D:/x` → `file:///D:/x` (need the extra slash).
     let mut uri = String::from("file://");
-    for b in path.to_string_lossy().as_bytes() {
+    if cfg!(windows) && !s.starts_with('/') {
+        uri.push('/');
+    }
+    for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                uri.push(*b as char);
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                uri.push(b as char);
             }
             _ => uri.push_str(&format!("%{b:02X}")),
         }
@@ -170,9 +195,66 @@ pub fn file_uri(path: &Path) -> String {
     uri
 }
 
+/// Decode a `file://` URI back to a filesystem path, or `None` if `uri` is not
+/// a file URL. Handles `file:///tmp/x`, `file:///D:/x`, and percent-encoding.
+pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // `file:///path` → path starts with `/`; `file://localhost/path` rare, skip.
+    let path_part = if let Some(p) = rest.strip_prefix("localhost") {
+        p
+    } else {
+        rest
+    };
+    // Percent-decode.
+    let mut out = Vec::with_capacity(path_part.len());
+    let bytes = path_part.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            let v = u8::from_str_radix(h, 16).ok()?;
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    if decoded.is_empty() {
+        return None;
+    }
+    // Unix: `/tmp/x`. Windows: `/D:/x` or `/D|/x` (some emitters) → `D:/x`.
+    #[cfg(windows)]
+    {
+        let trimmed = decoded
+            .strip_prefix('/')
+            .filter(|s| {
+                let b = s.as_bytes();
+                b.len() >= 2 && b[0].is_ascii_alphabetic() && (b[1] == b':' || b[1] == b'|')
+            })
+            .map(|s| {
+                if s.as_bytes()[1] == b'|' {
+                    format!("{}:{}", &s[..1], &s[2..])
+                } else {
+                    s.to_string()
+                }
+            })
+            .unwrap_or(decoded);
+        Some(PathBuf::from(trimmed))
+    }
+    #[cfg(not(windows))]
+    {
+        Some(PathBuf::from(decoded))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{file_uri, path_span_at, path_spans, resolve_path, url_span_at, url_spans};
+    use super::{
+        file_uri, path_from_file_uri, path_span_at, path_spans, resolve_path, url_span_at,
+        url_spans,
+    };
     use std::path::{Path, PathBuf};
 
     fn chars(s: &str) -> Vec<char> {
@@ -240,6 +322,13 @@ mod tests {
     }
 
     #[test]
+    fn finds_windows_path_with_backslashes() {
+        let line = chars(r"open D:\dev\muxel\src\app.rs please");
+        let p = path_span_at(&line, 10).expect("windows path candidate");
+        assert_eq!(p.2, r"D:\dev\muxel\src\app.rs");
+    }
+
+    #[test]
     fn strips_line_col_suffix_but_spans_it() {
         let line = chars("at src/main.rs:42:7 in build");
         let (s, e, p) = path_span_at(&line, 5).unwrap();
@@ -298,6 +387,46 @@ mod tests {
         assert_eq!(
             file_uri(Path::new("/plain/path.rs")),
             "file:///plain/path.rs"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn file_uri_windows_drive_path() {
+        let uri = file_uri(Path::new(r"D:\dev\proj\.wip\review.md"));
+        assert_eq!(uri, "file:///D:/dev/proj/.wip/review.md");
+        assert_eq!(
+            path_from_file_uri(&uri).as_deref(),
+            Some(Path::new(r"D:\dev\proj\.wip\review.md"))
+        );
+    }
+
+    #[test]
+    fn path_from_file_uri_unix() {
+        assert_eq!(
+            path_from_file_uri("file:///tmp/a%20b/c.rs").as_deref(),
+            Some(Path::new("/tmp/a b/c.rs"))
+        );
+    }
+
+    #[test]
+    fn resolve_windows_drive_abs() {
+        assert_eq!(
+            resolve_path(r"D:\dev\foo.rs", None, None),
+            Some(PathBuf::from(r"D:\dev\foo.rs"))
+        );
+        assert_eq!(
+            resolve_path("D:/dev/foo.rs", None, None),
+            Some(PathBuf::from("D:/dev/foo.rs"))
+        );
+    }
+
+    #[test]
+    fn resolve_dot_relative() {
+        let cwd = Path::new("/work/proj");
+        assert_eq!(
+            resolve_path(".wip/review.md", Some(cwd), None),
+            Some(PathBuf::from("/work/proj/.wip/review.md"))
         );
     }
 }

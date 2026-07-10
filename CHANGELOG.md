@@ -32,6 +32,11 @@ All notable changes to muxel are documented here. This project adheres to
   (text/paths into the PTY; images forwarded as 0x16 for agents like Grok);
   drag-and-drop pastes shell-quoted paths into the focused terminal; Shift+Insert
   pastes and Ctrl+Insert copies.
+- **Terminal file links on Windows** — `file://` URIs used a broken drive encoding
+  (`file://D%3A%5C…`), so Ctrl+click looked like a no-op. URIs are now
+  `file:///D:/…`, local files open in a muxel editor pane, OSC 8 bare paths
+  resolve against the pane cwd, and Ctrl/Cmd down re-hit-tests so the underline
+  appears without a mouse move.
 - **An agent's `pkill` could kill every agent in every project** — tmux forks its server
   from the first client that needs one and the server keeps that client's command line.
   Since 0.0.9 made local panes default to tmux, that first client was a pane's

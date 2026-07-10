@@ -6159,10 +6159,24 @@ impl MuxelApp {
         }
     }
 
-    /// Route a ctrl+clicked terminal link: `file://` URIs and disabled-browser
-    /// setups go to the OS handler; otherwise macOS/Windows open an embedded
-    /// browser pane and Linux spawns the separate muxel browser window.
+    /// Route a ctrl+clicked terminal link: local `file://` paths open in a muxel
+    /// editor pane; other `file://` / disabled-browser cases go to the OS handler;
+    /// otherwise macOS/Windows open an embedded browser pane and Linux spawns the
+    /// separate muxel browser window.
     fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = muxel_terminal::path_from_file_uri(url) {
+            if path.exists()
+                && let Some(pid) = self.workspace.active_project
+                && self
+                    .open_editor_at(pid, Some(path), self.active_instance, window, cx)
+                    .is_some()
+            {
+                return;
+            }
+            // Fall through to the OS if no project / editor open failed.
+            cx.open_url(url);
+            return;
+        }
         if !self.settings.browser_enabled || url.starts_with("file://") {
             let _ = window;
             cx.open_url(url);
