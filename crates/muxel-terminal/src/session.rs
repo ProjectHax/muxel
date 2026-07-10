@@ -263,7 +263,13 @@ impl TerminalSession {
             })
             .context("open pty")?;
 
-        let mut builder = CommandBuilder::new(&spec.program);
+        // On Windows, resolve bare names like `codex` to a real CreateProcess
+        // target (`codex.cmd` / `codex.exe`). npm installs an extension-less
+        // `#!/bin/sh` shim *before* the `.cmd` wrapper; portable-pty's search
+        // returns the shim first and CreateProcessW fails with
+        // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
+        let program = resolve_program_for_spawn(&spec.program);
+        let mut builder = CommandBuilder::new(&program);
         for arg in &spec.args {
             builder.arg(arg);
         }
@@ -947,6 +953,101 @@ fn push_mouse_report(
     }
 }
 
+/// Resolve `program` to a path CreateProcess can launch on Windows.
+///
+/// portable-pty's PATH search prefers an extension-less file over PATHEXT
+/// (`.exe`/`.cmd`). npm puts a Unix `#!/bin/sh` shim at that name, so agents
+/// like Codex fail with os error 193 ("%1 is not a valid Win32 application").
+/// Prefer PATHEXT matches and skip shebang scripts; leave non-Windows alone.
+fn resolve_program_for_spawn(program: &str) -> String {
+    #[cfg(not(windows))]
+    {
+        program.to_string()
+    }
+    #[cfg(windows)]
+    {
+        resolve_program_for_spawn_windows(program)
+    }
+}
+
+#[cfg(windows)]
+fn resolve_program_for_spawn_windows(program: &str) -> String {
+    use std::path::{Path, PathBuf};
+
+    fn is_shebang(path: &Path) -> bool {
+        use std::io::Read;
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut buf = [0u8; 2];
+        matches!(f.read(&mut buf), Ok(2) if &buf == b"#!")
+    }
+
+    fn is_spawnable(path: &Path) -> bool {
+        if !path.is_file() {
+            return false;
+        }
+        // CreateProcess runs .exe/.com and host scripts for .cmd/.bat.
+        // Extension-less npm shims are `#!/bin/sh` and are not.
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                e.eq_ignore_ascii_case("exe")
+                    || e.eq_ignore_ascii_case("com")
+                    || e.eq_ignore_ascii_case("cmd")
+                    || e.eq_ignore_ascii_case("bat")
+            }) {
+            Some(true) => true,
+            _ => !is_shebang(path),
+        }
+    }
+
+    fn pathexts() -> Vec<String> {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|e| e.trim_start_matches('.').to_string())
+            .collect()
+    }
+
+    fn try_with_exts(base: PathBuf, exts: &[String]) -> Option<PathBuf> {
+        for ext in exts {
+            let cand = base.with_extension(ext);
+            if is_spawnable(&cand) {
+                return Some(cand);
+            }
+        }
+        if is_spawnable(&base) {
+            return Some(base);
+        }
+        None
+    }
+
+    let path = Path::new(program);
+    // Absolute or relative path with a separator: prefer a spawnable sibling.
+    if program.contains('\\') || program.contains('/') {
+        let exts = pathexts();
+        if let Some(p) = try_with_exts(path.to_path_buf(), &exts) {
+            return p.to_string_lossy().into_owned();
+        }
+        return program.to_string();
+    }
+
+    // Bare name: search PATH, PATHEXT before bare (opposite of portable-pty).
+    let exts = pathexts();
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if let Some(p) = try_with_exts(dir.join(program), &exts) {
+                return p.to_string_lossy().into_owned();
+            }
+        }
+    }
+    program.to_string()
+}
+
 /// Strip an AppImage runtime's environment leakage from a child command, so a
 /// shell/agent muxel spawns gets a clean system environment. No-op unless muxel
 /// itself is running from an AppImage (`$APPIMAGE` set).
@@ -1181,6 +1282,62 @@ mod wheel_report_tests {
         push_mouse_report(&mut b, 0, 0, 0, false, false);
         // ESC [ M, release button 3+32=35, cell (1,1) → 33,33
         assert_eq!(b, &[0x1b, b'[', b'M', 35, 33, 33]);
+    }
+}
+
+// Windows PATH resolution for npm shims (CreateProcess cannot run #!/bin/sh).
+#[cfg(all(test, windows))]
+mod windows_spawn_resolve {
+    use super::resolve_program_for_spawn_windows;
+    use std::io::Write;
+
+    #[test]
+    fn prefers_cmd_over_shebang_shim() {
+        let dir = std::env::temp_dir().join(format!("muxel-spawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("fakeagent");
+        {
+            let mut f = std::fs::File::create(&shim).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, "echo hi").unwrap();
+        }
+        let cmd = dir.join("fakeagent.cmd");
+        {
+            let mut f = std::fs::File::create(&cmd).unwrap();
+            writeln!(f, "@echo off").unwrap();
+        }
+
+        let prev = std::env::var_os("PATH");
+        let prev_pathext = std::env::var_os("PATHEXT");
+        let mut path = dir.as_os_str().to_owned();
+        path.push(";");
+        if let Some(p) = &prev {
+            path.push(p);
+        }
+        // SAFETY: single-threaded unit test; PATH restored before return.
+        unsafe {
+            std::env::set_var("PATH", &path);
+            std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        }
+
+        let resolved = resolve_program_for_spawn_windows("fakeagent");
+        assert!(
+            resolved.to_ascii_lowercase().ends_with("fakeagent.cmd"),
+            "expected .cmd, got {resolved}"
+        );
+
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_pathext {
+                Some(p) => std::env::set_var("PATHEXT", p),
+                None => std::env::remove_var("PATHEXT"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
