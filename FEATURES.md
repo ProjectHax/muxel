@@ -39,10 +39,12 @@ feature is added or changed, update the matching entry here in the same change**
 ## Pop-out windows
 
 - **Detach a pane** — pop a pane out into its own OS window without terminating it.
+  Terminals and editors move across; a browser pane is re-created in the new window
+  at the same URL (a native webview belongs to the window that built it).
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
   button returns it to its original location.
 - **Close terminates** — closing a pop-out window kills its terminal (with a
-  confirmation).
+  confirmation). Editors and browser panes just close.
 
 ## Agents
 

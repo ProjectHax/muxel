@@ -1162,6 +1162,9 @@ pub struct MuxelApp {
     /// Editors awaiting re-dock into the main window (rebuilt in `render`, which
     /// has the main window — gpui-component input focus is window-bound).
     pending_editor_redock: Vec<(Uuid, EditorSnapshot, RedockAnchor)>,
+    /// Browsers awaiting re-dock into the main window, carrying the URL to
+    /// rebuild from (a native webview child can't move between windows).
+    pending_browser_redock: Vec<(Uuid, String, RedockAnchor)>,
     /// Whether the "Quit?" confirmation modal is shown (close was intercepted).
     show_quit_confirm: bool,
     /// Quit dialog: also kill muxel's LOCAL tmux sessions (off by default;
@@ -1317,12 +1320,13 @@ enum PaletteCommand {
     SendSnippet(usize),
 }
 
-/// The live view backing a pane — a terminal or a code editor. Lets the shared
-/// pane operations (focus, pop-out) treat both uniformly.
+/// The live view backing a pane — a terminal, a code editor, or a browser. Lets
+/// the shared pane operations (focus, pop-out) treat them uniformly.
 #[derive(Clone)]
 enum PaneView {
     Terminal(Entity<TerminalView>),
     Editor(Entity<EditorView>),
+    Browser(Entity<crate::browser::BrowserView>),
 }
 
 impl PaneView {
@@ -1330,6 +1334,7 @@ impl PaneView {
         match self {
             PaneView::Terminal(v) => v.read(cx).focus_handle(cx),
             PaneView::Editor(v) => v.read(cx).focus_handle(cx),
+            PaneView::Browser(v) => v.read(cx).focus_handle(cx),
         }
     }
 }
@@ -1384,6 +1389,9 @@ impl EditorSnapshot {
 enum PopoutContent {
     Terminal(Entity<TerminalView>),
     Editor(EditorSnapshot),
+    /// Just the URL: the native webview child belongs to the window that built
+    /// it, so the pane is re-created in its new window rather than moved.
+    Browser(String),
 }
 
 /// A pane popped out into its own window. Closing the window terminates the
@@ -1464,6 +1472,7 @@ impl PopoutView {
         match &view {
             PaneView::Terminal(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
             PaneView::Editor(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
+            PaneView::Browser(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
         }
         Self {
             view,
@@ -1481,6 +1490,7 @@ impl PopoutView {
                 .unwrap_or_else(|| "Terminal".to_string())
                 .into(),
             PaneView::Editor(v) => v.read(cx).title().into(),
+            PaneView::Browser(v) => v.read(cx).tab_title().into(),
         }
     }
 
@@ -1488,11 +1498,18 @@ impl PopoutView {
         match &self.view {
             PaneView::Terminal(v) => terminal_pane_element(v, cx),
             PaneView::Editor(v) => v.clone().into_any_element(),
+            PaneView::Browser(v) => v.clone().into_any_element(),
         }
     }
 
-    fn is_editor(&self) -> bool {
-        matches!(self.view, PaneView::Editor(_))
+    /// Heading + body for the close confirmation, which differs per pane kind
+    /// (only a terminal is actually terminated).
+    fn close_confirm_copy(&self) -> (&'static str, &'static str) {
+        match &self.view {
+            PaneView::Terminal(_) => ("Close terminal?", "This terminal will be terminated."),
+            PaneView::Editor(_) => ("Close editor?", "Unsaved changes will be lost."),
+            PaneView::Browser(_) => ("Close browser?", "This browser pane will be closed."),
+        }
     }
 }
 
@@ -1867,6 +1884,12 @@ impl DevLogEntry {
 impl Render for PopoutView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.title(cx);
+        // A native webview child draws above all gpui content, so it has to go
+        // away while the close confirmation sits on top of it.
+        if let PaneView::Browser(v) = &self.view {
+            let (v, visible) = (v.clone(), !self.show_close_confirm);
+            v.update(cx, |b, cx| b.set_native_visible(visible, cx));
+        }
         div()
             .size_full()
             .flex()
@@ -1969,20 +1992,17 @@ impl Render for PopoutView {
                             .rounded(cx.theme().radius_lg)
                             .shadow_lg()
                             .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                            .child(div().text_lg().font_semibold().child(if self.is_editor() {
-                                t("Close editor?")
-                            } else {
-                                t("Close terminal?")
-                            }))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_semibold()
+                                    .child(t(self.close_confirm_copy().0)),
+                            )
                             .child(
                                 div()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if self.is_editor() {
-                                        t("Unsaved changes will be lost.")
-                                    } else {
-                                        t("This terminal will be terminated.")
-                                    }),
+                                    .child(t(self.close_confirm_copy().1)),
                             )
                             .child(
                                 div()
@@ -2858,6 +2878,7 @@ impl MuxelApp {
             main_window: Some(window.window_handle()),
             pending_editor_rebuild: Vec::new(),
             pending_editor_redock: Vec::new(),
+            pending_browser_redock: Vec::new(),
             show_quit_confirm: false,
             quit_kill_tmux_local: false,
             quit_kill_tmux_remote: false,
@@ -3909,6 +3930,11 @@ impl MuxelApp {
         // Editors just drop (unsaved changes lost on workspace switch).
         self.editors.clear();
         self.pending_editor_redock.clear();
+        self.pending_browser_redock.clear();
+        // Drop the native webviews with their workspace. Left alive, they keep
+        // instance ids the new workspace will reuse, and the orphaned WebView2
+        // children outlive the panes they belonged to.
+        self.browsers.clear();
         // Close any per-monitor project windows from the previous workspace (the
         // close hook's cleanup no-ops — their records are dropped here first).
         for sec in std::mem::take(&mut self.secondary_windows) {
@@ -6262,6 +6288,29 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
         let pid = self.workspace.active_project?;
+        // Navigate a browser pane this project already has rather than stacking
+        // another one: ctrl+click means "show me this URL", and every extra pane
+        // is another native WebView2 child. A popped-out browser lives in its own
+        // window and isn't in `browsers`, so it never gets hijacked.
+        if let Some(iid) = self
+            .workspace
+            .project(pid)
+            .map(|p| p.instances())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|iid| self.browsers.contains_key(iid))
+        {
+            if let Some(view) = self.browsers.get(&iid).cloned() {
+                view.update(cx, |v, cx| v.navigate(&url, cx));
+            }
+            if let Some(inst) = self.workspace.instance_mut(iid) {
+                inst.browser_url = Some(url);
+            }
+            self.focus_instance(iid, window, cx);
+            self.persist();
+            cx.notify();
+            return Some(iid);
+        }
         let instance = Instance::browser(pid, url.clone());
         let iid = instance.id;
         let empty = self.workspace.project(pid).is_some_and(|p| p.is_empty());
@@ -9572,6 +9621,8 @@ impl MuxelApp {
             PopoutContent::Terminal(view)
         } else if let Some(ed) = self.editors.remove(&iid) {
             PopoutContent::Editor(EditorSnapshot::capture(&ed, cx))
+        } else if let Some(bv) = self.browsers.remove(&iid) {
+            PopoutContent::Browser(bv.read(cx).url().to_string())
         } else {
             self.redock_into_layout(iid, pid, redock, cx);
             return;
@@ -9608,6 +9659,7 @@ impl MuxelApp {
                 let content = match &content {
                     PopoutContent::Terminal(v) => PopoutContent::Terminal(v.clone()),
                     PopoutContent::Editor(s) => PopoutContent::Editor(s.clone()),
+                    PopoutContent::Browser(u) => PopoutContent::Browser(u.clone()),
                 };
                 move |window, cx| {
                     window.set_window_title(&title);
@@ -9616,6 +9668,9 @@ impl MuxelApp {
                         PopoutContent::Editor(snap) => {
                             PaneView::Editor(snap.build(config, window, cx))
                         }
+                        PopoutContent::Browser(url) => PaneView::Browser(
+                            cx.new(|cx| crate::browser::BrowserView::new(url, window, cx)),
+                        ),
                     };
                     let fh = pane.focus_handle(cx);
                     window.focus(&fh, cx);
@@ -9653,6 +9708,10 @@ impl MuxelApp {
                         let ed = snap.build(config, window, cx);
                         self.editors.insert(iid, ed);
                     }
+                    PopoutContent::Browser(url) => {
+                        let bv = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                        self.browsers.insert(iid, bv);
+                    }
                 }
                 self.redock_into_layout(iid, pid, redock, cx);
             }
@@ -9678,6 +9737,14 @@ impl MuxelApp {
                 // bound to the window where the InputState is built).
                 let snap = EditorSnapshot::capture(&ed, cx);
                 self.pending_editor_redock.push((iid, snap, popout.redock));
+                cx.notify();
+            }
+            PaneView::Browser(bv) => {
+                // Same deal, for the opposite reason: the native webview child is
+                // owned by the pop-out window, so it dies with it and the pane is
+                // rebuilt against the main window in `render`.
+                let url = bv.read(cx).url().to_string();
+                self.pending_browser_redock.push((iid, url, popout.redock));
                 cx.notify();
             }
         }
@@ -9714,6 +9781,21 @@ impl MuxelApp {
                 )
             });
             self.editors.insert(iid, ed);
+            if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) {
+                self.redock_into_layout(iid, pid, redock, cx);
+            }
+        }
+    }
+
+    /// Rebuild any browsers awaiting re-dock into the main window. Called from
+    /// `render`, which holds the main window the new webview must be a child of.
+    fn drain_browser_redocks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_browser_redock.is_empty() {
+            return;
+        }
+        for (iid, url, redock) in std::mem::take(&mut self.pending_browser_redock) {
+            let bv = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+            self.browsers.insert(iid, bv);
             if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) {
                 self.redock_into_layout(iid, pid, redock, cx);
             }
@@ -20321,8 +20403,9 @@ impl Render for MuxelApp {
                 )
                 .into_any_element();
         }
-        // Rebuild any editors awaiting re-dock (needs the main window).
+        // Rebuild any editors/browsers awaiting re-dock (needs the main window).
         self.drain_editor_redocks(window, cx);
+        self.drain_browser_redocks(window, cx);
 
         // The title bar shows the active *workspace* name (next to "muxel"), not
         // the highlighted project.

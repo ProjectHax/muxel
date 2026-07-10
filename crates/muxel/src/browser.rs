@@ -53,10 +53,31 @@ mod imp {
     use gpui_component::button::{Button, ButtonVariants as _};
     use gpui_component::input::{Input, InputEvent, InputState};
     use gpui_component::{IconName, Sizable as _, h_flex};
+    use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    /// The gpui window's native handle, detached from the `&Window` it came from.
+    ///
+    /// The webview is built from a spawned task (see [`BrowserView::new`]), where
+    /// no `&Window` is in scope, so wry is handed this instead.
+    struct ParentWindow(RawWindowHandle);
+
+    impl HasWindowHandle for ParentWindow {
+        fn window_handle(
+            &self,
+        ) -> Result<wry::raw_window_handle::WindowHandle<'_>, wry::raw_window_handle::HandleError>
+        {
+            // SAFETY: the handle belongs to the gpui window hosting this pane,
+            // which outlives the pane and therefore the task borrowing it.
+            Ok(unsafe { wry::raw_window_handle::WindowHandle::borrow_raw(self.0) })
+        }
+    }
 
     pub struct BrowserView {
         focus_handle: FocusHandle,
         webview: Option<Entity<gpui_wry::WebView>>,
+        /// Set once the deferred build finished *and* failed, so `render` can
+        /// tell "still starting" apart from "gave up".
+        webview_failed: bool,
         address: Entity<InputState>,
         url: String,
         /// What the app last asked of the native child (dedupes plaform calls).
@@ -65,17 +86,6 @@ mod imp {
 
     impl BrowserView {
         pub fn new(url: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
-            // Build the native webview as a child of this gpui window. Failure
-            // (e.g. WebView2 runtime missing) degrades to a visible error row
-            // instead of crashing the pane.
-            // gpui's `Window` implements raw_window_handle::HasWindowHandle,
-            // which is exactly what wry's `build_as_child` wants.
-            let webview = wry::WebViewBuilder::new()
-                .with_url(&url)
-                .build_as_child(&*window)
-                .ok()
-                .map(|wv| cx.new(|cx2| gpui_wry::WebView::new(wv, window, cx2)));
-
             let address = cx.new(|cx| InputState::new(window, cx).default_value(url.clone()));
             cx.subscribe(
                 &address,
@@ -90,9 +100,63 @@ mod imp {
             )
             .detach();
 
+            // Build the native webview from a spawned task, never inline here.
+            //
+            // WebView2 (Windows) initialises its controller by running a nested
+            // Win32 message pump. Called inline, that pump re-enters gpui while
+            // `App`'s RefCell is still mutably borrowed by the update building
+            // this view, so the first foreground task it happens to run — a
+            // terminal's PTY reader, say — panics with "RefCell already
+            // borrowed". The async builder awaits a completion handler rather
+            // than pumping, and a task body holds no borrow before its first
+            // `update`, so neither hazard applies.
+            //
+            // Failure (e.g. the WebView2 runtime is missing) degrades to a
+            // visible error row instead of crashing the pane.
+            //
+            // `HasWindowHandle::window_handle` is spelled out because gpui's
+            // inherent `Window::window_handle` otherwise wins and yields gpui's
+            // own `AnyWindowHandle`.
+            let parent = HasWindowHandle::window_handle(&*window)
+                .ok()
+                .map(|h| ParentWindow(h.as_raw()));
+            let requested = url.clone();
+
+            cx.spawn_in(window, async move |this, cx| {
+                let built = match parent.as_ref() {
+                    Some(parent) => wry::WebViewBuilder::new()
+                        .with_url(&requested)
+                        .build_as_child_async(parent)
+                        .await
+                        .ok(),
+                    None => None,
+                };
+
+                let _ = this.update_in(cx, |this, window, cx| {
+                    let Some(wv) = built else {
+                        this.webview_failed = true;
+                        cx.notify();
+                        return;
+                    };
+                    let wv = cx.new(|cx2| gpui_wry::WebView::new(wv, window, cx2));
+                    // Re-apply whatever the pane changed while the build ran.
+                    if !this.native_visible {
+                        wv.update(cx, |wv, _| wv.hide());
+                    }
+                    if this.url != requested {
+                        let current = this.url.clone();
+                        wv.update(cx, |wv, _| wv.load_url(&current));
+                    }
+                    this.webview = Some(wv);
+                    cx.notify();
+                });
+            })
+            .detach();
+
             Self {
                 focus_handle: cx.focus_handle(),
-                webview,
+                webview: None,
+                webview_failed: false,
                 address,
                 url,
                 native_visible: true,
@@ -101,6 +165,13 @@ mod imp {
 
         pub fn tab_title(&self) -> String {
             super::tab_label(&self.url)
+        }
+
+        /// The URL the pane is showing. A native webview child belongs to the
+        /// window that created it, so moving a browser pane between windows
+        /// (pop-out / re-dock) rebuilds it from this rather than reparenting.
+        pub fn url(&self) -> &str {
+            &self.url
         }
 
         /// Navigate the webview and remember the URL.
@@ -204,6 +275,9 @@ mod imp {
                     .min_h_0()
                     .child(wv.clone())
                     .into_any_element(),
+                // The native child is still being built; stay blank rather than
+                // flash a failure the pane hasn't actually hit.
+                None if !self.webview_failed => div().flex_1().into_any_element(),
                 None => div()
                     .flex_1()
                     .flex()
@@ -246,6 +320,11 @@ mod imp {
 
         pub fn tab_title(&self) -> String {
             super::tab_label(&self.url)
+        }
+
+        /// The URL the pane is showing (see the macOS/Windows impl).
+        pub fn url(&self) -> &str {
+            &self.url
         }
 
         pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<String> {

@@ -17,6 +17,9 @@ All notable changes to muxel are documented here. This project adheres to
   `session_id_flag` for agent-minted CLIs.
 
 ### Changed
+- **Ctrl+click reuses a project's browser pane** — opening a link navigates the
+  browser already open in that project instead of stacking another native webview
+  beside it. A popped-out browser keeps its own window and is left alone.
 - **Popped-out project windows open with the sidebar hidden** — the window exists to
   show one project on its own monitor, so the project list starts out of the way. Its
   title bar now carries the same sidebar toggle the main window has (the minimal bar it
@@ -24,6 +27,20 @@ All notable changes to muxel are documented here. This project adheres to
   sidebar state: hiding it in a project window no longer hides it in the main window.
 
 ### Fixed
+- **Opening a workspace or a link with a browser pane aborted on Windows**
+  (`0xc0000409`) — WebView2 builds its controller by running a nested Win32
+  message pump. Built inline, that pump re-entered gpui while `App`'s `RefCell`
+  was still mutably borrowed by the update creating the pane, so the first
+  foreground task it ran (a terminal's PTY reader) panicked with "RefCell already
+  borrowed". The webview is now built by awaiting wry's `build_as_child_async`,
+  which never pumps, from a task that holds no borrow.
+- **Browser panes can be popped out** — pop-out silently re-docked a browser pane
+  instead of detaching it. A native webview belongs to the window that created it,
+  so the pane is now re-created in the pop-out window at the same URL, and rebuilt
+  in the main window when docked back.
+- **Native webviews outlived their workspace** — switching workspaces dropped the
+  editors but kept every `BrowserView`, leaving orphaned WebView2 children under
+  instance ids the new workspace would reuse.
 - **Ctrl+S (and other plain Ctrl+letter) reached muxel instead of the agent** —
   `SaveFile` was bound globally, so Claude's stash never saw `0x13`. Plain
   `ctrl-<letter>` app bindings now default to `!Terminal` (agents get C0);
