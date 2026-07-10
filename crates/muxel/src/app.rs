@@ -11695,6 +11695,13 @@ impl MuxelApp {
     fn render_pane(&self, node: &PaneNode, cx: &mut Context<Self>) -> AnyElement {
         match node {
             PaneNode::Leaf(ld) => {
+                // A leaf should never carry zero tabs (pane.rs prunes an emptied
+                // leaf in the same mutation), but guard the `tabs[leaf_active]`
+                // index below defensively: render_pane runs every frame for every
+                // leaf, so a transient empty leaf would panic the whole UI.
+                if ld.tabs.is_empty() {
+                    return div().size_full().into_any_element();
+                }
                 // Each pane is a tab group. The focused pane shows its focused
                 // tab (== active_instance); other panes show their own saved
                 // active tab. Aliasing `iid`/`is_active` keeps the controls block
