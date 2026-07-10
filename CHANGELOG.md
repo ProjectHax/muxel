@@ -13,6 +13,11 @@ All notable changes to muxel are documented here. This project adheres to
   sidebar state: hiding it in a project window no longer hides it in the main window.
 
 ### Fixed
+- **Ctrl+S (and other plain Ctrl+letter) reached muxel instead of the agent** —
+  `SaveFile` was bound globally, so Claude's stash never saw `0x13`. Plain
+  `ctrl-<letter>` app bindings now default to `!Terminal` (agents get C0);
+  muxel chrome stays on `ctrl-shift-*`. `Ctrl+T` new-tab remains global;
+  Settings → terminal passthrough still covers other shapes.
 - **An agent's `pkill` could kill every agent in every project** — tmux forks its server
   from the first client that needs one and the server keeps that client's command line.
   Since 0.0.9 made local panes default to tmux, that first client was a pane's

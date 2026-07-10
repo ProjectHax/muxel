@@ -1076,9 +1076,10 @@ pub struct Settings {
     /// Scheduled task launchers (run a prompt on a timer).
     #[serde(default)]
     pub loops: Vec<Loop>,
-    /// Key chords (e.g. `ctrl-p`) that, while a terminal is focused, are sent to
-    /// the PTY instead of triggering muxel's shortcut — so agents like opencode
-    /// (Ctrl+P for commands) receive them.
+    /// Extra key chords that, while a terminal is focused, are sent to the PTY
+    /// instead of muxel's shortcut. Plain `ctrl-<letter>` app bindings already
+    /// yield to the terminal by default (see `install_keybindings`); use this
+    /// for other shapes (e.g. `ctrl-shift-p`) or custom rebinds.
     #[serde(default = "default_passthrough_keys")]
     pub terminal_passthrough_keys: Vec<String>,
     /// Saved SSH remote hosts for remote development.
@@ -1124,9 +1125,37 @@ fn default_snippets() -> Vec<Snippet> {
 }
 
 fn default_passthrough_keys() -> Vec<String> {
-    // Ctrl+P is handled directly (palette only when no terminal is focused), so the
-    // general pass-through list starts empty; add other conflicting chords as needed.
+    // Plain ctrl+letter app bindings yield to the terminal by default (see
+    // install_keybindings); this list is for other shapes (ctrl-shift-*, …).
     Vec::new()
+}
+
+/// True for `ctrl-a` … `ctrl-z` with no other modifiers (gpui keystroke form).
+/// Used to scope muxel shortcuts away from focused terminals so agents receive C0.
+pub fn is_plain_ctrl_letter(keystroke: &str) -> bool {
+    let ks = keystroke.trim().to_ascii_lowercase();
+    let Some(rest) = ks.strip_prefix("ctrl-") else {
+        return false;
+    };
+    rest.len() == 1 && rest.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
+#[cfg(test)]
+mod keystroke_tests {
+    use super::is_plain_ctrl_letter;
+
+    #[test]
+    fn plain_ctrl_letter() {
+        assert!(is_plain_ctrl_letter("ctrl-s"));
+        assert!(is_plain_ctrl_letter("Ctrl-S"));
+        assert!(is_plain_ctrl_letter(" ctrl-r "));
+        assert!(!is_plain_ctrl_letter("ctrl-shift-s"));
+        assert!(!is_plain_ctrl_letter("ctrl-shift-p"));
+        assert!(!is_plain_ctrl_letter("ctrl-1"));
+        assert!(!is_plain_ctrl_letter("ctrl-tab"));
+        assert!(!is_plain_ctrl_letter("alt-s"));
+        assert!(!is_plain_ctrl_letter("secondary-s"));
+    }
 }
 
 impl Default for Settings {
