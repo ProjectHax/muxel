@@ -367,6 +367,20 @@ impl TerminalSession {
         self.write_input(payload.as_bytes());
     }
 
+    /// Paste filesystem paths into the PTY (drag-drop / clipboard files).
+    pub fn paste_paths(&self, paths: &[std::path::PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut text = String::new();
+        for path in paths {
+            use std::fmt::Write as _;
+            let _ = write!(text, " {path:?}");
+        }
+        text.push(' ');
+        self.paste(&text);
+    }
+
     /// Write bytes to the PTY without touching the scroll position (used for
     /// non-input writes like focus reports).
     fn write_raw(&self, data: &[u8]) {

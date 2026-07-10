@@ -225,6 +225,11 @@ impl Element for TerminalElement {
         let track_top = f32::from(bounds.origin.y);
         let track_h = f32::from(bounds.size.height);
 
+        // File drag-and-drop from Explorer is handled on the TerminalView wrapper
+        // via InteractiveElement::on_drop::<ExternalPaths> — gpui rewrites OS
+        // FileDrop into an internal drag, so FileDropEvent mouse listeners never
+        // see Entered/Submit.
+
         // ---- Ctrl/Cmd+click: open the link (OSC 8 / URL / file path) under the
         // cursor. Dispatched as an action so the app decides where it opens
         // (built-in browser vs the OS).
@@ -464,16 +469,14 @@ impl Element for TerminalElement {
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
                             session.clear_selection();
                             window.refresh();
-                        } else if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                            session.paste(&text);
+                        } else {
+                            crate::view::paste_clipboard_into_session(&session, cx);
                         }
                     }
                     // The selection already auto-copied; right-click pastes and
                     // drops the (now stale) selection highlight.
                     TerminalMouseMode::CopyOnSelect => {
-                        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                            session.paste(&text);
-                        }
+                        crate::view::paste_clipboard_into_session(&session, cx);
                         if session.clear_selection() {
                             window.refresh();
                         }

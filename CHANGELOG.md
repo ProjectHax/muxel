@@ -27,6 +27,11 @@ All notable changes to muxel are documented here. This project adheres to
 - **Shift+Enter newline in agent TUIs (Grok, etc.)** — bare CR cannot carry
   modifiers, so Shift/Alt+Enter now send `ESC CR` (the sequence those agents
   already treat as a soft newline). Plain Enter is still CR.
+- **Terminal image paste and file drop** — Alt+letter is sent as ESC+letter so
+  Claude Code's Alt+V image paste works; plain Ctrl+V is host-side smart paste
+  (text/paths into the PTY; images forwarded as 0x16 for agents like Grok);
+  drag-and-drop pastes shell-quoted paths into the focused terminal; Shift+Insert
+  pastes and Ctrl+Insert copies.
 - **An agent's `pkill` could kill every agent in every project** — tmux forks its server
   from the first client that needs one and the server keeps that client's command line.
   Since 0.0.9 made local panes default to tmux, that first client was a pane's

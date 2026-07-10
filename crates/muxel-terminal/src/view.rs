@@ -527,27 +527,66 @@ impl TerminalView {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let m = &event.keystroke.modifiers;
 
-        // Copy / paste. On macOS the platform shortcut is ⌘C / ⌘V; everywhere
-        // else it's ctrl-shift-c / ctrl-shift-v (plain ctrl-c must stay SIGINT).
-        // macOS accepts the ctrl-shift combo too so muscle memory carries over.
+        // Copy / paste. On macOS the platform shortcut is ⌘C / ⌘V; elsewhere
+        // ctrl-shift-c / ctrl-shift-v (plain ctrl-c must stay SIGINT).
+        //
+        // Plain Ctrl+V is host-side smart paste (Windows Terminal / VS Code
+        // style): text and file paths are injected into the PTY; an image
+        // forwards raw 0x16 so agents that read the OS clipboard (Grok) can
+        // attach it. Leaving Ctrl+V as bare 0x16 broke text paste in Claude —
+        // it does not host-paste on 0x16. Claude's image chord is Alt+V
+        // (ESC v via the keymap); we never intercept that.
+        // Classic Insert: Ctrl+Insert = copy, Shift+Insert = paste.
+        //
+        // Always `stop_propagation` when we consume a key. On Windows, Alt+letter
+        // is `WM_SYSKEYDOWN`; if gpui returns unhandled, DefWindowProc rings the
+        // system ding (Windows Terminal never does — it eats the message).
+        let key = event.keystroke.key.as_str();
+        if key == "insert" || key == "ins" {
+            if m.control && !m.alt && !m.shift {
+                if let Some(text) = self.session.selection_to_string()
+                    && !text.is_empty()
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                cx.stop_propagation();
+                return;
+            }
+            if m.shift && !m.control && !m.alt {
+                paste_clipboard_into_session(&self.session, cx);
+                self.session.clear_selection();
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+        }
+        // Plain Ctrl+V — smart paste (see above). Must run before key_to_bytes
+        // would turn it into C0 0x16 unconditionally.
+        if key == "v" && m.control && !m.shift && !m.alt && !m.platform {
+            paste_clipboard_into_session(&self.session, cx);
+            self.session.clear_selection();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let copy_paste = (m.control && m.shift && !m.alt)
             || (cfg!(target_os = "macos") && m.platform && !m.control && !m.shift && !m.alt);
         if copy_paste {
-            match event.keystroke.key.as_str() {
+            match key {
                 "c" => {
                     if let Some(text) = self.session.selection_to_string()
                         && !text.is_empty()
                     {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
+                    cx.stop_propagation();
                     return;
                 }
                 "v" => {
-                    if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                        self.session.paste(&text);
-                    }
+                    paste_clipboard_into_session(&self.session, cx);
                     self.session.clear_selection();
                     cx.notify();
+                    cx.stop_propagation();
                     return;
                 }
                 _ => {}
@@ -577,7 +616,36 @@ impl TerminalView {
             if cleared {
                 cx.notify();
             }
+            cx.stop_propagation();
         }
+    }
+}
+
+/// Paste from the system clipboard into the PTY.
+/// Image → forward Ctrl+V (0x16) so the agent reads the OS clipboard.
+/// File paths → shell-quoted paths. Text → bracketed paste.
+pub fn paste_clipboard_into_session(session: &TerminalSession, cx: &App) {
+    let Some(item) = cx.read_from_clipboard() else {
+        return;
+    };
+    for entry in item.entries() {
+        match entry {
+            ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
+                session.write_input(&[0x16]);
+                return;
+            }
+            ClipboardEntry::ExternalPaths(paths) => {
+                let paths: Vec<_> = paths.paths().to_vec();
+                if !paths.is_empty() {
+                    session.paste_paths(&paths);
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(text) = item.text() {
+        session.paste(&text);
     }
 }
 
@@ -610,6 +678,13 @@ impl Render for TerminalView {
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .on_key_down(cx.listener(Self::on_key_down))
+            // OS file drops (Explorer → pane) arrive as an internal gpui drag of
+            // ExternalPaths, not as FileDropEvent listeners. Same path Zed uses.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                this.session.paste_paths(paths.paths());
+                this.session.clear_selection();
+                cx.notify();
+            }))
             .size_full()
             // Fill the inset margin with the terminal background and inset the
             // element so the grid (sized from the inner area) never butts against
