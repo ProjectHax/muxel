@@ -537,6 +537,10 @@ impl TerminalView {
         // it does not host-paste on 0x16. Claude's image chord is Alt+V
         // (ESC v via the keymap); we never intercept that.
         // Classic Insert: Ctrl+Insert = copy, Shift+Insert = paste.
+        //
+        // Always `stop_propagation` when we consume a key. On Windows, Alt+letter
+        // is `WM_SYSKEYDOWN`; if gpui returns unhandled, DefWindowProc rings the
+        // system ding (Windows Terminal never does — it eats the message).
         let key = event.keystroke.key.as_str();
         if key == "insert" || key == "ins" {
             if m.control && !m.alt && !m.shift {
@@ -545,12 +549,14 @@ impl TerminalView {
                 {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
+                cx.stop_propagation();
                 return;
             }
             if m.shift && !m.control && !m.alt {
                 paste_clipboard_into_session(&self.session, cx);
                 self.session.clear_selection();
                 cx.notify();
+                cx.stop_propagation();
                 return;
             }
         }
@@ -560,6 +566,7 @@ impl TerminalView {
             paste_clipboard_into_session(&self.session, cx);
             self.session.clear_selection();
             cx.notify();
+            cx.stop_propagation();
             return;
         }
         let copy_paste = (m.control && m.shift && !m.alt)
@@ -572,12 +579,14 @@ impl TerminalView {
                     {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
+                    cx.stop_propagation();
                     return;
                 }
                 "v" => {
                     paste_clipboard_into_session(&self.session, cx);
                     self.session.clear_selection();
                     cx.notify();
+                    cx.stop_propagation();
                     return;
                 }
                 _ => {}
@@ -607,6 +616,7 @@ impl TerminalView {
             if cleared {
                 cx.notify();
             }
+            cx.stop_propagation();
         }
     }
 }
