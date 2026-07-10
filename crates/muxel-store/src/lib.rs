@@ -209,6 +209,14 @@ pub fn workspaces_dir() -> Option<PathBuf> {
     data_dir().map(|d| d.join("workspaces"))
 }
 
+/// Directory holding downloaded speech-to-text models (`<data_dir>/models`),
+/// created on demand. `None` if the platform data dir can't be resolved.
+pub fn models_dir() -> Option<PathBuf> {
+    let dir = data_dir()?.join("models");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 /// Path to a workspace's saved document.
 pub fn workspace_doc_path(id: Uuid) -> Option<PathBuf> {
     workspaces_dir().map(|d| d.join(id.to_string()).join("workspace.json"))

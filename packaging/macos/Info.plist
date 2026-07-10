@@ -24,5 +24,7 @@
   <true/>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.developer-tools</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>muxel uses the microphone to transcribe your speech into the focused agent's prompt.</string>
 </dict>
 </plist>

@@ -9,6 +9,7 @@ pub mod memory;
 mod pane;
 mod shell;
 pub mod ssh;
+pub mod stt;
 pub mod tmux;
 pub mod worktree;
 
@@ -25,6 +26,7 @@ pub use pane::{
     set_split_sizes, set_tab_order, split, split_beside, swap_instances, swap_panes,
 };
 pub use shell::{join_words, split_words};
+pub use stt::SttEngine;
 pub use worktree::Worktree;
 
 use serde::{Deserialize, Serialize};
@@ -1107,6 +1109,36 @@ pub struct Settings {
     /// Show indentation guides in the editor.
     #[serde(default = "default_true")]
     pub editor_indent_guides: bool,
+    // --- Speech-to-text (dictate into the focused agent) ---
+    /// Which transcription engine dictation uses.
+    #[serde(default)]
+    pub stt_engine: SttEngine,
+    /// whisper.cpp model for the local engine (`tiny` | `base` | `small` | …).
+    #[serde(default = "default_stt_model")]
+    pub stt_model: String,
+    /// Spoken language hint (BCP-47, e.g. `en`); empty = auto-detect.
+    #[serde(default)]
+    pub stt_language: String,
+    /// Base URL of the OpenAI-compatible transcription endpoint (no trailing `/`).
+    #[serde(default = "default_stt_provider_url")]
+    pub stt_provider_url: String,
+    /// Model name sent to the provider (e.g. `whisper-1`, `whisper-large-v3`).
+    #[serde(default = "default_stt_provider_model")]
+    pub stt_provider_model: String,
+    /// Press Enter automatically after inserting the transcript (default: leave
+    /// it in the prompt unsubmitted for review).
+    #[serde(default)]
+    pub stt_autosubmit: bool,
+}
+
+fn default_stt_model() -> String {
+    "base".to_string()
+}
+fn default_stt_provider_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+fn default_stt_provider_model() -> String {
+    "whisper-1".to_string()
 }
 
 fn default_editor_font_size() -> f32 {
@@ -1198,6 +1230,12 @@ impl Default for Settings {
             editor_soft_wrap: false,
             editor_line_numbers: true,
             editor_indent_guides: true,
+            stt_engine: SttEngine::default(),
+            stt_model: default_stt_model(),
+            stt_language: String::new(),
+            stt_provider_url: default_stt_provider_url(),
+            stt_provider_model: default_stt_provider_model(),
+            stt_autosubmit: false,
         }
     }
 }

@@ -85,6 +85,16 @@ feature is added or changed, update the matching entry here in the same change**
   If the saved session is gone, the pane quietly starts fresh.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
+- **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to
+  toggle, or hold `Ctrl+Shift+H` to push-to-talk) records the microphone and
+  types the transcript into the **focused** agent's prompt, left unsubmitted so
+  you can review before pressing Enter (or enable auto-submit). Two engines,
+  chosen in Settings → Speech: **Local** runs whisper.cpp entirely on your
+  machine (the model downloads once on first use), or a **Provider** — any
+  OpenAI-compatible `/audio/transcriptions` endpoint (OpenAI, Groq, a self-hosted
+  server) via a base URL + model + API key stored in the OS keychain. Provider
+  mode uploads your recorded audio to that endpoint; local mode never leaves the
+  machine. macOS asks for microphone permission on first use.
 - **Shared project memory** — opt-in per project: agents are told (via their system
   prompt) to `grep` and add durable lessons to a `.muxel/MEMORY.md` file shared
   across every agent and run in that project. muxel creates the file, git-ignores

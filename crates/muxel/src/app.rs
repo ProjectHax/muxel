@@ -454,6 +454,10 @@ actions!(
         ShowKeys,
         // Toggle the broadcast bar (send one line to every agent in the project).
         ToggleBroadcast,
+        // Toggle speech-to-text dictation into the focused agent.
+        ToggleSpeechToText,
+        // Push-to-hold dictation: records while the chord is held.
+        HoldSpeechToText,
         // Toggle the "new agents get a git worktree" toolbar switch.
         ToggleWorktree,
         // OS fullscreen with the sidebar hidden (a floating pill reveals it).
@@ -514,6 +518,8 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
         "FocusDown" => KeyBinding::new(keystroke, FocusDown, context),
         "ShowKeys" => KeyBinding::new(keystroke, ShowKeys, context),
         "ToggleBroadcast" => KeyBinding::new(keystroke, ToggleBroadcast, context),
+        "ToggleSpeechToText" => KeyBinding::new(keystroke, ToggleSpeechToText, context),
+        "HoldSpeechToText" => KeyBinding::new(keystroke, HoldSpeechToText, context),
         "ToggleWorktree" => KeyBinding::new(keystroke, ToggleWorktree, context),
         "ToggleFullScreen" => KeyBinding::new(keystroke, ToggleFullScreen, context),
         "ToggleDevConsole" => KeyBinding::new(keystroke, ToggleDevConsole, context),
@@ -903,6 +909,21 @@ enum UpdateState {
     Error(String),
 }
 
+/// State of a speech-to-text dictation (drives the mic button + recording pill).
+#[derive(Clone, Default, PartialEq)]
+enum SttState {
+    /// Not recording.
+    #[default]
+    Idle,
+    /// Capturing the microphone.
+    Recording,
+    /// Post-capture work in progress; the string is a user-facing label
+    /// ("Downloading model…" / "Transcribing…").
+    Busy(String),
+    /// The last dictation failed (message shown briefly in the pill).
+    Error(String),
+}
+
 /// The small label shown under the cursor while dragging a project row.
 struct DragGhost {
     label: SharedString,
@@ -1182,6 +1203,13 @@ pub struct MuxelApp {
     broadcasting: bool,
     /// Reused input for the broadcast bar.
     broadcast_input: Entity<InputState>,
+    /// Speech-to-text dictation state (idle / recording / transcribing / error).
+    stt_state: SttState,
+    /// The in-flight microphone capture, held while `stt_state == Recording`.
+    stt_recording: Option<crate::stt::Recording>,
+    /// True while a push-to-hold dictation is active (started on the hold chord's
+    /// key-down, stopped on the next key-up).
+    stt_hold: bool,
     /// Set once the user confirms quitting, so the close hook stops vetoing.
     confirm_quit: bool,
     /// An in-progress split/new-tab button press (target pane + placement). A
@@ -2887,6 +2915,9 @@ impl MuxelApp {
             term_search_input,
             broadcasting: false,
             broadcast_input,
+            stt_state: SttState::Idle,
+            stt_recording: None,
+            stt_hold: false,
             confirm_quit: false,
             place_pending: None,
             place_menu: None,
@@ -6365,6 +6396,7 @@ impl MuxelApp {
             || self.show_new_remote
             || self.show_run_dialog
             || self.broadcasting
+            || self.stt_state != SttState::Idle
             || self.git_modal.is_some()
             || self.password_prompt.is_some()
             || self.confirm.is_some()
@@ -9467,6 +9499,22 @@ impl MuxelApp {
                 this.activate_main_window(window, cx);
                 this.toggle_broadcast(window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleSpeechToText, window, cx| {
+                this.activate_main_window(window, cx);
+                this.toggle_speech(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &HoldSpeechToText, window, cx| {
+                this.activate_main_window(window, cx);
+                this.start_hold(cx)
+            }))
+            // Push-to-hold: releasing any key while a hold dictation is active
+            // stops recording and transcribes. Key-ups bubble up the focus tree
+            // to this root, so this fires even while a terminal pane is focused.
+            .on_key_up(cx.listener(|this, _ev: &KeyUpEvent, window, cx| {
+                if this.stt_hold {
+                    this.stop_hold(window, cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &ToggleWorktree, _window, cx| this.toggle_worktree(cx)),
             )
@@ -10700,6 +10748,168 @@ impl MuxelApp {
         if let Some(iid) = self.active_instance {
             self.send_snippet_to(iid, idx, window, cx);
         }
+    }
+
+    // --- Speech-to-text: dictate into the focused agent -----------------------
+
+    /// Whether there is a focused terminal/agent pane to dictate into.
+    fn has_dictation_target(&self) -> bool {
+        self.active_instance
+            .is_some_and(|iid| self.terminals.contains_key(&iid))
+    }
+
+    /// Mic button / `ToggleSpeechToText`: start recording, or stop + transcribe
+    /// if already recording. Ignored while a transcription is in flight.
+    fn toggle_speech(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.stt_state {
+            SttState::Recording => self.stop_and_transcribe(window, cx),
+            SttState::Busy(_) => {}
+            _ => self.start_recording(cx),
+        }
+    }
+
+    /// Push-to-hold key-down: begin a hold dictation if idle.
+    fn start_hold(&mut self, cx: &mut Context<Self>) {
+        if self.stt_state != SttState::Idle {
+            return; // ignore key-repeat / already recording
+        }
+        self.stt_hold = true;
+        self.start_recording(cx);
+        // If the device failed to open, don't leave the hold flag stuck.
+        if self.stt_state != SttState::Recording {
+            self.stt_hold = false;
+        }
+    }
+
+    /// Push-to-hold key-up: stop and transcribe.
+    fn stop_hold(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.stt_hold {
+            return;
+        }
+        self.stt_hold = false;
+        if self.stt_state == SttState::Recording {
+            self.stop_and_transcribe(window, cx);
+        }
+    }
+
+    /// Begin capturing the microphone (needs a focused pane + a usable device).
+    fn start_recording(&mut self, cx: &mut Context<Self>) {
+        if !self.has_dictation_target() {
+            self.stt_state = SttState::Error(t("Focus an agent pane first").to_string());
+            cx.notify();
+            return;
+        }
+        match crate::stt::start_capture() {
+            Ok(rec) => {
+                self.stt_recording = Some(rec);
+                self.stt_state = SttState::Recording;
+            }
+            Err(e) => self.stt_state = SttState::Error(format!("{e:#}")),
+        }
+        cx.notify();
+    }
+
+    /// Stop capture, transcribe off the UI thread (local whisper.cpp or the
+    /// provider), then paste the transcript into the focused pane.
+    fn stop_and_transcribe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rec) = self.stt_recording.take() else {
+            self.stt_state = SttState::Idle;
+            cx.notify();
+            return;
+        };
+        let target = self.active_instance;
+        let engine = self.settings.stt_engine;
+        let model = self.settings.stt_model.clone();
+        let language = self.settings.stt_language.clone();
+        let provider_url = self.settings.stt_provider_url.clone();
+        let provider_model = self.settings.stt_provider_model.clone();
+        let autosubmit = self.settings.stt_autosubmit;
+        let api_key = crate::secrets::get_stt_api_key().unwrap_or_default();
+        let models_dir = muxel_store::models_dir();
+
+        // "Downloading model…" only when the local model isn't cached yet.
+        let downloading = engine == muxel_core::SttEngine::Local
+            && models_dir.as_ref().is_none_or(|d| {
+                !d.join(muxel_core::stt::whisper_model_filename(&model))
+                    .is_file()
+            });
+        self.stt_state = SttState::Busy(if downloading {
+            t("Downloading model…").to_string()
+        } else {
+            t("Transcribing…").to_string()
+        });
+        cx.notify();
+
+        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let (samples, rate, channels) = rec.stop()?;
+                    let audio = muxel_core::stt::resample_to_16k_mono(&samples, rate, channels);
+                    if audio.len() < (muxel_core::stt::WHISPER_RATE / 5) as usize {
+                        anyhow::bail!("no speech captured");
+                    }
+                    match engine {
+                        muxel_core::SttEngine::Local => {
+                            let dir =
+                                models_dir.ok_or_else(|| anyhow::anyhow!("no data directory"))?;
+                            let path = crate::stt::ensure_model(&model, &dir)?;
+                            crate::stt::transcribe_local(&audio, &path, &language)
+                        }
+                        muxel_core::SttEngine::Provider => {
+                            if api_key.is_empty() {
+                                anyhow::bail!("set a provider API key in Settings → Speech");
+                            }
+                            let wav = muxel_core::stt::encode_wav_16k_mono(&audio);
+                            crate::stt::transcribe_provider(
+                                &wav,
+                                &provider_url,
+                                &api_key,
+                                &provider_model,
+                                &language,
+                            )
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(text) if !text.is_empty() => {
+                        this.stt_state = SttState::Idle;
+                        this.insert_transcript(target, &text, autosubmit, window, cx);
+                    }
+                    Ok(_) => this.stt_state = SttState::Idle,
+                    Err(e) => this.stt_state = SttState::Error(format!("{e:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Paste a transcript into pane `iid`'s prompt (bracketed paste, so it lands
+    /// unsubmitted for review — mirrors `send_snippet_to`).
+    fn insert_transcript(
+        &mut self,
+        target: Option<Uuid>,
+        text: &str,
+        submit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(iid) = target else { return };
+        let Some(session) = self
+            .terminals
+            .get(&iid)
+            .map(|v| v.read(cx).session().clone())
+        else {
+            return;
+        };
+        session.paste(text);
+        if submit {
+            session.write_input(b"\r");
+        }
+        self.focus_instance(iid, window, cx);
     }
 
     /// Select the Nth tab (1-based) of the active pane.
@@ -14966,6 +15176,15 @@ impl MuxelApp {
                     .tooltip(t("Close pane"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.close_active(window, cx))),
             )
+            .child(
+                Button::new("speech-to-text")
+                    .ghost()
+                    .icon(Icon::empty().path("icons/mic.svg"))
+                    .selected(self.stt_state == SttState::Recording)
+                    .disabled(matches!(self.stt_state, SttState::Busy(_)))
+                    .tooltip(t("Dictate to the focused agent"))
+                    .on_click(cx.listener(|this, _ev, window, cx| this.toggle_speech(window, cx))),
+            )
             // Spacer pushes the git-diff toggle to the far right of the toolbar.
             .child(div().flex_1())
             .child(
@@ -15526,6 +15745,7 @@ impl MuxelApp {
                 notifications: self.notifications_enabled,
             });
             self.load_appearance_inputs(window, cx);
+            self.load_speech_inputs(window, cx);
             self.load_keybinding_inputs(window, cx);
         }
         cx.notify();
@@ -15614,6 +15834,262 @@ impl MuxelApp {
         self.refresh_terminal_config(cx);
         self.persist_settings();
         cx.notify();
+    }
+
+    // ===== Speech-to-text settings handlers =====
+
+    /// Seed the Speech section's text inputs from the current settings + keychain.
+    fn load_speech_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self.settings.stt_provider_url.clone();
+        self.settings_ui
+            .stt_provider_url
+            .update(cx, |s, cx| s.set_value(url, window, cx));
+        let model = self.settings.stt_provider_model.clone();
+        self.settings_ui
+            .stt_provider_model
+            .update(cx, |s, cx| s.set_value(model, window, cx));
+        let lang = self.settings.stt_language.clone();
+        self.settings_ui
+            .stt_language
+            .update(cx, |s, cx| s.set_value(lang, window, cx));
+        self.settings_ui
+            .stt_api_key
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.settings_ui.stt_has_key = crate::secrets::has_stt_api_key();
+    }
+
+    fn set_stt_engine(&mut self, engine: muxel_core::SttEngine, cx: &mut Context<Self>) {
+        self.settings.stt_engine = engine;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn set_stt_model(&mut self, model: &str, cx: &mut Context<Self>) {
+        self.settings.stt_model = model.to_string();
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Read the provider URL / model / language inputs and persist them.
+    fn apply_stt_provider(&mut self, cx: &mut Context<Self>) {
+        let url = self
+            .settings_ui
+            .stt_provider_url
+            .read(cx)
+            .value()
+            .to_string();
+        let url = url.trim();
+        self.settings.stt_provider_url = if url.is_empty() {
+            "https://api.openai.com/v1".to_string()
+        } else {
+            url.to_string()
+        };
+        let model = self
+            .settings_ui
+            .stt_provider_model
+            .read(cx)
+            .value()
+            .to_string();
+        self.settings.stt_provider_model = model.trim().to_string();
+        let lang = self.settings_ui.stt_language.read(cx).value().to_string();
+        self.settings.stt_language = lang.trim().to_string();
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Store the typed API key in the OS keychain, then clear the input.
+    fn save_stt_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self
+            .settings_ui
+            .stt_api_key
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if key.is_empty() {
+            return;
+        }
+        match crate::secrets::set_stt_api_key(&key) {
+            Ok(()) => {
+                self.settings_ui.stt_has_key = true;
+                self.settings_ui
+                    .stt_api_key
+                    .update(cx, |s, cx| s.set_value("", window, cx));
+                self.add_event(
+                    NotifKind::Success,
+                    t("API key saved to keychain").to_string(),
+                    String::new(),
+                );
+            }
+            Err(e) => self.add_event(
+                NotifKind::Error,
+                t("Couldn't save API key").to_string(),
+                format!("{e:#}"),
+            ),
+        }
+        cx.notify();
+    }
+
+    fn clear_stt_api_key(&mut self, cx: &mut Context<Self>) {
+        let _ = crate::secrets::delete_stt_api_key();
+        self.settings_ui.stt_has_key = false;
+        cx.notify();
+    }
+
+    fn stt_engine_btn(
+        &self,
+        value: muxel_core::SttEngine,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let id = SharedString::from(format!("stt-engine-{label}"));
+        Button::new(id)
+            .ghost()
+            .selected(self.settings.stt_engine == value)
+            .label(label.to_string())
+            .on_click(cx.listener(move |this, _e, _w, cx| this.set_stt_engine(value, cx)))
+    }
+
+    fn render_settings_speech(&self, cx: &mut Context<Self>) -> AnyElement {
+        let is_local = self.settings.stt_engine == muxel_core::SttEngine::Local;
+        let models = ["tiny", "base", "small", "medium"];
+        let current_model = self.settings.stt_model.clone();
+        let mut model_row = div().flex().flex_wrap().gap_1();
+        for m in models {
+            let selected = current_model == m;
+            model_row = model_row.child(
+                Button::new(SharedString::from(format!("stt-model-{m}")))
+                    .ghost()
+                    .selected(selected)
+                    .label(m)
+                    .on_click(cx.listener(move |this, _e, _w, cx| this.set_stt_model(m, cx))),
+            );
+        }
+
+        let mut col = v_flex()
+            .gap_3()
+            .max_w(px(560.0))
+            .child(self.settings_label(&t("Dictation engine"), cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(self.stt_engine_btn(muxel_core::SttEngine::Local, &t("Local"), cx))
+                    .child(self.stt_engine_btn(
+                        muxel_core::SttEngine::Provider,
+                        &t("Provider"),
+                        cx,
+                    )),
+            );
+
+        if is_local {
+            col = col
+                .child(self.settings_label(
+                    &t("Local model (whisper.cpp) — downloaded on first use"),
+                    cx,
+                ))
+                .child(model_row);
+        } else {
+            col = col
+                .child(self.settings_label(&t("Provider base URL (OpenAI-compatible)"), cx))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .child(Input::new(&self.settings_ui.stt_provider_url)),
+                        )
+                        .child(
+                            Button::new("stt-apply-provider")
+                                .primary()
+                                .label(t("Apply"))
+                                .on_click(
+                                    cx.listener(|this, _e, _w, cx| this.apply_stt_provider(cx)),
+                                ),
+                        ),
+                )
+                .child(self.settings_label(&t("Provider model"), cx))
+                .child(Self::wide_input(Input::new(
+                    &self.settings_ui.stt_provider_model,
+                )))
+                .child(self.settings_label(
+                    &if self.settings_ui.stt_has_key {
+                        t("API key — a key is stored; type a new one to replace it")
+                    } else {
+                        t("API key — stored in the OS keychain")
+                    },
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .child(Input::new(&self.settings_ui.stt_api_key)),
+                        )
+                        .child(
+                            Button::new("stt-save-key")
+                                .primary()
+                                .label(t("Save"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.save_stt_api_key(window, cx)
+                                })),
+                        )
+                        .children(self.settings_ui.stt_has_key.then(|| {
+                            Button::new("stt-clear-key")
+                                .ghost()
+                                .label(t("Remove"))
+                                .on_click(
+                                    cx.listener(|this, _e, _w, cx| this.clear_stt_api_key(cx)),
+                                )
+                        })),
+                );
+        }
+
+        col.child(self.settings_label(
+            &t("Spoken language (BCP-47, e.g. en) — blank auto-detects"),
+            cx,
+        ))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(v_flex().flex_1().child(Input::new(&self.settings_ui.stt_language)))
+                .child(
+                    Button::new("stt-apply-lang")
+                        .primary()
+                        .label(t("Apply"))
+                        .on_click(cx.listener(|this, _e, _w, cx| this.apply_stt_provider(cx))),
+                ),
+        )
+        .child(
+            self.check_row(
+                Checkbox::new("stt-autosubmit")
+                    .checked(self.settings.stt_autosubmit)
+                    .on_click(cx.listener(|this, c: &bool, _w, cx| {
+                        this.settings.stt_autosubmit = *c;
+                        this.persist_settings();
+                        cx.notify();
+                    })),
+                &t("Press Enter automatically after inserting the transcript"),
+            ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(t(
+                    "Provider mode uploads your recorded audio to the endpoint above. Local mode runs entirely on this machine.",
+                )),
+        )
+        .into_any_element()
     }
 
     // ===== Editor settings handlers =====
@@ -17869,6 +18345,61 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    /// The floating speech-to-text pill (recording / transcribing / error),
+    /// shown while `stt_state != Idle`. Modeled on the broadcast bar.
+    fn render_stt_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (accent, label, recording, error) = match &self.stt_state {
+            SttState::Recording => (cx.theme().danger, t("Recording…").to_string(), true, false),
+            SttState::Busy(l) => (cx.theme().accent, l.clone(), false, false),
+            SttState::Error(e) => (cx.theme().danger, e.clone(), false, true),
+            SttState::Idle => (cx.theme().muted_foreground, String::new(), false, false),
+        };
+        div()
+            .absolute()
+            .bottom(px(16.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .max_w_full()
+                    .rounded(cx.theme().radius_lg)
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(accent)
+                    .shadow_lg()
+                    .child(div().size(px(8.0)).rounded_full().bg(accent))
+                    .child(div().text_sm().child(label))
+                    .children(recording.then(|| {
+                        Button::new("stt-stop")
+                            .primary()
+                            .xsmall()
+                            .label(t("Stop"))
+                            .on_click(
+                                cx.listener(|this, _e, window, cx| this.toggle_speech(window, cx)),
+                            )
+                    }))
+                    .children(error.then(|| {
+                        Button::new("stt-dismiss")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.stt_state = SttState::Idle;
+                                cx.notify();
+                            }))
+                    }))
+                    .into_any_element(),
+            )
+            .into_any_element()
+    }
+
     /// Get-started state for a workspace with **zero projects** (post terms
     /// screen, a fresh workspace is otherwise blank space): the mark, the two
     /// ways to add a project, and a pointer to the shortcut cheat sheet. No
@@ -18441,6 +18972,9 @@ impl MuxelApp {
             .child(nav_item(t("Behavior"), SettingsSection::Behavior).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Behavior, cx)),
             ))
+            .child(nav_item(t("Speech"), SettingsSection::Speech).on_click(
+                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Speech, cx)),
+            ))
             .child(nav_item(t("Agents"), SettingsSection::Agents).on_click(
                 cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Agents, cx)),
             ))
@@ -18475,6 +19009,7 @@ impl MuxelApp {
             SettingsSection::Appearance => self.render_settings_appearance(cx),
             SettingsSection::Editor => self.render_settings_editor(cx),
             SettingsSection::Behavior => self.render_settings_behavior(cx),
+            SettingsSection::Speech => self.render_settings_speech(cx),
             SettingsSection::Agents => self.render_settings_agents(cx),
             SettingsSection::Runners => self.render_settings_runners(cx),
             SettingsSection::Snippets => self.render_settings_snippets(cx),
@@ -20665,6 +21200,7 @@ impl Render for MuxelApp {
                     .then(|| self.render_term_search_bar(cx)),
             )
             .children(self.broadcasting.then(|| self.render_broadcast_bar(cx)))
+            .children((self.stt_state != SttState::Idle).then(|| self.render_stt_bar(cx)))
             .children(
                 (!self.pending_worktree_dispose.is_empty())
                     .then(|| self.render_worktree_dispose_modal(cx)),

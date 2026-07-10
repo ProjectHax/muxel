@@ -3,6 +3,18 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- **Speech-to-text dictation** — a toolbar mic button (`Ctrl+Shift+M` toggle, or
+  hold `Ctrl+Shift+H` for push-to-talk) records the microphone and types the
+  transcript into the focused agent's prompt, unsubmitted for review (optional
+  auto-submit). Pick the engine in Settings → Speech: **Local** whisper.cpp runs
+  offline on this machine (the model downloads once on first use), or a
+  **Provider** — any OpenAI-compatible `/audio/transcriptions` endpoint (OpenAI,
+  Groq, self-hosted) via base URL + model + a keychain-stored API key. Provider
+  mode uploads audio to that endpoint; local mode stays on-device.
+
 ## [0.1.0] — 2026-07-10
 
 ### Added

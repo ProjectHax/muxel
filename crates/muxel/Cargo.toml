@@ -47,6 +47,10 @@ keyring = { version = "3", features = [
     "sync-secret-service",
     "crypto-rust",
 ] }
+# Speech-to-text: cross-platform mic capture (WASAPI/CoreAudio/ALSA) + in-process
+# whisper.cpp (compiled from source via cmake) for offline local transcription.
+cpal = "0.15"
+whisper-rs = "0.14"
 
 # --- Built-in browser (system webview via wry; no bundled Chromium) ---
 # macOS/Windows: an embedded in-pane webview via gpui-component's gpui-wry

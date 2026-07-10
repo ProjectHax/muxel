@@ -17,6 +17,7 @@ mod i18n;
 mod integrations;
 mod secrets;
 mod settings_view;
+mod stt;
 mod theme;
 mod update;
 

@@ -57,6 +57,8 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("FocusAttention", "ctrl-shift-a", None),
     ("ShowKeys", "ctrl-shift-/", None),
     ("ToggleBroadcast", "ctrl-shift-i", None),
+    ("ToggleSpeechToText", "ctrl-shift-m", None),
+    ("HoldSpeechToText", "ctrl-shift-h", None),
     // Toggle the toolbar's "new agents get a git worktree" switch.
     ("ToggleWorktree", "ctrl-shift-g", None),
     // OS fullscreen; the sidebar hides until revealed or fullscreen exits.
@@ -107,6 +109,7 @@ pub enum SettingsSection {
     Appearance,
     Editor,
     Behavior,
+    Speech,
     Agents,
     Runners,
     Snippets,
@@ -208,6 +211,15 @@ pub struct SettingsUi {
 
     // Editor.
     pub editor_font_family: Entity<InputState>,
+
+    // Speech-to-text.
+    pub stt_provider_url: Entity<InputState>,
+    pub stt_provider_model: Entity<InputState>,
+    pub stt_language: Entity<InputState>,
+    pub stt_api_key: Entity<InputState>,
+    /// Whether a provider API key is stored (cached so render doesn't hit the
+    /// keychain every frame).
+    pub stt_has_key: bool,
 
     // Keybindings (action name -> keystroke input).
     pub keybinds: Vec<(String, Entity<InputState>)>,
@@ -336,6 +348,17 @@ impl SettingsUi {
                 .new(|cx| InputState::new(window, cx).placeholder(t("DejaVu Sans Mono"))),
             editor_font_family: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t("theme monospace"))),
+            stt_provider_url: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("https://api.openai.com/v1"))),
+            stt_provider_model: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("whisper-1"))),
+            stt_language: cx.new(|cx| InputState::new(window, cx).placeholder(t("auto-detect"))),
+            stt_api_key: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder(t("stored in the OS keychain"))
+            }),
+            stt_has_key: false,
             keybinds: DEFAULT_KEYBINDINGS
                 .iter()
                 .map(|(name, default, _ctx)| {

@@ -70,3 +70,35 @@ pub fn delete_identity_password(identity_id: Uuid) -> Result<()> {
         Err(e) => Err(e).context("delete password from keychain"),
     }
 }
+
+// --- Speech-to-text provider API key -------------------------------------------
+// A single shared key (there's one provider at a time), namespaced `stt:provider`.
+
+fn stt_entry() -> Result<keyring::Entry> {
+    keyring::Entry::new(SERVICE, "stt:provider").context("open keychain entry")
+}
+
+/// Store (or replace) the speech-to-text provider API key.
+pub fn set_stt_api_key(key: &str) -> Result<()> {
+    stt_entry()?
+        .set_password(key)
+        .context("save API key to keychain")
+}
+
+/// Fetch the stored speech-to-text provider API key, if any.
+pub fn get_stt_api_key() -> Option<String> {
+    stt_entry().ok()?.get_password().ok()
+}
+
+/// Whether a provider API key is stored.
+pub fn has_stt_api_key() -> bool {
+    get_stt_api_key().is_some_and(|k| !k.is_empty())
+}
+
+/// Remove the stored provider API key (best-effort).
+pub fn delete_stt_api_key() -> Result<()> {
+    match stt_entry()?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e).context("delete API key from keychain"),
+    }
+}

@@ -35,6 +35,9 @@ set -euo pipefail
 app="${1:?usage: sign-macos.sh <app> <output-basename>}"
 out="${2:?usage: sign-macos.sh <app> <output-basename>}"
 tmp="${RUNNER_TEMP:-/tmp}"
+# Entitlements applied under Hardened Runtime — currently just microphone access
+# (speech-to-text). Resolved relative to this script so cwd doesn't matter.
+entitlements="$(cd "$(dirname "$0")/.." && pwd)/packaging/macos/muxel.entitlements"
 
 if [ -n "${MACOS_CERTIFICATE:-}" ]; then
   echo "==> Signing with Developer ID: ${MACOS_SIGN_IDENTITY:-?}"
@@ -51,6 +54,7 @@ if [ -n "${MACOS_CERTIFICATE:-}" ]; then
   security list-keychains -d user -s "$keychain" \
     "$(security default-keychain -d user | tr -d ' "')"
   codesign --force --deep --options runtime --timestamp \
+    --entitlements "$entitlements" \
     --sign "$MACOS_SIGN_IDENTITY" "$app"
   codesign --verify --strict --verbose=2 "$app"
 else
