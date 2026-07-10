@@ -2,7 +2,7 @@
 # Sign a built muxel.app and package it into a .dmg + .zip.
 #
 #   sign-macos.sh <muxel.app> <output-basename>
-#       e.g. sign-macos.sh muxel.app muxel-macos-aarch64
+#       e.g. sign-macos.sh muxel.app muxel-macos-universal
 #
 # Two modes, chosen by whether MACOS_CERTIFICATE is set:
 #

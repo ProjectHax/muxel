@@ -4971,7 +4971,16 @@ impl MuxelApp {
         let url = match &self.update_state {
             UpdateState::Available(info) => match crate::update::asset_for(kind, &info.assets) {
                 Some((_, url)) => url.clone(),
-                None => return,
+                // No asset matched this platform/arch — surface it instead of
+                // leaving the button looking dead.
+                None => {
+                    self.update_state = UpdateState::Error(
+                        t("No matching download for this platform. Use the releases page to update manually.")
+                            .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
             },
             _ => return,
         };

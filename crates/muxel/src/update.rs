@@ -174,7 +174,13 @@ pub fn fetch_latest() -> Result<Option<UpdateInfo>> {
 /// The release asset to download for a given install kind, if self-updatable.
 pub fn asset_for(kind: InstallKind, assets: &[(String, String)]) -> Option<&(String, String)> {
     let name = match kind {
-        InstallKind::AppImage | InstallKind::LinuxPortable => "muxel-linux-x86_64.AppImage",
+        InstallKind::AppImage | InstallKind::LinuxPortable => {
+            if cfg!(target_arch = "aarch64") {
+                "muxel-linux-aarch64.AppImage"
+            } else {
+                "muxel-linux-x86_64.AppImage"
+            }
+        }
         InstallKind::WindowsPortable => {
             if cfg!(target_arch = "aarch64") {
                 "muxel-windows-arm64.zip"
@@ -182,7 +188,8 @@ pub fn asset_for(kind: InstallKind, assets: &[(String, String)]) -> Option<&(Str
                 "muxel-windows-x86_64.zip"
             }
         }
-        InstallKind::MacOsApp => "muxel-macos-aarch64.zip",
+        // macOS ships one universal (x86_64 + aarch64) .app, not per-arch builds.
+        InstallKind::MacOsApp => "muxel-macos-universal.zip",
         InstallKind::SystemPackage => return None,
     };
     assets.iter().find(|(n, _)| n == name)
@@ -424,24 +431,42 @@ mod tests {
 
     #[test]
     fn asset_for_picks_the_right_file() {
+        // Mirror exactly what the release workflow publishes (see release.yml).
         let assets = vec![
             ("muxel-linux-x86_64.AppImage".into(), "u1".into()),
-            ("muxel-linux-x86_64.tar.gz".into(), "u2".into()),
-            ("muxel-macos-aarch64.zip".into(), "u3".into()),
-            ("muxel-windows-x86_64.zip".into(), "u4".into()),
-            ("muxel-windows-arm64.zip".into(), "u5".into()),
+            ("muxel-linux-aarch64.AppImage".into(), "u2".into()),
+            ("muxel-linux-x86_64.tar.gz".into(), "u3".into()),
+            ("muxel-macos-universal.zip".into(), "u4".into()),
+            ("muxel-macos-universal.dmg".into(), "u5".into()),
+            ("muxel-windows-x86_64.zip".into(), "u6".into()),
+            ("muxel-windows-arm64.zip".into(), "u7".into()),
         ];
+        // Linux/Windows have per-architecture assets; macOS ships one universal build.
+        let linux = if cfg!(target_arch = "aarch64") {
+            "muxel-linux-aarch64.AppImage"
+        } else {
+            "muxel-linux-x86_64.AppImage"
+        };
+        let windows = if cfg!(target_arch = "aarch64") {
+            "muxel-windows-arm64.zip"
+        } else {
+            "muxel-windows-x86_64.zip"
+        };
         assert_eq!(
             asset_for(InstallKind::AppImage, &assets).map(|a| a.0.as_str()),
-            Some("muxel-linux-x86_64.AppImage")
+            Some(linux)
         );
         assert_eq!(
             asset_for(InstallKind::LinuxPortable, &assets).map(|a| a.0.as_str()),
-            Some("muxel-linux-x86_64.AppImage")
+            Some(linux)
         );
         assert_eq!(
             asset_for(InstallKind::MacOsApp, &assets).map(|a| a.0.as_str()),
-            Some("muxel-macos-aarch64.zip")
+            Some("muxel-macos-universal.zip")
+        );
+        assert_eq!(
+            asset_for(InstallKind::WindowsPortable, &assets).map(|a| a.0.as_str()),
+            Some(windows)
         );
         assert!(asset_for(InstallKind::SystemPackage, &assets).is_none());
     }
