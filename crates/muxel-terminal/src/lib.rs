@@ -18,5 +18,6 @@ mod session;
 mod view;
 
 pub use colors::TerminalPalette;
+pub use links::path_from_file_uri;
 pub use session::{CommandSpec, PtyChunk, TerminalSession};
 pub use view::{AgentStatus, OpenLink, TerminalLaunch, TerminalMouseMode, TerminalView};

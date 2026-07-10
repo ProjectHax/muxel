@@ -244,11 +244,12 @@ feature is added or changed, update the matching entry here in the same change**
   search bar that highlights matches and jumps through them (Enter / ↑ / ↓),
   scanning the full history.
 - **Clickable links** — `Ctrl`/`Cmd`+click opens what's under the cursor: an
-  `http(s)` URL, an OSC 8 hyperlink (e.g. `ls --hyperlink`), or a **file path**
-  (absolute, `~/`, or relative to the pane's working directory — opened with the
-  system default app; only paths that actually exist are clickable, and a
-  trailing `:line:col` is understood). `Ctrl`/`Cmd`+hover underlines the link and
-  shows a pointing-hand cursor.
+  `http(s)` URL, an OSC 8 hyperlink (e.g. `ls --hyperlink` or agent markdown
+  links), or a **file path** (absolute, `~/`, or relative to the pane's working
+  directory). Local files open in a muxel editor pane; only paths that exist are
+  clickable, and a trailing `:line:col` is understood. `Ctrl`/`Cmd`+hover
+  underlines the link and shows a pointing-hand cursor (Ctrl/Cmd down re-hit-tests
+  without requiring a mouse move).
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can

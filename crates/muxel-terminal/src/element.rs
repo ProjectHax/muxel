@@ -255,25 +255,35 @@ impl Element for TerminalElement {
             });
         }
         // ---- Ctrl/Cmd+hover: underline the link under the cursor ----
+        // Always remember the pointer so Ctrl pressed *without* a move still
+        // hit-tests (users often park the mouse, then press Ctrl).
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
+            let cw = f32::from(cell_width);
+            let lh = f32::from(line_height);
             window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
+                }
+                let local = e.position - origin;
+                if hitbox.is_hovered(window) {
+                    session.set_pointer_hit(Some(crate::session::PointerHit {
+                        local_x: f32::from(local.x),
+                        local_y: f32::from(local.y),
+                        cell_width: cw,
+                        line_height: lh,
+                        cols,
+                        rows,
+                    }));
+                } else {
+                    session.set_pointer_hit(None);
                 }
                 let link = if e.modifiers.secondary()
                     && e.pressed_button.is_none()
                     && hitbox.is_hovered(window)
                 {
-                    link_at(
-                        &session,
-                        e.position - origin,
-                        cell_width,
-                        line_height,
-                        cols,
-                        rows,
-                    )
+                    link_at(&session, local, cell_width, line_height, cols, rows)
                 } else {
                     None
                 };
@@ -282,11 +292,29 @@ impl Element for TerminalElement {
                 }
             });
         }
-        // Releasing ctrl/cmd drops the underline without waiting for a mouse move.
+        // Ctrl/Cmd pressed or released: re-hit-test without waiting for a move.
         {
             let session = self.session.clone();
             window.on_modifiers_changed(move |e: &ModifiersChangedEvent, window, _cx| {
-                if !e.modifiers.secondary() && session.set_hovered_link(None) {
+                if !e.modifiers.secondary() {
+                    if session.set_hovered_link(None) {
+                        window.refresh();
+                    }
+                    return;
+                }
+                // Secondary just went down (or is held through another mod change).
+                let Some(hit) = session.pointer_hit() else {
+                    return;
+                };
+                let link = link_at(
+                    &session,
+                    point(px(hit.local_x), px(hit.local_y)),
+                    px(hit.cell_width),
+                    px(hit.line_height),
+                    hit.cols,
+                    hit.rows,
+                );
+                if session.set_hovered_link(link) {
                     window.refresh();
                 }
             });
@@ -859,12 +887,14 @@ fn link_at(
 
         // OSC 8 hyperlink: underline the contiguous run of cells carrying the
         // same URI (the hyperlink id/uri, not the visible text, is the link).
+        // Agents sometimes put a bare relative path in the URI; resolve those
+        // the same way as plain path text so the open target is a real file://.
         if let Some(link) = grid[point].hyperlink() {
-            let uri = link.uri().to_string();
+            let raw_uri = link.uri().to_string();
             let same = |c: usize| {
                 grid[GridPoint::new(point.line, Column(c))]
                     .hyperlink()
-                    .is_some_and(|h| h.uri() == uri)
+                    .is_some_and(|h| h.uri() == raw_uri)
             };
             let mut start = point.column.0;
             while start > 0 && same(start - 1) {
@@ -874,11 +904,12 @@ fn link_at(
             while end < columns && same(end) {
                 end += 1;
             }
+            let url = normalize_link_uri(&raw_uri, session);
             return Some(HoveredLink {
                 line: point.line.0,
                 start,
                 end,
-                url: uri,
+                url,
             });
         }
 
@@ -910,6 +941,27 @@ fn link_at(
         }
         None
     })
+}
+
+/// Turn a raw OSC 8 / pasted URI into something `OpenLink` can open: leave
+/// `http(s)`/`file://` alone; resolve bare filesystem paths against the pane cwd.
+fn normalize_link_uri(uri: &str, session: &TerminalSession) -> String {
+    if uri.starts_with("http://")
+        || uri.starts_with("https://")
+        || uri.starts_with("file://")
+        || uri.starts_with("mailto:")
+    {
+        return uri.to_string();
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    if let Some(abs) = crate::links::resolve_path(uri, session.cwd(), home.as_deref())
+        && abs.exists()
+    {
+        return crate::links::file_uri(&abs);
+    }
+    uri.to_string()
 }
 
 /// Map a pixel position (relative to the terminal origin) to a grid point +
