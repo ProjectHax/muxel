@@ -18,6 +18,9 @@ All notable changes to muxel are documented here. This project adheres to
   aborted with `0xc0000409`. Browser opens are deferred until after the update,
   and a project reuses its existing browser pane (navigate) instead of stacking
   another WebView2.
+- **Restoring/opening a project that has a browser pane crashed the same way** —
+  `spawn_project_terminals_now` built WebView2 inline on workspace restore /
+  select project. That path is deferred too.
 - **An agent's `pkill` could kill every agent in every project** — tmux forks its server
   from the first client that needs one and the server keeps that client's command line.
   Since 0.0.9 made local panes default to tmux, that first client was a pane's

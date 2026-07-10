@@ -3783,8 +3783,35 @@ impl MuxelApp {
                             .instance(iid)
                             .and_then(|i| i.browser_url.clone())
                             .unwrap_or_else(|| "about:blank".to_string());
-                        let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
-                        self.browsers.insert(iid, view);
+                        // Defer WebView construction. Building WKWebView/WebView2
+                        // as a native child from inside restore / select_project /
+                        // the mouse path re-enters gpui while the App RefCell is
+                        // held and aborts with 0xc0000409 on Windows (same class
+                        // as open_link / multi-monitor open_window).
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            cx.defer_in(window, move |this, window, cx| {
+                                if this.browsers.contains_key(&iid)
+                                    || this.workspace.instance(iid).is_none()
+                                {
+                                    return;
+                                }
+                                let view = cx.new(|cx| {
+                                    crate::browser::BrowserView::new(url, window, cx)
+                                });
+                                this.browsers.insert(iid, view);
+                                if this.active_instance == Some(iid) {
+                                    this.focus_instance(iid, window, cx);
+                                }
+                                cx.notify();
+                            });
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            let view =
+                                cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                            self.browsers.insert(iid, view);
+                        }
                     }
                 }
             }
