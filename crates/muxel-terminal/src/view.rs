@@ -527,10 +527,15 @@ impl TerminalView {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let m = &event.keystroke.modifiers;
 
-        // Copy / paste. On macOS the platform shortcut is ⌘C / ⌘V; everywhere
-        // else it's ctrl-shift-c / ctrl-shift-v (plain ctrl-c must stay SIGINT).
-        // Plain Ctrl+V is *not* intercepted — falls through as C0 0x16 so agents
-        // (Grok) can read the OS clipboard for images. Claude Code uses Alt+V.
+        // Copy / paste. On macOS the platform shortcut is ⌘C / ⌘V; elsewhere
+        // ctrl-shift-c / ctrl-shift-v (plain ctrl-c must stay SIGINT).
+        //
+        // Plain Ctrl+V is host-side smart paste (Windows Terminal / VS Code
+        // style): text and file paths are injected into the PTY; an image
+        // forwards raw 0x16 so agents that read the OS clipboard (Grok) can
+        // attach it. Leaving Ctrl+V as bare 0x16 broke text paste in Claude —
+        // it does not host-paste on 0x16. Claude's image chord is Alt+V
+        // (ESC v via the keymap); we never intercept that.
         // Classic Insert: Ctrl+Insert = copy, Shift+Insert = paste.
         let key = event.keystroke.key.as_str();
         if key == "insert" || key == "ins" {
@@ -548,6 +553,14 @@ impl TerminalView {
                 cx.notify();
                 return;
             }
+        }
+        // Plain Ctrl+V — smart paste (see above). Must run before key_to_bytes
+        // would turn it into C0 0x16 unconditionally.
+        if key == "v" && m.control && !m.shift && !m.alt && !m.platform {
+            paste_clipboard_into_session(&self.session, cx);
+            self.session.clear_selection();
+            cx.notify();
+            return;
         }
         let copy_paste = (m.control && m.shift && !m.alt)
             || (cfg!(target_os = "macos") && m.platform && !m.control && !m.shift && !m.alt);

@@ -234,8 +234,10 @@ feature is added or changed, update the matching entry here in the same change**
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
   right-click copies the selection, or pastes when nothing is selected), a
   **right-click Copy/Paste menu**, or **copy on select** (selecting copies
-  immediately; right-click pastes). **Image paste**: plain `Ctrl+V` is left for
-  the agent (Grok); Claude Code on Windows uses `Alt+V` (sent as `ESC v`).
+  immediately; right-click pastes). **Paste**: plain `Ctrl+V` is host-side smart
+  paste — text and file paths go into the PTY; an image is forwarded as raw
+  Ctrl+V (`0x16`) so agents that read the OS clipboard (Grok) can attach it.
+  Claude Code on Windows uses `Alt+V` (sent as `ESC v`) for images.
   `Shift+Insert` pastes and `Ctrl+Insert` copies. File **drag-and-drop** pastes
   shell-quoted paths into the focused terminal.
 - **Scrollback** — history with a draggable overlay scrollbar; clear it via

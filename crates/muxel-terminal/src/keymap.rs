@@ -24,7 +24,9 @@ pub fn key_to_bytes(
     mods: &KeyModifiers,
     app_cursor_mode: bool,
 ) -> Option<Vec<u8>> {
-    // Ctrl+<letter> -> control character (Ctrl+V = 0x16 — Grok image paste).
+    // Ctrl+<letter> -> control character. (Plain Ctrl+V is intercepted in the
+    // view as smart host paste; 0x16 only reaches the PTY when the clipboard
+    // holds an image, via paste_clipboard_into_session.)
     if mods.control
         && !mods.shift
         && !mods.alt
