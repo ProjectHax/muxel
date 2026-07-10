@@ -225,6 +225,42 @@ impl Element for TerminalElement {
         let track_top = f32::from(bounds.origin.y);
         let track_h = f32::from(bounds.size.height);
 
+        // ---- File drag-and-drop: paste paths into the PTY ----
+        {
+            let session = self.session.clone();
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |e: &FileDropEvent, phase, window, _cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                match e {
+                    FileDropEvent::Entered { position, paths } => {
+                        if hitbox.is_hovered(window) || hitbox.contains(position) {
+                            session.set_pending_drop_paths(Some(paths.paths().to_vec()));
+                        } else {
+                            session.set_pending_drop_paths(None);
+                        }
+                    }
+                    FileDropEvent::Pending { position } => {
+                        if !hitbox.is_hovered(window) && !hitbox.contains(position) {
+                            session.set_pending_drop_paths(None);
+                        }
+                    }
+                    FileDropEvent::Submit { position } => {
+                        if hitbox.is_hovered(window) || hitbox.contains(position) {
+                            if let Some(paths) = session.take_pending_drop_paths() {
+                                session.paste_paths(&paths);
+                            }
+                        } else {
+                            session.set_pending_drop_paths(None);
+                        }
+                    }
+                    FileDropEvent::Exited => {
+                        session.set_pending_drop_paths(None);
+                    }
+                }
+            });
+        }
         // ---- Ctrl/Cmd+click: open the link (OSC 8 / URL / file path) under the
         // cursor. Dispatched as an action so the app decides where it opens
         // (built-in browser vs the OS).
@@ -464,16 +500,14 @@ impl Element for TerminalElement {
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
                             session.clear_selection();
                             window.refresh();
-                        } else if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                            session.paste(&text);
+                        } else {
+                            crate::view::paste_clipboard_into_session(&session, cx);
                         }
                     }
                     // The selection already auto-copied; right-click pastes and
                     // drops the (now stale) selection highlight.
                     TerminalMouseMode::CopyOnSelect => {
-                        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                            session.paste(&text);
-                        }
+                        crate::view::paste_clipboard_into_session(&session, cx);
                         if session.clear_selection() {
                             window.refresh();
                         }

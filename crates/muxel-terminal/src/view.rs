@@ -529,11 +529,30 @@ impl TerminalView {
 
         // Copy / paste. On macOS the platform shortcut is ⌘C / ⌘V; everywhere
         // else it's ctrl-shift-c / ctrl-shift-v (plain ctrl-c must stay SIGINT).
-        // macOS accepts the ctrl-shift combo too so muscle memory carries over.
+        // Plain Ctrl+V is *not* intercepted — falls through as C0 0x16 so agents
+        // (Grok) can read the OS clipboard for images. Claude Code uses Alt+V.
+        // Classic Insert: Ctrl+Insert = copy, Shift+Insert = paste.
+        let key = event.keystroke.key.as_str();
+        if key == "insert" || key == "ins" {
+            if m.control && !m.alt && !m.shift {
+                if let Some(text) = self.session.selection_to_string()
+                    && !text.is_empty()
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                return;
+            }
+            if m.shift && !m.control && !m.alt {
+                paste_clipboard_into_session(&self.session, cx);
+                self.session.clear_selection();
+                cx.notify();
+                return;
+            }
+        }
         let copy_paste = (m.control && m.shift && !m.alt)
             || (cfg!(target_os = "macos") && m.platform && !m.control && !m.shift && !m.alt);
         if copy_paste {
-            match event.keystroke.key.as_str() {
+            match key {
                 "c" => {
                     if let Some(text) = self.session.selection_to_string()
                         && !text.is_empty()
@@ -543,9 +562,7 @@ impl TerminalView {
                     return;
                 }
                 "v" => {
-                    if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                        self.session.paste(&text);
-                    }
+                    paste_clipboard_into_session(&self.session, cx);
                     self.session.clear_selection();
                     cx.notify();
                     return;
@@ -578,6 +595,34 @@ impl TerminalView {
                 cx.notify();
             }
         }
+    }
+}
+
+/// Paste from the system clipboard into the PTY.
+/// Image → forward Ctrl+V (0x16) so the agent reads the OS clipboard.
+/// File paths → shell-quoted paths. Text → bracketed paste.
+pub fn paste_clipboard_into_session(session: &TerminalSession, cx: &App) {
+    let Some(item) = cx.read_from_clipboard() else {
+        return;
+    };
+    for entry in item.entries() {
+        match entry {
+            ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
+                session.write_input(&[0x16]);
+                return;
+            }
+            ClipboardEntry::ExternalPaths(paths) => {
+                let paths: Vec<_> = paths.paths().to_vec();
+                if !paths.is_empty() {
+                    session.paste_paths(&paths);
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(text) = item.text() {
+        session.paste(&text);
     }
 }
 

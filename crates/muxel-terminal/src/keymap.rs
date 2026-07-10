@@ -24,7 +24,7 @@ pub fn key_to_bytes(
     mods: &KeyModifiers,
     app_cursor_mode: bool,
 ) -> Option<Vec<u8>> {
-    // Ctrl+<letter> -> control character.
+    // Ctrl+<letter> -> control character (Ctrl+V = 0x16 — Grok image paste).
     if mods.control
         && !mods.shift
         && !mods.alt
@@ -35,6 +35,18 @@ pub fn key_to_bytes(
     {
         let ctrl = (c.to_ascii_lowercase() as u8) - b'a' + 1;
         return Some(vec![ctrl]);
+    }
+
+    // Alt+letter → ESC + letter. Claude Code on Windows uses Alt+V for image
+    // paste; without this, Alt is dropped and the agent never sees the chord.
+    if mods.alt
+        && !mods.control
+        && !mods.platform
+        && key.len() == 1
+        && let Some(c) = key.chars().next()
+        && c.is_ascii_alphabetic()
+    {
+        return Some(vec![0x1b, c.to_ascii_lowercase() as u8]);
     }
 
     if key == "tab" {
@@ -101,10 +113,31 @@ pub fn key_to_bytes(
             }
             return Some(b"\x1b[F".to_vec());
         }
-        "pageup" => return Some(b"\x1b[5~".to_vec()),
-        "pagedown" => return Some(b"\x1b[6~".to_vec()),
-        "delete" => return Some(b"\x1b[3~".to_vec()),
-        "insert" => return Some(b"\x1b[2~".to_vec()),
+        "pageup" => {
+            if modifier_code > 1 {
+                return Some(format!("\x1b[5;{modifier_code}~").into_bytes());
+            }
+            return Some(b"\x1b[5~".to_vec());
+        }
+        "pagedown" => {
+            if modifier_code > 1 {
+                return Some(format!("\x1b[6;{modifier_code}~").into_bytes());
+            }
+            return Some(b"\x1b[6~".to_vec());
+        }
+        "delete" => {
+            if modifier_code > 1 {
+                return Some(format!("\x1b[3;{modifier_code}~").into_bytes());
+            }
+            return Some(b"\x1b[3~".to_vec());
+        }
+        // Plain Insert; Shift+Insert / Ctrl+Insert handled in the view (paste/copy).
+        "insert" => {
+            if modifier_code > 1 {
+                return Some(format!("\x1b[2;{modifier_code}~").into_bytes());
+            }
+            return Some(b"\x1b[2~".to_vec());
+        }
         "f1" => return Some(b"\x1bOP".to_vec()),
         "f2" => return Some(b"\x1bOQ".to_vec()),
         "f3" => return Some(b"\x1bOR".to_vec()),
@@ -125,4 +158,42 @@ pub fn key_to_bytes(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mods(shift: bool, alt: bool, control: bool) -> KeyModifiers {
+        KeyModifiers {
+            control,
+            shift,
+            alt,
+            platform: false,
+        }
+    }
+
+    #[test]
+    fn alt_v_is_esc_v() {
+        assert_eq!(
+            key_to_bytes("v", None, &mods(false, true, false), false),
+            Some(b"\x1bv".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_v_is_c0() {
+        assert_eq!(
+            key_to_bytes("v", None, &mods(false, false, true), false),
+            Some(vec![0x16])
+        );
+    }
+
+    #[test]
+    fn shift_insert_csi() {
+        assert_eq!(
+            key_to_bytes("insert", None, &mods(true, false, false), false),
+            Some(b"\x1b[2;2~".to_vec())
+        );
+    }
 }

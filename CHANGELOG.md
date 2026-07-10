@@ -13,6 +13,10 @@ All notable changes to muxel are documented here. This project adheres to
   sidebar state: hiding it in a project window no longer hides it in the main window.
 
 ### Fixed
+- **Terminal image paste and file drop** — Alt+letter is sent as ESC+letter so
+  Claude Code's Alt+V image paste works; clipboard paste understands images
+  (forwards Ctrl+V to the agent) and file paths; drag-and-drop pastes quoted
+  paths into the focused terminal; Shift+Insert pastes and Ctrl+Insert copies.
 - **An agent's `pkill` could kill every agent in every project** — tmux forks its server
   from the first client that needs one and the server keeps that client's command line.
   Since 0.0.9 made local panes default to tmux, that first client was a pane's

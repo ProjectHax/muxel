@@ -277,9 +277,7 @@ fn terminal_pane_element(view: &Entity<TerminalView>, cx: &App) -> AnyElement {
             .item(PopupMenuItem::new(t("Paste")).on_click(window.listener_for(
                 &view,
                 |this, _e, _w, cx| {
-                    if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                        this.session().paste(&text);
-                    }
+                    muxel_terminal::paste_clipboard_into_session(this.session(), cx);
                 },
             )))
         })
