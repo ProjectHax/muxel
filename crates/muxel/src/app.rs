@@ -6263,9 +6263,33 @@ impl MuxelApp {
                 }
             }
         }
-        let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
-        self.browsers.insert(iid, view);
-        self.focus_instance(iid, window, cx);
+        // Defer WebView construction. Building a native child from inside an
+        // update re-enters gpui under a held App RefCell (0xc0000409 on Windows).
+        // Tab focus is applied immediately; keyboard focus lands once the view
+        // exists.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let view_url = url;
+            self.focus_instance(iid, window, cx);
+            cx.defer_in(window, move |this, window, cx| {
+                if this.browsers.contains_key(&iid) || this.workspace.instance(iid).is_none() {
+                    return;
+                }
+                let view =
+                    cx.new(|cx| crate::browser::BrowserView::new(view_url, window, cx));
+                this.browsers.insert(iid, view);
+                if this.active_instance == Some(iid) {
+                    this.focus_instance(iid, window, cx);
+                }
+                cx.notify();
+            });
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+            self.browsers.insert(iid, view);
+            self.focus_instance(iid, window, cx);
+        }
         self.persist();
         cx.notify();
         Some(iid)
