@@ -235,6 +235,11 @@ feature is added or changed, update the matching entry here in the same change**
   right-click copies the selection, or pastes when nothing is selected), a
   **right-click Copy/Paste menu**, or **copy on select** (selecting copies
   immediately; right-click pastes).
+- **Mouse reporting** — when an app enables mouse mode (Grok, Claude, vim, …),
+  clicks, drags, and motion are forwarded as SGR/X10 mouse events so the app can
+  focus its prompt, scroll its own pane, set the cursor, etc. Hold **Shift** to
+  force local text selection instead. The wheel already forwarded to mouse-aware
+  apps; button reports complete that path.
 - **Scrollback** — history with a draggable overlay scrollbar; clear it via
   `Ctrl+Shift+K` or the tab's "Clear scrollback" menu item. The mouse wheel
   scrolls history, or — for full-screen apps that enable mouse reporting

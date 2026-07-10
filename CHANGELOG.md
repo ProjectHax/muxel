@@ -13,6 +13,11 @@ All notable changes to muxel are documented here. This project adheres to
   sidebar state: hiding it in a project window no longer hides it in the main window.
 
 ### Fixed
+- **Terminal mouse reporting for agent TUIs** — when an app enables mouse mode
+  (Grok, Claude, vim, …), clicks, drags, and motion are forwarded as SGR/X10
+  events so the app receives them (focus the prompt, scroll its own content).
+  Hold Shift for local text selection. Wheel reporting was already present;
+  button press/release and motion complete it.
 - **An agent's `pkill` could kill every agent in every project** — tmux forks its server
   from the first client that needs one and the server keeps that client's command line.
   Since 0.0.9 made local panes default to tmux, that first client was a pane's
