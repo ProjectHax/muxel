@@ -72,12 +72,15 @@ feature is added or changed, update the matching entry here in the same change**
   to a shell showing the underlying error instead of crashing. If even the
   fallback shell can't start, the pane shows the failure in place (the toolbar
   Restart retries) and the error lands in the NOTIFICATIONS feed.
-- **Session resume** — resume-capable agents (Claude and Grok out of the box) get a
-  stable per-pane session id: muxel launches with `--session-id` the first time and
-  `--resume` on restart, so a pane reopens its previous conversation instead of
-  starting fresh. If the saved session is gone, it quietly starts a new one in the
-  same slot. Configurable per preset (`session_id_flag` / `resume_flag`), so other
-  agents can opt in.
+- **Session resume** — resume-capable agents reopen their prior conversation after
+  a muxel restart. Two shapes, both configurable per preset:
+  - **Host-minted** (Claude, Grok): `session_id_flag` + `resume_flag` — muxel
+    launches with `--session-id` the first time and `--resume` on restart.
+  - **Agent-minted** (Codex): only `resume_flag` (`resume`) — first launch is bare;
+    before restart muxel reads the real id from `~/.codex/sessions` (matched by
+    project cwd) and relaunches as `codex resume <id>`. One Codex pane per project
+    is the reliable shape (same-cwd multi-pane can race on "latest").
+  If the saved session is gone, the pane quietly starts fresh.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Shared project memory** — opt-in per project: agents are told (via their system

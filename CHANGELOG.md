@@ -10,6 +10,11 @@ All notable changes to muxel are documented here. This project adheres to
   `--resume` like Claude, so a Grok pane reopens its prior conversation after a
   muxel restart. Existing Grok presets pick up the flags on seed upgrade (unless
   you already set your own).
+- **Codex preset + session resume** — built-in Codex agent preset. Codex mints its
+  own session id (no create-time flag), so muxel starts bare, then on restart
+  captures the latest `~/.codex/sessions` rollout for the project cwd and launches
+  `codex resume <id>`. Resume support now allows `resume_flag` without
+  `session_id_flag` for agent-minted CLIs.
 
 ### Changed
 - **Popped-out project windows open with the sidebar hidden** — the window exists to

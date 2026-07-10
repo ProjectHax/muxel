@@ -81,12 +81,15 @@ pub struct AgentPreset {
     #[serde(default)]
     pub startup_delay_ms: u32,
     /// CLI flag that starts a conversation with a chosen session ID (e.g. Claude's
-    /// `--session-id <uuid>`). Paired with `resume_flag`, it lets muxel give each
-    /// pane a stable session and resume it on restart. `None` = no resume support.
+    /// `--session-id <uuid>`). When set with [`Self::resume_flag`], muxel mints a
+    /// stable id per pane and passes it on first launch. When `None` but
+    /// `resume_flag` is set (e.g. Codex), the agent mints its own id and muxel
+    /// captures it from disk before the next resume. `None` + no `resume_flag`
+    /// = no resume support.
     #[serde(default)]
     pub session_id_flag: Option<String>,
-    /// CLI flag that resumes a conversation by session ID (e.g. Claude's
-    /// `--resume <uuid>`). Only meaningful alongside `session_id_flag`.
+    /// CLI flag or subcommand that resumes a conversation by session ID (e.g.
+    /// Claude's `--resume`, Codex's `resume`). Required for resume support.
     #[serde(default)]
     pub resume_flag: Option<String>,
 }
@@ -335,6 +338,31 @@ impl AgentPreset {
         }
     }
 
+    /// OpenAI's Codex CLI (`codex`). Codex mints its own session UUID (no
+    /// `--session-id` on create); resume is the subcommand `codex resume <id>`.
+    /// muxel captures the real id from `~/.codex/sessions` before restarting.
+    pub fn codex() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: "Codex".to_string(),
+            program: Some("codex".to_string()),
+            model: None,
+            model_flag: default_model_flag(),
+            effort: None,
+            effort_flag: None,
+            args: Vec::new(),
+            system_prompt: None,
+            injection: InjectionMode::TypeIn,
+            env: Vec::new(),
+            working_markers: Vec::new(),
+            blocked_markers: Vec::new(),
+            startup_delay_ms: 0,
+            // Agent-owned id: leave session_id_flag unset; resume is a subcommand.
+            session_id_flag: None,
+            resume_flag: Some("resume".to_string()),
+        }
+    }
+
     pub fn defaults() -> Vec<AgentPreset> {
         let mut presets = vec![Self::shell()];
         // On Windows, offer cmd.exe alongside the PowerShell default.
@@ -345,6 +373,7 @@ impl AgentPreset {
             Self::opencode(),
             Self::amp(),
             Self::grok(),
+            Self::codex(),
             Self::hermes(),
             Self::ollama(),
             Self::ollama_code(),
@@ -426,26 +455,27 @@ pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
 
 /// The CLI arguments to start or resume a session for a resume-capable agent.
 ///
-/// `None` when the preset has no resume support (`session_id_flag` / `resume_flag`
-/// unset) or the instance has no session id yet. Returns `[session_id_flag, id]` on
-/// the very first launch (creating the session with the pane's chosen id), then
-/// `[resume_flag, id]` on every later launch. Keying off `session_started` rather
-/// than probing the agent's on-disk session avoids a flush race: the session file
-/// may not be visible yet right after a restart, which would wrongly force a fresh
-/// `--session-id` and collide with the still-existing session ("id already in
-/// use"). When the session was genuinely deleted, the caller probes the disk and
-/// restarts with a *fresh* id (so there's no collision — see [`claude_session_path`]),
-/// and the runtime recovery catches any resume that still slips through and hangs.
+/// Resume support requires [`AgentPreset::resume_flag`]. Two shapes:
+///
+/// - **Host-minted** (`session_id_flag` set, e.g. Claude): first launch returns
+///   `[session_id_flag, id]`; later launches return `[resume_flag, id]`.
+/// - **Agent-minted** (`session_id_flag` unset, e.g. Codex): first launch returns
+///   `None` (bare start — the agent creates its own id); later launches return
+///   `[resume_flag, id]` once the caller has captured the real id.
+///
+/// Keying off `session_started` rather than probing the agent's on-disk session
+/// avoids a flush race for host-minted agents. When a session was genuinely
+/// deleted, the caller probes the disk and restarts cleanly.
 pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<Vec<String>> {
-    let id_flag = preset.session_id_flag.as_deref()?;
     let resume_flag = preset.resume_flag.as_deref()?;
+    if instance.session_started {
+        let id = instance.session_id.as_deref()?;
+        return Some(vec![resume_flag.to_string(), id.to_string()]);
+    }
+    // First launch: only host-minted agents pass an id flag.
+    let id_flag = preset.session_id_flag.as_deref()?;
     let id = instance.session_id.as_deref()?;
-    let flag = if instance.session_started {
-        resume_flag
-    } else {
-        id_flag
-    };
-    Some(vec![flag.to_string(), id.to_string()])
+    Some(vec![id_flag.to_string(), id.to_string()])
 }
 
 /// Path to Claude's on-disk session transcript for an agent running in `cwd`:
@@ -465,6 +495,115 @@ pub fn claude_session_path(home: &Path, cwd: &Path, session_id: &str) -> PathBuf
         .join("projects")
         .join(slug)
         .join(format!("{session_id}.jsonl"))
+}
+
+/// Whether any Codex rollout under `~/.codex/sessions` carries `session_id`.
+/// Used to decide if a stored id is still resumable before `codex resume <id>`.
+pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
+    let root = home.join(".codex").join("sessions");
+    if !root.is_dir() {
+        return false;
+    }
+    let mut found = false;
+    walk_jsonl(&root, &mut |path| {
+        if found {
+            return;
+        }
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(session_id))
+        {
+            found = true;
+            return;
+        }
+        if let Some((id, _)) = codex_session_meta(path) {
+            if id == session_id {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// Most recently modified Codex session id whose `session_meta.cwd` matches `cwd`.
+///
+/// Codex mints its own UUID on first launch (no host-side `--session-id`), so on
+/// restart muxel adopts the latest rollout for this working directory. Multiple
+/// concurrent Codex panes in the *same* cwd may collide on that heuristic — keep
+/// one Codex pane per project for reliable autoresume.
+pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
+    let root = home.join(".codex").join("sessions");
+    if !root.is_dir() {
+        return None;
+    }
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    walk_jsonl(&root, &mut |path| {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        let Ok(mtime) = meta.modified() else {
+            return;
+        };
+        let Some((id, session_cwd)) = codex_session_meta(path) else {
+            return;
+        };
+        if !paths_loosely_equal(Path::new(&session_cwd), cwd) {
+            return;
+        }
+        if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
+            best = Some((mtime, id));
+        }
+    });
+    best.map(|(_, id)| id)
+}
+
+fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_jsonl(&path, visit);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            visit(&path);
+        }
+    }
+}
+
+/// First `session_meta` line in a Codex rollout → `(session_id, cwd)`.
+fn codex_session_meta(path: &Path) -> Option<(String, String)> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(8) {
+        let line = line.ok()?;
+        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+        if v.get("type")?.as_str()? != "session_meta" {
+            continue;
+        }
+        let payload = v.get("payload")?;
+        let id = payload
+            .get("session_id")
+            .or_else(|| payload.get("id"))?
+            .as_str()?
+            .to_string();
+        let cwd = payload.get("cwd")?.as_str()?.to_string();
+        return Some((id, cwd));
+    }
+    None
+}
+
+fn paths_loosely_equal(a: &Path, b: &Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+        return ca == cb;
+    }
+    fn norm(p: &Path) -> String {
+        let s = p.to_string_lossy();
+        let s = s.replace('/', "\\");
+        s.trim_end_matches(['\\', '/']).to_ascii_lowercase()
+    }
+    norm(a) == norm(b)
 }
 
 /// Directory (under the project root) holding muxel's per-project files.
@@ -607,6 +746,79 @@ mod tests {
         s.session_id = Some("abc".to_string());
         s.session_started = true;
         assert_eq!(session_resume_args(&shell, &s), None);
+    }
+
+    #[test]
+    fn codex_preset_is_agent_minted_resume() {
+        let c = AgentPreset::codex();
+        assert_eq!(c.program.as_deref(), Some("codex"));
+        assert!(c.session_id_flag.is_none());
+        assert_eq!(c.resume_flag.as_deref(), Some("resume"));
+        let mut inst = instance(&c, None);
+        // First launch: bare — Codex mints its own id.
+        assert_eq!(session_resume_args(&c, &inst), None);
+        // After capture: resume subcommand + id.
+        inst.session_id = Some("abc".to_string());
+        inst.session_started = true;
+        assert_eq!(
+            session_resume_args(&c, &inst),
+            Some(vec!["resume".to_string(), "abc".to_string()])
+        );
+    }
+
+    #[test]
+    fn codex_latest_session_id_picks_matching_cwd() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("muxel-codex-test-{}", Uuid::new_v4()));
+        let day = tmp.join(".codex").join("sessions").join("2026").join("07").join("09");
+        std::fs::create_dir_all(&day).unwrap();
+        let cwd = if cfg!(windows) {
+            PathBuf::from(r"D:\dev\proj")
+        } else {
+            PathBuf::from("/home/u/proj")
+        };
+        let other = if cfg!(windows) {
+            PathBuf::from(r"D:\other")
+        } else {
+            PathBuf::from("/home/u/other")
+        };
+        // Older matching session.
+        let older = day.join("rollout-old-aaaa.jsonl");
+        let mut f = std::fs::File::create(&older).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"session_meta","payload":{{"session_id":"id-old","cwd":"{}"}}}}"#,
+            cwd.display().to_string().replace('\\', "\\\\")
+        )
+        .unwrap();
+        // Newer matching session.
+        let newer = day.join("rollout-new-bbbb.jsonl");
+        // Ensure newer mtime.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut f = std::fs::File::create(&newer).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"session_meta","payload":{{"session_id":"id-new","cwd":"{}"}}}}"#,
+            cwd.display().to_string().replace('\\', "\\\\")
+        )
+        .unwrap();
+        // Different cwd — ignored.
+        let distractor = day.join("rollout-other-cccc.jsonl");
+        let mut f = std::fs::File::create(&distractor).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"session_meta","payload":{{"session_id":"id-other","cwd":"{}"}}}}"#,
+            other.display().to_string().replace('\\', "\\\\")
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_latest_session_id(&tmp, &cwd).as_deref(),
+            Some("id-new")
+        );
+        assert!(codex_session_exists(&tmp, "id-new"));
+        assert!(!codex_session_exists(&tmp, "missing"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
