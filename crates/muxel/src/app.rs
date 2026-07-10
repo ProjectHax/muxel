@@ -6394,6 +6394,15 @@ impl MuxelApp {
                 PaneNode::Leaf(ld) => {
                     // Mirror render_pane: a pane holding the focused instance
                     // shows it; others show their own saved active tab.
+                    //
+                    // Also mirror its empty-leaf guard. `pane.rs` prunes an
+                    // emptied leaf in the same mutation and `LeafData` refuses to
+                    // deserialize `"tabs": []`, so this should be unreachable —
+                    // but this walk runs every frame, so an index panic here
+                    // would take the whole UI down.
+                    if ld.tabs.is_empty() {
+                        return;
+                    }
                     let leaf_active = ld.active.min(ld.tabs.len().saturating_sub(1));
                     let iid = match active_instance {
                         Some(a) if ld.tabs.contains(&a) => a,
