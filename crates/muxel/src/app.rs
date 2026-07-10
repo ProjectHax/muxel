@@ -6160,17 +6160,28 @@ impl MuxelApp {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            if self
-                .open_browser_at(url.to_string(), self.active_instance, window, cx)
-                .is_none()
-            {
-                cx.open_url(url);
-            }
+            // Defer WebView2 construction. Building a native child webview from
+            // inside the mouse-down / action path re-enters gpui while the App
+            // RefCell is still held and has aborted with 0xc0000409 (stack/
+            // fast-fail) on Windows when a second link is opened. Same class of
+            // bug as multi-monitor `open_window` — run after this update ends.
+            let url = url.to_string();
+            let target = self.active_instance;
+            cx.defer_in(window, move |this, window, cx| {
+                if this
+                    .open_browser_at(url.clone(), target, window, cx)
+                    .is_none()
+                {
+                    cx.open_url(&url);
+                }
+            });
         }
     }
 
     /// Open the embedded browser pane on `url` in the active project, splitting
     /// beside `target` (or seeding an empty project). Returns the instance id.
+    /// Reuses an existing browser pane in the project when one is already open
+    /// (navigates it instead of spawning another WebView2).
     /// (Linux routes links to the separate browser window instead; restored
     /// cross-platform browser panes go through spawn_project_terminals_now.)
     #[cfg(not(target_os = "linux"))]
@@ -6182,6 +6193,27 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
         let pid = self.workspace.active_project?;
+        // Prefer navigating an existing browser in this project — avoids
+        // stacking WebView2 children and matches "open this URL" intent.
+        if let Some(iid) = self
+            .workspace
+            .project(pid)
+            .map(|p| p.instances())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|iid| self.browsers.contains_key(iid))
+        {
+            if let Some(view) = self.browsers.get(&iid).cloned() {
+                view.update(cx, |v, cx| v.navigate(&url, cx));
+            }
+            if let Some(inst) = self.workspace.instance_mut(iid) {
+                inst.browser_url = Some(url);
+            }
+            self.focus_instance(iid, window, cx);
+            self.persist();
+            cx.notify();
+            return Some(iid);
+        }
         let instance = Instance::browser(pid, url.clone());
         let iid = instance.id;
         let empty = self.workspace.project(pid).is_some_and(|p| p.is_empty());

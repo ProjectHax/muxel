@@ -13,6 +13,11 @@ All notable changes to muxel are documented here. This project adheres to
   sidebar state: hiding it in a project window no longer hides it in the main window.
 
 ### Fixed
+- **Ctrl+click a second terminal URL crashed on Windows** — building WebView2 as a
+  native child from inside the mouse-down / action path re-entered gpui and
+  aborted with `0xc0000409`. Browser opens are deferred until after the update,
+  and a project reuses its existing browser pane (navigate) instead of stacking
+  another WebView2.
 - **An agent's `pkill` could kill every agent in every project** — tmux forks its server
   from the first client that needs one and the server keeps that client's command line.
   Since 0.0.9 made local panes default to tmux, that first client was a pane's
