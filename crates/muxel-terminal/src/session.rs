@@ -368,14 +368,20 @@ impl TerminalSession {
     }
 
     /// Paste filesystem paths into the PTY (drag-drop / clipboard files).
+    ///
+    /// Paths are shell-quoted so a crafted filename can't inject shell code: a
+    /// file literally named `$(rm -rf ~).txt` must land in the input as one inert
+    /// argument, not run when the user hits Enter. `{:?}` (Rust `Debug`) is *not*
+    /// shell quoting — it leaves `$`, backticks, and `$(…)` live inside its double
+    /// quotes — so Unix uses POSIX single-quote escaping (`sh_quote`).
     pub fn paste_paths(&self, paths: &[std::path::PathBuf]) {
         if paths.is_empty() {
             return;
         }
         let mut text = String::new();
         for path in paths {
-            use std::fmt::Write as _;
-            let _ = write!(text, " {path:?}");
+            text.push(' ');
+            text.push_str(&quote_path_for_shell(&path.to_string_lossy()));
         }
         text.push(' ');
         self.paste(&text);
@@ -766,6 +772,24 @@ impl TerminalSession {
     }
 }
 
+/// Quote a filesystem path so pasting it into the PTY's shell/agent can't inject
+/// commands. On Unix this is POSIX single-quote escaping (`sh_quote`), which
+/// neutralizes every metacharacter (`$`, backticks, `;`, spaces, …). On Windows
+/// the child may be cmd.exe or PowerShell, whose quoting differs from POSIX, so
+/// the original double-quoted form is kept for now — a crafted name with
+/// `& | ^ %` or an embedded `"` remains a gap to close alongside the Windows
+/// spawn work (see PR #4).
+#[cfg(unix)]
+fn quote_path_for_shell(path: &str) -> String {
+    muxel_core::ssh::sh_quote(path)
+}
+
+#[cfg(not(unix))]
+fn quote_path_for_shell(path: &str) -> String {
+    // TODO(windows): cmd.exe / PowerShell need dedicated escaping.
+    format!("{path:?}")
+}
+
 /// Append one mouse-wheel report — button 64 (scroll up) / 65 (scroll down) — at
 /// the 0-based cell (`col`, `row`), in SGR (1006) or legacy X10 encoding. Wheel
 /// events are press-only (no release), so the SGR form always ends in `M`.
@@ -1007,6 +1031,24 @@ mod tests {
     use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::index::{Column, Line, Point as GridPoint};
     use std::time::{Duration, Instant};
+
+    /// A dropped/pasted filename must be shell-quoted so it lands as an inert
+    /// argument and can't run when the user hits Enter. Regression for the
+    /// `{:?}` (Debug, not shell) quoting that left `$(…)`/backticks live.
+    #[test]
+    fn paste_paths_quoting_blocks_injection() {
+        // Command-substitution payload → wrapped whole, nothing executes.
+        assert_eq!(
+            quote_path_for_shell("/tmp/$(touch pwned).txt"),
+            "'/tmp/$(touch pwned).txt'"
+        );
+        // Backtick payload → likewise inert.
+        assert_eq!(quote_path_for_shell("`id`.txt"), "'`id`.txt'");
+        // Embedded single quote is escaped, not left to close the quote early.
+        assert_eq!(quote_path_for_shell("a'b"), "'a'\\''b'");
+        // Ordinary paths pass through unwrapped (sh_quote fast path).
+        assert_eq!(quote_path_for_shell("/home/u/file.txt"), "/home/u/file.txt");
+    }
 
     /// End-to-end check of the backend: spawn a process, drain its PTY output
     /// through the VTE parser, and confirm the text lands in the emulator grid.

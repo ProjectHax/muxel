@@ -18,6 +18,7 @@ parking_lot = "0.12"
 async-channel = "2.3"
 libc = "0.2"
 
+muxel-core.workspace = true
 anyhow.workspace = true
 log.workspace = true
 uuid.workspace = true

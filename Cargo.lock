@@ -4684,6 +4684,7 @@ dependencies = [
  "gpui",
  "libc",
  "log",
+ "muxel-core",
  "parking_lot",
  "portable-pty",
  "uuid",
