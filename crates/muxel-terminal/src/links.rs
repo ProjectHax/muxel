@@ -148,6 +148,14 @@ pub fn path_span_at(line: &[char], col: usize) -> Option<(usize, usize, String)>
 /// `home` (for `~`). `None` when the needed base is unavailable — e.g. a remote
 /// pane with no local cwd.
 pub fn resolve_path(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    // Refuse UNC / network paths (`\\host\share\…`, `//host/share/…`). Probing
+    // one with `exists()` — which link detection does on a mere Ctrl-hover — makes
+    // Windows perform an SMB authentication to the named host, a well-known way to
+    // capture a user's NetNTLM hash. A malicious repo could print such a string to
+    // a build log; it must never become a clickable/probed link.
+    if raw.starts_with("\\\\") || raw.starts_with("//") {
+        return None;
+    }
     if let Some(rest) = raw.strip_prefix("~/") {
         return home.map(|h| h.join(rest));
     }
@@ -376,6 +384,22 @@ mod tests {
         // Relative with no cwd (e.g. a remote pane) → unresolvable.
         assert_eq!(resolve_path("src/x.rs", None, Some(home)), None);
         assert_eq!(resolve_path("~/y", Some(cwd), None), None);
+    }
+
+    #[test]
+    fn resolve_path_refuses_unc_network_paths() {
+        let cwd = Path::new("/work/proj");
+        let home = Path::new("/home/u");
+        // UNC / network paths must not resolve — an exists() probe on Windows
+        // would trigger SMB auth to the host (NetNTLM-hash capture vector).
+        assert_eq!(
+            resolve_path(r"\\attacker.example.com\share\x", Some(cwd), Some(home)),
+            None
+        );
+        assert_eq!(
+            resolve_path("//attacker.example.com/share/x", Some(cwd), Some(home)),
+            None
+        );
     }
 
     #[test]

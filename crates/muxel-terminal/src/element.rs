@@ -885,6 +885,12 @@ fn link_at(
     session.with_term(|term| {
         let grid = term.grid();
         let off = grid.display_offset() as i32;
+        // Clamp against the LIVE grid. `cols`/`rows` may be a stale cached
+        // `PointerHit` — Ctrl pressed without a mouse move after the pane resized
+        // — and `grid[point]` below is a raw `Vec` index that panics if the
+        // cached width exceeds the current grid.
+        let cols = cols.min(grid.columns() as u16);
+        let rows = rows.min(grid.screen_lines() as u16);
         let (point, _side) = grid_point(local, cell_width, line_height, cols, rows, off);
         let columns = grid.columns();
 
