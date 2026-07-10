@@ -678,6 +678,13 @@ impl Render for TerminalView {
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .on_key_down(cx.listener(Self::on_key_down))
+            // OS file drops (Explorer → pane) arrive as an internal gpui drag of
+            // ExternalPaths, not as FileDropEvent listeners. Same path Zed uses.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                this.session.paste_paths(paths.paths());
+                this.session.clear_selection();
+                cx.notify();
+            }))
             .size_full()
             // Fill the inset margin with the terminal background and inset the
             // element so the grid (sized from the inner area) never butts against

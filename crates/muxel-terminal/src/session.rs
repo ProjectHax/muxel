@@ -212,8 +212,6 @@ pub struct TerminalSession {
     /// The link span under a ctrl+hover, if any; the element paints an underline
     /// over it and shows a pointing-hand cursor (mirrors the `search` pattern).
     hovered_link: Mutex<Option<HoveredLink>>,
-    /// Paths from a FileDrop Entered event, pending Submit.
-    pending_drop_paths: Mutex<Option<Vec<std::path::PathBuf>>>,
     /// When output was last processed (for idle/status detection).
     last_output: Mutex<Instant>,
     /// Whether the child has produced any output yet (vs. still starting up).
@@ -327,7 +325,6 @@ impl TerminalSession {
             search: Mutex::new(Vec::new()),
             cwd,
             hovered_link: Mutex::new(None),
-            pending_drop_paths: Mutex::new(None),
             last_output: Mutex::new(Instant::now()),
             output_seen: AtomicBool::new(false),
             _reader: reader_handle,
@@ -382,14 +379,6 @@ impl TerminalSession {
         }
         text.push(' ');
         self.paste(&text);
-    }
-
-    pub(crate) fn set_pending_drop_paths(&self, paths: Option<Vec<std::path::PathBuf>>) {
-        *self.pending_drop_paths.lock() = paths;
-    }
-
-    pub(crate) fn take_pending_drop_paths(&self) -> Option<Vec<std::path::PathBuf>> {
-        self.pending_drop_paths.lock().take()
     }
 
     /// Write bytes to the PTY without touching the scroll position (used for
