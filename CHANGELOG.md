@@ -3,7 +3,7 @@
 All notable changes to muxel are documented here. This project adheres to
 [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.1.0] — 2026-07-10
 
 ### Added
 - **Grok session resume** — the built-in Grok preset now sets `--session-id` /
