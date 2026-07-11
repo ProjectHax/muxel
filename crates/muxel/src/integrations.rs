@@ -24,6 +24,74 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     cmd
 }
 
+/// Reap stale muxel AppImage squashfuse mounts left in `$TMPDIR` by prior
+/// instances that were SIGKILLed or crashed before the AppImage runtime could
+/// unmount them. Once such a mount goes dead (`statfs` → `ENOTCONN`), any
+/// filesystem scan — `df`, which some desktop system monitors run every ~60s —
+/// stalls in the kernel FUSE layer on it, which on Wayland surfaces as a
+/// periodic cursor stutter that worsens as more leftovers pile up. muxel can't
+/// catch SIGKILL, so it cleans up on the next launch.
+///
+/// Best-effort and fully detached: runs on a background thread so a hung probe
+/// can never block startup; unmounts only mounts that fail a liveness probe (a
+/// live one belongs to another running muxel instance) and never our own.
+#[cfg(target_os = "linux")]
+pub fn reap_stale_appimage_mounts() {
+    let _ = std::thread::Builder::new()
+        .name("muxel-reap-mounts".into())
+        .spawn(|| {
+            let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+                return;
+            };
+            let self_appdir = std::env::var("APPDIR").ok();
+            let candidates =
+                muxel_core::foreign_muxel_appimage_mounts(&mounts, self_appdir.as_deref());
+
+            let mut reaped = 0usize;
+            for mp in candidates {
+                // A live mount lists instantly; only reap the dead ones.
+                if fuse_mount_is_live(&mp) {
+                    continue;
+                }
+                if lazy_unmount_fuse(&mp) {
+                    reaped += 1;
+                }
+            }
+            if reaped > 0 {
+                muxel_store::append_event_log(&format!("reaped {reaped} stale AppImage mount(s)"));
+            }
+        });
+}
+
+/// Probe a FUSE mountpoint for liveness. A dead squashfuse mount fails to open
+/// or list (`ENOTCONN`); a live one lists instantly. Any error counts as dead —
+/// the mount is unusable either way, and the caller only lazy-unmounts, which is
+/// safe even if the probe is wrong.
+#[cfg(target_os = "linux")]
+fn fuse_mount_is_live(mountpoint: &str) -> bool {
+    match std::fs::read_dir(mountpoint) {
+        // `opendir` succeeded but the first `readdir` may still surface ENOTCONN.
+        Ok(mut entries) => !matches!(entries.next(), Some(Err(_))),
+        Err(_) => false,
+    }
+}
+
+/// Lazily unmount a FUSE mountpoint via the user-space `fusermount` helper: it
+/// works without root for the mount's owner, and `-z` detaches even a busy or
+/// unresponsive mount (a plain unmount fails `EBUSY` on a mount something still
+/// references). Returns whether a helper reported success.
+#[cfg(target_os = "linux")]
+fn lazy_unmount_fuse(mountpoint: &str) -> bool {
+    ["fusermount3", "fusermount"].into_iter().any(|bin| {
+        command(bin)
+            .args(["-u", "-z", mountpoint])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
 /// A remote git location: the host + the repo path on it + the shared
 /// ControlMaster socket + (optional) password for password auth.
 pub struct RemoteConn {

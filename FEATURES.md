@@ -559,6 +559,13 @@ feature is added or changed, update the matching entry here in the same change**
   Windows (x86_64 + arm64).
 - **Desktop integration** — app icon and a `.desktop` launcher entry (also the
   notification icon).
+- **Linux: self-cleaning AppImage mounts** — a muxel instance run from an
+  AppImage that crashes or is SIGKILLed can't unmount its squashfuse mount, and a
+  dead leftover mount makes any filesystem scan (a desktop monitor's periodic
+  `df`) stall in the kernel FUSE layer — a periodic Wayland cursor stutter that
+  worsens the longer the machine is up. On launch muxel reaps such dead
+  `/tmp/.mount_muxel-*` leftovers (leaving live mounts from other running
+  instances alone), so they can't accumulate.
 - **In-app updates** — check for and apply updates from within the app: it
   fetches the latest GitHub Release and self-replaces in place (the AppImage, the
   portable binary, the Windows `.exe`, or the macOS `.app`), then relaunches;

@@ -3,6 +3,7 @@
 //! unit-tested so the GPUI app and persistence layer can build on it.
 
 mod agent;
+mod appimage;
 pub mod diff;
 mod gui_path;
 pub mod memory;
@@ -19,6 +20,7 @@ pub use agent::{
     claude_session_path, codex_latest_session_id, codex_session_exists, memory_header,
     memory_instruction, memory_reference, resolve_launch, session_resume_args,
 };
+pub use appimage::foreign_muxel_appimage_mounts;
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
 pub use pane::{

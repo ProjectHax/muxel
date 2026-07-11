@@ -107,6 +107,16 @@ fn main() {
         }
     }
 
+    // Reap stale muxel AppImage squashfuse mounts left in /tmp by prior instances
+    // that crashed or were SIGKILLed before the runtime could unmount them —
+    // otherwise a dead mount makes filesystem scans (e.g. a desktop monitor's
+    // `df`) stall in the kernel FUSE layer and shows up as a periodic cursor
+    // stutter on Wayland. Detached, so it never blocks startup. Must follow the
+    // `set_var` blocks above: it spawns a thread, and `set_var` needs the process
+    // still single-threaded.
+    #[cfg(target_os = "linux")]
+    integrations::reap_stale_appimage_mounts();
+
     gpui_platform::application()
         // Serves muxel's agent icons + gpui-component's bundled SVG icons.
         .with_assets(AppAssets)
