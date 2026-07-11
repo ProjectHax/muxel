@@ -6,6 +6,11 @@ All notable changes to muxel are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- **Splitting a tab out into its own pane didn't work on its own pane** — dragging
+  a tab onto a pane edge pulls it out into a new split, but doing so on the tab's
+  *own* pane was a no-op when the tab was the pane's first one (the drop anchor is
+  the first tab, and moving a tab beside itself bailed out). It now splits the tab
+  out beside its siblings, so you can peel any tab off into a new pane in place.
 - **Dictation on a Mac with no microphone reported "microphone error: query
   default input config"** — on a machine with no audio input (a Mac mini or Mac
   Studio with nothing plugged in), CoreAudio still answers the default-input-device

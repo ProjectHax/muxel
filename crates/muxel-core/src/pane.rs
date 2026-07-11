@@ -579,38 +579,43 @@ pub fn move_into_split(
     direction: SplitDirection,
     before: bool,
 ) -> bool {
-    if dragged == target {
-        return false;
-    }
     let (Some(pd), Some(pt)) = (
         tree.as_ref().and_then(|r| r.find_path(dragged)),
         tree.as_ref().and_then(|r| r.find_path(target)),
     ) else {
         return false;
     };
-    // Same leaf: only valid when there are ≥2 tabs (target survives the remove).
-    // A sole-tab leaf is already its own pane, so there's nothing to do.
-    if pd == pt {
-        let sole = tree
+    // Which pane the new split sits beside. When the tab is dropped on its OWN
+    // pane (same leaf) — including onto itself, e.g. dragging the pane's first
+    // tab, which is the drop anchor — split it out beside a *sibling* tab that
+    // survives the removal. A sole-tab leaf is already its own pane → no-op.
+    let split_anchor = if pd == pt {
+        let Some((tabs, _)) = tree
             .as_ref()
             .and_then(|r| r.get_at_path(&pd))
             .and_then(|n| n.tabs())
-            .map(|(tabs, _)| tabs.len() == 1)
-            .unwrap_or(true);
-        if sole {
+        else {
             return false;
-        }
-    }
+        };
+        let Some(sibling) = tabs.iter().copied().find(|t| *t != dragged) else {
+            return false;
+        };
+        sibling
+    } else {
+        target
+    };
     if !remove(tree, dragged) {
         return false;
     }
-    // `target` is guaranteed to survive: it's either in a different leaf, or in
-    // the same leaf that still holds ≥1 tab after the removal.
+    // `split_anchor` is guaranteed to survive: a different leaf, or a sibling that
+    // stayed behind in the same leaf after the removal.
     debug_assert!(
-        tree.as_ref().and_then(|r| r.find_path(target)).is_some(),
-        "move_into_split: target vanished after remove",
+        tree.as_ref()
+            .and_then(|r| r.find_path(split_anchor))
+            .is_some(),
+        "move_into_split: split anchor vanished after remove",
     );
-    split_beside(tree, target, direction, dragged, before)
+    split_beside(tree, split_anchor, direction, dragged, before)
 }
 
 /// Move the whole pane (every tab + active index) holding `src_anchor` to a new
@@ -1076,6 +1081,27 @@ mod tests {
             false
         ));
         assert_eq!(tree, Some(PaneNode::leaf(a)));
+    }
+
+    #[test]
+    fn move_into_split_first_tab_onto_own_pane() {
+        // Dragging a pane's first tab out onto its own pane's edge: the drop
+        // anchor is `tabs[0]` (== the dragged tab), which used to bail via the
+        // `dragged == target` guard. It should split the tab out beside its
+        // siblings instead.
+        let (a, b, c) = (id(), id(), id());
+        let mut tree = Some(tabs_leaf(vec![a, b, c], 0));
+        assert!(move_into_split(
+            &mut tree,
+            a,
+            a, // anchor = tabs[0] = the dragged tab
+            SplitDirection::Horizontal,
+            false
+        ));
+        assert_eq!(leaf_tabs(&tree, b), vec![b, c]);
+        assert_eq!(leaf_tabs(&tree, a), vec![a]);
+        let root = tree.as_ref().unwrap();
+        assert_ne!(root.find_path(a), root.find_path(b));
     }
 
     #[test]
