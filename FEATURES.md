@@ -49,9 +49,11 @@ feature is added or changed, update the matching entry here in the same change**
 ## Agents
 
 - **Built-in agent presets** — Shell, Claude, opencode, Amp (ampcode), Grok
-  (x.ai), Hermes, Ollama, **Ollama Code**, and Pi, each with its own icon. On
-  Windows the default shell is **PowerShell**, with **Cmd** offered as a second
-  preset (instead of the single "Shell").
+  (x.ai), Hermes, Ollama, **Ollama Code**, Pi, and a **Browser** preset, each with
+  its own icon. On Windows the default shell is **PowerShell**, with **Cmd**
+  offered as a second preset (instead of the single "Shell"). A preset is either
+  a terminal agent or a **Browser** (opens a browser pane at its homepage) —
+  switch the type and edit the fields in Settings → Agents.
 - **Ollama Code** — runs a coding agent backed by an Ollama model via
   `ollama launch <agent> --model <model>` (seeded as `ollama launch opencode
   --model glm-5.2:cloud`); change the agent or model in the preset's args.
@@ -209,6 +211,12 @@ feature is added or changed, update the matching entry here in the same change**
 - **Linux: a separate browser window** — gpui can't embed WebKitGTK, so links open
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.
+- **Browser as a preset** — the built-in **Browser** preset opens a web-browser
+  pane; pick it anywhere you pick an agent (the toolbar's new-pane dropdown, or
+  hold a pane's split / `+` button and choose it). Configure its homepage — and
+  add more browser presets with their own homepages — in **Settings → Agents**
+  (default `duckduckgo.com`; a bare domain gets `https://`). On macOS/Windows it's
+  an embedded pane in the layout; on Linux it opens in a separate browser window.
 - **Optional** — Settings → Behavior → "Open ctrl+clicked links in the built-in
   browser" (default on); off routes every link to the system browser.
 

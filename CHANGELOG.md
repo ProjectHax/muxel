@@ -6,6 +6,12 @@ All notable changes to muxel are documented here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- **Browser is now a preset** — a built-in **Browser** preset opens a web-browser
+  pane; pick it anywhere you pick an agent (the new-pane dropdown or the
+  hold-a-split-button chooser). Its homepage is configurable in Settings → Agents
+  (default `duckduckgo.com`; a bare domain gets `https://`), and you can add more
+  browser presets. Embedded pane on macOS/Windows; a separate browser window on
+  Linux.
 - **Speech-to-text dictation** — a toolbar mic button (`Ctrl+Shift+M` toggle, or
   hold `Ctrl+Shift+H` for push-to-talk) records the microphone and types the
   transcript into the focused agent's prompt, unsubmitted for review (optional

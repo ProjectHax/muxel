@@ -93,7 +93,7 @@ mod imp {
                     if let InputEvent::PressEnter { .. } = event {
                         let typed = input.read(cx).value().trim().to_string();
                         if !typed.is_empty() {
-                            this.navigate(&normalize_url(&typed), cx);
+                            this.navigate(&muxel_core::normalize_url(&typed), cx);
                         }
                     }
                 },
@@ -214,15 +214,6 @@ mod imp {
             if let Some(wv) = &self.webview {
                 wv.update(cx, |wv, _| if visible { wv.show() } else { wv.hide() });
             }
-        }
-    }
-
-    /// `example.com` → `https://example.com` (typed addresses rarely carry a scheme).
-    fn normalize_url(typed: &str) -> String {
-        if typed.starts_with("http://") || typed.starts_with("https://") {
-            typed.to_string()
-        } else {
-            format!("https://{typed}")
         }
     }
 

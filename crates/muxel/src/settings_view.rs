@@ -7,7 +7,7 @@
 use crate::i18n::t;
 use gpui::*;
 use gpui_component::input::InputState;
-use muxel_core::{EnvVar, InjectionMode, SshAuth};
+use muxel_core::{EnvVar, InjectionMode, PresetKind, SshAuth};
 use uuid::Uuid;
 
 /// Inline result of a "Test connection" in the SSH host editor.
@@ -127,7 +127,11 @@ pub struct SettingsUi {
     // Agent preset editor.
     pub selected_preset: Option<usize>,
     pub p_injection: InjectionMode,
+    /// Terminal-agent vs browser preset (drives which editor fields show).
+    pub p_kind: PresetKind,
     pub p_name: Entity<InputState>,
+    /// Homepage for a browser preset.
+    pub p_url: Entity<InputState>,
     pub p_program: Entity<InputState>,
     pub p_model: Entity<InputState>,
     pub p_model_flag: Entity<InputState>,
@@ -233,7 +237,10 @@ impl SettingsUi {
             section: SettingsSection::Appearance,
             selected_preset: None,
             p_injection: InjectionMode::None,
+            p_kind: PresetKind::Terminal,
             p_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
+            p_url: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("https://duckduckgo.com"))),
             p_program: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t("Program (blank = shell)"))),
             p_model: cx.new(|cx| InputState::new(window, cx).placeholder(t("Model (optional)"))),

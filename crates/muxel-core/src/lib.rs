@@ -11,10 +11,11 @@ mod shell;
 pub mod ssh;
 pub mod stt;
 pub mod tmux;
+pub mod url;
 pub mod worktree;
 
 pub use agent::{
-    AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, ResolvedLaunch,
+    AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
     claude_session_path, codex_latest_session_id, codex_session_exists, memory_header,
     memory_instruction, memory_reference, resolve_launch, session_resume_args,
 };
@@ -27,6 +28,7 @@ pub use pane::{
 };
 pub use shell::{join_words, split_words};
 pub use stt::SttEngine;
+pub use url::normalize_url;
 pub use worktree::Worktree;
 
 use serde::{Deserialize, Serialize};
@@ -1249,7 +1251,8 @@ impl Default for Settings {
 /// v10: added the "Ollama Code" preset (`ollama launch <agent> --model <model>`).
 /// v11: Grok preset gains `--session-id`/`--resume` session resume.
 /// v12: added the Codex preset (agent-minted session resume).
-pub const PRESET_SEED_VERSION: u32 = 12;
+/// v13: added the built-in Browser preset (opens a browser pane).
+pub const PRESET_SEED_VERSION: u32 = 13;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see

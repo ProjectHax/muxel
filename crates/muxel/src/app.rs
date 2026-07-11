@@ -160,6 +160,30 @@ fn agent_icon_obj(program: Option<&str>) -> Icon {
     Icon::empty().path(agent_icon_path(program))
 }
 
+/// SVG path for a preset's icon: a globe for Browser-kind presets, else the
+/// agent icon derived from its program.
+fn preset_icon_path(preset: &AgentPreset) -> SharedString {
+    if preset.kind == muxel_core::PresetKind::Browser {
+        "icons/globe.svg".into()
+    } else {
+        agent_icon_path(preset.program.as_deref())
+    }
+}
+
+/// A preset's icon as an [`Svg`] (kind-aware — globe for browser presets).
+fn preset_icon(preset: &AgentPreset, size: Pixels, color: Hsla) -> Svg {
+    svg()
+        .path(preset_icon_path(preset))
+        .size(size)
+        .flex_none()
+        .text_color(color)
+}
+
+/// A preset's icon as a gpui-component [`Icon`] (kind-aware).
+fn preset_icon_obj(preset: &AgentPreset) -> Icon {
+    Icon::empty().path(preset_icon_path(preset))
+}
+
 /// A small status pill for an agent.
 fn status_tag(status: AgentStatus) -> Tag {
     match status {
@@ -5948,8 +5972,47 @@ impl MuxelApp {
             .get(preset_idx)
             .cloned()
             .unwrap_or_else(AgentPreset::shell);
+        // A Browser-kind preset opens a browser pane, not a terminal.
+        if preset.kind == muxel_core::PresetKind::Browser {
+            self.place_browser_url(&preset.url, target, placement, window, cx);
+            return;
+        }
         let instance = Instance::from_preset(pid, &preset);
         self.place_and_spawn(pid, instance, placement, target, None, window, cx);
+    }
+
+    /// Open a browser pane at `url` (a Browser-kind preset's homepage). macOS/
+    /// Windows get an embedded pane in the layout; Linux (which can't host a web
+    /// view in a pane) opens `url` in a separate browser window, like Ctrl+click.
+    fn place_browser_url(
+        &mut self,
+        url: &str,
+        target: Option<Uuid>,
+        placement: PlacementMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let url = muxel_core::normalize_url(url);
+        let url = if url.is_empty() {
+            "https://duckduckgo.com".to_string()
+        } else {
+            url
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (target, placement, window);
+            if !crate::browser::spawn_browser_window(&url) {
+                cx.open_url(&url);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let Some(pid) = self.workspace.active_project else {
+                return;
+            };
+            let instance = Instance::browser(pid, url);
+            self.place_and_spawn(pid, instance, placement, target, None, window, cx);
+        }
     }
 
     /// Create a new agent from the current preset as a tab in the active pane.
@@ -6030,39 +6093,46 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) {
         // tmux only when the user wants it AND it's actually installed (unix).
-        instance.use_tmux = self.use_tmux && self.tmux_available;
+        let kind = instance.kind;
+        let browser_url = instance.browser_url.clone();
         let iid = instance.id;
 
         // An empty project ignores the target/placement and just seeds a pane.
         let empty = self.workspace.project(pid).is_some_and(|p| p.is_empty());
         let placed_target = if empty { None } else { target };
 
-        // Decide the worktree: explicit (duplicate/resume) wins; otherwise a new
-        // tab OR split inherits the worktree of the pane it joins, if it has one;
-        // only when joining a worktree-less pane (or seeding an empty project)
-        // does the toggle decide whether to make a fresh worktree.
-        let choice = explicit_worktree.unwrap_or_else(|| match placed_target {
-            Some(t)
-                if self
-                    .workspace
-                    .instance(t)
-                    .and_then(|i| i.worktree_id)
-                    .is_some() =>
-            {
-                WorktreeChoice::Inherit(t)
-            }
-            _ if self.use_worktree => WorktreeChoice::New,
-            _ => WorktreeChoice::None,
-        });
-        self.apply_worktree_choice(pid, &mut instance, choice);
+        // tmux sessions and worktrees are terminal-only concerns — a browser pane
+        // gets neither.
+        if kind == InstanceKind::Terminal {
+            instance.use_tmux = self.use_tmux && self.tmux_available;
 
-        if instance.use_tmux {
-            let project_name = self
-                .workspace
-                .project(pid)
-                .map(|p| p.name.clone())
-                .unwrap_or_default();
-            instance.tmux_session = Some(muxel_core::tmux::session_name(&project_name, iid));
+            // Decide the worktree: explicit (duplicate/resume) wins; otherwise a new
+            // tab OR split inherits the worktree of the pane it joins, if it has one;
+            // only when joining a worktree-less pane (or seeding an empty project)
+            // does the toggle decide whether to make a fresh worktree.
+            let choice = explicit_worktree.unwrap_or_else(|| match placed_target {
+                Some(t)
+                    if self
+                        .workspace
+                        .instance(t)
+                        .and_then(|i| i.worktree_id)
+                        .is_some() =>
+                {
+                    WorktreeChoice::Inherit(t)
+                }
+                _ if self.use_worktree => WorktreeChoice::New,
+                _ => WorktreeChoice::None,
+            });
+            self.apply_worktree_choice(pid, &mut instance, choice);
+
+            if instance.use_tmux {
+                let project_name = self
+                    .workspace
+                    .project(pid)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                instance.tmux_session = Some(muxel_core::tmux::session_name(&project_name, iid));
+            }
         }
 
         match (placement, placed_target) {
@@ -6093,7 +6163,16 @@ impl MuxelApp {
                 }
             }
         }
-        self.spawn_terminal(iid, window, cx);
+        // Build the right live view for the pane's kind (mirrors the restore
+        // dispatch in `spawn_project_terminals_now`).
+        match kind {
+            InstanceKind::Browser => {
+                let url = browser_url.unwrap_or_else(|| "about:blank".to_string());
+                let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                self.browsers.insert(iid, view);
+            }
+            _ => self.spawn_terminal(iid, window, cx),
+        }
         self.focus_instance(iid, window, cx);
         self.persist();
         cx.notify();
@@ -15029,10 +15108,10 @@ impl MuxelApp {
         // preset; the caret picks the active preset / sets the default.
         let current = self.current_agent_preset();
         let current_name = current.name.clone();
-        let current_program = current.program.clone();
+        let current_icon = preset_icon_obj(&current);
         let current_id = current.id;
         let default_id = self.active_default_preset_id();
-        let preset_items: Vec<(Uuid, String, bool, Option<String>)> = self
+        let preset_items: Vec<(Uuid, String, bool, SharedString)> = self
             .presets
             .iter()
             .filter(|p| self.agent_runnable(p))
@@ -15041,7 +15120,7 @@ impl MuxelApp {
                     p.id,
                     p.name.clone(),
                     Some(p.id) == default_id,
-                    p.program.clone(),
+                    preset_icon_path(p),
                 )
             })
             .collect();
@@ -15051,7 +15130,7 @@ impl MuxelApp {
                     Button::new("preset-run-btn")
                         .ghost()
                         .small()
-                        .icon(agent_icon_obj(current_program.as_deref()))
+                        .icon(current_icon)
                         .label(current_name.clone())
                         .tooltip(t("New pane with the current preset"))
                         .on_click(cx.listener(|this, _ev, window, cx| {
@@ -15059,7 +15138,7 @@ impl MuxelApp {
                         })),
                 )
                 .dropdown_menu(move |mut menu, _window, _cx| {
-                    for (id, name, is_default, program) in preset_items.iter() {
+                    for (id, name, is_default, icon_path) in preset_items.iter() {
                         let label = if *is_default {
                             format!("★ {name}")
                         } else {
@@ -15067,7 +15146,7 @@ impl MuxelApp {
                         };
                         menu = menu.menu_with_icon(
                             label,
-                            agent_icon_obj(program.as_deref()),
+                            Icon::empty().path(icon_path.clone()),
                             Box::new(SetPreset(*id)),
                         );
                     }
@@ -16311,6 +16390,7 @@ impl MuxelApp {
         };
         self.settings_ui.selected_preset = Some(idx);
         self.settings_ui.p_injection = p.injection.clone();
+        self.settings_ui.p_kind = p.kind;
         let inj_flag = match &p.injection {
             InjectionMode::CliFlag { flag } => flag.clone(),
             _ => String::new(),
@@ -16318,6 +16398,8 @@ impl MuxelApp {
         let ui = &self.settings_ui;
         ui.p_name
             .update(cx, |s, cx| s.set_value(p.name.clone(), window, cx));
+        ui.p_url
+            .update(cx, |s, cx| s.set_value(p.url.clone(), window, cx));
         ui.p_program.update(cx, |s, cx| {
             s.set_value(p.program.clone().unwrap_or_default(), window, cx)
         });
@@ -16460,10 +16542,18 @@ impl MuxelApp {
             InjectionMode::TypeIn => InjectionMode::TypeIn,
             InjectionMode::None => InjectionMode::None,
         };
+        let kind = self.settings_ui.p_kind;
+        let url = self.settings_ui.p_url.read(cx).value().trim().to_string();
         let p = &mut self.presets[idx];
         if !name.is_empty() {
             p.name = name;
         }
+        p.kind = kind;
+        p.url = if kind == muxel_core::PresetKind::Browser && !url.is_empty() {
+            muxel_core::normalize_url(&url)
+        } else {
+            url
+        };
         p.program = (!program.is_empty()).then_some(program);
         p.model = (!model.is_empty()).then_some(model);
         p.model_flag = (!model_flag.is_empty()).then_some(model_flag);
@@ -17359,7 +17449,7 @@ impl MuxelApp {
                 continue;
             }
             let name = preset.name.clone();
-            let program = preset.program.clone();
+            let icon = preset_icon(preset, px(15.0), cx.theme().foreground);
             list = list.child(
                 div()
                     .id(SharedString::from(format!("place-preset-{idx}")))
@@ -17375,11 +17465,7 @@ impl MuxelApp {
                     .on_click(cx.listener(move |this, _e, window, cx| {
                         this.pick_place_agent(idx, window, cx)
                     }))
-                    .child(agent_icon(
-                        program.as_deref(),
-                        px(15.0),
-                        cx.theme().foreground,
-                    ))
+                    .child(icon)
                     .child(div().text_sm().child(name)),
             );
         }
@@ -19419,7 +19505,6 @@ impl MuxelApp {
         let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
         for (idx, p) in self.presets.iter().enumerate() {
             let selected = self.settings_ui.selected_preset == Some(idx);
-            let program = p.program.clone();
             // Flag agents whose binary isn't installed (hidden from new-agent menus).
             let not_installed = !self.agent_runnable(p);
             let fg = if selected {
@@ -19427,6 +19512,7 @@ impl MuxelApp {
             } else {
                 cx.theme().foreground
             };
+            let icon = preset_icon(p, px(15.0), fg);
             let mut row =
                 div()
                     .id(SharedString::from(format!("preset-item-{idx}")))
@@ -19442,7 +19528,7 @@ impl MuxelApp {
                     .on_click(cx.listener(move |this, _e, window, cx| {
                         this.open_preset_editor(idx, window, cx)
                     }))
-                    .child(agent_icon(program.as_deref(), px(15.0), fg))
+                    .child(icon)
                     .child(div().flex_1().text_sm().child(p.name.clone()))
                     .children(not_installed.then(|| {
                         div()
@@ -20521,102 +20607,140 @@ impl MuxelApp {
             .max_w(px(560.0))
             .child(self.settings_label(&t("Name"), cx))
             .child(Self::wide_input(Input::new(&ui.p_name)))
-            .child(self.settings_label(&t("Program (blank = default shell)"), cx))
-            .child(Self::wide_input(Input::new(&ui.p_program)))
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(self.settings_label(&t("Model"), cx))
-                            .child(Input::new(&ui.p_model)),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(self.settings_label(&t("Model flag"), cx))
-                            .child(Input::new(&ui.p_model_flag)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(self.settings_label(&t("Effort"), cx))
-                            .child(Input::new(&ui.p_effort)),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(self.settings_label(&t("Effort flag"), cx))
-                            .child(Input::new(&ui.p_effort_flag)),
-                    ),
-            )
-            .child(self.settings_label(&t("Extra arguments"), cx))
-            .child(Self::wide_input(Input::new(&ui.p_args)))
-            .child(self.settings_label(&t("System prompt"), cx))
-            .child(Self::wide_input(Input::new(&ui.p_prompt).h(px(72.0))))
-            .child(self.settings_label(&t("System-prompt injection"), cx))
+            .child(self.settings_label(&t("Type"), cx))
             .child(
                 div()
                     .flex()
                     .gap_1()
                     .child(
-                        Button::new("inj-none")
+                        Button::new("pk-terminal")
                             .ghost()
-                            .selected(matches!(inj, InjectionMode::None))
-                            .label(t("None"))
+                            .selected(ui.p_kind == muxel_core::PresetKind::Terminal)
+                            .label(t("Agent"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.set_editor_injection(InjectionMode::None, cx)
+                                this.settings_ui.p_kind = muxel_core::PresetKind::Terminal;
+                                cx.notify();
                             })),
                     )
                     .child(
-                        Button::new("inj-flag")
+                        Button::new("pk-browser")
                             .ghost()
-                            .selected(is_flag)
-                            .label(t("CLI flag"))
+                            .selected(ui.p_kind == muxel_core::PresetKind::Browser)
+                            .label(t("Browser"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.set_editor_injection(
-                                    InjectionMode::CliFlag {
-                                        flag: String::new(),
-                                    },
-                                    cx,
-                                )
-                            })),
-                    )
-                    .child(
-                        Button::new("inj-typein")
-                            .ghost()
-                            .selected(matches!(inj, InjectionMode::TypeIn))
-                            .label(t("Type-in"))
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.set_editor_injection(InjectionMode::TypeIn, cx)
+                                this.settings_ui.p_kind = muxel_core::PresetKind::Browser;
+                                cx.notify();
                             })),
                     ),
             )
-            .children(is_flag.then(|| {
+            .children((ui.p_kind == muxel_core::PresetKind::Browser).then(|| {
                 v_flex()
-                    .gap_1()
-                    .child(self.settings_label(&t("Injection flag"), cx))
-                    .child(Self::wide_input(Input::new(&ui.p_inj_flag)))
+                    .gap_2()
+                    .child(self.settings_label(&t("Homepage URL"), cx))
+                    .child(Self::wide_input(Input::new(&ui.p_url)))
             }))
-            .child(self.settings_label(&t("Environment (KEY=VALUE per line)"), cx))
-            .child(Self::wide_input(Input::new(&ui.p_env).h(px(60.0))))
-            .child(self.settings_label(&t("Status: working markers (comma-separated)"), cx))
-            .child(Self::wide_input(Input::new(&ui.p_working_markers)))
-            .child(self.settings_label(&t("Status: blocked markers (comma-separated)"), cx))
-            .child(Self::wide_input(Input::new(&ui.p_blocked_markers)))
-            .child(self.settings_label(&t("Runner startup delay (ms after first output)"), cx))
-            .child(Self::wide_input(Input::new(&ui.p_startup_delay)))
+            .children((ui.p_kind == muxel_core::PresetKind::Terminal).then(|| {
+                v_flex()
+                    .gap_2()
+                    .child(self.settings_label(&t("Program (blank = default shell)"), cx))
+                    .child(Self::wide_input(Input::new(&ui.p_program)))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(self.settings_label(&t("Model"), cx))
+                                    .child(Input::new(&ui.p_model)),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(self.settings_label(&t("Model flag"), cx))
+                                    .child(Input::new(&ui.p_model_flag)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(self.settings_label(&t("Effort"), cx))
+                                    .child(Input::new(&ui.p_effort)),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(self.settings_label(&t("Effort flag"), cx))
+                                    .child(Input::new(&ui.p_effort_flag)),
+                            ),
+                    )
+                    .child(self.settings_label(&t("Extra arguments"), cx))
+                    .child(Self::wide_input(Input::new(&ui.p_args)))
+                    .child(self.settings_label(&t("System prompt"), cx))
+                    .child(Self::wide_input(Input::new(&ui.p_prompt).h(px(72.0))))
+                    .child(self.settings_label(&t("System-prompt injection"), cx))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                Button::new("inj-none")
+                                    .ghost()
+                                    .selected(matches!(inj, InjectionMode::None))
+                                    .label(t("None"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.set_editor_injection(InjectionMode::None, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("inj-flag")
+                                    .ghost()
+                                    .selected(is_flag)
+                                    .label(t("CLI flag"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.set_editor_injection(
+                                            InjectionMode::CliFlag {
+                                                flag: String::new(),
+                                            },
+                                            cx,
+                                        )
+                                    })),
+                            )
+                            .child(
+                                Button::new("inj-typein")
+                                    .ghost()
+                                    .selected(matches!(inj, InjectionMode::TypeIn))
+                                    .label(t("Type-in"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.set_editor_injection(InjectionMode::TypeIn, cx)
+                                    })),
+                            ),
+                    )
+                    .children(is_flag.then(|| {
+                        v_flex()
+                            .gap_1()
+                            .child(self.settings_label(&t("Injection flag"), cx))
+                            .child(Self::wide_input(Input::new(&ui.p_inj_flag)))
+                    }))
+                    .child(self.settings_label(&t("Environment (KEY=VALUE per line)"), cx))
+                    .child(Self::wide_input(Input::new(&ui.p_env).h(px(60.0))))
+                    .child(self.settings_label(&t("Status: working markers (comma-separated)"), cx))
+                    .child(Self::wide_input(Input::new(&ui.p_working_markers)))
+                    .child(self.settings_label(&t("Status: blocked markers (comma-separated)"), cx))
+                    .child(Self::wide_input(Input::new(&ui.p_blocked_markers)))
+                    .child(
+                        self.settings_label(&t("Runner startup delay (ms after first output)"), cx),
+                    )
+                    .child(Self::wide_input(Input::new(&ui.p_startup_delay)))
+            }))
             .child(
                 div()
                     .flex()
