@@ -5,6 +5,8 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-07-11
+
 ### Added
 - **Browser is now a preset** — a built-in **Browser** preset opens a web-browser
   pane; pick it anywhere you pick an agent (the new-pane dropdown or the
@@ -20,6 +22,17 @@ All notable changes to muxel are documented here. This project adheres to
   **Provider** — any OpenAI-compatible `/audio/transcriptions` endpoint (OpenAI,
   Groq, self-hosted) via base URL + model + a keychain-stored API key. Provider
   mode uploads audio to that endpoint; local mode stays on-device.
+
+### Fixed
+- **In-app updater on macOS** — the update dialog's download button was dead and
+  fetched nothing; it now downloads and applies the macOS build correctly.
+- **Linux: stale AppImage mounts no longer accumulate** — a muxel instance run
+  from an AppImage that crashed or was killed left behind a dead squashfuse mount
+  under `/tmp/.mount_muxel-*`. As leftovers piled up, any filesystem scan (e.g. a
+  desktop system monitor's periodic `df`) would stall in the kernel FUSE layer on
+  the dead mounts, surfacing on Wayland as a periodic cursor stutter that got
+  worse the longer the machine stayed up. muxel now reaps these dead mounts on
+  startup (leaving live mounts from other running instances alone).
 
 ## [0.1.0] — 2026-07-10
 
