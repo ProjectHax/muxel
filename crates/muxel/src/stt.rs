@@ -136,6 +136,12 @@ where
 
 /// Route whisper.cpp's internal C logging through the `log` crate (once), so it
 /// doesn't spam stderr.
+//
+// whisper.cpp can't build for Windows on ARM (ggml's CPU backend rejects MSVC),
+// so `whisper-rs` is excluded on that target — see crates/muxel/Cargo.toml — and
+// the two functions that use it are gated out. The caller (app.rs) bails early
+// with a "use a Provider" message there, so local transcription is never reached.
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 fn quiet_whisper_logging() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -143,6 +149,7 @@ fn quiet_whisper_logging() {
 }
 
 /// Transcribe 16 kHz mono f32 `samples` with a local whisper.cpp model file.
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 pub fn transcribe_local(samples16k: &[f32], model_path: &Path, language: &str) -> Result<String> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
     if samples16k.is_empty() {
@@ -173,6 +180,21 @@ pub fn transcribe_local(samples16k: &[f32], model_path: &Path, language: &str) -
         }
     }
     Ok(text.trim().to_string())
+}
+
+/// Windows-on-ARM stub: whisper.cpp can't build there (ggml rejects MSVC on ARM —
+/// see crates/muxel/Cargo.toml), so local transcription is unavailable. Same
+/// signature as the real one so the caller stays platform-agnostic; it points the
+/// user at a Provider instead.
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+pub fn transcribe_local(
+    _samples16k: &[f32],
+    _model_path: &Path,
+    _language: &str,
+) -> Result<String> {
+    bail!(
+        "local transcription isn't available on Windows on ARM — pick a Provider in Settings → Speech"
+    )
 }
 
 /// Transcribe a WAV via an OpenAI-compatible `POST {base_url}/audio/transcriptions`.

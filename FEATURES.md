@@ -96,7 +96,9 @@ feature is added or changed, update the matching entry here in the same change**
   OpenAI-compatible `/audio/transcriptions` endpoint (OpenAI, Groq, a self-hosted
   server) via a base URL + model + API key stored in the OS keychain. Provider
   mode uploads your recorded audio to that endpoint; local mode never leaves the
-  machine. macOS asks for microphone permission on first use.
+  machine. macOS asks for microphone permission on first use. (Local whisper isn't
+  available on Windows-on-ARM — whisper.cpp can't build there — so use a Provider;
+  every other platform has both.)
 - **Shared project memory** — opt-in per project: agents are told (via their system
   prompt) to `grep` and add durable lessons to a `.muxel/MEMORY.md` file shared
   across every agent and run in that project. muxel creates the file, git-ignores

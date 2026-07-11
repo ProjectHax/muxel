@@ -47,9 +47,16 @@ keyring = { version = "3", features = [
     "sync-secret-service",
     "crypto-rust",
 ] }
-# Speech-to-text: cross-platform mic capture (WASAPI/CoreAudio/ALSA) + in-process
-# whisper.cpp (compiled from source via cmake) for offline local transcription.
+# Speech-to-text: cross-platform mic capture (WASAPI/CoreAudio/ALSA). In-process
+# whisper.cpp for offline local transcription is added per-target just below.
 cpal = "0.15"
+
+# whisper.cpp (compiled from source via cmake) — every target EXCEPT Windows on
+# ARM, where ggml's CPU backend refuses the MSVC compiler ("MSVC is not supported
+# for ARM, use clang"). There, local STT is unavailable and the Provider
+# (OpenAI-compatible) engine is the fallback. Keep this cfg in sync with the gates
+# in stt.rs and app.rs.
+[target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
 whisper-rs = "0.14"
 
 # --- Built-in browser (system webview via wry; no bundled Chromium) ---
