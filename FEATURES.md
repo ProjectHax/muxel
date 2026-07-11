@@ -96,7 +96,11 @@ feature is added or changed, update the matching entry here in the same change**
   OpenAI-compatible `/audio/transcriptions` endpoint (OpenAI, Groq, a self-hosted
   server) via a base URL + model + API key stored in the OS keychain. Provider
   mode uploads your recorded audio to that endpoint; local mode never leaves the
-  machine. macOS asks for microphone permission on first use. (Local whisper isn't
+  machine. macOS asks for microphone permission on first use. If the mic can't be
+  used you're told as soon as you press the button, rather than after speaking: no
+  input device says so plainly, and a *blocked* mic (which macOS otherwise reports
+  only as silence) comes with an **Open Settings** button that opens the OS
+  microphone privacy screen. (Local whisper isn't
   available on Windows-on-ARM — whisper.cpp can't build there — so use a Provider;
   every other platform has both.)
 - **Shared project memory** — opt-in per project: agents are told (via their system

@@ -944,8 +944,21 @@ enum SttState {
     /// Post-capture work in progress; the string is a user-facing label
     /// ("Downloading model…" / "Transcribing…").
     Busy(String),
-    /// The last dictation failed (message shown briefly in the pill).
-    Error(String),
+    /// The last dictation failed (message shown briefly in the pill). `mic` marks
+    /// the failures the OS microphone settings could fix — the pill offers a
+    /// shortcut there, which would be nonsense for e.g. a failed model download.
+    Error { message: String, mic: bool },
+}
+
+impl SttState {
+    /// An `Error` from a dictation failure, offering the mic-settings shortcut
+    /// only where the OS permission screen is the actual remedy.
+    fn error(e: &anyhow::Error) -> Self {
+        Self::Error {
+            message: format!("{e:#}"),
+            mic: crate::stt::mic_settings_would_help(e),
+        }
+    }
 }
 
 /// The small label shown under the cursor while dragging a project row.
@@ -10874,7 +10887,10 @@ impl MuxelApp {
     /// Begin capturing the microphone (needs a focused pane + a usable device).
     fn start_recording(&mut self, cx: &mut Context<Self>) {
         if !self.has_dictation_target() {
-            self.stt_state = SttState::Error(t("Focus an agent pane first").to_string());
+            self.stt_state = SttState::Error {
+                message: t("Focus an agent pane first").to_string(),
+                mic: false,
+            };
             cx.notify();
             return;
         }
@@ -10883,7 +10899,7 @@ impl MuxelApp {
                 self.stt_recording = Some(rec);
                 self.stt_state = SttState::Recording;
             }
-            Err(e) => self.stt_state = SttState::Error(format!("{e:#}")),
+            Err(e) => self.stt_state = SttState::error(&e),
         }
         cx.notify();
     }
@@ -10958,7 +10974,7 @@ impl MuxelApp {
                         this.insert_transcript(target, &text, autosubmit, window, cx);
                     }
                     Ok(_) => this.stt_state = SttState::Idle,
-                    Err(e) => this.stt_state = SttState::Error(format!("{e:#}")),
+                    Err(e) => this.stt_state = SttState::error(&e),
                 }
                 cx.notify();
             });
@@ -18434,12 +18450,28 @@ impl MuxelApp {
     /// The floating speech-to-text pill (recording / transcribing / error),
     /// shown while `stt_state != Idle`. Modeled on the broadcast bar.
     fn render_stt_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (accent, label, recording, error) = match &self.stt_state {
-            SttState::Recording => (cx.theme().danger, t("Recording…").to_string(), true, false),
-            SttState::Busy(l) => (cx.theme().accent, l.clone(), false, false),
-            SttState::Error(e) => (cx.theme().danger, e.clone(), false, true),
-            SttState::Idle => (cx.theme().muted_foreground, String::new(), false, false),
+        let (accent, label, recording, error, mic) = match &self.stt_state {
+            SttState::Recording => (
+                cx.theme().danger,
+                t("Recording…").to_string(),
+                true,
+                false,
+                false,
+            ),
+            SttState::Busy(l) => (cx.theme().accent, l.clone(), false, false, false),
+            SttState::Error { message, mic } => {
+                (cx.theme().danger, message.clone(), false, true, *mic)
+            }
+            SttState::Idle => (
+                cx.theme().muted_foreground,
+                String::new(),
+                false,
+                false,
+                false,
+            ),
         };
+        // Only where the OS actually has a microphone permission screen to open.
+        let mic_settings = mic && crate::integrations::HAS_MICROPHONE_SETTINGS;
         div()
             .absolute()
             .bottom(px(16.0))
@@ -18470,6 +18502,18 @@ impl MuxelApp {
                             .on_click(
                                 cx.listener(|this, _e, window, cx| this.toggle_speech(window, cx)),
                             )
+                    }))
+                    .children(mic_settings.then(|| {
+                        Button::new("stt-mic-settings")
+                            .primary()
+                            .xsmall()
+                            .label(t("Open Settings"))
+                            .tooltip(t("Open the system microphone privacy settings"))
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                crate::integrations::open_microphone_settings();
+                                this.stt_state = SttState::Idle;
+                                cx.notify();
+                            }))
                     }))
                     .children(error.then(|| {
                         Button::new("stt-dismiss")

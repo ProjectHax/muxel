@@ -1308,6 +1308,24 @@ pub fn reveal_in_file_manager(path: &Path) {
     }
 }
 
+/// Whether this OS has a per-app microphone permission screen worth offering to
+/// open. Linux has none (PipeWire/ALSA don't gate per app outside a Flatpak
+/// portal), so callers hide the shortcut there rather than open something useless.
+pub const HAS_MICROPHONE_SETTINGS: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
+/// Open the OS microphone privacy settings. Best-effort; no-op where
+/// [`HAS_MICROPHONE_SETTINGS`] is false.
+pub fn open_microphone_settings() {
+    #[cfg(target_os = "macos")]
+    let _ = command("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+        .output();
+    #[cfg(target_os = "windows")]
+    let _ = command("cmd")
+        .args(["/C", "start", "ms-settings:privacy-microphone"])
+        .output();
+}
+
 /// Local branch names (e.g. `["main", "feature/x"]`) at `loc`.
 pub fn list_branches(loc: &RepoLoc) -> Vec<String> {
     git_output(loc, &["branch", "--format=%(refname:short)"])

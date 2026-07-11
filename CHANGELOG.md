@@ -5,6 +5,28 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **Dictation on a Mac with no microphone reported "microphone error: query
+  default input config"** — on a machine with no audio input (a Mac mini or Mac
+  Studio with nothing plugged in), CoreAudio still answers the default-input-device
+  query, handing back a device that then fails every call made on it. muxel took
+  that phantom device to mean a mic existed, so instead of saying there was no
+  microphone it surfaced the internal failure of the next call. It now decides
+  whether a mic exists from the *enumerated* inputs and says **no microphone found
+  — connect an input device**. Dictation also fails at the moment you press the mic
+  rather than after you've spoken: the device is opened up front, so a missing mic
+  no longer shows "Recording…" for a capture that was never running.
+
+### Added
+- **Dictation tells you when the microphone is blocked, and offers a way in** — a
+  macOS app that has been denied the microphone isn't told so: CoreAudio hands it
+  silence, which muxel could only report as "no speech captured". Dictation now
+  asks macOS for the permission status up front and, when access is denied, says so
+  and offers an **Open Settings** button that opens Privacy & Security →
+  Microphone. The button appears only when the OS says access is denied — an app
+  that has never *requested* the microphone isn't listed on that screen at all, so
+  offering it for a merely-absent mic would send you to an empty list.
+
 ## [0.1.1] — 2026-07-11
 
 ### Added

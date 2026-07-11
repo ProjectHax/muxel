@@ -59,6 +59,14 @@ cpal = "0.15"
 [target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
 whisper-rs = "0.14"
 
+# Ask macOS (TCC) whether the microphone is *denied*. A denied app is handed
+# silent audio rather than an error, so nothing in cpal can tell us — see the
+# permission check in stt.rs. These are the objc2 versions gpui already pins, so
+# depending on them directly adds nothing new to the tree.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+
 # --- Built-in browser (system webview via wry; no bundled Chromium) ---
 # macOS/Windows: an embedded in-pane webview via gpui-component's gpui-wry
 # (WKWebView / WebView2 as a native child of the gpui window). Pinned to the
