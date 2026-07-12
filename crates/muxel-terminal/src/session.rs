@@ -285,8 +285,10 @@ impl TerminalSession {
         // a clean system environment (otherwise e.g. cmake caches `$(MAKE)` as the
         // AppImage and `make` relaunches muxel instead of building).
         sanitize_appimage_env(&mut builder);
+        ensure_utf8_locale(&mut builder);
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
+        // Last, so anything the instance/preset sets wins over muxel's defaults.
         for (k, v) in &spec.env {
             builder.env(k, v);
         }
@@ -1044,6 +1046,31 @@ fn resolve_program_for_spawn_windows(program: &str) -> String {
     }
     program.to_string()
 }
+
+/// Give the child a UTF-8 locale when it would otherwise inherit none.
+///
+/// A GUI app gets no locale from the OS session — on macOS `launchctl getenv LANG`
+/// is empty — so children of a Finder-launched muxel see no `LANG`/`LC_ALL`/
+/// `LC_CTYPE` and fall back to ASCII. tmux is the visible casualty: its client
+/// rewrites every non-ASCII cell as `_`. Only fills a gap; a locale the user has
+/// actually set is never touched. See `muxel_core::locale`.
+///
+/// Unix only: Windows has no locale environment variables (the console is driven
+/// by code pages), and tmux doesn't run there.
+#[cfg(unix)]
+fn ensure_utf8_locale(builder: &mut CommandBuilder) {
+    let var = |k: &str| std::env::var(k).ok();
+    if muxel_core::locale::needs_utf8_locale(
+        var("LC_ALL").as_deref(),
+        var("LC_CTYPE").as_deref(),
+        var("LANG").as_deref(),
+    ) {
+        builder.env("LANG", muxel_core::locale::FALLBACK_UTF8_LOCALE);
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_utf8_locale(_builder: &mut CommandBuilder) {}
 
 /// Strip an AppImage runtime's environment leakage from a child command, so a
 /// shell/agent muxel spawns gets a clean system environment. No-op unless muxel

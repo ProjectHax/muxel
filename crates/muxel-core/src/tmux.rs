@@ -86,6 +86,16 @@ pub fn new_session_args(
 /// (without it, tmux never sets the emulator's mouse flag and the wheel only scrolls
 /// the local, tmux-painted screen). `-g` (global) so it applies before the session
 /// exists; it's idempotent, so re-running on every launch is harmless.
+///
+/// `-u` (a client flag, so it must lead) forces the client to write UTF-8. Without
+/// it tmux decides from `LC_ALL`/`LC_CTYPE`/`LANG`, and when those say nothing —
+/// which is exactly what a GUI app on macOS passes on, since launchd sets no
+/// locale — it downgrades every non-ASCII cell to `_` on its way to the terminal.
+/// Box-drawing and agent glyphs then arrive as garbage that no redraw can repair,
+/// because the damage is done before muxel ever sees the bytes. `LANG` is also
+/// defaulted for local children (see `muxel_core::locale`), but `-u` is what covers
+/// a *remote* pane, whose locale belongs to the far host, and a user who has
+/// deliberately set a non-UTF-8 locale.
 pub fn launch_session_args(
     session: &str,
     cwd: Option<&str>,
@@ -93,6 +103,7 @@ pub fn launch_session_args(
     args: &[String],
 ) -> Vec<String> {
     let mut v = vec![
+        "-u".to_string(),
         "set".to_string(),
         "-g".to_string(),
         "mouse".to_string(),
@@ -193,11 +204,12 @@ mod tests {
     }
 
     #[test]
-    fn launch_enables_mouse_then_creates_session() {
+    fn launch_forces_utf8_then_enables_mouse_then_creates_session() {
         let args = launch_session_args("muxel_p_123", Some("/work"), None, &[]);
         assert_eq!(
             args,
             vec![
+                "-u",
                 "set",
                 "-g",
                 "mouse",
@@ -211,5 +223,13 @@ mod tests {
                 "/work"
             ]
         );
+    }
+
+    #[test]
+    fn utf8_flag_leads_because_tmux_client_options_precede_the_command() {
+        // `tmux set -u …` would be parsed as an argument to `set` and fail; the
+        // client flag has to come before the first command.
+        let args = launch_session_args("s", None, Some("claude"), &[]);
+        assert_eq!(args.first().map(String::as_str), Some("-u"));
     }
 }

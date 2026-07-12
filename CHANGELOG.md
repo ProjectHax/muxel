@@ -11,6 +11,18 @@ All notable changes to muxel are documented here. This project adheres to
   *own* pane was a no-op when the tab was the pane's first one (the drop anchor is
   the first tab, and moving a tab beside itself bailed out). It now splits the tab
   out beside its siblings, so you can peel any tab off into a new pane in place.
+- **Garbled glyphs in tmux panes on macOS** — box-drawing and agent glyphs (an
+  agent's `⏵⏵ auto mode`, Claude's prompt box) came out as `_` or blanks, and no
+  redraw would repair them. tmux picks its UTF-8 mode from `LC_ALL`/`LC_CTYPE`/
+  `LANG`, and when those say nothing its client rewrites every non-ASCII cell as
+  `_` on the way to the terminal — so the damage was done before muxel ever saw
+  the bytes, which is why the pane content itself (`capture-pane`) was fine. macOS
+  is where it bites: a GUI app inherits no locale (`launchctl getenv LANG` is
+  empty), so a muxel opened from Finder passed none to its children. The tmux
+  client is now launched with `-u` (forced UTF-8, and it covers remote panes, whose
+  locale belongs to the far host), and local children get a UTF-8 `LANG` when they
+  would otherwise inherit no locale at all. A locale you *have* set is never
+  overridden.
 - **Dictation on a Mac with no microphone reported "microphone error: query
   default input config"** — on a machine with no audio input (a Mac mini or Mac
   Studio with nothing plugged in), CoreAudio still answers the default-input-device

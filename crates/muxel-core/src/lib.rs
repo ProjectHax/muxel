@@ -6,6 +6,7 @@ mod agent;
 mod appimage;
 pub mod diff;
 mod gui_path;
+pub mod locale;
 pub mod memory;
 mod pane;
 mod shell;

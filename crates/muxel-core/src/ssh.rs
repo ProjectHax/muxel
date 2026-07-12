@@ -549,10 +549,12 @@ mod tests {
             use_tmux: true,
             tmux_session: Some("muxel-abc123"),
         };
+        // `-u` leads the attaching client: the remote host's login shell may hand
+        // tmux no UTF-8 locale, and then it would mangle every non-ASCII cell.
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
             "tmux start-server ';' set -s exit-empty off; \
-             exec tmux set -g mouse on ';' new-session -A -s muxel-abc123 -c /srv/app -- claude"
+             exec tmux -u set -g mouse on ';' new-session -A -s muxel-abc123 -c /srv/app -- claude"
         );
     }
 
