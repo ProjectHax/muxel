@@ -4371,6 +4371,17 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// From the "New remote project" dialog: jump to Settings → Remotes with a
+    /// fresh host editor open, so a host can be added without hunting for it.
+    fn open_add_remote_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_remote_project_modal(cx);
+        if !self.show_settings {
+            self.toggle_settings(window, cx);
+        }
+        self.set_section(SettingsSection::Remotes, cx);
+        self.add_remote(window, cx);
+    }
+
     /// Verify the chosen remote directory exists (background + toast).
     fn verify_remote_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self
@@ -8758,9 +8769,7 @@ impl MuxelApp {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(t(
-                        "No SSH hosts yet. Add one in Settings → Remotes, then come back.",
-                    )),
+                    .child(t("No SSH hosts yet — add one, then come back.")),
             )
             .child(
                 div()
@@ -8777,15 +8786,12 @@ impl MuxelApp {
                             ),
                     )
                     .child(
-                        Button::new("nr-open-settings")
+                        Button::new("nr-add-host")
                             .primary()
-                            .label(t("Open Settings"))
+                            .icon(IconName::Plus)
+                            .label(t("Add host"))
                             .on_click(cx.listener(|this, _e, window, cx| {
-                                this.close_remote_project_modal(cx);
-                                if !this.show_settings {
-                                    this.toggle_settings(window, cx);
-                                }
-                                this.set_section(SettingsSection::Remotes, cx);
+                                this.open_add_remote_host(window, cx)
                             })),
                     ),
             )
@@ -8810,6 +8816,15 @@ impl MuxelApp {
                         })),
                 );
             }
+            hosts = hosts.child(
+                Button::new("nr-add-host")
+                    .ghost()
+                    .icon(IconName::Plus)
+                    .label(t("Add host"))
+                    .on_click(
+                        cx.listener(|this, _e, window, cx| this.open_add_remote_host(window, cx)),
+                    ),
+            );
             card.child(self.settings_label(&t("Host"), cx))
                 .child(hosts)
                 .child(

@@ -6,6 +6,10 @@ All notable changes to muxel are documented here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- **Add an SSH host straight from "New remote project"** — the dialog's host list
+  now ends with an **Add host** button (and the empty state leads with it) that
+  jumps to Settings → Remotes with a fresh host editor open, so you can add a host
+  without leaving to hunt through settings first.
 - **The file browser shows git status, and can stage from the tree** — every row now
   carries its git mark (`?` untracked, `A` staged, `M` modified, `D` deleted, `!`
   conflicted), and a **folder carries the strongest status beneath it**, so a
