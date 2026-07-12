@@ -28,6 +28,14 @@ All notable changes to muxel are documented here. This project adheres to
   one beside it. Sessions are attributed by their working directory, not their name
   (the name's slug may be the project's or the host's), and only muxel's own
   sessions are ever taken.
+- **Dictation tells you when the microphone is blocked, and offers a way in** — a
+  macOS app that has been denied the microphone isn't told so: CoreAudio hands it
+  silence, which muxel could only report as "no speech captured". Dictation now
+  asks macOS for the permission status up front and, when access is denied, says so
+  and offers an **Open Settings** button that opens Privacy & Security →
+  Microphone. The button appears only when the OS says access is denied — an app
+  that has never *requested* the microphone isn't listed on that screen at all, so
+  offering it for a merely-absent mic would send you to an empty list.
 
 ### Changed
 - **"Open shared memory" opens the memory panel** — the project menu item (and the
@@ -123,16 +131,6 @@ All notable changes to muxel are documented here. This project adheres to
   — connect an input device**. Dictation also fails at the moment you press the mic
   rather than after you've spoken: the device is opened up front, so a missing mic
   no longer shows "Recording…" for a capture that was never running.
-
-### Added
-- **Dictation tells you when the microphone is blocked, and offers a way in** — a
-  macOS app that has been denied the microphone isn't told so: CoreAudio hands it
-  silence, which muxel could only report as "no speech captured". Dictation now
-  asks macOS for the permission status up front and, when access is denied, says so
-  and offers an **Open Settings** button that opens Privacy & Security →
-  Microphone. The button appears only when the OS says access is denied — an app
-  that has never *requested* the microphone isn't listed on that screen at all, so
-  offering it for a merely-absent mic would send you to an empty list.
 
 ## [0.1.1] — 2026-07-11
 
