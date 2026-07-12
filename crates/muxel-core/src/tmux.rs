@@ -18,6 +18,113 @@ pub fn session_name(project: &str, instance: Uuid) -> String {
     )
 }
 
+/// Every muxel session name starts with this.
+const SESSION_PREFIX: &str = "muxel_";
+
+/// A tmux session living on a host, as reported by [`list_sessions_args`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteSession {
+    pub name: String,
+    /// The directory the session was started in. This — not the name — is what
+    /// attributes a session to a project: the name's slug is the *project's* when
+    /// the session came from a recorded name, but the *host's* when it was derived,
+    /// so the name alone can't say which project a session belongs to.
+    pub path: String,
+    /// What is running in it now (`claude`, `zsh`, …) — enough to re-adopt the
+    /// session as the right kind of pane.
+    pub command: String,
+}
+
+/// `tmux …` args listing one line per pane: session, start dir, running command.
+///
+/// `list-panes -a` rather than `list-sessions`, because only a pane knows the
+/// command running in it; [`parse_sessions`] keeps the first pane of each session.
+pub fn list_sessions_args() -> Vec<String> {
+    vec![
+        "list-panes".to_string(),
+        "-a".to_string(),
+        "-F".to_string(),
+        "#{session_name}|#{session_path}|#{pane_current_command}".to_string(),
+    ]
+}
+
+/// Parse [`list_sessions_args`] output — one [`RemoteSession`] per session, the
+/// first pane winning. Malformed lines are skipped rather than failing the lot: a
+/// host is free to have sessions muxel knows nothing about.
+pub fn parse_sessions(out: &str) -> Vec<RemoteSession> {
+    let mut sessions: Vec<RemoteSession> = Vec::new();
+    for line in out.lines() {
+        let mut fields = line.splitn(3, '|');
+        let (Some(name), Some(path), Some(command)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if name.is_empty() || sessions.iter().any(|s| s.name == name) {
+            continue;
+        }
+        sessions.push(RemoteSession {
+            name: name.to_string(),
+            path: path.to_string(),
+            command: command.to_string(),
+        });
+    }
+    sessions
+}
+
+/// muxel's sessions under `project_root` that **no instance owns** — agents still
+/// running from an earlier run, or started from the iOS app, that nothing in the
+/// workspace points at any more.
+///
+/// They are otherwise unreachable: a session is only ever found by name, from an
+/// instance, so once the instance is gone the running agent is invisible to muxel
+/// while quietly holding the host's resources. `owned` is the resolved session name
+/// ([`session_for`]) of every instance in the project.
+///
+/// Sessions outside the project's tree, and any session not started by muxel, are
+/// left strictly alone — this adopts, it never adopts *someone else's* tmux.
+pub fn orphan_sessions(
+    sessions: &[RemoteSession],
+    project_root: &str,
+    owned: &[String],
+) -> Vec<RemoteSession> {
+    sessions
+        .iter()
+        .filter(|s| s.name.starts_with(SESSION_PREFIX))
+        .filter(|s| in_tree(&s.path, project_root))
+        .filter(|s| !owned.iter().any(|o| o == &s.name))
+        .cloned()
+        .collect()
+}
+
+/// Whether `path` is `root` or sits beneath it (a worktree, say).
+fn in_tree(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    let path = path.trim_end_matches('/');
+    path == root || path.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
+}
+
+/// The tmux session an instance uses: the name **recorded on the instance** wins;
+/// a canonical name is derived from `slug` + `instance` only when it has none.
+///
+/// One rule, for every site that launches, checks, or kills a session — because the
+/// two halves disagreeing is how an instance ends up with *two* sessions on a host.
+/// muxel records `muxel_<project>_<id>` on an instance when tmux is enabled, and the
+/// iOS app launches an instance from exactly that recorded name (falling back to the
+/// canonical one when it's empty — mirror that here). A desktop that recomputed
+/// `muxel_<host>_<id>` instead would attach to neither the session iOS created nor
+/// the one it left behind itself: it would mint a fresh duplicate on every launch,
+/// and its teardown — killing the recomputed name — would never reap the session it
+/// was actually running, so the host accumulates orphans.
+///
+/// Ported to Swift as the `instance.tmuxSession ?? TmuxSession.name(…)` resolution
+/// in `TerminalPaneView` — keep both in step.
+pub fn session_for(recorded: Option<&str>, slug: &str, instance: Uuid) -> String {
+    match recorded.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(recorded) => recorded.to_string(),
+        None => session_name(slug, instance),
+    }
+}
+
 /// Arguments for `tmux …` that start the server *before* any session exists, from a
 /// command line that names no project. Run this once per host before creating the
 /// first session — locally, and on every remote host muxel or the iOS app touches.
@@ -201,6 +308,94 @@ mod tests {
     #[test]
     fn kill_uses_exact_match_target() {
         assert_eq!(kill_session_args("s"), vec!["kill-session", "-t", "=s"]);
+    }
+
+    /// The recorded name wins. muxel writes `muxel_<project>_<id>` onto an instance
+    /// when tmux is enabled, and the iOS app launches from that; a desktop that
+    /// recomputed `muxel_<host>_<id>` would attach to a *different* session and leave
+    /// the real one orphaned on the host.
+    #[test]
+    fn a_recorded_session_wins_over_a_recomputed_one() {
+        let id = Uuid::from_u128(0x1a2b3c4d_0000_0000_0000_000000000000);
+        assert_eq!(
+            session_for(Some("muxel_sro_client_1a2b3c4d"), "rhel", id),
+            "muxel_sro_client_1a2b3c4d"
+        );
+    }
+
+    /// With nothing recorded — the common remote case, where tmux comes from the
+    /// host's default rather than the instance — both clients derive the same name.
+    #[test]
+    fn without_a_recorded_session_the_canonical_name_is_derived() {
+        let id = Uuid::from_u128(0x1a2b3c4d_0000_0000_0000_000000000000);
+        assert_eq!(session_for(None, "rhel", id), "muxel_rhel_1a2b3c4d");
+        assert_eq!(session_for(Some(""), "rhel", id), "muxel_rhel_1a2b3c4d");
+        assert_eq!(session_for(Some("   "), "rhel", id), "muxel_rhel_1a2b3c4d");
+    }
+
+    fn sessions() -> Vec<RemoteSession> {
+        parse_sessions(concat!(
+            "muxel_sro_client_90f9def0|/home/ryan/Projects/sro_client|claude\n",
+            "muxel_sro_client_d0d464c4|/home/ryan/Projects/sro_client|claude\n",
+            "muxel_rhel_ae15cabf|/home/ryan/Projects/Bot/Manager|claude\n",
+            "muxel_codem_6b80c97f|/home/ryan/Projects/codem|claude\n",
+            "work|/home/ryan|zsh\n",
+        ))
+    }
+
+    #[test]
+    fn parse_keeps_the_first_pane_of_each_session() {
+        let s = parse_sessions("a|/p|claude\na|/p|node\nb|/q|zsh\ngarbage-line\n|/r|zsh\nc|/s\n");
+        assert_eq!(s.len(), 2, "one entry per session, malformed lines dropped");
+        assert_eq!(s[0].name, "a");
+        assert_eq!(s[0].command, "claude", "the first pane wins");
+        assert_eq!(s[1].path, "/q");
+    }
+
+    /// The whole point: sessions still running in this project that nothing owns.
+    #[test]
+    fn orphans_are_this_projects_unowned_muxel_sessions() {
+        let owned = vec!["muxel_sro_client_d0d464c4".to_string()];
+        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/sro_client", &owned);
+        assert_eq!(
+            orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["muxel_sro_client_90f9def0"],
+            "an owned session, another project's, and a non-muxel session are all left alone"
+        );
+        assert_eq!(orphans[0].command, "claude");
+    }
+
+    /// A session named for the *host* still belongs to whichever project it was
+    /// started in — the path decides, not the slug.
+    #[test]
+    fn a_host_named_session_is_attributed_by_its_path() {
+        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/Bot/Manager", &[]);
+        assert_eq!(
+            orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["muxel_rhel_ae15cabf"]
+        );
+    }
+
+    /// A worktree lives under the project root, and its session belongs to it. But a
+    /// sibling directory that merely shares a prefix does not.
+    #[test]
+    fn the_project_tree_includes_worktrees_but_not_prefix_siblings() {
+        let s = parse_sessions(concat!(
+            "muxel_p_00000001|/home/ryan/Projects/app/.worktrees/feat|claude\n",
+            "muxel_p_00000002|/home/ryan/Projects/app-other|claude\n",
+        ));
+        let orphans = orphan_sessions(&s, "/home/ryan/Projects/app", &[]);
+        assert_eq!(
+            orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["muxel_p_00000001"]
+        );
+    }
+
+    /// muxel adopts only its own sessions — never the user's own tmux.
+    #[test]
+    fn a_users_own_session_is_never_adopted() {
+        let s = parse_sessions("work|/home/ryan/Projects/app|vim\n");
+        assert!(orphan_sessions(&s, "/home/ryan/Projects/app", &[]).is_empty());
     }
 
     #[test]

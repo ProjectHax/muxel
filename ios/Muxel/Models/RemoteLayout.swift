@@ -26,11 +26,22 @@ struct RemoteLayout: Codable, Equatable {
     var layout: PaneNode?
     var instances: [Instance] = []
     var worktrees: [Worktree] = []
+    /// Whether the project's shared memory (`.muxel/MEMORY.md`) is switched on.
+    /// Shared state: the file lives on the host and every agent there — desktop's
+    /// panes and this app's — reads and writes the same one, so the flag travels with
+    /// the project rather than living on one machine.
+    ///
+    /// Optional, and it must be *carried through even when we don't set it*: a doc
+    /// written before the field existed says "no opinion" (desktop then infers it
+    /// from the memory file), and re-encoding without it would erase an opinion
+    /// desktop had already recorded.
+    var memoryEnabled: Bool?
 
     private enum CodingKeys: String, CodingKey {
         case version
         case updatedAt = "updated_at"
         case remoteRoot = "remote_root"
+        case memoryEnabled = "memory_enabled"
         case layout, instances, worktrees
     }
 
@@ -49,6 +60,7 @@ struct RemoteLayout: Codable, Equatable {
         layout = try c.decodeIfPresent(PaneNode.self, forKey: .layout)
         instances = (try c.decodeIfPresent([Instance].self, forKey: .instances)) ?? []
         worktrees = (try c.decodeIfPresent([Worktree].self, forKey: .worktrees)) ?? []
+        memoryEnabled = try c.decodeIfPresent(Bool.self, forKey: .memoryEnabled)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -59,6 +71,9 @@ struct RemoteLayout: Codable, Equatable {
         try c.encode(layout, forKey: .layout)
         try c.encode(instances, forKey: .instances)
         try c.encode(worktrees, forKey: .worktrees)
+        // `encodeIfPresent`: absent stays absent, so "no opinion" is preserved rather
+        // than being written back as `false`.
+        try c.encodeIfPresent(memoryEnabled, forKey: .memoryEnabled)
     }
 
     /// Whether this document is consumable for `root` (correct version + root).

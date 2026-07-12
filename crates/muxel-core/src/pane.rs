@@ -254,6 +254,16 @@ impl PaneNode {
         }
     }
 
+    /// The tabs of the pane holding `instance` (itself included), or `None` if it
+    /// isn't in this subtree. Tabs share a pane, so they share its bounds — which is
+    /// how a new tab learns the size it will be laid out at before it has been.
+    pub fn tab_group(&self, instance: Uuid) -> Option<&[Uuid]> {
+        match self {
+            PaneNode::Leaf(ld) => ld.tabs.contains(&instance).then_some(ld.tabs.as_slice()),
+            PaneNode::Split { children, .. } => children.iter().find_map(|c| c.tab_group(instance)),
+        }
+    }
+
     /// All instance ids in this subtree, in reading order (every tab of every
     /// leaf). Drives terminal spawning and the FocusNext/Prev cycle.
     pub fn collect_instances(&self) -> Vec<Uuid> {

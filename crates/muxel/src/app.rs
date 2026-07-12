@@ -1095,6 +1095,10 @@ pub struct MuxelApp {
     file_browser_input: Entity<InputState>,
     /// Cached browser rows (recomputed only on change, not per render).
     file_browser_rows: Arc<Vec<crate::filetree::Row>>,
+    /// Git status per browser row (files *and* folders — a folder carries the
+    /// strongest status beneath it), so the tree shows what git hasn't been told
+    /// about. Absolute path → the two-char porcelain XY code.
+    file_browser_status: Arc<HashMap<PathBuf, String>>,
     /// Project-memory manager modal (`.muxel/MEMORY.md`) state.
     show_memory: bool,
     memory_pid: Option<Uuid>,
@@ -1149,6 +1153,10 @@ pub struct MuxelApp {
     /// Remote projects whose layout we've reconciled with the host this session
     /// (the connect-time pull/push decision runs once each, like `memory_ensured`).
     remote_synced: HashSet<Uuid>,
+    /// Remote projects with a connect in flight. `remote_synced` can't serve here:
+    /// it isn't set until the ssh check *returns*, so two connects could otherwise
+    /// overlap — each carrying the layout it fetched before the other landed.
+    remote_connecting: HashSet<Uuid>,
     /// Last-seen layout `content_key` per remote project, to detect real changes
     /// (vs. timestamp-only churn) for the debounced push.
     layout_keys: HashMap<Uuid, String>,
@@ -2909,6 +2917,7 @@ impl MuxelApp {
             file_browser_expanded: HashSet::new(),
             file_browser_input,
             file_browser_rows: Arc::new(Vec::new()),
+            file_browser_status: Arc::new(HashMap::new()),
             show_memory: false,
             memory_pid: None,
             memory_entries: Vec::new(),
@@ -3009,6 +3018,7 @@ impl MuxelApp {
             split_even_nonce: HashMap::new(),
             memory_ensured: HashSet::new(),
             remote_synced: HashSet::new(),
+            remote_connecting: HashSet::new(),
             layout_keys: HashMap::new(),
             remote_push_due: HashMap::new(),
             focus_handle: cx.focus_handle(),
@@ -3105,6 +3115,10 @@ impl MuxelApp {
         let mut workspace = workspace;
         // Give legacy per-instance worktrees a registry entry (no-op once done).
         migrate_worktrees(&mut workspace);
+        // Repair a workspace holding two panes on one tmux session — they would
+        // mirror each other, and closing one would kill the session under the other.
+        // Normally a no-op.
+        muxel_core::dedupe_instances(&mut workspace);
         self.workspace = workspace;
         let active = self
             .workspace
@@ -3179,7 +3193,11 @@ impl MuxelApp {
     ) -> (String, Vec<String>, Vec<(String, String)>) {
         let control_path = Self::control_path_for(host.id);
         let use_tmux = host.default_use_tmux || inst.is_some_and(|i| i.use_tmux);
-        let session = inst.map(|i| muxel_core::tmux::session_name(&host.name, i.id));
+        // The session recorded on the instance wins — it is what the iOS app
+        // launches from, and what a previous run left running on the host. See
+        // `tmux::session_for`.
+        let session = inst
+            .map(|i| muxel_core::tmux::session_for(i.tmux_session.as_deref(), &host.name, i.id));
         let ssh_argv = muxel_core::ssh::ssh_args(&muxel_core::ssh::SshSpec {
             host,
             control_path: &control_path,
@@ -3505,7 +3523,19 @@ impl MuxelApp {
         // launch can be reported with the path it tried.
         let prog = spec.program.clone();
         let cwd = spec.cwd.clone().unwrap_or_default();
-        let launch = match TerminalLaunch::spawn(spec) {
+        // Open the PTY at the size this pane will actually be laid out at, so its
+        // program never has to be resized after its first paint. A `tmux attach`
+        // otherwise draws the session's long-since-painted UI at 80×24, and rights
+        // itself only when the user types. Falls back to a sibling tab's size (same
+        // pane, same bounds), then to 80×24 for a genuinely new pane — which lays out
+        // before its program has drawn anything, so a resize there costs nothing.
+        let size = self
+            .workspace
+            .instance(instance_id)
+            .and_then(|i| i.grid)
+            .or_else(|| self.sibling_grid(instance_id, cx))
+            .unwrap_or((80, 24));
+        let launch = match TerminalLaunch::spawn(spec, size) {
             Ok(launch) => launch,
             Err(e) => {
                 // Total failure — even the fallback shell couldn't spawn. Show
@@ -3640,6 +3670,16 @@ impl MuxelApp {
                 self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
                 return;
             }
+            // One connect in flight per project. A project is reached here from
+            // several places (open, focus, a respawn tick), and nothing is marked
+            // reconciled until the ssh check *returns* — so without this, a second
+            // call starts a second connect that is still carrying the layout it
+            // fetched before the first one landed. It would then tear the first's
+            // panes down (`pull_remote_layout` against a stale doc) and adopt the
+            // host's sessions a second time, giving every session two panes.
+            if !self.remote_connecting.insert(pid) {
+                return;
+            }
             // A fresh attempt hides the failure state until it fails again.
             self.remote_connect_failed.remove(&pid);
             // Pre-flight: verify login (and warm the ControlMaster) before opening.
@@ -3652,20 +3692,29 @@ impl MuxelApp {
             let loc = if first_sync { self.repo_loc(pid) } else { None };
             let host_for_err = host.clone();
             cx.spawn_in(window, async move |this, cx| {
-                let (res, fetched) = cx
+                let (res, fetched, sessions, has_memory) = cx
                     .background_executor()
                     .spawn(async move {
                         let res =
                             integrations::ssh_check(&host, &control_path, password.as_deref());
-                        let fetched = match (&res, loc) {
-                            (Ok(()), Some(loc)) => integrations::fetch_remote_layout(&loc),
-                            _ => None,
+                        let (fetched, sessions, has_memory) = match (&res, loc) {
+                            (Ok(()), Some(loc)) => (
+                                integrations::fetch_remote_layout(&loc),
+                                // Agents left running on the host with no pane are
+                                // adopted back below.
+                                integrations::list_remote_tmux_sessions(&loc),
+                                // Evidence for the shared-memory flag when the host's
+                                // doc is too old to carry one.
+                                integrations::memory_file_exists(&loc),
+                            ),
+                            _ => (None, None, false),
                         };
-                        (res, fetched)
+                        (res, fetched, sessions, has_memory)
                     })
                     .await;
                 let _ = this.update_in(cx, |this, window, cx| match res {
                     Ok(()) => {
+                        this.remote_connecting.remove(&pid);
                         this.remote_connect_failed.remove(&pid);
                         this.add_event(
                             NotifKind::Success,
@@ -3673,7 +3722,12 @@ impl MuxelApp {
                             String::new(),
                         );
                         if first_sync {
-                            this.apply_remote_layout_sync(pid, fetched, window, cx);
+                            this.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
+                            // After the sync, so a session the layout accounts for is
+                            // not adopted a second time.
+                            if let Some(sessions) = sessions {
+                                this.adopt_remote_sessions(pid, &sessions, window, cx);
+                            }
                         }
                         this.spawn_project_terminals_now(pid, window, cx);
                         // A pull may have replaced the layout (and the focused pane
@@ -3688,6 +3742,7 @@ impl MuxelApp {
                         cx.notify();
                     }
                     Err(e) => {
+                        this.remote_connecting.remove(&pid);
                         let msg = format!("{e}");
                         this.remote_connect_failed.insert(pid, msg.clone());
                         let retry = SshRetry::ConnectProject(pid);
@@ -3715,12 +3770,118 @@ impl MuxelApp {
         // Local layout-synced project: its `.muxel/workspace.json` is on this machine,
         // so reconcile it synchronously (a fast local read) before spawning panes.
         if first_sync && !is_remote {
-            let fetched = self
-                .repo_loc(pid)
-                .and_then(|loc| integrations::fetch_remote_layout(&loc));
-            self.apply_remote_layout_sync(pid, fetched, window, cx);
+            let loc = self.repo_loc(pid);
+            let fetched = loc.as_ref().and_then(integrations::fetch_remote_layout);
+            let has_memory = loc.as_ref().is_some_and(integrations::memory_file_exists);
+            self.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
         }
         self.spawn_project_terminals_now(pid, window, cx);
+    }
+
+    /// The grid of a live terminal sharing this instance's pane (a sibling tab).
+    /// Tabs share a pane, so they share its bounds: this is exactly the size the new
+    /// pane will render at, known before it has ever been laid out.
+    fn sibling_grid(&self, iid: Uuid, cx: &App) -> Option<(u16, u16)> {
+        let project = self
+            .workspace
+            .instance(iid)
+            .and_then(|i| self.workspace.project(i.project_id))?;
+        let tabs = project.layout.as_ref()?.tab_group(iid)?;
+        tabs.iter()
+            .filter(|t| **t != iid)
+            .find_map(|t| self.terminals.get(t))
+            .map(|view| view.read(cx).session().size())
+    }
+
+    /// Re-attach panes to muxel sessions still running on `pid`'s host that no
+    /// instance owns.
+    ///
+    /// A session is only ever reachable *through* an instance — muxel asks for it by
+    /// name — so an instance that goes away (closed, or lost with its workspace)
+    /// strands the agent still running inside it: invisible to muxel, and holding the
+    /// host's resources indefinitely. Opening the project adopts those back into
+    /// panes. `new-session -A` then attaches to the live session rather than starting
+    /// anything, so the agent is picked up mid-conversation, exactly where it was.
+    ///
+    /// Only muxel's own sessions, started in this project's tree, are ever taken —
+    /// see `tmux::orphan_sessions`.
+    fn adopt_remote_sessions(
+        &mut self,
+        pid: Uuid,
+        sessions: &[muxel_core::tmux::RemoteSession],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
+        let Some(root) = project.remote.as_ref().map(|r| r.remote_root.clone()) else {
+            return;
+        };
+        let host_name = project
+            .remote
+            .as_ref()
+            .and_then(|r| self.remotes.iter().find(|h| h.id == r.host_id))
+            .map(|h| h.name.clone())
+            .unwrap_or_default();
+        let owned: Vec<String> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|i| i.project_id == pid)
+            .map(|i| muxel_core::tmux::session_for(i.tmux_session.as_deref(), &host_name, i.id))
+            .collect();
+
+        let orphans = muxel_core::tmux::orphan_sessions(sessions, &root, &owned);
+        if orphans.is_empty() {
+            return;
+        }
+        let adopted = orphans.len();
+        // Each adopted pane joins the project's existing pane as a tab. Without an
+        // anchor, `PlacementMode::Tab` has nothing to attach to: only the first
+        // (which seeds an empty project) would enter the layout, and the rest would
+        // exist as instances with a live terminal but no pane — invisible, while
+        // still holding a client on the session.
+        let mut anchor = self.workspace.project(pid).and_then(|p| p.first_instance());
+        for session in orphans {
+            // Come back as the agent that is actually running in there (`claude`,
+            // `zsh`, …), so the pane reads and behaves like the one that was lost.
+            let preset = self
+                .presets
+                .iter()
+                .find(|p| {
+                    p.kind == muxel_core::PresetKind::Terminal
+                        && p.program.as_deref() == Some(session.command.as_str())
+                })
+                .cloned()
+                .unwrap_or_else(AgentPreset::shell);
+            let mut instance = Instance::from_preset(pid, &preset);
+            // The binding that makes this an *adoption*: `place_and_spawn` keeps a
+            // pre-set session, and the launch resolves to it (`tmux::session_for`).
+            instance.tmux_session = Some(session.name.clone());
+            let iid = instance.id;
+            // Its worktree (if it had one) is the session's business, not ours — the
+            // pane attaches to a running shell, so muxel must not create one here.
+            self.place_and_spawn(
+                pid,
+                instance,
+                PlacementMode::Tab,
+                anchor,
+                Some(WorktreeChoice::None),
+                window,
+                cx,
+            );
+            // The first adopted pane seeds an empty project; the rest tab onto it.
+            anchor.get_or_insert(iid);
+        }
+        self.add_event(
+            NotifKind::Success,
+            tf(
+                "Attached {n} running session(s)",
+                &[("n", &adopted.to_string())],
+            ),
+            t("Agents were still running on the host with no pane — they're back.").to_string(),
+        );
     }
 
     /// Every tmux session muxel has launched, `(project, session, is_remote)` —
@@ -3730,12 +3891,24 @@ impl MuxelApp {
             .instances
             .iter()
             .filter_map(|i| {
-                let s = i.tmux_session.clone()?;
-                let remote = self
-                    .workspace
-                    .project(i.project_id)
-                    .is_some_and(|p| p.is_remote());
-                Some((i.project_id, s, remote))
+                let project = self.workspace.project(i.project_id)?;
+                let host = project
+                    .remote
+                    .as_ref()
+                    .and_then(|r| self.remotes.iter().find(|h| h.id == r.host_id));
+                match host {
+                    // A remote instance usually carries no *recorded* session — it
+                    // runs under tmux because its host defaults to it — so resolve the
+                    // name the pane was launched with rather than skipping it, which
+                    // would leave the session alive on the host forever.
+                    Some(host) if host.default_use_tmux || i.use_tmux => Some((
+                        i.project_id,
+                        muxel_core::tmux::session_for(i.tmux_session.as_deref(), &host.name, i.id),
+                        true,
+                    )),
+                    Some(_) => None,
+                    None => Some((i.project_id, i.tmux_session.clone()?, false)),
+                }
             })
             .collect()
     }
@@ -5299,6 +5472,28 @@ impl MuxelApp {
     /// the agent's deliberate "I need you" signal (e.g. Claude on a permission
     /// prompt), so it's precise — no guessing from idle time.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Remember the grid each pane settled at, so a restart respawns its program
+        // already at the right size instead of resizing it after its first paint —
+        // which a re-attached tmux session shows as visibly wrong spacing until the
+        // user types (see `Instance::grid`).
+        let sizes: Vec<(Uuid, (u16, u16))> = self
+            .terminals
+            .iter()
+            .map(|(iid, view)| (*iid, view.read(cx).session().size()))
+            .collect();
+        let mut resized = false;
+        for (iid, size) in sizes {
+            if let Some(inst) = self.workspace.instance_mut(iid)
+                && inst.grid != Some(size)
+            {
+                inst.grid = Some(size);
+                resized = true;
+            }
+        }
+        if resized {
+            self.persist();
+        }
+
         // Keep browser panes' URL fresh (the user clicks links inside the
         // webview): syncs the address bar, tab label, and the persisted
         // `Instance.browser_url` so a restart restores where they ended up.
@@ -6117,7 +6312,11 @@ impl MuxelApp {
         // tmux sessions and worktrees are terminal-only concerns — a browser pane
         // gets neither.
         if kind == InstanceKind::Terminal {
-            instance.use_tmux = self.use_tmux && self.tmux_available;
+            // An adopted pane arrives already bound to a session running on a host.
+            // Keep that binding — and keep tmux on — instead of letting the toolbar
+            // toggle re-decide and mint a second session beside the live one.
+            let adopted = instance.tmux_session.is_some();
+            instance.use_tmux = adopted || (self.use_tmux && self.tmux_available);
 
             // Decide the worktree: explicit (duplicate/resume) wins; otherwise a new
             // tab OR split inherits the worktree of the pane it joins, if it has one;
@@ -6138,7 +6337,7 @@ impl MuxelApp {
             });
             self.apply_worktree_choice(pid, &mut instance, choice);
 
-            if instance.use_tmux {
+            if instance.use_tmux && !adopted {
                 let project_name = self
                     .workspace
                     .project(pid)
@@ -6900,7 +7099,7 @@ impl MuxelApp {
             PaletteCommand::OpenSettings => self.toggle_settings(window, cx),
             PaletteCommand::OpenMemory => {
                 if let Some(pid) = self.workspace.active_project {
-                    self.open_project_memory(pid, window, cx);
+                    self.open_memory_panel(pid, window, cx);
                 }
             }
             PaletteCommand::RunRunner(i) => self.run_runner(i, String::new(), window, cx),
@@ -7397,15 +7596,12 @@ impl MuxelApp {
         iid: Uuid,
         project_id: Uuid,
         use_tmux: bool,
-        local_session: Option<String>,
+        // The session name recorded on the instance, if it had one (`tmux_session`).
+        recorded_session: Option<String>,
         worktree_path: Option<PathBuf>,
         worktree_id: Option<Uuid>,
         cx: &mut Context<Self>,
     ) {
-        // Local tmux session.
-        if let Some(session) = local_session {
-            integrations::kill_tmux_session(&session);
-        }
         // Remote tmux session: closing a pane always tears its session down —
         // a *dropped* SSH connection never reaches here (an abnormal exit leaves
         // a tombstone pane instead of auto-closing), so reconnectability is
@@ -7422,8 +7618,18 @@ impl MuxelApp {
                     .map(|h| h.effective(&self.identities))
             })
             .filter(|host| host.default_use_tmux || use_tmux);
+        // A remote instance's session lives on the host, not here; killing the
+        // recorded name locally would be a no-op at best.
+        if remote_host.is_none()
+            && let Some(session) = recorded_session.clone()
+        {
+            integrations::kill_tmux_session(&session);
+        }
         if let Some(host) = remote_host {
-            let session = muxel_core::tmux::session_name(&host.name, iid);
+            // The same name the pane was launched with — a recomputed one would
+            // leave the session it was actually running alive on the host forever.
+            let session =
+                muxel_core::tmux::session_for(recorded_session.as_deref(), &host.name, iid);
             let control_path = Self::control_path_for(host.id);
             let password = (host.auth == SshAuth::Password)
                 .then(|| self.remote_password(&host))
@@ -7864,6 +8070,14 @@ impl MuxelApp {
             cx.notify();
             return;
         }
+        self.open_memory_panel(pid, window, cx);
+    }
+
+    /// Show `pid`'s memory in the docked panel (beside the sidebar).
+    ///
+    /// Idempotent, unlike [`Self::toggle_memory_panel`]: asking to *open* memory that
+    /// is already open must leave it open, not close it.
+    fn open_memory_panel(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.show_memory = true;
         self.show_file_browser = false; // the two docked panels share the slot
         self.memory_pid = Some(pid);
@@ -8136,6 +8350,9 @@ impl MuxelApp {
         &mut self,
         pid: Uuid,
         fetched: Option<String>,
+        // Whether the host actually has a `.muxel/MEMORY.md` — the fallback for a
+        // doc written before `memory_enabled` was part of it.
+        has_memory: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8157,6 +8374,10 @@ impl MuxelApp {
             .as_deref()
             .and_then(|j| RemoteLayout::parse(j, &layout_root));
 
+        // Whether the stored doc says anything about shared memory. A doc from before
+        // the field existed says nothing — see below.
+        let recorded_memory = remote.as_ref().and_then(|r| r.memory_enabled);
+
         match remote {
             // Remote is strictly newer and actually different → adopt it.
             Some(r) if r.updated_at > local_rev && r.content_key() != local_key => {
@@ -8171,6 +8392,23 @@ impl MuxelApp {
                 self.layout_keys.insert(pid, local_key);
                 self.remote_push_due.insert(pid, Instant::now());
             }
+        }
+
+        // Shared memory belongs to the project, not to one machine: the file lives at
+        // the root and every agent working there shares it. When the doc records the
+        // flag, the pull above has already applied it. When it doesn't — a doc written
+        // before the flag existed — fall back to the plain evidence: a project whose
+        // root *has* a memory file is one whose memory is in use, and showing the
+        // toggle off there is simply wrong. Recording it now gives every peer the
+        // opinion the doc was missing.
+        if recorded_memory.is_none()
+            && has_memory
+            && let Some(project) = self.workspace.project_mut(pid)
+            && !project.memory_enabled
+        {
+            project.memory_enabled = true;
+            self.persist();
+            self.remote_push_due.insert(pid, Instant::now());
         }
     }
 
@@ -8210,8 +8448,17 @@ impl MuxelApp {
             mut instances,
             mut worktrees,
             updated_at,
+            memory_enabled,
             ..
         } = remote;
+        // Shared memory is the host's state, not this machine's: the memory file
+        // lives there and every agent on it shares the one file. A doc written
+        // before the field existed has no opinion, and leaves the local flag alone.
+        if let Some(enabled) = memory_enabled
+            && let Some(project) = self.workspace.project_mut(pid)
+        {
+            project.memory_enabled = enabled;
+        }
         for inst in &mut instances {
             inst.project_id = pid;
         }
@@ -11758,6 +12005,7 @@ impl MuxelApp {
         self.file_browser_pid = Some(pid);
         self.file_browser_files = Vec::new();
         self.file_browser_rows = Arc::new(Vec::new());
+        self.file_browser_status = Arc::new(HashMap::new());
         let root = self.browser_root(pid);
         // Remote projects list over SSH (`git ls-files`/`find`); local walk otherwise.
         let remote_loc = self
@@ -11766,6 +12014,9 @@ impl MuxelApp {
             .is_some_and(|p| p.is_remote())
             .then(|| self.repo_loc(pid))
             .flatten();
+        // The repo the rows live in, for their git marks — resolves local or remote.
+        let git_loc = self.repo_loc(pid);
+        let status_root = root.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
             let files: Vec<PathBuf> = if let Some(loc) = remote_loc {
                 cx.background_executor()
@@ -11788,9 +12039,74 @@ impl MuxelApp {
                     cx.notify();
                 }
             });
+            // Status second, so the tree appears at once and then gets its marks.
+            let status = cx
+                .background_executor()
+                .spawn(async move {
+                    let Some(loc) = git_loc else {
+                        return HashMap::new();
+                    };
+                    let changes: Vec<(PathBuf, String)> = integrations::git_status_files(&loc)
+                        .into_iter()
+                        .map(|c| (status_root.join(&c.path), c.status))
+                        .collect();
+                    crate::filetree::status_index(&changes, &status_root)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.file_browser_pid == Some(pid) {
+                    this.file_browser_status = Arc::new(status);
+                    cx.notify();
+                }
+            });
         })
         .detach();
         cx.notify();
+    }
+
+    /// Stage `abs` (`git add`) from the file browser — a folder stages everything
+    /// under it — then reload so the row's mark reflects it.
+    fn git_add_from_browser(&mut self, abs: PathBuf, cx: &mut Context<Self>) {
+        let Some(pid) = self.file_browser_pid else {
+            return;
+        };
+        let Some(loc) = self.repo_loc(pid) else {
+            return;
+        };
+        let root = self.browser_root(pid);
+        // git wants a path relative to the repo root — and a remote project's rows are
+        // paths on the *host*, which would never resolve here anyway.
+        let rel = abs
+            .strip_prefix(&root)
+            .unwrap_or(&abs)
+            .to_string_lossy()
+            .to_string();
+        let name = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| rel.clone());
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { integrations::git_add_paths(&loc, &[rel]) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.add_event(
+                        NotifKind::Success,
+                        tf("Added “{name}” to git", &[("name", &name)]),
+                        String::new(),
+                    ),
+                    Err(e) => this.add_event(NotifKind::Error, t("git add"), format!("{e:#}")),
+                }
+                // Re-read status either way: a partial add still moved something.
+                if let Some(pid) = this.file_browser_pid {
+                    this.load_file_browser(pid, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Recompute the cached browser rows (tree or flat search) — called only when
@@ -11883,12 +12199,40 @@ impl MuxelApp {
             .and_then(|pid| self.workspace.project(pid))
             .is_some_and(|p| p.is_remote());
 
+        // Git marks for the rows: which files git hasn't been told about, which are
+        // modified, which are staged — folders included (see `filetree::status_index`).
+        let status = self.file_browser_status.clone();
+        let glyph_colors: HashMap<&'static str, Hsla> = ["?", "A", "M", "D", "R", "C", "!", "·"]
+            .into_iter()
+            .map(|g| {
+                let kind = match g {
+                    "?" => GlyphKind::Untracked,
+                    "A" => GlyphKind::Added,
+                    "M" => GlyphKind::Modified,
+                    "D" => GlyphKind::Deleted,
+                    "R" => GlyphKind::Renamed,
+                    "!" => GlyphKind::Conflict,
+                    _ => GlyphKind::Other,
+                };
+                (g, kind.to_color(cx))
+            })
+            .collect();
+
         let list = uniform_list("fb-rows", rows.len(), move |range, window, _cx| {
             range
                 .map(|i| {
                     let row = &rows[i];
                     let abs = row.abs_path.clone();
                     let is_dir = row.is_dir;
+                    // The row's git status, if git has anything to say about it.
+                    let xy = status.get(&abs).cloned();
+                    // Something to stage: untracked, or changed in the worktree. An
+                    // already-staged file (`M `/`A `) has nothing left to add.
+                    let stageable = xy.as_deref().is_some_and(|xy| {
+                        xy.starts_with('?') || xy.chars().nth(1).is_some_and(|y| y != ' ')
+                    });
+                    let mark = xy.as_deref().map(git_status_glyph_label).map(|(g, _)| g);
+                    let mark_color = mark.and_then(|g| glyph_colors.get(g).copied());
                     let indent = px(6.0 + row.depth as f32 * 12.0);
                     let base = div()
                         .id(("fb-row", i))
@@ -11971,6 +12315,14 @@ impl MuxelApp {
                                 .text_ellipsis()
                                 .child(row.name.clone()),
                         )
+                        .children(mark.map(|g| {
+                            div()
+                                .flex_none()
+                                .pl_1()
+                                .text_xs()
+                                .text_color(mark_color.unwrap_or(muted))
+                                .child(g)
+                        }))
                         .context_menu({
                             let entity = entity.clone();
                             move |menu, window, _cx| {
@@ -12017,6 +12369,24 @@ impl MuxelApp {
                                                 },
                                             )),
                                     );
+                                }
+                                if stageable {
+                                    let add_abs = abs.clone();
+                                    menu =
+                                        menu.separator().item(
+                                            PopupMenuItem::new(if is_dir {
+                                                t("Add folder to git")
+                                            } else {
+                                                t("Add to git")
+                                            })
+                                            .icon(IconName::Plus)
+                                            .on_click(window.listener_for(
+                                                &entity,
+                                                move |this, _e, _w, cx| {
+                                                    this.git_add_from_browser(add_abs.clone(), cx)
+                                                },
+                                            )),
+                                        );
                                 }
                                 menu = menu.item(
                                     PopupMenuItem::new(t("Open in terminal"))
@@ -14557,11 +14927,11 @@ impl MuxelApp {
                                 .separator()
                                 .item(
                                     PopupMenuItem::new(t("Open shared memory"))
-                                        .icon(IconName::File)
+                                        .icon(IconName::Star)
                                         .on_click(window.listener_for(
                                             &entity,
                                             move |this, _, window, cx| {
-                                                this.open_project_memory(pid, window, cx)
+                                                this.open_memory_panel(pid, window, cx)
                                             },
                                         )),
                                 )
@@ -21016,13 +21386,28 @@ impl MuxelApp {
     }
 }
 
+/// Cap on how many files one project lists. The old 10k silently cut real repos
+/// off — a folder whose files all fell past the cut simply vanished from the tree,
+/// which reads as "the browser is missing things" rather than "it stopped counting".
+pub(crate) const MAX_PROJECT_FILES: usize = 100_000;
+
 /// List files under `root`, gitignore-aware, capped to keep the palette snappy.
+///
+/// `hidden(false)` because dotfiles *are* project files — `.github`, `.cargo`,
+/// `.gitignore`, `.muxel` — and skipping them (the `ignore` crate's default) left
+/// the local browser silently missing every dot-folder, while a remote project, which
+/// lists with `git ls-files`, showed them all along. `.git` stays out: it's plumbing,
+/// and it's enormous.
 fn list_project_files(root: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for entry in ignore::WalkBuilder::new(root).build().flatten() {
+    let walk = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build();
+    for entry in walk.flatten() {
         if entry.file_type().is_some_and(|t| t.is_file()) {
             out.push(entry.into_path());
-            if out.len() >= 10_000 {
+            if out.len() >= MAX_PROJECT_FILES {
                 break;
             }
         }
@@ -21508,5 +21893,53 @@ mod dev_log_tests {
             "[12:34:56] ERROR Launch failed: claude\n    tried `claude` in `/tmp`\n    \
              No such file or directory (os error 2)"
         );
+    }
+}
+
+#[cfg(test)]
+mod file_walk_tests {
+    use super::list_project_files;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// The file browser lists a project's files, and dotfiles are project files:
+    /// `.github`, `.cargo`, `.gitignore`. Skipping them (the `ignore` crate's
+    /// default) left the local browser missing every dot-folder while a *remote*
+    /// project — listed with `git ls-files` — showed them all along.
+    #[test]
+    fn dotfiles_are_listed_while_git_plumbing_and_ignored_files_are_not() {
+        let root = std::env::temp_dir().join(format!("muxel-walk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".github/workflows")).expect("mkdir");
+        fs::create_dir_all(root.join(".git")).expect("mkdir");
+        fs::create_dir_all(root.join("target")).expect("mkdir");
+        fs::write(root.join(".gitignore"), "target\n").expect("write");
+        fs::write(root.join(".github/workflows/ci.yml"), "").expect("write");
+        fs::write(root.join(".git/config"), "").expect("write");
+        fs::write(root.join("target/junk.o"), "").expect("write");
+        fs::write(root.join("main.rs"), "").expect("write");
+
+        let listed: Vec<PathBuf> = list_project_files(&root)
+            .iter()
+            .map(|p| p.strip_prefix(&root).unwrap_or(p).to_path_buf())
+            .collect();
+        let has = |p: &str| listed.iter().any(|l| l == Path::new(p));
+
+        assert!(has(".gitignore"), "dotfiles are project files: {listed:?}");
+        assert!(
+            has(".github/workflows/ci.yml"),
+            "so are dot-folders: {listed:?}"
+        );
+        assert!(has("main.rs"), "and ordinary files, obviously: {listed:?}");
+        assert!(
+            !listed.iter().any(|l| l.starts_with(".git/")),
+            "but git's own plumbing stays out: {listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|l| l.starts_with("target")),
+            "and the tree stays gitignore-aware: {listed:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

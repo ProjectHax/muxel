@@ -5,7 +5,84 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **The file browser shows git status, and can stage from the tree** — every row now
+  carries its git mark (`?` untracked, `A` staged, `M` modified, `D` deleted, `!`
+  conflicted), and a **folder carries the strongest status beneath it**, so a
+  collapsed folder still tells you something inside it has never been added. Right-
+  click a row with anything to stage for **Add to git**; on a folder it stages
+  everything under it. Local and remote alike — for a remote project the `git add`
+  runs on the host.
+- **Remote projects pick their running agents back up** — a tmux session is only
+  ever reachable *through* an instance, by name, so an instance that goes away
+  strands the agent still running inside it: invisible to muxel, holding the host's
+  resources, and impossible to get back. Opening a remote project now lists muxel's
+  sessions on the host and re-attaches a pane to any in that project's tree that no
+  instance owns, resuming the agent mid-conversation instead of starting a second
+  one beside it. Sessions are attributed by their working directory, not their name
+  (the name's slug may be the project's or the host's), and only muxel's own
+  sessions are ever taken.
+
+### Changed
+- **"Open shared memory" opens the memory panel** — the project menu item (and the
+  command palette's *Open memory*) opened `MEMORY.md` as raw markdown in an editor
+  pane. Both now open the docked memory panel beside the sidebar, where entries are
+  listed, searchable, pinnable, and editable. The raw file is still one click away,
+  from the panel's own "Open MEMORY.md in editor" button.
+
 ### Fixed
+- **The file browser hid every dot-folder on a local project, and truncated big
+  trees** — dotfiles *are* project files (`.github`, `.cargo`, `.gitignore`,
+  `.muxel`), but the local walk used the `ignore` crate's default of skipping hidden
+  entries, so none of them appeared — while the same project opened over SSH, listed
+  with `git ls-files`, showed them all along. (On muxel's own repo: 249 files locally
+  vs 255 remotely.) Both sides now list them, and `.git` itself stays out. The
+  per-project cap also rose from 10,000 files to 100,000: past the old limit a folder
+  whose files all fell beyond the cut simply vanished, which reads as a broken browser
+  rather than a limit. The tree is still gitignore-aware, as documented.
+- **Shared memory showed as off on a remote project that was plainly using it** —
+  `.muxel/MEMORY.md` lives at the project root on the host, and every agent working
+  there (desktop's panes, the iOS app's) reads and writes that one file — but the
+  *enabled* flag never left the machine it was switched on from. So a project whose
+  host had shared memory in active use still showed the toggle off elsewhere. The
+  flag now travels with the project in the layout doc peers already exchange, and a
+  doc written before it existed says "no opinion" rather than "off" — muxel then
+  infers it from the evidence (the host has a memory file, so memory is in use) and
+  records the answer for every peer. iOS carries the field through untouched, so it
+  can't erase an opinion desktop recorded.
+- **A re-attached tmux pane opened with mangled spacing until you typed** — the PTY
+  was always opened at 80×24 and only resized once the pane had been laid out. A
+  program starting fresh doesn't care (it draws after the resize), but a `tmux
+  attach` does: the session's agent painted its UI long ago, so tmux replays it at
+  80×24, and the agent redraws only when something prompts it to — a keystroke. Panes
+  now remember the grid they last rendered at and reopen at that size, so nothing has
+  to resize after the first paint. A new tab takes its size from the pane it joins
+  (tabs share bounds), which also covers a session adopted from a host.
+- **Remote panes made a new tmux session every launch instead of re-attaching, and
+  orphaned the old one** — an instance's session name was resolved two different
+  ways. When tmux is enabled muxel *records* `muxel_<project>_<id>` on the instance,
+  and the iOS app launches from exactly that recorded name; the desktop's remote
+  path ignored it and recomputed `muxel_<host>_<id>`. So the same instance ran under
+  two names: the desktop attached to neither the session iOS had created nor the one
+  it had left behind itself, minting a duplicate each time — and its teardown, which
+  killed the *recomputed* name, never reaped the session it was actually running, so
+  they piled up on the host. Every site that launches, checks or kills a session now
+  resolves it one way (`tmux::session_for`): the name recorded on the instance wins,
+  and a canonical one is derived only when it has none — the same rule iOS follows.
+  Quit-time cleanup also no longer skips remote panes that inherit tmux from the
+  host default rather than carrying a recorded name.
+- **A remote agent pane connected, then instantly quit with `[exited]`** — while a
+  remote *shell* pane worked fine. tmux `execvp`s the program it is given with the
+  environment of the tmux **server**, which on a remote host is forked from a
+  non-interactive ssh command — so its `PATH` is sshd's bare default
+  (`/usr/local/bin:/usr/bin:…`). Agents live in a user prefix (`~/.local/bin`, an
+  nvm dir) that only a shell profile adds, so `-- claude` died with ENOENT the
+  moment the pane opened: the window closed, the session died with it, and ssh
+  exited 0 — which muxel read as "finished cleanly" and auto-closed the pane. A
+  shell pane escaped it because tmux starts *its* default shell as a login shell.
+  Remote programs now run through the user's login shell (`$SHELL -ilc 'exec …'`),
+  resolving on the same `PATH` they'd get on that host by hand — the fix the iOS app
+  already carried. Applies to remote panes with and without tmux.
 - **Every remote action failed on macOS with "keyword controlpath extra arguments
   at end of line"** — scanning a host for projects, remote panes, remote git. ssh
   reads each `-o` argument as a line of `ssh_config` and splits the value on

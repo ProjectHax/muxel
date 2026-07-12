@@ -104,6 +104,16 @@ pub struct Instance {
     /// tmux session name, once created.
     #[serde(default)]
     pub tmux_session: Option<String>,
+    /// The grid `(cols, rows)` this pane last rendered at, so it can respawn at the
+    /// size it will actually be laid out at instead of the 80×24 default.
+    ///
+    /// A program that starts at the wrong size and is resized after its first paint
+    /// redraws only when something prompts it to. A `tmux attach` shows this off
+    /// badly: the session's agent painted its UI long ago, so the pane opens visibly
+    /// mis-spaced and only rights itself when the user types. Starting at the right
+    /// size means nothing has to resize at all.
+    #[serde(default)]
+    pub grid: Option<(u16, u16)>,
     /// Worktree directory, once created (becomes this instance's working dir).
     #[serde(default)]
     pub worktree_path: Option<std::path::PathBuf>,
@@ -166,6 +176,7 @@ impl Instance {
             use_tmux: false,
             use_worktree: false,
             tmux_session: None,
+            grid: None,
             worktree_path: None,
             worktree_branch: None,
             auto_mode_presses: 0,
@@ -225,6 +236,7 @@ impl Instance {
             use_tmux: false,
             use_worktree: false,
             tmux_session: None,
+            grid: None,
             worktree_path: None,
             worktree_branch: None,
             auto_mode_presses: 0,
@@ -626,6 +638,20 @@ pub struct RemoteLayout {
     pub instances: Vec<Instance>,
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
+    /// Whether the project's shared memory (`.muxel/MEMORY.md`) is switched on.
+    ///
+    /// Shared state, not local preference: the memory file lives on the host and
+    /// every agent on it — from this desktop, another machine, or the iOS app —
+    /// reads and writes the same one. Left out of the doc, each client kept its own
+    /// idea of whether memory was on, so a project whose host plainly *has* shared
+    /// memory in use still showed the toggle as off wherever it hadn't been switched
+    /// on by hand.
+    ///
+    /// `Option` so a doc written before this field existed says "no opinion" rather
+    /// than "off" — otherwise the first sync from an older peer would quietly switch
+    /// memory off for everyone.
+    #[serde(default)]
+    pub memory_enabled: Option<bool>,
 }
 
 impl RemoteLayout {
@@ -665,6 +691,7 @@ impl RemoteLayout {
             layout: project.layout.clone(),
             instances,
             worktrees,
+            memory_enabled: Some(project.memory_enabled),
         }
     }
 
@@ -689,8 +716,96 @@ impl RemoteLayout {
             "layout": self.layout,
             "instances": self.instances,
             "worktrees": self.worktrees,
+            // In the key, so flipping the toggle counts as a change and is pushed to
+            // the host rather than sitting on one machine.
+            "memory_enabled": self.memory_enabled,
         })
         .to_string()
+    }
+}
+
+/// Drop instances that duplicate another one — the same id twice, or a second
+/// instance bound to a tmux session another already owns — removing them from the
+/// layout as well. The first of each wins.
+///
+/// Two panes on one tmux session are never right: both attach as clients to the
+/// same terminal, so they mirror each other keystroke for keystroke while muxel
+/// treats them as separate agents (and closing one kills the session under the
+/// other). Run on load, so a workspace that got into this state is repaired rather
+/// than reproducing it every launch.
+pub fn dedupe_instances(workspace: &mut Workspace) {
+    use std::collections::HashSet;
+    let mut seen_ids: HashSet<Uuid> = HashSet::new();
+    let mut seen_sessions: HashSet<(Uuid, String)> = HashSet::new();
+    let mut kept: Vec<Instance> = Vec::with_capacity(workspace.instances.len());
+    // Instances dropped as duplicates, whose panes must also leave the layout. An
+    // instance repeated under the *same* id is not in here: the copy we keep still
+    // answers to that id, so its pane stays valid.
+    let mut unlink: Vec<Uuid> = Vec::new();
+
+    for inst in std::mem::take(&mut workspace.instances) {
+        if !seen_ids.insert(inst.id) {
+            continue; // the same row twice — the kept copy already covers its pane
+        }
+        let claim = inst
+            .tmux_session
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .map(|s| (inst.project_id, s.clone()));
+        // A tmux session is claimed by exactly one instance per project.
+        if claim.is_some_and(|c| !seen_sessions.insert(c)) {
+            unlink.push(inst.id);
+            continue;
+        }
+        kept.push(inst);
+    }
+    workspace.instances = kept;
+    for id in unlink {
+        for project in &mut workspace.projects {
+            pane::remove(&mut project.layout, id);
+        }
+    }
+
+    // An instance can also appear *twice in the layout* — one pane per tab, both
+    // spawning a terminal, both attaching to its session. `pane::remove` takes the
+    // first occurrence it finds, so one call per surplus tab leaves exactly one.
+    for project in &mut workspace.projects {
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        let surplus: Vec<Uuid> = project
+            .instances()
+            .into_iter()
+            .filter(|id| !seen.insert(*id))
+            .collect();
+        for id in surplus {
+            pane::remove(&mut project.layout, id);
+        }
+    }
+
+    // And the mirror image: an instance the layout never got. It is invisible — no
+    // pane shows it and none can close it — while still owning its tmux session, so
+    // it can't even be re-adopted (the session counts as taken). Give it a pane back.
+    for project in &mut workspace.projects {
+        let placed: HashSet<Uuid> = project.instances().into_iter().collect();
+        let missing: Vec<Uuid> = workspace
+            .instances
+            .iter()
+            .filter(|i| i.project_id == project.id && !placed.contains(&i.id))
+            .map(|i| i.id)
+            .collect();
+        for id in missing {
+            match project.first_instance() {
+                Some(anchor) => {
+                    pane::add_tab(&mut project.layout, anchor, id);
+                }
+                // An empty project: this instance seeds the layout.
+                None => {
+                    project.layout = Some(PaneNode::Leaf(LeafData {
+                        tabs: vec![id],
+                        active: 0,
+                    }))
+                }
+            }
+        }
     }
 }
 

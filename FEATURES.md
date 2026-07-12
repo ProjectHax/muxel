@@ -337,6 +337,12 @@ feature is added or changed, update the matching entry here in the same change**
   tree with a search box; click a file to open it in an editor. Resizable; width
   persists. Right-click a row for: copy path, copy relative path, reveal in the OS
   file manager, rename on disk, and open a terminal in that directory.
+- **Git marks in the browser** — each row carries its git status: `?` for a file git
+  hasn't been told about, `A` staged, `M` modified, `D` deleted, `!` conflicted.
+  Folders carry the strongest status beneath them, so a collapsed folder still shows
+  that something inside is unadded. Right-click anything with something to stage for
+  **Add to git** (a folder stages everything under it) — works on remote projects
+  too, where the `git add` runs on the host.
 - **Markdown & image rendering** — `.md`/`.markdown` files render as formatted
   markdown and image files (`png`, `jpg`, `gif`, `webp`, `bmp`, `svg`, …) render as
   images, both by default, with a header **Raw / Rendered** toggle to view the
@@ -418,6 +424,14 @@ feature is added or changed, update the matching entry here in the same change**
   optionally verify it). Shells and agents then run on the remote, in a pane that
   behaves exactly like a local one. Local muxel still owns the UI, layout, and
   settings.
+- **Running agents are picked back up** — opening a remote project looks for muxel
+  tmux sessions still alive on the host in that project's tree, and re-attaches a
+  pane to any the workspace no longer has an instance for. An agent whose pane was
+  closed (or whose workspace was lost) keeps running on the host with nothing
+  pointing at it; this brings it back mid-conversation, exactly where it was,
+  rather than starting a second one beside it. It adopts only muxel's own sessions,
+  only within the project, and never one a pane already owns — your own tmux is left
+  alone.
 - **Scan for remote projects** — in the new-remote-project wizard, "Scan for
   projects" searches the host for existing muxel projects (`.muxel/workspace.json`
   markers, heavy dirs pruned) and lists the found roots; clicking one fills in the

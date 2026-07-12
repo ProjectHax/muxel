@@ -318,14 +318,48 @@ pub struct SshSpec<'a> {
     pub tmux_session: Option<&'a str>,
 }
 
+/// A remote *program* — run through the user's login+interactive shell.
+///
+/// Handed to ssh or to tmux directly, a program is `exec`'d with the environment of
+/// a non-interactive ssh command, whose `PATH` is sshd's bare default
+/// (`/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin`). Agents don't live there —
+/// they sit in a user prefix (`~/.local/bin`, an nvm/npm-global dir) that only the
+/// user's shell profile adds. So `-- claude` dies with ENOENT the instant the pane
+/// starts: tmux closes the window, the session dies with it, and the pane shows
+/// `[exited]` — with a clean exit 0, which then reads as "the process finished".
+///
+/// A *shell* pane never hit this, which is what makes the bug look so odd: with no
+/// program, tmux starts its own default shell as a login shell and the profile runs.
+///
+/// So give a program the same footing: `$SHELL -ilc 'exec <program> <args>'`, which
+/// is the PATH the user gets on that host by hand. Login *and* interactive, because
+/// `PATH` is as often set in `.zshrc`/`.bashrc` (interactive-only) as in a profile.
+/// The inner `exec` keeps the agent as the pane's own process, so exit status and
+/// signals are unchanged. `$SHELL` is deliberately unquoted — the *remote* shell
+/// expands it.
+///
+/// Ported from Swift's `TmuxCommands.launchAgent`, which fixed this on iOS first —
+/// keep the two in step.
+fn login_shell_command(program: &str, args: &[String]) -> String {
+    let mut inner = String::from("exec ");
+    inner.push_str(&sh_quote(program));
+    for a in args {
+        inner.push(' ');
+        inner.push_str(&sh_quote(a));
+    }
+    format!("\"${{SHELL:-/bin/sh}}\" -ilc {}", sh_quote(&inner))
+}
+
 /// The remote command string a pane runs (the single argument after `--`).
 fn remote_command(spec: &SshSpec) -> String {
     if spec.use_tmux {
         // `tmux new-session -A` attaches if the session exists, so a reconnect
         // resumes the running agent. Reuse the local tmux arg builder, run remote.
+        // The program is appended separately, wrapped in a login shell — see
+        // `login_shell_command` — so tmux is told to create the session with no
+        // command of its own.
         let session = spec.tmux_session.unwrap_or("muxel");
-        let targs =
-            crate::tmux::launch_session_args(session, spec.remote_cwd, spec.program, spec.args);
+        let targs = crate::tmux::launch_session_args(session, spec.remote_cwd, None, &[]);
         // Fork the remote tmux server off a project-less command line first — it's a
         // separate process, so the server never inherits the argv below. Without this,
         // a `pkill -f <project>` *on the remote host* matches the shared server and
@@ -341,6 +375,10 @@ fn remote_command(spec: &SshSpec) -> String {
             cmd.push(' ');
             cmd.push_str(&sh_quote(a));
         }
+        if let Some(program) = spec.program {
+            cmd.push_str(" -- ");
+            cmd.push_str(&login_shell_command(program, spec.args));
+        }
         cmd
     } else {
         let mut cmd = String::new();
@@ -351,13 +389,9 @@ fn remote_command(spec: &SshSpec) -> String {
         }
         cmd.push_str("exec ");
         match spec.program {
-            Some(p) => {
-                cmd.push_str(&sh_quote(p));
-                for a in spec.args {
-                    cmd.push(' ');
-                    cmd.push_str(&sh_quote(a));
-                }
-            }
+            // Same PATH problem without tmux: ssh runs this via a *non-interactive*
+            // shell, which reads no profile.
+            Some(p) => cmd.push_str(&login_shell_command(p, spec.args)),
             // The remote login shell (expanded by the remote shell — left unquoted).
             None => cmd.push_str("${SHELL:-/bin/sh} -l"),
         }
@@ -563,7 +597,10 @@ mod tests {
         let v = ssh_args(&spec);
         assert_eq!(v[0], "-t");
         assert_eq!(v[v.len() - 2], "--");
-        assert_eq!(v.last().unwrap(), "cd /srv/app && exec claude --model opus");
+        assert_eq!(
+            v.last().unwrap(),
+            "cd /srv/app && exec \"${SHELL:-/bin/sh}\" -ilc 'exec claude --model opus'"
+        );
     }
 
     #[test]
@@ -597,11 +634,66 @@ mod tests {
             tmux_session: Some("muxel-abc123"),
         };
         // `-u` leads the attaching client: the remote host's login shell may hand
-        // tmux no UTF-8 locale, and then it would mangle every non-ASCII cell.
+        // tmux no UTF-8 locale, and then it would mangle every non-ASCII cell. The
+        // agent runs through a login shell so it resolves on the user's real PATH.
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
             "tmux start-server ';' set -s exit-empty off; \
-             exec tmux -u set -g mouse on ';' new-session -A -s muxel-abc123 -c /srv/app -- claude"
+             exec tmux -u set -g mouse on ';' new-session -A -s muxel-abc123 -c /srv/app \
+             -- \"${SHELL:-/bin/sh}\" -ilc 'exec claude'"
+        );
+    }
+
+    /// The bug this guards: tmux `execvp`s a program with the *tmux server's*
+    /// environment, and on a remote host that server is forked from a
+    /// non-interactive ssh command whose PATH is sshd's bare default. An agent in
+    /// `~/.local/bin` (or an nvm dir) isn't on it, so a bare `-- claude` dies with
+    /// ENOENT: the window closes, the session dies with it, and the pane shows
+    /// `[exited]` and a clean exit 0. A shell pane never hits it — tmux runs its own
+    /// default shell as a login shell.
+    #[test]
+    fn tmux_never_execs_an_agent_without_a_login_shell() {
+        let h = host();
+        let args = ["--model".to_string(), "opus".to_string()];
+        let spec = SshSpec {
+            host: &h,
+            control_path: "/s",
+            remote_cwd: Some("/srv/app"),
+            program: Some("claude"),
+            args: &args,
+            use_tmux: true,
+            tmux_session: Some("s"),
+        };
+        let cmd = ssh_args(&spec).last().unwrap().clone();
+        let (_, after) = cmd
+            .split_once(" -- ")
+            .expect("a command follows the separator");
+        assert!(
+            after.starts_with("\"${SHELL:-/bin/sh}\" -ilc "),
+            "the agent must go through a login shell, got: {after}"
+        );
+        // …and the agent still ends up as the pane's own process.
+        assert!(after.contains("'exec claude --model opus'"), "got: {after}");
+    }
+
+    /// With no program tmux starts its own login shell, so there is nothing to wrap.
+    #[test]
+    fn a_tmux_shell_pane_is_left_to_tmux() {
+        let h = host();
+        let spec = SshSpec {
+            host: &h,
+            control_path: "/s",
+            remote_cwd: Some("/srv/app"),
+            program: None,
+            args: &[],
+            use_tmux: true,
+            tmux_session: Some("s"),
+        };
+        let cmd = ssh_args(&spec).last().unwrap().clone();
+        assert!(!cmd.contains("SHELL"), "got: {cmd}");
+        assert!(
+            cmd.ends_with("new-session -A -s s -c /srv/app"),
+            "got: {cmd}"
         );
     }
 
@@ -645,7 +737,7 @@ mod tests {
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
-            "cd '/srv/my app' && exec bash"
+            "cd '/srv/my app' && exec \"${SHELL:-/bin/sh}\" -ilc 'exec bash'"
         );
     }
 

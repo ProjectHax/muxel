@@ -183,17 +183,25 @@ pub struct TerminalLaunch {
 }
 
 impl TerminalLaunch {
-    /// Spawn `spec`; if it can't be launched (e.g. the agent isn't installed),
-    /// fall back to a shell that prints the error. `Err` only when even the
-    /// fallback shell can't spawn (bogus `$SHELL` and no `/bin/bash`, fd
-    /// exhaustion, …).
-    pub fn spawn(spec: CommandSpec) -> anyhow::Result<Self> {
-        Self::spawn_with_fallback(spec, CommandSpec::shell())
+    /// Spawn `spec` at `size` (`(cols, rows)`); if it can't be launched (e.g. the
+    /// agent isn't installed), fall back to a shell that prints the error. `Err` only
+    /// when even the fallback shell can't spawn (bogus `$SHELL` and no `/bin/bash`,
+    /// fd exhaustion, …).
+    ///
+    /// `size` should be the grid the pane will actually render at — see
+    /// [`TerminalSession::size`]. Getting it right up front is what keeps a
+    /// `tmux attach` from painting its first frame at the wrong size.
+    pub fn spawn(spec: CommandSpec, size: (u16, u16)) -> anyhow::Result<Self> {
+        Self::spawn_with_fallback(spec, CommandSpec::shell(), size)
     }
 
     /// Testable inner half of [`Self::spawn`]: the fallback spec is injectable.
-    fn spawn_with_fallback(spec: CommandSpec, fallback: CommandSpec) -> anyhow::Result<Self> {
-        match TerminalSession::spawn(spec.clone(), 80, 24) {
+    fn spawn_with_fallback(
+        spec: CommandSpec,
+        fallback: CommandSpec,
+        (cols, rows): (u16, u16),
+    ) -> anyhow::Result<Self> {
+        match TerminalSession::spawn(spec.clone(), cols, rows) {
             Ok((session, rx)) => Ok(Self {
                 spec,
                 session,
@@ -210,7 +218,7 @@ impl TerminalLaunch {
                 let shell = fallback.with_startup_input(format!(
                     "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
                 ));
-                let (session, rx) = TerminalSession::spawn(shell.clone(), 80, 24)
+                let (session, rx) = TerminalSession::spawn(shell.clone(), cols, rows)
                     .with_context(|| format!("fallback shell (after `{prog}` failed: {detail})"))?;
                 Ok(Self {
                     spec: shell,
@@ -712,9 +720,11 @@ mod launch_tests {
 
     #[test]
     fn bad_program_falls_back_to_shell_with_error() {
-        let launch =
-            TerminalLaunch::spawn(CommandSpec::program("/definitely/not/here-muxel", vec![]))
-                .expect("fallback shell should spawn");
+        let launch = TerminalLaunch::spawn(
+            CommandSpec::program("/definitely/not/here-muxel", vec![]),
+            (80, 24),
+        )
+        .expect("fallback shell should spawn");
         assert!(
             launch.launch_error().is_some(),
             "the original failure is kept for the dev console"
@@ -725,14 +735,14 @@ mod launch_tests {
     #[test]
     fn double_failure_is_an_error_not_a_panic() {
         let bogus = CommandSpec::program("/definitely/not/here-muxel", vec![]);
-        let result = TerminalLaunch::spawn_with_fallback(bogus.clone(), bogus);
+        let result = TerminalLaunch::spawn_with_fallback(bogus.clone(), bogus, (80, 24));
         assert!(result.is_err(), "total failure must surface as Err");
     }
 
     #[test]
     fn good_program_has_no_launch_error() {
-        let launch =
-            TerminalLaunch::spawn(CommandSpec::program("/bin/cat", vec![])).expect("spawn cat");
+        let launch = TerminalLaunch::spawn(CommandSpec::program("/bin/cat", vec![]), (80, 24))
+            .expect("spawn cat");
         assert!(launch.launch_error().is_none());
         launch.session.kill();
     }

@@ -2,7 +2,7 @@
 //! of project file paths into renderable rows — an expandable folder tree, or a
 //! flat search result. No GPUI here, so it's unit-testable on its own.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// One renderable row in the file browser.
@@ -72,6 +72,57 @@ fn emit(
 pub fn visible_rows(files: &[PathBuf], root: &Path, expanded: &HashSet<PathBuf>) -> Vec<Row> {
     let mut out = Vec::new();
     emit(root, 0, files, expanded, &mut out);
+    out
+}
+
+/// How loudly a git status wants to be seen, when one row has to stand for many.
+/// A conflict outranks everything; then a file git doesn't know about yet;
+/// then any ordinary change.
+fn rank(xy: &str) -> u8 {
+    let (x, y) = (
+        xy.chars().next().unwrap_or(' '),
+        xy.chars().nth(1).unwrap_or(' '),
+    );
+    if x == 'U' || y == 'U' || (x == 'D' && y == 'D') || (x == 'A' && y == 'A') {
+        3
+    } else if x == '?' || y == '?' {
+        2
+    } else {
+        1
+    }
+}
+
+/// Git status per row — for **folders too**, each inheriting the strongest status
+/// among the files beneath it.
+///
+/// `git status` only ever speaks about files, so without this a collapsed folder
+/// gives no hint that something inside it is unadded or modified: you'd have to open
+/// every folder to find out. Keyed by absolute path; only paths under `root` count.
+pub fn status_index(changes: &[(PathBuf, String)], root: &Path) -> HashMap<PathBuf, String> {
+    let mut out: HashMap<PathBuf, String> = HashMap::new();
+    for (path, xy) in changes {
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        // The file itself, then every folder up to (but not including) the root.
+        let mut at = root.to_path_buf();
+        let mut targets = vec![path.clone()];
+        for comp in rel.components() {
+            at = at.join(comp);
+            if at != *path {
+                targets.push(at.clone());
+            }
+        }
+        for target in targets {
+            out.entry(target)
+                .and_modify(|cur| {
+                    if rank(xy) > rank(cur) {
+                        *cur = xy.clone();
+                    }
+                })
+                .or_insert_with(|| xy.clone());
+        }
+    }
     out
 }
 
@@ -167,5 +218,63 @@ mod tests {
     #[test]
     fn empty_query_matches_everything() {
         assert_eq!(filter(&files(), Path::new("/proj"), "").len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::status_index;
+    use std::path::{Path, PathBuf};
+
+    fn changes() -> Vec<(PathBuf, String)> {
+        vec![
+            (PathBuf::from("/proj/src/new.rs"), "??".to_string()),
+            (PathBuf::from("/proj/src/edited.rs"), " M".to_string()),
+            (PathBuf::from("/proj/README.md"), "A ".to_string()),
+            (PathBuf::from("/elsewhere/other.rs"), "??".to_string()),
+        ]
+    }
+
+    #[test]
+    fn files_carry_their_own_status() {
+        let ix = status_index(&changes(), Path::new("/proj"));
+        assert_eq!(ix.get(Path::new("/proj/src/new.rs")).unwrap(), "??");
+        assert_eq!(ix.get(Path::new("/proj/README.md")).unwrap(), "A ");
+    }
+
+    /// The point of the index: a *collapsed* folder still shows that something inside
+    /// it needs attention, and shows the loudest thing in there.
+    #[test]
+    fn a_folder_inherits_the_strongest_status_beneath_it() {
+        let ix = status_index(&changes(), Path::new("/proj"));
+        assert_eq!(
+            ix.get(Path::new("/proj/src")).unwrap(),
+            "??",
+            "untracked outranks a plain modification"
+        );
+    }
+
+    #[test]
+    fn a_conflict_outranks_everything() {
+        let c = vec![
+            (PathBuf::from("/proj/src/a.rs"), "??".to_string()),
+            (PathBuf::from("/proj/src/b.rs"), "UU".to_string()),
+        ];
+        assert_eq!(
+            status_index(&c, Path::new("/proj"))
+                .get(Path::new("/proj/src"))
+                .unwrap(),
+            "UU"
+        );
+    }
+
+    #[test]
+    fn the_root_itself_and_paths_outside_it_are_not_indexed() {
+        let ix = status_index(&changes(), Path::new("/proj"));
+        assert!(
+            !ix.contains_key(Path::new("/proj")),
+            "the root is not a row"
+        );
+        assert!(!ix.contains_key(Path::new("/elsewhere/other.rs")));
     }
 }

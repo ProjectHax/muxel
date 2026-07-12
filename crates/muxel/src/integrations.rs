@@ -180,9 +180,12 @@ pub fn list_remote_files(loc: &RepoLoc) -> Vec<String> {
     };
     let root = c.remote_path.trim_end_matches('/');
     let q = ssh::sh_quote(root);
+    // Same cap as the local walk: the old 10k quietly cut large trees off, and a
+    // folder whose files all fell past the cut just vanished from the browser.
+    let cap = crate::app::MAX_PROJECT_FILES;
     let cmd = format!(
         "cd {q} && (git ls-files --cached --others --exclude-standard 2>/dev/null \
-         || find . -type f -not -path '*/.git/*') | head -n 10000"
+         || find . -type f -not -path '*/.git/*') | head -n {cap}"
     );
     let Ok(out) = remote_ssh_command(c, cmd).output() else {
         return Vec::new();
@@ -212,6 +215,30 @@ pub fn read_remote_file(loc: &RepoLoc, abs_path: &str) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Every tmux session on a remote host — the input to adopting the ones no instance
+/// owns (see `muxel_core::tmux::orphan_sessions`). `None` when the host can't be
+/// reached or tmux isn't there; an empty list means "reached it, no sessions", and
+/// the two must not be confused — a blip would otherwise read as "nothing running".
+pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::RemoteSession>> {
+    let RepoLoc::Remote(c) = loc else {
+        return None;
+    };
+    let args = muxel_core::tmux::list_sessions_args();
+    let cmd = std::iter::once("tmux".to_string())
+        .chain(args.iter().map(|a| ssh::sh_quote(a)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let out = remote_ssh_command(c, cmd).output().ok()?;
+    if !out.status.success() {
+        // "no server running" is a perfectly good answer: nothing is running there.
+        let err = String::from_utf8_lossy(&out.stderr);
+        return err.contains("no server running").then(Vec::new);
+    }
+    Some(muxel_core::tmux::parse_sessions(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
 }
 
 /// Write `content` to a remote file (overwriting), piping it over SSH stdin.
@@ -339,6 +366,25 @@ pub fn load_memory(loc: &RepoLoc) -> Vec<MemoryEntry> {
         RepoLoc::Remote(_) => read_remote_file(loc, &memory_abs(loc)).unwrap_or_default(),
     };
     memory::parse_document(&text)
+}
+
+/// Whether the project already has a `.muxel/MEMORY.md` — i.e. shared memory is
+/// plainly in use here, whoever switched it on. Local or remote.
+///
+/// The evidence of last resort for the shared-memory flag: a layout doc written
+/// before that flag existed carries no opinion, and defaulting such a project to
+/// "off" would show the toggle off for a project whose agents are demonstrably
+/// sharing a memory file on the host.
+pub fn memory_file_exists(loc: &RepoLoc) -> bool {
+    match loc {
+        RepoLoc::Local(root) => root.join(MEMORY_DIR).join(MEMORY_FILE).is_file(),
+        RepoLoc::Remote(c) => {
+            let cmd = format!("test -f {}", ssh::sh_quote(&memory_abs(loc)));
+            remote_ssh_command(c, cmd)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        }
+    }
 }
 
 /// Render `entries` to the project's `.muxel/MEMORY.md` (overwriting). Ensures the
@@ -858,6 +904,14 @@ pub fn delete_branch(repo: &Path, branch: &str) {
 pub fn git_commit(loc: &RepoLoc, msg: &str) -> Result<String> {
     git_run_loc(loc, &["add", "-A"])?;
     git_run_loc(loc, &["commit", "-m", msg])
+}
+
+/// Stage `paths` (`git add -- <paths>`), relative to the repo root. A directory
+/// stages everything under it. Works local or remote.
+pub fn git_add_paths(loc: &RepoLoc, paths: &[String]) -> Result<()> {
+    let mut args: Vec<&str> = vec!["add", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    git_run_loc(loc, &args).map(|_| ())
 }
 
 /// One entry from `git status --porcelain` — i.e. a file a blanket `git add -A`

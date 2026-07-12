@@ -512,6 +512,17 @@ impl TerminalSession {
     /// Resize the PTY and emulator grid, **debounced**: the requested size must
     /// hold steady for [`RESIZE_SETTLE`] before it's applied, so a burst of
     /// changes from a pane close / divider drag collapses into one resize (one
+    /// The grid size currently applied to the PTY, `(cols, rows)`.
+    ///
+    /// Worth persisting: a pane that respawns at the size it last had opens its
+    /// program *already* at the right size, so nothing has to resize after the first
+    /// paint. That matters most for a `tmux attach`, where the session's program has
+    /// long since drawn its UI — it repaints only when something prompts it to, so a
+    /// late resize leaves the first frame visibly mis-spaced until the user types.
+    pub fn size(&self) -> (u16, u16) {
+        self.resize.lock().applied
+    }
+
     /// SIGWINCH) instead of many. Returns `true` while a resize is still
     /// settling — the caller should schedule another frame (e.g. `window.refresh`)
     /// so the pending resize eventually lands even if nothing else repaints.
