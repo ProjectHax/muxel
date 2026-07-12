@@ -5,6 +5,8 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-07-12
+
 ### Added
 - **Add an SSH host straight from "New remote project"** — the dialog's host list
   now ends with an **Add host** button (and the empty state leads with it) that
