@@ -125,11 +125,33 @@ pub fn connection_args(host: &RemoteHost, control_path: &str) -> Vec<String> {
         v.push("-o".into());
         v.push("ControlMaster=auto".into());
         v.push("-o".into());
-        v.push(format!("ControlPath={control_path}"));
+        v.push(format!("ControlPath={}", quote_option_value(control_path)));
         v.push("-o".into());
         v.push("ControlPersist=60".into());
     }
     v
+}
+
+/// Quote an `-o` option value that contains whitespace.
+///
+/// ssh parses each `-o` argument as a line of `ssh_config` and splits the value on
+/// whitespace, so an unquoted path with a space in it is read as trailing junk and
+/// ssh refuses the whole command before connecting:
+///
+/// ```text
+/// command-line line 0: keyword controlpath extra arguments at end of line
+/// ```
+///
+/// Which is not hypothetical: muxel's control socket lives under the platform data
+/// dir, and on macOS that is `~/Library/Application Support/…`. Double quotes are
+/// how `ssh_config` carries a value with spaces. Values without whitespace are left
+/// bare, so the common case stays readable in logs.
+fn quote_option_value(value: &str) -> String {
+    if value.contains(char::is_whitespace) {
+        format!("\"{value}\"")
+    } else {
+        value.to_string()
+    }
 }
 
 /// A "REMOTE HOST IDENTIFICATION HAS CHANGED" refusal parsed from ssh stderr —
@@ -402,6 +424,31 @@ mod tests {
         }
         assert_eq!(connection_args(&h, "/tmp/s.sock"), want);
         assert_eq!(target(&h), "example.com");
+    }
+
+    /// muxel's control socket lives under the platform data dir, which on macOS is
+    /// `~/Library/Application Support/…`. Unquoted, ssh splits that on the space and
+    /// dies with "keyword controlpath extra arguments at end of line" before it ever
+    /// connects — every remote action (project scan, panes, git) fails.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn control_path_with_a_space_is_quoted() {
+        let h = host();
+        let path = "/Users/me/Library/Application Support/dev.muxel.muxel/ssh/ab12.sock";
+        let args = connection_args(&h, path);
+        let want =
+            "ControlPath=\"/Users/me/Library/Application Support/dev.muxel.muxel/ssh/ab12.sock\""
+                .to_string();
+        assert!(
+            args.contains(&want),
+            "spacey control path must be quoted, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn quoting_is_only_applied_where_it_is_needed() {
+        assert_eq!(quote_option_value("/tmp/s.sock"), "/tmp/s.sock");
+        assert_eq!(quote_option_value("/a b/s.sock"), "\"/a b/s.sock\"");
     }
 
     #[test]

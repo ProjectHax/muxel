@@ -6,6 +6,13 @@ All notable changes to muxel are documented here. This project adheres to
 ## [Unreleased]
 
 ### Fixed
+- **Every remote action failed on macOS with "keyword controlpath extra arguments
+  at end of line"** — scanning a host for projects, remote panes, remote git. ssh
+  reads each `-o` argument as a line of `ssh_config` and splits the value on
+  whitespace, so muxel's unquoted `-o ControlPath=…` broke apart: the connection
+  multiplexing socket lives under the platform data dir, and on macOS that is
+  `~/Library/Application Support/…`. ssh rejected the command before connecting.
+  The value is now quoted when it contains whitespace.
 - **Splitting a tab out into its own pane didn't work on its own pane** — dragging
   a tab onto a pane edge pulls it out into a new split, but doing so on the tab's
   *own* pane was a no-op when the tab was the pane's first one (the drop anchor is
