@@ -25,7 +25,14 @@ log.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
 notify-rust = "4"
-rust-embed = "8"
+# debug-embed: always bake files into the binary, even in debug builds.
+# Without this, rust-embed reads icons from disk under CARGO_MANIFEST_DIR
+# (e.g. the primary user's .cargo/git/checkouts/gpui-component-*/assets). That breaks
+# secondary Windows identities (AgentWorker via runas) which cannot read the
+# primary user's profile — title-bar min/max/close and other gpui-component
+# icons render as empty gray plates. Feature unification applies this to
+# gpui-component-assets as well.
+rust-embed = { version = "8", features = ["debug-embed"] }
 # Decode the embedded app icon (PNG) to RGBA for the Windows/macOS tray icon.
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Detect the OS UI locale at startup for i18n (already resolved transitively).
