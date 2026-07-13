@@ -319,10 +319,12 @@ pub fn transcribe_local(samples16k: &[f32], model_path: &Path, language: &str) -
     state
         .full(params, samples16k)
         .context("whisper inference")?;
-    let n = state.full_n_segments().context("whisper segment count")?;
     let mut text = String::new();
-    for i in 0..n {
-        if let Ok(seg) = state.full_get_segment_text(i) {
+    for i in 0..state.full_n_segments() {
+        // Lossy: whisper splits on token boundaries, which can cut a multi-byte
+        // character in half, and one mangled glyph beats dropping the segment that
+        // holds it (what a strict `to_str` would do to the whole utterance).
+        if let Some(Ok(seg)) = state.get_segment(i).map(|s| s.to_str_lossy()) {
             text.push_str(&seg);
         }
     }

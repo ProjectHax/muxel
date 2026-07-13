@@ -17,6 +17,12 @@ All notable changes to muxel are documented here. This project adheres to
   teardown alike. They are *appended* to the remote `PATH`, so a host that already
   finds tmux keeps using the exact binary it uses today. The iOS companion app,
   which builds the same commands, is fixed with it.
+- **muxel builds again against a current clang** — `whisper-rs` 0.14's bindgen
+  mis-sized a whisper.cpp struct under clang 22 (Homebrew's current), so its own
+  generated layout assertion failed the build (`attempt to compute
+  1_usize - 264_usize`) and no build could complete on such a machine, whatever it
+  was building. Upgraded to `whisper-rs` 0.16, whose bindings clang 22 generates
+  correctly; local speech-to-text moves to the whisper.cpp it wraps.
 
 ### Added
 - **Add an SSH host straight from "New remote project"** — the dialog's host list

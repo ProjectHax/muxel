@@ -99,7 +99,7 @@ features = ["rt"]
 # (OpenAI-compatible) engine is the fallback. Keep this cfg in sync with the gates
 # in stt.rs and app.rs.
 [target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
-whisper-rs = "0.14"
+whisper-rs = "0.16"
 
 # Ask macOS (TCC) whether the microphone is *denied*. A denied app is handed
 # silent audio rather than an error, so nothing in cpal can tell us — see the
