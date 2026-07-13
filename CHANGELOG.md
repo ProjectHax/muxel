@@ -5,6 +5,17 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **The pane area scrolls horizontally when the panes don't fit** — a pane will not
+  shrink below a usable terminal width, so side-by-side panes add up and a layout is
+  not guaranteed to fit the window it opens in: open one built on a large monitor
+  (typically by pulling it from a remote host that had one) on a smaller display and
+  it needs more width than there is. The surplus panes used to lay out past the right
+  edge of the window, where they were invisible and unreachable — no scrollbar, no
+  clipping. The pane area now scrolls across them instead. Panes still shrink to fill
+  a window they do fit in, and scrolling only begins once they can shrink no further,
+  so a window that was always big enough is unchanged.
+
 ### Fixed
 - **Remote panes on a Mac host no longer die with `command not found: tmux`** — sshd
   runs a remote command through a shell that is neither login nor interactive, so it

@@ -15,6 +15,13 @@ feature is added or changed, update the matching entry here in the same change**
 - **Resizable splits** — drag the divider between panes; sizes persist per project.
 - **Minimum pane width** — panes can't shrink so narrow that an agent TUI becomes
   unusable (keeps a sane terminal width).
+- **Scrollable pane area** — because panes have that minimum width, a layout with
+  enough panes side by side needs more width than a small display has — most often
+  a layout built on a large monitor and then reopened on a laptop, or pulled from a
+  remote host that had one. The pane area scrolls horizontally in that case, so the
+  panes that don't fit can still be reached instead of falling off the right edge.
+  Panes still shrink to fill a window they do fit in; scrolling only begins once
+  they can shrink no further.
 - **Drag-to-dock split (Zed-style)** — drag a tab onto a pane edge to pull it out
   into a new split, or onto the center to add it as a tab; drag a pane by its
   title bar to relocate the whole pane, with a highlighted drop zone.

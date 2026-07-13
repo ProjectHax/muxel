@@ -294,6 +294,37 @@ impl PaneNode {
             .join("-")
     }
 
+    /// The narrowest this tree lays out in, given a pane that will not shrink below
+    /// `leaf_min`.
+    ///
+    /// Panes have a floor (an agent TUI is unusable much under ~40 columns), so a
+    /// layout does *not* always fit the window it's opened in: side-by-side panes
+    /// add up, and a tree authored on a large monitor — or pulled from a remote
+    /// host that had one — can need more width than a laptop has. The renderer sizes
+    /// the pane area to this, so the panes that don't fit can be scrolled to instead
+    /// of laying out past the window edge, where they are invisible and unreachable.
+    ///
+    /// Widths add across a horizontal split and are shared by a vertical one (its
+    /// children are stacked, so the widest child governs). Resize handles are hairline
+    /// (1px) and not counted. A childless split — which the tree's own invariants do
+    /// not produce — needs nothing.
+    pub fn min_width(&self, leaf_min: f32) -> f32 {
+        match self {
+            PaneNode::Leaf(_) => leaf_min,
+            PaneNode::Split {
+                direction,
+                children,
+                ..
+            } => {
+                let widths = children.iter().map(|c| c.min_width(leaf_min));
+                match direction {
+                    SplitDirection::Horizontal => widths.sum(),
+                    SplitDirection::Vertical => widths.fold(0.0, f32::max),
+                }
+            }
+        }
+    }
+
     /// The first instance in reading order (the first tab of the first leaf). A
     /// stable anchor — it does not change as the user switches tabs.
     pub fn first_instance(&self) -> Option<Uuid> {
@@ -1811,6 +1842,62 @@ mod tests {
             sizes: vec![1.0, 1.0],
             children: vec![a, b],
         }
+    }
+
+    // ---- min_width -------------------------------------------------------
+
+    /// What the pane area must be at least as wide as: side-by-side panes add up,
+    /// stacked ones don't. This is what decides whether a layout fits the window
+    /// at all — and so whether the pane area has to scroll to reach the last pane.
+    #[test]
+    fn min_width_adds_across_a_row_and_shares_down_a_column() {
+        // One pane needs one pane's width, however many tabs it holds.
+        assert_eq!(PaneNode::leaf(id()).min_width(340.0), 340.0);
+        assert_eq!(tabs_leaf(vec![id(), id(), id()], 0).min_width(340.0), 340.0);
+
+        // [a | b] — side by side, so the widths add.
+        let row = hsplit(PaneNode::leaf(id()), PaneNode::leaf(id()));
+        assert_eq!(row.min_width(340.0), 680.0);
+
+        // [a / b] — stacked, so they share the width.
+        let column = vsplit(PaneNode::leaf(id()), PaneNode::leaf(id()));
+        assert_eq!(column.min_width(340.0), 340.0);
+
+        // A column of panes inside a row counts once, not once per pane: the
+        // widest child governs a column. [a | [b / c]] → 2 panes wide, not 3.
+        let nested = hsplit(
+            PaneNode::leaf(id()),
+            vsplit(PaneNode::leaf(id()), PaneNode::leaf(id())),
+        );
+        assert_eq!(nested.min_width(340.0), 680.0);
+
+        // …and a row nested in a column still adds: [[a | b] / c] → 2 wide.
+        let row_in_column = vsplit(
+            hsplit(PaneNode::leaf(id()), PaneNode::leaf(id())),
+            PaneNode::leaf(id()),
+        );
+        assert_eq!(row_in_column.min_width(340.0), 680.0);
+    }
+
+    /// The case that sent the last pane off the edge of the screen: a layout built
+    /// on a large monitor (or pulled from a remote host that had one) needs more
+    /// width than a laptop has, so the pane area must scroll rather than lay the
+    /// overflow out past the window edge where it can't be seen or reached.
+    #[test]
+    fn min_width_exceeds_a_small_display_for_a_wide_layout() {
+        let mut tree = Some(PaneNode::leaf(id()));
+        let mut last = tree.as_ref().unwrap().last_instance().unwrap();
+        for _ in 0..4 {
+            let next = id();
+            assert!(split(&mut tree, last, SplitDirection::Horizontal, next));
+            last = next;
+        }
+        // 5 panes side by side: more than a 1440px laptop can show, less than a
+        // large monitor — exactly the layout that has to scroll on the laptop.
+        let needed = tree.as_ref().unwrap().min_width(340.0);
+        assert_eq!(needed, 1700.0);
+        assert!(needed > 1440.0, "must scroll on a laptop");
+        assert!(needed < 2560.0, "fits the monitor it was built on");
     }
 
     #[test]

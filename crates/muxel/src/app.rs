@@ -1200,6 +1200,12 @@ pub struct MuxelApp {
     collapsed: HashSet<Uuid>,
     /// Scroll position for the settings content area (drives the scrollbar).
     settings_scroll: ScrollHandle,
+    /// Horizontal scroll position of each project's pane area, keyed by project —
+    /// a layout too wide for the window scrolls rather than losing its last panes
+    /// off the right edge (see `render_pane_root`). Kept per project so switching
+    /// projects (or detaching one to its own window) doesn't drag another one's
+    /// scroll position along; a project is only ever in one window at a time.
+    panes_scroll: HashMap<Uuid, ScrollHandle>,
     /// Live state captured on open so the settings Cancel button can revert.
     settings_snapshot: Option<SettingsSnapshot>,
     /// The active workspace (None until one is chosen in the selector).
@@ -2957,6 +2963,7 @@ impl MuxelApp {
             rename_input,
             collapsed: HashSet::new(),
             settings_scroll: ScrollHandle::new(),
+            panes_scroll: HashMap::new(),
             settings_snapshot: None,
             current_workspace: None,
             workspaces,
@@ -9977,7 +9984,7 @@ impl MuxelApp {
             self.render_pane(&PaneNode::leaf(iid), cx)
         } else {
             match layout {
-                Some(root) => self.render_pane(&root, cx),
+                Some(root) => self.render_pane_root(pid, &root, cx),
                 None => div()
                     .size_full()
                     .flex()
@@ -12732,6 +12739,64 @@ impl MuxelApp {
         self.workspace
             .worktree(wid)
             .map(|w| worktree_color(w.color))
+    }
+
+    /// A project's pane tree, in a viewport that scrolls horizontally when the tree
+    /// is wider than the window.
+    ///
+    /// A pane will not shrink below `MIN_PANE_WIDTH` — an agent TUI is unusable much
+    /// under ~40 columns — so a layout is not guaranteed to fit the window it opens
+    /// in: side-by-side panes add up. Open a layout authored on a large monitor (most
+    /// often by pulling one from a remote host that had one) on a laptop and it needs
+    /// more width than there is. With nowhere to put the overflow, the flex row simply
+    /// laid the surplus panes out past the right edge of the window, where they were
+    /// invisible and unreachable — no scrollbar, no clipping, no way back to them.
+    ///
+    /// So give the overflow somewhere to go. The content is at least the tree's own
+    /// minimum width (`PaneNode::min_width`) and the viewport scrolls across it. When
+    /// the tree does fit, `flex_1` stretches it to exactly the viewport width — the
+    /// layout is untouched and the scrollbar hides itself, so nothing changes for a
+    /// window that was always big enough.
+    ///
+    /// The width is a *minimum*, not a fixed width: panes still shrink toward it as
+    /// the window narrows, and scrolling only starts once they can shrink no further.
+    fn render_pane_root(
+        &mut self,
+        pid: Uuid,
+        root: &PaneNode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let scroll = self.panes_scroll.entry(pid).or_default().clone();
+        let min_w = px(root.min_width(f32::from(MIN_PANE_WIDTH)));
+        let panes = self.render_pane(root, cx);
+        div()
+            .relative()
+            .size_full()
+            .child(
+                div()
+                    .id("panes-scroll")
+                    .size_full()
+                    .overflow_x_scroll()
+                    .track_scroll(&scroll)
+                    // Width and height are sized differently on purpose. Width is the
+                    // scroll axis, where a percentage collapses (the same reason the
+                    // settings pane sizes its content block absolutely): `flex_1` fills
+                    // a viewport the tree fits in, `min_w` overflows one it doesn't.
+                    // Height is not the scroll axis, so `h_full` resolves normally — and
+                    // it has to be said, because the flex line does *not* stretch the
+                    // child here: without it the tree takes its content height, every
+                    // pane collapses to the height of its own tab bar, and the terminals
+                    // are left with no body at all.
+                    .child(div().h_full().flex_1().min_w(min_w).child(panes)),
+            )
+            .child(
+                div().absolute().inset_0().child(
+                    Scrollbar::new(&scroll)
+                        .id("panes-sb")
+                        .axis(ScrollbarAxis::Horizontal),
+                ),
+            )
+            .into_any_element()
     }
 
     fn render_pane(&self, node: &PaneNode, cx: &mut Context<Self>) -> AnyElement {
@@ -21823,13 +21888,13 @@ impl Render for MuxelApp {
         } else if let Some(iid) = maximized_here {
             self.render_pane(&PaneNode::leaf(iid), cx)
         } else {
-            match active_layout {
-                Some(root) => self.render_pane(&root, cx),
+            match (active_layout, self.workspace.active_project) {
+                (Some(root), Some(pid)) => self.render_pane_root(pid, &root, cx),
                 // A workspace with zero projects gets the full get-started state;
                 // projects-with-no-panes keeps the small transient hint (the
                 // toolbar affordances already cover that case).
-                None if self.workspace.projects.is_empty() => self.render_empty_workspace(cx),
-                None => div()
+                _ if self.workspace.projects.is_empty() => self.render_empty_workspace(cx),
+                _ => div()
                     .size_full()
                     .flex()
                     .items_center()
