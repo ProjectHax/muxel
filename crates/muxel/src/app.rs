@@ -933,6 +933,10 @@ enum UpdateState {
     Error(String),
 }
 
+/// How long the wake command lingers on each pane, so the sweep is visible
+/// rather than a single-frame jump to the last pane.
+const WAKE_STEP: Duration = Duration::from_millis(250);
+
 /// State of a speech-to-text dictation (drives the mic button + recording pill).
 #[derive(Clone, Default, PartialEq)]
 enum SttState {
@@ -1255,6 +1259,9 @@ pub struct MuxelApp {
     /// True while a push-to-hold dictation is active (started on the hold chord's
     /// key-down, stopped on the next key-up).
     stt_hold: bool,
+    /// True while the spoken wake command's pane sweep is walking the workspace
+    /// (guards against a second sweep stacking on top of the running one).
+    waking: bool,
     /// Set once the user confirms quitting, so the close hook stops vetoing.
     confirm_quit: bool,
     /// An in-progress split/new-tab button press (target pane + placement). A
@@ -2964,6 +2971,7 @@ impl MuxelApp {
             stt_state: SttState::Idle,
             stt_recording: None,
             stt_hold: false,
+            waking: false,
             confirm_quit: false,
             place_pending: None,
             place_menu: None,
@@ -11147,8 +11155,12 @@ impl MuxelApp {
     }
 
     /// Begin capturing the microphone (needs a focused pane + a usable device).
+    ///
+    /// With the wake command on, a dictation with no target is still worth
+    /// recording — the words may be the wake phrase, whose whole job is to bring
+    /// dead panes back, not to be typed into one.
     fn start_recording(&mut self, cx: &mut Context<Self>) {
-        if !self.has_dictation_target() {
+        if !self.has_dictation_target() && !self.settings.stt_wake_command {
             self.stt_state = SttState::Error {
                 message: t("Focus an agent pane first").to_string(),
                 mic: false,
@@ -11181,6 +11193,8 @@ impl MuxelApp {
         let provider_url = self.settings.stt_provider_url.clone();
         let provider_model = self.settings.stt_provider_model.clone();
         let autosubmit = self.settings.stt_autosubmit;
+        let wake_command = self.settings.stt_wake_command;
+        let wake_phrase = self.settings.stt_wake_phrase.clone();
         let api_key = crate::secrets::get_stt_api_key().unwrap_or_default();
         let models_dir = muxel_store::models_dir();
 
@@ -11233,11 +11247,130 @@ impl MuxelApp {
                 match result {
                     Ok(text) if !text.is_empty() => {
                         this.stt_state = SttState::Idle;
-                        this.insert_transcript(target, &text, autosubmit, window, cx);
+                        // The wake phrase is a command, not dictation — it wakes the
+                        // panes instead of being typed into one.
+                        if wake_command && muxel_core::stt::matches_wake_phrase(&text, &wake_phrase)
+                        {
+                            this.wake_all_panes(window, cx);
+                        } else {
+                            this.insert_transcript(target, &text, autosubmit, window, cx);
+                        }
                     }
                     Ok(_) => this.stt_state = SttState::Idle,
                     Err(e) => this.stt_state = SttState::error(&e),
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Relaunch `iid`'s process if it isn't running, returning whether it did.
+    /// Editor/diff/browser panes have no process of their own — left alone.
+    fn ensure_instance_running(
+        &mut self,
+        iid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.workspace.instance(iid).map(|i| i.kind) != Some(InstanceKind::Terminal) {
+            return false;
+        }
+        let dead = match self.terminals.get(&iid) {
+            Some(view) => view.read(cx).exited(),
+            None => true,
+        };
+        if !dead {
+            return false;
+        }
+        if let Some(view) = self.terminals.remove(&iid) {
+            view.read(cx).session().kill();
+        }
+        // A wake is an explicit retry, like the toolbar's Restart: drop the sticky
+        // launch failure so the pane isn't skipped as a known-bad launch.
+        self.failed_launches.remove(&iid);
+        self.spawn_terminal(iid, window, cx);
+        true
+    }
+
+    /// The spoken wake command: walk every project's panes in turn, relaunching
+    /// each one that isn't running, then land back where the sweep started.
+    ///
+    /// A project shown in a secondary window keeps its own focus — its dead panes
+    /// are relaunched, but it isn't pulled into this window.
+    fn wake_all_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.waking {
+            return;
+        }
+        let pids: Vec<Uuid> = self.workspace.projects.iter().map(|p| p.id).collect();
+        if pids.is_empty() {
+            return;
+        }
+        let home_pid = self.workspace.active_project;
+        let home_iid = self.active_instance;
+        self.waking = true;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+            let mut launched = 0usize;
+            for pid in pids {
+                let Ok((elsewhere, panes)) = this.update_in(cx, |this, window, cx| {
+                    let elsewhere = this.secondary_windows.iter().any(|s| s.pid == pid);
+                    if !elsewhere && this.workspace.active_project != Some(pid) {
+                        this.select_project(pid, window, cx);
+                    }
+                    let panes = this
+                        .workspace
+                        .project(pid)
+                        .map(|p| p.instances())
+                        .unwrap_or_default();
+                    (elsewhere, panes)
+                }) else {
+                    return; // window/app went away mid-sweep
+                };
+
+                for iid in panes {
+                    let Ok(woke) = this.update_in(cx, |this, window, cx| {
+                        let woke = this.ensure_instance_running(iid, window, cx);
+                        if !elsewhere {
+                            this.focus_instance(iid, window, cx);
+                        }
+                        cx.notify();
+                        woke
+                    }) else {
+                        return;
+                    };
+                    launched += usize::from(woke);
+                    cx.background_executor().timer(WAKE_STEP).await;
+                }
+            }
+
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.waking = false;
+                // Back to the pane the user was on when they spoke.
+                if let Some(pid) = home_pid.filter(|p| this.workspace.project(*p).is_some()) {
+                    if this.workspace.active_project != Some(pid) {
+                        this.select_project(pid, window, cx);
+                    }
+                    if let Some(iid) = home_iid.filter(|i| this.workspace.instance(*i).is_some()) {
+                        this.focus_instance(iid, window, cx);
+                    }
+                }
+                this.add_event(
+                    NotifKind::Success,
+                    t("Wake up — daddy's home"),
+                    if launched == 0 {
+                        t("Every pane was already running").to_string()
+                    } else {
+                        tn(
+                            "Relaunched {n} pane",
+                            "Relaunched {n} panes",
+                            launched,
+                            &[("n", &launched.to_string())],
+                        )
+                    },
+                );
+                this.persist();
                 cx.notify();
             });
         })
@@ -16332,10 +16465,38 @@ impl MuxelApp {
         self.settings_ui
             .stt_language
             .update(cx, |s, cx| s.set_value(lang, window, cx));
+        let phrase = self.settings.stt_wake_phrase.clone();
+        self.settings_ui
+            .stt_wake_phrase
+            .update(cx, |s, cx| s.set_value(phrase, window, cx));
         self.settings_ui
             .stt_api_key
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.settings_ui.stt_has_key = crate::secrets::has_stt_api_key();
+    }
+
+    /// Read the wake-phrase input and persist it. A phrase of only punctuation
+    /// normalizes to nothing and could never match, so blanking it restores the
+    /// default rather than silently disabling the command.
+    fn apply_stt_wake_phrase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self
+            .settings_ui
+            .stt_wake_phrase
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        self.settings.stt_wake_phrase = if muxel_core::stt::normalize_spoken(&typed).is_empty() {
+            let restored = muxel_core::stt::DEFAULT_WAKE_PHRASE.to_string();
+            self.settings_ui
+                .stt_wake_phrase
+                .update(cx, |s, cx| s.set_value(restored.clone(), window, cx));
+            restored
+        } else {
+            typed
+        };
+        self.persist_settings();
+        cx.notify();
     }
 
     fn set_stt_engine(&mut self, engine: muxel_core::SttEngine, cx: &mut Context<Self>) {
@@ -16561,6 +16722,50 @@ impl MuxelApp {
                 &t("Press Enter automatically after inserting the transcript"),
             ),
         )
+        .child(
+            self.check_row(
+                Checkbox::new("stt-wake-command")
+                    .checked(self.settings.stt_wake_command)
+                    .on_click(cx.listener(|this, c: &bool, _w, cx| {
+                        this.settings.stt_wake_command = *c;
+                        this.persist_settings();
+                        cx.notify();
+                    })),
+                &t("Dictating the wake phrase sweeps every pane and relaunches the ones that aren't running"),
+            ),
+        )
+        .children(self.settings.stt_wake_command.then(|| {
+            v_flex()
+                .gap_3()
+                .child(self.settings_label(&t("Wake phrase"), cx))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .child(Input::new(&self.settings_ui.stt_wake_phrase)),
+                        )
+                        .child(
+                            Button::new("stt-apply-wake-phrase")
+                                .primary()
+                                .label(t("Apply"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.apply_stt_wake_phrase(window, cx)
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t(
+                            "Matched on whole words, ignoring case and punctuation. The transcript that triggers it is not typed into the pane.",
+                        )),
+                )
+        }))
         .child(
             div()
                 .text_xs()

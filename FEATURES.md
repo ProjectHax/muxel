@@ -103,6 +103,15 @@ feature is added or changed, update the matching entry here in the same change**
   microphone privacy screen. (Local whisper isn't
   available on Windows-on-ARM — whisper.cpp can't build there — so use a Provider;
   every other platform has both.)
+- **Spoken wake command** — an opt-in toggle in Settings → Speech: say the wake
+  phrase (default *"wake up daddy's home"*) into the mic and muxel walks every
+  pane of every project in turn, relaunching each agent whose process isn't
+  running, then lands back on the pane you started from. Panes still running are
+  left untouched, and the transcript that triggers it is treated as a command —
+  it isn't typed into any agent. Matching ignores case, punctuation and
+  surrounding filler, so however whisper hears it ("Wake up, Daddy's home!") it
+  fires; the phrase itself is editable. A project shown in a second window keeps
+  its own focus — its dead panes are relaunched without stealing it.
 - **Shared project memory** — opt-in per project: agents are told (via their system
   prompt) to `grep` and add durable lessons to a `.muxel/MEMORY.md` file shared
   across every agent and run in that project. muxel creates the file, git-ignores

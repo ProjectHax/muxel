@@ -221,6 +221,8 @@ pub struct SettingsUi {
     pub stt_provider_model: Entity<InputState>,
     pub stt_language: Entity<InputState>,
     pub stt_api_key: Entity<InputState>,
+    /// The spoken phrase that triggers the wake command.
+    pub stt_wake_phrase: Entity<InputState>,
     /// Whether a provider API key is stored (cached so render doesn't hit the
     /// keychain every frame).
     pub stt_has_key: bool,
@@ -364,6 +366,10 @@ impl SettingsUi {
                 InputState::new(window, cx)
                     .masked(true)
                     .placeholder(t("stored in the OS keychain"))
+            }),
+            stt_wake_phrase: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(muxel_core::stt::DEFAULT_WAKE_PHRASE.to_string())
             }),
             stt_has_key: false,
             keybinds: DEFAULT_KEYBINDINGS

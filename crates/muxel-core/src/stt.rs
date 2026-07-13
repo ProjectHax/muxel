@@ -123,6 +123,44 @@ pub fn build_transcription_multipart(
     (content_type, body)
 }
 
+/// Spoken phrase that triggers the wake command by default.
+pub const DEFAULT_WAKE_PHRASE: &str = "wake up daddy's home";
+
+/// Fold spoken text down to bare lowercase words for matching: whisper
+/// capitalizes and punctuates freely ("Wake up, Daddy's home!"), and an
+/// apostrophe joins rather than splits (`daddy's` → `daddys`).
+pub fn normalize_spoken(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut gap = false;
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            if gap && !out.is_empty() {
+                out.push(' ');
+            }
+            gap = false;
+            out.extend(ch.to_lowercase());
+        } else if ch.is_whitespace() {
+            gap = true;
+        }
+    }
+    out
+}
+
+/// Whether `transcript` speaks the wake `phrase` — case-, punctuation- and
+/// filler-insensitive, but on whole words ("homestead" is not "home"). An empty
+/// phrase never matches, so a blank setting can't fire on every dictation.
+pub fn matches_wake_phrase(transcript: &str, phrase: &str) -> bool {
+    let needle = normalize_spoken(phrase);
+    if needle.is_empty() {
+        return false;
+    }
+    let haystack = normalize_spoken(transcript);
+    if haystack.is_empty() {
+        return false;
+    }
+    format!(" {haystack} ").contains(&format!(" {needle} "))
+}
+
 /// Local filename for a whisper.cpp ggml model (e.g. `"base"` → `ggml-base.bin`).
 pub fn whisper_model_filename(model: &str) -> String {
     format!("ggml-{model}.bin")
@@ -139,8 +177,9 @@ pub fn whisper_model_url(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WHISPER_RATE, build_transcription_multipart, encode_wav_16k_mono, resample_to_16k_mono,
-        whisper_model_filename, whisper_model_url,
+        DEFAULT_WAKE_PHRASE, WHISPER_RATE, build_transcription_multipart, encode_wav_16k_mono,
+        matches_wake_phrase, normalize_spoken, resample_to_16k_mono, whisper_model_filename,
+        whisper_model_url,
     };
 
     #[test]
@@ -205,6 +244,50 @@ mod tests {
         assert!(!String::from_utf8_lossy(&body).contains("language"));
         let (_, body2) = build_transcription_multipart(b"x", "m", Some(""));
         assert!(!String::from_utf8_lossy(&body2).contains("language"));
+    }
+
+    #[test]
+    fn normalize_folds_case_punctuation_and_spacing() {
+        assert_eq!(
+            normalize_spoken("  Wake up,\n Daddy's home! "),
+            "wake up daddys home"
+        );
+        assert_eq!(normalize_spoken("...!?"), "");
+    }
+
+    #[test]
+    fn wake_phrase_matches_however_whisper_punctuates_it() {
+        for said in [
+            "wake up daddy's home",
+            "Wake up, Daddy's home!",
+            "  wake  up   daddys home  ",
+            "Okay — wake up, daddy's home. Let's go.",
+        ] {
+            assert!(matches_wake_phrase(said, DEFAULT_WAKE_PHRASE), "{said:?}");
+        }
+    }
+
+    #[test]
+    fn wake_phrase_rejects_near_misses() {
+        assert!(!matches_wake_phrase("wake up", DEFAULT_WAKE_PHRASE));
+        assert!(!matches_wake_phrase(
+            "write a wake up daddy test",
+            DEFAULT_WAKE_PHRASE
+        ));
+        // Whole words only: "home" must not match inside "homestead".
+        assert!(!matches_wake_phrase(
+            "wake up daddys homestead",
+            DEFAULT_WAKE_PHRASE
+        ));
+    }
+
+    #[test]
+    fn wake_phrase_is_configurable_and_blank_never_fires() {
+        assert!(matches_wake_phrase("Rise and shine!", "rise and shine"));
+        // A blank phrase would otherwise fire on every dictation.
+        assert!(!matches_wake_phrase("anything at all", ""));
+        assert!(!matches_wake_phrase("anything at all", "  ,, "));
+        assert!(!matches_wake_phrase("", DEFAULT_WAKE_PHRASE));
     }
 
     #[test]

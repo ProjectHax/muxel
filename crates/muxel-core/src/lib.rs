@@ -1249,6 +1249,14 @@ pub struct Settings {
     /// it in the prompt unsubmitted for review).
     #[serde(default)]
     pub stt_autosubmit: bool,
+    /// Treat a dictation of [`Settings::stt_wake_phrase`] as the wake command
+    /// (sweep every pane and relaunch the ones that aren't running) instead of
+    /// pasting it into the focused pane.
+    #[serde(default)]
+    pub stt_wake_command: bool,
+    /// The spoken phrase that triggers the wake command.
+    #[serde(default = "default_stt_wake_phrase")]
+    pub stt_wake_phrase: String,
 }
 
 fn default_stt_model() -> String {
@@ -1259,6 +1267,9 @@ fn default_stt_provider_url() -> String {
 }
 fn default_stt_provider_model() -> String {
     "whisper-1".to_string()
+}
+fn default_stt_wake_phrase() -> String {
+    stt::DEFAULT_WAKE_PHRASE.to_string()
 }
 
 fn default_editor_font_size() -> f32 {
@@ -1356,6 +1367,8 @@ impl Default for Settings {
             stt_provider_url: default_stt_provider_url(),
             stt_provider_model: default_stt_provider_model(),
             stt_autosubmit: false,
+            stt_wake_command: false,
+            stt_wake_phrase: default_stt_wake_phrase(),
         }
     }
 }
