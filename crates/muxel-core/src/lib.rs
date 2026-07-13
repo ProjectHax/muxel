@@ -4,6 +4,7 @@
 
 mod agent;
 mod appimage;
+pub mod audio;
 pub mod diff;
 mod gui_path;
 pub mod locale;
@@ -13,6 +14,7 @@ mod shell;
 pub mod ssh;
 pub mod stt;
 pub mod tmux;
+pub mod tts;
 pub mod url;
 pub mod worktree;
 
@@ -31,6 +33,7 @@ pub use pane::{
 };
 pub use shell::{join_words, split_words};
 pub use stt::SttEngine;
+pub use tts::TtsEngine;
 pub use url::normalize_url;
 pub use worktree::Worktree;
 
@@ -1257,6 +1260,27 @@ pub struct Settings {
     /// The spoken phrase that triggers the wake command.
     #[serde(default = "default_stt_wake_phrase")]
     pub stt_wake_phrase: String,
+    // --- Text-to-speech (the voice muxel *can* answer in) ---
+    // Nothing speaks today — the spoken wake command was cut — but `muxel::tts` is
+    // kept working behind these, so a future spoken feature inherits a configured
+    // voice rather than starting from nothing. See crates/muxel/src/tts.rs.
+    /// Which synthesizer speaks. Defaults to the OS voice: it needs no model and
+    /// no key, so speech works on a fresh install with nothing configured.
+    #[serde(default)]
+    pub tts_engine: TtsEngine,
+    /// Kokoro voice for the local engine (`bm_george`, `am_michael`, …).
+    #[serde(default = "default_kokoro_voice")]
+    pub tts_local_voice: String,
+    /// Kokoro weights for the local engine (`model_quantized` | `model_q8f16` | `model`).
+    #[serde(default = "default_kokoro_model")]
+    pub tts_local_model: String,
+    /// Voice name sent to the provider (`onyx`, `nova`, …).
+    #[serde(default = "default_tts_voice")]
+    pub tts_provider_voice: String,
+    /// Model sent to the provider (`tts-1`, `gpt-4o-mini-tts`, …). The endpoint and
+    /// API key are the Speech section's — one provider, both directions.
+    #[serde(default = "default_tts_provider_model")]
+    pub tts_provider_model: String,
 }
 
 fn default_stt_model() -> String {
@@ -1270,6 +1294,18 @@ fn default_stt_provider_model() -> String {
 }
 fn default_stt_wake_phrase() -> String {
     stt::DEFAULT_WAKE_PHRASE.to_string()
+}
+fn default_kokoro_voice() -> String {
+    tts::DEFAULT_KOKORO_VOICE.to_string()
+}
+fn default_kokoro_model() -> String {
+    tts::DEFAULT_KOKORO_MODEL.to_string()
+}
+fn default_tts_voice() -> String {
+    tts::DEFAULT_TTS_VOICE.to_string()
+}
+fn default_tts_provider_model() -> String {
+    tts::DEFAULT_TTS_PROVIDER_MODEL.to_string()
 }
 
 fn default_editor_font_size() -> f32 {
@@ -1369,6 +1405,11 @@ impl Default for Settings {
             stt_autosubmit: false,
             stt_wake_command: false,
             stt_wake_phrase: default_stt_wake_phrase(),
+            tts_engine: TtsEngine::default(),
+            tts_local_voice: default_kokoro_voice(),
+            tts_local_model: default_kokoro_model(),
+            tts_provider_voice: default_tts_voice(),
+            tts_provider_model: default_tts_provider_model(),
         }
     }
 }

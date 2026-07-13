@@ -933,9 +933,27 @@ enum UpdateState {
     Error(String),
 }
 
-/// How long the wake command lingers on each pane, so the sweep is visible
-/// rather than a single-frame jump to the last pane.
-const WAKE_STEP: Duration = Duration::from_millis(250);
+// --- Wake sequence ---------------------------------------------------------
+// The sweep walks the panes themselves — nothing is drawn over the workspace, so
+// what you watch is the real thing coming back. The pacing below is the whole
+// effect: a sweep fast enough to be efficient would just look like a glitch.
+
+/// How long the sweep dwells on each pane before moving to the next.
+const WAKE_STEP: Duration = Duration::from_millis(400);
+
+/// The wake command's report, once every pane has been visited.
+fn wake_report(relaunched: usize) -> String {
+    if relaunched == 0 {
+        t("Every agent was already running").to_string()
+    } else {
+        tn(
+            "Relaunched {n} agent",
+            "Relaunched {n} agents",
+            relaunched,
+            &[("n", &relaunched.to_string())],
+        )
+    }
+}
 
 /// State of a speech-to-text dictation (drives the mic button + recording pill).
 #[derive(Clone, Default, PartialEq)]
@@ -1259,8 +1277,8 @@ pub struct MuxelApp {
     /// True while a push-to-hold dictation is active (started on the hold chord's
     /// key-down, stopped on the next key-up).
     stt_hold: bool,
-    /// True while the spoken wake command's pane sweep is walking the workspace
-    /// (guards against a second sweep stacking on top of the running one).
+    /// True while the wake command's sweep is walking the workspace — the guard
+    /// against a second sweep stacking on top of the running one.
     waking: bool,
     /// Set once the user confirms quitting, so the close hook stops vetoing.
     confirm_quit: bool,
@@ -4634,6 +4652,11 @@ impl MuxelApp {
         } else if let Some(bv) = self.browsers.get(&iid) {
             let handle = bv.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
+            // Deliberately NOT `focus_native` here. The native webview is a real
+            // child window: once it holds the OS keyboard focus it swallows muxel's
+            // own chords too. Selecting a browser pane with a keyboard shortcut must
+            // leave those working — only a click *into the page* should hand the
+            // keyboard over (see the click handler in the tick).
         }
         cx.notify();
     }
@@ -5526,6 +5549,21 @@ impl MuxelApp {
                 {
                     inst.browser_url = Some(url);
                     changed = true;
+                }
+                // A click inside the native webview never reaches gpui — the child
+                // window sits above it and consumes the event — so the page reports
+                // it over IPC instead. Without this, clicking a browser pane left the
+                // highlight (and keyboard actions like paste) on whichever pane was
+                // focused before.
+                if view.update(cx, |v, _| v.take_page_click()) {
+                    if self.active_instance != Some(iid) {
+                        self.focus_instance(iid, window, cx);
+                    }
+                    // The user clicked *into the page*, so the keyboard belongs to it
+                    // — and `focus_instance` above may have just pulled focus back to
+                    // gpui. This is the ONLY path that hands the OS keyboard to a
+                    // webview; see the note in `focus_instance`.
+                    view.read(cx).focus_native(cx);
                 }
             }
             if changed {
@@ -11265,6 +11303,34 @@ impl MuxelApp {
         .detach();
     }
 
+    /// Snapshot the speech settings for one utterance. The provider URL and key
+    /// are the Speech section's — one provider serves both transcription and
+    /// speech, so there is no second endpoint to configure.
+    ///
+    /// Unused while nothing speaks (see `tts.rs`), but kept as the settings → voice
+    /// bridge so the next feature that wants a voice only has to call
+    /// `crate::tts::speak(text, self.voice_config())`.
+    #[allow(dead_code)]
+    fn voice_config(&self) -> crate::tts::VoiceConfig {
+        crate::tts::VoiceConfig {
+            engine: self.settings.tts_engine,
+            local_voice: self.settings.tts_local_voice.clone(),
+            local_model: self.settings.tts_local_model.clone(),
+            provider_url: self.settings.stt_provider_url.clone(),
+            provider_model: self.settings.tts_provider_model.clone(),
+            provider_voice: self.settings.tts_provider_voice.clone(),
+            api_key: crate::secrets::get_stt_api_key().unwrap_or_default(),
+            models_dir: muxel_store::models_dir(),
+        }
+    }
+
+    /// Whether `iid`'s process is up: a live view whose child hasn't exited.
+    fn is_running(&self, iid: Uuid, cx: &App) -> bool {
+        self.terminals
+            .get(&iid)
+            .is_some_and(|view| !view.read(cx).exited())
+    }
+
     /// Relaunch `iid`'s process if it isn't running, returning whether it did.
     /// Editor/diff/browser panes have no process of their own — left alone.
     fn ensure_instance_running(
@@ -11273,14 +11339,9 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.workspace.instance(iid).map(|i| i.kind) != Some(InstanceKind::Terminal) {
-            return false;
-        }
-        let dead = match self.terminals.get(&iid) {
-            Some(view) => view.read(cx).exited(),
-            None => true,
-        };
-        if !dead {
+        if self.workspace.instance(iid).map(|i| i.kind) != Some(InstanceKind::Terminal)
+            || self.is_running(iid, cx)
+        {
             return false;
         }
         if let Some(view) = self.terminals.remove(&iid) {
@@ -11293,56 +11354,65 @@ impl MuxelApp {
         true
     }
 
-    /// The spoken wake command: walk every project's panes in turn, relaunching
-    /// each one that isn't running, then land back where the sweep started.
+    /// The spoken wake command: walk every agent pane in the workspace in turn —
+    /// dead ones brought back, live ones passed over — and land back where the
+    /// sweep started.
     ///
-    /// A project shown in a secondary window keeps its own focus — its dead panes
-    /// are relaunched, but it isn't pulled into this window.
+    /// Nothing is drawn over the workspace: the panes themselves are the display,
+    /// so what you watch is the real thing coming back. The tally lands in the
+    /// notifications feed at the end.
+    ///
+    /// Only panes with a process take part; an editor has nothing to bring online.
+    /// A project shown in a secondary window keeps its own focus: its dead panes
+    /// are relaunched without stealing it into this window.
     fn wake_all_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.waking {
-            return;
+            return; // a sweep is already running
         }
-        let pids: Vec<Uuid> = self.workspace.projects.iter().map(|p| p.id).collect();
-        if pids.is_empty() {
-            return;
+        // Every agent pane in the workspace, in project order.
+        let targets: Vec<(Uuid, Uuid)> = self
+            .workspace
+            .projects
+            .iter()
+            .flat_map(|p| {
+                p.instances()
+                    .into_iter()
+                    .filter(|iid| {
+                        self.workspace.instance(*iid).map(|i| i.kind)
+                            == Some(InstanceKind::Terminal)
+                    })
+                    .map(|iid| (p.id, iid))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if targets.is_empty() {
+            return; // nothing in this workspace has a process to wake
         }
+
         let home_pid = self.workspace.active_project;
         let home_iid = self.active_instance;
         self.waking = true;
         cx.notify();
 
         cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
-            let mut launched = 0usize;
-            for pid in pids {
-                let Ok((elsewhere, panes)) = this.update_in(cx, |this, window, cx| {
+            let mut relaunched = 0usize;
+            for (pid, iid) in targets {
+                let Ok(was_dead) = this.update_in(cx, |this, window, cx| {
                     let elsewhere = this.secondary_windows.iter().any(|s| s.pid == pid);
                     if !elsewhere && this.workspace.active_project != Some(pid) {
                         this.select_project(pid, window, cx);
                     }
-                    let panes = this
-                        .workspace
-                        .project(pid)
-                        .map(|p| p.instances())
-                        .unwrap_or_default();
-                    (elsewhere, panes)
+                    let was_dead = this.ensure_instance_running(iid, window, cx);
+                    if !elsewhere {
+                        this.focus_instance(iid, window, cx);
+                    }
+                    cx.notify();
+                    was_dead
                 }) else {
                     return; // window/app went away mid-sweep
                 };
-
-                for iid in panes {
-                    let Ok(woke) = this.update_in(cx, |this, window, cx| {
-                        let woke = this.ensure_instance_running(iid, window, cx);
-                        if !elsewhere {
-                            this.focus_instance(iid, window, cx);
-                        }
-                        cx.notify();
-                        woke
-                    }) else {
-                        return;
-                    };
-                    launched += usize::from(woke);
-                    cx.background_executor().timer(WAKE_STEP).await;
-                }
+                relaunched += usize::from(was_dead);
+                cx.background_executor().timer(WAKE_STEP).await;
             }
 
             let _ = this.update_in(cx, |this, window, cx| {
@@ -11359,16 +11429,7 @@ impl MuxelApp {
                 this.add_event(
                     NotifKind::Success,
                     t("Wake up — daddy's home"),
-                    if launched == 0 {
-                        t("Every pane was already running").to_string()
-                    } else {
-                        tn(
-                            "Relaunched {n} pane",
-                            "Relaunched {n} panes",
-                            launched,
-                            &[("n", &launched.to_string())],
-                        )
-                    },
+                    wake_report(relaunched),
                 );
                 this.persist();
                 cx.notify();

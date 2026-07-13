@@ -58,6 +58,41 @@ keyring = { version = "3", features = [
 # whisper.cpp for offline local transcription is added per-target just below.
 cpal = "0.15"
 
+# --- Local neural voice (opt-in, OFF by default) ---
+# `tts.rs` can speak with Kokoro-82M in-process, fully offline. Nothing in muxel
+# calls it today — it is kept, wired and working, for a future spoken feature — so
+# it is behind a feature flag rather than compiled into every build: `ort` links
+# onnxruntime statically, which is ~63 MB of binary that no user is currently
+# getting anything for. Build it with `--features voice-local`.
+#
+# The System and Provider voices need no feature and no extra dependency: cpal
+# (above) plays the audio, ureq (above) fetches it.
+#
+# Not buildable on Windows-on-ARM, same as whisper-rs below.
+[features]
+voice-local = ["dep:kokoro-en", "dep:tokio"]
+
+[dependencies.kokoro-en]
+version = "0.1"
+optional = true
+# `default-features = false` + `misaki-lean` is load-bearing: the default
+# `g2p-espeak` feature compiles espeak-ng from source via cmake for unlimited
+# vocabulary, which muxel does not need — everything it says is a sentence we wrote
+# ourselves, and the bundled CMU dictionary covers that vocabulary exactly (digits
+# included). It is also the *better* phonemizer here: espeak clips word-final
+# sounds ("online" → "onlin"). Note this only drops the BUNDLED espeak — kokoro-en
+# still probes for a system `espeak-ng` at runtime, which `main.rs` disables.
+default-features = false
+features = ["misaki-lean"]
+
+# kokoro-en's API is async; muxel is gpui, not tokio, so speech runs on its own
+# thread with a current-thread runtime. tokio comes in under kokoro-en anyway, so
+# this adds nothing new to the tree.
+[dependencies.tokio]
+version = "1"
+optional = true
+features = ["rt"]
+
 # whisper.cpp (compiled from source via cmake) — every target EXCEPT Windows on
 # ARM, where ggml's CPU backend refuses the MSVC compiler ("MSVC is not supported
 # for ARM, use clang"). There, local STT is unavailable and the Provider
