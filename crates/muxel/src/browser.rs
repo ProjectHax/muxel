@@ -52,7 +52,7 @@ mod imp {
     use super::*;
     use gpui_component::button::{Button, ButtonVariants as _};
     use gpui_component::input::{Input, InputEvent, InputState};
-    use gpui_component::{IconName, Sizable as _, h_flex};
+    use gpui_component::{Icon, IconName, Sizable as _, h_flex};
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     /// The gpui window's native handle, detached from the `&Window` it came from.
@@ -72,6 +72,26 @@ mod imp {
         }
     }
 
+    /// IPC message the page posts when it is clicked. Namespaced so it can't
+    /// collide with a site that uses `window.ipc` for its own purposes.
+    const CLICK_MSG: &str = "muxel:page-click";
+
+    /// Injected into every page (and every frame) before its own scripts run.
+    ///
+    /// The native webview is a real child window stacked ABOVE gpui, so a click
+    /// inside it is consumed by the OS and gpui never dispatches a mouse event for
+    /// it — which is why the pane's `on_mouse_down` handler (app.rs) can't see it,
+    /// and why the clicked pane never became the active one. The page itself is the
+    /// only thing that *can* see the click, so it tells us. Capture phase, so a
+    /// page that stops propagation on its own handlers can't hide the click.
+    const CLICK_SCRIPT: &str = r#"
+        (function () {
+          window.addEventListener('mousedown', function () {
+            try { window.ipc.postMessage('muxel:page-click'); } catch (e) {}
+          }, true);
+        })();
+    "#;
+
     pub struct BrowserView {
         focus_handle: FocusHandle,
         webview: Option<Entity<gpui_wry::WebView>>,
@@ -82,6 +102,9 @@ mod imp {
         url: String,
         /// What the app last asked of the native child (dedupes plaform calls).
         native_visible: bool,
+        /// Clicks the page reported over IPC (see [`CLICK_SCRIPT`]). Drained each
+        /// tick by [`BrowserView::take_page_click`].
+        clicks: std::sync::mpsc::Receiver<()>,
     }
 
     impl BrowserView {
@@ -121,11 +144,20 @@ mod imp {
                 .ok()
                 .map(|h| ParentWindow(h.as_raw()));
             let requested = url.clone();
+            let (click_tx, clicks) = std::sync::mpsc::channel();
 
             cx.spawn_in(window, async move |this, cx| {
                 let built = match parent.as_ref() {
                     Some(parent) => wry::WebViewBuilder::new()
                         .with_url(&requested)
+                        .with_initialization_script(CLICK_SCRIPT)
+                        .with_ipc_handler(move |req| {
+                            if req.body().as_str() == CLICK_MSG {
+                                // The receiver is dropped with the pane; a click
+                                // arriving after that is simply nobody's business.
+                                let _ = click_tx.send(());
+                            }
+                        })
                         .build_as_child_async(parent)
                         .await
                         .ok(),
@@ -160,7 +192,72 @@ mod imp {
                 address,
                 url,
                 native_visible: true,
+                clicks,
             }
+        }
+
+        /// Whether the page was clicked since the last check (drains the queue).
+        ///
+        /// The app polls this each tick and makes this pane the active one — the
+        /// click never reaches gpui on its own, so without this the pane keeps its
+        /// old highlight and keyboard actions (paste, restart, close) go to
+        /// whichever pane was focused before.
+        pub fn take_page_click(&mut self) -> bool {
+            let mut clicked = false;
+            while self.clicks.try_recv().is_ok() {
+                clicked = true;
+            }
+            clicked
+        }
+
+        /// Hand the OS keyboard focus to the native webview, so typing (and paste)
+        /// goes to the page rather than to the pane muxel last focused.
+        pub fn focus_native(&self, cx: &App) {
+            // Focusing a hidden child would pull focus out of whatever is actually
+            // on screen (a modal, another tab).
+            if !self.native_visible {
+                return;
+            }
+            if let Some(wv) = &self.webview {
+                let _ = wv.read(cx).raw().focus();
+            }
+        }
+
+        /// Reload the page the webview is *currently* on.
+        ///
+        /// This is wry's native reload, not a re-navigation to `self.url` and not a
+        /// rebuild of the pane: the user may be several links deep, and refresh must
+        /// reload where they actually are.
+        pub fn reload(&mut self, cx: &mut Context<Self>) {
+            if let Some(wv) = &self.webview {
+                let _ = wv.read(cx).raw().reload();
+            }
+        }
+
+        /// Step back / forward through the page's session history.
+        ///
+        /// Reload is the only navigation wry exposes natively, so history has to go
+        /// through the page itself. That is a genuine limitation, not a shortcut:
+        /// it means back/forward do nothing on a document where scripts can't run
+        /// (a webview that failed to load, `about:blank`), where a native
+        /// `canGoBack` would at least have told us the button was pointless. The
+        /// buttons therefore stay enabled and simply no-op at the ends of history,
+        /// which is also what they did before.
+        fn history_go(&self, delta: i32, cx: &App) {
+            if let Some(wv) = &self.webview {
+                let _ = wv
+                    .read(cx)
+                    .raw()
+                    .evaluate_script(&format!("history.go({delta});"));
+            }
+        }
+
+        pub fn back(&mut self, cx: &mut Context<Self>) {
+            self.history_go(-1, cx);
+        }
+
+        pub fn forward(&mut self, cx: &mut Context<Self>) {
+            self.history_go(1, cx);
         }
 
         pub fn tab_title(&self) -> String {
@@ -236,27 +333,23 @@ mod imp {
                         .xsmall()
                         .icon(IconName::ArrowLeft)
                         .tooltip(t("Back"))
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            if let Some(wv) = &this.webview {
-                                wv.update(cx, |wv, _| {
-                                    let _ = wv.back();
-                                });
-                            }
-                        })),
+                        .on_click(cx.listener(|this, _e, _w, cx| this.back(cx))),
+                )
+                .child(
+                    Button::new("browser-forward")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ArrowRight)
+                        .tooltip(t("Forward"))
+                        .on_click(cx.listener(|this, _e, _w, cx| this.forward(cx))),
                 )
                 .child(
                     Button::new("browser-reload")
                         .ghost()
                         .xsmall()
-                        .icon(IconName::Redo)
-                        .tooltip(t("Reload"))
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            if let Some(wv) = &this.webview {
-                                wv.update(cx, |wv, _| {
-                                    let _ = wv.evaluate_script("location.reload();");
-                                });
-                            }
-                        })),
+                        .icon(Icon::empty().path("icons/refresh.svg"))
+                        .tooltip(t("Reload this page"))
+                        .on_click(cx.listener(|this, _e, _w, cx| this.reload(cx))),
                 )
                 .child(div().flex_1().child(Input::new(&self.address)));
 
@@ -323,6 +416,19 @@ mod imp {
         }
 
         pub fn set_native_visible(&mut self, _visible: bool, _cx: &mut Context<Self>) {}
+
+        /// No embedded webview here, so clicks land on ordinary gpui elements and
+        /// the pane's own `on_mouse_down` already focuses it (see the macOS/Windows
+        /// impl for why that isn't true there).
+        pub fn take_page_click(&mut self) -> bool {
+            false
+        }
+
+        /// No native child to focus.
+        pub fn focus_native(&self, _cx: &App) {}
+
+        // No `reload` here: the placeholder has no toolbar and no page. Reload is
+        // called only from the macOS/Windows toolbar, inside that impl.
     }
 
     impl Focusable for BrowserView {

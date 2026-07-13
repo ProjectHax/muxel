@@ -21,43 +21,13 @@ pub enum SttEngine {
 }
 
 /// Downmix interleaved `channels`-channel `samples` to mono and resample from
-/// `src_rate` to [`WHISPER_RATE`] by linear interpolation. Linear is adequate
-/// for speech recognition; swap for a sinc resampler (`rubato`) if accuracy on
-/// heavy downsampling ever proves insufficient.
+/// `src_rate` to [`WHISPER_RATE`], which is what whisper.cpp will accept.
 pub fn resample_to_16k_mono(samples: &[f32], src_rate: u32, channels: u16) -> Vec<f32> {
-    let channels = channels as usize;
-    if samples.is_empty() || src_rate == 0 || channels == 0 {
+    if src_rate == 0 {
         return Vec::new();
     }
-
-    // Interleaved frames → mono (average the channels).
-    let frames = samples.len() / channels;
-    let mono: Vec<f32> = (0..frames)
-        .map(|f| {
-            let base = f * channels;
-            samples[base..base + channels].iter().sum::<f32>() / channels as f32
-        })
-        .collect();
-
-    if src_rate == WHISPER_RATE || mono.len() < 2 {
-        return mono;
-    }
-
-    let dst_len = ((mono.len() as u64 * WHISPER_RATE as u64) / src_rate as u64) as usize;
-    if dst_len == 0 {
-        return Vec::new();
-    }
-    let step = src_rate as f64 / WHISPER_RATE as f64;
-    (0..dst_len)
-        .map(|i| {
-            let pos = i as f64 * step;
-            let idx = pos.floor() as usize;
-            let frac = (pos - idx as f64) as f32;
-            let a = mono[idx.min(mono.len() - 1)];
-            let b = mono[(idx + 1).min(mono.len() - 1)];
-            a + (b - a) * frac
-        })
-        .collect()
+    let mono = crate::audio::downmix(samples, channels);
+    crate::audio::resample_linear(&mono, src_rate, WHISPER_RATE)
 }
 
 /// Encode 16 kHz mono f32 `samples` as a 16-bit PCM WAV (44-byte header + data),
@@ -161,6 +131,25 @@ pub fn matches_wake_phrase(transcript: &str, phrase: &str) -> bool {
     format!(" {haystack} ").contains(&format!(" {needle} "))
 }
 
+/// Which greeting the wake command opens with. The spoken wording itself lives
+/// in the app (it goes through `t()`); only the choice is decided here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DayPart {
+    Morning,
+    Afternoon,
+    Evening,
+}
+
+/// The part of the day a local `hour` (0–23) falls in. Out-of-range hours read
+/// as evening rather than panicking — a greeting is never worth a crash.
+pub fn day_part(hour: u32) -> DayPart {
+    match hour {
+        5..=11 => DayPart::Morning,
+        12..=17 => DayPart::Afternoon,
+        _ => DayPart::Evening,
+    }
+}
+
 /// Local filename for a whisper.cpp ggml model (e.g. `"base"` → `ggml-base.bin`).
 pub fn whisper_model_filename(model: &str) -> String {
     format!("ggml-{model}.bin")
@@ -177,10 +166,21 @@ pub fn whisper_model_url(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_WAKE_PHRASE, WHISPER_RATE, build_transcription_multipart, encode_wav_16k_mono,
-        matches_wake_phrase, normalize_spoken, resample_to_16k_mono, whisper_model_filename,
-        whisper_model_url,
+        DEFAULT_WAKE_PHRASE, DayPart, WHISPER_RATE, build_transcription_multipart, day_part,
+        encode_wav_16k_mono, matches_wake_phrase, normalize_spoken, resample_to_16k_mono,
+        whisper_model_filename, whisper_model_url,
     };
+
+    #[test]
+    fn day_part_splits_the_clock_and_never_panics() {
+        assert_eq!(day_part(5), DayPart::Morning);
+        assert_eq!(day_part(11), DayPart::Morning);
+        assert_eq!(day_part(12), DayPart::Afternoon);
+        assert_eq!(day_part(17), DayPart::Afternoon);
+        assert_eq!(day_part(18), DayPart::Evening);
+        assert_eq!(day_part(4), DayPart::Evening); // small hours
+        assert_eq!(day_part(99), DayPart::Evening); // nonsense hour, not a panic
+    }
 
     #[test]
     fn resample_downmixes_and_hits_16k() {

@@ -19,6 +19,7 @@ mod secrets;
 mod settings_view;
 mod stt;
 mod theme;
+mod tts;
 mod update;
 
 use app::MuxelApp;
@@ -106,6 +107,29 @@ fn main() {
             unsafe { std::env::set_var("PATH", path) };
         }
     }
+
+    // The local (Kokoro) voice: phonemize with the bundled CMU dictionary, never
+    // with a system espeak-ng.
+    //
+    // Only compiled in with `--features voice-local`; nothing speaks by default.
+    //
+    // `kokoro-en` probes for an `espeak-ng` binary at RUNTIME and prefers it if it
+    // finds one — and that path mangles word-final phonemes: "by" → "bee",
+    // "online" → "onlin", "evening" → "evenin". It is audible as the last sound of
+    // every word being clipped. The dictionary gets all of them right, digits
+    // included ("12 agents" → twˈɛlv ˈeɪdʒənts).
+    //
+    // Compiling espeak out (`misaki-lean`, see Cargo.toml) is not enough on its
+    // own, because that only drops the *bundled* copy. Without this the voice would
+    // also be nondeterministic — muxel would speak differently depending on whether
+    // espeak-ng happened to be installed, which is exactly how this went unnoticed.
+    //
+    // SAFETY: still single-threaded here (before the GPUI app starts) — and this
+    // must precede the thread spawned just below.
+    #[cfg(feature = "voice-local")]
+    unsafe {
+        std::env::set_var("KOKORO_ESPEAK_NG", "0")
+    };
 
     // Reap stale muxel AppImage squashfuse mounts left in /tmp by prior instances
     // that crashed or were SIGKILLed before the runtime could unmount them —

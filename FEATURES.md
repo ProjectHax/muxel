@@ -105,13 +105,40 @@ feature is added or changed, update the matching entry here in the same change**
   every other platform has both.)
 - **Spoken wake command** — an opt-in toggle in Settings → Speech: say the wake
   phrase (default *"wake up daddy's home"*) into the mic and muxel walks every
-  pane of every project in turn, relaunching each agent whose process isn't
-  running, then lands back on the pane you started from. Panes still running are
-  left untouched, and the transcript that triggers it is treated as a command —
-  it isn't typed into any agent. Matching ignores case, punctuation and
-  surrounding filler, so however whisper hears it ("Wake up, Daddy's home!") it
-  fires; the phrase itself is editable. A project shown in a second window keeps
-  its own focus — its dead panes are relaunched without stealing it.
+  agent pane of every project in turn, relaunching each one whose process isn't
+  running, then lands back on the pane you started from. Nothing is drawn over the
+  workspace — the sweep moves through the real panes, so you watch them come back.
+  Panes still running are left untouched, and the transcript that triggers it is
+  treated as a command: it isn't typed into any agent. Matching ignores case,
+  punctuation and surrounding filler, so however whisper hears it ("Wake up,
+  Daddy's home!") it fires; the phrase itself is editable. A project shown in a
+  second window keeps its own focus — its dead panes are relaunched without
+  stealing it. The result lands in the notifications feed either way.
+- **Spoken report** (optional) — with the wake command on, a second toggle has muxel
+  greet you with what it found ("Good evening. Two agents are offline. Bringing
+  them back online.") and sign off when the sweep finishes ("All systems online.
+  Standing by."). The greeting is timed to land before the panes start moving. Turn
+  it off and the wake command runs silently.
+- **The voice muxel answers in** — Settings → Speech picks the synthesizer, in the
+  same three flavours as dictation:
+  - **System** (default) — the voice the OS already ships (`say` on macOS, SAPI on
+    Windows, `spd-say`/`espeak` on Linux). No model, no key, no network, works on a
+    fresh install — and sounds like 1998.
+  - **Local** — **Kokoro-82M**, a real neural voice run on your machine, with six
+    English reads to pick from (the default `bm_george` is a British male). The
+    model downloads once (~89 MB) the first time it speaks and nothing leaves the
+    machine after that. Speech is streamed a sentence at a time, so it starts
+    talking in about a second rather than after rendering the whole line.
+  - **Provider** — any OpenAI-compatible `/audio/speech` endpoint, reusing the base
+    URL and keychain API key the Speech section already stores; the voice and model
+    (e.g. `onyx` / `tts-1`) are yours to set. What it says is sent to that endpoint.
+
+  A **Test voice** button speaks a sample line so you can hear the setting without
+  triggering a wake. Every engine degrades rather than fails: a provider that
+  errors, a model that won't download, or a machine with no audio device at all
+  falls back to the system voice, and failing even that, stays quiet — the sweep
+  still runs and still reports. (The local voice, like local whisper, is
+  unavailable on Windows-on-ARM; use a Provider there.)
 - **Shared project memory** — opt-in per project: agents are told (via their system
   prompt) to `grep` and add durable lessons to a `.muxel/MEMORY.md` file shared
   across every agent and run in that project. muxel creates the file, git-ignores
@@ -221,8 +248,12 @@ feature is added or changed, update the matching entry here in the same change**
   locally hosted dev site) without leaving muxel. Uses the OS engine (WKWebView on
   macOS, WebView2 on Windows, WebKitGTK on Linux), so it's light on disk and memory.
 - **macOS/Windows: an embedded pane** — ctrl+click a URL and it opens as a browser
-  pane beside the terminal, with an address bar, Back, and Reload; the URL persists
-  and restores with the workspace.
+  pane beside the terminal, with an address bar and Back / Forward / Reload buttons;
+  Reload refreshes the page you are actually on (several links deep, if that's where
+  you are), not the pane's original URL. The URL persists and restores with the
+  workspace. Clicking into the page makes it the active pane — so paste and the
+  toolbar act on the browser, not on whichever pane you were in before — and hands
+  it the keyboard; muxel's own shortcuts keep working until you click into a page.
 - **Linux: a separate browser window** — gpui can't embed WebKitGTK, so links open
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.
