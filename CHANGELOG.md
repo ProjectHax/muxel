@@ -5,7 +5,18 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
-## [0.1.2] — 2026-07-12
+### Fixed
+- **Remote panes on a Mac host no longer die with `command not found: tmux`** — sshd
+  runs a remote command through a shell that is neither login nor interactive, so it
+  reads no profile and gets sshd's bare default `PATH`
+  (`/usr/bin:/bin:/usr/sbin:/sbin`). A Mac's tmux comes from Homebrew — on Apple
+  silicon `/opt/homebrew/bin/tmux` — which is on none of those, so every remote pane
+  against such a host closed the instant it opened, shell and agent alike. muxel now
+  names the standard prefixes (Homebrew, MacPorts, Linuxbrew, snap, `~/.local/bin`,
+  Nix) when it runs `tmux` on a host, for panes, session listing, and session
+  teardown alike. They are *appended* to the remote `PATH`, so a host that already
+  finds tmux keeps using the exact binary it uses today. The iOS companion app,
+  which builds the same commands, is fixed with it.
 
 ### Added
 - **Add an SSH host straight from "New remote project"** — the dialog's host list

@@ -304,6 +304,50 @@ pub fn parse_keygen_lookup(stdout: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Dirs appended to a remote command's `PATH` so that `tmux` resolves.
+///
+/// sshd runs a command through a *non-interactive, non-login* shell, whose `PATH` is
+/// sshd's bare default (`/usr/bin:/bin:/usr/sbin:/sbin`) — no profile, no rc file. A
+/// Mac's tmux comes from Homebrew, which on Apple silicon lives in `/opt/homebrew/bin`
+/// and is on none of them: every remote pane on such a host dies with
+/// `command not found: tmux` before a session exists, shell and agent alike (the
+/// remote command names `tmux` twice, so the failure even arrives twice). Linux hosts
+/// never showed it — a distro tmux is `/usr/bin/tmux`, already on the bare PATH.
+///
+/// This is the far-side twin of the bug [`crate::gui_path`] fixes for a Finder launch,
+/// so it gets the same fix: name the standard prefixes. The remote OS is unknown here,
+/// so macOS and Linux ones share a list — a `PATH` entry that doesn't exist is
+/// harmless.
+///
+/// **Appended, never prepended**: a host that resolves `tmux` today keeps resolving the
+/// exact binary it resolves now, and these only add fallbacks behind it.
+const REMOTE_TMUX_PATH_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",              // Homebrew, Apple silicon
+    "/usr/local/bin",                 // Homebrew, Intel macOS — and the usual local prefix
+    "/opt/local/bin",                 // MacPorts
+    "/home/linuxbrew/.linuxbrew/bin", // Linuxbrew
+    "/snap/bin",
+    "$HOME/.local/bin",
+    "$HOME/bin",
+    "$HOME/.nix-profile/bin", // Nix
+];
+
+/// The `PATH` assignment that must lead **every** remote command line naming `tmux` —
+/// panes (see [`ssh_args`]), session listing, and session teardown alike. See
+/// [`REMOTE_TMUX_PATH_DIRS`] for why.
+///
+/// Only `tmux` itself is resolved this way. A *program* (the agent) still goes through
+/// the user's shell — see [`login_shell_command`] — because it needs the user's whole
+/// environment, not just a findable binary; tmux only needs to be found, and sourcing a
+/// user's rc files to find it would put their startup output into command results muxel
+/// parses.
+///
+/// `$PATH` and `$HOME` are expanded by the *remote* shell, so this is deliberately left
+/// unquoted.
+pub fn tmux_path_prelude() -> String {
+    format!("export PATH=\"$PATH:{}\"", REMOTE_TMUX_PATH_DIRS.join(":"))
+}
+
 /// Parameters for a remote interactive pane command.
 pub struct SshSpec<'a> {
     pub host: &'a RemoteHost,
@@ -365,7 +409,11 @@ fn remote_command(spec: &SshSpec) -> String {
         // a `pkill -f <project>` *on the remote host* matches the shared server and
         // kills every session on it. See `tmux::start_server_args`. This runs before
         // the `exec`, so it costs one short-lived process and nothing after.
-        let mut cmd = String::from("tmux");
+        //
+        // Both `tmux` words below are resolved against the augmented PATH — sshd's bare
+        // default doesn't have Homebrew's on it. See `tmux_path_prelude`.
+        let mut cmd = tmux_path_prelude();
+        cmd.push_str("; tmux");
         for a in crate::tmux::start_server_args() {
             cmd.push(' ');
             cmd.push_str(&sh_quote(&a));
@@ -635,13 +683,51 @@ mod tests {
         };
         // `-u` leads the attaching client: the remote host's login shell may hand
         // tmux no UTF-8 locale, and then it would mangle every non-ASCII cell. The
-        // agent runs through a login shell so it resolves on the user's real PATH.
+        // agent runs through a login shell so it resolves on the user's real PATH;
+        // tmux itself resolves on the augmented PATH (`tmux_path_prelude`).
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
-            "tmux start-server ';' set -s exit-empty off; \
-             exec tmux -u set -g mouse on ';' new-session -A -s muxel-abc123 -c /srv/app \
-             -- \"${SHELL:-/bin/sh}\" -ilc 'exec claude'"
+            &format!(
+                "{}; tmux start-server ';' set -s exit-empty off; \
+                 exec tmux -u set -g mouse on ';' new-session -A -s muxel-abc123 -c /srv/app \
+                 -- \"${{SHELL:-/bin/sh}}\" -ilc 'exec claude'",
+                tmux_path_prelude()
+            )
         );
+    }
+
+    /// The bug this guards: sshd runs the remote command with its bare default PATH
+    /// (`/usr/bin:/bin:/usr/sbin:/sbin`) and no profile, so a Mac's Homebrew tmux —
+    /// `/opt/homebrew/bin/tmux` on Apple silicon — is not on it. Every `tmux` word in
+    /// the command then dies with `command not found: tmux` and the pane closes,
+    /// whether it was going to run a shell or an agent.
+    #[test]
+    fn remote_tmux_resolves_when_the_ssh_path_is_bare() {
+        let h = host();
+        for program in [None, Some("claude")] {
+            let spec = SshSpec {
+                host: &h,
+                control_path: "/s",
+                remote_cwd: Some("/srv/app"),
+                program,
+                args: &[],
+                use_tmux: true,
+                tmux_session: Some("s"),
+            };
+            let cmd = ssh_args(&spec).last().unwrap().clone();
+            let (prelude, rest) = cmd.split_once("; ").expect("a PATH prelude leads");
+            assert_eq!(prelude, tmux_path_prelude(), "for program {program:?}");
+            // Every tmux invocation is behind it — nothing names tmux before the PATH
+            // it will be looked up on is set.
+            assert!(!prelude.contains("tmux "), "got: {prelude}");
+            assert!(rest.starts_with("tmux "), "got: {rest}");
+        }
+        // The prefix that makes a Homebrew Mac work at all, and the `$HOME` dirs the
+        // remote shell (not muxel) must expand.
+        assert!(tmux_path_prelude().contains("/opt/homebrew/bin"));
+        assert!(tmux_path_prelude().contains("$HOME/.local/bin"));
+        // Appended, so a host that already resolves tmux keeps the binary it has.
+        assert!(tmux_path_prelude().starts_with("export PATH=\"$PATH:"));
     }
 
     /// The bug this guards: tmux `execvp`s a program with the *tmux server's*
@@ -719,7 +805,7 @@ mod tests {
             !server.contains("sro_client"),
             "the server's command line must not name the project: {server}"
         );
-        assert!(server.starts_with("tmux start-server"));
+        assert!(server.ends_with("tmux start-server ';' set -s exit-empty off"));
         assert!(pane.contains("muxel_sro_client_abc123"));
     }
 

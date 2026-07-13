@@ -70,8 +70,32 @@ final class ProtocolPortTests: XCTestCase {
         // command and the server would exit the moment it had no sessions.
         XCTAssertEqual(
             TmuxCommands.commandLine(TmuxCommands.startServer()),
-            "'tmux' 'start-server' ';' 'set' '-s' 'exit-empty' 'off'")
+            "\(TmuxCommands.pathPrelude); 'tmux' 'start-server' ';' 'set' '-s' 'exit-empty' 'off'")
         XCTAssertFalse(TmuxCommands.commandLine(TmuxCommands.startServer()).contains("muxel"))
+    }
+
+    // sshd runs an exec channel's command with its bare default PATH and no profile, so a
+    // Mac's Homebrew tmux (`/opt/homebrew/bin/tmux` on Apple silicon) is not on it and every
+    // tmux command fails with `command not found: tmux`. Port of `ssh::tmux_path_prelude`.
+    func testTmuxResolvesWhenTheSSHPathIsBare() {
+        let prelude = TmuxCommands.pathPrelude
+        // Appended, so a host that already resolves tmux keeps the binary it has.
+        XCTAssertTrue(prelude.hasPrefix("export PATH=\"$PATH:"))
+        XCTAssertTrue(prelude.contains("/opt/homebrew/bin"))
+        // `$HOME` is expanded by the remote shell, so it must stay unquoted.
+        XCTAssertTrue(prelude.contains("$HOME/.local/bin"))
+
+        // Every command line that names tmux is behind it — exec channels and PTY alike.
+        for cmd in [
+            TmuxCommands.commandLine(TmuxCommands.listSessions()),
+            TmuxCommands.launchAgent(session: "s", cwd: "/w", program: "claude", args: []),
+            TmuxCommands.attachPTYCommand(session: "s"),
+            TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: nil, args: []),
+        ] {
+            XCTAssertTrue(cmd.hasPrefix("\(prelude); "), "no PATH prelude: \(cmd)")
+            // Nothing names tmux before the PATH it is looked up on is set.
+            XCTAssertFalse(cmd.dropLast(cmd.count - prelude.count).contains("tmux"))
+        }
     }
 
     // iOS must launch the agent through a login+interactive shell so it's on the
@@ -80,19 +104,22 @@ final class ProtocolPortTests: XCTestCase {
         let cmd = TmuxCommands.launchAgent(
             session: "muxel_h_abcdef12", cwd: "/work", program: "claude", args: ["--model", "opus"])
         XCTAssertTrue(cmd.hasPrefix(
-            "tmux new-session -d -s 'muxel_h_abcdef12' -c '/work' -- \"${SHELL:-/bin/sh}\" -ilc "))
+            "\(TmuxCommands.pathPrelude); tmux new-session -d -s 'muxel_h_abcdef12' -c '/work' "
+            + "-- \"${SHELL:-/bin/sh}\" -ilc "))
         XCTAssertTrue(cmd.contains("exec"))
         XCTAssertTrue(cmd.contains("claude"))
         XCTAssertTrue(cmd.contains("opus"))
         // No program → tmux's own default login shell, no wrapping.
         XCTAssertEqual(
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: nil, args: []),
-            "tmux new-session -d -s 's' -c '/w'")
+            "\(TmuxCommands.pathPrelude); tmux new-session -d -s 's' -c '/w'")
     }
 
     func testCommandLineShellQuotes() {
         let line = TmuxCommands.commandLine(TmuxCommands.capturePane(session: "muxel_h_abcdef12"))
-        XCTAssertEqual(line, "'tmux' 'capture-pane' '-p' '-t' '=muxel_h_abcdef12:'")
+        XCTAssertEqual(
+            line,
+            "\(TmuxCommands.pathPrelude); 'tmux' 'capture-pane' '-p' '-t' '=muxel_h_abcdef12:'")
     }
 
     // Pane/window-target commands must use `=session:` (active pane of the session).

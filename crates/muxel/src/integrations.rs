@@ -226,10 +226,14 @@ pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::
         return None;
     };
     let args = muxel_core::tmux::list_sessions_args();
+    // `tmux` is not on sshd's bare default PATH when it came from Homebrew — see
+    // `ssh::tmux_path_prelude`. Unresolved, this reads as "no sessions on the host"
+    // and every running agent there stays stranded.
     let cmd = std::iter::once("tmux".to_string())
         .chain(args.iter().map(|a| ssh::sh_quote(a)))
         .collect::<Vec<_>>()
         .join(" ");
+    let cmd = format!("{}; {cmd}", ssh::tmux_path_prelude());
     let out = remote_ssh_command(c, cmd).output().ok()?;
     if !out.status.success() {
         // "no server running" is a perfectly good answer: nothing is running there.
@@ -1291,7 +1295,13 @@ pub fn kill_remote_tmux(
     session: &str,
 ) {
     let target = format!("={session}"); // exact-match target, as in kill_session_args
-    let cmd = format!("tmux kill-session -t {}", ssh::sh_quote(&target));
+    // Unresolved tmux (Homebrew's isn't on sshd's PATH) would leak the session — see
+    // `ssh::tmux_path_prelude`.
+    let cmd = format!(
+        "{}; tmux kill-session -t {}",
+        ssh::tmux_path_prelude(),
+        ssh::sh_quote(&target)
+    );
     let _ = ssh_exec(host, control_path, password, &cmd);
 }
 
@@ -1305,7 +1315,11 @@ pub fn kill_remote_tmux_detached(
     session: &str,
 ) {
     let target = format!("={session}"); // exact-match target, as in kill_session_args
-    let remote_cmd = format!("tmux kill-session -t {}", ssh::sh_quote(&target));
+    let remote_cmd = format!(
+        "{}; tmux kill-session -t {}",
+        ssh::tmux_path_prelude(),
+        ssh::sh_quote(&target)
+    );
     let mut argv = ssh::connection_args(host, control_path);
     if password.is_none() {
         argv.push("-o".into());

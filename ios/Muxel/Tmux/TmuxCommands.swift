@@ -7,9 +7,49 @@ import Foundation
 /// the read-only status/capture commands the iOS poller needs (these have no
 /// desktop equivalent because the desktop reads status from its live PTY grid).
 enum TmuxCommands {
-    /// `tmux <args…>` as a single shell-quoted command line.
+    /// Dirs appended to a remote command's `PATH` so that `tmux` resolves. Port of
+    /// `REMOTE_TMUX_PATH_DIRS` in `crates/muxel-core/src/ssh.rs` — keep the two in step.
+    ///
+    /// An SSH exec channel runs its command through a *non-interactive, non-login* shell,
+    /// whose `PATH` is sshd's bare default (`/usr/bin:/bin:/usr/sbin:/sbin`) — no profile,
+    /// no rc file. A Mac's tmux comes from Homebrew, which on Apple silicon lives in
+    /// `/opt/homebrew/bin` and is on none of them: against such a host *every* tmux command
+    /// fails with `command not found: tmux`, so a pane dies the moment it launches and the
+    /// poller reads the host as having no sessions at all. Linux hosts never showed it — a
+    /// distro tmux is `/usr/bin/tmux`, already on the bare PATH.
+    ///
+    /// The remote OS is unknown here, so macOS and Linux prefixes share a list; a `PATH`
+    /// entry that doesn't exist is harmless. **Appended, never prepended**: a host that
+    /// resolves `tmux` today keeps resolving the exact binary it resolves now.
+    static let pathDirs = [
+        "/opt/homebrew/bin",  // Homebrew, Apple silicon
+        "/usr/local/bin",  // Homebrew, Intel macOS — and the usual local prefix
+        "/opt/local/bin",  // MacPorts
+        "/home/linuxbrew/.linuxbrew/bin",  // Linuxbrew
+        "/snap/bin",
+        "$HOME/.local/bin",
+        "$HOME/bin",
+        "$HOME/.nix-profile/bin",  // Nix
+    ]
+
+    /// The `PATH` assignment that must lead **every** remote command line naming `tmux`.
+    /// Port of `ssh::tmux_path_prelude`; see `pathDirs` for why.
+    ///
+    /// Only `tmux` is resolved this way. A *program* (the agent) still goes through the
+    /// user's login+interactive shell — see `launchAgent` — because it needs the user's
+    /// whole environment, not merely a findable binary; tmux only needs to be found, and
+    /// sourcing a user's rc files to find it would fold their startup output into the
+    /// command results this app parses.
+    ///
+    /// `$PATH` and `$HOME` are expanded by the *remote* shell, so this is left unquoted.
+    static var pathPrelude: String {
+        "export PATH=\"$PATH:\(pathDirs.joined(separator: ":"))\""
+    }
+
+    /// `tmux <args…>` as a single shell-quoted command line, behind the PATH that makes
+    /// tmux resolvable (`pathPrelude`).
     static func commandLine(_ args: [String]) -> String {
-        Shell.command(["tmux"] + args)
+        "\(pathPrelude); " + Shell.command(["tmux"] + args)
     }
 
     // MARK: Lifecycle
@@ -81,7 +121,7 @@ enum TmuxCommands {
     /// wrapping is needed. Returned as a shell string (not a quoted arg array) because
     /// it relies on the remote shell expanding `$SHELL`.
     static func launchAgent(session: String, cwd: String, program: String?, args: [String]) -> String {
-        var cmd = "tmux new-session -d -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
+        var cmd = "\(pathPrelude); tmux new-session -d -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"
@@ -101,7 +141,7 @@ enum TmuxCommands {
     /// sized from the start. `clear;` wipes the login banner + echoed command so they
     /// don't bleed through under tmux's redraw.
     static func attachPTYCommand(session: String) -> String {
-        "clear; exec tmux attach-session -t \(Shell.quote("=\(session)"))"
+        "\(pathPrelude); clear; exec tmux attach-session -t \(Shell.quote("=\(session)"))"
     }
 
     /// Raw PTY command: `exec tmux new-session -A` **attached** (no `-d`), running
@@ -110,7 +150,9 @@ enum TmuxCommands {
     /// they get one, exactly like desktop's `ssh -t`. `program == nil` → default shell.
     static func newAttachedPTYCommand(session: String, cwd: String, program: String?, args: [String]) -> String {
         // `clear;` wipes the login banner + echoed command before tmux takes over.
-        var cmd = "clear; exec tmux new-session -A -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
+        var cmd =
+            "\(pathPrelude); clear; exec tmux new-session -A -s \(Shell.quote(session)) "
+            + "-c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"
