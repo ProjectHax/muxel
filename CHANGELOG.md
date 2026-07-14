@@ -5,7 +5,26 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-07-14
+
 ### Added
+- **Wake every agent with a spoken command** — an opt-in toggle in Settings → Speech:
+  say the wake phrase (default *"wake up daddy's home"*) into the mic and muxel walks
+  every agent pane of every project in turn, relaunching each one whose process isn't
+  running, then lands back on the pane you started from. Panes still running are left
+  alone, and a pane whose launch previously failed outright is genuinely retried
+  rather than skipped. Nothing is drawn over the workspace — the sweep moves through
+  the real panes, so you watch them come back — and the tally lands in the
+  notifications feed. The transcript that triggers it is treated as a command, not
+  dictation: it is never typed into an agent. Matching ignores case, punctuation and
+  surrounding filler, so however whisper hears it ("Wake up, Daddy's home!") it fires,
+  and the phrase itself is editable.
+- **Browser panes get a Forward button, and Reload reloads the page you are on** —
+  Reload was injected JavaScript (`location.reload()`), which fails exactly where a
+  refresh matters most: error pages, `about:blank`, and sites with a strict content
+  security policy. It now uses the webview's native reload, which refreshes the
+  document you are actually on — several links deep, if that is where you are —
+  rather than the pane's original URL. Forward joins the existing Back beside it.
 - **The pane area scrolls horizontally when the panes don't fit** — a pane will not
   shrink below a usable terminal width, so side-by-side panes add up and a layout is
   not guaranteed to fit the window it opens in: open one built on a large monitor
@@ -17,6 +36,12 @@ All notable changes to muxel are documented here. This project adheres to
   so a window that was always big enough is unchanged.
 
 ### Fixed
+- **Clicking into a browser pane makes it the active pane** — on macOS and Windows the
+  embedded webview is a real child window stacked above the rest of the UI, so the OS
+  consumed the click and muxel never saw it: the pane kept its old highlight, and a
+  Ctrl+V went to whichever pane was focused before — usually pasting into a terminal.
+  The page now reports its own clicks, so clicking one focuses its pane and hands it
+  the keyboard. muxel's own shortcuts keep working until you click into a page.
 - **Remote panes on a Mac host no longer die with `command not found: tmux`** — sshd
   runs a remote command through a shell that is neither login nor interactive, so it
   reads no profile and gets sshd's bare default `PATH`
@@ -34,6 +59,8 @@ All notable changes to muxel are documented here. This project adheres to
   1_usize - 264_usize`) and no build could complete on such a machine, whatever it
   was building. Upgraded to `whisper-rs` 0.16, whose bindings clang 22 generates
   correctly; local speech-to-text moves to the whisper.cpp it wraps.
+
+## [0.1.2] — 2026-07-12
 
 ### Added
 - **Add an SSH host straight from "New remote project"** — the dialog's host list
