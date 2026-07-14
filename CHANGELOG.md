@@ -59,6 +59,15 @@ All notable changes to muxel are documented here. This project adheres to
   1_usize - 264_usize`) and no build could complete on such a machine, whatever it
   was building. Upgraded to `whisper-rs` 0.16, whose bindings clang 22 generates
   correctly; local speech-to-text moves to the whisper.cpp it wraps.
+- **Icons render for a Windows account that can't read the builder's profile** — in
+  debug builds, rust-embed loaded gpui-component's icons from the cargo checkout on
+  disk rather than from the binary. A secondary Windows identity (a standard
+  AgentWorker account launched via `runas`) cannot read the primary user's profile,
+  so those icons never loaded and the title-bar min/max/close controls — and others
+  besides — rendered as empty gray plates. Debug builds now bake the icons in, the
+  way release builds always did. Thanks to
+  [@railapex](https://github.com/railapex)
+  ([#11](https://github.com/ProjectHax/muxel/pull/11)).
 
 ## [0.1.2] — 2026-07-12
 
@@ -664,6 +673,17 @@ All notable changes to muxel are documented here. This project adheres to
 
 Initial public release.
 
+[Unreleased]: https://github.com/ProjectHax/muxel/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/ProjectHax/muxel/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/ProjectHax/muxel/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/ProjectHax/muxel/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/ProjectHax/muxel/compare/v0.0.9...v0.1.0
+[0.0.9]: https://github.com/ProjectHax/muxel/compare/v0.0.8...v0.0.9
+[0.0.8]: https://github.com/ProjectHax/muxel/compare/v0.0.7...v0.0.8
+[0.0.7]: https://github.com/ProjectHax/muxel/compare/v0.0.6...v0.0.7
+[0.0.6]: https://github.com/ProjectHax/muxel/compare/v0.0.5...v0.0.6
+[0.0.5]: https://github.com/ProjectHax/muxel/compare/v0.0.4...v0.0.5
+[0.0.4]: https://github.com/ProjectHax/muxel/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/ProjectHax/muxel/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/ProjectHax/muxel/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/ProjectHax/muxel/releases/tag/v0.0.1
