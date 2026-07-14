@@ -348,12 +348,39 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Needed for CHANGELOG.md below. Checked out at the tag, so the notes are
+      # the ones the release was actually cut with.
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: muxel-*
           merge-multiple: true
+      # The release notes are the changelog section for this version.
+      #
+      # GitHub's generated notes are built from *pull requests*, so anything
+      # pushed straight to master is silently absent from the release page — 0.1.3
+      # went out announcing two of its six changes for exactly that reason. The
+      # changelog doesn't care how a commit arrived.
+      - name: Take the release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v header="## [$version]" '
+            index($0, header) == 1 { found = 1; next }   # the version heading
+            found && /^## \[/      { exit }              # the next version ends it
+            found                  { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > RELEASE_NOTES.md
+          if [ -s RELEASE_NOTES.md ]; then
+            echo "release notes from CHANGELOG.md [$version]:"
+            cat RELEASE_NOTES.md
+          else
+            echo "::warning::no '## [$version]' section in CHANGELOG.md — the release will carry only the generated notes"
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
+          # The changelog section is the body; GitHub appends its generated
+          # "What's Changed" and contributor list underneath it, so PR credit
+          # (e.g. a first-time contributor) is still given.
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true
