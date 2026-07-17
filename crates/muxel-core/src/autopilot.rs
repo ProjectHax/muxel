@@ -32,10 +32,12 @@ pub const COOLDOWN_TICKS: u32 = 5;
 /// the pane counts as genuinely idle rather than mid-work.
 ///
 /// This is the real "is it working?" test, and it doesn't depend on any status
-/// marker: a working agent repaints every tick — a spinner glyph, an elapsed-time
-/// counter ticking up — so its screen is never still, while a paused one is frozen.
+/// marker: a working agent repaints every tick — a rotating spinner glyph,
+/// streaming output — so its screen is never still, while a paused one is frozen.
 /// Waiting for stillness is what stops auto-continue from firing over an agent that
 /// is plainly busy but whose "working" marker muxel happened not to recognize.
+/// ("Still" ignores digits — see [`stability_digest`] — so a lone ticking counter
+/// on an otherwise idle screen doesn't masquerade as work.)
 pub const STABLE_TICKS_REQUIRED: u32 = 3;
 
 /// What an agent pane is doing, coarsened from its lifecycle status: the two
@@ -133,7 +135,7 @@ impl AutoContinue {
         self.cooldown = self.cooldown.saturating_sub(1);
 
         // Track screen stillness every tick, whatever the status.
-        let screen_hash = hash_str(screen);
+        let screen_hash = stability_digest(screen);
         if self.last_screen == Some(screen_hash) {
             self.stable_ticks = self.stable_ticks.saturating_add(1);
         } else {
@@ -175,10 +177,20 @@ impl AutoContinue {
     }
 }
 
-/// Hash a string to a `u64` (for cheap screen-change detection).
-fn hash_str(s: &str) -> u64 {
+/// Hash the screen for stillness detection, **ignoring ASCII digits**.
+///
+/// A paused agent's screen can still carry a live counter — an elapsed-time
+/// readout, a "2 shells still running" timer — that ticks every second. Hashing
+/// those digits would make the screen look like it's always changing, i.e. always
+/// working, so an idle agent would never be nudged (exactly the "phase completed
+/// but it didn't continue" case). Digits are the only thing dropped: letters,
+/// punctuation, and crucially a rotating spinner glyph are all kept, so genuine
+/// activity still reads as activity and a busy agent is still left alone.
+fn stability_digest(screen: &str) -> u64 {
     let mut h = DefaultHasher::new();
-    s.hash(&mut h);
+    for c in screen.chars().filter(|c| !c.is_ascii_digit()) {
+        c.hash(&mut h);
+    }
     h.finish()
 }
 
@@ -365,17 +377,42 @@ Wrapped up.
 
     #[test]
     fn a_working_agent_is_never_nudged() {
-        // The over-fire bug: the agent is plainly busy — its screen repaints every
-        // tick (an elapsed-time counter, a spinner glyph) — but muxel misread the
-        // status as Paused and the todo list has pending work. It must NOT nudge,
-        // because the screen never holds still.
+        // The over-fire bug: the agent is plainly busy — its spinner glyph rotates
+        // every tick — but muxel misread the status as Paused and the todo list has
+        // pending work. It must NOT nudge, because the screen never holds still.
+        // (The rotating glyph is a non-digit change, so it survives the digit-blind
+        // stillness test that ignores the elapsed-seconds counter beside it.)
+        let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let mut a = AutoContinue::default();
         a.enable();
         for t in 0..30 {
-            let screen = format!("{MID_PLAN}\n✳ Implementing… ({t}s) ⠋");
+            let g = spinner[t % spinner.len()];
+            let screen = format!("{MID_PLAN}\n✳ Implementing… ({t}s) {g}");
             assert_eq!(a.step(PaneActivity::Paused, &screen), AutoAction::None);
         }
         assert!(a.enabled);
+    }
+
+    #[test]
+    fn an_idle_agent_with_a_ticking_background_timer_is_still_nudged() {
+        // The "phase completed but it didn't continue" case: the turn has ended
+        // (status Done) with pending tasks, but a background "N shells still running"
+        // elapsed counter ticks every second. Only digits change, so the pane counts
+        // as still and gets nudged — a live timer must not read as the agent working.
+        let mut a = AutoContinue::default();
+        a.enable();
+        let mut fired = false;
+        for t in 10..40 {
+            let screen = format!("{MID_PLAN}\nSautéed for 11m {t}s · 2 shells still running");
+            if a.step(PaneActivity::Paused, &screen) == AutoAction::Continue {
+                fired = true;
+                break;
+            }
+        }
+        assert!(
+            fired,
+            "an idle agent behind a ticking timer should still be nudged"
+        );
     }
 
     #[test]
