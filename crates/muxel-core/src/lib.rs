@@ -5,6 +5,7 @@
 mod agent;
 mod appimage;
 pub mod audio;
+pub mod autopilot;
 pub mod diff;
 mod gui_path;
 pub mod locale;

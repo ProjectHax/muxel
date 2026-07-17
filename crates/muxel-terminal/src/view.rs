@@ -504,6 +504,12 @@ impl TerminalView {
         self.session.visible_text().contains(needle)
     }
 
+    /// The current visible grid as text (rows joined by newlines). Used by the
+    /// app's auto-continue to scan an agent's todo list.
+    pub fn visible_text(&self) -> String {
+        self.session.visible_text()
+    }
+
     pub fn title(&self) -> Option<String> {
         self.session.title()
     }

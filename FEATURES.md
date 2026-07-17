@@ -181,6 +181,23 @@ feature is added or changed, update the matching entry here in the same change**
   activity. They reach **done** only from the bell or process exit, never from a
   quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
   pane) can't fake a finished turn.
+- **Auto-continue** — an agent that lays out a multi-phase plan sometimes finishes
+  the first phase and just stops, waiting, with the todo list still half-unchecked.
+  Each agent pane has an **Auto** toggle in its header: while it's on, muxel watches
+  the pane and, whenever the agent goes idle with work still to do, types `continue`
+  and presses Enter for you. It fires when it can see pending work — Claude's `☐`
+  checkboxes or an "N pending" count — or when the agent voluntarily stops to check
+  in ("My recommendation is to pause here.", "Shall I continue?"), so a plan keeps
+  moving without you babysitting it. "Idle" is judged by the screen going still
+  rather than by a status guess, so it won't fire over an agent that's plainly
+  mid-work (spinner still turning) even if its "working" marker isn't recognized;
+  and the *next* nudge keys off the todo list actually moving, so it follows a
+  multi-phase plan even when a phase finishes and the agent re-pauses in a blink. It
+  never nudges a genuinely-finished agent, and never answers a permission prompt
+  (that needs your real yes/no). If `continue` fires a few times without the task
+  list moving — a failure loop, like an agent erroring out the instant it resumes —
+  it stands down on its own and posts a notification rather than hammering forever.
+  Runtime-only: it's off again after a restart.
 
 ## Git worktrees
 

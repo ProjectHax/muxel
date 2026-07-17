@@ -5,6 +5,23 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Auto-continue keeps a stalled agent going** — an agent that plans several phases
+  sometimes finishes the first and stops, waiting, with its todo list still
+  half-unchecked. Each agent pane now has an **Auto** toggle: while it's on, muxel
+  watches the pane and types `continue` (and Enter) whenever the agent goes idle
+  with unfinished tasks visible — Claude's `☐` checkboxes or an "N pending" count.
+  It also nudges when the agent voluntarily stops to check in ("My recommendation is
+  to pause here.", "Shall I continue?"), even with no todo list on screen. "Idle" is
+  judged by the screen going still, not by a status guess, so it won't fire over an
+  agent that's plainly mid-work (spinner still turning), and it keys the *next* nudge
+  off the todo list actually moving, so it keeps a multi-phase plan going even when
+  the agent finishes a phase and re-pauses in a blink. It won't
+  nudge a finished agent, won't answer a permission prompt (that needs a real
+  decision from you), and — if `continue` fires a few times without the task list
+  moving, i.e. a failure loop — stands down on its own and tells you rather than
+  hammering forever. Off again after a restart.
+
 ## [0.1.3] — 2026-07-14
 
 ### Added

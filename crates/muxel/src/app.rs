@@ -17,6 +17,7 @@ use gpui_component::scroll::{Scrollbar, ScrollbarAxis};
 use gpui_component::tag::Tag;
 use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
+use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::{
     AgentPreset, FocusDir, Identity, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule,
@@ -1148,6 +1149,9 @@ pub struct MuxelApp {
     dev_console_window: Option<WindowHandle<gpui_component::Root>>,
     /// Last seen status per instance, to fire notifications on transitions.
     last_status: HashMap<Uuid, AgentStatus>,
+    /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
+    /// user has armed appear here; runtime-only, never persisted.
+    auto: HashMap<Uuid, AutoContinue>,
     /// Instances whose process exit has already been logged/flagged, so `tick`
     /// records each exit exactly once. Cleared on respawn.
     exit_logged: HashSet<Uuid>,
@@ -3042,6 +3046,7 @@ impl MuxelApp {
             dev_log: Vec::new(),
             dev_console_window: None,
             last_status: HashMap::new(),
+            auto: HashMap::new(),
             exit_logged: HashSet::new(),
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
@@ -5854,10 +5859,97 @@ impl MuxelApp {
         let live: HashSet<Uuid> = self.terminals.keys().copied().collect();
         self.last_status.retain(|iid, _| live.contains(iid));
         self.exit_logged.retain(|iid| live.contains(iid));
+        self.auto.retain(|iid, _| live.contains(iid));
+        // Auto-continue: nudge armed panes whose agent has stalled with work left.
+        self.tick_auto_continue(cx);
         // Sync remote projects' layouts to their hosts (change-detect + debounce).
         self.tick_remote_sync(cx);
         if dirty {
             cx.notify();
+        }
+    }
+
+    /// Whether pane `iid` has auto-continue switched on.
+    fn auto_continue_on(&self, iid: Uuid) -> bool {
+        self.auto.get(&iid).is_some_and(|a| a.enabled)
+    }
+
+    /// The pane's **Auto** toggle: arm/disarm auto-continue for this agent.
+    fn toggle_auto_continue(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        if self.auto_continue_on(iid) {
+            self.auto.remove(&iid);
+        } else {
+            self.auto.entry(iid).or_default().enable();
+        }
+        cx.notify();
+    }
+
+    /// Type the auto-continue message into pane `iid` and press Enter — without
+    /// stealing focus, since this fires while the user is doing something else.
+    ///
+    /// Typed as literal keystrokes (not a bracketed paste): it's a one-word command,
+    /// and typing it is exactly what the user would do, with no paste-mode markers
+    /// for an agent's input box to mishandle.
+    fn send_continue(&self, iid: Uuid, cx: &App) {
+        if let Some(session) = self
+            .terminals
+            .get(&iid)
+            .map(|v| v.read(cx).session().clone())
+        {
+            session.write_input(autopilot::AUTO_CONTINUE_MESSAGE.as_bytes());
+            session.write_input(b"\r");
+        }
+    }
+
+    /// Auto-continue pass, run each `tick`. For every armed pane, feed its current
+    /// activity and screen to the pure state machine and act on its verdict:
+    /// resume a stalled-but-unfinished agent, or stand down when it's clearly
+    /// getting nowhere.
+    fn tick_auto_continue(&mut self, cx: &mut Context<Self>) {
+        if self.auto.is_empty() {
+            return;
+        }
+        // Snapshot (activity, screen) for the armed panes first, so the mutable
+        // pass over `self.auto` below doesn't also borrow `self.terminals`.
+        // `visible_text` builds a string, so only pay it for panes that opted in.
+        let inputs: Vec<(Uuid, PaneActivity, String)> = self
+            .auto
+            .iter()
+            .filter(|(_, a)| a.enabled)
+            .filter_map(|(iid, _)| {
+                let v = self.terminals.get(iid)?.read(cx);
+                let activity = match v.status() {
+                    AgentStatus::Working => PaneActivity::Working,
+                    AgentStatus::Blocked => PaneActivity::Blocked,
+                    AgentStatus::Idle | AgentStatus::Done => PaneActivity::Paused,
+                };
+                Some((*iid, activity, v.visible_text()))
+            })
+            .collect();
+
+        for (iid, activity, screen) in inputs {
+            let action = self
+                .auto
+                .get_mut(&iid)
+                .map(|a| a.step(activity, &screen))
+                .unwrap_or(AutoAction::None);
+            match action {
+                AutoAction::None => {}
+                AutoAction::Continue => self.send_continue(iid, cx),
+                AutoAction::StopStalled => {
+                    // The state machine already disabled itself; drop the entry so
+                    // the toolbar button reflects "off".
+                    self.auto.remove(&iid);
+                    let title = self.instance_title(iid, cx).to_string();
+                    self.add_event(
+                        NotifKind::Blocked,
+                        tf("Auto-continue stopped for {title}", &[("title", &title)]),
+                        t("It kept resuming without the task list moving, so it stood down. Look in on the agent and re-arm Auto if you want it to keep trying.")
+                            .to_string(),
+                    );
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -13055,8 +13147,24 @@ impl MuxelApp {
                                 }),
                             ),
                     )
-                    // Agent panes get a "show git diff" button; diff panes get a
-                    // "refresh" button instead.
+                    // Agent panes get an auto-continue toggle and a "show git diff"
+                    // button; diff panes get a "refresh" button instead.
+                    .children((kind == InstanceKind::Terminal).then(|| {
+                        let on = self.auto_continue_on(iid);
+                        Button::new(SharedString::from(format!("auto-{sid}")))
+                            .ghost()
+                            .xsmall()
+                            .selected(on)
+                            .label(t("Auto"))
+                            .tooltip(if on {
+                                t("Auto-continue is on — types \"continue\" when the agent stalls with tasks still to do. Click to turn off.")
+                            } else {
+                                t("Auto-continue: keep this agent going — type \"continue\" whenever it stalls with unfinished tasks on screen.")
+                            })
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.toggle_auto_continue(iid, cx)
+                            }))
+                    }))
                     .children((kind == InstanceKind::Terminal).then(|| {
                         Button::new(SharedString::from(format!("diff-{sid}")))
                             .ghost()
