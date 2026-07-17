@@ -3534,10 +3534,29 @@ impl MuxelApp {
             .with_markers(working, blocked)
     }
 
+    /// Reset the per-instance runtime state that's tied to a terminal's live
+    /// *content*, so a freshly (re)spawned terminal is judged from scratch rather
+    /// than against the one it replaced. The single home for this kind of reset, so
+    /// every path that swaps a terminal in place — restart, session recover, and
+    /// especially a remote reattach that replays the old scrollback — stays
+    /// consistent; add new per-terminal runtime trackers here.
+    ///
+    /// (Not `last_status`: that's re-derived from the live terminal every tick and
+    /// only feeds transition notifications, so a stale previous value is harmless.)
+    fn reset_terminal_runtime(&mut self, iid: Uuid) {
+        // A respawn replaces any exited view; its next exit is a fresh event.
+        self.exit_logged.remove(&iid);
+        // Re-baseline auto-continue against the new screen (keeping its Auto toggle):
+        // otherwise a reattach's replayed scrollback is compared to the old
+        // fingerprint/cooldown and can fire `continue` again for already-done work.
+        if let Some(a) = self.auto.get_mut(&iid) {
+            a.rebaseline();
+        }
+    }
+
     /// Spawn (or replace) the live terminal for an instance id.
     fn spawn_terminal(&mut self, instance_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        // A respawn replaces any exited view; its next exit is a fresh event.
-        self.exit_logged.remove(&instance_id);
+        self.reset_terminal_runtime(instance_id);
         // A remote password host with no saved/session password: prompt for it
         // first (storing it in memory), then this spawn is retried via
         // `ensure_project_terminals`. Avoids `sshpass -e` with an empty $SSHPASS.

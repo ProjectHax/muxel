@@ -99,6 +99,21 @@ impl AutoContinue {
         *self = Self::default();
     }
 
+    /// Drop the per-screen tracking (stillness, cooldown, progress fingerprint,
+    /// stall count) while leaving the on/off state untouched.
+    ///
+    /// Call this whenever the pane's terminal is replaced under it — a restart, or
+    /// a remote reattach that replays the old scrollback. Without it, the fresh
+    /// screen is compared against the dead terminal's fingerprint and cooldown, so
+    /// `continue` can fire again for work the agent already did. After it, the new
+    /// terminal is judged from scratch: it must settle, then it nudges at most once
+    /// for the current state.
+    pub fn rebaseline(&mut self) {
+        if self.enabled {
+            self.enable();
+        }
+    }
+
     /// Decide what to do with the pane this tick, given what it's doing and the
     /// text on its screen. Advances the internal state (stability, cooldown, stall).
     ///
@@ -408,6 +423,30 @@ Wrapped up.
         a.enable();
         let screen = "My recommendation is to pause here.\nfollow-up ideas…";
         assert_eq!(nudge_after_settling(&mut a, screen), AutoAction::Continue);
+    }
+
+    #[test]
+    fn rebaseline_re_arms_a_replaced_terminal_without_flipping_the_toggle() {
+        let mut a = AutoContinue::default();
+        a.enable();
+        // Settle and fire once, leaving it mid-cooldown with a remembered fingerprint.
+        assert_eq!(nudge_after_settling(&mut a, MID_PLAN), AutoAction::Continue);
+
+        // The terminal is replaced (a remote reattach). Re-baseline: it must forget
+        // the old screen and start settling the new one from scratch — so the first
+        // few ticks on the replayed scrollback do NOT immediately re-fire.
+        a.rebaseline();
+        assert!(a.enabled, "the Auto toggle must stay on across a reattach");
+        for _ in 0..super::STABLE_TICKS_REQUIRED {
+            assert_eq!(a.step(PaneActivity::Paused, MID_PLAN), AutoAction::None);
+        }
+        // Then exactly one nudge for the reattached state.
+        assert_eq!(a.step(PaneActivity::Paused, MID_PLAN), AutoAction::Continue);
+
+        // On a pane where Auto is off, re-baselining leaves it off.
+        let mut off = AutoContinue::default();
+        off.rebaseline();
+        assert!(!off.enabled);
     }
 
     #[test]
