@@ -21,8 +21,10 @@ All notable changes to muxel are documented here. This project adheres to
   decision from you), and — if `continue` fires a few times and the screen never
   changes at all, i.e. a dead loop — stands down on its own and tells you rather
   than hammering forever. A responsive agent that keeps answering with fresh work
-  (even when its tasks are blocked and no checkbox moves) is not given up on. Off
-  again after a restart.
+  (even when its tasks are blocked and no checkbox moves) is not given up on — but
+  once the agent says it has nothing left it can do ("no responsible work left",
+  "nothing further I can do"), auto-continue stops and tells you, so a finished
+  agent isn't nudged in circles. Off again after a restart.
 
 ## [0.1.3] — 2026-07-14
 

@@ -199,7 +199,9 @@ feature is added or changed, update the matching entry here in the same change**
   resumes — it stands down on its own and posts a notification rather than
   hammering forever; but an agent that keeps answering with fresh work (even when
   its remaining tasks are blocked on you and no checkbox moves) is left running.
-  Runtime-only: it's off again after a restart.
+  When the agent says it's out of work it can do ("no responsible work left",
+  "nothing further I can do"), auto-continue stops and notifies you rather than
+  nudging a finished agent in circles. Runtime-only: it's off again after a restart.
 
 ## Git worktrees
 

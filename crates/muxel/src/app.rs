@@ -5955,15 +5955,26 @@ impl MuxelApp {
             match action {
                 AutoAction::None => {}
                 AutoAction::Continue => self.send_continue(iid, cx),
+                // Both stops already disabled the state machine; drop the entry so
+                // the toolbar button reflects "off".
                 AutoAction::StopStalled => {
-                    // The state machine already disabled itself; drop the entry so
-                    // the toolbar button reflects "off".
                     self.auto.remove(&iid);
                     let title = self.instance_title(iid, cx).to_string();
                     self.add_event(
                         NotifKind::Blocked,
                         tf("Auto-continue stopped for {title}", &[("title", &title)]),
-                        t("It kept resuming without the task list moving, so it stood down. Look in on the agent and re-arm Auto if you want it to keep trying.")
+                        t("It kept resuming without the screen changing, so it stood down. Look in on the agent and re-arm Auto if you want it to keep trying.")
+                            .to_string(),
+                    );
+                    cx.notify();
+                }
+                AutoAction::StopDone => {
+                    self.auto.remove(&iid);
+                    let title = self.instance_title(iid, cx).to_string();
+                    self.add_event(
+                        NotifKind::Success,
+                        tf("Auto-continue finished for {title}", &[("title", &title)]),
+                        t("The agent reported it has nothing left to do, so auto-continue stopped.")
                             .to_string(),
                     );
                     cx.notify();

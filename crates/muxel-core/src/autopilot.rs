@@ -62,9 +62,13 @@ pub enum AutoAction {
     None,
     /// Type [`AUTO_CONTINUE_MESSAGE`] and press Enter.
     Continue,
-    /// Auto-continue has disarmed itself: `continue` fired repeatedly without the
-    /// todo list moving. The app tells the user and clears the toggle.
+    /// Auto-continue disarmed itself: `continue` fired repeatedly against a screen
+    /// that never changed — a dead loop. The app tells the user and clears the toggle.
     StopStalled,
+    /// Auto-continue disarmed itself: the agent says it has finished / has nothing
+    /// left it can do. Nudging further just produces another "nothing to do" reply,
+    /// so it stops. The app tells the user and clears the toggle.
+    StopDone,
 }
 
 /// Per-pane auto-continue state. Runtime-only (never persisted): arming an agent
@@ -154,6 +158,17 @@ impl AutoContinue {
         if activity != PaneActivity::Paused || self.stable_ticks < STABLE_TICKS_REQUIRED {
             return AutoAction::None;
         }
+        // The agent explicitly says it's out of work it can do — stop, rather than
+        // nudge a "there's nothing further I can do" reply into producing another,
+        // reworded, forever. Only after we've actually been nudging (so enabling Auto
+        // on an already-finished pane just stays quietly idle, ready if work appears).
+        if looks_finished(screen) {
+            if self.last_nudge_screen.is_some() {
+                self.disable();
+                return AutoAction::StopDone;
+            }
+            return AutoAction::None;
+        }
         if !should_continue(screen) {
             return AutoAction::None; // the plan looks done and it isn't asking
         }
@@ -234,6 +249,32 @@ pub fn is_checkpoint_pause(screen: &str) -> bool {
     CHECKPOINT_PHRASES.iter().any(|p| lower.contains(p))
 }
 
+/// Phrases that mean the agent has run out of work it can responsibly do — it's
+/// finished, or holding for the user to unblock it. These express *inability* or
+/// *completion* ("nothing further I can do", "no responsible work left"), which is
+/// the opposite of a check-in's *willingness* ("want me to keep going?"), so the
+/// two don't overlap: a paused agent is either offering to continue or declaring
+/// it's done. Matched case-insensitively.
+const DONE_PHRASES: &[&str] = &[
+    "no responsible work left",
+    "no work left",
+    "nothing left to do",
+    "nothing left for me",
+    "nothing more to do",
+    "nothing more i can do",
+    "nothing further i can",
+    "nothing further to do",
+    "nothing else i can do",
+    "nothing i can responsibly do",
+];
+
+/// Whether the agent says it has nothing left it can do (finished, or blocked and
+/// holding for the user) — the signal to stop nudging rather than loop on it.
+pub fn looks_finished(screen: &str) -> bool {
+    let lower = screen.to_lowercase();
+    DONE_PHRASES.iter().any(|p| lower.contains(p))
+}
+
 /// Whether an idle pane's screen is one auto-continue should act on: either a
 /// todo list with work left, or the agent explicitly checking in about continuing.
 fn should_continue(screen: &str) -> bool {
@@ -263,7 +304,10 @@ fn count_before(hay: &str, word: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AutoAction, AutoContinue, PaneActivity, has_pending_tasks, is_checkpoint_pause};
+    use super::{
+        AutoAction, AutoContinue, PaneActivity, has_pending_tasks, is_checkpoint_pause,
+        looks_finished,
+    };
 
     // A todo panel like the one Claude renders, mid-plan.
     const MID_PLAN: &str = "\
@@ -387,6 +431,35 @@ Wrapped up.
     }
 
     #[test]
+    fn a_finished_agent_stops_the_loop_even_while_rewording() {
+        // Screenshot: the agent has run out of work it can do and keeps rewording
+        // "there's nothing further I can do" every time it's nudged. The screen
+        // changes each turn, so screen-change progress alone would loop forever —
+        // the completion language is what stops it.
+        assert!(looks_finished(
+            "Holding — nothing has changed. Without one of those there's no responsible work left for me to do."
+        ));
+        assert!(looks_finished(
+            "Still holding; otherwise there's nothing further I can responsibly do here."
+        ));
+        // A "want me to keep going?" check-in is willingness, not completion.
+        assert!(!looks_finished("Want me to take on the mount visual next?"));
+
+        let mut a = AutoContinue::default();
+        a.enable();
+        // First nudge on a normal pending screen.
+        assert_eq!(nudge_after_settling(&mut a, MID_PLAN), AutoAction::Continue);
+        // The agent replies that it's done — auto stops rather than nudging the
+        // reworded "nothing further" replies forever.
+        let done = "There's no responsible work left for me to do.";
+        assert_eq!(nudge_after_settling(&mut a, done), AutoAction::StopDone);
+        assert!(
+            !a.enabled,
+            "it should turn itself off when the agent is done"
+        );
+    }
+
+    #[test]
     fn responsive_check_ins_keep_going_when_the_todo_counts_hold() {
         // The screenshot case: every remaining task is blocked on the user, so the
         // agent keeps answering with fresh analysis and a "want me to take on X?"
@@ -491,6 +564,7 @@ Wrapped up.
                     break;
                 }
                 AutoAction::None => {} // settling or cooling down
+                AutoAction::StopDone => panic!("MID_PLAN isn't a finished screen"),
             }
         }
         assert!(stopped, "auto-continue never gave up on a frozen list");
