@@ -5,6 +5,8 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-07-18
+
 ### Added
 - **Auto-continue keeps a stalled agent going** — an agent that plans several phases
   sometimes finishes the first and stops, waiting, with its todo list still
@@ -15,8 +17,8 @@ All notable changes to muxel are documented here. This project adheres to
   to pause here.", "Shall I continue?"), even with no todo list on screen. "Idle" is
   judged by the screen going still, not by a status guess, so it won't fire over an
   agent that's plainly mid-work (spinner still turning), and it keys the *next* nudge
-  off the todo list actually moving, so it keeps a multi-phase plan going even when
-  the agent finishes a phase and re-pauses in a blink. It won't
+  off the agent producing something new, so it keeps a multi-phase plan going even
+  when the agent finishes a phase and re-pauses in a blink. It won't
   nudge a finished agent, won't answer a permission prompt (that needs a real
   decision from you), and — if `continue` fires a few times and the screen never
   changes at all, i.e. a dead loop — stands down on its own and tells you rather
@@ -694,7 +696,8 @@ All notable changes to muxel are documented here. This project adheres to
 
 Initial public release.
 
-[Unreleased]: https://github.com/ProjectHax/muxel/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/ProjectHax/muxel/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/ProjectHax/muxel/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ProjectHax/muxel/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ProjectHax/muxel/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ProjectHax/muxel/compare/v0.1.0...v0.1.1
