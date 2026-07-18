@@ -18,9 +18,11 @@ All notable changes to muxel are documented here. This project adheres to
   off the todo list actually moving, so it keeps a multi-phase plan going even when
   the agent finishes a phase and re-pauses in a blink. It won't
   nudge a finished agent, won't answer a permission prompt (that needs a real
-  decision from you), and — if `continue` fires a few times without the task list
-  moving, i.e. a failure loop — stands down on its own and tells you rather than
-  hammering forever. Off again after a restart.
+  decision from you), and — if `continue` fires a few times and the screen never
+  changes at all, i.e. a dead loop — stands down on its own and tells you rather
+  than hammering forever. A responsive agent that keeps answering with fresh work
+  (even when its tasks are blocked and no checkbox moves) is not given up on. Off
+  again after a restart.
 
 ## [0.1.3] — 2026-07-14
 

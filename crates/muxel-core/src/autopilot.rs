@@ -16,10 +16,11 @@ use std::hash::{Hash, Hasher};
 /// What gets typed (then Enter) when the agent is nudged.
 pub const AUTO_CONTINUE_MESSAGE: &str = "continue";
 
-/// How many times in a row `continue` may fire without the todo list changing
+/// How many times in a row `continue` may fire without the screen changing at all
 /// before auto-continue gives up and hands the pane back to the user. This is the
-/// guard against a fast failure loop — e.g. an agent that errors out the instant
-/// it resumes, pausing again with the same unfinished list, forever.
+/// guard against a dead loop — e.g. an agent that errors out the instant it
+/// resumes, re-pausing on the very same screen, forever. A responsive agent that
+/// keeps answering with fresh text never trips it, even if no todo item completes.
 pub const MAX_NO_PROGRESS_CONTINUES: u32 = 3;
 
 /// Ticks (the app samples ~once a second) to wait before nudging the *same*
@@ -36,8 +37,8 @@ pub const COOLDOWN_TICKS: u32 = 5;
 /// streaming output — so its screen is never still, while a paused one is frozen.
 /// Waiting for stillness is what stops auto-continue from firing over an agent that
 /// is plainly busy but whose "working" marker muxel happened not to recognize.
-/// ("Still" ignores digits — see [`stability_digest`] — so a lone ticking counter
-/// on an otherwise idle screen doesn't masquerade as work.)
+/// ("Still" ignores digits — see [`screen_digest`] — so a lone ticking counter on
+/// an otherwise idle screen doesn't masquerade as work.)
 pub const STABLE_TICKS_REQUIRED: u32 = 3;
 
 /// What an agent pane is doing, coarsened from its lifecycle status: the two
@@ -72,18 +73,20 @@ pub enum AutoAction {
 pub struct AutoContinue {
     /// Whether the pane's Auto toggle is on.
     pub enabled: bool,
-    /// Hash of the whole screen last tick, to notice any repaint at all.
+    /// Screen digest last tick, to notice repaints (the stillness signal).
     last_screen: Option<u64>,
-    /// Consecutive ticks the whole screen has been unchanged (see
-    /// [`STABLE_TICKS_REQUIRED`]).
+    /// Consecutive ticks the screen has been unchanged (see [`STABLE_TICKS_REQUIRED`]).
     stable_ticks: u32,
     /// Ticks left before the same unchanged screen may be nudged again.
     cooldown: u32,
-    /// The todo-list fingerprint at the last nudge. A *change* from this is proof
-    /// the agent made progress and earns an immediate re-nudge; an unchanged one
-    /// only re-nudges after the cooldown, and counts toward the stall guard.
-    last_fingerprint: Option<u64>,
-    /// Consecutive nudges fired against an unchanged todo list.
+    /// The screen digest at the last nudge. A *change* from this means the agent
+    /// produced something new — progress — and earns an immediate re-nudge; an
+    /// unchanged one only re-nudges after the cooldown, and counts toward the stall
+    /// guard. Using the whole screen (not just the todo counts) is deliberate: an
+    /// agent that keeps answering with fresh analysis is making progress even when
+    /// no checkbox moves, while a true dead loop repeats itself verbatim.
+    last_nudge_screen: Option<u64>,
+    /// Consecutive nudges fired against an unchanged screen.
     no_progress: u32,
 }
 
@@ -101,13 +104,13 @@ impl AutoContinue {
         *self = Self::default();
     }
 
-    /// Drop the per-screen tracking (stillness, cooldown, progress fingerprint,
-    /// stall count) while leaving the on/off state untouched.
+    /// Drop the per-screen tracking (stillness, cooldown, last-nudge screen, stall
+    /// count) while leaving the on/off state untouched.
     ///
     /// Call this whenever the pane's terminal is replaced under it — a restart, or
     /// a remote reattach that replays the old scrollback. Without it, the fresh
-    /// screen is compared against the dead terminal's fingerprint and cooldown, so
-    /// `continue` can fire again for work the agent already did. After it, the new
+    /// screen is compared against the dead terminal's and cooldown, so `continue`
+    /// can fire again for work the agent already did. After it, the new
     /// terminal is judged from scratch: it must settle, then it nudges at most once
     /// for the current state.
     pub fn rebaseline(&mut self) {
@@ -125,9 +128,11 @@ impl AutoContinue {
     ///   [`STABLE_TICKS_REQUIRED`] ticks. A working agent repaints (spinner,
     ///   elapsed counter) every tick, so it never settles; this is what keeps a
     ///   nudge from landing on a busy agent even when muxel misreads its status.
-    /// - **Should it nudge again?** — re-firing keys off the todo list *changing*,
-    ///   durable evidence of progress that survives the fast bounces (an agent that
-    ///   errors out and re-pauses in under a tick) which slip through the sampling.
+    /// - **Should it nudge again?** — re-firing keys off the settled screen
+    ///   *changing* since the last nudge: a responsive agent answers with something
+    ///   new (progress), a dead loop repeats itself (stall). This also survives the
+    ///   fast bounces (an agent that errors out and re-pauses in under a tick) that
+    ///   slip through the sampling.
     pub fn step(&mut self, activity: PaneActivity, screen: &str) -> AutoAction {
         if !self.enabled {
             return AutoAction::None;
@@ -135,12 +140,12 @@ impl AutoContinue {
         self.cooldown = self.cooldown.saturating_sub(1);
 
         // Track screen stillness every tick, whatever the status.
-        let screen_hash = stability_digest(screen);
-        if self.last_screen == Some(screen_hash) {
+        let digest = screen_digest(screen);
+        if self.last_screen == Some(digest) {
             self.stable_ticks = self.stable_ticks.saturating_add(1);
         } else {
             self.stable_ticks = 0;
-            self.last_screen = Some(screen_hash);
+            self.last_screen = Some(digest);
         }
 
         // Act only on a pane that is both reported paused (not Working, and never a
@@ -153,9 +158,10 @@ impl AutoContinue {
             return AutoAction::None; // the plan looks done and it isn't asking
         }
 
-        let fingerprint = progress_fingerprint(screen);
-        let progressed = self.last_fingerprint != Some(fingerprint);
-        // Same list as the last nudge, still cooling down → give the agent more
+        // Progress = the settled screen differs from the one we last nudged at, i.e.
+        // the agent answered with something new. A verbatim repeat is a dead loop.
+        let progressed = self.last_nudge_screen != Some(digest);
+        // Same screen as the last nudge, still cooling down → give the agent more
         // time to react before trying again.
         if !progressed && self.cooldown > 0 {
             return AutoAction::None;
@@ -164,29 +170,30 @@ impl AutoContinue {
             self.no_progress = 0;
         } else {
             self.no_progress += 1;
-            // Nudged repeatedly with the list frozen — it's achieving nothing.
-            // Stand down and let the user look.
+            // Nudged repeatedly and the screen never budged — it's achieving
+            // nothing. Stand down and let the user look.
             if self.no_progress > MAX_NO_PROGRESS_CONTINUES {
                 self.disable();
                 return AutoAction::StopStalled;
             }
         }
-        self.last_fingerprint = Some(fingerprint);
+        self.last_nudge_screen = Some(digest);
         self.cooldown = COOLDOWN_TICKS;
         AutoAction::Continue
     }
 }
 
-/// Hash the screen for stillness detection, **ignoring ASCII digits**.
+/// Hash the screen — for both stillness and progress — **ignoring ASCII digits**.
 ///
 /// A paused agent's screen can still carry a live counter — an elapsed-time
-/// readout, a "2 shells still running" timer — that ticks every second. Hashing
+/// readout, a "2 shells still running" timer — that ticks every second. Counting
 /// those digits would make the screen look like it's always changing, i.e. always
 /// working, so an idle agent would never be nudged (exactly the "phase completed
-/// but it didn't continue" case). Digits are the only thing dropped: letters,
-/// punctuation, and crucially a rotating spinner glyph are all kept, so genuine
-/// activity still reads as activity and a busy agent is still left alone.
-fn stability_digest(screen: &str) -> u64 {
+/// but it didn't continue" case) and no two nudges would ever compare equal.
+/// Digits are the only thing dropped: letters, punctuation, and crucially a
+/// rotating spinner glyph are all kept, so genuine activity still reads as
+/// activity and a busy agent is still left alone.
+fn screen_digest(screen: &str) -> u64 {
     let mut h = DefaultHasher::new();
     for c in screen.chars().filter(|c| !c.is_ascii_digit()) {
         c.hash(&mut h);
@@ -233,41 +240,9 @@ fn should_continue(screen: &str) -> bool {
     has_pending_tasks(screen) || is_checkpoint_pause(screen)
 }
 
-/// Words whose preceding count changes as a todo list advances, across the
-/// summary shapes agents render (`+1 pending, 5 completed`; `5 done, 1 in
-/// progress, 5 open`). Any of them moving is progress.
-const TALLY_WORDS: &[&str] = &["pending", "completed", "done", "in progress", "open"];
-
-/// A cheap hash of just the parts of the screen that change when the todo list
-/// makes progress: the task-summary counts and the tally of empty vs done
-/// checkboxes. Blind to spinners, elapsed-time counters and other churn, so an
-/// unchanged fingerprint means the plan genuinely didn't move.
-pub fn progress_fingerprint(screen: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    for word in TALLY_WORDS {
-        count_before(screen, word).unwrap_or(0).hash(&mut h);
-    }
-    screen
-        .chars()
-        .filter(|c| is_empty_checkbox(*c))
-        .count()
-        .hash(&mut h);
-    screen
-        .chars()
-        .filter(|c| is_done_checkbox(*c))
-        .count()
-        .hash(&mut h);
-    h.finish()
-}
-
 /// Empty (unchecked) todo-box glyphs an agent might render.
 fn is_empty_checkbox(c: char) -> bool {
     matches!(c, '☐' | '⬜' | '▢' | '◻' | '◽' | '□')
-}
-
-/// Filled/checked todo-box glyphs.
-fn is_done_checkbox(c: char) -> bool {
-    matches!(c, '☑' | '☒' | '⬛' | '■' | '▣' | '✓' | '✔')
 }
 
 /// Parse the number immediately before `word`, e.g. `count_before("+1 pending", "pending") == Some(1)`.
@@ -288,10 +263,7 @@ fn count_before(hay: &str, word: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AutoAction, AutoContinue, PaneActivity, has_pending_tasks, is_checkpoint_pause,
-        progress_fingerprint,
-    };
+    use super::{AutoAction, AutoContinue, PaneActivity, has_pending_tasks, is_checkpoint_pause};
 
     // A todo panel like the one Claude renders, mid-plan.
     const MID_PLAN: &str = "\
@@ -328,18 +300,6 @@ Wrapped up.
         // The word in prose, with no number and no checkbox, must not trip it.
         assert!(!has_pending_tasks("the payment is pending confirmation"));
         assert!(!has_pending_tasks(""));
-    }
-
-    #[test]
-    fn fingerprint_changes_only_when_the_list_moves() {
-        // Spinner text / elapsed timer churn doesn't count as progress.
-        let noisy = format!("{MID_PLAN}\n✳ Churned for 9m 26s");
-        assert_eq!(progress_fingerprint(MID_PLAN), progress_fingerprint(&noisy));
-        // A phase completing does.
-        assert_ne!(
-            progress_fingerprint(MID_PLAN),
-            progress_fingerprint(PROGRESSED)
-        );
     }
 
     /// Hold the pane paused on one unchanging screen until it acts (clearing the
@@ -427,10 +387,29 @@ Wrapped up.
     }
 
     #[test]
+    fn responsive_check_ins_keep_going_when_the_todo_counts_hold() {
+        // The screenshot case: every remaining task is blocked on the user, so the
+        // agent keeps answering with fresh analysis and a "want me to take on X?"
+        // without any checkbox moving. Different screen each time = real responses,
+        // so it must keep nudging rather than give up as an old todo-count guard did.
+        let topics = [
+            "storage", "alchemy", "trade", "pets", "pvp", "guilds", "cash",
+        ];
+        let mut a = AutoContinue::default();
+        a.enable();
+        for topic in topics.iter().cycle().take(20) {
+            // Same pending todos (MID_PLAN), different message body each round.
+            let screen = format!("{MID_PLAN}\nRoadmap: want me to take on {topic} next?");
+            assert_eq!(nudge_after_settling(&mut a, &screen), AutoAction::Continue);
+        }
+        assert!(a.enabled, "a responsive agent must not be given up on");
+    }
+
+    #[test]
     fn refires_after_progress_but_only_once_the_new_state_settles() {
-        // Fixes "it only typed continue once": after a nudge the agent completes a
-        // phase and re-pauses, without muxel ever catching a Working sample. The
-        // changed todo list earns another nudge — once the new screen has settled.
+        // Fixes "it only typed continue once": after a nudge the agent produces a
+        // new screen and re-pauses, without muxel ever catching a Working sample.
+        // The changed screen earns another nudge — once it has settled.
         let mut a = AutoContinue::default();
         a.enable();
         assert_eq!(nudge_after_settling(&mut a, MID_PLAN), AutoAction::Continue);

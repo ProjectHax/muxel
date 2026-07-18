@@ -194,9 +194,11 @@ feature is added or changed, update the matching entry here in the same change**
   and the *next* nudge keys off the todo list actually moving, so it follows a
   multi-phase plan even when a phase finishes and the agent re-pauses in a blink. It
   never nudges a genuinely-finished agent, and never answers a permission prompt
-  (that needs your real yes/no). If `continue` fires a few times without the task
-  list moving — a failure loop, like an agent erroring out the instant it resumes —
-  it stands down on its own and posts a notification rather than hammering forever.
+  (that needs your real yes/no). If `continue` fires a few times and the screen
+  never changes at all — a dead loop, like an agent erroring out the instant it
+  resumes — it stands down on its own and posts a notification rather than
+  hammering forever; but an agent that keeps answering with fresh work (even when
+  its remaining tasks are blocked on you and no checkbox moves) is left running.
   Runtime-only: it's off again after a restart.
 
 ## Git worktrees
