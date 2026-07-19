@@ -5,6 +5,13 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+- **Auto-continue also nudges on a soft "I'd hold here" check-in** — a message that
+  parks but still offers more work ("I'd hold here unless you want that scaled run.",
+  "if you want me to, I can…") now counts as a check-in and gets a `continue`, the
+  same as an explicit "Shall I continue?". A message that instead declares it's out
+  of work ("nothing further I can do") still stops it — completion is checked first.
+
 ## [0.1.4] — 2026-07-18
 
 ### Added

@@ -187,8 +187,9 @@ feature is added or changed, update the matching entry here in the same change**
   the pane and, whenever the agent goes idle with work still to do, types `continue`
   and presses Enter for you. It fires when it can see pending work — Claude's `☐`
   checkboxes or an "N pending" count — or when the agent voluntarily stops to check
-  in ("My recommendation is to pause here.", "Shall I continue?"), so a plan keeps
-  moving without you babysitting it. "Idle" is judged by the screen going still
+  in ("My recommendation is to pause here.", "Shall I continue?", "I'd hold here
+  unless you want that scaled run."), so a plan keeps moving without you babysitting
+  it. "Idle" is judged by the screen going still
   rather than by a status guess, so it won't fire over an agent that's plainly
   mid-work (spinner still turning) even if its "working" marker isn't recognized;
   and the *next* nudge keys off the todo list actually moving, so it follows a

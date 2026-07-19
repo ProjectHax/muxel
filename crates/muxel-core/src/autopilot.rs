@@ -228,18 +228,26 @@ pub fn has_pending_tasks(screen: &str) -> bool {
 }
 
 /// Phrases an agent uses when it *voluntarily* stops mid-task to check in — a
-/// "shall I keep going?" moment. Seeing one is reason to nudge even with no todo
-/// list on screen, since the agent has plainly parked more work. Matched
-/// case-insensitively; kept to strong mid-task signals so a completion sign-off
-/// ("all done — let me know if you need anything else") doesn't trip it.
+/// "shall I keep going?" moment, or a soft "I'd hold here, but I could do X" that
+/// offers more work. Seeing one is reason to nudge even with no todo list on
+/// screen, since the agent has plainly parked something it could still do. Matched
+/// case-insensitively. These express *willingness*, the opposite of the *inability*
+/// in [`DONE_PHRASES`]; and since a finished screen is caught first (see
+/// [`AutoContinue::step`]), a completion message that happens to say "hold" still
+/// stops rather than being mistaken for one of these offers.
 const CHECKPOINT_PHRASES: &[&str] = &[
     "pause here",
+    "hold here",
     "shall i continue",
     "should i continue",
     "shall i proceed",
     "should i proceed",
     "want me to continue",
     "want me to proceed",
+    "unless you want",
+    "unless you'd like",
+    "if you want me to",
+    "if you'd like me to",
 ];
 
 /// Whether the agent has stopped to ask (or recommend) whether to keep going —
@@ -500,6 +508,11 @@ Wrapped up.
         ));
         assert!(is_checkpoint_pause("Done with that. Shall I continue?"));
         assert!(is_checkpoint_pause("WANT ME TO PROCEED with the refactor?"));
+        // A soft hold that still offers more work is a check-in, not a stop — and it
+        // must NOT read as finished, since it isn't declaring inability.
+        let soft_hold = "I'd hold here unless you want that scaled run.";
+        assert!(is_checkpoint_pause(soft_hold));
+        assert!(!looks_finished(soft_hold));
         // Ordinary prose (and a completion sign-off) must not trip it.
         assert!(!is_checkpoint_pause(
             "This section is about something else."
