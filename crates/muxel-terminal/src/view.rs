@@ -16,6 +16,11 @@ use std::time::Duration;
 /// can't starve the UI; the rest stays buffered for the next turn.
 const MAX_BYTES_PER_TURN: usize = 256 * 1024;
 
+/// Unfocused terminals still parse PTY output (status badges need a warm grid)
+/// but only repaint at this rate. With a couple dozen streaming agents, full-rate
+/// `cx.notify()` on every chunk was stealing main-thread time from key handling.
+const BACKGROUND_PAINT_INTERVAL: Duration = Duration::from_millis(100);
+
 /// A small margin between the terminal grid and the pane edge. The grid (and so
 /// the reported size) is computed from the inset area, giving a TUI that renders
 /// wider than expected some breathing room from the border/scrollbar instead of
@@ -167,6 +172,8 @@ pub struct TerminalView {
     /// again or the pane is attended (see `clear_done`).
     prev_raw: std::cell::Cell<Option<AgentStatus>>,
     done_latch: std::cell::Cell<bool>,
+    /// Last time we `cx.notify()`'d a paint from the drain loop (background throttle).
+    last_paint_notify: std::cell::Cell<std::time::Instant>,
     _drain: Task<()>,
 }
 
@@ -379,6 +386,38 @@ impl TerminalView {
                     }
                 }
 
+                // Background agents: briefly wait and coalesce more before taking
+                // the UI lock — N chatty agents each doing view.update per chunk
+                // is what made typing feel laggy under load.
+                let focused = view
+                    .read_with(cx, |v, _| v.session.is_focused())
+                    .unwrap_or(true);
+                if !focused && exit.is_none() && output.len() < MAX_BYTES_PER_TURN {
+                    cx.background_executor()
+                        .timer(BACKGROUND_PAINT_INTERVAL)
+                        .await;
+                    while let Ok(more) = rx.try_recv() {
+                        match more {
+                            PtyChunk::Output(b) => output.extend_from_slice(&b),
+                            PtyChunk::Exit {
+                                code,
+                                signal,
+                                read_error,
+                            } => {
+                                exit = Some(ExitInfo {
+                                    code,
+                                    signal,
+                                    read_error,
+                                });
+                                break;
+                            }
+                        }
+                        if output.len() >= MAX_BYTES_PER_TURN {
+                            break;
+                        }
+                    }
+                }
+
                 let stop = view
                     .update(cx, |view, cx| {
                         if !output.is_empty() {
@@ -396,7 +435,18 @@ impl TerminalView {
                             view.exit_signal = info.signal;
                             view.exit_read_error = info.read_error;
                         }
-                        cx.notify();
+                        // Focused pane: paint every batch so typing/echo feels live.
+                        // Background agents: throttle paints — still advance the
+                        // grid for status markers, but don't schedule a full
+                        // TerminalElement paint per chunk for each of N agents.
+                        let focused = view.session.is_focused();
+                        let now = std::time::Instant::now();
+                        let due = now.duration_since(view.last_paint_notify.get())
+                            >= BACKGROUND_PAINT_INTERVAL;
+                        if stop || focused || due {
+                            view.last_paint_notify.set(now);
+                            cx.notify();
+                        }
                         stop
                     })
                     .unwrap_or(true);
@@ -422,6 +472,7 @@ impl TerminalView {
             blocked_markers,
             prev_raw: std::cell::Cell::new(None),
             done_latch: std::cell::Cell::new(false),
+            last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
             _drain: drain,
         }
     }

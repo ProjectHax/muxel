@@ -239,6 +239,8 @@ pub struct TerminalSession {
     last_output: Mutex<Instant>,
     /// Whether the child has produced any output yet (vs. still starting up).
     output_seen: AtomicBool,
+    /// Whether this terminal currently has keyboard focus (UI thread + drain).
+    focused: AtomicBool,
     _reader: JoinHandle<()>,
 }
 
@@ -360,6 +362,7 @@ impl TerminalSession {
             pointer_hit: Mutex::new(None),
             last_output: Mutex::new(Instant::now()),
             output_seen: AtomicBool::new(false),
+            focused: AtomicBool::new(false),
             _reader: reader_handle,
         });
 
@@ -384,7 +387,14 @@ impl TerminalSession {
     /// jumps the viewport back to the bottom, so typing while scrolled up in the
     /// history snaps you to the live prompt.
     pub fn write_input(&self, data: &[u8]) {
-        self.term.lock().scroll_display(Scroll::Bottom);
+        // Skip scroll work when already pinned to the live row — every key
+        // otherwise takes the term mutex for a no-op scroll under load.
+        {
+            let mut term = self.term.lock();
+            if term.grid().display_offset() != 0 {
+                term.scroll_display(Scroll::Bottom);
+            }
+        }
         self.write_raw(data);
     }
 
@@ -752,11 +762,17 @@ impl TerminalSession {
     /// program requested focus reporting (DECSET 1004). Lets agents like Claude
     /// know whether their pane is the one the user is looking at.
     pub fn report_focus(&self, focused: bool) {
+        self.focused.store(focused, Ordering::Relaxed);
         if self.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
             // Raw write: a focus report must not yank the viewport to the bottom
             // (e.g. clicking a scrolled-up pane to read its history).
             self.write_raw(if focused { b"\x1b[I" } else { b"\x1b[O" });
         }
+    }
+
+    /// Whether the UI currently treats this terminal as focused (for paint/drain budget).
+    pub fn is_focused(&self) -> bool {
+        self.focused.load(Ordering::Relaxed)
     }
 
     /// The most recent OSC title, if any.
