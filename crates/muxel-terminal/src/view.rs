@@ -5,12 +5,13 @@
 use crate::colors::TerminalPalette;
 use crate::element::TerminalElement;
 use crate::keymap::{KeyModifiers, key_to_bytes};
+use crate::profile;
 use crate::session::{CommandSpec, PtyChunk, TerminalSession};
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
 use gpui::*;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Stop draining after this many bytes in a single turn so one noisy terminal
 /// can't starve the UI; the rest stays buffered for the next turn.
@@ -418,10 +419,13 @@ impl TerminalView {
                     }
                 }
 
+                let batch_len = output.len();
                 let stop = view
                     .update(cx, |view, cx| {
                         if !output.is_empty() {
+                            let t0 = Instant::now();
                             view.session.process_output(&output);
+                            profile::process_output(batch_len, t0.elapsed());
                             // OSC-52 copies parsed from this batch land on the
                             // system clipboard here, where a gpui cx exists.
                             for (ty, text) in view.session.take_clipboard_stores() {
@@ -440,12 +444,13 @@ impl TerminalView {
                         // grid for status markers, but don't schedule a full
                         // TerminalElement paint per chunk for each of N agents.
                         let focused = view.session.is_focused();
-                        let now = std::time::Instant::now();
+                        let now = Instant::now();
                         let due = now.duration_since(view.last_paint_notify.get())
                             >= BACKGROUND_PAINT_INTERVAL;
                         if stop || focused || due {
                             view.last_paint_notify.set(now);
                             cx.notify();
+                            profile::notify_scheduled();
                         }
                         stop
                     })
@@ -590,6 +595,8 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let t0 = Instant::now();
+        let held = event.is_held;
         let m = &event.keystroke.modifiers;
 
         // Copy / paste. On macOS the platform shortcut is ⌘C / ⌘V; elsewhere
@@ -682,6 +689,7 @@ impl TerminalView {
                 cx.notify();
             }
             cx.stop_propagation();
+            profile::key_handled(held, t0.elapsed());
         }
     }
 }

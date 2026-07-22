@@ -6,6 +6,7 @@
 //! are merged into rectangles, to keep per-frame draw calls low.
 
 use crate::colors::{TerminalPalette, brighten};
+use crate::profile;
 use crate::session::TerminalSession;
 use crate::view::TerminalMouseMode;
 use alacritty_terminal::grid::Dimensions;
@@ -15,6 +16,7 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use gpui::*;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// gpui element rendering one [`TerminalSession`].
 pub struct TerminalElement {
@@ -180,6 +182,7 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let paint_t0 = Instant::now();
         // Route typed text (and IME) to this terminal while it's focused.
         window.handle_input(
             &self.focus_handle,
@@ -918,6 +921,7 @@ impl Element for TerminalElement {
                 ));
             }
         });
+        profile::paint(paint_t0.elapsed());
     }
 }
 
@@ -1242,7 +1246,10 @@ impl InputHandler for TerminalInputHandler {
         _cx: &mut App,
     ) {
         if !text.is_empty() {
+            let t0 = Instant::now();
             self.session.write_input(text.as_bytes());
+            // InputHandler has no is_held; key-repeat for letters often lands here.
+            profile::key_handled(false, t0.elapsed());
         }
     }
 
