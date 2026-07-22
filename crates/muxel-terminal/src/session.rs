@@ -8,6 +8,7 @@
 
 use crate::colors::TerminalPalette;
 use crate::listener::{MuxelListener, SharedWriter};
+use crate::profile;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Osc52, Term, TermMode};
@@ -17,7 +18,7 @@ use parking_lot::Mutex;
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -152,6 +153,24 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(60);
 /// Sentinel for `mouse_pressed_button` meaning "no button press is outstanding".
 const NO_MOUSE_PRESS: u8 = u8::MAX;
 
+/// `Write` adapter that queues bytes to the dedicated PTY writer thread.
+/// `write` never blocks (unbounded channel); byte order is preserved. Errors
+/// only once the writer thread has exited (child gone), mirroring a broken
+/// pipe.
+struct ChannelWriter(std::sync::mpsc::Sender<Vec<u8>>);
+
+impl Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .send(buf.to_vec())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty writer gone"))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Debounce state for resizing: the last-applied size, the size currently being
 /// requested, and when that request first appeared.
 struct ResizeState {
@@ -241,7 +260,75 @@ pub struct TerminalSession {
     output_seen: AtomicBool,
     /// Whether this terminal currently has keyboard focus (UI thread + drain).
     focused: AtomicBool,
+    /// Bumped whenever pixels that depend on the grid/selection/scroll/search
+    /// would change. [`crate::element`] skips the full cell walk when this matches
+    /// the last painted generation (draw-list replay).
+    content_gen: AtomicU64,
+    /// Last built draw list for this session (main-thread only via the GPUI paint
+    /// path). Invalid when [`Self::content_gen`] advances or paint metrics change.
+    paint_list: Mutex<Option<PaintDrawList>>,
     _reader: JoinHandle<()>,
+}
+
+/// Layout metrics that must match for a draw-list replay to be valid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PaintMetrics {
+    pub cell_w: f32,
+    pub line_h: f32,
+    pub font_size: f32,
+    pub cols: u16,
+    pub rows: u16,
+    pub bg: [f32; 4],
+}
+
+/// One text run ready to paint. After the first full paint, [`Self::shaped`]
+/// holds the gpui layout so sibling-pane replays skip `shape_line`.
+#[derive(Clone, Debug)]
+pub(crate) struct CachedRun {
+    pub start_line: i32,
+    pub start_col: i32,
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub color: [f32; 4],
+    pub underline: bool,
+    pub wavy: bool,
+    pub strike: bool,
+    /// Populated during paint (needs the window text system). Replay uses this
+    /// and skips re-shaping.
+    pub shaped: Option<gpui::ShapedLine>,
+}
+
+impl PaintMetrics {
+    /// Whether shaped glyph layouts built under these metrics are reusable under
+    /// `other`: same font geometry. Grid size / background may differ — shaping
+    /// doesn't depend on them.
+    pub(crate) fn same_font(&self, other: &Self) -> bool {
+        self.cell_w == other.cell_w
+            && self.line_h == other.line_h
+            && self.font_size == other.font_size
+    }
+}
+
+/// Batched background / selection / search rect.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CachedRect {
+    pub line: i32,
+    pub start_col: i32,
+    pub num_cells: usize,
+    pub color: [f32; 4],
+}
+
+/// Full-grid draw list produced by a full paint walk; reused on subsequent paints
+/// while [`TerminalSession::content_gen`] is unchanged.
+#[derive(Clone, Debug)]
+pub(crate) struct PaintDrawList {
+    pub content_gen: u64,
+    pub metrics: PaintMetrics,
+    pub runs: Vec<CachedRun>,
+    pub bg_rects: Vec<CachedRect>,
+    pub sel_rects: Vec<CachedRect>,
+    pub search_rects: Vec<CachedRect>,
 }
 
 impl TerminalSession {
@@ -299,9 +386,32 @@ impl TerminalSession {
         let child_pid = child.process_id();
         let killer = child.clone_killer();
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
-        let writer: SharedWriter = Arc::new(Mutex::new(
-            pair.master.take_writer().context("take pty writer")?,
-        ));
+        // PTY writes go through a dedicated thread — NEVER synchronously from
+        // the caller. When a busy agent stops draining stdin (e.g. an Ink TUI
+        // deep in its render debounce under key-repeat), conhost stops reading
+        // the ConPTY input pipe and `write_all` BLOCKS until the agent catches
+        // up — which it only does once input pauses. Written directly from the
+        // UI thread, that stall froze the entire window for seconds mid-hold
+        // (no draws, no presents, no input processing), unfreezing exactly at
+        // key release. The writer thread absorbs the stall; callers (key
+        // handler, mouse reports, the VTE listener's query replies) just queue
+        // bytes. Windows Terminal threads its PTY input for the same reason.
+        let mut pipe_writer = pair.master.take_writer().context("take pty writer")?;
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::Builder::new()
+            .name("muxel-pty-writer".to_string())
+            .spawn(move || {
+                // Exits when every sender is gone (session dropped) or the
+                // pipe breaks (child gone).
+                while let Ok(bytes) = write_rx.recv() {
+                    if pipe_writer.write_all(&bytes).is_err() {
+                        break;
+                    }
+                    let _ = pipe_writer.flush();
+                }
+            })
+            .context("spawn pty writer thread")?;
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter(write_tx))));
         // `pair.slave` is dropped at the end of this function, closing the
         // parent's copy so the reader sees EOF when the child exits.
 
@@ -363,6 +473,8 @@ impl TerminalSession {
             last_output: Mutex::new(Instant::now()),
             output_seen: AtomicBool::new(false),
             focused: AtomicBool::new(false),
+            content_gen: AtomicU64::new(1),
+            paint_list: Mutex::new(None),
             _reader: reader_handle,
         });
 
@@ -374,8 +486,66 @@ impl TerminalSession {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
         processor.advance(&mut *term, data);
+        // Synchronized updates (DECSET 2026): vte BUFFERS everything between
+        // BSU/ESU instead of applying it, and expiring a stuck window is the
+        // embedder's job (alacritty services this in its event loop; vte's
+        // deadline is 150ms). Without this check, an app that opens a window
+        // and never closes it would freeze the grid until it next goes idle.
+        // Checking here bounds the freeze to deadline + one batch gap.
+        if processor
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|d| Instant::now() >= d)
+        {
+            processor.stop_sync(&mut *term);
+            profile::sync_expired();
+        }
         *self.last_output.lock() = Instant::now();
         self.output_seen.store(true, Ordering::Relaxed);
+        if !data.is_empty() {
+            self.bump_content();
+        }
+    }
+
+    /// Current content generation — advances on any grid/selection/scroll/search
+    /// change that should invalidate the cached draw list.
+    pub(crate) fn content_generation(&self) -> u64 {
+        self.content_gen.load(Ordering::Relaxed)
+    }
+
+    /// Invalidate the paint draw-list cache (grid-facing content changed).
+    pub(crate) fn bump_content(&self) {
+        self.content_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Store a freshly built draw list after a full paint walk.
+    pub(crate) fn store_paint_list(&self, list: PaintDrawList) {
+        *self.paint_list.lock() = Some(list);
+    }
+
+    /// Take the previous draw list (for shape retention across content_gen bumps).
+    pub(crate) fn take_paint_list(&self) -> Option<PaintDrawList> {
+        self.paint_list.lock().take()
+    }
+
+    /// Run `f` with the cached draw list when it matches `content_gen` + `metrics`.
+    /// Returns `true` if the cache hit (so the caller can skip a full rebuild).
+    pub(crate) fn with_paint_list_if_valid(
+        &self,
+        content_gen: u64,
+        metrics: PaintMetrics,
+        f: impl FnOnce(&PaintDrawList),
+    ) -> bool {
+        let guard = self.paint_list.lock();
+        if let Some(list) = guard
+            .as_ref()
+            .filter(|l| l.content_gen == content_gen && l.metrics == metrics)
+        {
+            f(list);
+            true
+        } else {
+            false
+        }
     }
 
     /// Whether the child has produced any output yet.
@@ -393,6 +563,7 @@ impl TerminalSession {
             let mut term = self.term.lock();
             if term.grid().display_offset() != 0 {
                 term.scroll_display(Scroll::Bottom);
+                self.bump_content();
             }
         }
         self.write_raw(data);
@@ -496,7 +667,9 @@ impl TerminalSession {
 
         let count = lines.unsigned_abs().min(100) as usize;
         match action {
-            Wheel::Scrolled => {}
+            Wheel::Scrolled => {
+                self.bump_content();
+            }
             Wheel::MouseReport { sgr } => {
                 let mut buf = Vec::with_capacity(count * 16);
                 for _ in 0..count {
@@ -519,9 +692,6 @@ impl TerminalSession {
         true
     }
 
-    /// Resize the PTY and emulator grid, **debounced**: the requested size must
-    /// hold steady for [`RESIZE_SETTLE`] before it's applied, so a burst of
-    /// changes from a pane close / divider drag collapses into one resize (one
     /// The grid size currently applied to the PTY, `(cols, rows)`.
     ///
     /// Worth persisting: a pane that respawns at the size it last had opens its
@@ -533,9 +703,13 @@ impl TerminalSession {
         self.resize.lock().applied
     }
 
+    /// Resize the PTY and emulator grid, **debounced**: the requested size must
+    /// hold steady for [`RESIZE_SETTLE`] before it's applied, so a burst of
+    /// changes from a pane close / divider drag collapses into one resize (one
     /// SIGWINCH) instead of many. Returns `true` while a resize is still
-    /// settling — the caller should schedule another frame (e.g. `window.refresh`)
-    /// so the pending resize eventually lands even if nothing else repaints.
+    /// settling — the caller should schedule another frame for *this* view
+    /// (`request_animation_frame`, not `window.refresh`) so the pending resize
+    /// lands without invalidating every cached terminal.
     #[must_use]
     pub fn resize(&self, cols: u16, rows: u16) -> bool {
         let cols = cols.max(1);
@@ -564,6 +738,7 @@ impl TerminalSession {
             .lock()
             .resize(TermSize::new(cols as usize, rows as usize));
         st.applied = (cols, rows);
+        self.bump_content();
         false
     }
 
@@ -573,11 +748,20 @@ impl TerminalSession {
         let mut term = self.term.lock();
         term.grid_mut().clear_history();
         term.scroll_display(Scroll::Bottom);
+        drop(term);
+        self.bump_content();
     }
 
     /// Set the search needle the element highlights (empty string clears it).
     pub fn set_search(&self, needle: &str) {
-        *self.search.lock() = needle.chars().collect();
+        let chars: Vec<char> = needle.chars().collect();
+        let mut cur = self.search.lock();
+        if *cur == chars {
+            return;
+        }
+        *cur = chars;
+        drop(cur);
+        self.bump_content();
     }
 
     /// The current search needle (chars), for the element to highlight.
@@ -603,6 +787,7 @@ impl TerminalSession {
             return false;
         }
         *cur = link;
+        // Link underline is painted live outside the draw-list cache — no gen bump.
         true
     }
 
@@ -673,6 +858,8 @@ impl TerminalSession {
         let delta = target as i32 - cur as i32;
         if delta != 0 {
             term.scroll_display(Scroll::Delta(delta));
+            drop(term);
+            self.bump_content();
         }
     }
 
@@ -695,6 +882,30 @@ impl TerminalSession {
 
     /// The visible screen as text (one row per line, newline-separated). Used for
     /// marker-based agent-status detection (e.g. scanning for "esc to interrupt").
+    /// Profiler probe: cursor position plus the text of the cursor's row.
+    /// Answers "did the typed characters actually reach the grid?" during a
+    /// visually frozen key-repeat hang — if the row grows here but not on
+    /// screen it's our display path; if it never grows, the bytes never came.
+    pub(crate) fn cursor_probe(&self) -> (usize, i32, String) {
+        use alacritty_terminal::index::{Column, Point as GridPoint};
+        self.with_term(|term| {
+            let grid = term.grid();
+            let cursor = grid.cursor.point;
+            let cols = grid.columns();
+            let mut text = String::with_capacity(cols);
+            for col in 0..cols {
+                text.push(
+                    grid[GridPoint {
+                        line: cursor.line,
+                        column: Column(col),
+                    }]
+                    .c,
+                );
+            }
+            (cursor.column.0, cursor.line.0, text.trim_end().to_string())
+        })
+    }
+
     pub(crate) fn visible_text(&self) -> String {
         use alacritty_terminal::index::{Column, Line, Point as GridPoint};
         self.with_term(|term| {
@@ -721,7 +932,11 @@ impl TerminalSession {
     /// Mutate the terminal (e.g. to update the text selection).
     pub(crate) fn with_term_mut<R>(&self, f: impl FnOnce(&mut Term<MuxelListener>) -> R) -> R {
         let mut term = self.term.lock();
-        f(&mut term)
+        let out = f(&mut term);
+        drop(term);
+        // Selection / other visual mutations go through here.
+        self.bump_content();
+        out
     }
 
     /// The currently-selected text, if any.
@@ -735,6 +950,10 @@ impl TerminalSession {
         let mut term = self.term.lock();
         let had = term.selection.is_some();
         term.selection = None;
+        drop(term);
+        if had {
+            self.bump_content();
+        }
         had
     }
 
@@ -790,6 +1009,7 @@ impl TerminalSession {
     /// whenever the app theme (re)applies, so answers track what's painted.
     pub(crate) fn set_palette(&self, palette: TerminalPalette) {
         *self.palette.lock() = palette;
+        self.bump_content();
     }
 
     /// Consume the "bell rang" edge.

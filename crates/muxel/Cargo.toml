@@ -12,6 +12,7 @@ name = "muxel"
 path = "src/main.rs"
 
 [dependencies]
+env_logger = "0.11"
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
@@ -113,6 +114,16 @@ objc2-foundation = "0.3"
 # macOS/Windows: an embedded in-pane webview via gpui-component's gpui-wry
 # (WKWebView / WebView2 as a native child of the gpui window). Pinned to the
 # same gpui-component rev so the `gpui` types unify.
+# Present pump (see `spawn_present_pump` in main.rs): the same `windows` crate
+# version gpui_windows already pins, so this adds nothing new to the tree.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.57", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "e416af7f4dad861f251d357b6aa677dbc13a500e" }
 # The same lb-wry release gpui-wry pins, so the `wry` types unify.

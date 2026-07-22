@@ -54,7 +54,61 @@ impl AssetSource for AppAssets {
     }
 }
 
+/// Windows present pump — works around a gpui frame-scheduling gap that froze
+/// terminal panes for seconds under sustained key repeat.
+///
+/// Upstream: <https://github.com/zed-industries/zed/issues/61469>. Removable
+/// once that is fixed AND muxel's gpui pin (via gpui-component) includes the
+/// fix; until then this stays. It is close to free when nothing is dirty.
+///
+/// gpui-on-Windows presents ONLY from `WM_PAINT`, the lowest-priority message,
+/// synthesized when the message queue is idle. Under key-repeat + PTY notify
+/// traffic the queue never idles — and gpui's `dispatch_key_event` draws the
+/// window synchronously (consuming the dirty flag) WITHOUT presenting, so
+/// frames are rendered but never reach the screen until input stops (proven
+/// via PresentMon: 15s of zero `Present()` calls while element paints ticked
+/// at 20/s). `RDW_UPDATENOW` delivers `WM_PAINT` through the sent-message
+/// channel, which bypasses posted-queue priority entirely — a present
+/// opportunity arrives every tick no matter how deep the queue is. Frames
+/// with nothing new are a cheap no-op in gpui's request-frame handler.
+#[cfg(target_os = "windows")]
+fn spawn_present_pump() {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::Graphics::Gdi::{RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows;
+
+    unsafe extern "system" fn pump(hwnd: HWND, _: LPARAM) -> BOOL {
+        unsafe {
+            let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+        }
+        BOOL(1)
+    }
+
+    // Captured on the UI thread (main); the pump enumerates its windows so
+    // secondary/pop-out windows are covered automatically.
+    let ui_thread = unsafe { GetCurrentThreadId() };
+    std::thread::Builder::new()
+        .name("muxel-present-pump".to_string())
+        .spawn(move || {
+            loop {
+                unsafe {
+                    let _ = EnumThreadWindows(ui_thread, Some(pump), LPARAM(0));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        })
+        .ok();
+}
+
 fn main() {
+    // gpui reports real render failures (swap-chain present, scene-too-large
+    // draw errors, GPU device loss) through `log` and swallows the Result;
+    // without a logger they vanish silently. Errors/warnings go to stderr.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    #[cfg(target_os = "windows")]
+    spawn_present_pump();
+
     // Linux built-in browser: `muxel --browser <url>` relaunches this binary as
     // a standalone WebKitGTK window (gpui can't host one — see browser_helper).
     // Must run before anything gpui-related initializes.

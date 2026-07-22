@@ -144,6 +144,36 @@ struct ExitInfo {
     read_error: Option<String>,
 }
 
+/// Drain whatever is already buffered on the channel into `output`, stopping
+/// at an Exit event or once [`MAX_BYTES_PER_TURN`] is buffered (the rest stays
+/// queued for the next drain turn).
+fn coalesce_pending(
+    rx: &async_channel::Receiver<PtyChunk>,
+    output: &mut Vec<u8>,
+    exit: &mut Option<ExitInfo>,
+) {
+    while let Ok(more) = rx.try_recv() {
+        match more {
+            PtyChunk::Output(b) => output.extend_from_slice(&b),
+            PtyChunk::Exit {
+                code,
+                signal,
+                read_error,
+            } => {
+                *exit = Some(ExitInfo {
+                    code,
+                    signal,
+                    read_error,
+                });
+                return;
+            }
+        }
+        if output.len() >= MAX_BYTES_PER_TURN {
+            return;
+        }
+    }
+}
+
 pub struct TerminalView {
     session: Arc<TerminalSession>,
     focus_handle: FocusHandle,
@@ -175,6 +205,8 @@ pub struct TerminalView {
     done_latch: std::cell::Cell<bool>,
     /// Last time we `cx.notify()`'d a paint from the drain loop (background throttle).
     last_paint_notify: std::cell::Cell<std::time::Instant>,
+    /// Cached agent status for the current session content generation.
+    status_cache: std::cell::Cell<Option<(u64, AgentStatus)>>,
     _drain: Task<()>,
 }
 
@@ -342,7 +374,9 @@ impl TerminalView {
             .detach();
         }
 
+        let drain_session = session.clone();
         let drain = cx.spawn(async move |view: WeakEntity<Self>, cx| {
+            let session = drain_session;
             loop {
                 let chunk = match rx.recv().await {
                     Ok(c) => c,
@@ -365,67 +399,32 @@ impl TerminalView {
                         });
                     }
                 }
-                // Coalesce whatever else is already buffered.
-                while let Ok(more) = rx.try_recv() {
-                    match more {
-                        PtyChunk::Output(b) => output.extend_from_slice(&b),
-                        PtyChunk::Exit {
-                            code,
-                            signal,
-                            read_error,
-                        } => {
-                            exit = Some(ExitInfo {
-                                code,
-                                signal,
-                                read_error,
-                            });
-                            break;
-                        }
-                    }
-                    if output.len() >= MAX_BYTES_PER_TURN {
-                        break;
-                    }
-                }
+                coalesce_pending(&rx, &mut output, &mut exit);
 
                 // Background agents: briefly wait and coalesce more before taking
                 // the UI lock — N chatty agents each doing view.update per chunk
                 // is what made typing feel laggy under load.
-                let focused = view
-                    .read_with(cx, |v, _| v.session.is_focused())
-                    .unwrap_or(true);
-                if !focused && exit.is_none() && output.len() < MAX_BYTES_PER_TURN {
+                if !session.is_focused() && exit.is_none() && output.len() < MAX_BYTES_PER_TURN {
                     cx.background_executor()
                         .timer(BACKGROUND_PAINT_INTERVAL)
                         .await;
-                    while let Ok(more) = rx.try_recv() {
-                        match more {
-                            PtyChunk::Output(b) => output.extend_from_slice(&b),
-                            PtyChunk::Exit {
-                                code,
-                                signal,
-                                read_error,
-                            } => {
-                                exit = Some(ExitInfo {
-                                    code,
-                                    signal,
-                                    read_error,
-                                });
-                                break;
-                            }
-                        }
-                        if output.len() >= MAX_BYTES_PER_TURN {
-                            break;
-                        }
-                    }
+                    coalesce_pending(&rx, &mut output, &mut exit);
                 }
 
                 let batch_len = output.len();
                 let stop = view
                     .update(cx, |view, cx| {
+                        let focused = view.session.is_focused();
                         if !output.is_empty() {
                             let t0 = Instant::now();
                             view.session.process_output(&output);
-                            profile::process_output(batch_len, t0.elapsed());
+                            profile::process_output(batch_len, t0.elapsed(), focused);
+                            // Grid probe: whether typed chars reached the grid
+                            // (dump appends the focused pane's cursor row).
+                            if focused && profile::is_enabled() {
+                                let (col, row, text) = view.session.cursor_probe();
+                                profile::screen_probe_update(col, row, text);
+                            }
                             // OSC-52 copies parsed from this batch land on the
                             // system clipboard here, where a gpui cx exists.
                             for (ty, text) in view.session.take_clipboard_stores() {
@@ -439,15 +438,16 @@ impl TerminalView {
                             view.exit_signal = info.signal;
                             view.exit_read_error = info.read_error;
                         }
-                        // Focused pane: paint every batch so typing/echo feels live.
-                        // Background agents: throttle paints — still advance the
-                        // grid for status markers, but don't schedule a full
-                        // TerminalElement paint per chunk for each of N agents.
-                        let focused = view.session.is_focused();
+                        // Focused: paint every batch. With AnyView::cached, only this
+                        // entity repaints — skipping notify left the grid ahead of
+                        // pixels (stale cache) and felt like a hang after ~key-repeat
+                        // fills the echo buffer. Background: 10 Hz still.
                         let now = Instant::now();
-                        let due = now.duration_since(view.last_paint_notify.get())
-                            >= BACKGROUND_PAINT_INTERVAL;
-                        if stop || focused || due {
+                        let due = focused
+                            || stop
+                            || now.duration_since(view.last_paint_notify.get())
+                                >= BACKGROUND_PAINT_INTERVAL;
+                        if due {
                             view.last_paint_notify.set(now);
                             cx.notify();
                             profile::notify_scheduled();
@@ -478,6 +478,7 @@ impl TerminalView {
             prev_raw: std::cell::Cell::new(None),
             done_latch: std::cell::Cell::new(false),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
+            status_cache: std::cell::Cell::new(None),
             _drain: drain,
         }
     }
@@ -519,6 +520,22 @@ impl TerminalView {
     /// bell, output activity, and process exit (see [`classify`]). Agents with no
     /// markers fall back to the bell + activity heuristic.
     pub fn status(&self) -> AgentStatus {
+        // Cache against content gen so sidebar/tick don't re-scan the grid every
+        // frame while the agent is idle. Bell and idle-time still force a recheck.
+        let content_gen = self.session.content_generation();
+        let bell = self.session.has_bell();
+        if !bell
+            && let Some((cached_gen, cached)) = self.status_cache.get()
+            && cached_gen == content_gen
+            && !self.exited
+        {
+            // Idle duration can advance Working→Idle without a content gen bump
+            // (no new output). Recompute when the activity heuristic might flip.
+            if !matches!(cached, AgentStatus::Working) {
+                return cached;
+            }
+        }
+
         // Only scan the grid when there are markers to look for.
         let screen = if self.working_markers.is_empty() && self.blocked_markers.is_empty() {
             String::new()
@@ -530,7 +547,7 @@ impl TerminalView {
             &screen,
             &self.working_markers,
             &self.blocked_markers,
-            self.session.has_bell(),
+            bell,
             self.session.idle_for(),
         );
         // Only agents with a real working marker may latch Done from a
@@ -545,6 +562,7 @@ impl TerminalView {
             can_latch,
         );
         self.done_latch.set(latch);
+        self.status_cache.set(Some((content_gen, status)));
         status
     }
 
@@ -766,6 +784,7 @@ impl Render for TerminalView {
             .p(TERM_INSET)
             .child(TerminalElement::new(
                 self.session.clone(),
+                cx.entity_id(),
                 self.focus_handle.clone(),
                 self.palette.clone(),
                 self.font_family.clone(),
