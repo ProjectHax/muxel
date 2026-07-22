@@ -39,11 +39,13 @@ struct Counters {
     process_bytes: AtomicU64,
     process_us: AtomicU64,
     paint_count: AtomicU64,
+    paint_focused: AtomicU64,
     paint_us: AtomicU64,
     paint_max_us: AtomicU64,
     process_max_us: AtomicU64,
     last_event: std::sync::Mutex<Option<Instant>>,
-    window_start: std::sync::Mutex<Option<Instant>>,
+    /// Start of the current stats interval (reset every dump).
+    interval_start: std::sync::Mutex<Option<Instant>>,
     flusher_started: AtomicBool,
 }
 
@@ -59,11 +61,12 @@ fn counters() -> &'static Counters {
         process_bytes: AtomicU64::new(0),
         process_us: AtomicU64::new(0),
         paint_count: AtomicU64::new(0),
+        paint_focused: AtomicU64::new(0),
         paint_us: AtomicU64::new(0),
         paint_max_us: AtomicU64::new(0),
         process_max_us: AtomicU64::new(0),
         last_event: std::sync::Mutex::new(None),
-        window_start: std::sync::Mutex::new(None),
+        interval_start: std::sync::Mutex::new(None),
         flusher_started: AtomicBool::new(false),
     })
 }
@@ -74,7 +77,7 @@ fn touch() {
     if let Ok(mut g) = c.last_event.lock() {
         *g = Some(now);
     }
-    if let Ok(mut g) = c.window_start.lock()
+    if let Ok(mut g) = c.interval_start.lock()
         && g.is_none()
     {
         *g = Some(now);
@@ -107,14 +110,8 @@ fn ensure_flusher() {
                 if quiet || periodic {
                     dump(if quiet { "quiet" } else { "tick" });
                     last_dump = Instant::now();
-                    if quiet {
-                        // Reset window so the next hold starts a fresh sample.
-                        if let Ok(mut g) = c.window_start.lock() {
-                            *g = None;
-                        }
-                        if let Ok(mut g) = c.last_event.lock() {
-                            *g = None;
-                        }
+                    if quiet && let Ok(mut g) = c.last_event.lock() {
+                        *g = None;
                     }
                 }
             }
@@ -132,6 +129,7 @@ fn dump(tag: &str) {
     let bytes = c.process_bytes.swap(0, Ordering::Relaxed);
     let process_us = c.process_us.swap(0, Ordering::Relaxed);
     let paints = c.paint_count.swap(0, Ordering::Relaxed);
+    let paints_f = c.paint_focused.swap(0, Ordering::Relaxed);
     let paint_us = c.paint_us.swap(0, Ordering::Relaxed);
     let paint_max = c.paint_max_us.swap(0, Ordering::Relaxed);
     let process_max = c.process_max_us.swap(0, Ordering::Relaxed);
@@ -140,12 +138,17 @@ fn dump(tag: &str) {
         return;
     }
 
+    // Interval since last dump (not since first event — that understated Hz).
     let win_ms = c
-        .window_start
+        .interval_start
         .lock()
         .ok()
-        .and_then(|g| g.map(|t| t.elapsed().as_millis()))
-        .unwrap_or(0)
+        .and_then(|mut g| {
+            let start = g.take();
+            *g = Some(Instant::now());
+            start.map(|t| t.elapsed().as_millis())
+        })
+        .unwrap_or(500)
         .max(1);
 
     let key_avg = key_us.checked_div(keys).unwrap_or(0);
@@ -154,12 +157,16 @@ fn dump(tag: &str) {
     let notify_hz = notify as u128 * 1000 / win_ms;
     let paint_hz = paints as u128 * 1000 / win_ms;
     let key_hz = keys as u128 * 1000 / win_ms;
+    let paints_bg = paints.saturating_sub(paints_f);
+    let paint_total_ms = paint_us / 1000;
+    let paint_pct = paint_us as u128 * 100 / (win_ms * 1000);
 
     eprintln!(
-        "term-prof[{tag}] win={win_ms}ms keys={keys} (held={keys_held}, ~{key_hz}/s, avg={key_avg}µs) \
+        "term-prof[{tag}] Δ={win_ms}ms keys={keys} (held={keys_held}, ~{key_hz}/s, avg={key_avg}µs) \
          notify={notify} (~{notify_hz}/s) \
          process={batches} batches/{bytes}B avg={proc_avg}µs max={process_max}µs \
-         paint={paints} (~{paint_hz}/s) avg={paint_avg}µs max={paint_max}µs"
+         paint={paints} (focus={paints_f} bg={paints_bg}, ~{paint_hz}/s) \
+         avg={paint_avg}µs max={paint_max}µs sum={paint_total_ms}ms (~{paint_pct}% of interval)"
     );
 }
 
@@ -200,12 +207,15 @@ pub fn process_output(bytes: usize, elapsed: Duration) {
     touch();
 }
 
-pub fn paint(elapsed: Duration) {
+pub fn paint(elapsed: Duration, focused: bool) {
     if !enabled() {
         return;
     }
     let c = counters();
     c.paint_count.fetch_add(1, Ordering::Relaxed);
+    if focused {
+        c.paint_focused.fetch_add(1, Ordering::Relaxed);
+    }
     let us = elapsed.as_micros() as u64;
     c.paint_us.fetch_add(us, Ordering::Relaxed);
     c.paint_max_us.fetch_max(us, Ordering::Relaxed);

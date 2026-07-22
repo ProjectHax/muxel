@@ -921,7 +921,7 @@ impl Element for TerminalElement {
                 ));
             }
         });
-        profile::paint(paint_t0.elapsed());
+        profile::paint(paint_t0.elapsed(), focused);
     }
 }
 
