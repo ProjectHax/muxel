@@ -73,6 +73,11 @@ impl AssetSource for AppAssets {
 /// with nothing new are a cheap no-op in gpui's request-frame handler.
 #[cfg(target_os = "windows")]
 fn spawn_present_pump() {
+    // Escape hatch for reproducing the upstream bug (and later for verifying
+    // its fix before removing the pump): MUXEL_NO_PRESENT_PUMP=1 disables it.
+    if std::env::var_os("MUXEL_NO_PRESENT_PUMP").is_some() {
+        return;
+    }
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows::Win32::Graphics::Gdi::{RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow};
     use windows::Win32::System::Threading::GetCurrentThreadId;
