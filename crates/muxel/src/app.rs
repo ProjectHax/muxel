@@ -1155,6 +1155,10 @@ pub struct MuxelApp {
     /// Instances whose process exit has already been logged/flagged, so `tick`
     /// records each exit exactly once. Cleared on respawn.
     exit_logged: HashSet<Uuid>,
+    /// Remote tmux panes whose relay dropped and are being auto-reattached — the
+    /// pane shows "reconnecting…" (not "exited") until it settles, and the drop is
+    /// announced only once, not on every retry. Runtime-only.
+    reconnecting: HashSet<Uuid>,
     /// System-tray handle (when `minimize_to_tray` is on and a tray is available).
     tray: Option<muxel_tray::TrayController>,
     /// Last tray menu we pushed, so we only update on change.
@@ -3048,6 +3052,7 @@ impl MuxelApp {
             last_status: HashMap::new(),
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
+            reconnecting: HashSet::new(),
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
             terminal_launches: HashMap::new(),
@@ -3170,6 +3175,33 @@ impl MuxelApp {
             if let Some(iid) = self.active_instance {
                 self.focus_instance(iid, window, cx);
             }
+        }
+        // Bring every OTHER remote project's tmux panes back in the background, so an
+        // agent left running on a host reconnects on launch instead of waiting to be
+        // clicked into. Skip any host that would pop a password prompt — a startup
+        // password storm across several hosts is worse than reconnecting them lazily.
+        // The connect callback only focuses the active project, so these don't steal
+        // focus, and `remote_connecting` dedupes against the active connect above.
+        let reattach: Vec<Uuid> = self
+            .workspace
+            .projects
+            .iter()
+            .map(|p| p.id)
+            .filter(|&pid| Some(pid) != active)
+            .filter(|&pid| self.remote_can_connect_unattended(pid))
+            .collect();
+        for pid in reattach {
+            self.ensure_project_terminals(pid, window, cx);
+        }
+    }
+
+    /// Whether a remote project can connect with no user interaction — key auth, or
+    /// password auth whose password is already in memory or the keychain. Gates the
+    /// startup auto-reattach so it never triggers a password prompt.
+    fn remote_can_connect_unattended(&self, pid: Uuid) -> bool {
+        match self.remote_host_for_project(pid) {
+            Some(host) => host.auth != SshAuth::Password || self.remote_password(&host).is_some(),
+            None => false, // not a remote project (or host gone) → nothing to reattach
         }
     }
 
@@ -5676,6 +5708,9 @@ impl MuxelApp {
         // every second (rebuilding every button) is what strands gpui-component
         // tooltips: a repaint landing as the cursor leaves a button drops the
         // hover-out event, leaving the tooltip stuck until another one shows.
+        // How long a reattached pane must stay alive before it counts as reconnected
+        // (rather than a respawn that's about to fail again on a still-down host).
+        const RECONNECT_SETTLE_SECS: u64 = 4;
         let mut dirty = false;
         for Snap {
             iid,
@@ -5691,6 +5726,23 @@ impl MuxelApp {
         {
             let changed = self.last_status.insert(iid, status) != Some(status);
             dirty |= changed;
+            // A reconnecting remote pane that's stayed alive since its last respawn
+            // has reattached — clear the state and say so, once.
+            if self.reconnecting.contains(&iid)
+                && !exited
+                && self
+                    .terminal_launches
+                    .get(&iid)
+                    .is_some_and(|&(at, _)| at.elapsed().as_secs() >= RECONNECT_SETTLE_SECS)
+            {
+                self.reconnecting.remove(&iid);
+                self.add_event(
+                    NotifKind::Success,
+                    tf("{title}: reconnected", &[("title", &title)]),
+                    t("The remote session picked up where it left off.").to_string(),
+                );
+                dirty = true;
+            }
             // Record each process exit exactly once in the durable event log —
             // the GUI often runs with stderr discarded, and an auto-closed pane
             // leaves no other trace to debug "my pane vanished" from.
@@ -5824,24 +5876,44 @@ impl MuxelApp {
             // the session and the agent relaunches with `--resume <id>`, restoring the
             // conversation from its transcript — the tmux scrollback is the only
             // casualty. Resetting the id would throw the conversation away.
-            let alive = integrations::tmux_session_exists(&session);
-            let (heading, detail) = if alive {
-                (
-                    tf("{title}: reattached", &[("title", &title)]),
-                    t("The terminal was killed; its tmux session kept running.").to_string(),
-                )
-            } else {
-                (
-                    tf("{title}: session restored", &[("title", &title)]),
-                    t("The tmux session was killed; the agent was resumed where it left off.")
-                        .to_string(),
-                )
-            };
-            self.add_event(NotifKind::Success, heading, detail);
-            muxel_store::append_event_log(&format!(
-                "{}: \"{title}\" [{session}]",
-                if alive { "reattach" } else { "resume" }
-            ));
+            let is_remote = self.remote_host_for_instance(iid).is_some();
+            // Announce the drop once per outage, not on every retry.
+            let first_drop = self.reconnecting.insert(iid);
+            if is_remote {
+                // The tmux session lives on the host and outlives a dropped relay, so
+                // `tmux_session_exists` (a *local* check) is meaningless here — never
+                // claim the session was lost. The pane shows "reconnecting…" until
+                // this respawn's `tmux new-session -A` reattaches it.
+                if first_drop {
+                    self.add_event(
+                        NotifKind::Blocked,
+                        tf("{title}: connection lost — reconnecting…", &[("title", &title)]),
+                        t("The tmux session is still running on the host; muxel will reattach as soon as it's reachable.")
+                            .to_string(),
+                    );
+                    muxel_store::append_event_log(&format!("reconnect: \"{title}\" [{session}]"));
+                }
+            } else if first_drop {
+                // Local pane: the local has-session check is correct.
+                let alive = integrations::tmux_session_exists(&session);
+                let (heading, detail) = if alive {
+                    (
+                        tf("{title}: reattached", &[("title", &title)]),
+                        t("The terminal was killed; its tmux session kept running.").to_string(),
+                    )
+                } else {
+                    (
+                        tf("{title}: session restored", &[("title", &title)]),
+                        t("The tmux session was killed; the agent was resumed where it left off.")
+                            .to_string(),
+                    )
+                };
+                self.add_event(NotifKind::Success, heading, detail);
+                muxel_store::append_event_log(&format!(
+                    "{}: \"{title}\" [{session}]",
+                    if alive { "reattach" } else { "resume" }
+                ));
+            }
             self.spawn_terminal(iid, window, cx);
             dirty = true;
         }
@@ -5878,6 +5950,7 @@ impl MuxelApp {
         let live: HashSet<Uuid> = self.terminals.keys().copied().collect();
         self.last_status.retain(|iid, _| live.contains(iid));
         self.exit_logged.retain(|iid| live.contains(iid));
+        self.reconnecting.retain(|iid| live.contains(iid));
         self.auto.retain(|iid, _| live.contains(iid));
         // Auto-continue: nudge armed panes whose agent has stalled with work left.
         self.tick_auto_continue(cx);
@@ -12952,10 +13025,18 @@ impl MuxelApp {
                         // all) visible under an explicit banner, so a dead
                         // process never masquerades as a live pane or a random
                         // disappearance. The toolbar Restart respawns in place.
-                        let abnormal = v.exit_read_error().is_some() || v.exit_code() != Some(0);
+                        //
+                        // A remote pane mid-reconnect is NOT a tombstone: its tmux
+                        // session is alive on the host and muxel is retrying, so it
+                        // reads as "reconnecting…", not "exited".
+                        let reconnecting = self.reconnecting.contains(&iid);
+                        let abnormal = !reconnecting
+                            && (v.exit_read_error().is_some() || v.exit_code() != Some(0));
                         // A signalled child reports code 1; say "killed by
                         // <signal>" rather than mislabelling it a crash.
-                        let label: SharedString =
+                        let label: SharedString = if reconnecting {
+                            t("Connection lost — reconnecting…")
+                        } else {
                             match (v.exit_read_error(), v.exit_signal(), v.exit_code()) {
                                 (Some(_), _, _) => t("process ended — terminal read failed"),
                                 (None, Some(sig), _) => {
@@ -12968,11 +13049,19 @@ impl MuxelApp {
                                 )
                                 .into(),
                                 (None, None, None) => t("process exited — code unknown"),
-                            };
-                        let (bg, fg) = if abnormal {
+                            }
+                        };
+                        let (bg, fg) = if reconnecting {
+                            (cx.theme().warning.opacity(0.15), cx.theme().warning)
+                        } else if abnormal {
                             (cx.theme().danger.opacity(0.15), cx.theme().danger)
                         } else {
                             (cx.theme().muted.opacity(0.5), cx.theme().muted_foreground)
+                        };
+                        let hint = if reconnecting {
+                            t("Waiting for the host…")
+                        } else {
+                            t("Restart to relaunch")
                         };
                         div()
                             .size_full()
@@ -12996,9 +13085,7 @@ impl MuxelApp {
                                     .text_color(fg)
                                     .child(label)
                                     .child(
-                                        div()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(t("Restart to relaunch")),
+                                        div().text_color(cx.theme().muted_foreground).child(hint),
                                     ),
                             )
                             .into_any_element()
@@ -21244,7 +21331,10 @@ impl MuxelApp {
             )
             .child(self.settings_label(&t("StrictHostKeyChecking (blank = accept-new)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_strict)))
-            .child(self.settings_label(&t("Keepalive — ServerAliveInterval secs (optional)"), cx))
+            .child(self.settings_label(
+                &t("Keepalive — ServerAliveInterval secs (blank = 20s default; 0 disables)"),
+                cx,
+            ))
             .child(Self::wide_input(Input::new(&ui.s_keepalive)))
             .child(self.settings_label(&t("Extra ssh -o options (one per line)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_extra).h(px(60.0))));

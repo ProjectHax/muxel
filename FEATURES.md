@@ -541,6 +541,18 @@ feature is added or changed, update the matching entry here in the same change**
   pane and all git calls. Launching a tmux session (remote, or a local tmux-mode
   project) enables tmux `mouse on`, so the pane's scroll wheel scrolls tmux's own
   copy-mode history instead of just the visible screen.
+- **Survives a dropped connection** — every SSH connection keeps itself alive with
+  periodic probes (`ServerAliveInterval`), so a drop (Wi-Fi blip, laptop sleep, host
+  reboot) is *detected* — roughly a minute of silence — instead of the pane freezing
+  on a dead socket forever. A dropped remote tmux pane then shows **"Connection lost —
+  reconnecting…"** (not "exited"), because its session is still running on the host,
+  and muxel keeps retrying on its own until the host is reachable and reattaches the
+  agent right where it left off. (Tune or disable the probe per host in Settings →
+  Remotes → Keepalive; blank uses a 20s default, `0` turns it off.)
+- **Reattaches everything on launch** — on startup muxel reconnects the tmux panes of
+  *every* remote project in the background, not just the one you had open, so agents
+  left running on your hosts come back automatically. Hosts that would need a password
+  you haven't saved are skipped (no password storm) and reconnect when you open them.
 - **Roaming layouts** — a remote project's pane layout is mirrored to the host at
   `<remote_root>/.muxel/workspace.json`, so opening the same project from another
   machine restores the whole session (the tmux-backed panes re-attach to their

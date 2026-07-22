@@ -5,6 +5,20 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+- **Remote sessions survive a dropped connection, and reattach on launch** — a lost
+  SSH connection (Wi-Fi blip, laptop sleep, host reboot) used to freeze a remote pane
+  on a dead socket, so muxel never noticed and the session read as "exited" when you
+  reopened. Every SSH connection now keeps itself alive with periodic probes
+  (`ServerAliveInterval`, ~60s to detect a drop; set per host in Settings → Remotes,
+  blank = 20s default, `0` disables), so a drop is *detected*: the pane shows
+  **"Connection lost — reconnecting…"** instead of "exited" — its tmux session is
+  still running on the host — and muxel retries on its own until the host is reachable
+  and reattaches the agent where it left off. On startup it also reconnects the tmux
+  panes of *every* remote project in the background (not just the active one), so
+  agents left running on your hosts come back automatically; hosts needing an
+  unsaved password are skipped and reconnect when opened.
+
 ### Changed
 - **Auto-continue also nudges on a soft "I'd hold here" check-in** — a message that
   parks but still offers more work ("I'd hold here unless you want that scaled run.",

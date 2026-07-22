@@ -47,6 +47,14 @@ pub fn target(host: &RemoteHost) -> String {
 /// wedging a pane or the connection test. Overridable via `extra_options`.
 const CONNECT_TIMEOUT_SECS: u32 = 15;
 
+/// Default `ServerAliveInterval` (seconds) when a host doesn't set its own — the
+/// gap between keepalive probes on an otherwise-silent connection.
+const DEFAULT_KEEPALIVE_SECS: u32 = 20;
+/// Default `ServerAliveCountMax`: missed probes before ssh declares the
+/// connection dead and exits. With the interval above, a drop is detected in
+/// roughly `SECS * COUNT` (~60s).
+const DEFAULT_KEEPALIVE_COUNT: u32 = 3;
+
 /// Base connection **options** for a host (port, identity, jump, agent
 /// forwarding, host-key policy, connect timeout, keepalive, compression, extra
 /// `-o`s) — everything *except* ControlMaster multiplexing, the target, and the
@@ -100,9 +108,21 @@ pub fn base_args(host: &RemoteHost) -> Vec<String> {
         v.push("-o".into());
         v.push(format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"));
     }
-    if let Some(secs) = host.keepalive_secs {
+    // Keepalive: probe the server periodically so a dropped connection (Wi-Fi
+    // blip, laptop sleep, host reboot) is *detected* — the ssh client exits
+    // after `ServerAliveCountMax` missed probes instead of hanging forever on a
+    // dead socket. This is what lets muxel notice a remote pane's relay died and
+    // reconnect it; without it the pane freezes silently. `keepalive_secs` unset
+    // takes the default; an explicit `Some(0)` disables it; a hand-written
+    // `ServerAliveInterval` in `extra_options` wins.
+    let keepalive = host.keepalive_secs.unwrap_or(DEFAULT_KEEPALIVE_SECS);
+    if keepalive > 0 && !user_set("ServerAliveInterval") {
         v.push("-o".into());
-        v.push(format!("ServerAliveInterval={secs}"));
+        v.push(format!("ServerAliveInterval={keepalive}"));
+        if !user_set("ServerAliveCountMax") {
+            v.push("-o".into());
+            v.push(format!("ServerAliveCountMax={DEFAULT_KEEPALIVE_COUNT}"));
+        }
     }
     if host.compression && !user_set("Compression") {
         v.push("-o".into());
@@ -493,6 +513,10 @@ mod tests {
             "StrictHostKeyChecking=accept-new",
             "-o",
             "ConnectTimeout=15",
+            "-o",
+            "ServerAliveInterval=20",
+            "-o",
+            "ServerAliveCountMax=3",
         ];
         if cfg!(not(target_os = "windows")) {
             want.extend([
@@ -601,8 +625,36 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["-J", "bastion"]));
         assert!(a.contains(&"-A".to_string()));
         assert!(a.contains(&"ServerAliveInterval=30".to_string()));
+        assert!(a.contains(&"ServerAliveCountMax=3".to_string()));
         assert!(a.contains(&"Compression=yes".to_string()));
         assert_eq!(target(&h), "ryan@example.com");
+    }
+
+    #[test]
+    fn keepalive_defaults_on_so_drops_are_detected() {
+        // A host that never set keepalive still gets a sensible default — the fix
+        // for a dropped connection hanging forever instead of exiting.
+        let mut h = host();
+        h.keepalive_secs = None;
+        let a = base_args(&h);
+        assert!(a.contains(&"ServerAliveInterval=20".to_string()));
+        assert!(a.contains(&"ServerAliveCountMax=3".to_string()));
+    }
+
+    #[test]
+    fn keepalive_can_be_disabled_and_overridden() {
+        // Explicit 0 turns it off entirely.
+        let mut h = host();
+        h.keepalive_secs = Some(0);
+        let a = base_args(&h);
+        assert!(!a.iter().any(|o| o.starts_with("ServerAlive")));
+        // A hand-written option in extra_options wins over the default.
+        let mut h = host();
+        h.keepalive_secs = None;
+        h.extra_options = vec!["ServerAliveInterval=99".into()];
+        let a = base_args(&h);
+        assert!(!a.contains(&"ServerAliveInterval=20".to_string()));
+        assert!(a.contains(&"ServerAliveInterval=99".to_string()));
     }
 
     #[test]
