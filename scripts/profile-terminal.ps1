@@ -13,21 +13,20 @@ $sandbox = Join-Path $root ".muxel-lagtest"
 New-Item -ItemType Directory -Force -Path (Join-Path $sandbox "config"), (Join-Path $sandbox "data") | Out-Null
 
 $exe = Join-Path $root "target\debug\muxel.exe"
-if (-not (Test-Path $exe)) {
-    Write-Host "Building muxel..."
-    Push-Location $root
-    cargo build -p muxel
-    Pop-Location
-}
+Write-Host "Building muxel (ensure profiler is current)..."
+Push-Location $root
+cargo build -p muxel
+if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+Pop-Location
 
 $env:MUXEL_PROFILE_TERMINAL = "1"
 $env:XDG_CONFIG_HOME = Join-Path $sandbox "config"
 $env:XDG_DATA_HOME = Join-Path $sandbox "data"
 
-Write-Host "Profile ON (MUXEL_PROFILE_TERMINAL=1)"
+Write-Host "Profile ON (MUXEL_PROFILE_TERMINAL=1) — lines must start with term-prof[v2 …]"
+Write-Host "If you see win= instead of Δ=, you are on a stale binary."
 Write-Host "Sandbox: $sandbox"
-Write-Host "stderr lines: term-prof[tick] every ~500ms while active; term-prof[quiet] ~1s after last event"
-Write-Host "Hold a key in the focused terminal, release, paste the quiet line back."
+Write-Host "Hold a key ~2s in one Claude with several Claudes visible; release; paste term-prof[v2 quiet]."
 Write-Host ""
 
 & $exe

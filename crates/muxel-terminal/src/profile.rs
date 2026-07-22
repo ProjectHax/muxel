@@ -161,8 +161,9 @@ fn dump(tag: &str) {
     let paint_total_ms = paint_us / 1000;
     let paint_pct = paint_us as u128 * 100 / (win_ms * 1000);
 
+    // Prefix `v2` so a stale binary is obvious (old builds print `win=`).
     eprintln!(
-        "term-prof[{tag}] Δ={win_ms}ms keys={keys} (held={keys_held}, ~{key_hz}/s, avg={key_avg}µs) \
+        "term-prof[v2 {tag}] Δ={win_ms}ms keys={keys} (held={keys_held}, ~{key_hz}/s, avg={key_avg}µs) \
          notify={notify} (~{notify_hz}/s) \
          process={batches} batches/{bytes}B avg={proc_avg}µs max={process_max}µs \
          paint={paints} (focus={paints_f} bg={paints_bg}, ~{paint_hz}/s) \
