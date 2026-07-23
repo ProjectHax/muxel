@@ -13,6 +13,7 @@ mod element;
 mod keymap;
 mod links;
 mod listener;
+mod profile;
 mod search;
 mod session;
 mod view;

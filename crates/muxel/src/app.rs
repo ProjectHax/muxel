@@ -276,18 +276,27 @@ fn shell_dir_title(osc: &str) -> &str {
     }
 }
 
+/// Terminal as a **cached** view element. Without `.cached(...)`, every window
+/// frame re-renders and re-paints every visible terminal (GPUI multipaint). With
+/// it, siblings reuse last frame's paint until that view's `cx.notify()` (or a
+/// full `window.refresh`). This is the main multi-agent key-repeat win.
+fn cached_terminal_view(view: Entity<TerminalView>) -> AnyView {
+    AnyView::from(view).cached(StyleRefinement::default().size_full())
+}
+
 /// Render a terminal pane. In `RightClickMenu` mouse mode it wraps the view in a
 /// right-click Copy/Paste context menu (the menu component lives in this crate, not
 /// in muxel-terminal); the other modes handle the mouse inside the terminal element
 /// itself. Shared by the main pane and pop-out windows.
 fn terminal_pane_element(view: &Entity<TerminalView>, cx: &App) -> AnyElement {
+    let cached = cached_terminal_view(view.clone());
     if view.read(cx).mouse_mode() != TerminalMouseMode::RightClickMenu {
-        return view.clone().into_any_element();
+        return cached.into_any_element();
     }
     let view = view.clone();
     div()
         .size_full()
-        .child(view.clone())
+        .child(cached)
         .context_menu(move |menu, window, _cx| {
             menu.item(PopupMenuItem::new(t("Copy")).icon(IconName::Copy).on_click(
                 window.listener_for(&view, |this, _e, _w, cx| {
@@ -3682,7 +3691,12 @@ impl MuxelApp {
     fn refresh_terminal_palettes(&mut self, cx: &mut Context<Self>) {
         let palette = theme::palette_from_theme(cx);
         for view in self.terminals.values() {
-            view.update(cx, |view, _cx| view.set_palette(palette.clone()));
+            view.update(cx, |view, cx| {
+                view.set_palette(palette.clone());
+                // Terminals render through AnyView::cached — without a notify,
+                // an idle pane replays old pixels until its next PTY byte.
+                cx.notify();
+            });
         }
     }
 
@@ -16786,9 +16800,11 @@ impl MuxelApp {
         let font_size = self.settings.font_size * self.settings.zoom;
         let mouse_mode = TerminalMouseMode::from_setting(&self.settings.terminal_mouse);
         for view in self.terminals.values() {
-            view.update(cx, |view, _cx| {
+            view.update(cx, |view, cx| {
                 view.set_config(font_family.clone(), font_size);
                 view.set_mouse_mode(mouse_mode);
+                // See refresh_terminal_palettes: cached views need the notify.
+                cx.notify();
             });
         }
     }
