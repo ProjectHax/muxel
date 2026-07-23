@@ -179,8 +179,14 @@ fn spawn_present_pump() {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
-                    unsafe {
-                        let _ = PostMessageW(sink, WM_MUXEL_PRESENT, WPARAM(0), LPARAM(0));
+                    // Only the wndproc clears PRESENT_PENDING, and only when the
+                    // message actually arrives. If the post fails, nothing ever
+                    // clears the flag and the pump goes dark for the rest of the
+                    // run — so clear it here and retry on the next tick.
+                    let posted =
+                        unsafe { PostMessageW(sink, WM_MUXEL_PRESENT, WPARAM(0), LPARAM(0)) };
+                    if posted.is_err() {
+                        PRESENT_PENDING.store(false, Ordering::Release);
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(8));
@@ -194,8 +200,6 @@ fn main() {
     // draw errors, GPU device loss) through `log` and swallows the Result;
     // without a logger they vanish silently. Errors/warnings go to stderr.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    #[cfg(target_os = "windows")]
-    spawn_present_pump();
 
     // Linux built-in browser: `muxel --browser <url>` relaunches this binary as
     // a standalone WebKitGTK window (gpui can't host one — see browser_helper).
@@ -282,6 +286,12 @@ fn main() {
     // still single-threaded.
     #[cfg(target_os = "linux")]
     integrations::reap_stale_appimage_mounts();
+
+    // Force gpui to present under sustained input on Windows (see the fn). Spawns a
+    // watchdog thread, so — like the reap above — it must come AFTER every `set_var`
+    // block: `set_var` is only sound while the process is single-threaded.
+    #[cfg(target_os = "windows")]
+    spawn_present_pump();
 
     gpui_platform::application()
         // Serves muxel's agent icons + gpui-component's bundled SVG icons.
