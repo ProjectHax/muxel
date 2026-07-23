@@ -285,9 +285,23 @@ impl Element for TerminalElement {
         if hit {
             paint_mode = PaintMode::Replay;
         } else {
+            let damage = self.session.take_pending_damage();
             let prev = self.session.take_paint_list();
             let t0 = Instant::now();
-            let mut list = build_draw_list(&self.session, &palette, content_gen, metrics);
+            let mut list = match (
+                damage.prefer_partial_rebuild(rows as usize),
+                prev.as_ref().filter(|p| p.metrics.same_font(&metrics)),
+            ) {
+                (Some(lines), Some(prev_list)) => patch_draw_list(
+                    prev_list,
+                    &self.session,
+                    &palette,
+                    content_gen,
+                    metrics,
+                    lines,
+                ),
+                _ => build_draw_list(&self.session, &palette, content_gen, metrics),
+            };
             phases.build = t0.elapsed();
             phases.runs = list.runs.len() as u64;
             // Reuse shapes only from a list with the same font geometry — a
@@ -301,6 +315,8 @@ impl Element for TerminalElement {
             shape_draw_list(&mut list, cell_width, font_size, state, window);
             phases.shape = t1.elapsed();
             let t2 = Instant::now();
+            // Full submit still required under gpui (element paints whole bounds).
+            // Damage cuts rebuild cost; priority scheduling cuts how often we get here.
             paint_draw_list(
                 &list,
                 origin,
@@ -551,16 +567,63 @@ fn shape_draw_list(
     }
 }
 
+/// Rebuild only `visual_lines` into a clone of `prev`, dropping old runs/rects
+/// on those lines. Used when alacritty reports partial damage.
+fn patch_draw_list(
+    prev: &PaintDrawList,
+    session: &TerminalSession,
+    palette: &TerminalPalette,
+    content_gen: u64,
+    metrics: PaintMetrics,
+    visual_lines: &[i32],
+) -> PaintDrawList {
+    let mut list = prev.clone();
+    list.content_gen = content_gen;
+    list.metrics = metrics;
+    let damaged: std::collections::HashSet<i32> = visual_lines.iter().copied().collect();
+    list.runs.retain(|r| !damaged.contains(&r.start_line));
+    list.bg_rects.retain(|r| !damaged.contains(&r.line));
+    list.sel_rects.retain(|r| !damaged.contains(&r.line));
+    list.search_rects.retain(|r| !damaged.contains(&r.line));
+
+    let patch = build_draw_list_rows(session, palette, content_gen, metrics, visual_lines);
+    list.runs.extend(patch.runs);
+    list.bg_rects.extend(patch.bg_rects);
+    list.sel_rects.extend(patch.sel_rects);
+    list.search_rects.extend(patch.search_rects);
+    // Stable paint order: top-to-bottom, left-to-right.
+    list.runs
+        .sort_by_key(|a| (a.start_line, a.start_col));
+    list.bg_rects
+        .sort_by_key(|a| (a.line, a.start_col));
+    list.sel_rects
+        .sort_by_key(|a| (a.line, a.start_col));
+    list.search_rects
+        .sort_by_key(|a| (a.line, a.start_col));
+    list
+}
+
 fn build_draw_list(
     session: &TerminalSession,
     palette: &TerminalPalette,
     content_gen: u64,
     metrics: PaintMetrics,
 ) -> PaintDrawList {
+    let rows: Vec<i32> = (0..metrics.rows as i32).collect();
+    build_draw_list_rows(session, palette, content_gen, metrics, &rows)
+}
+
+fn build_draw_list_rows(
+    session: &TerminalSession,
+    palette: &TerminalPalette,
+    content_gen: u64,
+    metrics: PaintMetrics,
+    visual_rows: &[i32],
+) -> PaintDrawList {
     let search_needle = session.search_needle();
     session.with_term(|term| {
         let grid = term.grid();
-        let screen_lines = grid.screen_lines();
+        let screen_lines = grid.screen_lines() as i32;
         let columns = grid.columns();
         let display_offset = grid.display_offset() as i32;
         let sel_range = term.selection.as_ref().and_then(|s| s.to_range(term));
@@ -576,7 +639,11 @@ fn build_draw_list(
         let mut cur_sel: Option<BgRect> = None;
         let mut cur_search: Option<BgRect> = None;
 
-        for row in 0..screen_lines {
+        for &visual_line in visual_rows {
+            if visual_line < 0 || visual_line >= screen_lines {
+                continue;
+            }
+            let row = visual_line as usize;
             let visual_line = row as i32;
             let buffer_line = visual_line - display_offset;
 

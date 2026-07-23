@@ -11,7 +11,9 @@ use crate::listener::{MuxelListener, SharedWriter};
 use crate::profile;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Osc52, Term, TermMode};
+use alacritty_terminal::term::{
+    ClipboardType, Config as TermConfig, Osc52, Term, TermDamage, TermMode,
+};
 use alacritty_terminal::vte::ansi::Processor;
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
@@ -267,7 +269,52 @@ pub struct TerminalSession {
     /// Last built draw list for this session (main-thread only via the GPUI paint
     /// path). Invalid when [`Self::content_gen`] advances or paint metrics change.
     paint_list: Mutex<Option<PaintDrawList>>,
+    /// Accumulated grid damage since the last paint (from alacritty `TermDamage`).
+    pending_damage: Mutex<ContentDamage>,
+    /// Set by [`Self::write_input`]; next [`Self::process_output`] is treated as
+    /// high-priority echo for paint scheduling (type-while-stream).
+    expect_echo: AtomicBool,
     _reader: JoinHandle<()>,
+}
+
+/// Viewport damage since the last paint, derived from alacritty's damage tracker.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ContentDamage {
+    /// Entire viewport must be rebuilt (scroll, resize, clear, alt-screen, …).
+    #[default]
+    Full,
+    /// Only these **visual** line indices (0 = top of viewport) changed.
+    Partial(Vec<i32>),
+}
+
+impl ContentDamage {
+    pub(crate) fn merge(&mut self, other: ContentDamage) {
+        match (&mut *self, other) {
+            (ContentDamage::Full, _) => {}
+            (_, ContentDamage::Full) => *self = ContentDamage::Full,
+            (ContentDamage::Partial(a), ContentDamage::Partial(b)) => {
+                for line in b {
+                    if !a.contains(&line) {
+                        a.push(line);
+                    }
+                }
+                a.sort_unstable();
+            }
+        }
+    }
+
+    /// Whether a partial rebuild is worthwhile (not almost-full).
+    pub(crate) fn prefer_partial_rebuild(&self, screen_lines: usize) -> Option<&[i32]> {
+        match self {
+            ContentDamage::Full => None,
+            ContentDamage::Partial(lines)
+                if !lines.is_empty() && lines.len() * 2 < screen_lines.max(1) =>
+            {
+                Some(lines.as_slice())
+            }
+            ContentDamage::Partial(_) => None,
+        }
+    }
 }
 
 /// Layout metrics that must match for a draw-list replay to be valid.
@@ -475,6 +522,8 @@ impl TerminalSession {
             focused: AtomicBool::new(false),
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
+            pending_damage: Mutex::new(ContentDamage::Full),
+            expect_echo: AtomicBool::new(false),
             _reader: reader_handle,
         });
 
@@ -482,6 +531,9 @@ impl TerminalSession {
     }
 
     /// Feed PTY output through the VTE parser into the terminal grid.
+    ///
+    /// Collects alacritty damage for the next paint (partial row rebuild) and
+    /// for paint-priority scheduling (echo vs stream).
     pub(crate) fn process_output(&self, data: &[u8]) {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
@@ -500,11 +552,64 @@ impl TerminalSession {
             processor.stop_sync(&mut *term);
             profile::sync_expired();
         }
+        if !data.is_empty() {
+            let screen = term.screen_lines() as i32;
+            let dmg = match term.damage() {
+                TermDamage::Full => ContentDamage::Full,
+                TermDamage::Partial(iter) => {
+                    // alacritty's iterator yields viewport-oriented line indices
+                    // when display_offset is applied; clamp to the visible grid.
+                    let mut lines: Vec<i32> = iter
+                        .map(|b| b.line as i32)
+                        .filter(|&l| l >= 0 && l < screen)
+                        .collect();
+                    lines.sort_unstable();
+                    lines.dedup();
+                    if lines.is_empty() {
+                        ContentDamage::Full
+                    } else {
+                        ContentDamage::Partial(lines)
+                    }
+                }
+            };
+            term.reset_damage();
+            // Do not call bump_content() here — it marks Full damage and would
+            // erase the partial lines we just collected.
+            self.pending_damage.lock().merge(dmg);
+            self.content_gen.fetch_add(1, Ordering::Relaxed);
+        }
         *self.last_output.lock() = Instant::now();
         self.output_seen.store(true, Ordering::Relaxed);
-        if !data.is_empty() {
-            self.bump_content();
-        }
+    }
+
+    /// Take accumulated damage for the next paint.
+    pub(crate) fn take_pending_damage(&self) -> ContentDamage {
+        std::mem::replace(
+            &mut *self.pending_damage.lock(),
+            ContentDamage::Partial(Vec::new()),
+        )
+    }
+
+    /// Peek damage without clearing (tests).
+    #[cfg(test)]
+    pub(crate) fn pending_damage_for_test(&self) -> ContentDamage {
+        self.pending_damage.lock().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_pending_damage_for_test(&self) {
+        *self.pending_damage.lock() = ContentDamage::Partial(Vec::new());
+        // Don't touch content_gen — tests only care about damage merge.
+    }
+
+    /// Next PTY output batch should be scheduled as high-priority user echo.
+    pub(crate) fn mark_expect_echo(&self) {
+        self.expect_echo.store(true, Ordering::Release);
+    }
+
+    /// Consume the expect-echo flag (paint scheduler).
+    pub(crate) fn take_expect_echo(&self) -> bool {
+        self.expect_echo.swap(false, Ordering::AcqRel)
     }
 
     /// Current content generation — advances on any grid/selection/scroll/search
@@ -516,6 +621,9 @@ impl TerminalSession {
     /// Invalidate the paint draw-list cache (grid-facing content changed).
     pub(crate) fn bump_content(&self) {
         self.content_gen.fetch_add(1, Ordering::Relaxed);
+        // Selection / search / scroll paths bump without going through
+        // process_output's damage collector — treat as full viewport.
+        self.pending_damage.lock().merge(ContentDamage::Full);
     }
 
     /// Store a freshly built draw list after a full paint walk.
@@ -563,8 +671,14 @@ impl TerminalSession {
             let mut term = self.term.lock();
             if term.grid().display_offset() != 0 {
                 term.scroll_display(Scroll::Bottom);
+                self.pending_damage.lock().merge(ContentDamage::Full);
                 self.bump_content();
             }
+        }
+        if !data.is_empty() {
+            // Echo (or TUI reaction) will follow; paint scheduler prioritizes it
+            // over background stream frames in the same pane.
+            self.mark_expect_echo();
         }
         self.write_raw(data);
     }
@@ -1466,6 +1580,47 @@ fn read_loop(
         while let Ok(None) = child.try_wait() {
             std::thread::sleep(Duration::from_secs(1));
         }
+    }
+}
+
+#[cfg(test)]
+mod content_damage_tests {
+    use super::{CommandSpec, ContentDamage, TerminalSession};
+
+    fn spawn_quiet() -> std::sync::Arc<TerminalSession> {
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/C".into(), "pause >nul".into()],
+        );
+        TerminalSession::spawn(spec, 80, 24).expect("spawn").0
+    }
+
+    /// Printable input leaves Full or Partial damage; expect_echo is independent.
+    #[test]
+    fn process_output_records_damage_and_expect_echo() {
+        let session = spawn_quiet();
+        let _ = session.take_pending_damage();
+        session.clear_pending_damage_for_test();
+
+        session.mark_expect_echo();
+        assert!(session.take_expect_echo());
+        assert!(!session.take_expect_echo());
+
+        session.mark_expect_echo();
+        session.process_output(b"hello");
+        assert!(session.take_expect_echo());
+
+        match session.pending_damage_for_test() {
+            ContentDamage::Full => {}
+            ContentDamage::Partial(lines) => {
+                assert!(!lines.is_empty());
+                assert!(lines.iter().all(|&l| (0..24).contains(&l)));
+            }
+        }
+        session.kill();
     }
 }
 

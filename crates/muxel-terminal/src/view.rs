@@ -17,10 +17,15 @@ use std::time::{Duration, Instant};
 /// can't starve the UI; the rest stays buffered for the next turn.
 const MAX_BYTES_PER_TURN: usize = 256 * 1024;
 
-/// Unfocused terminals still parse PTY output (status badges need a warm grid)
-/// but only repaint at this rate. With a couple dozen streaming agents, full-rate
-/// `cx.notify()` on every chunk was stealing main-thread time from key handling.
+/// Unfocused terminals: status badges only need a slow warm grid.
 const BACKGROUND_PAINT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Focused **stream** (agent output without a pending key-echo): ~30 Hz.
+/// Typing-while-Claude-streams used to notify every batch (~full submit thrash).
+const FOCUSED_STREAM_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Focused **user echo** (PTY output after `write_input`): keep key feedback crisp.
+const FOCUSED_ECHO_INTERVAL: Duration = Duration::from_millis(8);
 
 /// A small margin between the terminal grid and the pane edge. The grid (and so
 /// the reported size) is computed from the inset area, giving a TUI that renders
@@ -401,32 +406,39 @@ impl TerminalView {
                 }
                 coalesce_pending(&rx, &mut output, &mut exit);
 
-                // Background agents: briefly wait and coalesce more before taking
-                // the UI lock — N chatty agents each doing view.update per chunk
-                // is what made typing feel laggy under load.
-                if !session.is_focused() && exit.is_none() && output.len() < MAX_BYTES_PER_TURN {
-                    cx.background_executor()
-                        .timer(BACKGROUND_PAINT_INTERVAL)
-                        .await;
-                    coalesce_pending(&rx, &mut output, &mut exit);
+                // Coalesce before taking the UI lock: bg agents always; focused
+                // stream bursts too (echo priority is decided after process_output).
+                let focused_hint = session.is_focused();
+                if exit.is_none() && output.len() < MAX_BYTES_PER_TURN {
+                    let wait = if !focused_hint {
+                        Some(BACKGROUND_PAINT_INTERVAL)
+                    } else if output.len() >= 4096 {
+                        Some(FOCUSED_STREAM_INTERVAL)
+                    } else {
+                        None
+                    };
+                    if let Some(d) = wait {
+                        cx.background_executor().timer(d).await;
+                        coalesce_pending(&rx, &mut output, &mut exit);
+                    }
                 }
 
                 let batch_len = output.len();
                 let stop = view
                     .update(cx, |view, cx| {
                         let focused = view.session.is_focused();
+                        // Echo flag is set by write_input; consume after parse so
+                        // this batch schedules as UserEcho, not Stream.
+                        let mut echo = false;
                         if !output.is_empty() {
                             let t0 = Instant::now();
                             view.session.process_output(&output);
+                            echo = view.session.take_expect_echo();
                             profile::process_output(batch_len, t0.elapsed(), focused);
-                            // Grid probe: whether typed chars reached the grid
-                            // (dump appends the focused pane's cursor row).
                             if focused && profile::is_enabled() {
                                 let (col, row, text) = view.session.cursor_probe();
                                 profile::screen_probe_update(col, row, text);
                             }
-                            // OSC-52 copies parsed from this batch land on the
-                            // system clipboard here, where a gpui cx exists.
                             for (ty, text) in view.session.take_clipboard_stores() {
                                 write_clipboard(ty, text, cx);
                             }
@@ -438,15 +450,20 @@ impl TerminalView {
                             view.exit_signal = info.signal;
                             view.exit_read_error = info.read_error;
                         }
-                        // Focused: paint every batch. With AnyView::cached, only this
-                        // entity repaints — skipping notify left the grid ahead of
-                        // pixels (stale cache) and felt like a hang after ~key-repeat
-                        // fills the echo buffer. Background: 10 Hz still.
+                        // Priority scheduler (see docs/terminal-paint-architecture.md):
+                        // UserEcho ≫ Stream; never "focused ⇒ every batch".
                         let now = Instant::now();
-                        let due = focused
-                            || stop
-                            || now.duration_since(view.last_paint_notify.get())
-                                >= BACKGROUND_PAINT_INTERVAL;
+                        let min_interval = if stop {
+                            Duration::ZERO
+                        } else if !focused {
+                            BACKGROUND_PAINT_INTERVAL
+                        } else if echo {
+                            FOCUSED_ECHO_INTERVAL
+                        } else {
+                            FOCUSED_STREAM_INTERVAL
+                        };
+                        let due = stop
+                            || now.duration_since(view.last_paint_notify.get()) >= min_interval;
                         if due {
                             view.last_paint_notify.set(now);
                             cx.notify();
