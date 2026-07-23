@@ -1,21 +1,28 @@
 //! Opt-in main-thread timing for key → PTY → paint under load.
 //!
-//! Enable with `MUXEL_PROFILE_TERMINAL=1` (or `true` / `yes`). Stats dump to
-//! stderr **and** a log file every ~500 ms while events are flowing, and a
-//! final line after 1 s of quiet (e.g. after you release a held key).
+//! **Off by default.** Enable with `MUXEL_PROFILE_TERMINAL=1` or
+//! `MUXEL_PROFILE=1` (`true` / `yes` also work). Stats dump to a log file
+//! every ~500 ms while **interesting** events are flowing (keypresses, paint
+//! spikes, high felt latency), and a final line after 1 s of quiet.
+//!
+//! ## Overhead
+//! When disabled: one OnceLock bool check per call site (effectively free).
+//! When enabled: atomics + occasional `Instant::now()`; a background thread
+//! formats one line every 500 ms (append + rotate).
 //!
 //! Log path (first match wins):
 //! 1. `MUXEL_PROFILE_LOG` — absolute or relative path
 //! 2. `$XDG_DATA_HOME/term-prof.log` when that env is set
 //! 3. `term-prof.log` in the process cwd
 //!
+//! `MUXEL_PROFILE_STDERR=1` also echoes dump lines to stderr (default: file only
+//! — keeps GUI launches quiet and avoids console I/O on the hot path).
+//!
 //! Example (PowerShell, second instance / sandbox):
 //! ```text
 //! $env:MUXEL_PROFILE_TERMINAL = "1"
-//! $env:XDG_CONFIG_HOME = "…\sandbox\config"
-//! $env:XDG_DATA_HOME = "…\sandbox\data"
+//! $env:MUXEL_PROFILE_LOG = "…\term-prof.log"
 //! .\target\debug\muxel.exe
-//! # → writes …\sandbox\data\term-prof.log
 //! ```
 //! Hold a key in a terminal; open the log file (no paste needed).
 //!
@@ -27,14 +34,18 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
+static LOG_STDERR: OnceLock<bool> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+
+/// Rotate when the profile log reaches this size (keep one `.1` backup).
+const PROFILE_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Latest cursor position + cursor-row text of the focused pane, pushed by the
 /// drain after each processed batch. Dumps append it so the log shows whether
@@ -56,15 +67,23 @@ pub fn screen_probe_update(col: usize, row: i32, text: String) {
     }
 }
 
+fn env_truthy(key: &str) -> Option<bool> {
+    std::env::var(key).ok().map(|v| {
+        let v = v.trim();
+        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+    })
+}
+
 fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
-        std::env::var("MUXEL_PROFILE_TERMINAL")
-            .map(|v| {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-            })
+        env_truthy("MUXEL_PROFILE_TERMINAL")
+            .or_else(|| env_truthy("MUXEL_PROFILE"))
             .unwrap_or(false)
     })
+}
+
+fn log_stderr() -> bool {
+    *LOG_STDERR.get_or_init(|| env_truthy("MUXEL_PROFILE_STDERR").unwrap_or(false))
 }
 
 fn log_path() -> &'static PathBuf {
@@ -85,6 +104,30 @@ fn log_path() -> &'static PathBuf {
     })
 }
 
+fn open_log_file(path: &Path) -> Option<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Append across restarts so a long session (or many short ones) builds a
+    // corpus; rotate when large so a multi-day run cannot fill the disk.
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() >= PROFILE_LOG_MAX_BYTES
+    {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        let _ = std::fs::rename(path, PathBuf::from(rotated));
+    }
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            if log_stderr() {
+                eprintln!("term-prof: could not open log {}: {e}", path.display());
+            }
+            None
+        }
+    }
+}
+
 fn emit_line(line: &str) {
     // Wall-clock prefix (epoch seconds.millis) so dump lines correlate with
     // external instruments (capture-window.ps1 hashes, PresentMon traces).
@@ -93,33 +136,31 @@ fn emit_line(line: &str) {
         .unwrap_or_default();
     let line = format!("[{}.{:03}] {line}", now.as_secs(), now.subsec_millis());
     let line = line.as_str();
-    eprintln!("{line}");
+    if log_stderr() {
+        eprintln!("{line}");
+    }
     let path = log_path();
     let slot = LOG_FILE.get_or_init(|| {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let f = open_log_file(path);
+        if f.is_some() && log_stderr() {
+            eprintln!("term-prof: writing {}", path.display());
         }
-        match OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)
-        {
-            Ok(f) => {
-                eprintln!("term-prof: writing {}", path.display());
-                Mutex::new(Some(f))
-            }
-            Err(e) => {
-                eprintln!("term-prof: could not open log {}: {e}", path.display());
-                Mutex::new(None)
-            }
-        }
+        Mutex::new(f)
     });
-    if let Ok(mut g) = slot.lock()
-        && let Some(f) = g.as_mut()
-    {
-        let _ = writeln!(f, "{line}");
-        let _ = f.flush();
+    if let Ok(mut g) = slot.lock() {
+        // Re-open after rotation mid-process when the live file grew too large.
+        let needs_reopen = g.as_ref().is_none_or(|f| {
+            f.metadata()
+                .map(|m| m.len() >= PROFILE_LOG_MAX_BYTES)
+                .unwrap_or(false)
+        });
+        if needs_reopen {
+            *g = open_log_file(path);
+        }
+        if let Some(f) = g.as_mut() {
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
+        }
     }
 }
 
@@ -326,6 +367,21 @@ fn dump(tag: &str) {
     let sync_exp = c.sync_expired.swap(0, Ordering::Relaxed);
 
     if keys == 0 && batches == 0 && paints == 0 && notify == 0 {
+        return;
+    }
+
+    // Always-on corpus filter: skip pure background paint/notify ticks. Those
+    // flood the log under multi-agent load and do not explain typing lag.
+    // Keep intervals with keypresses, paint spikes, or high felt latency.
+    let interesting = keys > 0
+        || spikes_3 > 0
+        || spikes_8 > 0
+        || echo_max >= 80_000 // ≥80ms key→echo
+        || plat_max >= 30_000 // ≥30ms echo→paint
+        || paint_max >= 8_000 // ≥8ms single paint
+        || tag == "quiet"; // end-of-burst summary still useful after typing
+    if !interesting {
+        // Counters already swapped to zero above; drop the interval.
         return;
     }
 

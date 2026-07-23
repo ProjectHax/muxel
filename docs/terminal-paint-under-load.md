@@ -32,12 +32,17 @@ none reached the screen until input stopped. Proven with PresentMon (15s of
 zero `Present()` calls while element paints ticked at 20/s) and a per-paint
 color-cycling beacon that froze on glass.
 
-Fix: `spawn_present_pump` in `crates/muxel/src/main.rs` — a message-only
-HWND on the UI thread plus a watchdog that `PostMessage`s it every 8ms.
-The wndproc (top of the message loop, `App` not borrowed) then runs
-`RedrawWindow(RDW_UPDATENOW)` on real windows so `WM_PAINT` arrives via the
-sent-message channel and gpui presents. Idle is cheap: paint goes through
-`draw_window(false)`, a no-op when nothing is dirty.
+Fix: `present_pump` (`crates/muxel/src/present_pump.rs`) — a message-only
+HWND on the UI thread plus a watchdog that `PostMessage`s when present is
+needed. The wndproc (top of the message loop, `App` not borrowed) then runs
+`RedrawWindow(RDW_INVALIDATE|UPDATENOW)` so `WM_PAINT` arrives via the
+sent-message channel and gpui presents.
+
+**v2 (soft-lag):** the first pump posted every 8 ms and invalidated *every*
+top-level HWND. That cured freezes but under multi-agent load made typing
+mushy (settings included) — pump avg ~20 ms, present queue coalesced, cursor
+vanished until input stopped. v2 is dirty-gated + adaptive 16–64 ms interval
++ foreground-window-first, with terminal paint caps (focus ≤60 Hz, bg ≤4 Hz).
 
 Do **not** call `RDW_UPDATENOW` from a background thread (cross-thread
 `SendMessage` → re-enter while `App` is borrowed → `ERROR gpui::window:
@@ -45,6 +50,10 @@ already borrowed`). Do **not** post gpui's `WM_GPUI_FORCE_UPDATE_WINDOW`
 either — that sets `force_render` and full-redraws under load. This is a
 gpui bug worth upstreaming (any gpui app on Windows with background entity
 notifies during sustained typing hits it).
+
+**Removable when fixed:** `present_pump` + `present_flag` are temporary. Exit
+criteria are in the `present_pump.rs` module docs (zed#61469 in our gpui pin +
+`MUXEL_NO_PRESENT_PUMP=1` regression green).
 
 ## Fixed along the way
 
@@ -70,18 +79,48 @@ notifies during sustained typing hits it).
   Never observed to fire in practice (`sync_exp=0` throughout) — this is
   latent-bug hardening, not one of the root causes.
 
-## Diagnostics (opt-in, `MUXEL_PROFILE_TERMINAL=1`)
+## Diagnostics (opt-in — **off by default**)
 
-`crates/muxel-terminal/src/profile.rs` logs 500ms interval stats to
-`term-prof.log`. Run any build with `MUXEL_PROFILE_TERMINAL=1`; set
-`MUXEL_PROFILE_LOG` for the log path and `XDG_CONFIG_HOME`/`XDG_DATA_HOME`
-to sandbox away from the real workspace. Logged: key/notify/process/paint
-rates, paint phase splits
-(build/shape/submit) with shape-reuse %, felt-latency samples (`key→echo` =
-agent+ConPTY side, `echo→paint` = muxel side), sync-expiry count, and a
-focused-pane cursor-row probe that shows whether typed bytes reached the grid.
-`env_logger` is initialized at `warn` so gpui render errors (present failures,
-device loss) are visible on stderr.
+Nothing profiles unless you set env vars. When off, call sites are a single
+OnceLock check.
+
+| Env | Meaning |
+|-----|---------|
+| `MUXEL_PROFILE=1` | enable **both** terminal + UI profilers |
+| `MUXEL_PROFILE_TERMINAL=1` | terminal key→echo→paint only (`profile.rs`) |
+| `MUXEL_PROFILE_UI=1` | UI/present-pump/probe only (`ui_profile.rs`) |
+| `MUXEL_PROFILE_LOG` | terminal log path (append; rotates at 2 MB → `.1`) |
+| `MUXEL_PROFILE_UI_LOG` | UI log path (default: sibling `ui-prof*.log`) |
+| `MUXEL_PROFILE_STDERR=1` | also echo dump lines to stderr (default: file only) |
+
+**Terminal log** (`term-prof`): ~500 ms intervals while interesting work
+happens (keys, paint spikes, high felt latency). Fields: paint phase splits,
+shape reuse, `key→echo` vs `echo→paint`, cursor-row probe.
+
+**UI log** (`ui-prof`): present-pump cost, UI-queue probe RTT, coalesce rate,
+1m / 15m / hourly snapshots (working set). Use this for settings typing and
+cursor starvation (term-prof cannot see non-terminal keys). Spikes:
+`pump >8ms/>30ms`, `probe >50ms/>200ms`, `timeout=`.
+
+Example (PowerShell):
+
+```text
+$env:MUXEL_PROFILE = "1"
+$env:MUXEL_PROFILE_LOG = "…\term-prof.log"
+$env:MUXEL_PROFILE_UI_LOG = "…\ui-prof.log"
+.\target\debug\muxel.exe
+```
+
+Attach-only PresentMon (optional external tool):
+
+```text
+presentmon --process_id <pid> --timed 20 --output_file pm.csv --terminate_after_timed
+```
+
+Logged: key/notify/process/paint rates, paint phase splits (build/shape/submit)
+with shape-reuse %, felt-latency samples (`key→echo` = agent+ConPTY side,
+`echo→paint` = muxel side), sync-expiry count, and a focused-pane cursor-row
+probe that shows whether typed bytes reached the grid.
 
 ## Ruled out on the way (kept for the next archaeologist)
 

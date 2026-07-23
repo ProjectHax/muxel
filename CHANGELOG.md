@@ -5,6 +5,15 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **Typing stays smooth under multi-agent load (Windows soft lag)** — the present
+  pump that cured multi-second freezes could still make input feel mushy after a
+  few minutes (settings fields included; cursor vanished until keys caught up).
+  The pump is now dirty-gated with adaptive 16–64 ms backpressure and paints the
+  foreground window first; focused terminals repaint at most ~60 Hz and background
+  ones ~4 Hz, with extra coalesce on large paste/stream batches. Opt-in profilers
+  (`MUXEL_PROFILE=1`) remain available for the next archaeology dig.
+
 ### Added
 - **Remote sessions survive a dropped connection, and reattach on launch** — a lost
   SSH connection (Wi-Fi blip, laptop sleep, host reboot) used to freeze a remote pane

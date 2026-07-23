@@ -18,9 +18,13 @@ use std::time::{Duration, Instant};
 const MAX_BYTES_PER_TURN: usize = 256 * 1024;
 
 /// Unfocused terminals still parse PTY output (status badges need a warm grid)
-/// but only repaint at this rate. With a couple dozen streaming agents, full-rate
-/// `cx.notify()` on every chunk was stealing main-thread time from key handling.
-const BACKGROUND_PAINT_INTERVAL: Duration = Duration::from_millis(100);
+/// but only repaint at this rate. Multi-agent streams at 10 Hz still starved the
+/// UI thread under load; 4 Hz is enough for status dots and idle panes.
+const BACKGROUND_PAINT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Focused pane: cap repaints at ~60 Hz. Echo still feels live; paste/stream
+/// bursts no longer schedule a full TerminalElement paint per PTY chunk.
+const FOCUSED_PAINT_INTERVAL: Duration = Duration::from_millis(16);
 
 /// A small margin between the terminal grid and the pane edge. The grid (and so
 /// the reported size) is computed from the inset area, giving a TUI that renders
@@ -401,12 +405,21 @@ impl TerminalView {
                 }
                 coalesce_pending(&rx, &mut output, &mut exit);
 
-                // Background agents: briefly wait and coalesce more before taking
-                // the UI lock — N chatty agents each doing view.update per chunk
-                // is what made typing feel laggy under load.
+                // Background agents: coalesce before taking the UI lock so N
+                // chatty agents don't each view.update per chunk.
                 if !session.is_focused() && exit.is_none() && output.len() < MAX_BYTES_PER_TURN {
                     cx.background_executor()
                         .timer(BACKGROUND_PAINT_INTERVAL)
+                        .await;
+                    coalesce_pending(&rx, &mut output, &mut exit);
+                } else if session.is_focused()
+                    && exit.is_none()
+                    && output.len() >= 4096
+                    && output.len() < MAX_BYTES_PER_TURN
+                {
+                    // Paste / stream burst: pull more bytes before one paint.
+                    cx.background_executor()
+                        .timer(FOCUSED_PAINT_INTERVAL)
                         .await;
                     coalesce_pending(&rx, &mut output, &mut exit);
                 }
@@ -438,19 +451,21 @@ impl TerminalView {
                             view.exit_signal = info.signal;
                             view.exit_read_error = info.read_error;
                         }
-                        // Focused: paint every batch. With AnyView::cached, only this
-                        // entity repaints — skipping notify left the grid ahead of
-                        // pixels (stale cache) and felt like a hang after ~key-repeat
-                        // fills the echo buffer. Background: 10 Hz still.
+                        // Focused: ≤60 Hz. Background: ≤4 Hz. AnyView::cached means
+                        // only this entity repaints on notify.
                         let now = Instant::now();
-                        let due = focused
-                            || stop
-                            || now.duration_since(view.last_paint_notify.get())
-                                >= BACKGROUND_PAINT_INTERVAL;
+                        let min_interval = if focused {
+                            FOCUSED_PAINT_INTERVAL
+                        } else {
+                            BACKGROUND_PAINT_INTERVAL
+                        };
+                        let due = stop
+                            || now.duration_since(view.last_paint_notify.get()) >= min_interval;
                         if due {
                             view.last_paint_notify.set(now);
                             cx.notify();
                             profile::notify_scheduled();
+                            crate::present_flag::mark_present_needed();
                         }
                         stop
                     })
@@ -706,6 +721,8 @@ impl TerminalView {
             if cleared {
                 cx.notify();
             }
+            // Key path: gpui may sync-draw without presenting — arm the pump.
+            crate::present_flag::mark_present_needed();
             cx.stop_propagation();
             profile::key_handled(held, t0.elapsed());
         }
