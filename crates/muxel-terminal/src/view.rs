@@ -418,9 +418,7 @@ impl TerminalView {
                     && output.len() < MAX_BYTES_PER_TURN
                 {
                     // Paste / stream burst: pull more bytes before one paint.
-                    cx.background_executor()
-                        .timer(FOCUSED_PAINT_INTERVAL)
-                        .await;
+                    cx.background_executor().timer(FOCUSED_PAINT_INTERVAL).await;
                     coalesce_pending(&rx, &mut output, &mut exit);
                 }
 

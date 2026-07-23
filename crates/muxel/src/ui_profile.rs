@@ -55,6 +55,7 @@ static PROBE_SPIKE_200MS: AtomicU64 = AtomicU64::new(0);
 /// Probes that never came back within the wait window.
 static PROBE_TIMEOUT: AtomicU64 = AtomicU64::new(0);
 /// Last probe send tick (GetTickCount64); 0 = none in flight / completed.
+#[allow(dead_code)] // present-pump telemetry: only `present_pump` (Windows) writes it
 static PROBE_SENT_TICK: AtomicU64 = AtomicU64::new(0);
 
 fn env_truthy(key: &str) -> bool {
@@ -119,11 +120,7 @@ fn open_log(path: &Path) -> Option<std::fs::File> {
         rotated.push(".1");
         let _ = std::fs::rename(path, PathBuf::from(rotated));
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+    OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
 fn emit(line: &str) {
@@ -302,10 +299,7 @@ fn dump_snapshot(tag: &str) {
     let pto = PROBE_TIMEOUT.swap(0, Ordering::Relaxed);
     let _ = PUMP_HWNDS.swap(0, Ordering::Relaxed);
 
-    let up_s = STARTED
-        .get()
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
+    let up_s = STARTED.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     let ws = working_set_bytes()
         .map(|b| format!("{}MB", b / (1024 * 1024)))
         .unwrap_or_else(|| "?".into());
@@ -319,7 +313,12 @@ fn dump_snapshot(tag: &str) {
     ));
 }
 
+// The recorders below are called only from `present_pump` (Windows-only), so on
+// other platforms they are dead — kept compiled everywhere so the bodies stay
+// under lint/type coverage on the Linux CI runner.
+
 /// Record one present-pump handler invocation (UI thread).
+#[allow(dead_code)]
 pub fn pump_handled(elapsed: Duration, hwnd_count: u32) {
     if !is_enabled() {
         return;
@@ -338,6 +337,7 @@ pub fn pump_handled(elapsed: Duration, hwnd_count: u32) {
     }
 }
 
+#[allow(dead_code)]
 pub fn pump_posted() {
     if !is_enabled() {
         return;
@@ -346,6 +346,7 @@ pub fn pump_posted() {
     PUMP_POSTS.fetch_add(1, Ordering::Relaxed);
 }
 
+#[allow(dead_code)]
 pub fn pump_coalesced() {
     if !is_enabled() {
         return;
@@ -355,6 +356,7 @@ pub fn pump_coalesced() {
 }
 
 /// Wndproc side of the UI latency probe (µs of queue delay).
+#[allow(dead_code)]
 pub fn probe_completed(rtt_us: u64) {
     if !is_enabled() {
         return;
@@ -374,6 +376,7 @@ pub fn probe_completed(rtt_us: u64) {
 }
 
 /// Call from the probe poster when a prior probe never completed.
+#[allow(dead_code)]
 pub fn probe_timeout() {
     if !is_enabled() {
         return;
@@ -402,10 +405,12 @@ pub fn init() {
 // --- Windows probe helpers (tick count) ------------------------------------
 
 /// Store the tick used when posting a probe (for timeout detection).
+#[allow(dead_code)]
 pub fn probe_mark_sent(tick_ms: u64) {
     PROBE_SENT_TICK.store(tick_ms, Ordering::Relaxed);
 }
 
+#[allow(dead_code)]
 pub fn probe_last_sent() -> u64 {
     PROBE_SENT_TICK.load(Ordering::Relaxed)
 }

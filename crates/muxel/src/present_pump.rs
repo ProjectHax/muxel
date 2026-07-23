@@ -179,9 +179,8 @@ pub fn spawn() {
                         // Only the wndproc clears PRESENT_PENDING when the
                         // message arrives. If the post fails, clear here or the
                         // pump stays dark for the rest of the run.
-                        let posted = unsafe {
-                            PostMessageW(sink, WM_MUXEL_PRESENT, WPARAM(0), LPARAM(0))
-                        };
+                        let posted =
+                            unsafe { PostMessageW(sink, WM_MUXEL_PRESENT, WPARAM(0), LPARAM(0)) };
                         if posted.is_err() {
                             PRESENT_PENDING.store(false, Ordering::Release);
                         }
