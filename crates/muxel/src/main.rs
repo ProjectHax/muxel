@@ -59,7 +59,8 @@ impl AssetSource for AppAssets {
 ///
 /// Upstream: <https://github.com/zed-industries/zed/issues/61469>. Removable
 /// once that is fixed AND muxel's gpui pin (via gpui-component) includes the
-/// fix; until then this stays. It is close to free when nothing is dirty.
+/// fix; until then this stays. Idle cost is small: `draw_window(false)` is a
+/// no-op when nothing is dirty / nothing needs present.
 ///
 /// gpui-on-Windows presents ONLY from `WM_PAINT`, the lowest-priority message,
 /// synthesized when the message queue is idle. Under key-repeat + PTY notify
@@ -68,9 +69,17 @@ impl AssetSource for AppAssets {
 /// frames are rendered but never reach the screen until input stops (proven
 /// via PresentMon: 15s of zero `Present()` calls while element paints ticked
 /// at 20/s). `RDW_UPDATENOW` delivers `WM_PAINT` through the sent-message
-/// channel, which bypasses posted-queue priority entirely — a present
-/// opportunity arrives every tick no matter how deep the queue is. Frames
-/// with nothing new are a cheap no-op in gpui's request-frame handler.
+/// channel, which bypasses posted-queue priority.
+///
+/// Calling `RedrawWindow(RDW_UPDATENOW)` from a **background** thread is a
+/// cross-thread `SendMessage` and re-enters the window proc while `App`'s
+/// `RefCell` is still borrowed → `ERROR gpui::window: already borrowed`.
+/// Calling gpui's `WM_GPUI_FORCE_UPDATE_WINDOW` instead avoids the borrow but
+/// sets `force_render` and full-redraws every tick under load (felt like the
+/// original freeze, just hotter). So: a message-only HWND on the UI thread
+/// receives a normal-priority `PostMessage`; its wndproc then runs
+/// `RDW_UPDATENOW` **on the UI thread between handlers**, where App is free
+/// and paint goes through `draw_window(false)`.
 #[cfg(target_os = "windows")]
 fn spawn_present_pump() {
     // Escape hatch for reproducing the upstream bug (and later for verifying
@@ -78,27 +87,101 @@ fn spawn_present_pump() {
     if std::env::var_os("MUXEL_NO_PRESENT_PUMP").is_some() {
         return;
     }
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::{RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, EnumThreadWindows, HWND_MESSAGE, PostMessageW,
+        RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_USER, WNDCLASSW,
+    };
+    use windows::core::PCWSTR;
 
-    unsafe extern "system" fn pump(hwnd: HWND, _: LPARAM) -> BOOL {
+    /// Posted to our message-only window; handled on the UI thread.
+    const WM_MUXEL_PRESENT: u32 = WM_USER + 0x6D58; // "mX" — avoid gpui's WM_USER+1..8
+
+    // At most one present message in the queue — if the UI thread is busy the
+    // pump ticks coalesce instead of flooding GetMessage.
+    static PRESENT_PENDING: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" fn paint_one(hwnd: HWND, _: LPARAM) -> BOOL {
+        // EnumThreadWindows skips message-only HWNDs, so we only hit real
+        // top-level gpui windows. Same-thread RDW_UPDATENOW → nested WM_PAINT
+        // → draw_window(false); App is not borrowed at top-of-loop.
         unsafe {
             let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
         }
         BOOL(1)
     }
 
-    // Captured on the UI thread (main); the pump enumerates its windows so
-    // secondary/pop-out windows are covered automatically.
-    let ui_thread = unsafe { GetCurrentThreadId() };
+    unsafe extern "system" fn present_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_MUXEL_PRESENT {
+            PRESENT_PENDING.store(false, Ordering::Release);
+            let ui_thread = unsafe { GetCurrentThreadId() };
+            unsafe {
+                let _ = EnumThreadWindows(ui_thread, Some(paint_one), LPARAM(0));
+            }
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    // Message-only window lives on this (UI) thread so its messages are
+    // dispatched by gpui's GetMessage loop. Created before Application::new.
+    let class_name: Vec<u16> = "muxel_present_pump\0".encode_utf16().collect();
+    let hinstance: HINSTANCE = unsafe { GetModuleHandleW(None) }
+        .map(|m| m.into())
+        .unwrap_or_default();
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(present_wndproc),
+        hInstance: hinstance,
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+    // Ignore already-registered (hot reload / double main).
+    unsafe {
+        let _ = RegisterClassW(&wc);
+    }
+    let sink = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR::null(),
+            WINDOW_STYLE::default(),
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            None,
+            hinstance,
+            None,
+        )
+    };
+    if sink.0 == 0 {
+        log::error!("present pump: failed to create message-only window");
+        return;
+    }
+
     std::thread::Builder::new()
         .name("muxel-present-pump".to_string())
         .spawn(move || {
             loop {
-                unsafe {
-                    let _ = EnumThreadWindows(ui_thread, Some(pump), LPARAM(0));
+                // Post, never Send — runs after the current UI handler returns.
+                // Coalesce: skip if a present is already queued/in-flight.
+                if PRESENT_PENDING
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    unsafe {
+                        let _ = PostMessageW(sink, WM_MUXEL_PRESENT, WPARAM(0), LPARAM(0));
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(8));
             }

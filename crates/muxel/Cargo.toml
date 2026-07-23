@@ -120,6 +120,7 @@ objc2-foundation = "0.3"
 windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

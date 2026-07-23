@@ -32,13 +32,19 @@ none reached the screen until input stopped. Proven with PresentMon (15s of
 zero `Present()` calls while element paints ticked at 20/s) and a per-paint
 color-cycling beacon that froze on glass.
 
-Fix: `spawn_present_pump` in `crates/muxel/src/main.rs` — a watchdog thread
-calling `RedrawWindow(RDW_INVALIDATE | RDW_UPDATENOW)` on the UI thread's
-windows every 8ms. `RDW_UPDATENOW` delivers `WM_PAINT` through the
-sent-message channel, which bypasses posted-queue priority. When nothing is
-dirty, gpui's request-frame handler is a no-op, so the idle cost is small.
-This is a gpui bug worth upstreaming (any gpui app on Windows with background
-entity notifies during sustained typing hits it).
+Fix: `spawn_present_pump` in `crates/muxel/src/main.rs` — a message-only
+HWND on the UI thread plus a watchdog that `PostMessage`s it every 8ms.
+The wndproc (top of the message loop, `App` not borrowed) then runs
+`RedrawWindow(RDW_UPDATENOW)` on real windows so `WM_PAINT` arrives via the
+sent-message channel and gpui presents. Idle is cheap: paint goes through
+`draw_window(false)`, a no-op when nothing is dirty.
+
+Do **not** call `RDW_UPDATENOW` from a background thread (cross-thread
+`SendMessage` → re-enter while `App` is borrowed → `ERROR gpui::window:
+already borrowed`). Do **not** post gpui's `WM_GPUI_FORCE_UPDATE_WINDOW`
+either — that sets `force_render` and full-redraws under load. This is a
+gpui bug worth upstreaming (any gpui app on Windows with background entity
+notifies during sustained typing hits it).
 
 ## Fixed along the way
 
