@@ -79,6 +79,10 @@ pub struct Instance {
     /// User-assigned name; when set it fully replaces the agent's own title.
     #[serde(default)]
     pub custom_name: Option<String>,
+    /// Last title reported by the running program. This is kept separate from
+    /// `custom_name` so a manual rename remains an explicit, stable override.
+    #[serde(default)]
+    pub auto_name: Option<String>,
     /// Program to run; `None` means the user's default shell.
     #[serde(default)]
     pub program: Option<String>,
@@ -155,6 +159,38 @@ pub struct Instance {
 }
 
 impl Instance {
+    /// Display label precedence. Empty persisted values do not mask the next
+    /// useful source.
+    pub fn display_name(&self) -> &str {
+        self.custom_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                self.auto_name
+                    .as_deref()
+                    .filter(|name| is_useful_auto_name(name))
+            })
+            .unwrap_or(&self.title)
+    }
+
+    /// Record a useful program-supplied title. Returns whether persisted state
+    /// changed, so callers can debounce disk writes without losing the last
+    /// non-empty title.
+    pub fn update_auto_name(&mut self, name: String) -> bool {
+        if !is_useful_auto_name(&name) || self.auto_name.as_ref() == Some(&name) {
+            return false;
+        }
+        self.auto_name = Some(name);
+        true
+    }
+
+    /// A duplicated pane copies launch settings, not the source conversation.
+    pub fn reset_conversation_for_duplicate(&mut self) {
+        self.session_id = None;
+        self.session_started = false;
+        self.auto_name = None;
+    }
+
     /// A plain shell instance.
     pub fn shell(project_id: Uuid) -> Self {
         Self::from_preset(project_id, &AgentPreset::shell())
@@ -170,6 +206,7 @@ impl Instance {
             editor_path: None,
             browser_url: None,
             custom_name: None,
+            auto_name: None,
             program: preset.program.clone(),
             args: preset.compose_args(),
             system_prompt: preset.system_prompt.clone(),
@@ -230,6 +267,7 @@ impl Instance {
             editor_path: path,
             browser_url: None,
             custom_name: None,
+            auto_name: None,
             program: None,
             args: Vec::new(),
             system_prompt: None,
@@ -716,9 +754,20 @@ impl RemoteLayout {
     /// sync" checks. Relies on [`capture`](Self::capture)'s canonical ordering and
     /// serde_json's deterministic (sorted-key) object encoding.
     pub fn content_key(&self) -> String {
+        // Program-supplied titles are local display state. Retitling an active
+        // agent must not schedule a remote layout push.
+        let instances: Vec<Instance> = self
+            .instances
+            .iter()
+            .cloned()
+            .map(|mut instance| {
+                instance.auto_name = None;
+                instance
+            })
+            .collect();
         serde_json::json!({
             "layout": self.layout,
-            "instances": self.instances,
+            "instances": instances,
             "worktrees": self.worktrees,
             // In the key, so flipping the toggle counts as a change and is pushed to
             // the host rather than sitting on one machine.
@@ -1340,6 +1389,96 @@ pub fn is_plain_ctrl_letter(keystroke: &str) -> bool {
     rest.len() == 1 && rest.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
 }
 
+/// Program-supplied titles that are useful to a person. Some harnesses expose
+/// their session UUID as the terminal title until the user explicitly names the
+/// thread; that is identity, not a display name.
+pub fn is_useful_auto_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty() && Uuid::parse_str(name).is_err()
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+
+    #[test]
+    fn display_name_prefers_custom_then_auto_then_title() {
+        let mut instance = Instance::shell(Uuid::new_v4());
+        instance.title = "Claude".into();
+        assert_eq!(instance.display_name(), "Claude");
+
+        instance.auto_name = Some("Generated title".into());
+        assert_eq!(instance.display_name(), "Generated title");
+
+        instance.custom_name = Some("My title".into());
+        assert_eq!(instance.display_name(), "My title");
+    }
+
+    #[test]
+    fn display_name_ignores_blank_overrides() {
+        let mut instance = Instance::shell(Uuid::new_v4());
+        instance.title = "Claude".into();
+        instance.auto_name = Some("Generated title".into());
+        instance.custom_name = Some(" \r\n".into());
+        assert_eq!(instance.display_name(), "Generated title");
+
+        instance.auto_name = Some("\t".into());
+        assert_eq!(instance.display_name(), "Claude");
+    }
+
+    #[test]
+    fn missing_auto_name_deserializes_for_old_workspaces() {
+        let instance = Instance::shell(Uuid::new_v4());
+        let mut json = serde_json::to_value(&instance).unwrap();
+        json.as_object_mut().unwrap().remove("auto_name");
+
+        let decoded: Instance = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.auto_name, None);
+        assert_eq!(decoded.display_name(), instance.title);
+    }
+
+    #[test]
+    fn auto_name_updates_only_for_new_nonblank_titles() {
+        let mut instance = Instance::shell(Uuid::new_v4());
+        assert!(!instance.update_auto_name(" \r\n".into()));
+        assert_eq!(instance.auto_name, None);
+
+        assert!(instance.update_auto_name("Generated title".into()));
+        assert_eq!(instance.auto_name.as_deref(), Some("Generated title"));
+        assert!(!instance.update_auto_name("Generated title".into()));
+        assert!(!instance.update_auto_name(String::new()));
+        assert_eq!(instance.auto_name.as_deref(), Some("Generated title"));
+    }
+
+    #[test]
+    fn auto_name_rejects_a_bare_session_uuid() {
+        let mut instance = Instance::shell(Uuid::new_v4());
+        let session_id = Uuid::new_v4().to_string();
+
+        assert!(!instance.update_auto_name(session_id.clone()));
+        assert_eq!(instance.auto_name, None);
+
+        instance.auto_name = Some(session_id);
+        assert_eq!(instance.display_name(), instance.title);
+    }
+
+    #[test]
+    fn duplicate_reset_keeps_settings_but_clears_conversation_state() {
+        let mut instance = Instance::shell(Uuid::new_v4());
+        instance.custom_name = Some("Manual name".into());
+        instance.auto_name = Some("Generated title".into());
+        instance.session_id = Some(Uuid::new_v4().to_string());
+        instance.session_started = true;
+
+        instance.reset_conversation_for_duplicate();
+
+        assert_eq!(instance.custom_name.as_deref(), Some("Manual name"));
+        assert_eq!(instance.auto_name, None);
+        assert_eq!(instance.session_id, None);
+        assert!(!instance.session_started);
+    }
+}
+
 #[cfg(test)]
 mod keystroke_tests {
     use super::is_plain_ctrl_letter;
@@ -1768,6 +1907,28 @@ mod remote_layout_tests {
         ws.instances.push(i2);
         let c = RemoteLayout::capture(&proj, &ws, 1);
         assert_ne!(a.content_key(), c.content_key());
+    }
+
+    #[test]
+    fn content_key_ignores_auto_name_but_tracks_custom_name() {
+        let mut ws = Workspace::default();
+        let mut proj = remote_project("/srv/app");
+        let instance = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::Leaf(LeafData {
+            tabs: vec![instance.id],
+            active: 0,
+        }));
+        ws.instances = vec![instance];
+        ws.projects = vec![proj.clone()];
+
+        let original = RemoteLayout::capture(&proj, &ws, 1);
+        ws.instances[0].auto_name = Some("Generated title".into());
+        let retitled = RemoteLayout::capture(&proj, &ws, 1);
+        assert_eq!(original.content_key(), retitled.content_key());
+
+        ws.instances[0].custom_name = Some("My title".into());
+        let renamed = RemoteLayout::capture(&proj, &ws, 1);
+        assert_ne!(original.content_key(), renamed.content_key());
     }
 
     #[test]
