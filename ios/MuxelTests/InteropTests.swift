@@ -33,6 +33,53 @@ final class InteropTests: XCTestCase {
         // Instance defaults applied for missing fields.
         XCTAssertEqual(layout.instances.first?.kind, .terminal)
         XCTAssertEqual(layout.instances.first?.injection, InjectionMode.none)
+        XCTAssertNil(layout.instances.first?.autoName)
+    }
+
+    func testInstanceDisplayNamePrefersCustomThenAutoThenTitle() {
+        var instance = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
+        XCTAssertEqual(instance.displayName, "Claude")
+
+        instance.autoName = "Generated title"
+        XCTAssertEqual(instance.displayName, "Generated title")
+
+        instance.customName = "My title"
+        XCTAssertEqual(instance.displayName, "My title")
+
+        instance.customName = " \n"
+        XCTAssertEqual(instance.displayName, "Generated title")
+
+        instance.autoName = "\t"
+        XCTAssertEqual(instance.displayName, "Claude")
+
+        instance.autoName = "019f957d-b731-7db0-904d-9e08330e0000"
+        XCTAssertEqual(instance.displayName, "Claude")
+    }
+
+    func testInstanceAutoNameRoundTrips() throws {
+        var instance = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
+        instance.autoName = "Generated title"
+
+        let data = try MuxelJSON.encoder.encode(instance)
+        let decoded = try MuxelJSON.decoder.decode(Instance.self, from: data)
+
+        XCTAssertEqual(decoded.autoName, "Generated title")
+        XCTAssertEqual(decoded.displayName, "Generated title")
+    }
+
+    func testDuplicateResetClearsConversationStateAndAutoName() {
+        var instance = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
+        instance.sessionId = "session"
+        instance.sessionStarted = true
+        instance.autoName = "Generated title"
+        instance.customName = "Manual title"
+
+        instance.resetConversationForDuplicate()
+
+        XCTAssertNil(instance.sessionId)
+        XCTAssertFalse(instance.sessionStarted)
+        XCTAssertNil(instance.autoName)
+        XCTAssertEqual(instance.customName, "Manual title")
     }
 
     func testPaneNodeRoundTrips() throws {

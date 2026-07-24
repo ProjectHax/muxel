@@ -64,6 +64,9 @@ struct Instance: Codable, Equatable, Identifiable {
     /// preserves this so an iOS layout write-back doesn't strip it from the peer.
     var browserUrl: String?
     var customName: String?
+    /// Last program-supplied title. Preserved across remote-layout write-back;
+    /// a manual custom name still wins.
+    var autoName: String?
     var program: String?
     var args: [String] = []
     var systemPrompt: String?
@@ -91,6 +94,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case editorPath = "editor_path"
         case browserUrl = "browser_url"
         case customName = "custom_name"
+        case autoName = "auto_name"
         case program, args
         case systemPrompt = "system_prompt"
         case injection, preset
@@ -130,6 +134,7 @@ struct Instance: Codable, Equatable, Identifiable {
         editorPath = try c.decodeIfPresent(String.self, forKey: .editorPath)
         browserUrl = try c.decodeIfPresent(String.self, forKey: .browserUrl)
         customName = try c.decodeIfPresent(String.self, forKey: .customName)
+        autoName = try c.decodeIfPresent(String.self, forKey: .autoName)
         program = try c.decodeIfPresent(String.self, forKey: .program)
         args = (try c.decodeIfPresent([String].self, forKey: .args)) ?? []
         systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt)
@@ -160,6 +165,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(editorPath, forKey: .editorPath)
         try c.encode(browserUrl, forKey: .browserUrl)
         try c.encode(customName, forKey: .customName)
+        try c.encode(autoName, forKey: .autoName)
         try c.encode(program, forKey: .program)
         try c.encode(args, forKey: .args)
         try c.encode(systemPrompt, forKey: .systemPrompt)
@@ -181,9 +187,23 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(sessionStarted, forKey: .sessionStarted)
     }
 
-    /// The display label shown in the tab bar (custom name overrides the title).
+    /// The display label shown in the tab bar.
     var displayName: String {
-        if let customName, !customName.isEmpty { return customName }
+        if let customName, !customName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return customName
+        }
+        if let autoName,
+           !autoName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           UUID(uuidString: autoName.trimmingCharacters(in: .whitespacesAndNewlines)) == nil
+        {
+            return autoName
+        }
         return title
+    }
+
+    mutating func resetConversationForDuplicate() {
+        sessionId = nil
+        sessionStarted = false
+        autoName = nil
     }
 }
