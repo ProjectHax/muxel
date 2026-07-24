@@ -43,3 +43,13 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# Muxel is an interactive GUI even in local builds. Plain Cargo dev mode leaves
+# GPUI/Taffy primitive arithmetic and layout helpers uninlined; sustained
+# terminal output can then spend an entire core recomputing layout. Keep local
+# crates cheap to compile while optimizing third-party layout/rendering code.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

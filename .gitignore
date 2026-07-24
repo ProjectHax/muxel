@@ -6,6 +6,10 @@
 # muxel runtime data written during local dev
 /.muxel-dev/
 
+# local performance captures and derived analysis; never publish trace data
+/.muxel-local/
+/.perf-analysis/
+
 # local-only dev config (per-developer; not part of the public repo)
 /.claude/
 /.githooks/
