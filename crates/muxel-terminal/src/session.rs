@@ -592,13 +592,13 @@ impl TerminalSession {
         )
     }
 
-    /// Peek damage without clearing (tests).
-    #[cfg(test)]
+    /// Peek damage without clearing (tests). Unix-only with its caller module.
+    #[cfg(all(test, unix))]
     pub(crate) fn pending_damage_for_test(&self) -> ContentDamage {
         self.pending_damage.lock().clone()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn clear_pending_damage_for_test(&self) {
         *self.pending_damage.lock() = ContentDamage::Partial(Vec::new());
         // Don't touch content_gen — tests only care about damage merge.
@@ -1590,16 +1590,18 @@ fn read_loop(
     }
 }
 
-#[cfg(test)]
+// Real-PTY tests are Unix-only, like the `tests` module below. A Windows
+// fixture that exits on the first keystroke (`cmd.exe /C "pause"`) deadlocks
+// the suite: once the child is gone, further writes to the ConPTY never
+// return, so `stream_then_type_stress` hung until the 6 h CI timeout. The
+// pure paint-priority logic is covered cross-platform in `view.rs` tests.
+#[cfg(all(test, unix))]
 mod content_damage_tests {
     use super::{CommandSpec, ContentDamage, TerminalSession};
     use std::time::{Duration, Instant};
 
     fn spawn_quiet() -> std::sync::Arc<TerminalSession> {
-        #[cfg(unix)]
         let spec = CommandSpec::program("/bin/cat", vec![]);
-        #[cfg(windows)]
-        let spec = CommandSpec::program("cmd.exe", vec!["/C".into(), "pause >nul".into()]);
         TerminalSession::spawn(spec, 80, 24).expect("spawn").0
     }
 
