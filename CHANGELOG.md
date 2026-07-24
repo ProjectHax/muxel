@@ -9,7 +9,7 @@ All notable changes to muxel are documented here. This project adheres to
 - **Type-while-stream no longer thrash-paints the focused terminal** — paste into
   a busy agent and steer in the same pane used to schedule a full terminal paint
   on every PTY batch. Muxel now uses alacritty grid damage for partial draw-list
-  rebuilds and a paint-priority policy: user echo (~8 ms cadence) beats stream
+  rebuilds and a paint-priority policy: recent-input response (~8 ms cadence) beats stream
   frames (~30 Hz focused, ~10 Hz background). See
   `docs/terminal-paint-architecture.md`.
 

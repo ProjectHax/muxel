@@ -271,9 +271,11 @@ pub struct TerminalSession {
     paint_list: Mutex<Option<PaintDrawList>>,
     /// Accumulated grid damage since the last paint (from alacritty `TermDamage`).
     pending_damage: Mutex<ContentDamage>,
-    /// Set by [`Self::write_input`]; next [`Self::process_output`] is treated as
-    /// high-priority echo for paint scheduling (type-while-stream).
-    expect_echo: AtomicBool,
+    /// Deadline through which PTY output is treated as an interactive response
+    /// to recent input. A TUI usually redraws rather than literally echoing the
+    /// typed byte, so correlating one input with the next output batch is wrong
+    /// when agent output is already queued.
+    interactive_until: Mutex<Option<Instant>>,
     _reader: JoinHandle<()>,
 }
 
@@ -523,7 +525,7 @@ impl TerminalSession {
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
-            expect_echo: AtomicBool::new(false),
+            interactive_until: Mutex::new(None),
             _reader: reader_handle,
         });
 
@@ -533,7 +535,7 @@ impl TerminalSession {
     /// Feed PTY output through the VTE parser into the terminal grid.
     ///
     /// Collects alacritty damage for the next paint (partial row rebuild) and
-    /// for paint-priority scheduling (echo vs stream).
+    /// for paint-priority scheduling (recent interaction vs stream).
     pub(crate) fn process_output(&self, data: &[u8]) {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
@@ -602,14 +604,19 @@ impl TerminalSession {
         // Don't touch content_gen — tests only care about damage merge.
     }
 
-    /// Next PTY output batch should be scheduled as high-priority user echo.
-    pub(crate) fn mark_expect_echo(&self) {
-        self.expect_echo.store(true, Ordering::Release);
+    /// Keep terminal output responsive briefly after user input. This is an
+    /// interaction window, not echo detection: full-screen TUIs redraw in
+    /// response to keys and streaming output may already be queued.
+    fn mark_interactive(&self) {
+        const INTERACTION_WINDOW: Duration = Duration::from_millis(75);
+        *self.interactive_until.lock() = Some(Instant::now() + INTERACTION_WINDOW);
     }
 
-    /// Consume the expect-echo flag (paint scheduler).
-    pub(crate) fn take_expect_echo(&self) -> bool {
-        self.expect_echo.swap(false, Ordering::AcqRel)
+    /// Whether output should use the interactive paint cadence.
+    pub(crate) fn is_interactive(&self) -> bool {
+        self.interactive_until
+            .lock()
+            .is_some_and(|deadline| Instant::now() < deadline)
     }
 
     /// Current content generation — advances on any grid/selection/scroll/search
@@ -676,9 +683,9 @@ impl TerminalSession {
             }
         }
         if !data.is_empty() {
-            // Echo (or TUI reaction) will follow; paint scheduler prioritizes it
-            // over background stream frames in the same pane.
-            self.mark_expect_echo();
+            // A TUI reaction will follow; prioritize output during this short
+            // interaction window even if stream output is already queued.
+            self.mark_interactive();
         }
         self.write_raw(data);
     }
@@ -1586,32 +1593,28 @@ fn read_loop(
 #[cfg(test)]
 mod content_damage_tests {
     use super::{CommandSpec, ContentDamage, TerminalSession};
+    use std::time::{Duration, Instant};
 
     fn spawn_quiet() -> std::sync::Arc<TerminalSession> {
         #[cfg(unix)]
         let spec = CommandSpec::program("/bin/cat", vec![]);
         #[cfg(windows)]
-        let spec = CommandSpec::program(
-            "cmd.exe",
-            vec!["/C".into(), "pause >nul".into()],
-        );
+        let spec = CommandSpec::program("cmd.exe", vec!["/C".into(), "pause >nul".into()]);
         TerminalSession::spawn(spec, 80, 24).expect("spawn").0
     }
 
-    /// Printable input leaves Full or Partial damage; expect_echo is independent.
+    /// Printable output records damage; interaction priority survives queued
+    /// stream batches until its deadline.
     #[test]
-    fn process_output_records_damage_and_expect_echo() {
+    fn process_output_records_damage_during_interaction() {
         let session = spawn_quiet();
         let _ = session.take_pending_damage();
         session.clear_pending_damage_for_test();
 
-        session.mark_expect_echo();
-        assert!(session.take_expect_echo());
-        assert!(!session.take_expect_echo());
-
-        session.mark_expect_echo();
+        session.write_input(b"x");
+        assert!(session.is_interactive());
         session.process_output(b"hello");
-        assert!(session.take_expect_echo());
+        assert!(session.is_interactive());
 
         match session.pending_damage_for_test() {
             ContentDamage::Full => {}
@@ -1620,6 +1623,39 @@ mod content_damage_tests {
                 assert!(lines.iter().all(|&l| (0..24).contains(&l)));
             }
         }
+        session.kill();
+    }
+
+    /// Stream + type: output batches do not consume recent-input priority.
+    #[test]
+    fn stream_then_type_stress() {
+        let session = spawn_quiet();
+        let _ = session.take_pending_damage();
+        session.clear_pending_damage_for_test();
+
+        // Agent stream: big ANSI-ish dumps outside an interaction window.
+        let chunk = b"\x1b[32mline of agent output that is fairly long\x1b[0m\r\n".repeat(40);
+        for _ in 0..20 {
+            session.process_output(&chunk);
+            assert!(!session.is_interactive());
+        }
+        // Damage should be Full or a non-empty Partial after scroll/stream.
+        match session.take_pending_damage() {
+            ContentDamage::Full => {}
+            ContentDamage::Partial(lines) => assert!(!lines.is_empty()),
+        }
+
+        // Every nearby output batch remains interactive instead of the first
+        // queued stream batch consuming a one-shot flag.
+        for _ in 0..30 {
+            session.write_input(b"x");
+            session.process_output(b"x");
+            assert!(session.is_interactive());
+            session.process_output(&chunk[..200.min(chunk.len())]);
+            assert!(session.is_interactive());
+        }
+        *session.interactive_until.lock() = Some(Instant::now() - Duration::from_millis(1));
+        assert!(!session.is_interactive());
         session.kill();
     }
 }

@@ -75,13 +75,15 @@ Replace “focused ⇒ notify every batch” with:
 
 | Reason | When | Min interval (focused) | Unfocused |
 |--------|------|------------------------|-----------|
-| **UserEcho** | `write_input` set `expect_echo`; next `process_output` consumes it | **8 ms** (~120 Hz cap) | same as stream bg |
-| **Stream** | PTY output without pending echo | **33 ms** (~30 Hz) | **100 ms** (status) |
+| **Interaction** | PTY output within 75 ms after `write_input` | **8 ms** (~120 Hz cap) | same as stream bg |
+| **Stream** | PTY output outside the recent-input window | **33 ms** (~30 Hz) | **100 ms** (status) |
 | **Structure** | resize, selection, search, scroll-from-UI | immediate | immediate |
 | **Exit** | process exit | immediate | immediate |
 
-`write_input` always arms `expect_echo`. Multi-key before echo keeps the flag set
-so key feedback stays high-priority when the agent is also streaming.
+`write_input` extends a 75 ms interaction window. This does not claim to detect
+literal echo: full-screen TUIs redraw after input, and older stream output can
+already be queued ahead of that response. Every throttled update also schedules
+one trailing-edge paint, so the final batch cannot remain stale after output stops.
 
 No per-paste special cases: large stream without echo naturally uses Stream 30 Hz.
 
@@ -132,7 +134,7 @@ Existing `MUXEL_PROFILE=1` / `MUXEL_PROFILE_TERMINAL=1`. Extend term-prof lines 
 enabled with:
 
 - `dmg=full|partial:N` for last batch
-- `reason=echo|stream|structure` for last notify
+- `reason=interaction|stream|structure` for last notify
 
 No always-on logging.
 

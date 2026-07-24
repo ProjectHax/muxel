@@ -592,14 +592,10 @@ fn patch_draw_list(
     list.sel_rects.extend(patch.sel_rects);
     list.search_rects.extend(patch.search_rects);
     // Stable paint order: top-to-bottom, left-to-right.
-    list.runs
-        .sort_by_key(|a| (a.start_line, a.start_col));
-    list.bg_rects
-        .sort_by_key(|a| (a.line, a.start_col));
-    list.sel_rects
-        .sort_by_key(|a| (a.line, a.start_col));
-    list.search_rects
-        .sort_by_key(|a| (a.line, a.start_col));
+    list.runs.sort_by_key(|a| (a.start_line, a.start_col));
+    list.bg_rects.sort_by_key(|a| (a.line, a.start_col));
+    list.sel_rects.sort_by_key(|a| (a.line, a.start_col));
+    list.search_rects.sort_by_key(|a| (a.line, a.start_col));
     list
 }
 

@@ -20,12 +20,49 @@ const MAX_BYTES_PER_TURN: usize = 256 * 1024;
 /// Unfocused terminals: status badges only need a slow warm grid.
 const BACKGROUND_PAINT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Focused **stream** (agent output without a pending key-echo): ~30 Hz.
+/// Focused stream output outside the recent-input window: ~30 Hz.
 /// Typing-while-Claude-streams used to notify every batch (~full submit thrash).
 const FOCUSED_STREAM_INTERVAL: Duration = Duration::from_millis(33);
 
-/// Focused **user echo** (PTY output after `write_input`): keep key feedback crisp.
-const FOCUSED_ECHO_INTERVAL: Duration = Duration::from_millis(8);
+/// Focused output shortly after user input: keep TUI feedback crisp.
+const FOCUSED_INTERACTION_INTERVAL: Duration = Duration::from_millis(8);
+
+/// Pure paint-priority policy (see `docs/terminal-paint-architecture.md`).
+/// Extracted so we can unit-test without a full GPUI window.
+pub(crate) fn paint_min_interval(focused: bool, interactive: bool, stop: bool) -> Duration {
+    if stop {
+        Duration::ZERO
+    } else if !focused {
+        BACKGROUND_PAINT_INTERVAL
+    } else if interactive {
+        FOCUSED_INTERACTION_INTERVAL
+    } else {
+        FOCUSED_STREAM_INTERVAL
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintSchedule {
+    Now,
+    At(Instant),
+    KeepPending,
+}
+
+fn next_paint_schedule(
+    last_notify: Instant,
+    pending: Option<Instant>,
+    now: Instant,
+    min_interval: Duration,
+) -> PaintSchedule {
+    let deadline = last_notify + min_interval;
+    if now >= deadline {
+        PaintSchedule::Now
+    } else if pending.is_some_and(|pending| pending <= deadline) {
+        PaintSchedule::KeepPending
+    } else {
+        PaintSchedule::At(deadline)
+    }
+}
 
 /// A small margin between the terminal grid and the pane edge. The grid (and so
 /// the reported size) is computed from the inset area, giving a TUI that renders
@@ -210,6 +247,11 @@ pub struct TerminalView {
     done_latch: std::cell::Cell<bool>,
     /// Last time we `cx.notify()`'d a paint from the drain loop (background throttle).
     last_paint_notify: std::cell::Cell<std::time::Instant>,
+    /// A throttled batch must still paint if output stops before the next batch.
+    /// The generation invalidates an older, later timer when interactive output
+    /// brings the deadline forward.
+    pending_paint_deadline: std::cell::Cell<Option<std::time::Instant>>,
+    paint_timer_generation: std::cell::Cell<u64>,
     /// Cached agent status for the current session content generation.
     status_cache: std::cell::Cell<Option<(u64, AgentStatus)>>,
     _drain: Task<()>,
@@ -283,6 +325,49 @@ impl TerminalLaunch {
 }
 
 impl TerminalView {
+    /// Notify now or arm one trailing-edge notify. A leading-edge throttle alone
+    /// can leave the final output batch stale forever when output stops inside
+    /// the interval.
+    fn schedule_paint(&mut self, min_interval: Duration, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let deadline = match next_paint_schedule(
+            self.last_paint_notify.get(),
+            self.pending_paint_deadline.get(),
+            now,
+            min_interval,
+        ) {
+            PaintSchedule::Now => {
+                self.pending_paint_deadline.set(None);
+                self.paint_timer_generation
+                    .set(self.paint_timer_generation.get().wrapping_add(1));
+                self.last_paint_notify.set(now);
+                cx.notify();
+                profile::notify_scheduled();
+                return;
+            }
+            PaintSchedule::KeepPending => return,
+            PaintSchedule::At(deadline) => deadline,
+        };
+
+        self.pending_paint_deadline.set(Some(deadline));
+        let generation = self.paint_timer_generation.get().wrapping_add(1);
+        self.paint_timer_generation.set(generation);
+        let delay = deadline.saturating_duration_since(now);
+        cx.spawn(async move |view: WeakEntity<Self>, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = view.update(cx, |view, cx| {
+                if view.paint_timer_generation.get() != generation {
+                    return;
+                }
+                view.pending_paint_deadline.set(None);
+                view.last_paint_notify.set(Instant::now());
+                cx.notify();
+                profile::notify_scheduled();
+            });
+        })
+        .detach();
+    }
+
     /// Wrap a spawned terminal in a view and wire up its output drain.
     pub fn new(launch: TerminalLaunch, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let TerminalLaunch {
@@ -407,7 +492,7 @@ impl TerminalView {
                 coalesce_pending(&rx, &mut output, &mut exit);
 
                 // Coalesce before taking the UI lock: bg agents always; focused
-                // stream bursts too (echo priority is decided after process_output).
+                // stream bursts too (interaction priority is decided after parsing).
                 let focused_hint = session.is_focused();
                 if exit.is_none() && output.len() < MAX_BYTES_PER_TURN {
                     let wait = if !focused_hint {
@@ -427,13 +512,9 @@ impl TerminalView {
                 let stop = view
                     .update(cx, |view, cx| {
                         let focused = view.session.is_focused();
-                        // Echo flag is set by write_input; consume after parse so
-                        // this batch schedules as UserEcho, not Stream.
-                        let mut echo = false;
                         if !output.is_empty() {
                             let t0 = Instant::now();
                             view.session.process_output(&output);
-                            echo = view.session.take_expect_echo();
                             profile::process_output(batch_len, t0.elapsed(), focused);
                             if focused && profile::is_enabled() {
                                 let (col, row, text) = view.session.cursor_probe();
@@ -451,24 +532,11 @@ impl TerminalView {
                             view.exit_read_error = info.read_error;
                         }
                         // Priority scheduler (see docs/terminal-paint-architecture.md):
-                        // UserEcho ≫ Stream; never "focused ⇒ every batch".
-                        let now = Instant::now();
-                        let min_interval = if stop {
-                            Duration::ZERO
-                        } else if !focused {
-                            BACKGROUND_PAINT_INTERVAL
-                        } else if echo {
-                            FOCUSED_ECHO_INTERVAL
-                        } else {
-                            FOCUSED_STREAM_INTERVAL
-                        };
-                        let due = stop
-                            || now.duration_since(view.last_paint_notify.get()) >= min_interval;
-                        if due {
-                            view.last_paint_notify.set(now);
-                            cx.notify();
-                            profile::notify_scheduled();
-                        }
+                        // Recent input ≫ stream; every throttled batch gets one
+                        // trailing-edge notify if no later output arrives.
+                        let interactive = view.session.is_interactive();
+                        let min_interval = paint_min_interval(focused, interactive, stop);
+                        view.schedule_paint(min_interval, cx);
                         stop
                     })
                     .unwrap_or(true);
@@ -495,6 +563,8 @@ impl TerminalView {
             prev_raw: std::cell::Cell::new(None),
             done_latch: std::cell::Cell::new(false),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
+            pending_paint_deadline: std::cell::Cell::new(None),
+            paint_timer_generation: std::cell::Cell::new(0),
             status_cache: std::cell::Cell::new(None),
             _drain: drain,
         }
@@ -853,7 +923,11 @@ mod launch_tests {
 mod tests {
     // Import specifically (not `super::*`) so `#[test]` resolves to the built-in
     // macro, not gpui's glob-imported `test` attribute.
-    use super::{AgentStatus, TerminalMouseMode, classify, latch_done};
+    use super::{
+        AgentStatus, BACKGROUND_PAINT_INTERVAL, FOCUSED_INTERACTION_INTERVAL,
+        FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, classify, latch_done,
+        next_paint_schedule, paint_min_interval,
+    };
     use std::time::Duration;
 
     fn m(s: &[&str]) -> Vec<String> {
@@ -974,5 +1048,52 @@ mod tests {
         assert_eq!(latch_done(Some(Idle), Idle, true, false), (Idle, false));
         // The bell/exit `Done` still passes straight through (precise signals).
         assert_eq!(latch_done(Some(Working), Done, false, false), (Done, false));
+    }
+
+    #[test]
+    fn paint_priority_interaction_beats_stream() {
+        assert_eq!(
+            paint_min_interval(true, true, false),
+            FOCUSED_INTERACTION_INTERVAL
+        );
+        assert_eq!(
+            paint_min_interval(true, false, false),
+            FOCUSED_STREAM_INTERVAL
+        );
+        assert_eq!(
+            paint_min_interval(false, false, false),
+            BACKGROUND_PAINT_INTERVAL
+        );
+        assert_eq!(
+            paint_min_interval(false, true, false),
+            BACKGROUND_PAINT_INTERVAL
+        );
+        assert_eq!(paint_min_interval(true, false, true), Duration::ZERO);
+        assert!(FOCUSED_INTERACTION_INTERVAL < FOCUSED_STREAM_INTERVAL);
+        assert!(FOCUSED_STREAM_INTERVAL < BACKGROUND_PAINT_INTERVAL);
+    }
+
+    #[test]
+    fn throttled_paint_gets_one_trailing_deadline() {
+        let last = std::time::Instant::now();
+        let now = last + Duration::from_millis(10);
+        let deadline = last + FOCUSED_STREAM_INTERVAL;
+        assert_eq!(
+            next_paint_schedule(last, None, now, FOCUSED_STREAM_INTERVAL),
+            PaintSchedule::At(deadline)
+        );
+        assert_eq!(
+            next_paint_schedule(
+                last,
+                Some(deadline),
+                now + Duration::from_millis(1),
+                FOCUSED_STREAM_INTERVAL,
+            ),
+            PaintSchedule::KeepPending
+        );
+        assert_eq!(
+            next_paint_schedule(last, Some(deadline), deadline, FOCUSED_STREAM_INTERVAL),
+            PaintSchedule::Now
+        );
     }
 }
