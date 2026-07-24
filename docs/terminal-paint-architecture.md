@@ -2,6 +2,7 @@
 
 Status: **implemented (damage + priority scheduler); local echo deferred (settings later)**  
 Related: `docs/terminal-paint-under-load.md` (Windows present pump / multi-agent freezes)
+Follow-up experiments: `docs/terminal-performance-next-steps.md`
 
 ## Problem (validated 2026-07-23)
 
