@@ -1,6 +1,7 @@
 //! Opt-in main-thread timing for key → PTY → paint under load.
 //!
-//! Enable with `MUXEL_PROFILE_TERMINAL=1` (or `true` / `yes`). Stats dump to
+//! Enable with `MUXEL_PROFILE=1` or `MUXEL_PROFILE_TERMINAL=1` (or `true` /
+//! `yes`). Stats dump to
 //! stderr **and** a log file every ~500 ms while events are flowing, and a
 //! final line after 1 s of quiet (e.g. after you release a held key).
 //!
@@ -19,11 +20,12 @@
 //! ```
 //! Hold a key in a terminal; open the log file (no paste needed).
 //!
-//! Lines are `term-prof[v5 …]` and include paint phase splits
+//! Lines are `term-prof[v6 …]` and include paint phase splits
 //! (`build=` / `shape=` / `submit=` / `runs=` / `reuse=`) plus felt-latency
-//! samples: `key→echo` (keypress until the focused pane's PTY echo is parsed —
-//! high here = ConPTY/agent/scheduling, not paint) and `echo→paint` (parsed
-//! echo until the focused pane finishes painting — high here = muxel).
+//! samples: `key→pty-output` (keypress until matching focused-pane PTY output
+//! is parsed — high here = ConPTY/agent/scheduling, not paint) and
+//! `pty-output→paint` (parsed output until the focused pane finishes painting
+//! — high here = muxel).
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -58,12 +60,16 @@ pub fn screen_probe_update(col: usize, row: i32, text: String) {
 
 fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
-        std::env::var("MUXEL_PROFILE_TERMINAL")
-            .map(|v| {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        ["MUXEL_PROFILE", "MUXEL_PROFILE_TERMINAL"]
+            .into_iter()
+            .any(|name| {
+                std::env::var(name)
+                    .map(|v| {
+                        let v = v.trim();
+                        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+                    })
+                    .unwrap_or(false)
             })
-            .unwrap_or(false)
     })
 }
 
@@ -363,9 +369,10 @@ fn dump(tag: &str) {
     let echo_avg = echo_us.checked_div(echo_n).unwrap_or(0);
     let plat_avg = plat_us.checked_div(plat_n).unwrap_or(0);
 
-    // v5: v4 + felt latency (key→echo = ConPTY/agent side, echo→paint = ours).
+    // v6: name the measured boundaries instead of calling arbitrary PTY output
+    // "echo" (full-screen TUIs often redraw instead of echoing).
     let line = format!(
-        "term-prof[v5 {tag}] Δ={win_ms}ms keys={keys} (held={keys_held}, ~{key_hz}/s, avg={key_avg}µs) \
+        "term-prof[v6 {tag}] Δ={win_ms}ms keys={keys} (held={keys_held}, ~{key_hz}/s, avg={key_avg}µs) \
          notify={notify} (~{notify_hz}/s) \
          process={batches} batches/{bytes}B avg={proc_avg}µs max={process_max}µs \
          paint={paints} (focus={paints_f} bg={paints_bg} full={paint_full} replay={paint_replay}, ~{paint_hz}/s) \
@@ -373,8 +380,8 @@ fn dump(tag: &str) {
          spikes(>3ms={spikes_3} >8ms={spikes_8}) \
          full-phases: build_avg={build_avg}µs shape_avg={shape_avg}µs submit_avg={submit_avg}µs \
          runs={runs_total} reuse={runs_reused} ({reuse_pct}%) \
-         lat: key→echo avg={echo_avg}µs max={echo_max}µs (n={echo_n}) \
-         echo→paint avg={plat_avg}µs max={plat_max}µs (n={plat_n}) \
+         lat: key→pty-output avg={echo_avg}µs max={echo_max}µs (n={echo_n}) \
+         pty-output→paint avg={plat_avg}µs max={plat_max}µs (n={plat_n}) \
          sync_exp={sync_exp}"
     );
     // Focused-pane grid probe: proves whether typed chars reached the grid.
@@ -431,8 +438,8 @@ pub fn process_output(bytes: usize, elapsed: Duration, focused: bool) {
     let us = elapsed.as_micros() as u64;
     c.process_us.fetch_add(us, Ordering::Relaxed);
     c.process_max_us.fetch_max(us, Ordering::Relaxed);
-    // Focused-pane echo: close the key→echo sample and arm echo→paint. Only the
-    // focused pane — a background agent's stream must not answer for a keypress.
+    // Focused-pane output: close key→PTY-output and arm PTY-output→paint. Only
+    // the focused pane — background output must not answer for a keypress.
     if focused && bytes > 0 {
         let t0 = c.pending_echo.swap(0, Ordering::Relaxed);
         record_latency(t0, &c.echo_lat_us, &c.echo_lat_max, &c.echo_lat_n);

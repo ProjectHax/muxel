@@ -27,6 +27,94 @@ use gpui::*;
 use gpui_component::{Root, TitleBar, *};
 use std::borrow::Cow;
 
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+/// Name the Windows UI thread for ETW and emit enough identity to reject stale
+/// profiler logs. Priority changes remain an explicit A/B experiment.
+#[cfg(target_os = "windows")]
+fn configure_ui_thread_profiling() {
+    use std::io::Write;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, GetThreadPriority,
+        SetThreadDescription, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    use windows::core::PCWSTR;
+
+    let thread = unsafe { GetCurrentThread() };
+    let description: Vec<u16> = "muxel-ui\0".encode_utf16().collect();
+    if let Err(error) = unsafe { SetThreadDescription(thread, PCWSTR(description.as_ptr())) } {
+        log::warn!("profiler: could not name UI thread: {error}");
+    }
+
+    let priority_requested = std::env::var("MUXEL_UI_PRIORITY").unwrap_or_default();
+    let priority_result = if priority_requested.eq_ignore_ascii_case("above-normal") {
+        match unsafe { SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL) } {
+            Ok(()) => "applied",
+            Err(error) => {
+                log::warn!("profiler: could not raise UI thread priority: {error}");
+                "failed"
+            }
+        }
+    } else {
+        "not-requested"
+    };
+
+    if !env_enabled("MUXEL_PROFILE") {
+        return;
+    }
+
+    let profiler_started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let executable = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let build_profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let build_commit = option_env!("MUXEL_BUILD_COMMIT").unwrap_or("unknown");
+    let pid = unsafe { GetCurrentProcessId() };
+    let tid = unsafe { GetCurrentThreadId() };
+    let priority = unsafe { GetThreadPriority(thread) };
+    let record = format!(
+        "ui-prof[v2 startup] pid={pid} ui_tid={tid} profiler_start_unix_ms={profiler_started} \
+         exe={executable:?} build_profile={build_profile} commit={build_commit} \
+         priority={priority} priority_request={priority_requested:?} \
+         priority_result={priority_result}"
+    );
+
+    eprintln!("{record}");
+    let path = std::env::var_os("MUXEL_UI_PROFILE_LOG")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(std::path::PathBuf::from)
+                .map(|path| path.join("ui-prof.log"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("ui-prof.log"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::File::create(&path) {
+        Ok(mut file) => {
+            if let Err(error) = writeln!(file, "{record}") {
+                log::warn!("profiler: could not write {}: {error}", path.display());
+            }
+        }
+        Err(error) => log::warn!("profiler: could not create {}: {error}", path.display()),
+    }
+}
+
 /// muxel's own bundled SVG assets: agent logos under `icons/agent-*.svg`, plus
 /// the app icon `muxel.svg` (shown in the welcome dialog).
 #[derive(rust_embed::RustEmbed)]
@@ -290,6 +378,9 @@ fn main() {
     // Force gpui to present under sustained input on Windows (see the fn). Spawns a
     // watchdog thread, so — like the reap above — it must come AFTER every `set_var`
     // block: `set_var` is only sound while the process is single-threaded.
+    #[cfg(target_os = "windows")]
+    configure_ui_thread_profiling();
+
     #[cfg(target_os = "windows")]
     spawn_present_pump();
 
