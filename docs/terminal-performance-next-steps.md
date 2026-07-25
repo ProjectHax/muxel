@@ -98,19 +98,19 @@ only with recorded evidence.
 Input-to-grid depends on the child. Report it, but do not assign it to muxel
 unless a deterministic child shows the same regression.
 
-## Fix the profiler before changing architecture
+## Profiler boundary names
 
-The current `term-prof[v5]` names two samples too strongly:
+`term-prof[v6]` names the observed boundaries without claiming that arbitrary
+PTY output is a literal echo:
 
-- `key→echo` closes on the next focused PTY batch. During streaming, that batch
-  may predate the key. Rename it `key→next-output`.
-- `echo→paint` starts at that same arbitrary batch. Rename it
-  `output→paint`.
+- `key→pty-output` closes on the next focused PTY batch. During streaming, that
+  batch may predate the key.
+- `pty-output→paint` starts at that same arbitrary batch.
 
 Those samples remain useful as upper-level symptoms. They do not identify the
 slow stage.
 
-### Add a v6 event path
+### Add a future sequenced event path
 
 Give each processed output batch a sequence number and timestamps for:
 

@@ -70,18 +70,29 @@ notifies during sustained typing hits it).
   Never observed to fire in practice (`sync_exp=0` throughout) — this is
   latent-bug hardening, not one of the root causes.
 
-## Diagnostics (opt-in, `MUXEL_PROFILE_TERMINAL=1`)
+## Diagnostics (opt-in, `MUXEL_PROFILE=1`)
 
 `crates/muxel-terminal/src/profile.rs` logs 500ms interval stats to
-`term-prof.log`. Run any build with `MUXEL_PROFILE_TERMINAL=1`; set
+`term-prof.log`. Run any build with `MUXEL_PROFILE=1` (or the narrower
+`MUXEL_PROFILE_TERMINAL=1`); set
 `MUXEL_PROFILE_LOG` for the log path and `XDG_CONFIG_HOME`/`XDG_DATA_HOME`
 to sandbox away from the real workspace. Logged: key/notify/process/paint
 rates, paint phase splits
-(build/shape/submit) with shape-reuse %, felt-latency samples (`key→echo` =
-agent+ConPTY side, `echo→paint` = muxel side), sync-expiry count, and a
+(build/shape/submit) with shape-reuse %, felt-latency samples
+(`key→pty-output` = agent+ConPTY side, `pty-output→paint` = muxel side),
+sync-expiry count, and a
 focused-pane cursor-row probe that shows whether typed bytes reached the grid.
 `env_logger` is initialized at `warn` so gpui render errors (present failures,
 device loss) are visible on stderr.
+
+On Windows, the umbrella flag also writes `ui-prof[v3]` startup provenance
+from GPUI's actual application callback. The record includes PID, UI TID,
+executable, build commit, dirty state, build profile, and thread priority.
+Default logs are run-unique under `XDG_DATA_HOME`; set
+`MUXEL_UI_PROFILE_LOG` only when a capture harness requires a stable path.
+
+`MUXEL_UI_PRIORITY=above-normal` is an A/B experiment, not a default. It is
+accepted only with `MUXEL_PROFILE=1` and applies only to the GPUI UI thread.
 
 ## Ruled out on the way (kept for the next archaeologist)
 

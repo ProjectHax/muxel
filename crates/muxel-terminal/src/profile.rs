@@ -412,8 +412,8 @@ pub fn key_handled(held: bool, elapsed: Duration) {
     }
     c.key_us
         .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
-    // Arm the key→echo latency sample with the FIRST unanswered key (a later
-    // key must not shrink an in-flight measurement).
+    // Arm key→PTY-output with the FIRST unanswered key (a later key must not
+    // shrink an in-flight measurement).
     let _ = c
         .pending_echo
         .compare_exchange(0, now_us(), Ordering::Relaxed, Ordering::Relaxed);

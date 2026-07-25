@@ -27,19 +27,67 @@ use gpui::*;
 use gpui_component::{Root, TitleBar, *};
 use std::borrow::Cow;
 
-fn env_enabled(name: &str) -> bool {
-    std::env::var(name)
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct UiProfileConfig {
+    enabled: bool,
+    profiler_started_unix_ms: u128,
+    log_path: Option<std::path::PathBuf>,
+    priority_request: Option<String>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn value_enabled(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
         .map(|value| {
-            let value = value.trim();
             value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
         })
         .unwrap_or(false)
 }
 
-/// Name the Windows UI thread for ETW and emit enough identity to reject stale
-/// profiler logs. Priority changes remain an explicit A/B experiment.
 #[cfg(target_os = "windows")]
-fn configure_ui_thread_profiling() {
+fn env_enabled(name: &str) -> bool {
+    value_enabled(std::env::var(name).ok().as_deref())
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_ui_thread_profiling() -> UiProfileConfig {
+    let enabled = env_enabled("MUXEL_PROFILE");
+    let profiler_started_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let pid = std::process::id();
+    let log_path = enabled.then(|| {
+        std::env::var_os("MUXEL_UI_PROFILE_LOG")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_DATA_HOME")
+                    .map(std::path::PathBuf::from)
+                    .map(|path| path.join(format!("ui-prof-{pid}-{profiler_started_unix_ms}.log")))
+            })
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(format!("ui-prof-{pid}-{profiler_started_unix_ms}.log"))
+            })
+    });
+    let priority_request = std::env::var("MUXEL_UI_PRIORITY")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    UiProfileConfig {
+        enabled,
+        profiler_started_unix_ms,
+        log_path,
+        priority_request,
+    }
+}
+
+/// Run inside GPUI's application callback so this names and records the thread
+/// that actually dispatches UI work, not an assumed bootstrap thread.
+#[cfg(target_os = "windows")]
+fn activate_ui_thread_profiling(config: &UiProfileConfig) {
     use std::io::Write;
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, GetThreadPriority,
@@ -53,27 +101,31 @@ fn configure_ui_thread_profiling() {
         log::warn!("profiler: could not name UI thread: {error}");
     }
 
-    let priority_requested = std::env::var("MUXEL_UI_PRIORITY").unwrap_or_default();
-    let priority_result = if priority_requested.eq_ignore_ascii_case("above-normal") {
-        match unsafe { SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL) } {
-            Ok(()) => "applied",
-            Err(error) => {
-                log::warn!("profiler: could not raise UI thread priority: {error}");
-                "failed"
+    let priority_result = match config.priority_request.as_deref() {
+        Some("above-normal") if config.enabled => {
+            match unsafe { SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL) } {
+                Ok(()) => "applied",
+                Err(error) => {
+                    log::warn!("profiler: could not raise UI thread priority: {error}");
+                    "failed"
+                }
             }
         }
-    } else {
-        "not-requested"
+        Some("above-normal") => {
+            log::warn!("MUXEL_UI_PRIORITY requires MUXEL_PROFILE=1; ignoring priority request");
+            "profiling-required"
+        }
+        Some(value) => {
+            log::warn!("unknown MUXEL_UI_PRIORITY={value:?}; ignoring priority request");
+            "invalid"
+        }
+        None => "not-requested",
     };
 
-    if !env_enabled("MUXEL_PROFILE") {
+    if !config.enabled {
         return;
     }
 
-    let profiler_started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
     let executable = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
@@ -82,28 +134,37 @@ fn configure_ui_thread_profiling() {
     } else {
         "release"
     };
-    let build_commit = option_env!("MUXEL_BUILD_COMMIT").unwrap_or("unknown");
+    let build_commit = env!("MUXEL_BUILD_COMMIT");
+    let build_dirty = env!("MUXEL_BUILD_DIRTY");
     let pid = unsafe { GetCurrentProcessId() };
     let tid = unsafe { GetCurrentThreadId() };
     let priority = unsafe { GetThreadPriority(thread) };
+    let priority = if priority == i32::MAX {
+        "error".to_string()
+    } else {
+        priority.to_string()
+    };
     let record = format!(
-        "ui-prof[v2 startup] pid={pid} ui_tid={tid} profiler_start_unix_ms={profiler_started} \
+        "ui-prof[v3 startup] pid={pid} ui_tid={tid} profiler_start_unix_ms={} \
          exe={executable:?} build_profile={build_profile} commit={build_commit} \
-         priority={priority} priority_request={priority_requested:?} \
-         priority_result={priority_result}"
+         dirty={build_dirty} priority={priority} priority_request={:?} \
+         priority_result={priority_result}",
+        config.profiler_started_unix_ms, config.priority_request
     );
 
     eprintln!("{record}");
-    let path = std::env::var_os("MUXEL_UI_PROFILE_LOG")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(std::path::PathBuf::from)
-                .map(|path| path.join("ui-prof.log"))
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("ui-prof.log"));
+    let Some(path) = config.log_path.as_ref() else {
+        log::error!("profiler: enabled without a UI profiler log path");
+        return;
+    };
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            log::error!(
+                "profiler: could not create UI profiler directory {}: {error}",
+                parent.display()
+            );
+            return;
+        }
     }
     match std::fs::File::create(&path) {
         Ok(mut file) => {
@@ -379,7 +440,7 @@ fn main() {
     // watchdog thread, so — like the reap above — it must come AFTER every `set_var`
     // block: `set_var` is only sound while the process is single-threaded.
     #[cfg(target_os = "windows")]
-    configure_ui_thread_profiling();
+    let ui_profile = prepare_ui_thread_profiling();
 
     #[cfg(target_os = "windows")]
     spawn_present_pump();
@@ -388,6 +449,9 @@ fn main() {
         // Serves muxel's agent icons + gpui-component's bundled SVG icons.
         .with_assets(AppAssets)
         .run(move |cx: &mut App| {
+            #[cfg(target_os = "windows")]
+            activate_ui_thread_profiling(&ui_profile);
+
             gpui_component::init(cx);
             theme::register_bundled_themes(cx);
             app::register_actions(cx);
@@ -441,4 +505,20 @@ fn main() {
             })
             .detach();
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::value_enabled;
+
+    #[test]
+    fn profiler_flags_accept_only_documented_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", " Yes "] {
+            assert!(value_enabled(Some(value)), "{value:?}");
+        }
+        for value in ["", "0", "false", "on", "enabled"] {
+            assert!(!value_enabled(Some(value)), "{value:?}");
+        }
+        assert!(!value_enabled(None));
+    }
 }

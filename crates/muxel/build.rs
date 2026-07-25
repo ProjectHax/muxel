@@ -1,4 +1,41 @@
+use std::process::Command;
+
+fn git_output(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn main() {
+    println!("cargo:rerun-if-env-changed=MUXEL_BUILD_COMMIT");
+    println!("cargo:rerun-if-env-changed=MUXEL_BUILD_DIRTY");
+
+    if let Some(git_dir) = git_output(&["rev-parse", "--git-dir"]) {
+        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+        println!("cargo:rerun-if-changed={git_dir}/index");
+    }
+
+    let commit = std::env::var("MUXEL_BUILD_COMMIT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| git_output(&["rev-parse", "--short=12", "HEAD"]))
+        .unwrap_or_else(|| "unknown".to_string());
+    let dirty = std::env::var("MUXEL_BUILD_DIRTY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            let clean = Command::new("git")
+                .args(["diff", "--quiet", "--ignore-submodules", "HEAD", "--"])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if clean { "0" } else { "1" }.to_string()
+        });
+    println!("cargo:rustc-env=MUXEL_BUILD_COMMIT={commit}");
+    println!("cargo:rustc-env=MUXEL_BUILD_DIRTY={dirty}");
+
     // Bump the Windows main-thread stack to 8 MiB. The MSVC linker defaults the
     // executable's stack reserve to 1 MiB, but GPUI's layout/paint recurse deep
     // enough — especially when rendering a full-screen agent TUI (e.g. Claude) —
