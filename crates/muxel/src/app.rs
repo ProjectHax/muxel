@@ -6938,23 +6938,26 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
         let pid = self.workspace.active_project?;
-        // Navigate a browser pane this project already has rather than stacking
-        // another one: ctrl+click means "show me this URL", and every extra pane
-        // is another native WebView2 child. A popped-out browser lives in its own
-        // window and isn't in `browsers`, so it never gets hijacked.
+        // Reuse and refresh only the exact resource. A different path, query, or
+        // fragment is a different tab; silently replacing the first browser in
+        // the project loses the page the user already opened.
         if let Some(iid) = self
             .workspace
             .project(pid)
             .map(|p| p.instances())
             .unwrap_or_default()
             .into_iter()
-            .find(|iid| self.browsers.contains_key(iid))
+            .find(|iid| {
+                self.browsers.contains_key(iid)
+                    && self
+                        .workspace
+                        .instance(*iid)
+                        .and_then(|instance| instance.browser_url.as_deref())
+                        .is_some_and(|existing| muxel_core::same_resource_url(existing, &url))
+            })
         {
             if let Some(view) = self.browsers.get(&iid).cloned() {
-                view.update(cx, |v, cx| v.navigate(&url, cx));
-            }
-            if let Some(inst) = self.workspace.instance_mut(iid) {
-                inst.browser_url = Some(url);
+                view.update(cx, |v, cx| v.reload(cx));
             }
             self.focus_instance(iid, window, cx);
             self.persist();
