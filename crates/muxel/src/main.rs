@@ -228,19 +228,3 @@ fn main() {
             .detach();
         });
 }
-
-#[cfg(test)]
-mod tests {
-    use super::value_enabled;
-
-    #[test]
-    fn profiler_flags_accept_only_documented_truthy_values() {
-        for value in ["1", "true", "TRUE", "yes", " Yes "] {
-            assert!(value_enabled(Some(value)), "{value:?}");
-        }
-        for value in ["", "0", "false", "on", "enabled"] {
-            assert!(!value_enabled(Some(value)), "{value:?}");
-        }
-        assert!(!value_enabled(None));
-    }
-}

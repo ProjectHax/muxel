@@ -60,12 +60,14 @@ static PROBE_TIMEOUT: AtomicU64 = AtomicU64::new(0);
 static PROBE_SENT_TICK: AtomicU64 = AtomicU64::new(0);
 
 fn env_truthy(key: &str) -> bool {
-    std::env::var(key)
-        .map(|v| {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-        })
-        .unwrap_or(false)
+    value_enabled(std::env::var(key).ok().as_deref())
+}
+
+fn value_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    })
 }
 
 fn umbrella_profile_enabled() -> bool {
@@ -240,6 +242,22 @@ fn working_set_bytes() -> Option<u64> {
     #[cfg(not(windows))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::value_enabled;
+
+    #[test]
+    fn profiler_flags_accept_only_documented_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", " Yes "] {
+            assert!(value_enabled(Some(value)), "{value:?}");
+        }
+        for value in ["", "0", "false", "on", "enabled"] {
+            assert!(!value_enabled(Some(value)), "{value:?}");
+        }
+        assert!(!value_enabled(None));
     }
 }
 
