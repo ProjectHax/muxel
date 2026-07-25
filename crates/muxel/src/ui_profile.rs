@@ -245,22 +245,6 @@ fn working_set_bytes() -> Option<u64> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::value_enabled;
-
-    #[test]
-    fn profiler_flags_accept_only_documented_truthy_values() {
-        for value in ["1", "true", "TRUE", "yes", " Yes "] {
-            assert!(value_enabled(Some(value)), "{value:?}");
-        }
-        for value in ["", "0", "false", "on", "enabled"] {
-            assert!(!value_enabled(Some(value)), "{value:?}");
-        }
-        assert!(!value_enabled(None));
-    }
-}
-
 fn dump_interval(tag: &str) {
     let n = PUMP_N.swap(0, Ordering::Relaxed);
     let us = PUMP_US.swap(0, Ordering::Relaxed);
@@ -519,4 +503,20 @@ pub fn probe_mark_sent(tick_ms: u64) {
 #[allow(dead_code)]
 pub fn probe_last_sent() -> u64 {
     PROBE_SENT_TICK.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::value_enabled;
+
+    #[test]
+    fn profiler_flags_accept_only_documented_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", " Yes "] {
+            assert!(value_enabled(Some(value)), "{value:?}");
+        }
+        for value in ["", "0", "false", "on", "enabled"] {
+            assert!(!value_enabled(Some(value)), "{value:?}");
+        }
+        assert!(!value_enabled(None));
+    }
 }
