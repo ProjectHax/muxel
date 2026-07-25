@@ -814,6 +814,74 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
     }
 }
 
+/// Keep Codex approval policy in restored panes aligned with its current preset.
+///
+/// Instances snapshot launch arguments when created. Without this repair, changing
+/// Codex from `-a never` to `-a on-request` only affects new panes; restored panes
+/// silently keep the old policy.
+pub fn sync_codex_approval_args(workspace: &mut Workspace, presets: &[AgentPreset]) -> bool {
+    let mut changed = false;
+    for instance in &mut workspace.instances {
+        if !instance
+            .program
+            .as_deref()
+            .is_some_and(|program| program.to_ascii_lowercase().contains("codex"))
+        {
+            continue;
+        }
+        let Some(preset) = instance
+            .preset_id
+            .and_then(|id| presets.iter().find(|preset| preset.id == id))
+            .or_else(|| presets.iter().find(|preset| preset.name == instance.preset))
+        else {
+            continue;
+        };
+        let Some(policy) = preset
+            .compose_args()
+            .windows(2)
+            .find(|pair| pair[0] == "-a" || pair[0] == "--ask-for-approval")
+            .map(|pair| pair[1].clone())
+        else {
+            continue;
+        };
+        if let Some(index) = instance
+            .args
+            .iter()
+            .position(|arg| arg == "-a" || arg == "--ask-for-approval")
+            .filter(|index| index + 1 < instance.args.len())
+            && instance.args[index + 1] != policy
+        {
+            instance.args[index + 1] = policy;
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod codex_approval_sync_tests {
+    use super::*;
+
+    #[test]
+    fn restored_codex_pane_adopts_current_approval_policy() {
+        let mut preset = AgentPreset::codex();
+        preset.args = vec!["-a".into(), "on-request".into()];
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &preset);
+        instance.args = vec!["-a".into(), "never".into()];
+        let mut workspace = Workspace {
+            instances: vec![instance],
+            ..Workspace::default()
+        };
+
+        assert!(sync_codex_approval_args(&mut workspace, &[preset]));
+        assert_eq!(workspace.instances[0].args, ["-a", "on-request"]);
+        assert!(!sync_codex_approval_args(
+            &mut workspace,
+            &[AgentPreset::codex()]
+        ));
+    }
+}
+
 /// One-time migration: give legacy per-instance worktrees a registry entry.
 /// If any instance already has a `worktree_id` this is a no-op. Instances are
 /// grouped by `worktree_path`, so any that share a path share one [`Worktree`].

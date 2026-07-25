@@ -26,7 +26,7 @@ use muxel_core::{
     WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, focus_in_direction,
     memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
     move_pane_beside, move_tab_to, remove, resolve_launch, set_active_tab, set_split_sizes,
-    set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
+    set_tab_order, split, split_beside, ssh, swap_instances, swap_panes, sync_codex_approval_args,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
@@ -3167,6 +3167,9 @@ impl MuxelApp {
         let mut workspace = workspace;
         // Give legacy per-instance worktrees a registry entry (no-op once done).
         migrate_worktrees(&mut workspace);
+        // Presets can change after a pane is created. Codex approval policy must
+        // follow the current preset instead of its stale per-pane argument snapshot.
+        sync_codex_approval_args(&mut workspace, &self.presets);
         // Repair a workspace holding two panes on one tmux session — they would
         // mirror each other, and closing one would kill the session under the other.
         // Normally a no-op.
