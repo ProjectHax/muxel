@@ -949,7 +949,18 @@ fn link_at(
         let chars: Vec<char> = (0..columns)
             .map(|c| grid[GridPoint::new(point.line, Column(c))].c)
             .collect();
+        if let Some((start, end, target)) = crate::links::markdown_link_at(&chars, point.column.0)
+            && let Some(url) = checked_link_uri(&target, session)
+        {
+            return Some(HoveredLink {
+                line: point.line.0,
+                start,
+                end,
+                url,
+            });
+        }
         if let Some((start, end, url)) = crate::links::url_span_at(&chars, point.column.0) {
+            let url = checked_link_uri(&url, session)?;
             return Some(HoveredLink {
                 line: point.line.0,
                 start,
@@ -964,11 +975,16 @@ fn link_at(
             if let Some(abs) = crate::links::resolve_path(&raw, session.cwd(), home.as_deref())
                 && abs.exists()
             {
+                let visible: String = chars[start..end].iter().collect();
+                let mut url = crate::links::file_uri(&abs);
+                if let Some(fragment) = crate::links::source_fragment(&visible) {
+                    url.push_str(&fragment);
+                }
                 return Some(HoveredLink {
                     line: point.line.0,
                     start,
                     end,
-                    url: crate::links::file_uri(&abs),
+                    url,
                 });
             }
         }
@@ -995,6 +1011,19 @@ fn normalize_link_uri(uri: &str, session: &TerminalSession) -> String {
         return crate::links::file_uri(&abs);
     }
     uri.to_string()
+}
+
+fn checked_link_uri(uri: &str, session: &TerminalSession) -> Option<String> {
+    if uri.starts_with("http://") || uri.starts_with("https://") || uri.starts_with("mailto:") {
+        return Some(uri.to_string());
+    }
+    if uri.starts_with("file://") {
+        return crate::links::path_from_file_uri(uri)
+            .filter(|path| path.is_file())
+            .map(|_| uri.to_string());
+    }
+    let normalized = normalize_link_uri(uri, session);
+    (normalized != uri).then_some(normalized)
 }
 
 /// Map a pixel position (relative to the terminal origin) to a grid point +

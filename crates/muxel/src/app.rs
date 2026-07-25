@@ -23,10 +23,10 @@ use muxel_core::{
     AgentPreset, FocusDir, Identity, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule,
     MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteRef,
     ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace,
-    WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, focus_in_direction,
-    memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
-    move_pane_beside, move_tab_to, remove, resolve_launch, set_active_tab, set_split_sizes,
-    set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
+    WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, file_link_instruction,
+    focus_in_direction, memory_instruction, memory_reference, migrate_worktrees, move_into_split,
+    move_into_tabs, move_pane_beside, move_tab_to, remove, resolve_launch, set_active_tab,
+    set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
@@ -3437,6 +3437,13 @@ impl MuxelApp {
         // lessons across runs). Launch-only — done on a clone so nothing persisted is
         // touched; skipped for plain shells (`InjectionMode::None` drops the prompt).
         let inst_owned = inst.cloned().map(|mut i| {
+            if i.injection != InjectionMode::None {
+                let instruction = file_link_instruction();
+                i.system_prompt = Some(match i.system_prompt.take() {
+                    Some(base) if !base.is_empty() => format!("{base}\n\n{instruction}"),
+                    _ => instruction.to_string(),
+                });
+            }
             if let Some(p) = project
                 && p.memory_enabled
                 && i.injection != InjectionMode::None
@@ -3540,6 +3547,9 @@ impl MuxelApp {
         spec = spec.with_submit(resolved.submit);
         spec.env = resolved.env.clone();
         spec.env.extend(extra_env);
+        if project.is_some_and(|p| p.remote.is_none()) {
+            spec.env.push(("MUXEL_FILE_LINKS".into(), "1".into()));
+        }
         // Point a memory-enabled *local* project's agent at its memory file so tools
         // can find it without being told the path. Remote agents get the path via the
         // system-prompt instruction instead (env vars don't cross the ssh boundary).

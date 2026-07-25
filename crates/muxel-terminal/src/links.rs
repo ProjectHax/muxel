@@ -8,11 +8,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// Does the text starting at `i` begin an `http://` or `https://` scheme?
+/// Does the text starting at `i` begin a supported URI scheme?
 fn starts_scheme(line: &[char], i: usize) -> bool {
-    const SCHEMES: [&[char]; 2] = [
+    const SCHEMES: [&[char]; 3] = [
         &['h', 't', 't', 'p', ':', '/', '/'],
         &['h', 't', 't', 'p', 's', ':', '/', '/'],
+        &['f', 'i', 'l', 'e', ':', '/', '/'],
     ];
     SCHEMES.iter().any(|s| line[i..].starts_with(s))
 }
@@ -64,6 +65,46 @@ pub fn url_span_at(line: &[char], col: usize) -> Option<(usize, usize, String)> 
         .into_iter()
         .find(|(s, e)| col >= *s && col < *e)
         .map(|(s, e)| (s, e, line[s..e].iter().collect()))
+}
+
+/// A literal Markdown inline link whose label covers `col`.
+///
+/// Terminal applications usually convert Markdown links to OSC 8. This bounded
+/// scanner covers applications that print `[label](target)` literally without
+/// pulling a Markdown parser into the paint path.
+pub fn markdown_link_at(line: &[char], col: usize) -> Option<(usize, usize, String)> {
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] != '[' {
+            i += 1;
+            continue;
+        }
+        let label_end = line[i + 1..].iter().position(|c| *c == ']')? + i + 1;
+        if line.get(label_end + 1) != Some(&'(') {
+            i = label_end + 1;
+            continue;
+        }
+        let target_start = label_end + 2;
+        let target_end = line[target_start..].iter().position(|c| *c == ')')? + target_start;
+        if col > i && col < label_end && target_end > target_start {
+            let target: String = line[target_start..target_end].iter().collect();
+            return Some((i + 1, label_end, target));
+        }
+        i = target_end + 1;
+    }
+    None
+}
+
+/// Convert a visible `:line[:column]` suffix to a file-URI fragment.
+pub fn source_fragment(token: &str) -> Option<String> {
+    let mut parts = token.rsplitn(3, ':');
+    let last = parts.next()?;
+    let prior = parts.next()?;
+    if let (Ok(column), Ok(line)) = (last.parse::<u32>(), prior.parse::<u32>()) {
+        return Some(format!("#L{line}C{column}"));
+    }
+    let line = last.parse::<u32>().ok()?;
+    Some(format!("#L{line}"))
 }
 
 /// Characters that may appear inside a file path. `:` is included so a trailing
@@ -206,12 +247,14 @@ pub fn file_uri(path: &Path) -> String {
 /// Decode a `file://` URI back to a filesystem path, or `None` if `uri` is not
 /// a file URL. Handles `file:///tmp/x`, `file:///D:/x`, and percent-encoding.
 pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
+    let rest = uri.strip_prefix("file://")?.split('#').next()?;
     // `file:///path` → path starts with `/`; `file://localhost/path` rare, skip.
     let path_part = if let Some(p) = rest.strip_prefix("localhost") {
         p
-    } else {
+    } else if rest.starts_with('/') {
         rest
+    } else {
+        return None;
     };
     // Percent-decode.
     let mut out = Vec::with_capacity(path_part.len());
@@ -260,8 +303,8 @@ pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_uri, path_from_file_uri, path_span_at, path_spans, resolve_path, url_span_at,
-        url_spans,
+        file_uri, markdown_link_at, path_from_file_uri, path_span_at, path_spans, resolve_path,
+        source_fragment, url_span_at, url_spans,
     };
     use std::path::{Path, PathBuf};
 
@@ -304,6 +347,25 @@ mod tests {
     }
 
     #[test]
+    fn finds_plain_file_uri() {
+        let line = chars("open file:///D:/dev/muxel/README.md");
+        assert_eq!(
+            find_url_at(&line, 10).as_deref(),
+            Some("file:///D:/dev/muxel/README.md")
+        );
+    }
+
+    #[test]
+    fn markdown_label_carries_target() {
+        let line = chars("[browser.rs:112](file:///D:/dev/muxel/browser.rs#L112)");
+        assert_eq!(
+            markdown_link_at(&line, 5),
+            Some((1, 15, "file:///D:/dev/muxel/browser.rs#L112".to_string()))
+        );
+        assert!(markdown_link_at(&line, 20).is_none());
+    }
+
+    #[test]
     fn two_urls_on_one_line() {
         let line = chars("https://a.com/1 and https://b.com/2");
         assert_eq!(url_spans(&line).len(), 2);
@@ -343,6 +405,11 @@ mod tests {
         assert_eq!(p, "src/main.rs");
         // The visual span still covers the ":42:7" suffix.
         assert_eq!(&line[s..e].iter().collect::<String>(), "src/main.rs:42:7");
+        assert_eq!(
+            source_fragment("src/main.rs:42:7").as_deref(),
+            Some("#L42C7")
+        );
+        assert_eq!(source_fragment("src/main.rs:42").as_deref(), Some("#L42"));
     }
 
     #[test]
@@ -431,6 +498,11 @@ mod tests {
             path_from_file_uri("file:///tmp/a%20b/c.rs").as_deref(),
             Some(Path::new("/tmp/a b/c.rs"))
         );
+        assert_eq!(
+            path_from_file_uri("file:///tmp/a.rs#L12C4").as_deref(),
+            Some(Path::new("/tmp/a.rs"))
+        );
+        assert!(path_from_file_uri("file://server/share/a.rs").is_none());
     }
 
     #[test]
