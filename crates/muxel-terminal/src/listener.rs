@@ -2,7 +2,6 @@
 //! copies, answers color queries, and writes PTY responses (cursor-position
 //! reports, query replies) back to the child.
 
-use crate::colors::{TerminalPalette, index_to_rgb};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::term::ClipboardType;
 use parking_lot::Mutex;
@@ -27,9 +26,6 @@ pub(crate) struct MuxelListener {
     /// OSC-52 copies from the child, drained by the view onto the system
     /// clipboard (a clipboard write needs a gpui context this thread lacks).
     pub clipboard_store: Arc<Mutex<Vec<(ClipboardType, String)>>>,
-    /// The palette color queries are answered from — kept current with the app
-    /// theme via `TerminalSession::set_palette`.
-    pub palette: Arc<Mutex<TerminalPalette>>,
 }
 
 impl MuxelListener {
@@ -69,16 +65,10 @@ impl EventListener for MuxelListener {
                 let reply = format("");
                 self.write_reply(&reply);
             }
-            // OSC 4;n / 10 / 11 / 12 color queries: answer from the active theme
-            // palette so TUIs detect dark/light mode correctly. The renderer
-            // paints from this same palette (runtime `set_color` overrides are
-            // not consulted), so the answer reports exactly what's on screen.
-            Event::ColorRequest(index, format) => {
-                if let Some(rgb) = index_to_rgb(&self.palette.lock(), index) {
-                    let reply = format(rgb);
-                    self.write_reply(&reply);
-                }
-            }
+            // Color queries are answered synchronously on the PTY reader thread.
+            // Waiting for this listener means waiting for the GPUI drain task,
+            // which is late enough for a TUI to treat the reply as typed text.
+            Event::ColorRequest(_, _) => {}
             // `Wakeup` and `ChildExit` are emitted only by alacritty's own
             // EventLoop, which muxel doesn't run: repaints are driven by the
             // view's drain task, and exit (with its code) comes from the PTY
@@ -102,7 +92,6 @@ mod tests {
             session_id_hint: hint.clone(),
             bell: Arc::new(AtomicBool::new(false)),
             clipboard_store: Arc::new(Mutex::new(Vec::new())),
-            palette: Arc::new(Mutex::new(TerminalPalette::default())),
         };
         let first = "019f95d7-db31-7db0-904d-9e08330e0000";
         let resumed = "019f95d7-db31-7db0-904d-9e08330e0001";

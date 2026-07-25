@@ -366,8 +366,8 @@ feature is added or changed, update the matching entry here in the same change**
   an empty reply, so a remote can probe for support but never see your clipboard.
 - **Color queries** — answers `OSC 10/11/12` and `OSC 4` color queries from the
   active theme's terminal palette, so TUIs detect dark/light mode correctly (and
-  the answer always matches what's painted). OSC requests bypass display-output
-  batching so replies arrive while the requesting TUI is still waiting for them.
+  the answer always matches what's painted). Replies are generated directly on
+  the PTY reader thread, while the requesting TUI is still waiting for them.
 - **Exit codes** — a pane's child exit status is captured, so close-on-exit and
   session-resume recovery can tell a clean `exit` from a crash (a deliberate quit
   no longer triggers resume recovery).
