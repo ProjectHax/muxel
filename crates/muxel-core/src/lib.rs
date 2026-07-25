@@ -21,8 +21,9 @@ pub mod worktree;
 
 pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
-    claude_session_path, codex_latest_session_id, codex_session_exists, file_link_instruction,
-    memory_header, memory_instruction, memory_reference, resolve_launch, session_resume_args,
+    claude_session_path, codex_developer_instructions_override, codex_latest_session_id,
+    codex_session_exists, file_link_instruction, memory_header, memory_instruction,
+    memory_reference, resolve_launch, session_resume_args,
 };
 pub use appimage::foreign_muxel_appimage_mounts;
 pub use diff::{SplitRow, split_diff};

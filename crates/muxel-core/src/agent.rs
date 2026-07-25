@@ -364,7 +364,9 @@ impl AgentPreset {
             effort_flag: None,
             args: Vec::new(),
             system_prompt: None,
-            injection: InjectionMode::TypeIn,
+            injection: InjectionMode::CliFlag {
+                flag: "--rules".to_string(),
+            },
             env: Vec::new(),
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -748,6 +750,20 @@ and an optional #L<line>C<column> fragment, for example \
 label readable and never invent a target."
 }
 
+/// Encode additional Codex instructions as a one-run `--config` override.
+///
+/// Codex parses CLI config values as TOML. Passing this through argv keeps the
+/// instruction out of the visible conversation and does not consume a turn.
+pub fn codex_developer_instructions_override(instructions: &str) -> String {
+    let escaped = instructions
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("developer_instructions=\"{escaped}\"")
+}
+
 /// Seed contents written when a project's `MEMORY.md` is first created. Delegates to
 /// the memory model so the seeded file matches muxel's maintained format exactly.
 pub fn memory_header() -> &'static str {
@@ -983,6 +999,14 @@ mod tests {
         assert_eq!(r.program.as_deref(), Some("opencode"));
         assert!(r.args.is_empty());
         assert_eq!(r.startup_input.as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn codex_developer_instructions_are_a_toml_config_override() {
+        assert_eq!(
+            codex_developer_instructions_override("open \"D:\\dev\\x\"\nnext"),
+            "developer_instructions=\"open \\\"D:\\\\dev\\\\x\\\"\\nnext\""
+        );
     }
 
     #[test]

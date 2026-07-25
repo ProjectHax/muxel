@@ -23,10 +23,11 @@ use muxel_core::{
     AgentPreset, FocusDir, Identity, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule,
     MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteRef,
     ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace,
-    WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, file_link_instruction,
-    focus_in_direction, memory_instruction, memory_reference, migrate_worktrees, move_into_split,
-    move_into_tabs, move_pane_beside, move_tab_to, remove, resolve_launch, set_active_tab,
-    set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
+    WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at,
+    codex_developer_instructions_override, file_link_instruction, focus_in_direction,
+    memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
+    move_pane_beside, move_tab_to, remove, resolve_launch, set_active_tab, set_split_sizes,
+    set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
@@ -3432,17 +3433,27 @@ impl MuxelApp {
         let resume_args = self.session_resume_for(instance_id);
         let inst = self.workspace.instance(instance_id);
         let project = inst.and_then(|i| self.workspace.project(i.project_id));
-        // Shared project memory: for an agent in a memory-enabled project, append an
-        // instruction pointing it at the project's `.muxel/MEMORY.md` (read + append
-        // lessons across runs). Launch-only — done on a clone so nothing persisted is
-        // touched; skipped for plain shells (`InjectionMode::None` drops the prompt).
+        // Automatic instructions must not be typed into an agent: that creates a
+        // visible user message and consumes a turn. Native prompt flags receive them
+        // directly; Codex receives a one-run developer_instructions config override.
+        let mut codex_instructions = Vec::new();
         let inst_owned = inst.cloned().map(|mut i| {
+            let is_codex = i
+                .program
+                .as_deref()
+                .is_some_and(|program| program.to_ascii_lowercase().contains("codex"));
+            let mut add_automatic = |instruction: String, i: &mut Instance| {
+                if is_codex {
+                    codex_instructions.push(instruction);
+                } else if matches!(i.injection, InjectionMode::CliFlag { .. }) {
+                    i.system_prompt = Some(match i.system_prompt.take() {
+                        Some(base) if !base.is_empty() => format!("{base}\n\n{instruction}"),
+                        _ => instruction,
+                    });
+                }
+            };
             if i.injection != InjectionMode::None {
-                let instruction = file_link_instruction();
-                i.system_prompt = Some(match i.system_prompt.take() {
-                    Some(base) if !base.is_empty() => format!("{base}\n\n{instruction}"),
-                    _ => instruction.to_string(),
-                });
+                add_automatic(file_link_instruction().to_string(), &mut i);
             }
             if let Some(p) = project
                 && p.memory_enabled
@@ -3457,10 +3468,7 @@ impl MuxelApp {
                 // there makes every pane of the project match `pkill -f <project>`.
                 let cwd = i.worktree_path.as_ref().map(|w| w.display().to_string());
                 let instruction = memory_instruction(&memory_reference(&root, cwd.as_deref()));
-                i.system_prompt = Some(match i.system_prompt.take() {
-                    Some(base) if !base.is_empty() => format!("{base}\n\n{instruction}"),
-                    _ => instruction,
-                });
+                add_automatic(instruction, &mut i);
             }
             i
         });
@@ -3475,6 +3483,12 @@ impl MuxelApp {
                 submit: true,
                 env: Vec::new(),
             });
+        if !codex_instructions.is_empty() {
+            resolved.args.push("--config".to_string());
+            resolved.args.push(codex_developer_instructions_override(
+                &codex_instructions.join("\n\n"),
+            ));
+        }
         // The session flag goes ahead of model / system-prompt args.
         if let Some(mut resume) = resume_args {
             resume.append(&mut resolved.args);
