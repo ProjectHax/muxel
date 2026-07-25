@@ -950,33 +950,69 @@ fn link_at(
         // wrap on the final cell; a hard newline has no WRAPLINE flag. Parsing one
         // display row at a time makes a URL/path that crosses the right edge vanish.
         let last_column = Column(columns - 1);
-        let mut first_line = point.line;
-        while first_line > grid.topmost_line()
-            && grid[GridPoint::new(first_line - 1, last_column)]
+        let first_text_column = |line: Line| {
+            (0..columns)
+                .find(|&column| !grid[GridPoint::new(line, Column(column))].c.is_whitespace())
+                .unwrap_or(columns)
+        };
+        let continues_into = |line: Line| {
+            if line >= grid.bottommost_line() {
+                return false;
+            }
+            if grid[GridPoint::new(line, last_column)]
                 .flags
                 .contains(Flags::WRAPLINE)
+            {
+                return true;
+            }
+            // Claude and other TUIs sometimes perform their own wrapping, leaving
+            // real grid rows instead of WRAPLINE rows. Accept a small hanging
+            // indent only when the prior row reaches the edge. File existence
+            // remains the final guard for path candidates.
+            let next_text = first_text_column(line + 1);
+            !grid[GridPoint::new(line, last_column)].c.is_whitespace()
+                && next_text <= 8
+                && next_text < columns
+        };
+        let mut first_line = point.line;
+        while first_line > grid.topmost_line()
+            && continues_into(first_line - 1)
+            && point.line.0 - first_line.0 < 8
         {
             first_line -= 1;
         }
         let mut last_line = point.line;
-        while last_line < grid.bottommost_line()
-            && grid[GridPoint::new(last_line, last_column)]
-                .flags
-                .contains(Flags::WRAPLINE)
-        {
+        while continues_into(last_line) && last_line.0 - point.line.0 < 8 {
             last_line += 1;
         }
-        let chars: Vec<char> = (first_line.0..=last_line.0)
-            .flat_map(|line| {
-                (0..columns).map(move |column| grid[GridPoint::new(Line(line), Column(column))].c)
-            })
-            .collect();
-        let row_base = (point.line.0 - first_line.0) as usize * columns;
-        let logical_column = row_base + point.column.0;
+        let mut chars = Vec::new();
+        let mut row_base = 0;
+        let mut row_start = 0;
+        for line_number in first_line.0..=last_line.0 {
+            let line = Line(line_number);
+            let start = if line > first_line
+                && !grid[GridPoint::new(line - 1, last_column)]
+                    .flags
+                    .contains(Flags::WRAPLINE)
+            {
+                first_text_column(line)
+            } else {
+                0
+            };
+            if line == point.line {
+                row_base = chars.len();
+                row_start = start;
+            }
+            chars.extend(
+                (start..columns).map(|column| grid[GridPoint::new(line, Column(column))].c),
+            );
+        }
+        let logical_column = row_base + point.column.0.saturating_sub(row_start);
+        let row_len = columns - row_start;
         let hovered = |start: usize, end: usize, url: String| HoveredLink {
             line: point.line.0,
-            start: start.max(row_base) - row_base,
-            end: end.min(row_base + columns) - row_base,
+            start: start.max(row_base) - row_base + row_start,
+            end: end.min(row_base + row_len) - row_base + row_start,
             url,
         };
 
