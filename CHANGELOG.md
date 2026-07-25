@@ -5,12 +5,21 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-07-24
+
 ### Fixed
+- **Typing stays smooth under multi-agent load (Windows soft lag)** — the present
+  pump that cured multi-second freezes could still make input feel mushy after a
+  few minutes (settings fields included; cursor vanished until keys caught up).
+  The pump is now dirty-gated with adaptive 16–64 ms backpressure and paints the
+  foreground window first; background terminals repaint at ~4 Hz, with extra
+  coalesce on large paste/stream batches. Opt-in profilers (`MUXEL_PROFILE=1`)
+  remain available for the next archaeology dig.
 - **Type-while-stream no longer thrash-paints the focused terminal** — paste into
   a busy agent and steer in the same pane used to schedule a full terminal paint
   on every PTY batch. Muxel now uses alacritty grid damage for partial draw-list
-  rebuilds and a paint-priority policy: recent-input response (~8 ms cadence) beats stream
-  frames (~30 Hz focused, ~10 Hz background). See
+  rebuilds and a paint-priority policy: recent-input response (~8 ms cadence) beats
+  stream frames (~30 Hz focused, ~4 Hz background). See
   `docs/terminal-paint-architecture.md`.
 
 ### Added
@@ -725,7 +734,8 @@ All notable changes to muxel are documented here. This project adheres to
 
 Initial public release.
 
-[Unreleased]: https://github.com/ProjectHax/muxel/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/ProjectHax/muxel/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/ProjectHax/muxel/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ProjectHax/muxel/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ProjectHax/muxel/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ProjectHax/muxel/compare/v0.1.1...v0.1.2

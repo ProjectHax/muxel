@@ -288,9 +288,16 @@ impl Element for TerminalElement {
             let damage = self.session.take_pending_damage();
             let prev = self.session.take_paint_list();
             let t0 = Instant::now();
+            // Patching keeps undamaged rows verbatim from the previous list, so
+            // it is only valid when *every* metric matches — `same_font` ignores
+            // `bg`, `rows`, and `cols`. A theme switch mid-stream (bg changes,
+            // damage is partial) would otherwise leave undamaged rows painted in
+            // the old palette; a resize would keep rows the grid no longer has.
+            // Shape retention below stays on `same_font` — glyph layout really
+            // does depend only on font geometry.
             let mut list = match (
                 damage.prefer_partial_rebuild(rows as usize),
-                prev.as_ref().filter(|p| p.metrics.same_font(&metrics)),
+                prev.as_ref().filter(|p| p.metrics == metrics),
             ) {
                 (Some(lines), Some(prev_list)) => patch_draw_list(
                     prev_list,

@@ -17,8 +17,10 @@ use std::time::{Duration, Instant};
 /// can't starve the UI; the rest stays buffered for the next turn.
 const MAX_BYTES_PER_TURN: usize = 256 * 1024;
 
-/// Unfocused terminals: status badges only need a slow warm grid.
-const BACKGROUND_PAINT_INTERVAL: Duration = Duration::from_millis(100);
+/// Unfocused terminals still parse PTY output (status badges need a warm grid)
+/// but only repaint at this rate. Multi-agent streams at 10 Hz still starved the
+/// UI thread under load; 4 Hz is enough for status dots and idle panes.
+const BACKGROUND_PAINT_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Focused stream output outside the recent-input window: ~30 Hz.
 /// Typing-while-Claude-streams used to notify every batch (~full submit thrash).
@@ -328,6 +330,10 @@ impl TerminalView {
     /// Notify now or arm one trailing-edge notify. A leading-edge throttle alone
     /// can leave the final output batch stale forever when output stops inside
     /// the interval.
+    ///
+    /// Every path that calls `cx.notify()` here must also arm the Windows
+    /// present pump ([`crate::present_flag`]): gpui-on-Windows can draw without
+    /// presenting, so a frame we schedule but never mark stays off-screen.
     fn schedule_paint(&mut self, min_interval: Duration, cx: &mut Context<Self>) {
         let now = Instant::now();
         let deadline = match next_paint_schedule(
@@ -343,6 +349,7 @@ impl TerminalView {
                 self.last_paint_notify.set(now);
                 cx.notify();
                 profile::notify_scheduled();
+                crate::present_flag::mark_present_needed();
                 return;
             }
             PaintSchedule::KeepPending => return,
@@ -363,6 +370,7 @@ impl TerminalView {
                 view.last_paint_notify.set(Instant::now());
                 cx.notify();
                 profile::notify_scheduled();
+                crate::present_flag::mark_present_needed();
             });
         })
         .detach();
@@ -793,6 +801,8 @@ impl TerminalView {
             if cleared {
                 cx.notify();
             }
+            // Key path: gpui may sync-draw without presenting — arm the pump.
+            crate::present_flag::mark_present_needed();
             cx.stop_propagation();
             profile::key_handled(held, t0.elapsed());
         }
