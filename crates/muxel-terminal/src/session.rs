@@ -224,6 +224,7 @@ pub struct TerminalSession {
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
+    session_id_hint: Arc<Mutex<Option<String>>>,
     bell: Arc<AtomicBool>,
     /// OSC-52 copies parsed from output, pending pickup by the view (which owns
     /// the gpui context a clipboard write needs).
@@ -471,12 +472,14 @@ impl TerminalSession {
             .context("spawn reader thread")?;
 
         let title = Arc::new(Mutex::new(None));
+        let session_id_hint = Arc::new(Mutex::new(None));
         let bell = Arc::new(AtomicBool::new(false));
         let clipboard_store = Arc::new(Mutex::new(Vec::new()));
         let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let listener = MuxelListener {
             writer: writer.clone(),
             title: title.clone(),
+            session_id_hint: session_id_hint.clone(),
             bell: bell.clone(),
             clipboard_store: clipboard_store.clone(),
             palette: palette.clone(),
@@ -503,6 +506,7 @@ impl TerminalSession {
             killer: Mutex::new(killer),
             child_pid,
             title,
+            session_id_hint,
             bell,
             clipboard_store,
             palette,
@@ -1118,6 +1122,12 @@ impl TerminalSession {
     /// The most recent OSC title, if any.
     pub fn title(&self) -> Option<String> {
         self.title.lock().clone()
+    }
+
+    /// Latest UUID-shaped OSC title retained when an agent replaces it with a
+    /// display name. Muxel uses this as an exact agent session identity hint.
+    pub fn session_id_hint(&self) -> Option<String> {
+        self.session_id_hint.lock().clone()
     }
 
     /// Drain the OSC-52 copies parsed since the last call. The view lands them
@@ -2042,6 +2052,23 @@ mod tests {
             wait_for_reply(&rx, b"]11;rgb:1111/2222/3333"),
             "background query should answer with the set palette"
         );
+        session.kill();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uuid_title_tracks_session_switch_and_ignores_display_title() {
+        let (session, _rx) =
+            TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 80, 24)
+                .expect("spawn");
+        let id = "019f95d7-db31-7db0-904d-9e08330e0000";
+        let resumed = "019f95d7-db31-7db0-904d-9e08330e0001";
+        session.process_output(format!("\x1b]0;{id}\x07").as_bytes());
+        session.process_output(b"\x1b]0;Review changes\x07");
+        assert_eq!(session.title().as_deref(), Some("Review changes"));
+        assert_eq!(session.session_id_hint().as_deref(), Some(id));
+        session.process_output(format!("\x1b]0;{resumed}\x07").as_bytes());
+        assert_eq!(session.session_id_hint().as_deref(), Some(resumed));
         session.kill();
     }
 

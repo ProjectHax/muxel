@@ -188,6 +188,48 @@ struct ExitInfo {
     read_error: Option<String>,
 }
 
+/// Tracks OSC sequences across PTY chunks. OSC queries must be parsed without
+/// the normal paint-coalescing delay: their replies go back through the PTY's
+/// input stream, and a TUI that has stopped waiting treats a late reply as text.
+#[derive(Default)]
+struct OscTracker {
+    state: OscState,
+}
+
+#[derive(Clone, Copy, Default)]
+enum OscState {
+    #[default]
+    Ground,
+    Escape,
+    Osc,
+    OscEscape,
+}
+
+impl OscTracker {
+    /// Returns true while this batch starts, continues, or completes an OSC.
+    fn observe(&mut self, bytes: &[u8]) -> bool {
+        let mut saw_osc = matches!(self.state, OscState::Osc | OscState::OscEscape);
+        for &byte in bytes {
+            self.state = match (self.state, byte) {
+                (OscState::Ground, 0x1b) => OscState::Escape,
+                (OscState::Escape, b']') => {
+                    saw_osc = true;
+                    OscState::Osc
+                }
+                (OscState::Escape, 0x1b) => OscState::Escape,
+                (OscState::Osc, 0x07) => OscState::Ground,
+                (OscState::Osc, 0x1b) => OscState::OscEscape,
+                (OscState::Osc, _) => OscState::Osc,
+                (OscState::OscEscape, b'\\') => OscState::Ground,
+                (OscState::OscEscape, 0x1b) => OscState::OscEscape,
+                (OscState::OscEscape, _) => OscState::Osc,
+                _ => OscState::Ground,
+            };
+        }
+        saw_osc
+    }
+}
+
 /// Drain whatever is already buffered on the channel into `output`, stopping
 /// at an Exit event or once [`MAX_BYTES_PER_TURN`] is buffered (the rest stays
 /// queued for the next drain turn).
@@ -475,6 +517,7 @@ impl TerminalView {
         let drain_session = session.clone();
         let drain = cx.spawn(async move |view: WeakEntity<Self>, cx| {
             let session = drain_session;
+            let mut osc_tracker = OscTracker::default();
             loop {
                 let chunk = match rx.recv().await {
                     Ok(c) => c,
@@ -498,11 +541,12 @@ impl TerminalView {
                     }
                 }
                 coalesce_pending(&rx, &mut output, &mut exit);
+                let contains_osc = osc_tracker.observe(&output);
 
                 // Coalesce before taking the UI lock: bg agents always; focused
                 // stream bursts too (interaction priority is decided after parsing).
                 let focused_hint = session.is_focused();
-                if exit.is_none() && output.len() < MAX_BYTES_PER_TURN {
+                if !contains_osc && exit.is_none() && output.len() < MAX_BYTES_PER_TURN {
                     let wait = if !focused_hint {
                         Some(BACKGROUND_PAINT_INTERVAL)
                     } else if output.len() >= 4096 {
@@ -681,6 +725,10 @@ impl TerminalView {
 
     pub fn title(&self) -> Option<String> {
         self.session.title()
+    }
+
+    pub fn session_id_hint(&self) -> Option<String> {
+        self.session.session_id_hint()
     }
 
     /// Replace the color palette used to render this terminal. Also pushed into
@@ -935,13 +983,27 @@ mod tests {
     // macro, not gpui's glob-imported `test` attribute.
     use super::{
         AgentStatus, BACKGROUND_PAINT_INTERVAL, FOCUSED_INTERACTION_INTERVAL,
-        FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, classify, latch_done,
-        next_paint_schedule, paint_min_interval,
+        FOCUSED_STREAM_INTERVAL, OscTracker, PaintSchedule, TerminalMouseMode, classify,
+        latch_done, next_paint_schedule, paint_min_interval,
     };
     use std::time::Duration;
 
     fn m(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn osc_tracker_prioritizes_queries_split_across_chunks() {
+        let mut tracker = OscTracker::default();
+        assert!(!tracker.observe(b"ordinary output"));
+        assert!(tracker.observe(b"\x1b]11;"));
+        assert!(tracker.observe(b"?"));
+        assert!(tracker.observe(b"\x07after"));
+        assert!(!tracker.observe(b"ordinary again"));
+
+        assert!(tracker.observe(b"\x1b]10;?\x1b"));
+        assert!(tracker.observe(b"\\"));
+        assert!(!tracker.observe(b"done"));
     }
 
     #[test]

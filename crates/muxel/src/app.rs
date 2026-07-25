@@ -3405,18 +3405,23 @@ impl MuxelApp {
                 inst.session_started = false;
             }
         } else if inst.session_started {
-            // Agent-minted (Codex): adopt the real id from disk before resuming.
-            let need_capture = match inst.session_id.as_deref() {
-                None => true,
-                Some(sid) => agent_minted_session_gone(&preset, sid),
-            };
-            if need_capture {
+            // Agent-minted (Codex): legacy panes created before exact title
+            // capture have no id, so recover their newest cwd-matching rollout.
+            // A known id that disappeared must start fresh; adopting "latest"
+            // there can steal a sibling pane's conversation.
+            if inst.session_id.is_none() {
                 if let Some(id) = capture_agent_session_id(&preset, cwd.as_deref()) {
                     inst.session_id = Some(id);
                 } else {
-                    inst.session_id = None;
                     inst.session_started = false;
                 }
+            } else if inst
+                .session_id
+                .as_deref()
+                .is_some_and(|sid| agent_minted_session_gone(&preset, sid))
+            {
+                inst.session_id = None;
+                inst.session_started = false;
             }
         }
         let snapshot = inst.clone();
@@ -5663,6 +5668,7 @@ impl MuxelApp {
         struct Snap {
             iid: Uuid,
             status: AgentStatus,
+            session_id_hint: Option<String>,
             exited: bool,
             exit_code: Option<i32>,
             /// `Some` when a signal killed the child — the only way to tell a
@@ -5679,6 +5685,7 @@ impl MuxelApp {
             .map(|(iid, view)| {
                 let v = view.read(cx);
                 let status = v.status();
+                let session_id_hint = v.session_id_hint();
                 let exited = v.exited();
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
@@ -5703,6 +5710,7 @@ impl MuxelApp {
                 Snap {
                     iid: *iid,
                     status,
+                    session_id_hint,
                     exited,
                     exit_code,
                     exit_signal,
@@ -5729,6 +5737,7 @@ impl MuxelApp {
         for Snap {
             iid,
             status,
+            session_id_hint,
             exited,
             exit_code,
             exit_signal,
@@ -5738,6 +5747,29 @@ impl MuxelApp {
             resume_error,
         } in snapshot
         {
+            // Codex mints its own session id and publishes it as this pane's
+            // initial OSC title. Capture that exact id instead of guessing from
+            // the newest rollout in the cwd, which aliases concurrent panes.
+            // A later UUID updates the binding when `/resume` switches sessions
+            // inside the running Codex TUI.
+            let captured_codex_id = self.workspace.instance(iid).and_then(|inst| {
+                let preset = inst
+                    .preset_id
+                    .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
+                    .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
+                let id =
+                    muxel_core::codex_session_id_from_title(preset, session_id_hint.as_deref()?)?;
+                if inst.session_id.as_deref() == Some(id.as_str()) {
+                    return None;
+                }
+                Some(id)
+            });
+            if let Some(id) = captured_codex_id
+                && let Some(inst) = self.workspace.instance_mut(iid)
+            {
+                inst.session_id = Some(id);
+                self.persist();
+            }
             let changed = self.last_status.insert(iid, status) != Some(status);
             dirty |= changed;
             // A reconnecting remote pane that's stayed alive since its last respawn
