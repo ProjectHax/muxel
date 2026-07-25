@@ -6861,13 +6861,13 @@ impl MuxelApp {
                     ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm")
                 });
             #[cfg(not(target_os = "linux"))]
-            if is_html && self.settings.browser_enabled {
-                if self
+            if is_html
+                && self.settings.browser_enabled
+                && self
                     .open_browser_at(url.to_string(), self.active_instance, window, cx)
                     .is_some()
-                {
-                    return;
-                }
+            {
+                return;
             }
             if target.path.is_file()
                 && let Some(pid) = self.workspace.active_project
