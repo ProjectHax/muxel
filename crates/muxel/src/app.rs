@@ -6848,13 +6848,49 @@ impl MuxelApp {
     /// otherwise macOS/Windows open an embedded browser pane and Linux spawns the
     /// separate muxel browser window.
     fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = muxel_terminal::path_from_file_uri(url) {
-            if path.exists()
-                && let Some(pid) = self.workspace.active_project
-                && self
-                    .open_editor_at(pid, Some(path), self.active_instance, window, cx)
+        if let Some(mut target) = muxel_terminal::file_target_from_uri(url) {
+            if let Ok(canonical) = std::fs::canonicalize(&target.path) {
+                target.path = canonical;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let is_html = target
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm")
+                });
+            #[cfg(not(target_os = "linux"))]
+            if is_html && self.settings.browser_enabled {
+                if self
+                    .open_browser_at(url.to_string(), self.active_instance, window, cx)
                     .is_some()
+                {
+                    return;
+                }
+            }
+            if target.path.is_file()
+                && let Some(pid) = self.workspace.active_project
+                && let Some(iid) = self.open_editor_at(
+                    pid,
+                    Some(target.path.clone()),
+                    self.active_instance,
+                    window,
+                    cx,
+                )
             {
+                if let Some(line) = target.line
+                    && let Some(editor) = self.editors.get(&iid)
+                {
+                    editor.update(cx, |editor, cx| {
+                        editor.goto_position(
+                            line.saturating_sub(1),
+                            target.column.unwrap_or(1).saturating_sub(1),
+                            window,
+                            cx,
+                        );
+                    });
+                }
                 return;
             }
             // Fall through to the OS if no project / editor open failed.
@@ -7086,6 +7122,11 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
+        let path = if self.workspace.project(pid).is_some_and(|p| p.is_remote()) {
+            path
+        } else {
+            path.map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        };
         // Reuse an already-open editor for this exact path.
         if let Some(p) = &path
             && let Some(iid) = self
@@ -7093,6 +7134,9 @@ impl MuxelApp {
                 .iter()
                 .find_map(|(iid, ed)| (ed.read(cx).path() == Some(p.as_path())).then_some(*iid))
         {
+            if let Some(editor) = self.editors.get(&iid).cloned() {
+                editor.update(cx, |editor, cx| editor.reload_if_clean(window, cx));
+            }
             self.focus_instance(iid, window, cx);
             return Some(iid);
         }
@@ -13346,6 +13390,31 @@ impl MuxelApp {
                                         if let Some(ed) = this.editors.get(&iid).cloned() {
                                             ed.update(cx, |e, cx| e.toggle_rendered(cx));
                                         }
+                                    }))
+                            }),
+                    )
+                    .children(
+                        self.editors
+                            .get(&iid)
+                            .filter(|editor| editor.read(cx).is_html())
+                            .map(|_| {
+                                Button::new(SharedString::from(format!("preview-html-{sid}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .label(t("Preview"))
+                                    .tooltip(t("Preview HTML in the browser"))
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
+                                        #[cfg(not(target_os = "linux"))]
+                                        if let Some(path) = this
+                                            .editors
+                                            .get(&iid)
+                                            .and_then(|editor| editor.read(cx).path().map(PathBuf::from))
+                                        {
+                                            let url = muxel_terminal::file_uri(&path);
+                                            let _ = this.open_browser_at(url, Some(iid), window, cx);
+                                        }
+                                        #[cfg(target_os = "linux")]
+                                        let _ = (this, window, cx);
                                     }))
                             }),
                     )

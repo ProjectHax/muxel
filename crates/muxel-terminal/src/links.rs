@@ -8,6 +8,15 @@
 
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileLinkTarget {
+    pub path: PathBuf,
+    /// One-based source line from a `#L12` fragment.
+    pub line: Option<u32>,
+    /// One-based source column from a `#L12C4` fragment.
+    pub column: Option<u32>,
+}
+
 /// Does the text starting at `i` begin a supported URI scheme?
 fn starts_scheme(line: &[char], i: usize) -> bool {
     const SCHEMES: [&[char]; 3] = [
@@ -247,7 +256,12 @@ pub fn file_uri(path: &Path) -> String {
 /// Decode a `file://` URI back to a filesystem path, or `None` if `uri` is not
 /// a file URL. Handles `file:///tmp/x`, `file:///D:/x`, and percent-encoding.
 pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?.split('#').next()?;
+    file_target_from_uri(uri).map(|target| target.path)
+}
+
+pub fn file_target_from_uri(uri: &str) -> Option<FileLinkTarget> {
+    let rest = uri.strip_prefix("file://")?;
+    let (rest, fragment) = rest.split_once('#').unwrap_or((rest, ""));
     // `file:///path` → path starts with `/`; `file://localhost/path` rare, skip.
     let path_part = if let Some(p) = rest.strip_prefix("localhost") {
         p
@@ -292,19 +306,38 @@ pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
                 }
             })
             .unwrap_or(decoded);
-        Some(PathBuf::from(trimmed))
+        Some(FileLinkTarget {
+            path: PathBuf::from(trimmed),
+            line: parse_source_fragment(fragment).map(|p| p.0),
+            column: parse_source_fragment(fragment).and_then(|p| p.1),
+        })
     }
     #[cfg(not(windows))]
     {
-        Some(PathBuf::from(decoded))
+        Some(FileLinkTarget {
+            path: PathBuf::from(decoded),
+            line: parse_source_fragment(fragment).map(|p| p.0),
+            column: parse_source_fragment(fragment).and_then(|p| p.1),
+        })
     }
+}
+
+fn parse_source_fragment(fragment: &str) -> Option<(u32, Option<u32>)> {
+    let source = fragment.strip_prefix('L')?;
+    let (line, column) = source
+        .split_once('C')
+        .map(|(line, column)| (line, Some(column)))
+        .unwrap_or((source, None));
+    let line = line.parse().ok()?;
+    let column = column.and_then(|column| column.parse().ok());
+    Some((line, column))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        file_uri, markdown_link_at, path_from_file_uri, path_span_at, path_spans, resolve_path,
-        source_fragment, url_span_at, url_spans,
+        file_target_from_uri, file_uri, markdown_link_at, path_from_file_uri, path_span_at,
+        path_spans, resolve_path, source_fragment, url_span_at, url_spans,
     };
     use std::path::{Path, PathBuf};
 
@@ -502,6 +535,9 @@ mod tests {
             path_from_file_uri("file:///tmp/a.rs#L12C4").as_deref(),
             Some(Path::new("/tmp/a.rs"))
         );
+        let target = file_target_from_uri("file:///tmp/a.rs#L12C4").unwrap();
+        assert_eq!(target.line, Some(12));
+        assert_eq!(target.column, Some(4));
         assert!(path_from_file_uri("file://server/share/a.rs").is_none());
     }
 

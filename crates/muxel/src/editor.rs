@@ -204,6 +204,14 @@ impl EditorView {
         self.is_markdown || self.is_image
     }
 
+    pub fn is_html(&self) -> bool {
+        self.path
+            .as_deref()
+            .and_then(Path::extension)
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"))
+    }
+
     /// Whether the rendered view (vs raw editor) is currently shown.
     pub fn show_rendered(&self) -> bool {
         self.show_rendered
@@ -278,9 +286,39 @@ impl EditorView {
 
     /// Move the cursor to a 0-based line (used by find-in-project navigation).
     pub fn goto_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.goto_position(line, 0, window, cx);
+    }
+
+    pub fn goto_position(
+        &self,
+        line: u32,
+        character: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.input.update(cx, |s, cx| {
-            s.set_cursor_position(Position { line, character: 0 }, window, cx);
+            s.set_cursor_position(Position { line, character }, window, cx);
         });
+    }
+
+    /// Reload an unchanged local buffer from disk. Dirty source always wins.
+    pub fn reload_if_clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dirty {
+            return;
+        }
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let Some(content) = read_text_file(path) else {
+            return;
+        };
+        if &*self.input.read(cx).value() != content.as_str() {
+            self.input.update(cx, |s, cx| {
+                let offset = s.scroll_offset();
+                s.set_value(content, window, cx);
+                s.set_scroll_offset(offset, cx);
+            });
+        }
     }
 
     pub fn path(&self) -> Option<&Path> {
