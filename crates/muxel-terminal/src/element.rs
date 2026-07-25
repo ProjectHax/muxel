@@ -946,29 +946,50 @@ fn link_at(
             });
         }
 
-        let chars: Vec<char> = (0..columns)
-            .map(|c| grid[GridPoint::new(point.line, Column(c))].c)
+        // Reconstruct the logical line around the pointer. Alacritty marks a soft
+        // wrap on the final cell; a hard newline has no WRAPLINE flag. Parsing one
+        // display row at a time makes a URL/path that crosses the right edge vanish.
+        let last_column = Column(columns - 1);
+        let mut first_line = point.line;
+        while first_line > grid.topmost_line()
+            && grid[GridPoint::new(first_line - 1, last_column)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        {
+            first_line -= 1;
+        }
+        let mut last_line = point.line;
+        while last_line < grid.bottommost_line()
+            && grid[GridPoint::new(last_line, last_column)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        {
+            last_line += 1;
+        }
+        let chars: Vec<char> = (first_line.0..=last_line.0)
+            .flat_map(|line| {
+                (0..columns).map(move |column| grid[GridPoint::new(Line(line), Column(column))].c)
+            })
             .collect();
-        if let Some((start, end, target)) = crate::links::markdown_link_at(&chars, point.column.0)
+        let row_base = (point.line.0 - first_line.0) as usize * columns;
+        let logical_column = row_base + point.column.0;
+        let hovered = |start: usize, end: usize, url: String| HoveredLink {
+            line: point.line.0,
+            start: start.max(row_base) - row_base,
+            end: end.min(row_base + columns) - row_base,
+            url,
+        };
+
+        if let Some((start, end, target)) = crate::links::markdown_link_at(&chars, logical_column)
             && let Some(url) = checked_link_uri(&target, session)
         {
-            return Some(HoveredLink {
-                line: point.line.0,
-                start,
-                end,
-                url,
-            });
+            return Some(hovered(start, end, url));
         }
-        if let Some((start, end, url)) = crate::links::url_span_at(&chars, point.column.0) {
+        if let Some((start, end, url)) = crate::links::url_span_at(&chars, logical_column) {
             let url = checked_link_uri(&url, session)?;
-            return Some(HoveredLink {
-                line: point.line.0,
-                start,
-                end,
-                url,
-            });
+            return Some(hovered(start, end, url));
         }
-        if let Some((start, end, raw)) = crate::links::path_span_at(&chars, point.column.0) {
+        if let Some((start, end, raw)) = crate::links::path_span_at(&chars, logical_column) {
             let home = std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(std::path::PathBuf::from);
@@ -980,12 +1001,7 @@ fn link_at(
                 if let Some(fragment) = crate::links::source_fragment(&visible) {
                     url.push_str(&fragment);
                 }
-                return Some(HoveredLink {
-                    line: point.line.0,
-                    start,
-                    end,
-                    url,
-                });
+                return Some(hovered(start, end, url));
             }
         }
         None
