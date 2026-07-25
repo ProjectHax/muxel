@@ -407,10 +407,7 @@ impl TerminalSession {
         // returns the shim first and CreateProcessW fails with
         // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
         let program = resolve_program_for_spawn(&spec.program);
-        let mut builder = CommandBuilder::new(&program);
-        for arg in &spec.args {
-            builder.arg(arg);
-        }
+        let mut builder = command_builder_for_spawn(&program, &spec.args);
         // Remembered for resolving relative file paths on ctrl+click.
         let cwd = spec.cwd.as_ref().map(std::path::PathBuf::from);
         if let Some(cwd) = &spec.cwd {
@@ -1340,53 +1337,67 @@ fn resolve_program_for_spawn(program: &str) -> String {
     }
 }
 
+fn command_builder_for_spawn(program: &str, args: &[String]) -> CommandBuilder {
+    #[cfg(not(windows))]
+    {
+        let mut builder = CommandBuilder::new(program);
+        for arg in args {
+            builder.arg(arg);
+        }
+        builder
+    }
+    #[cfg(windows)]
+    {
+        use std::path::Path;
+
+        let is_batch = Path::new(program)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+        if !is_batch {
+            let mut builder = CommandBuilder::new(program);
+            for arg in args {
+                builder.arg(arg);
+            }
+            return builder;
+        }
+
+        // CreateProcess cannot execute batch files, and cmd.exe reparses a
+        // reconstructed command string (`%*`, quotes, and metacharacters).
+        // Keep the public PATH target, but move each original argv token
+        // losslessly through a child-only environment slot. PowerShell expands
+        // the resulting array without another command-line parse.
+        const BATCH_RUNNER: &str = concat!(
+            "$argv = for ($i = 0; $i -lt [int]$env:MUXEL_BATCH_ARG_COUNT; $i++) { ",
+            "[Environment]::GetEnvironmentVariable(('MUXEL_BATCH_ARG_' + $i)) }; ",
+            "& $env:MUXEL_BATCH_PROGRAM @argv; exit $LASTEXITCODE"
+        );
+        let encoded_runner = {
+            use base64::Engine;
+            let bytes = BATCH_RUNNER
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let mut builder = CommandBuilder::new("powershell.exe");
+        builder.arg("-NoLogo");
+        builder.arg("-NoProfile");
+        builder.arg("-NonInteractive");
+        builder.arg("-EncodedCommand");
+        builder.arg(encoded_runner);
+        builder.env("MUXEL_BATCH_PROGRAM", program);
+        builder.env("MUXEL_BATCH_ARG_COUNT", args.len().to_string());
+        for (index, arg) in args.iter().enumerate() {
+            builder.env(format!("MUXEL_BATCH_ARG_{index}"), arg);
+        }
+        builder
+    }
+}
+
 #[cfg(windows)]
 fn resolve_program_for_spawn_windows(program: &str) -> String {
     use std::path::{Path, PathBuf};
-
-    fn prefer_native_codex(path: PathBuf) -> PathBuf {
-        let is_codex_cmd = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("codex"))
-            && path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
-                });
-        if !is_codex_cmd {
-            return path;
-        }
-
-        let Some(npm_bin) = path.parent() else {
-            return path;
-        };
-        let (package, target) = if cfg!(target_arch = "aarch64") {
-            ("codex-win32-arm64", "aarch64-pc-windows-msvc")
-        } else {
-            ("codex-win32-x64", "x86_64-pc-windows-msvc")
-        };
-        let package_root = npm_bin.join("node_modules").join("@openai").join("codex");
-        [
-            package_root
-                .join("node_modules")
-                .join("@openai")
-                .join(package)
-                .join("vendor")
-                .join(target)
-                .join("bin")
-                .join("codex.exe"),
-            package_root
-                .join("vendor")
-                .join(target)
-                .join("bin")
-                .join("codex.exe"),
-        ]
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .unwrap_or(path)
-    }
 
     fn is_shebang(path: &Path) -> bool {
         use std::io::Read;
@@ -1428,11 +1439,11 @@ fn resolve_program_for_spawn_windows(program: &str) -> String {
         for ext in exts {
             let cand = base.with_extension(ext);
             if is_spawnable(&cand) {
-                return Some(prefer_native_codex(cand));
+                return Some(cand);
             }
         }
         if is_spawnable(&base) {
-            return Some(prefer_native_codex(base));
+            return Some(base);
         }
         None
     }
@@ -1449,27 +1460,12 @@ fn resolve_program_for_spawn_windows(program: &str) -> String {
 
     // Bare name: search PATH, PATHEXT before bare (opposite of portable-pty).
     let exts = pathexts();
-    let search_native_codex = program.eq_ignore_ascii_case("codex");
-    let mut codex_script_fallback = None;
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             if let Some(p) = try_with_exts(dir.join(program), &exts) {
-                if search_native_codex
-                    && p.extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| {
-                            ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
-                        })
-                {
-                    codex_script_fallback.get_or_insert(p);
-                    continue;
-                }
                 return p.to_string_lossy().into_owned();
             }
         }
-    }
-    if let Some(path) = codex_script_fallback {
-        return path.to_string_lossy().into_owned();
     }
     program.to_string()
 }
@@ -1868,53 +1864,6 @@ mod windows_spawn_resolve {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn codex_cmd_resolves_to_the_packaged_native_executable() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join(format!("muxel-codex-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let (package, target) = if cfg!(target_arch = "aarch64") {
-            ("codex-win32-arm64", "aarch64-pc-windows-msvc")
-        } else {
-            ("codex-win32-x64", "x86_64-pc-windows-msvc")
-        };
-        let native = dir
-            .join("node_modules")
-            .join("@openai")
-            .join("codex")
-            .join("node_modules")
-            .join("@openai")
-            .join(package)
-            .join("vendor")
-            .join(target)
-            .join("bin")
-            .join("codex.exe");
-        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
-        std::fs::write(dir.join("codex.cmd"), "@echo off\r\n").unwrap();
-        std::fs::write(&native, b"fixture").unwrap();
-
-        let prev = std::env::var_os("PATH");
-        let prev_pathext = std::env::var_os("PATHEXT");
-        unsafe {
-            std::env::set_var("PATH", &dir);
-            std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
-        }
-        let resolved = resolve_program_for_spawn_windows("codex");
-        unsafe {
-            match prev {
-                Some(value) => std::env::set_var("PATH", value),
-                None => std::env::remove_var("PATH"),
-            }
-            match prev_pathext {
-                Some(value) => std::env::set_var("PATHEXT", value),
-                None => std::env::remove_var("PATHEXT"),
-            }
-        }
-
-        assert_eq!(std::path::PathBuf::from(resolved), native);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Manual installed-tool smoke test for the full PTY launch path. Ignored in
     /// CI because Codex is not a repo dependency; run it on Windows when changing
     /// npm shim resolution or launch-time instructions.
@@ -1923,8 +1872,8 @@ mod windows_spawn_resolve {
     fn installed_codex_accepts_instruction_argv_through_pty() {
         let resolved = resolve_program_for_spawn_windows("codex");
         assert!(
-            resolved.to_ascii_lowercase().ends_with("codex.exe"),
-            "installed Codex did not resolve to its native executable: {resolved}"
+            resolved.to_ascii_lowercase().ends_with("codex.cmd"),
+            "installed Codex did not resolve through its public PATH shim: {resolved}"
         );
         let instruction = muxel_core::codex_developer_instructions_override(
             "Use [name](file:///D:/dev/project/file.rs#L12C4); keep <targets> exact.",
@@ -1933,12 +1882,17 @@ mod windows_spawn_resolve {
             "codex",
             vec!["--config".to_string(), instruction, "--version".to_string()],
         );
-        let (_session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn Codex");
+        let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn Codex");
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut output = Vec::new();
         while Instant::now() < deadline {
             match rx.try_recv() {
-                Ok(PtyChunk::Output(bytes)) => output.extend(bytes),
+                Ok(PtyChunk::Output(bytes)) => {
+                    if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+                        session.write_input(b"\x1b[1;1R");
+                    }
+                    output.extend(bytes);
+                }
                 Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
                 Err(async_channel::TryRecvError::Empty) => {}
             }
@@ -1947,7 +1901,7 @@ mod windows_spawn_resolve {
         let output = String::from_utf8_lossy(&output);
         assert!(
             output.contains("codex-cli"),
-            "Codex did not reach its native CLI: {output:?}"
+            "Codex did not reach its public CLI: {output:?}"
         );
     }
 }

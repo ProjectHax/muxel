@@ -750,18 +750,18 @@ and an optional source fragment such as #L12C4, for example \
 label readable and never invent a target."
 }
 
-/// Encode additional Codex instructions as a one-run `--config` override.
+/// Add instructions through Codex's one-run `--config` override.
 ///
-/// Codex parses CLI config values as TOML. Passing this through argv keeps the
-/// instruction out of the visible conversation and does not consume a turn.
+/// An invalid TOML value is treated as a raw string by Codex. Keeping this
+/// value unquoted matters on Windows: npm's `codex.cmd` reparses argv and turns
+/// TOML's escaped inner quotes into shell syntax. A single line also avoids
+/// command-script newline handling without changing the instruction.
 pub fn codex_developer_instructions_override(instructions: &str) -> String {
-    let escaped = instructions
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t");
-    format!("developer_instructions=\"{escaped}\"")
+    let flattened = instructions
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("developer_instructions={flattened}")
 }
 
 /// Seed contents written when a project's `MEMORY.md` is first created. Delegates to
@@ -1002,10 +1002,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_developer_instructions_are_a_toml_config_override() {
+    fn codex_developer_instructions_use_a_batch_safe_raw_config_value() {
         assert_eq!(
             codex_developer_instructions_override("open \"D:\\dev\\x\"\nnext"),
-            "developer_instructions=\"open \\\"D:\\\\dev\\\\x\\\"\\nnext\""
+            "developer_instructions=open \"D:\\dev\\x\" next"
         );
     }
 
