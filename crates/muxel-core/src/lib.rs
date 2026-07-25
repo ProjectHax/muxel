@@ -21,8 +21,9 @@ pub mod worktree;
 
 pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
-    claude_session_path, codex_latest_session_id, codex_session_exists, memory_header,
-    memory_instruction, memory_reference, resolve_launch, session_resume_args,
+    claude_session_path, codex_latest_session_id, codex_session_exists,
+    codex_session_id_from_title, memory_header, memory_instruction, memory_reference,
+    resolve_launch, session_resume_args,
 };
 pub use appimage::foreign_muxel_appimage_mounts;
 pub use diff::{SplitRow, split_diff};
@@ -859,6 +860,74 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
                 }
             }
         }
+    }
+}
+
+/// Keep Codex approval policy in restored panes aligned with its current preset.
+///
+/// Instances snapshot launch arguments when created. Without this repair, changing
+/// Codex from `-a never` to `-a on-request` only affects new panes; restored panes
+/// silently keep the old policy.
+pub fn sync_codex_approval_args(workspace: &mut Workspace, presets: &[AgentPreset]) -> bool {
+    let mut changed = false;
+    for instance in &mut workspace.instances {
+        if !instance
+            .program
+            .as_deref()
+            .is_some_and(|program| program.to_ascii_lowercase().contains("codex"))
+        {
+            continue;
+        }
+        let Some(preset) = instance
+            .preset_id
+            .and_then(|id| presets.iter().find(|preset| preset.id == id))
+            .or_else(|| presets.iter().find(|preset| preset.name == instance.preset))
+        else {
+            continue;
+        };
+        let Some(policy) = preset
+            .compose_args()
+            .windows(2)
+            .find(|pair| pair[0] == "-a" || pair[0] == "--ask-for-approval")
+            .map(|pair| pair[1].clone())
+        else {
+            continue;
+        };
+        if let Some(index) = instance
+            .args
+            .iter()
+            .position(|arg| arg == "-a" || arg == "--ask-for-approval")
+            .filter(|index| index + 1 < instance.args.len())
+            && instance.args[index + 1] != policy
+        {
+            instance.args[index + 1] = policy;
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod codex_approval_sync_tests {
+    use super::*;
+
+    #[test]
+    fn restored_codex_pane_adopts_current_approval_policy() {
+        let mut preset = AgentPreset::codex();
+        preset.args = vec!["-a".into(), "on-request".into()];
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &preset);
+        instance.args = vec!["-a".into(), "never".into()];
+        let mut workspace = Workspace {
+            instances: vec![instance],
+            ..Workspace::default()
+        };
+
+        assert!(sync_codex_approval_args(&mut workspace, &[preset]));
+        assert_eq!(workspace.instances[0].args, ["-a", "on-request"]);
+        assert!(!sync_codex_approval_args(
+            &mut workspace,
+            &[AgentPreset::codex()]
+        ));
     }
 }
 
