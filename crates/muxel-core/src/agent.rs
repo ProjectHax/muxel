@@ -745,7 +745,7 @@ delete other entries, and don't repeat what's already there."
 /// System-prompt guidance for file citations muxel can open directly.
 pub fn file_link_instruction() -> &'static str {
     "When citing a local file, use a Markdown link with an absolute file:/// URI \
-and an optional #L<line>C<column> fragment, for example \
+and an optional source fragment such as #L12C4, for example \
 [browser.rs:112](file:///D:/dev/muxel/crates/muxel/src/browser.rs#L112). Keep the \
 label readable and never invent a target."
 }
