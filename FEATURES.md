@@ -283,6 +283,9 @@ feature is added or changed, update the matching entry here in the same change**
   workspace. Clicking into the page makes it the active pane — so paste and the
   toolbar act on the browser, not on whichever pane you were in before — and hands
   it the keyboard; muxel's own shortcuts keep working until you click into a page.
+  The toolbar can open the current page in the system browser. Native page context
+  menus remain usable, and WebView2 stores its profile under muxel's app-data
+  directory rather than beside the executable.
 - **Linux: a separate browser window** — gpui can't embed WebKitGTK, so links open
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.

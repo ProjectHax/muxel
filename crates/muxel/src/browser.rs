@@ -86,8 +86,10 @@ mod imp {
     /// page that stops propagation on its own handlers can't hide the click.
     const CLICK_SCRIPT: &str = r#"
         (function () {
-          window.addEventListener('mousedown', function () {
-            try { window.ipc.postMessage('muxel:page-click'); } catch (e) {}
+          window.addEventListener('mousedown', function (event) {
+            if (event.button === 0) {
+              try { window.ipc.postMessage('muxel:page-click'); } catch (e) {}
+            }
           }, true);
         })();
     "#;
@@ -147,20 +149,44 @@ mod imp {
             let (click_tx, clicks) = std::sync::mpsc::channel();
 
             cx.spawn_in(window, async move |this, cx| {
+                #[cfg(target_os = "windows")]
+                let mut web_context = muxel_store::data_dir().and_then(|dir| {
+                    let dir = dir.join("webview2");
+                    std::fs::create_dir_all(&dir)
+                        .ok()
+                        .map(|()| wry::WebContext::new(Some(dir)))
+                });
+
                 let built = match parent.as_ref() {
-                    Some(parent) => wry::WebViewBuilder::new()
-                        .with_url(&requested)
-                        .with_initialization_script(CLICK_SCRIPT)
-                        .with_ipc_handler(move |req| {
-                            if req.body().as_str() == CLICK_MSG {
-                                // The receiver is dropped with the pane; a click
-                                // arriving after that is simply nobody's business.
-                                let _ = click_tx.send(());
-                            }
-                        })
-                        .build_as_child_async(parent)
-                        .await
-                        .ok(),
+                    Some(parent) => {
+                        #[cfg(target_os = "windows")]
+                        let Some(builder) = web_context
+                            .as_mut()
+                            .map(wry::WebViewBuilder::new_with_web_context)
+                        else {
+                            let _ = this.update_in(cx, |this, _window, cx| {
+                                this.webview_failed = true;
+                                cx.notify();
+                            });
+                            return;
+                        };
+                        #[cfg(target_os = "macos")]
+                        let builder = wry::WebViewBuilder::new();
+
+                        builder
+                            .with_url(&requested)
+                            .with_initialization_script(CLICK_SCRIPT)
+                            .with_ipc_handler(move |req| {
+                                if req.body().as_str() == CLICK_MSG {
+                                    // The receiver is dropped with the pane; a click
+                                    // arriving after that is simply nobody's business.
+                                    let _ = click_tx.send(());
+                                }
+                            })
+                            .build_as_child_async(parent)
+                            .await
+                            .ok()
+                    }
                     None => None,
                 };
 
@@ -260,6 +286,10 @@ mod imp {
             self.history_go(1, cx);
         }
 
+        pub fn open_external(&self, cx: &mut Context<Self>) {
+            cx.open_url(&self.url);
+        }
+
         pub fn tab_title(&self) -> String {
             super::tab_label(&self.url)
         }
@@ -350,6 +380,14 @@ mod imp {
                         .icon(Icon::empty().path("icons/refresh.svg"))
                         .tooltip(t("Reload this page"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.reload(cx))),
+                )
+                .child(
+                    Button::new("browser-open-external")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ExternalLink)
+                        .tooltip(t("Open in system browser"))
+                        .on_click(cx.listener(|this, _e, _w, cx| this.open_external(cx))),
                 )
                 .child(div().flex_1().child(Input::new(&self.address)));
 
