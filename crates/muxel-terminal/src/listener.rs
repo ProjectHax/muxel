@@ -20,6 +20,9 @@ pub(crate) type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 pub(crate) struct MuxelListener {
     pub writer: SharedWriter,
     pub title: Arc<Mutex<Option<String>>>,
+    /// Latest UUID-shaped OSC title published by the child. Agent UIs may replace
+    /// it with a human title immediately or switch sessions in-place.
+    pub session_id_hint: Arc<Mutex<Option<String>>>,
     pub bell: Arc<AtomicBool>,
     /// OSC-52 copies from the child, drained by the view onto the system
     /// clipboard (a clipboard write needs a gpui context this thread lacks).
@@ -40,7 +43,13 @@ impl MuxelListener {
 impl EventListener for MuxelListener {
     fn send_event(&self, event: Event) {
         match event {
-            Event::Title(title) => *self.title.lock() = Some(title),
+            Event::Title(title) => {
+                let mut hint = self.session_id_hint.lock();
+                if uuid::Uuid::parse_str(title.trim()).is_ok() {
+                    *hint = Some(title.trim().to_string());
+                }
+                *self.title.lock() = Some(title);
+            }
             Event::ResetTitle => *self.title.lock() = None,
             Event::Bell => self.bell.store(true, Ordering::Relaxed),
             // Apps query the terminal (cursor position, device attributes, …);
@@ -77,5 +86,32 @@ impl EventListener for MuxelListener {
             // text-area pixel size for CSI 14t) are intentionally unhandled.
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_title_hint_follows_an_in_place_session_switch() {
+        let hint = Arc::new(Mutex::new(None));
+        let listener = MuxelListener {
+            writer: Arc::new(Mutex::new(Box::new(Vec::<u8>::new()))),
+            title: Arc::new(Mutex::new(None)),
+            session_id_hint: hint.clone(),
+            bell: Arc::new(AtomicBool::new(false)),
+            clipboard_store: Arc::new(Mutex::new(Vec::new())),
+            palette: Arc::new(Mutex::new(TerminalPalette::default())),
+        };
+        let first = "019f95d7-db31-7db0-904d-9e08330e0000";
+        let resumed = "019f95d7-db31-7db0-904d-9e08330e0001";
+
+        listener.send_event(Event::Title(first.to_string()));
+        listener.send_event(Event::Title("Review changes".to_string()));
+        assert_eq!(hint.lock().as_deref(), Some(first));
+
+        listener.send_event(Event::Title(resumed.to_string()));
+        assert_eq!(hint.lock().as_deref(), Some(resumed));
     }
 }
