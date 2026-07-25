@@ -8,6 +8,63 @@
 
 use std::path::{Path, PathBuf};
 
+/// A logical line reconstructed from terminal rows, plus the clicked row's
+/// location inside it so a match can be painted back onto that row.
+pub struct StitchedRows {
+    pub chars: Vec<char>,
+    pub clicked_col: usize,
+    pub row_base: usize,
+    pub row_start: usize,
+    pub row_len: usize,
+}
+
+/// Join rows selected as one visual token.
+///
+/// A terminal soft wrap preserves every column. A TUI-generated hard wrap has
+/// already inserted a real row break, often with a right margin and hanging
+/// indent, so its previous row is right-trimmed and its continuation left-trimmed.
+pub fn stitch_rows(
+    rows: &[(Vec<char>, bool)],
+    clicked_row: usize,
+    clicked_col: usize,
+) -> StitchedRows {
+    let mut chars = Vec::new();
+    let mut row_base = 0;
+    let mut row_start = 0;
+    let mut row_len = 0;
+    for (index, (row, soft_wraps_to_next)) in rows.iter().enumerate() {
+        let hard_continuation = index > 0 && !rows[index - 1].1;
+        let start = if hard_continuation {
+            row.iter()
+                .position(|c| !c.is_whitespace())
+                .unwrap_or(row.len())
+        } else {
+            0
+        };
+        let end = if *soft_wraps_to_next {
+            row.len()
+        } else {
+            row.iter()
+                .rposition(|c| !c.is_whitespace())
+                .map(|column| column + 1)
+                .unwrap_or(start)
+        };
+        if index == clicked_row {
+            row_base = chars.len();
+            row_start = start;
+            row_len = end.saturating_sub(start);
+        }
+        chars.extend(row[start..end].iter().copied());
+    }
+    StitchedRows {
+        clicked_col: row_base + clicked_col.saturating_sub(row_start),
+        chars,
+        row_base,
+        row_start,
+        row_len,
+    }
+}
+
 /// Does the text starting at `i` begin a supported URI scheme?
 fn starts_scheme(line: &[char], i: usize) -> bool {
     const SCHEMES: [&[char]; 3] = [
@@ -304,7 +361,7 @@ pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
 mod tests {
     use super::{
         file_uri, markdown_link_at, path_from_file_uri, path_span_at, path_spans, resolve_path,
-        source_fragment, url_span_at, url_spans,
+        source_fragment, stitch_rows, url_span_at, url_spans,
     };
     use std::path::{Path, PathBuf};
 
@@ -370,6 +427,38 @@ mod tests {
         let line = chars("https://a.com/1 and https://b.com/2");
         assert_eq!(url_spans(&line).len(), 2);
         assert_eq!(find_url_at(&line, 25).as_deref(), Some("https://b.com/2"));
+    }
+
+    #[test]
+    fn stitches_claude_hanging_indent_url_without_margin_spaces() {
+        let rows = vec![
+            (chars("  Published https://claude.ai/c      "), false),
+            (chars("    ode/artifact/dd8e7386-edf1     "), false),
+            (chars("    -4ead-915a-1272481f3b7c        "), false),
+        ];
+        let stitched = stitch_rows(&rows, 0, 20);
+        assert_eq!(
+            url_span_at(&stitched.chars, stitched.clicked_col)
+                .map(|(_, _, url)| url)
+                .as_deref(),
+            Some("https://claude.ai/code/artifact/dd8e7386-edf1-4ead-915a-1272481f3b7c")
+        );
+    }
+
+    #[test]
+    fn stitches_claude_hanging_indent_file_uri() {
+        let rows = vec![
+            (chars("file:///D:/temp/windows/claude/D--dev-   "), false),
+            (chars("    moxie/a7962661/scratchpad/off-by-   "), false),
+            (chars("    one.html                            "), false),
+        ];
+        let stitched = stitch_rows(&rows, 1, 12);
+        assert_eq!(
+            url_span_at(&stitched.chars, stitched.clicked_col)
+                .map(|(_, _, url)| url)
+                .as_deref(),
+            Some("file:///D:/temp/windows/claude/D--dev-moxie/a7962661/scratchpad/off-by-one.html")
+        );
     }
 
     // ---- file paths ----

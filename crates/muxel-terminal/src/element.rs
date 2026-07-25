@@ -955,6 +955,12 @@ fn link_at(
                 .find(|&column| !grid[GridPoint::new(line, Column(column))].c.is_whitespace())
                 .unwrap_or(columns)
         };
+        let last_text_column = |line: Line| {
+            (0..columns)
+                .rfind(|&column| !grid[GridPoint::new(line, Column(column))].c.is_whitespace())
+                .map(|column| column + 1)
+                .unwrap_or(0)
+        };
         let continues_into = |line: Line| {
             if line >= grid.bottommost_line() {
                 return false;
@@ -965,14 +971,24 @@ fn link_at(
             {
                 return true;
             }
-            // Claude and other TUIs sometimes perform their own wrapping, leaving
-            // real grid rows instead of WRAPLINE rows. Accept a small hanging
-            // indent only when the prior row reaches the edge. File existence
-            // remains the final guard for path candidates.
+            // Claude and other TUIs wrap inside a narrower content box, leaving a
+            // right margin and a small hanging indent. These are real grid rows,
+            // not WRAPLINE rows. Candidate parsing and file existence remain the
+            // guards against joining unrelated text.
             let next_text = first_text_column(line + 1);
-            !grid[GridPoint::new(line, last_column)].c.is_whitespace()
-                && next_text <= 8
-                && next_text < columns
+            let end = last_text_column(line);
+            if end == 0 || next_text > 12 || next_text >= columns {
+                return false;
+            }
+            let chars: Vec<char> = (0..end)
+                .map(|column| grid[GridPoint::new(line, Column(column))].c)
+                .collect();
+            crate::links::url_spans(&chars)
+                .into_iter()
+                .any(|(_, span_end)| span_end == end)
+                || crate::links::path_spans(&chars)
+                    .into_iter()
+                    .any(|(_, span_end, _)| span_end == end)
         };
         let mut first_line = point.line;
         while first_line > grid.topmost_line()
@@ -985,30 +1001,25 @@ fn link_at(
         while continues_into(last_line) && last_line.0 - point.line.0 < 8 {
             last_line += 1;
         }
-        let mut chars = Vec::new();
-        let mut row_base = 0;
-        let mut row_start = 0;
-        for line_number in first_line.0..=last_line.0 {
-            let line = Line(line_number);
-            let start = if line > first_line
-                && !grid[GridPoint::new(line - 1, last_column)]
+        let rows: Vec<(Vec<char>, bool)> = (first_line.0..=last_line.0)
+            .map(|line_number| {
+                let line = Line(line_number);
+                let chars = (0..columns)
+                    .map(|column| grid[GridPoint::new(line, Column(column))].c)
+                    .collect();
+                let soft_wrap = grid[GridPoint::new(line, last_column)]
                     .flags
-                    .contains(Flags::WRAPLINE)
-            {
-                first_text_column(line)
-            } else {
-                0
-            };
-            if line == point.line {
-                row_base = chars.len();
-                row_start = start;
-            }
-            chars.extend(
-                (start..columns).map(|column| grid[GridPoint::new(line, Column(column))].c),
-            );
-        }
-        let logical_column = row_base + point.column.0.saturating_sub(row_start);
-        let row_len = columns - row_start;
+                    .contains(Flags::WRAPLINE);
+                (chars, soft_wrap)
+            })
+            .collect();
+        let clicked_row = (point.line.0 - first_line.0) as usize;
+        let stitched = crate::links::stitch_rows(&rows, clicked_row, point.column.0);
+        let chars = stitched.chars;
+        let logical_column = stitched.clicked_col;
+        let row_base = stitched.row_base;
+        let row_start = stitched.row_start;
+        let row_len = stitched.row_len;
         let hovered = |start: usize, end: usize, url: String| HoveredLink {
             line: point.line.0,
             start: start.max(row_base) - row_base + row_start,
