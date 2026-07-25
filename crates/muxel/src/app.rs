@@ -276,6 +276,53 @@ fn shell_dir_title(osc: &str) -> &str {
     }
 }
 
+/// Ignore the transient command-shell title shown before an agent emits its own
+/// OSC title. Let the instance's preset/auto fallback render during startup.
+fn terminal_auto_title(instance: &Instance, title: &str) -> Option<String> {
+    if !muxel_core::is_useful_auto_name(title) {
+        return None;
+    }
+    let leaf = title
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let program_leaf = instance.program.as_deref().map(|program| {
+        program
+            .trim()
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    });
+    if program_leaf.as_deref() == Some(leaf.as_str()) {
+        return None;
+    }
+    if instance.program.is_some()
+        && matches!(
+            leaf.as_str(),
+            "cmd"
+                | "cmd.exe"
+                | "powershell"
+                | "powershell.exe"
+                | "pwsh"
+                | "pwsh.exe"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "fish"
+        )
+    {
+        return None;
+    }
+    Some(if instance.program.is_none() {
+        shell_dir_title(title).to_string()
+    } else {
+        title.to_string()
+    })
+}
+
 /// Terminal as a **cached** view element. Without `.cached(...)`, every window
 /// frame re-renders and re-paints every visible terminal (GPUI multipaint). With
 /// it, siblings reuse last frame's paint until that view's `cx.notify()` (or a
@@ -762,6 +809,18 @@ enum RenameTarget {
     File(PathBuf),
 }
 
+/// The view which owns the shared inline rename input. A GPUI entity must not
+/// be rendered in two places in the same frame.
+#[derive(Clone, Copy, PartialEq)]
+enum RenameOrigin {
+    FileBrowser,
+    PaneTab,
+    PaneWorktree(Uuid),
+    WorktreeHeader,
+    ProjectSidebar,
+    InstanceSidebar,
+}
+
 /// Drag payload for reordering projects in the sidebar.
 #[derive(Clone)]
 struct DragProject {
@@ -1212,7 +1271,11 @@ pub struct MuxelApp {
     bounds_save_task: Option<Task<()>>,
     /// Inline rename editor: the target being renamed + the shared input widget.
     rename: Option<RenameTarget>,
+    rename_origin: Option<RenameOrigin>,
     rename_input: Entity<InputState>,
+    /// A changed OSC title is held briefly so chatty programs do not rewrite the
+    /// workspace file for every intermediate title.
+    auto_name_save_due: Option<Instant>,
     /// Projects whose instance list is collapsed in the sidebar.
     collapsed: HashSet<Uuid>,
     /// Scroll position for the settings content area (drives the scrollbar).
@@ -2744,7 +2807,14 @@ impl MuxelApp {
         cx.subscribe_in(
             &rename_input,
             window,
-            |this, _input, ev: &InputEvent, _window, cx| match ev {
+            |this, input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::Focus if this.rename.is_some() => {
+                    input.read(cx).focus_handle(cx).dispatch_action(
+                        &gpui_component::input::SelectAll,
+                        window,
+                        cx,
+                    );
+                }
                 InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_rename(cx),
                 _ => {}
             },
@@ -2977,7 +3047,9 @@ impl MuxelApp {
             show_settings: false,
             settings_ui,
             rename: None,
+            rename_origin: None,
             rename_input,
+            auto_name_save_due: None,
             collapsed: HashSet::new(),
             settings_scroll: ScrollHandle::new(),
             panes_scroll: HashMap::new(),
@@ -3097,15 +3169,16 @@ impl MuxelApp {
             find_contents: Vec::new(),
         };
 
-        // muxel keeps the tmux server alive with `exit-empty off` (see
-        // `ensure_tmux_server`); hand it back so it exits with its last session.
-        if cfg!(unix) {
-            cx.on_app_quit(|_this, _cx| {
+        // Flush any coalesced auto-title before shutdown. On Unix, muxel also
+        // hands tmux's exit policy back so it exits with its last session.
+        cx.on_app_quit(|this, _cx| {
+            this.persist();
+            if cfg!(unix) {
                 integrations::restore_tmux_exit_empty();
-                async {}
-            })
-            .detach();
-        }
+            }
+            async {}
+        })
+        .detach();
 
         // Terminate a popped-out terminal when the user closes its window.
         let weak = cx.weak_entity();
@@ -4225,17 +4298,31 @@ impl MuxelApp {
     /// Persist the current workspace to disk. A failure lands in the
     /// NOTIFICATIONS feed (deduped — this runs on nearly every interaction).
     fn persist(&mut self) {
+        self.try_persist();
+    }
+
+    /// Persist and report whether the write completed. Workspace switching uses
+    /// this to avoid discarding an unsaved auto-title on a failed flush.
+    fn try_persist(&mut self) -> bool {
         let Some(id) = self.current_workspace else {
-            return; // no workspace chosen yet (selector still open)
+            return true; // no workspace chosen yet (selector still open)
         };
         let Some(path) = muxel_store::workspace_doc_path(id) else {
-            return;
+            return false;
         };
         match muxel_store::save_workspace_to(&path, &self.workspace) {
-            Ok(()) => self.clear_save_error(SaveTarget::Workspace),
+            Ok(()) => {
+                self.auto_name_save_due = None;
+                self.clear_save_error(SaveTarget::Workspace);
+                true
+            }
             Err(e) => {
                 log::warn!("failed to save workspace: {e}");
                 self.report_save_error(SaveTarget::Workspace, format!("{}: {e:#}", path.display()));
+                if self.auto_name_save_due.is_some() {
+                    self.auto_name_save_due = Some(Instant::now() + Duration::from_secs(3));
+                }
+                false
             }
         }
     }
@@ -4262,6 +4349,11 @@ impl MuxelApp {
             return;
         };
         self.workspace_busy = None;
+        if self.auto_name_save_due.is_some() && !self.try_persist() {
+            self.show_workspace_selector = true;
+            cx.notify();
+            return;
+        }
         // Replacing the handle drops the previous workspace's lock, freeing it for
         // another process to open.
         self.workspace_lock = Some(lock);
@@ -5613,6 +5705,35 @@ impl MuxelApp {
             self.persist();
         }
 
+        // Keep the program-supplied name for restart/resume UI. A manual name is
+        // stored separately and always wins at render time.
+        let names: Vec<(Uuid, Option<String>)> = self
+            .terminals
+            .iter()
+            .map(|(iid, view)| (*iid, view.read(cx).title()))
+            .collect();
+        let mut name_changed = false;
+        for (iid, name) in names {
+            let Some(instance) = self.workspace.instance(iid) else {
+                continue;
+            };
+            let Some(name) = name.and_then(|name| terminal_auto_title(instance, &name)) else {
+                continue;
+            };
+            if let Some(inst) = self.workspace.instance_mut(iid) {
+                name_changed |= inst.update_auto_name(name);
+            }
+        }
+        if name_changed && self.auto_name_save_due.is_none() {
+            self.auto_name_save_due = Some(Instant::now() + Duration::from_secs(3));
+            cx.notify();
+        } else if self
+            .auto_name_save_due
+            .is_some_and(|due| Instant::now() >= due)
+        {
+            self.persist();
+        }
+
         // Keep browser panes' URL fresh (the user clicks links inside the
         // webview): syncs the address bar, tab label, and the persisted
         // `Instance.browser_url` so a restart restores where they ended up.
@@ -5695,7 +5816,9 @@ impl MuxelApp {
                         })
                         && v.screen_has("No conversation found");
                 let inst = self.workspace.instance(*iid);
-                let title = inst.map(|i| i.title.clone()).unwrap_or_default();
+                let title = inst
+                    .map(|i| i.display_name().to_string())
+                    .unwrap_or_default();
                 let project = inst
                     .and_then(|i| self.workspace.project(i.project_id))
                     .map(|p| p.name.clone())
@@ -7393,11 +7516,7 @@ impl MuxelApp {
             .instances
             .iter()
             .map(|i| {
-                let label = i
-                    .custom_name
-                    .clone()
-                    .filter(|c| !c.is_empty())
-                    .unwrap_or_else(|| i.title.clone());
+                let label = i.display_name().to_string();
                 (i.id, label, Some(i.project_id) == active_pid)
             })
             .collect();
@@ -7943,7 +8062,10 @@ impl MuxelApp {
         // Durable trace of every close: with stderr often discarded, this log is
         // what distinguishes "I closed it" from "it vanished" after the fact.
         if let Some(inst) = self.workspace.instance(iid) {
-            muxel_store::append_event_log(&format!("{reason}: \"{}\" [{iid}]", inst.title));
+            muxel_store::append_event_log(&format!(
+                "{reason}: \"{}\" [{iid}]",
+                inst.display_name()
+            ));
         }
         let pid = self.workspace.instance(iid).map(|i| i.project_id);
         // If `iid` is one of several tabs in its pane, which tab survives as
@@ -8697,6 +8819,11 @@ impl MuxelApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let local_auto_names: HashMap<Uuid, String> = local
+            .instances
+            .iter()
+            .filter_map(|instance| instance.auto_name.clone().map(|name| (instance.id, name)))
+            .collect();
         self.backup_local_layout(pid, &local, remote.updated_at);
 
         // Light teardown: drop the local views (kill the ssh client / local PTY),
@@ -8734,6 +8861,12 @@ impl MuxelApp {
         }
         for inst in &mut instances {
             inst.project_id = pid;
+            // auto_name is local observation state and is excluded from layout
+            // conflict detection. A structural pull must not replace a newer
+            // local observation with stale peer JSON.
+            if let Some(name) = local_auto_names.get(&inst.id) {
+                inst.auto_name = Some(name.clone());
+            }
         }
         for wt in &mut worktrees {
             wt.project_id = pid;
@@ -10319,7 +10452,7 @@ impl MuxelApp {
         let title = self
             .workspace
             .instance(iid)
-            .map(|i| i.custom_name.clone().unwrap_or_else(|| i.title.clone()))
+            .map(|i| i.display_name().to_string())
             .unwrap_or_else(|| "muxel".to_string());
 
         // The PaneView is built inside the window closure (so its input focus
@@ -10646,7 +10779,7 @@ impl MuxelApp {
             let name = self
                 .workspace
                 .instance(iid)
-                .map(|i| i.custom_name.clone().unwrap_or_else(|| i.title.clone()))
+                .map(|i| i.display_name().to_string())
                 .unwrap_or_else(|| tf("this {noun}", &[("noun", &noun)]));
             self.request_confirm(
                 tf("Close {noun}?", &[("noun", &noun)]),
@@ -11012,6 +11145,11 @@ impl MuxelApp {
         inst.id = Uuid::new_v4();
         inst.tmux_session = None;
         inst.pinned = false; // a duplicate starts unpinned
+        // A pane owns one resumable conversation. Reusing the source session id
+        // lets two live Claudes create branches in one transcript; after restart
+        // there is only one resumable id, so one pane appears to vanish. Start the
+        // duplicate with its own id instead.
+        inst.reset_conversation_for_duplicate();
         // A duplicate shares the original's worktree (its worktree_id/path/branch
         // came across in the clone); we do NOT create a fresh one.
         if inst.use_tmux {
@@ -11785,13 +11923,19 @@ impl MuxelApp {
         cx.notify();
     }
 
-    fn start_rename_instance(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_rename_instance(
+        &mut self,
+        iid: Uuid,
+        origin: RenameOrigin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let current = self
             .workspace
             .instance(iid)
-            .and_then(|i| i.custom_name.clone())
+            .map(|i| i.display_name().to_string())
             .unwrap_or_default();
-        self.start_rename(RenameTarget::Instance(iid), current, window, cx);
+        self.start_rename(RenameTarget::Instance(iid), origin, current, window, cx);
     }
 
     fn start_rename_project(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -11800,37 +11944,52 @@ impl MuxelApp {
             .project(pid)
             .map(|p| p.name.clone())
             .unwrap_or_default();
-        self.start_rename(RenameTarget::Project(pid), current, window, cx);
+        self.start_rename(
+            RenameTarget::Project(pid),
+            RenameOrigin::ProjectSidebar,
+            current,
+            window,
+            cx,
+        );
     }
 
-    fn start_rename_worktree(&mut self, wid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_rename_worktree(
+        &mut self,
+        wid: Uuid,
+        origin: RenameOrigin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let current = self
             .workspace
             .worktree(wid)
             .map(|w| w.name.clone())
             .unwrap_or_default();
-        self.start_rename(RenameTarget::Worktree(wid), current, window, cx);
+        self.start_rename(RenameTarget::Worktree(wid), origin, current, window, cx);
     }
 
     fn start_rename(
         &mut self,
         target: RenameTarget,
+        origin: RenameOrigin,
         current: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.rename = Some(target);
+        self.rename_origin = Some(origin);
         self.rename_input
             .update(cx, |s, cx| s.set_value(current, window, cx));
         let handle = self.rename_input.read(cx).focus_handle(cx);
-        window.focus(&handle, cx);
         cx.notify();
+        window.defer(cx, move |window, cx| handle.focus(window, cx));
     }
 
     fn commit_rename(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.rename.take() else {
             return;
         };
+        self.rename_origin = None;
         let value = self.rename_input.read(cx).value().trim().to_string();
         match target {
             RenameTarget::Instance(iid) => {
@@ -11901,6 +12060,7 @@ impl MuxelApp {
 
     fn cancel_rename(&mut self, cx: &mut Context<Self>) {
         self.rename = None;
+        self.rename_origin = None;
         cx.notify();
     }
 
@@ -12014,10 +12174,7 @@ impl MuxelApp {
                     .project(inst.project_id)
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
-                let name = inst
-                    .custom_name
-                    .clone()
-                    .unwrap_or_else(|| inst.title.clone());
+                let name = inst.display_name().to_string();
                 let status = self
                     .last_status
                     .get(iid)
@@ -12680,12 +12837,12 @@ impl MuxelApp {
                                     }
                                 },
                             ))
-                            .on_mouse_down_out(
-                                window.listener_for(&entity, |this, _ev, _w, cx| {
-                                    this.commit_rename(cx)
-                                }),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&rename_input).w_full().min_w_0()),
                             )
-                            .child(div().flex_1().child(Input::new(&rename_input)))
                             .into_any_element();
                     }
                     let icon = if is_dir {
@@ -12832,6 +12989,7 @@ impl MuxelApp {
                                                 move |this, _e, window, cx| {
                                                     this.start_rename(
                                                         RenameTarget::File(ren.clone()),
+                                                        RenameOrigin::FileBrowser,
                                                         row_name.clone(),
                                                         window,
                                                         cx,
@@ -12903,14 +13061,12 @@ impl MuxelApp {
     /// A tab/pane's display name: the user's custom name if set, else the
     /// editor's file name; for a **shell** the live working directory (its OSC
     /// title with any `user@host:` prefix stripped — handier than a static
-    /// "Shell"); for an **agent** the static preset name, which deliberately does
-    /// NOT follow the OSC title an agent rewrites as it works, so the tab keeps a
-    /// stable name until renamed.
+    /// "Shell"); for an **agent** the last persisted program-supplied title.
     fn instance_title(&self, iid: Uuid, cx: &App) -> SharedString {
         let inst = self.workspace.instance(iid);
         if let Some(c) = inst
             .and_then(|i| i.custom_name.clone())
-            .filter(|c| !c.is_empty())
+            .filter(|c| !c.trim().is_empty())
         {
             return c.into();
         }
@@ -12920,14 +13076,26 @@ impl MuxelApp {
         if let Some(bv) = self.browsers.get(&iid) {
             return bv.read(cx).tab_title().into();
         }
-        // A shell (no agent program) shows its current directory from the live
-        // terminal title; an agent keeps its static preset name.
-        if inst.is_some_and(|i| i.program.is_none())
-            && let Some(osc) = self.terminals.get(&iid).and_then(|v| v.read(cx).title())
+        if let Some(osc) = self
+            .terminals
+            .get(&iid)
+            .and_then(|v| v.read(cx).title())
+            .and_then(|title| inst.and_then(|instance| terminal_auto_title(instance, &title)))
         {
-            return shell_dir_title(&osc).to_string().into();
+            return osc.into();
         }
-        inst.map(|i| i.title.clone()).unwrap_or_default().into()
+        if let Some(instance) = inst {
+            if instance.program.is_none()
+                && let Some(auto_name) = instance
+                    .auto_name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+            {
+                return shell_dir_title(auto_name).to_string().into();
+            }
+            return instance.display_name().to_string().into();
+        }
+        SharedString::default()
     }
 
     /// The worktree shared by ALL of `tabs` (None if mixed or none) — drives the
@@ -13404,7 +13572,9 @@ impl MuxelApp {
                         };
 
                         // Renaming: swap the title for the shared rename input.
-                        if self.rename == Some(RenameTarget::Instance(tab)) {
+                        if self.rename == Some(RenameTarget::Instance(tab))
+                            && self.rename_origin == Some(RenameOrigin::PaneTab)
+                        {
                             return div()
                                 .id(SharedString::from(format!("tab-{}", tab.simple())))
                                 .flex()
@@ -13412,7 +13582,8 @@ impl MuxelApp {
                                 .gap_1()
                                 .px_1()
                                 .h_full()
-                                .max_w(px(180.0))
+                                .w(px(180.0))
+                                .flex_none()
                                 .border_r_1()
                                 .border_color(cx.theme().border)
                                 .bg(pill_bg)
@@ -13421,15 +13592,17 @@ impl MuxelApp {
                                         this.cancel_rename(cx);
                                     }
                                 }))
-                                .on_mouse_down_out(
-                                    cx.listener(|this, _ev, _w, cx| this.commit_rename(cx)),
-                                )
                                 .child(agent_icon(
                                     tab_program.as_deref(),
                                     px(12.0),
                                     cx.theme().muted_foreground,
                                 ))
-                                .child(div().flex_1().child(Input::new(&self.rename_input)))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                                )
                                 .into_any_element();
                         }
 
@@ -13509,7 +13682,12 @@ impl MuxelApp {
                                                 .on_click(window.listener_for(
                                                     &entity,
                                                     move |this, _, window, cx| {
-                                                        this.start_rename_instance(tab, window, cx)
+                                                        this.start_rename_instance(
+                                                            tab,
+                                                            RenameOrigin::PaneTab,
+                                                            window,
+                                                            cx,
+                                                        )
                                                     },
                                                 )),
                                         )
@@ -13586,7 +13764,12 @@ impl MuxelApp {
                                                 .on_click(window.listener_for(
                                                     &entity,
                                                     move |this, _, window, cx| {
-                                                        this.start_rename_worktree(wid, window, cx)
+                                                        this.start_rename_worktree(
+                                                            wid,
+                                                            RenameOrigin::PaneWorktree(anchor),
+                                                            window,
+                                                            cx,
+                                                        )
                                                     },
                                                 )),
                                         )
@@ -13787,7 +13970,8 @@ impl MuxelApp {
                     // Uniform pane: a worktree badge (dot + name) before controls.
                     // Double-click the name (or the pill menu) to rename it.
                     .children(strip_wt.clone().map(|(c, name, wid)| {
-                        let renaming = self.rename == Some(RenameTarget::Worktree(wid));
+                        let renaming = self.rename == Some(RenameTarget::Worktree(wid))
+                            && self.rename_origin == Some(RenameOrigin::PaneWorktree(anchor));
                         let badge = div()
                             .flex_none()
                             .flex()
@@ -13805,10 +13989,12 @@ impl MuxelApp {
                                         this.cancel_rename(cx);
                                     }
                                 }))
-                                .on_mouse_down_out(
-                                    cx.listener(|this, _ev, _w, cx| this.commit_rename(cx)),
+                                .child(
+                                    div()
+                                        .w(px(110.0))
+                                        .min_w_0()
+                                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
                                 )
-                                .child(div().w(px(110.0)).child(Input::new(&self.rename_input)))
                                 .into_any_element()
                         } else {
                             badge
@@ -13818,7 +14004,12 @@ impl MuxelApp {
                                     MouseButton::Left,
                                     cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                                         if ev.click_count >= 2 {
-                                            this.start_rename_worktree(wid, window, cx);
+                                            this.start_rename_worktree(
+                                                wid,
+                                                RenameOrigin::PaneWorktree(anchor),
+                                                window,
+                                                cx,
+                                            );
                                         }
                                     }),
                                 )
@@ -14355,7 +14546,9 @@ impl MuxelApp {
                 );
             for iid in project.instances() {
                 let inst = self.workspace.instance(iid);
-                let title = inst.map(|i| i.title.clone()).unwrap_or_default();
+                let title = inst
+                    .map(|i| i.display_name().to_string())
+                    .unwrap_or_default();
                 let program = inst.and_then(|i| i.program.clone());
                 let status = self.terminals.get(&iid).map(|v| v.read(cx).status());
                 let color = status
@@ -14430,15 +14623,21 @@ impl MuxelApp {
             .items_center()
             .gap_2()
             .child(div().size(px(7.0)).rounded_full().flex_none().bg(color));
-        if self.rename == Some(RenameTarget::Worktree(wid)) {
+        if self.rename == Some(RenameTarget::Worktree(wid))
+            && self.rename_origin == Some(RenameOrigin::WorktreeHeader)
+        {
             return base
                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
                     if ev.keystroke.key == "escape" {
                         this.cancel_rename(cx);
                     }
                 }))
-                .on_mouse_down_out(cx.listener(|this, _ev, _w, cx| this.commit_rename(cx)))
-                .child(div().flex_1().child(Input::new(&self.rename_input)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                )
                 .into_any_element();
         }
         let entity = entity.clone();
@@ -14448,7 +14647,7 @@ impl MuxelApp {
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                     if ev.click_count >= 2 {
-                        this.start_rename_worktree(wid, window, cx);
+                        this.start_rename_worktree(wid, RenameOrigin::WorktreeHeader, window, cx);
                     }
                 }),
             )
@@ -14545,7 +14744,12 @@ impl MuxelApp {
                         PopupMenuItem::new(t("Rename worktree"))
                             .icon(Icon::empty().path("icons/pencil.svg"))
                             .on_click(window.listener_for(&entity, move |this, _, window, cx| {
-                                this.start_rename_worktree(wid, window, cx)
+                                this.start_rename_worktree(
+                                    wid,
+                                    RenameOrigin::WorktreeHeader,
+                                    window,
+                                    cx,
+                                )
                             })),
                     )
                     .item(
@@ -15207,7 +15411,8 @@ impl MuxelApp {
             let is_first = ix == 0;
             let is_last = ix + 1 == project_count;
             let collapsed = self.collapsed.contains(&pid);
-            let renaming = self.rename == Some(RenameTarget::Project(pid));
+            let renaming = self.rename == Some(RenameTarget::Project(pid))
+                && self.rename_origin == Some(RenameOrigin::ProjectSidebar);
             let name: SharedString = project.name.clone().into();
             let has_startup = !project.startup.is_empty();
             let memory_on = project.memory_enabled;
@@ -15278,8 +15483,12 @@ impl MuxelApp {
                         this.cancel_rename(cx);
                     }
                 }))
-                .on_mouse_down_out(cx.listener(|this, _ev, _w, cx| this.commit_rename(cx)))
-                .child(div().flex_1().child(Input::new(&self.rename_input)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                )
                 .into_any_element()
             } else {
                 base.cursor_pointer()
@@ -15797,15 +16006,19 @@ impl MuxelApp {
                     let program = inst.and_then(|i| i.program.clone());
                     let custom = inst
                         .and_then(|i| i.custom_name.clone())
-                        .filter(|c| !c.is_empty());
-                    let meta = inst.map(|i| i.title.clone()).unwrap_or_default();
+                        .filter(|c| !c.trim().is_empty());
+                    let meta = inst
+                        .map(|i| i.display_name().to_string())
+                        .unwrap_or_default();
                     let (app_title, status) = if let Some(view) = self.terminals.get(&iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
                         // Agent titles have no such prefix and pass through unchanged.
                         (
                             view.title()
-                                .map(|t| shell_dir_title(&t).to_string())
+                                .and_then(|title| {
+                                    inst.and_then(|instance| terminal_auto_title(instance, &title))
+                                })
                                 .unwrap_or(meta),
                             view.status(),
                         )
@@ -15824,7 +16037,8 @@ impl MuxelApp {
                     };
                     let ghost_label: SharedString = display.clone().into();
                     let is_sel = self.active_instance == Some(iid);
-                    let renaming = self.rename == Some(RenameTarget::Instance(iid));
+                    let renaming = self.rename == Some(RenameTarget::Instance(iid))
+                        && self.rename_origin == Some(RenameOrigin::InstanceSidebar);
                     let hover_col = cx.theme().sidebar_accent.opacity(0.45);
                     let drop_hl = cx.theme().primary.opacity(0.3);
                     let mut base = div()
@@ -15861,8 +16075,12 @@ impl MuxelApp {
                                 this.cancel_rename(cx);
                             }
                         }))
-                        .on_mouse_down_out(cx.listener(|this, _ev, _w, cx| this.commit_rename(cx)))
-                        .child(div().flex_1().child(Input::new(&self.rename_input)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&self.rename_input).w_full().min_w_0()),
+                        )
                         .into_any_element()
                     } else {
                         base.cursor_pointer()
@@ -15873,7 +16091,12 @@ impl MuxelApp {
                             // renames (like before).
                             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                                 if matches!(ev, ClickEvent::Mouse(e) if e.up.click_count >= 2) {
-                                    this.start_rename_instance(iid, window, cx);
+                                    this.start_rename_instance(
+                                        iid,
+                                        RenameOrigin::InstanceSidebar,
+                                        window,
+                                        cx,
+                                    );
                                 } else {
                                     this.select_instance(iid, window, cx);
                                 }
@@ -15905,7 +16128,12 @@ impl MuxelApp {
                                             .on_click(window.listener_for(
                                                 &entity,
                                                 move |this, _, window, cx| {
-                                                    this.start_rename_instance(iid, window, cx)
+                                                    this.start_rename_instance(
+                                                        iid,
+                                                        RenameOrigin::InstanceSidebar,
+                                                        window,
+                                                        cx,
+                                                    )
                                                 },
                                             )),
                                     )
@@ -16227,12 +16455,7 @@ impl MuxelApp {
                 SearchItem::FocusInstance(iid) => {
                     let inst = self.workspace.instance(*iid);
                     let label = inst
-                        .map(|i| {
-                            i.custom_name
-                                .clone()
-                                .filter(|c| !c.is_empty())
-                                .unwrap_or_else(|| i.title.clone())
-                        })
+                        .map(|i| i.display_name().to_string())
                         .unwrap_or_default();
                     let proj = inst
                         .and_then(|i| self.workspace.project(i.project_id))
@@ -18622,12 +18845,7 @@ impl MuxelApp {
         let has_target = target.is_some();
         let target_label = target
             .and_then(|iid| self.workspace.instance(iid))
-            .map(|i| {
-                i.custom_name
-                    .clone()
-                    .filter(|c| !c.is_empty())
-                    .unwrap_or_else(|| i.title.clone())
-            })
+            .map(|i| i.display_name().to_string())
             .unwrap_or_default();
         let mut list = v_flex().gap_px().w_full();
         if self.snippets.is_empty() {
@@ -22413,7 +22631,9 @@ impl Render for MuxelApp {
 
 #[cfg(test)]
 mod shell_title_tests {
-    use super::shell_dir_title;
+    use super::{shell_dir_title, terminal_auto_title};
+    use muxel_core::{AgentPreset, Instance};
+    use uuid::Uuid;
 
     #[test]
     fn strips_user_host_prefix() {
@@ -22426,6 +22646,28 @@ mod shell_title_tests {
         assert_eq!(shell_dir_title("make build"), "make build");
         // A colon but no `@` before it → unchanged.
         assert_eq!(shell_dir_title("12:34"), "12:34");
+    }
+
+    #[test]
+    fn agent_ignores_launcher_shell_until_a_real_title_arrives() {
+        let instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+
+        assert_eq!(terminal_auto_title(&instance, "cmd.exe"), None);
+        assert_eq!(terminal_auto_title(&instance, "codex"), None);
+        assert_eq!(
+            terminal_auto_title(&instance, "Review session names"),
+            Some("Review session names".to_string())
+        );
+    }
+
+    #[test]
+    fn default_shell_still_uses_its_directory_title() {
+        let instance = Instance::shell(Uuid::new_v4());
+
+        assert_eq!(
+            terminal_auto_title(&instance, "user@host:~/dev/muxel"),
+            Some("~/dev/muxel".to_string())
+        );
     }
 }
 

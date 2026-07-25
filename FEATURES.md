@@ -40,7 +40,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Pinned tabs** — pin a tab to the leftmost block; pins behave fluidly when
   dragged past unpinned tabs.
 - **Tab context menu** — right-click a tab to Rename, Duplicate, Pin/Unpin, Close
-  tabs to the left / right, Close others, or Close.
+  tabs to the left / right, Close others, or Close. Duplicate clears copied
+  conversation state so a harness can mint a new session instead of deliberately
+  resuming the source.
 - **Tab cycling** — keyboard shortcuts cycle to the next/previous tab.
 
 ## Pop-out windows
@@ -461,7 +463,13 @@ feature is added or changed, update the matching entry here in the same change**
   project → **Move up** / **Move down** (disabled at the ends) for an explicit,
   discoverable alternative; the order persists. Swap/move instances between panes
   from the sidebar.
-- **Instance names** — custom names with inline rename and right-click menus.
+- **Instance names** — muxel persists each program's changing auto-title after a
+  short debounce, so restored panes and resume views keep their useful names.
+  Custom inline names remain a separate override; clearing one falls back to the
+  latest auto-title. Rename opens with the current value selected in a full-width
+  editor and commits on Enter or blur without the opening click prematurely
+  saving it. Bare session UUIDs and transient startup titles such as `cmd.exe`
+  or the agent executable name are never used as display names.
 - **Resizable sidebar** — drag to resize (up to half the window); width persists.
 - **Fullscreen mode** — `F11` (rebindable) toggles OS fullscreen with the sidebar
   fully hidden. A floating pill at the left edge brings the sidebar back without
