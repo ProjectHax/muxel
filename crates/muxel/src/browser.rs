@@ -389,7 +389,15 @@ mod imp {
                         .tooltip(t("Open in system browser"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.open_external(cx))),
                 )
-                .child(div().flex_1().child(Input::new(&self.address)));
+                .child(
+                    // gpui-wry returns focus to the native page for clicks outside
+                    // its bounds. Claim this press after Input handles it so the
+                    // window-level webview handler cannot steal focus back.
+                    div()
+                        .flex_1()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(Input::new(&self.address)),
+                );
 
             let content: AnyElement = match &self.webview {
                 Some(wv) => div()
