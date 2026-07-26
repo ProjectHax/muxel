@@ -750,6 +750,15 @@ and an optional source fragment such as #L12C4, for example \
 label readable and never invent a target."
 }
 
+/// Add one capability instruction to the prompt bundle delivered by the
+/// preset's configured transport.
+pub fn append_agent_instruction(prompt: &mut Option<String>, instruction: String) {
+    *prompt = Some(match prompt.take() {
+        Some(base) if !base.is_empty() => format!("{base}\n\n{instruction}"),
+        _ => instruction,
+    });
+}
+
 /// Add instructions through Codex's one-run `--config` override.
 ///
 /// An invalid TOML value is treated as a raw string by Codex. Keeping this
@@ -1006,6 +1015,17 @@ mod tests {
         assert_eq!(
             codex_developer_instructions_override("open \"D:\\dev\\x\"\nnext"),
             "developer_instructions=open \"D:\\dev\\x\" next"
+        );
+    }
+
+    #[test]
+    fn combines_custom_prompt_and_capabilities_once_for_any_transport() {
+        let mut prompt = Some("custom rules".to_string());
+        append_agent_instruction(&mut prompt, "file links".to_string());
+        append_agent_instruction(&mut prompt, "project memory".to_string());
+        assert_eq!(
+            prompt.as_deref(),
+            Some("custom rules\n\nfile links\n\nproject memory")
         );
     }
 

@@ -23,7 +23,7 @@ use muxel_core::{
     AgentPreset, FocusDir, Identity, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule,
     MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteRef,
     ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace,
-    WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at,
+    WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, append_agent_instruction,
     codex_developer_instructions_override, file_link_instruction, focus_in_direction,
     memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
     move_pane_beside, move_tab_to, remove, resolve_launch, set_active_tab, set_split_sizes,
@@ -41,6 +41,7 @@ use uuid::Uuid;
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
 /// TUIs (Claude/opencode/…) don't get squished narrow enough to overflow.
 const MIN_PANE_WIDTH: Pixels = px(340.0);
+
 /// Minimum height a vertical split's pane can shrink to (a few rows).
 const MIN_PANE_HEIGHT: Pixels = px(120.0);
 
@@ -3433,23 +3434,26 @@ impl MuxelApp {
         let resume_args = self.session_resume_for(instance_id);
         let inst = self.workspace.instance(instance_id);
         let project = inst.and_then(|i| self.workspace.project(i.project_id));
-        // Automatic instructions must not be typed into an agent: that creates a
-        // visible user message and consumes a turn. Native prompt flags receive them
-        // directly; Codex receives a one-run developer_instructions config override.
+        // Build one instruction bundle, then let the preset's injection transport
+        // deliver it. CliFlag and Codex are hidden launch-time instructions;
+        // TypeIn intentionally submits one visible startup turn; None opts out.
         let mut codex_instructions = Vec::new();
         let inst_owned = inst.cloned().map(|mut i| {
             let is_codex = i
                 .program
                 .as_deref()
                 .is_some_and(|program| program.to_ascii_lowercase().contains("codex"));
+            if is_codex
+                && i.injection != InjectionMode::None
+                && let Some(custom) = i.system_prompt.take().filter(|prompt| !prompt.is_empty())
+            {
+                codex_instructions.push(custom);
+            }
             let mut add_automatic = |instruction: String, i: &mut Instance| {
                 if is_codex {
                     codex_instructions.push(instruction);
-                } else if matches!(i.injection, InjectionMode::CliFlag { .. }) {
-                    i.system_prompt = Some(match i.system_prompt.take() {
-                        Some(base) if !base.is_empty() => format!("{base}\n\n{instruction}"),
-                        _ => instruction,
-                    });
+                } else if i.injection != InjectionMode::None {
+                    append_agent_instruction(&mut i.system_prompt, instruction);
                 }
             };
             if i.injection != InjectionMode::None {
