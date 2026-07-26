@@ -247,15 +247,21 @@ pub fn path_spans(line: &[char]) -> Vec<(usize, usize, String)> {
             j -= 1;
         }
         let token = &line[start..j];
-        // Must look like a path: contains '/' or '\', isn't a URL (those have
-        // "://"), and starts with a plausible path lead-in (incl. `D:` drives).
+        // Must look like a path: contains a separator or is filename-shaped,
+        // isn't a URL (those have "://"), and has a plausible lead-in. Bare
+        // names remain candidates only; the caller checks them against cwd.
         let has_slash = token.contains(&'/') || token.contains(&'\\');
         let is_url = token.windows(3).any(|w| w == [':', '/', '/']);
         let good_start = token.first().is_some_and(|c| {
             *c == '/' || *c == '\\' || *c == '~' || *c == '.' || c.is_alphanumeric() || *c == '_'
         });
-        if has_slash && !is_url && good_start && token.len() >= 2 {
-            let path: String = strip_line_suffix(token).iter().collect();
+        let stripped = strip_line_suffix(token);
+        let bare_filename = !has_slash
+            && stripped.len() >= 3
+            && stripped[1..].contains(&'.')
+            && stripped.last().is_some_and(|c| c.is_alphanumeric());
+        if (has_slash || bare_filename) && !is_url && good_start && token.len() >= 2 {
+            let path: String = stripped.iter().collect();
             if !path.is_empty() && path != "/" && path != "\\" {
                 spans.push((start, j, path));
             }
@@ -528,6 +534,16 @@ mod tests {
         assert_eq!(path_span_at(&line, 6).unwrap().2, "~/projects/x.txt");
         assert_eq!(path_span_at(&line, 27).unwrap().2, "./src/lib.rs");
         assert_eq!(path_span_at(&line, 44).unwrap().2, "../up.c");
+    }
+
+    #[test]
+    fn finds_bare_filename_for_cwd_resolution() {
+        let line = chars("opened joke.html but not documentation");
+        assert_eq!(
+            path_span_at(&line, 9),
+            Some((7, 16, "joke.html".to_string()))
+        );
+        assert!(path_span_at(&line, 25).is_none());
     }
 
     #[test]
