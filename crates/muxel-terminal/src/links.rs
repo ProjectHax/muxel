@@ -152,6 +152,35 @@ pub fn markdown_link_at(line: &[char], col: usize) -> Option<(usize, usize, Stri
     None
 }
 
+/// A Markdown link after a TUI has rendered away the brackets but left its
+/// destination visible: `label (file:///path)` or `label (https://host/path)`.
+/// Grok uses this form without emitting an OSC 8 hyperlink for the label.
+pub fn rendered_markdown_link_at(line: &[char], col: usize) -> Option<(usize, usize, String)> {
+    for target_open in 0..line.len().saturating_sub(1) {
+        if line[target_open] != '(' || !starts_scheme(line, target_open + 1) {
+            continue;
+        }
+        let target_start = target_open + 1;
+        let target_end = line[target_start..].iter().position(|c| *c == ')')? + target_start;
+        let label_end = line[..target_open]
+            .iter()
+            .rposition(|c| !c.is_whitespace())?
+            + 1;
+        let label_start = line[..label_end]
+            .iter()
+            .rposition(|c| c.is_whitespace())
+            .map_or(0, |index| index + 1);
+        if col >= label_start && col < label_end {
+            return Some((
+                label_start,
+                label_end,
+                line[target_start..target_end].iter().collect(),
+            ));
+        }
+    }
+    None
+}
+
 /// Convert a visible `:line[:column]` suffix to a file-URI fragment.
 pub fn source_fragment(token: &str) -> Option<String> {
     let mut parts = token.rsplitn(3, ':');
@@ -360,8 +389,9 @@ pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_uri, markdown_link_at, path_from_file_uri, path_span_at, path_spans, resolve_path,
-        source_fragment, stitch_rows, url_span_at, url_spans,
+        file_uri, markdown_link_at, path_from_file_uri, path_span_at, path_spans,
+        rendered_markdown_link_at, resolve_path, source_fragment, stitch_rows, url_span_at,
+        url_spans,
     };
     use std::path::{Path, PathBuf};
 
@@ -458,6 +488,26 @@ mod tests {
                 .map(|(_, _, url)| url)
                 .as_deref(),
             Some("file:///D:/temp/windows/claude/D--dev-moxie/a7962661/scratchpad/off-by-one.html")
+        );
+    }
+
+    #[test]
+    fn grok_rendered_markdown_label_carries_wrapped_file_uri() {
+        let rows = vec![
+            (chars("joke.html (file:///D:/       "), false),
+            (chars("dev/moxie/joke.html)         "), false),
+        ];
+        let stitched = stitch_rows(&rows, 0, 3);
+        assert_eq!(
+            rendered_markdown_link_at(&stitched.chars, stitched.clicked_col),
+            Some((0, 9, "file:///D:/dev/moxie/joke.html".to_string()))
+        );
+        let target_click = stitch_rows(&rows, 1, 8);
+        assert_eq!(
+            url_span_at(&target_click.chars, target_click.clicked_col)
+                .map(|(_, _, url)| url)
+                .as_deref(),
+            Some("file:///D:/dev/moxie/joke.html")
         );
     }
 

@@ -1032,6 +1032,12 @@ fn link_at(
         {
             return Some(hovered(start, end, url));
         }
+        if let Some((start, end, target)) =
+            crate::links::rendered_markdown_link_at(&chars, logical_column)
+            && let Some(url) = checked_link_uri(&target, session)
+        {
+            return Some(hovered(start, end, url));
+        }
         if let Some((start, end, url)) = crate::links::url_span_at(&chars, logical_column) {
             let url = checked_link_uri(&url, session)?;
             return Some(hovered(start, end, url));
