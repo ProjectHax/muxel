@@ -973,7 +973,7 @@ mod agent_injection_sync_tests {
 
         assert!(sync_agent_injection_modes(
             &mut workspace,
-            &[preset.clone()]
+            std::slice::from_ref(&preset)
         ));
         assert_eq!(workspace.instances[0].injection, preset.injection);
         assert_eq!(
