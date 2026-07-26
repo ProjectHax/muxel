@@ -33,6 +33,17 @@ pub fn spawn_browser_window(url: &str) -> bool {
 
 /// A short label for a browser tab: the URL's host (falls back to the URL).
 fn tab_label(url: &str) -> String {
+    let url_without_fragment = url.split('#').next().unwrap_or(url);
+    if let Some(name) = muxel_terminal::path_from_file_uri(url_without_fragment)
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.is_empty())
+    {
+        return name;
+    }
+
     let trimmed = url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
@@ -44,6 +55,19 @@ fn tab_label(url: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::tab_label;
+
+    #[test]
+    fn local_file_tab_uses_decoded_filename() {
+        assert_eq!(
+            tab_label("file:///D:/business/report%202026.html#L12"),
+            "report 2026.html"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // macOS / Windows: the real embedded webview pane.
 // ---------------------------------------------------------------------------
@@ -51,7 +75,9 @@ fn tab_label(url: &str) -> String {
 mod imp {
     use super::*;
     use gpui_component::button::{Button, ButtonVariants as _};
-    use gpui_component::input::{Input, InputEvent, InputState};
+    use gpui_component::input::{
+        Input, InputEvent, InputState, MoveToEnd, MoveToStart, SelectToStart,
+    };
     use gpui_component::{Icon, IconName, Sizable as _, h_flex};
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -117,17 +143,29 @@ mod imp {
                 window,
                 |this: &mut Self, input, event: &InputEvent, window, cx| match event {
                     InputEvent::Focus => {
-                        input.read(cx).focus_handle(cx).dispatch_action(
-                            &gpui_component::input::SelectAll,
-                            window,
-                            cx,
-                        );
+                        let handle = input.read(cx).focus_handle(cx);
+                        // Select end-to-start so the whole URL is selected while
+                        // the scheme and host remain at the visible edge.
+                        handle.dispatch_action(&MoveToEnd, window, cx);
+                        handle.dispatch_action(&SelectToStart, window, cx);
                     }
                     InputEvent::PressEnter { .. } => {
                         let typed = input.read(cx).value().trim().to_string();
                         if !typed.is_empty() {
                             this.navigate(&muxel_core::normalize_url(&typed), cx);
+                            // Navigation is done. Return GPUI focus to the pane,
+                            // then hand OS keyboard focus back to the page.
+                            this.focus_handle.focus(window, cx);
+                            this.focus_native(cx);
                         }
+                    }
+                    InputEvent::Blur => {
+                        // An unfocused address bar should show its scheme/host,
+                        // not remain scrolled to the tail where editing ended.
+                        input
+                            .read(cx)
+                            .focus_handle(cx)
+                            .dispatch_action(&MoveToStart, window, cx);
                     }
                     _ => {}
                 },
@@ -332,8 +370,14 @@ mod imp {
             // Don't stomp the address bar while the user is editing it.
             if !self.address.read(cx).focus_handle(cx).is_focused(window) {
                 let url = current.clone();
+                self.address.update(cx, |s, cx| {
+                    s.set_value(url, window, cx);
+                    s.set_scroll_offset(point(px(0.), px(0.)), cx);
+                });
                 self.address
-                    .update(cx, |s, cx| s.set_value(url, window, cx));
+                    .read(cx)
+                    .focus_handle(cx)
+                    .dispatch_action(&MoveToStart, window, cx);
             }
             cx.notify();
             Some(current)
@@ -366,6 +410,12 @@ mod imp {
                 .px_2()
                 .py_1()
                 .bg(cx.theme().secondary)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        this.focus_handle.focus(window, cx);
+                    }),
+                )
                 .child(
                     Button::new("browser-back")
                         .ghost()

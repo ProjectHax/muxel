@@ -5764,6 +5764,12 @@ impl MuxelApp {
                 if view.update(cx, |v, _| v.take_page_click()) {
                     if self.active_instance != Some(iid) {
                         self.focus_instance(iid, window, cx);
+                    } else {
+                        // Even when the pane is already active, move GPUI focus
+                        // off its address input before the native page takes the
+                        // OS keyboard. Otherwise InputEvent::Blur never fires.
+                        let handle = view.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
                     }
                     // The user clicked *into the page*, so the keyboard belongs to it
                     // — and `focus_instance` above may have just pulled focus back to
