@@ -821,8 +821,7 @@ final class AppState: ObservableObject {
         // Desktop "Inherit" semantics: the duplicate shares the source's worktree
         // (a worktree can back several panes) but gets a fresh, not-yet-started
         // session so it doesn't collide on `--resume`.
-        copy.sessionId = nil
-        copy.sessionStarted = false
+        copy.resetConversationForDuplicate()
         do {
             let conn = connection(for: host)
             try await conn.connect()

@@ -683,6 +683,10 @@ impl TerminalView {
         self.session.title()
     }
 
+    pub fn session_id_hint(&self) -> Option<String> {
+        self.session.session_id_hint()
+    }
+
     /// Replace the color palette used to render this terminal. Also pushed into
     /// the session so OSC color queries answer with what's actually painted.
     pub fn set_palette(&mut self, palette: TerminalPalette) {
