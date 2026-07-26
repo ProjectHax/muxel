@@ -591,6 +591,25 @@ pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
     found
 }
 
+/// A Codex terminal title that directly identifies its session.
+///
+/// Codex publishes its agent-minted UUID as an OSC terminal title.
+/// Capturing that title binds each pane to its own rollout even when several
+/// Codex panes share a working directory. The normal pre-resume existence check
+/// still rejects a stale or missing UUID before it reaches the CLI.
+pub fn codex_session_id_from_title(preset: &AgentPreset, title: &str) -> Option<String> {
+    if !preset
+        .program
+        .as_deref()
+        .unwrap_or_default()
+        .contains("codex")
+    {
+        return None;
+    }
+    Uuid::parse_str(title.trim()).ok()?;
+    Some(title.trim().to_string())
+}
+
 /// Most recently modified Codex session id whose `session_meta.cwd` matches `cwd`.
 ///
 /// Codex mints its own UUID on first launch (no host-side `--session-id`), so on
@@ -853,6 +872,21 @@ mod tests {
         assert_eq!(
             session_resume_args(&c, &inst),
             Some(vec!["resume".to_string(), "abc".to_string()])
+        );
+    }
+
+    #[test]
+    fn codex_session_id_comes_from_uuid_terminal_title() {
+        let codex = AgentPreset::codex();
+        let id = Uuid::new_v4().to_string();
+        assert_eq!(
+            codex_session_id_from_title(&codex, &format!(" {id} ")).as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(codex_session_id_from_title(&codex, "Review changes"), None);
+        assert_eq!(
+            codex_session_id_from_title(&AgentPreset::claude(), &id),
+            None
         );
     }
 
