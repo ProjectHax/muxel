@@ -112,15 +112,24 @@ mod imp {
     impl BrowserView {
         pub fn new(url: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
             let address = cx.new(|cx| InputState::new(window, cx).default_value(url.clone()));
-            cx.subscribe(
+            cx.subscribe_in(
                 &address,
-                |this: &mut Self, input, event: &InputEvent, cx| {
-                    if let InputEvent::PressEnter { .. } = event {
+                window,
+                |this: &mut Self, input, event: &InputEvent, window, cx| match event {
+                    InputEvent::Focus => {
+                        input.read(cx).focus_handle(cx).dispatch_action(
+                            &gpui_component::input::SelectAll,
+                            window,
+                            cx,
+                        );
+                    }
+                    InputEvent::PressEnter { .. } => {
                         let typed = input.read(cx).value().trim().to_string();
                         if !typed.is_empty() {
                             this.navigate(&muxel_core::normalize_url(&typed), cx);
                         }
                     }
+                    _ => {}
                 },
             )
             .detach();
