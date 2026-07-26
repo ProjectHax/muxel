@@ -289,6 +289,7 @@ impl EditorView {
         self.goto_position(line, 0, window, cx);
     }
 
+    /// Move the cursor to a zero-based source position.
     pub fn goto_position(
         &self,
         line: u32,

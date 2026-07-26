@@ -6,7 +6,7 @@
 //! the bytes through the VTE `Processor` into the `Term` (see `process_output`),
 //! so the `Term` is only ever touched from the GPUI thread.
 
-use crate::colors::TerminalPalette;
+use crate::colors::{TerminalPalette, index_to_rgb};
 use crate::listener::{MuxelListener, SharedWriter};
 use crate::profile;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -224,6 +224,7 @@ pub struct TerminalSession {
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
+    session_id_hint: Arc<Mutex<Option<String>>>,
     bell: Arc<AtomicBool>,
     /// OSC-52 copies parsed from output, pending pickup by the view (which owns
     /// the gpui context a clipboard write needs).
@@ -407,10 +408,7 @@ impl TerminalSession {
         // returns the shim first and CreateProcessW fails with
         // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
         let program = resolve_program_for_spawn(&spec.program);
-        let mut builder = CommandBuilder::new(&program);
-        for arg in &spec.args {
-            builder.arg(arg);
-        }
+        let mut builder = command_builder_for_spawn(&program, &spec.args);
         // Remembered for resolving relative file paths on ctrl+click.
         let cwd = spec.cwd.as_ref().map(std::path::PathBuf::from);
         if let Some(cwd) = &spec.cwd {
@@ -430,6 +428,10 @@ impl TerminalSession {
         for (k, v) in &spec.env {
             builder.env(k, v);
         }
+        // These are private transport slots, not preset-overridable child env.
+        // Reapply them after preset env so a collision cannot replace the batch
+        // program or argv that Muxel resolved.
+        apply_windows_batch_runner_env(&mut builder, &program, &spec.args);
 
         let child = pair.slave.spawn_command(builder).context("spawn command")?;
         let child_pid = child.process_id();
@@ -464,22 +466,25 @@ impl TerminalSession {
         // `pair.slave` is dropped at the end of this function, closing the
         // parent's copy so the reader sees EOF when the child exits.
 
+        let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let (tx, rx) = async_channel::unbounded::<PtyChunk>();
+        let reply_writer = writer.clone();
+        let reply_palette = palette.clone();
         let reader_handle = std::thread::Builder::new()
             .name("muxel-pty-reader".to_string())
-            .spawn(move || read_loop(reader, child, tx))
+            .spawn(move || read_loop(reader, child, tx, reply_writer, reply_palette))
             .context("spawn reader thread")?;
 
         let title = Arc::new(Mutex::new(None));
+        let session_id_hint = Arc::new(Mutex::new(None));
         let bell = Arc::new(AtomicBool::new(false));
         let clipboard_store = Arc::new(Mutex::new(Vec::new()));
-        let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let listener = MuxelListener {
             writer: writer.clone(),
             title: title.clone(),
+            session_id_hint: session_id_hint.clone(),
             bell: bell.clone(),
             clipboard_store: clipboard_store.clone(),
-            palette: palette.clone(),
         };
 
         let term = Term::new(
@@ -503,6 +508,7 @@ impl TerminalSession {
             killer: Mutex::new(killer),
             child_pid,
             title,
+            session_id_hint,
             bell,
             clipboard_store,
             palette,
@@ -1120,6 +1126,12 @@ impl TerminalSession {
         self.title.lock().clone()
     }
 
+    /// Latest UUID-shaped OSC title retained when an agent replaces it with a
+    /// display name. Muxel uses this as an exact agent session identity hint.
+    pub fn session_id_hint(&self) -> Option<String> {
+        self.session_id_hint.lock().clone()
+    }
+
     /// Drain the OSC-52 copies parsed since the last call. The view lands them
     /// on the system clipboard (this crate has no gpui context of its own here).
     pub(crate) fn take_clipboard_stores(&self) -> Vec<(ClipboardType, String)> {
@@ -1340,9 +1352,128 @@ fn resolve_program_for_spawn(program: &str) -> String {
     }
 }
 
+fn command_builder_for_spawn(program: &str, args: &[String]) -> CommandBuilder {
+    #[cfg(not(windows))]
+    {
+        let mut builder = CommandBuilder::new(program);
+        for arg in args {
+            builder.arg(arg);
+        }
+        builder
+    }
+    #[cfg(windows)]
+    {
+        if !is_windows_batch_program(program) {
+            let mut builder = CommandBuilder::new(program);
+            for arg in args {
+                builder.arg(arg);
+            }
+            return builder;
+        }
+
+        // CreateProcess cannot execute batch files, and cmd.exe reparses a
+        // reconstructed command string (`%*`, quotes, and metacharacters).
+        // Keep the public PATH target, but move each original argv token
+        // through child-only environment slots. Batch files still require a
+        // final cmd.exe parse, so reject metacharacters that cmd can reinterpret
+        // instead of silently launching a different command.
+        const BATCH_RUNNER: &str = concat!(
+            "$program = $env:MUXEL_BATCH_PROGRAM; ",
+            "$argv = for ($i = 0; $i -lt [int]$env:MUXEL_BATCH_ARG_COUNT; $i++) { ",
+            "[Environment]::GetEnvironmentVariable(('MUXEL_BATCH_ARG_' + $i)) }; ",
+            "$unsafe = [char[]]'\"%&|<>^' + [char[]]([char]13,[char]10); ",
+            "if ($argv | Where-Object { $_.IndexOfAny($unsafe) -ge 0 }) { ",
+            "[Console]::Error.WriteLine('muxel: batch-file arguments contain characters cmd.exe can reinterpret'); exit 2 }; ",
+            "Remove-Item Env:MUXEL_BATCH_PROGRAM,Env:MUXEL_BATCH_ARG_COUNT; ",
+            "for ($i = 0; $i -lt $argv.Count; $i++) { ",
+            "Remove-Item ('Env:MUXEL_BATCH_ARG_' + $i) }; ",
+            "& $program @argv; ",
+            "if ($null -eq $LASTEXITCODE) { exit 1 }; exit $LASTEXITCODE"
+        );
+        let encoded_runner = {
+            use base64::Engine;
+            let bytes = BATCH_RUNNER
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let mut builder = CommandBuilder::new("powershell.exe");
+        builder.arg("-NoLogo");
+        builder.arg("-NoProfile");
+        builder.arg("-NonInteractive");
+        builder.arg("-EncodedCommand");
+        builder.arg(encoded_runner);
+        apply_windows_batch_runner_env(&mut builder, program, args);
+        builder
+    }
+}
+
+#[cfg(windows)]
+fn is_windows_batch_program(program: &str) -> bool {
+    std::path::Path::new(program)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
+fn apply_windows_batch_runner_env(builder: &mut CommandBuilder, program: &str, args: &[String]) {
+    #[cfg(not(windows))]
+    let _ = (builder, program, args);
+    #[cfg(windows)]
+    if is_windows_batch_program(program) {
+        builder.env("MUXEL_BATCH_PROGRAM", program);
+        builder.env("MUXEL_BATCH_ARG_COUNT", args.len().to_string());
+        for (index, arg) in args.iter().enumerate() {
+            builder.env(format!("MUXEL_BATCH_ARG_{index}"), arg);
+        }
+    }
+}
+
 #[cfg(windows)]
 fn resolve_program_for_spawn_windows(program: &str) -> String {
     use std::path::{Path, PathBuf};
+
+    fn prefer_packaged_codex(path: PathBuf) -> PathBuf {
+        let is_codex_batch = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("codex"))
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                });
+        if !is_codex_batch {
+            return path;
+        }
+        let Some(npm_bin) = path.parent() else {
+            return path;
+        };
+        let (package, target) = if cfg!(target_arch = "aarch64") {
+            ("codex-win32-arm64", "aarch64-pc-windows-msvc")
+        } else {
+            ("codex-win32-x64", "x86_64-pc-windows-msvc")
+        };
+        let root = npm_bin.join("node_modules").join("@openai").join("codex");
+        [
+            root.join("node_modules")
+                .join("@openai")
+                .join(package)
+                .join("vendor")
+                .join(target)
+                .join("bin")
+                .join("codex.exe"),
+            root.join("vendor")
+                .join(target)
+                .join("bin")
+                .join("codex.exe"),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or(path)
+    }
 
     fn is_shebang(path: &Path) -> bool {
         use std::io::Read;
@@ -1382,13 +1513,16 @@ fn resolve_program_for_spawn_windows(program: &str) -> String {
 
     fn try_with_exts(base: PathBuf, exts: &[String]) -> Option<PathBuf> {
         for ext in exts {
-            let cand = base.with_extension(ext);
+            let mut candidate = base.as_os_str().to_owned();
+            candidate.push(".");
+            candidate.push(ext);
+            let cand = PathBuf::from(candidate);
             if is_spawnable(&cand) {
-                return Some(cand);
+                return Some(prefer_packaged_codex(cand));
             }
         }
         if is_spawnable(&base) {
-            return Some(base);
+            return Some(prefer_packaged_codex(base));
         }
         None
     }
@@ -1405,12 +1539,21 @@ fn resolve_program_for_spawn_windows(program: &str) -> String {
 
     // Bare name: search PATH, PATHEXT before bare (opposite of portable-pty).
     let exts = pathexts();
+    let search_native_codex = program.eq_ignore_ascii_case("codex");
+    let mut codex_batch_fallback = None;
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             if let Some(p) = try_with_exts(dir.join(program), &exts) {
+                if search_native_codex && is_windows_batch_program(&p.to_string_lossy()) {
+                    codex_batch_fallback.get_or_insert(p);
+                    continue;
+                }
                 return p.to_string_lossy().into_owned();
             }
         }
+    }
+    if let Some(path) = codex_batch_fallback {
+        return path.to_string_lossy().into_owned();
     }
     program.to_string()
 }
@@ -1513,6 +1656,119 @@ impl Drop for TerminalSession {
     }
 }
 
+/// Answers OSC color queries in the PTY reader thread, before terminal output
+/// crosses the async channel to GPUI. Querying TUIs briefly switch the tty into
+/// a response-reading mode; a reply generated later by the UI drain can arrive
+/// after that mode ends and become visible prompt input.
+struct ImmediateColorQueries {
+    state: OscScanState,
+    body: Vec<u8>,
+    writer: SharedWriter,
+    palette: Arc<Mutex<TerminalPalette>>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum OscScanState {
+    #[default]
+    Ground,
+    Escape,
+    Osc,
+    OscEscape,
+}
+
+#[derive(Clone, Copy)]
+enum OscTerminator {
+    Bell,
+    StringTerminator,
+}
+
+impl ImmediateColorQueries {
+    const MAX_BODY: usize = 1024;
+
+    fn new(writer: SharedWriter, palette: Arc<Mutex<TerminalPalette>>) -> Self {
+        Self {
+            state: OscScanState::Ground,
+            body: Vec::new(),
+            writer,
+            palette,
+        }
+    }
+
+    fn advance(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.state = match (self.state, byte) {
+                (OscScanState::Ground, 0x1b) => OscScanState::Escape,
+                (OscScanState::Escape, b']') => {
+                    self.body.clear();
+                    OscScanState::Osc
+                }
+                (OscScanState::Escape, 0x1b) => OscScanState::Escape,
+                (OscScanState::Osc, 0x07) => {
+                    self.answer(OscTerminator::Bell);
+                    OscScanState::Ground
+                }
+                (OscScanState::Osc, 0x9c) => {
+                    self.answer(OscTerminator::StringTerminator);
+                    OscScanState::Ground
+                }
+                (OscScanState::Osc, 0x1b) => OscScanState::OscEscape,
+                (OscScanState::Osc, 0x18 | 0x1a) => OscScanState::Ground,
+                (OscScanState::Osc, byte) if self.body.len() < Self::MAX_BODY => {
+                    self.body.push(byte);
+                    OscScanState::Osc
+                }
+                (OscScanState::Osc, _) => {
+                    self.body.clear();
+                    OscScanState::Ground
+                }
+                (OscScanState::OscEscape, b'\\') => {
+                    self.answer(OscTerminator::StringTerminator);
+                    OscScanState::Ground
+                }
+                (OscScanState::OscEscape, 0x18 | 0x1a) => OscScanState::Ground,
+                (OscScanState::OscEscape, _) => OscScanState::Ground,
+                _ => OscScanState::Ground,
+            };
+        }
+    }
+
+    fn answer(&mut self, terminator: OscTerminator) {
+        let Ok(body) = std::str::from_utf8(&self.body) else {
+            return;
+        };
+        let Some(request) = body.strip_suffix(";?") else {
+            return;
+        };
+        let (prefix, index) = match request {
+            "10" => ("10".to_string(), 256),
+            "11" => ("11".to_string(), 257),
+            "12" => ("12".to_string(), 258),
+            _ => {
+                let Some(index) = request.strip_prefix("4;").and_then(|s| s.parse().ok()) else {
+                    return;
+                };
+                (request.to_string(), index)
+            }
+        };
+        let Some(rgb) = index_to_rgb(&self.palette.lock(), index) else {
+            return;
+        };
+        let end = match terminator {
+            OscTerminator::Bell => "\x07",
+            OscTerminator::StringTerminator => "\x1b\\",
+        };
+        let reply = format!(
+            "\x1b]{prefix};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}{end}",
+            r = rgb.r,
+            g = rgb.g,
+            b = rgb.b,
+        );
+        let mut writer = self.writer.lock();
+        let _ = writer.write_all(reply.as_bytes());
+        let _ = writer.flush();
+    }
+}
+
 /// Blocking PTY reader. Owns the `Child` so that after EOF it can harvest the
 /// exit code — letting the app tell a clean `exit` from a crash (resume
 /// recovery must not treat a deliberate quit as recoverable).
@@ -1520,8 +1776,11 @@ fn read_loop(
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn Child + Send + Sync>,
     tx: async_channel::Sender<PtyChunk>,
+    writer: SharedWriter,
+    palette: Arc<Mutex<TerminalPalette>>,
 ) {
     let mut buf = [0u8; 65536];
+    let mut color_queries = ImmediateColorQueries::new(writer, palette);
     // Only a clean EOF or a real error ends the session. EINTR is a signal
     // interruption, not an exit — retrying it keeps a healthy pane from being
     // torn down. Any other error is recorded so the app can log/show it.
@@ -1531,6 +1790,7 @@ fn read_loop(
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF → every slave fd closed; child is (probably) gone
             Ok(n) => {
+                color_queries.advance(&buf[..n]);
                 if tx
                     .send_blocking(PtyChunk::Output(buf[..n].to_vec()))
                     .is_err()
@@ -1752,11 +2012,16 @@ mod wheel_report_tests {
 // Windows PATH resolution for npm shims (CreateProcess cannot run #!/bin/sh).
 #[cfg(all(test, windows))]
 mod windows_spawn_resolve {
-    use super::resolve_program_for_spawn_windows;
+    use super::{CommandSpec, PtyChunk, TerminalSession, resolve_program_for_spawn_windows};
     use std::io::Write;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn prefers_cmd_over_shebang_shim() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("muxel-spawn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1802,6 +2067,132 @@ mod windows_spawn_resolve {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_cmd_prefers_its_packaged_native_executable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("muxel-codex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (package, target) = if cfg!(target_arch = "aarch64") {
+            ("codex-win32-arm64", "aarch64-pc-windows-msvc")
+        } else {
+            ("codex-win32-x64", "x86_64-pc-windows-msvc")
+        };
+        let native = dir
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("node_modules")
+            .join("@openai")
+            .join(package)
+            .join("vendor")
+            .join(target)
+            .join("bin")
+            .join("codex.exe");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(dir.join("codex.cmd"), "@echo off\r\n").unwrap();
+        std::fs::write(&native, b"fixture").unwrap();
+
+        let prev = std::env::var_os("PATH");
+        let prev_pathext = std::env::var_os("PATHEXT");
+        unsafe {
+            std::env::set_var("PATH", &dir);
+            std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        }
+        let resolved = resolve_program_for_spawn_windows("codex");
+        unsafe {
+            match prev {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_pathext {
+                Some(value) => std::env::set_var("PATHEXT", value),
+                None => std::env::remove_var("PATHEXT"),
+            }
+        }
+
+        assert_eq!(std::path::PathBuf::from(resolved), native);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Manual installed-tool smoke test for the full PTY launch path. Ignored in
+    /// CI because Codex is not a repo dependency; run it on Windows when changing
+    /// npm shim resolution or launch-time instructions.
+    #[test]
+    #[ignore = "requires an installed npm Codex CLI"]
+    fn installed_codex_accepts_instruction_argv_through_pty() {
+        let resolved = resolve_program_for_spawn_windows("codex");
+        assert!(
+            resolved.to_ascii_lowercase().ends_with("codex.exe"),
+            "installed Codex did not resolve to its packaged native executable: {resolved}"
+        );
+        let instruction = muxel_core::codex_developer_instructions_override(
+            "Use [name](file:///D:/dev/project/file.rs#L12C4); keep <targets> exact.",
+        );
+        let spec = CommandSpec::program(
+            "codex",
+            vec!["--config".to_string(), instruction, "--version".to_string()],
+        );
+        let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn Codex");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+                        session.write_input(b"\x1b[1;1R");
+                    }
+                    output.extend(bytes);
+                }
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
+                Err(async_channel::TryRecvError::Empty) => {}
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("codex-cli"),
+            "Codex did not reach its public CLI: {output:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod immediate_color_tests {
+    use super::*;
+
+    fn responder() -> (ImmediateColorQueries, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter(tx))));
+        let palette = Arc::new(Mutex::new(TerminalPalette {
+            background: 0x112233,
+            ..Default::default()
+        }));
+        (ImmediateColorQueries::new(writer, palette), rx)
+    }
+
+    #[test]
+    fn color_query_is_answered_immediately_across_reader_chunks() {
+        let (mut responder, rx) = responder();
+        responder.advance(b"\x1b]11;");
+        assert!(rx.try_recv().is_err());
+        responder.advance(b"?\x07");
+        assert_eq!(rx.recv().unwrap(), b"\x1b]11;rgb:1111/2222/3333\x07");
+    }
+
+    #[test]
+    fn indexed_query_preserves_index_and_string_terminator() {
+        let (mut responder, rx) = responder();
+        responder.advance(b"\x1b]4;1;?\x1b\\");
+        assert_eq!(rx.recv().unwrap(), b"\x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\");
+    }
+
+    #[test]
+    fn ordinary_osc_title_does_not_write_to_the_pty() {
+        let (mut responder, rx) = responder();
+        responder.advance(b"\x1b]0;Review changes\x07");
+        assert!(rx.try_recv().is_err());
     }
 }
 
@@ -2026,22 +2417,20 @@ mod tests {
         session.kill();
     }
 
-    /// OSC 11 (default background) query: answered from the session palette so
-    /// TUIs detect dark/light from what's actually painted.
+    #[cfg(unix)]
     #[test]
-    fn color_query_reports_palette_background() {
-        let (session, rx) =
+    fn uuid_title_tracks_session_switch_and_ignores_display_title() {
+        let (session, _rx) =
             TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 80, 24)
                 .expect("spawn");
-        session.set_palette(crate::colors::TerminalPalette {
-            background: 0x112233,
-            ..Default::default()
-        });
-        session.process_output(b"\x1b]11;?\x07");
-        assert!(
-            wait_for_reply(&rx, b"]11;rgb:1111/2222/3333"),
-            "background query should answer with the set palette"
-        );
+        let id = "019f95d7-db31-7db0-904d-9e08330e0000";
+        let resumed = "019f95d7-db31-7db0-904d-9e08330e0001";
+        session.process_output(format!("\x1b]0;{id}\x07").as_bytes());
+        session.process_output(b"\x1b]0;Review changes\x07");
+        assert_eq!(session.title().as_deref(), Some("Review changes"));
+        assert_eq!(session.session_id_hint().as_deref(), Some(id));
+        session.process_output(format!("\x1b]0;{resumed}\x07").as_bytes());
+        assert_eq!(session.session_id_hint().as_deref(), Some(resumed));
         session.kill();
     }
 

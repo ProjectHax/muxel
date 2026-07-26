@@ -17,6 +17,67 @@ pub struct FileLinkTarget {
     pub column: Option<u32>,
 }
 
+/// A logical line reconstructed from terminal rows, plus the clicked row's
+/// location inside it so a match can be painted back onto that row.
+pub struct StitchedRows {
+    pub chars: Vec<char>,
+    pub clicked_col: usize,
+    pub clicked_in_content: bool,
+    pub row_base: usize,
+    pub row_start: usize,
+    pub row_len: usize,
+}
+
+/// Join rows selected as one visual token.
+///
+/// A terminal soft wrap preserves every column. A TUI-generated hard wrap has
+/// already inserted a real row break, often with a right margin and hanging
+/// indent, so its previous row is right-trimmed and its continuation left-trimmed.
+pub fn stitch_rows(
+    rows: &[(Vec<char>, bool)],
+    clicked_row: usize,
+    clicked_col: usize,
+) -> StitchedRows {
+    let mut chars = Vec::new();
+    let mut row_base = 0;
+    let mut row_start = 0;
+    let mut row_len = 0;
+    let mut clicked_in_content = false;
+    for (index, (row, soft_wraps_to_next)) in rows.iter().enumerate() {
+        let hard_continuation = index > 0 && !rows[index - 1].1;
+        let start = if hard_continuation {
+            row.iter()
+                .position(|c| !c.is_whitespace())
+                .unwrap_or(row.len())
+        } else {
+            0
+        };
+        let end = if *soft_wraps_to_next {
+            row.len()
+        } else {
+            row.iter()
+                .rposition(|c| !c.is_whitespace())
+                .map(|column| column + 1)
+                .unwrap_or(start)
+        };
+        if index == clicked_row {
+            row_base = chars.len();
+            row_start = start;
+            row_len = end.saturating_sub(start);
+            clicked_in_content = clicked_col >= start && clicked_col < end;
+        }
+        chars.extend(row[start..end].iter().copied());
+    }
+    StitchedRows {
+        clicked_col: row_base + clicked_col.saturating_sub(row_start),
+        clicked_in_content,
+        chars,
+        row_base,
+        row_start,
+        row_len,
+    }
+}
+
 /// Does the text starting at `i` begin a supported URI scheme?
 fn starts_scheme(line: &[char], i: usize) -> bool {
     const SCHEMES: [&[char]; 3] = [
@@ -88,18 +149,67 @@ pub fn markdown_link_at(line: &[char], col: usize) -> Option<(usize, usize, Stri
             i += 1;
             continue;
         }
-        let label_end = line[i + 1..].iter().position(|c| *c == ']')? + i + 1;
+        let Some(label_end) = line[i + 1..]
+            .iter()
+            .position(|c| *c == ']')
+            .map(|end| end + i + 1)
+        else {
+            i += 1;
+            continue;
+        };
         if line.get(label_end + 1) != Some(&'(') {
             i = label_end + 1;
             continue;
         }
         let target_start = label_end + 2;
-        let target_end = line[target_start..].iter().position(|c| *c == ')')? + target_start;
+        let Some(target_end) = line[target_start..]
+            .iter()
+            .position(|c| *c == ')')
+            .map(|end| end + target_start)
+        else {
+            i = target_start;
+            continue;
+        };
         if col > i && col < label_end && target_end > target_start {
             let target: String = line[target_start..target_end].iter().collect();
             return Some((i + 1, label_end, target));
         }
         i = target_end + 1;
+    }
+    None
+}
+
+/// A Markdown link after a TUI has rendered away the brackets but left its
+/// destination visible: `label (file:///path)` or `label (https://host/path)`.
+/// Grok uses this form without emitting an OSC 8 hyperlink for the label.
+pub fn rendered_markdown_link_at(line: &[char], col: usize) -> Option<(usize, usize, String)> {
+    for target_open in 0..line.len().saturating_sub(1) {
+        if line[target_open] != '(' || !starts_scheme(line, target_open + 1) {
+            continue;
+        }
+        let target_start = target_open + 1;
+        let Some(target_end) = line[target_start..]
+            .iter()
+            .position(|c| *c == ')')
+            .map(|end| end + target_start)
+        else {
+            continue;
+        };
+        let label_end = line[..target_open]
+            .iter()
+            .rposition(|c| !c.is_whitespace())?
+            + 1;
+        let label_start = line[..label_end]
+            .iter()
+            .rposition(|c| c.is_whitespace())
+            .map_or(0, |index| index + 1);
+        if col >= label_start && col < label_end {
+            return Some((
+                label_start,
+                label_end,
+                line[target_start..target_end].iter().collect(),
+            ));
+        }
     }
     None
 }
@@ -170,15 +280,21 @@ pub fn path_spans(line: &[char]) -> Vec<(usize, usize, String)> {
             j -= 1;
         }
         let token = &line[start..j];
-        // Must look like a path: contains '/' or '\', isn't a URL (those have
-        // "://"), and starts with a plausible path lead-in (incl. `D:` drives).
+        // Must look like a path: contains a separator or is filename-shaped,
+        // isn't a URL (those have "://"), and has a plausible lead-in. Bare
+        // names remain candidates only; the caller checks them against cwd.
         let has_slash = token.contains(&'/') || token.contains(&'\\');
         let is_url = token.windows(3).any(|w| w == [':', '/', '/']);
         let good_start = token.first().is_some_and(|c| {
             *c == '/' || *c == '\\' || *c == '~' || *c == '.' || c.is_alphanumeric() || *c == '_'
         });
-        if has_slash && !is_url && good_start && token.len() >= 2 {
-            let path: String = strip_line_suffix(token).iter().collect();
+        let stripped = strip_line_suffix(token);
+        let bare_filename = !has_slash
+            && stripped.len() >= 3
+            && stripped[1..].contains(&'.')
+            && stripped.last().is_some_and(|c| c.is_alphanumeric());
+        if (has_slash || bare_filename) && !is_url && good_start && token.len() >= 2 {
+            let path: String = stripped.iter().collect();
             if !path.is_empty() && path != "/" && path != "\\" {
                 spans.push((start, j, path));
             }
@@ -263,8 +379,11 @@ pub fn file_target_from_uri(uri: &str) -> Option<FileLinkTarget> {
     let rest = uri.strip_prefix("file://")?;
     let (rest, fragment) = rest.split_once('#').unwrap_or((rest, ""));
     // `file:///path` → path starts with `/`; `file://localhost/path` rare, skip.
-    let path_part = if let Some(p) = rest.strip_prefix("localhost") {
-        p
+    let path_part = if rest.len() >= "localhost".len()
+        && rest[.."localhost".len()].eq_ignore_ascii_case("localhost")
+        && rest.as_bytes().get("localhost".len()) == Some(&b'/')
+    {
+        &rest["localhost".len()..]
     } else if rest.starts_with('/') {
         rest
     } else {
@@ -287,6 +406,12 @@ pub fn file_target_from_uri(uri: &str) -> Option<FileLinkTarget> {
     }
     let decoded = String::from_utf8(out).ok()?;
     if decoded.is_empty() {
+        return None;
+    }
+    // Never turn a URI into a UNC/network path. Link validation calls
+    // `exists()` on hover; probing an attacker-controlled SMB host can leak
+    // Windows credentials. Check after percent-decoding to block smuggling.
+    if decoded.starts_with("//") || decoded.starts_with("\\\\") {
         return None;
     }
     // Unix: `/tmp/x`. Windows: `/D:/x` or `/D|/x` (some emitters) → `D:/x`.
@@ -337,7 +462,8 @@ fn parse_source_fragment(fragment: &str) -> Option<(u32, Option<u32>)> {
 mod tests {
     use super::{
         file_target_from_uri, file_uri, markdown_link_at, path_from_file_uri, path_span_at,
-        path_spans, resolve_path, source_fragment, url_span_at, url_spans,
+        path_spans, rendered_markdown_link_at, resolve_path, source_fragment, stitch_rows,
+        url_span_at, url_spans,
     };
     use std::path::{Path, PathBuf};
 
@@ -399,10 +525,88 @@ mod tests {
     }
 
     #[test]
+    fn malformed_markup_does_not_hide_a_later_valid_link() {
+        let literal = chars("[broken [good](https://example.com)");
+        assert_eq!(
+            markdown_link_at(&literal, 10).map(|(_, _, target)| target),
+            Some("https://example.com".to_string())
+        );
+        let rendered = chars("bad (https://broken good (https://example.com)");
+        assert_eq!(
+            rendered_markdown_link_at(&rendered, 21).map(|(_, _, target)| target),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
     fn two_urls_on_one_line() {
         let line = chars("https://a.com/1 and https://b.com/2");
         assert_eq!(url_spans(&line).len(), 2);
         assert_eq!(find_url_at(&line, 25).as_deref(), Some("https://b.com/2"));
+    }
+
+    #[test]
+    fn stitches_claude_hanging_indent_url_without_margin_spaces() {
+        let rows = vec![
+            (chars("  Published https://claude.ai/c      "), false),
+            (chars("    ode/artifact/dd8e7386-edf1     "), false),
+            (chars("    -4ead-915a-1272481f3b7c        "), false),
+        ];
+        let stitched = stitch_rows(&rows, 0, 20);
+        assert_eq!(
+            url_span_at(&stitched.chars, stitched.clicked_col)
+                .map(|(_, _, url)| url)
+                .as_deref(),
+            Some("https://claude.ai/code/artifact/dd8e7386-edf1-4ead-915a-1272481f3b7c")
+        );
+    }
+
+    #[test]
+    fn stitches_claude_hanging_indent_file_uri() {
+        let rows = vec![
+            (chars("file:///D:/temp/windows/claude/D--dev-   "), false),
+            (chars("    moxie/a7962661/scratchpad/off-by-   "), false),
+            (chars("    one.html                            "), false),
+        ];
+        let stitched = stitch_rows(&rows, 1, 12);
+        assert_eq!(
+            url_span_at(&stitched.chars, stitched.clicked_col)
+                .map(|(_, _, url)| url)
+                .as_deref(),
+            Some("file:///D:/temp/windows/claude/D--dev-moxie/a7962661/scratchpad/off-by-one.html")
+        );
+    }
+
+    #[test]
+    fn grok_rendered_markdown_label_carries_wrapped_file_uri() {
+        let rows = vec![
+            (chars("joke.html (file:///D:/       "), false),
+            (chars("dev/moxie/joke.html)         "), false),
+        ];
+        let stitched = stitch_rows(&rows, 0, 3);
+        assert_eq!(
+            rendered_markdown_link_at(&stitched.chars, stitched.clicked_col),
+            Some((0, 9, "file:///D:/dev/moxie/joke.html".to_string()))
+        );
+        let target_click = stitch_rows(&rows, 1, 8);
+        assert_eq!(
+            url_span_at(&target_click.chars, target_click.clicked_col)
+                .map(|(_, _, url)| url)
+                .as_deref(),
+            Some("file:///D:/dev/moxie/joke.html")
+        );
+    }
+
+    #[test]
+    fn hanging_indent_is_not_part_of_the_wrapped_link() {
+        let rows = vec![
+            (chars("file:///D:/dev/moxie/       "), false),
+            (chars("    joke.html               "), false),
+        ];
+        let indent = stitch_rows(&rows, 1, 2);
+        assert!(!indent.clicked_in_content);
+        let link = stitch_rows(&rows, 1, 6);
+        assert!(link.clicked_in_content);
     }
 
     // ---- file paths ----
@@ -422,6 +626,16 @@ mod tests {
         assert_eq!(path_span_at(&line, 6).unwrap().2, "~/projects/x.txt");
         assert_eq!(path_span_at(&line, 27).unwrap().2, "./src/lib.rs");
         assert_eq!(path_span_at(&line, 44).unwrap().2, "../up.c");
+    }
+
+    #[test]
+    fn finds_bare_filename_for_cwd_resolution() {
+        let line = chars("opened joke.html but not documentation");
+        assert_eq!(
+            path_span_at(&line, 9),
+            Some((7, 16, "joke.html".to_string()))
+        );
+        assert!(path_span_at(&line, 25).is_none());
     }
 
     #[test]
@@ -538,7 +752,18 @@ mod tests {
         let target = file_target_from_uri("file:///tmp/a.rs#L12C4").unwrap();
         assert_eq!(target.line, Some(12));
         assert_eq!(target.column, Some(4));
+        assert_eq!(
+            path_from_file_uri("file://localhost/tmp/a.rs").as_deref(),
+            Some(Path::new("/tmp/a.rs"))
+        );
+        assert_eq!(
+            path_from_file_uri("file://LOCALHOST/tmp/a.rs").as_deref(),
+            Some(Path::new("/tmp/a.rs"))
+        );
+        assert!(path_from_file_uri("file://localhost.evil/tmp/a.rs").is_none());
         assert!(path_from_file_uri("file://server/share/a.rs").is_none());
+        assert!(path_from_file_uri("file:////server/share/a.rs").is_none());
+        assert!(path_from_file_uri("file:///%2F%2Fserver/share/a.rs").is_none());
     }
 
     #[test]

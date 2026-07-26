@@ -937,7 +937,7 @@ fn link_at(
             while end < columns && same(end) {
                 end += 1;
             }
-            let url = normalize_link_uri(&raw_uri, session);
+            let url = checked_link_uri(&normalize_link_uri(&raw_uri, session), session)?;
             return Some(HoveredLink {
                 line: point.line.0,
                 start,
@@ -946,29 +946,116 @@ fn link_at(
             });
         }
 
-        let chars: Vec<char> = (0..columns)
-            .map(|c| grid[GridPoint::new(point.line, Column(c))].c)
+        // Reconstruct the logical line around the pointer. Alacritty marks a soft
+        // wrap on the final cell; a hard newline has no WRAPLINE flag. Parsing one
+        // display row at a time makes a URL/path that crosses the right edge vanish.
+        let last_column = Column(columns - 1);
+        let first_text_column = |line: Line| {
+            (0..columns)
+                .find(|&column| !grid[GridPoint::new(line, Column(column))].c.is_whitespace())
+                .unwrap_or(columns)
+        };
+        let last_text_column = |line: Line| {
+            (0..columns)
+                .rfind(|&column| !grid[GridPoint::new(line, Column(column))].c.is_whitespace())
+                .map(|column| column + 1)
+                .unwrap_or(0)
+        };
+        let continues_into = |line: Line| {
+            if line >= grid.bottommost_line() {
+                return false;
+            }
+            if grid[GridPoint::new(line, last_column)]
+                .flags
+                .contains(Flags::WRAPLINE)
+            {
+                return true;
+            }
+            // Claude and other TUIs wrap inside a narrower content box, leaving a
+            // right margin and a small hanging indent. These are real grid rows,
+            // not WRAPLINE rows. Candidate parsing and file existence remain the
+            // guards against joining unrelated text.
+            let next_text = first_text_column(line + 1);
+            let end = last_text_column(line);
+            // A hard-wrapped token should end near the TUI's right edge. Without
+            // this bound, an ordinary URL at the end of a short paragraph absorbs
+            // the next line as though it were one long URL.
+            if end == 0
+                || end.saturating_add(16) < columns
+                || next_text > 12
+                || next_text >= columns
+            {
+                return false;
+            }
+            let chars: Vec<char> = (0..end)
+                .map(|column| grid[GridPoint::new(line, Column(column))].c)
+                .collect();
+            crate::links::url_spans(&chars)
+                .into_iter()
+                .any(|(_, span_end)| span_end == end)
+                || crate::links::path_spans(&chars)
+                    .into_iter()
+                    .any(|(_, span_end, _)| span_end == end)
+        };
+        let mut first_line = point.line;
+        while first_line > grid.topmost_line()
+            && continues_into(first_line - 1)
+            && point.line.0 - first_line.0 < 8
+        {
+            first_line -= 1;
+        }
+        let mut last_line = point.line;
+        while continues_into(last_line) && last_line.0 - point.line.0 < 8 {
+            last_line += 1;
+        }
+        let rows: Vec<(Vec<char>, bool)> = (first_line.0..=last_line.0)
+            .map(|line_number| {
+                let line = Line(line_number);
+                let chars = (0..columns)
+                    .map(|column| grid[GridPoint::new(line, Column(column))].c)
+                    .collect();
+                let soft_wrap = grid[GridPoint::new(line, last_column)]
+                    .flags
+                    .contains(Flags::WRAPLINE);
+                (chars, soft_wrap)
+            })
             .collect();
-        if let Some((start, end, target)) = crate::links::markdown_link_at(&chars, point.column.0)
+        let clicked_row = (point.line.0 - first_line.0) as usize;
+        let stitched = crate::links::stitch_rows(&rows, clicked_row, point.column.0);
+        if !stitched.clicked_in_content {
+            return None;
+        }
+        let chars = stitched.chars;
+        let logical_column = stitched.clicked_col;
+        let row_base = stitched.row_base;
+        let row_start = stitched.row_start;
+        let row_len = stitched.row_len;
+        let hovered = |start: usize, end: usize, url: String| HoveredLink {
+            line: point.line.0,
+            start: start.max(row_base) - row_base + row_start,
+            end: end.min(row_base + row_len) - row_base + row_start,
+            url,
+        };
+
+        if let Some((start, end, target)) = crate::links::markdown_link_at(&chars, logical_column)
             && let Some(url) = checked_link_uri(&target, session)
         {
-            return Some(HoveredLink {
-                line: point.line.0,
-                start,
-                end,
-                url,
-            });
+            return Some(hovered(start, end, url));
         }
-        if let Some((start, end, url)) = crate::links::url_span_at(&chars, point.column.0) {
+        if let Some((start, end, target)) =
+            crate::links::rendered_markdown_link_at(&chars, logical_column)
+            && let Some(url) = checked_link_uri(&target, session)
+        {
+            return Some(hovered(start, end, url));
+        }
+        if let Some((start, end, url)) = crate::links::url_span_at(&chars, logical_column) {
             let url = checked_link_uri(&url, session)?;
-            return Some(HoveredLink {
-                line: point.line.0,
-                start,
-                end,
-                url,
-            });
+            return Some(hovered(start, end, url));
         }
-        if let Some((start, end, raw)) = crate::links::path_span_at(&chars, point.column.0) {
+        if let Some((start, end, raw)) = crate::links::path_span_at(&chars, logical_column) {
+            // Remote sessions have no local cwd. Do not resolve an absolute
+            // remote path against a coincidentally matching local file.
+            session.cwd()?;
             let home = std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(std::path::PathBuf::from);
@@ -980,12 +1067,7 @@ fn link_at(
                 if let Some(fragment) = crate::links::source_fragment(&visible) {
                     url.push_str(&fragment);
                 }
-                return Some(HoveredLink {
-                    line: point.line.0,
-                    start,
-                    end,
-                    url,
-                });
+                return Some(hovered(start, end, url));
             }
         }
         None
@@ -1018,8 +1100,10 @@ fn checked_link_uri(uri: &str, session: &TerminalSession) -> Option<String> {
         return Some(uri.to_string());
     }
     if uri.starts_with("file://") {
+        // Remote sessions have no safe local filesystem namespace.
+        session.cwd()?;
         return crate::links::path_from_file_uri(uri)
-            .filter(|path| path.is_file())
+            .filter(|path| path.exists())
             .map(|_| uri.to_string());
     }
     let normalized = normalize_link_uri(uri, session);

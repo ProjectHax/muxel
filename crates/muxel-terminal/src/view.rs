@@ -461,7 +461,7 @@ impl TerminalView {
                 }
                 if let Some(input) = startup_input {
                     timer(PRE_TYPE_MS).await;
-                    session.write_input(input.as_bytes());
+                    session.paste(&input);
                     // On restore, leave the prompt typed but unsubmitted.
                     if submit {
                         timer(SUBMIT_DELAY_MS).await;
@@ -681,6 +681,10 @@ impl TerminalView {
 
     pub fn title(&self) -> Option<String> {
         self.session.title()
+    }
+
+    pub fn session_id_hint(&self) -> Option<String> {
+        self.session.session_id_hint()
     }
 
     /// Replace the color palette used to render this terminal. Also pushed into
