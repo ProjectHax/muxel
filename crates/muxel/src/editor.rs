@@ -319,6 +319,9 @@ impl EditorView {
                 s.set_value(content, window, cx);
                 s.set_scroll_offset(offset, cx);
             });
+            // `set_value` emits `InputEvent::Change`; this is a disk refresh,
+            // not a user edit. Keep the buffer eligible for later refreshes.
+            self.dirty = false;
         }
     }
 
