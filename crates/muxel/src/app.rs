@@ -3523,7 +3523,9 @@ impl MuxelApp {
             let is_codex = i
                 .program
                 .as_deref()
-                .is_some_and(|program| program.to_ascii_lowercase().contains("codex"));
+                .and_then(|program| std::path::Path::new(program).file_stem())
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("codex"));
             if is_codex
                 && i.injection != InjectionMode::None
                 && let Some(custom) = i.system_prompt.take().filter(|prompt| !prompt.is_empty())
@@ -3537,7 +3539,9 @@ impl MuxelApp {
                     append_agent_instruction(&mut i.system_prompt, instruction);
                 }
             };
-            if i.injection != InjectionMode::None {
+            if i.injection != InjectionMode::None
+                && project.is_none_or(|project| project.remote.is_none())
+            {
                 add_automatic(file_link_instruction().to_string(), &mut i);
             }
             if let Some(p) = project
@@ -3646,9 +3650,6 @@ impl MuxelApp {
         spec = spec.with_submit(resolved.submit);
         spec.env = resolved.env.clone();
         spec.env.extend(extra_env);
-        if project.is_some_and(|p| p.remote.is_none()) {
-            spec.env.push(("MUXEL_FILE_LINKS".into(), "1".into()));
-        }
         // Point a memory-enabled *local* project's agent at its memory file so tools
         // can find it without being told the path. Remote agents get the path via the
         // system-prompt instruction instead (env vars don't cross the ssh boundary).

@@ -498,9 +498,13 @@ pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
         match &instance.injection {
             InjectionMode::CliFlag { flag } => {
                 args.push(flag.clone());
-                args.push(prompt.clone());
+                args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
             }
-            InjectionMode::TypeIn => startup_input = Some(prompt.clone()),
+            InjectionMode::TypeIn => {
+                // A raw newline is Enter in TUIs without bracketed-paste mode.
+                // Keep the instruction bundle to one startup turn everywhere.
+                startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
             InjectionMode::None => {}
         }
     }
@@ -1042,6 +1046,14 @@ mod tests {
         assert_eq!(r.program.as_deref(), Some("opencode"));
         assert!(r.args.is_empty());
         assert_eq!(r.startup_input.as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn prompt_transports_keep_multiline_bundles_to_one_turn() {
+        let cli = resolve_launch(&instance(&AgentPreset::claude(), Some("one\n\ntwo")));
+        assert_eq!(cli.args.last().map(String::as_str), Some("one two"));
+        let typed = resolve_launch(&instance(&AgentPreset::opencode(), Some("one\n\ntwo")));
+        assert_eq!(typed.startup_input.as_deref(), Some("one two"));
     }
 
     #[test]

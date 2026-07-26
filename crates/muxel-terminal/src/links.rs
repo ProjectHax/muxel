@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub struct StitchedRows {
     pub chars: Vec<char>,
     pub clicked_col: usize,
+    pub clicked_in_content: bool,
     pub row_base: usize,
     pub row_start: usize,
     pub row_len: usize,
@@ -32,6 +33,7 @@ pub fn stitch_rows(
     let mut row_base = 0;
     let mut row_start = 0;
     let mut row_len = 0;
+    let mut clicked_in_content = false;
     for (index, (row, soft_wraps_to_next)) in rows.iter().enumerate() {
         let hard_continuation = index > 0 && !rows[index - 1].1;
         let start = if hard_continuation {
@@ -53,11 +55,13 @@ pub fn stitch_rows(
             row_base = chars.len();
             row_start = start;
             row_len = end.saturating_sub(start);
+            clicked_in_content = clicked_col >= start && clicked_col < end;
         }
         chars.extend(row[start..end].iter().copied());
     }
     StitchedRows {
         clicked_col: row_base + clicked_col.saturating_sub(row_start),
+        clicked_in_content,
         chars,
         row_base,
         row_start,
@@ -136,13 +140,27 @@ pub fn markdown_link_at(line: &[char], col: usize) -> Option<(usize, usize, Stri
             i += 1;
             continue;
         }
-        let label_end = line[i + 1..].iter().position(|c| *c == ']')? + i + 1;
+        let Some(label_end) = line[i + 1..]
+            .iter()
+            .position(|c| *c == ']')
+            .map(|end| end + i + 1)
+        else {
+            i += 1;
+            continue;
+        };
         if line.get(label_end + 1) != Some(&'(') {
             i = label_end + 1;
             continue;
         }
         let target_start = label_end + 2;
-        let target_end = line[target_start..].iter().position(|c| *c == ')')? + target_start;
+        let Some(target_end) = line[target_start..]
+            .iter()
+            .position(|c| *c == ')')
+            .map(|end| end + target_start)
+        else {
+            i = target_start;
+            continue;
+        };
         if col > i && col < label_end && target_end > target_start {
             let target: String = line[target_start..target_end].iter().collect();
             return Some((i + 1, label_end, target));
@@ -161,7 +179,13 @@ pub fn rendered_markdown_link_at(line: &[char], col: usize) -> Option<(usize, us
             continue;
         }
         let target_start = target_open + 1;
-        let target_end = line[target_start..].iter().position(|c| *c == ')')? + target_start;
+        let Some(target_end) = line[target_start..]
+            .iter()
+            .position(|c| *c == ')')
+            .map(|end| end + target_start)
+        else {
+            continue;
+        };
         let label_end = line[..target_open]
             .iter()
             .rposition(|c| !c.is_whitespace())?
@@ -341,8 +365,11 @@ pub fn file_uri(path: &Path) -> String {
 pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?.split('#').next()?;
     // `file:///path` → path starts with `/`; `file://localhost/path` rare, skip.
-    let path_part = if let Some(p) = rest.strip_prefix("localhost") {
-        p
+    let path_part = if rest.len() >= "localhost".len()
+        && rest[.."localhost".len()].eq_ignore_ascii_case("localhost")
+        && rest.as_bytes().get("localhost".len()) == Some(&b'/')
+    {
+        &rest["localhost".len()..]
     } else if rest.starts_with('/') {
         rest
     } else {
@@ -365,6 +392,12 @@ pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
     }
     let decoded = String::from_utf8(out).ok()?;
     if decoded.is_empty() {
+        return None;
+    }
+    // Never turn a URI into a UNC/network path. Link validation calls
+    // `exists()` on hover; probing an attacker-controlled SMB host can leak
+    // Windows credentials. Check after percent-decoding to block smuggling.
+    if decoded.starts_with("//") || decoded.starts_with("\\\\") {
         return None;
     }
     // Unix: `/tmp/x`. Windows: `/D:/x` or `/D|/x` (some emitters) → `D:/x`.
@@ -459,6 +492,20 @@ mod tests {
     }
 
     #[test]
+    fn malformed_markup_does_not_hide_a_later_valid_link() {
+        let literal = chars("[broken [good](https://example.com)");
+        assert_eq!(
+            markdown_link_at(&literal, 10).map(|(_, _, target)| target),
+            Some("https://example.com".to_string())
+        );
+        let rendered = chars("bad (https://broken good (https://example.com)");
+        assert_eq!(
+            rendered_markdown_link_at(&rendered, 21).map(|(_, _, target)| target),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
     fn two_urls_on_one_line() {
         let line = chars("https://a.com/1 and https://b.com/2");
         assert_eq!(url_spans(&line).len(), 2);
@@ -515,6 +562,18 @@ mod tests {
                 .as_deref(),
             Some("file:///D:/dev/moxie/joke.html")
         );
+    }
+
+    #[test]
+    fn hanging_indent_is_not_part_of_the_wrapped_link() {
+        let rows = vec![
+            (chars("file:///D:/dev/moxie/       "), false),
+            (chars("    joke.html               "), false),
+        ];
+        let indent = stitch_rows(&rows, 1, 2);
+        assert!(!indent.clicked_in_content);
+        let link = stitch_rows(&rows, 1, 6);
+        assert!(link.clicked_in_content);
     }
 
     // ---- file paths ----
@@ -657,7 +716,18 @@ mod tests {
             path_from_file_uri("file:///tmp/a.rs#L12C4").as_deref(),
             Some(Path::new("/tmp/a.rs"))
         );
+        assert_eq!(
+            path_from_file_uri("file://localhost/tmp/a.rs").as_deref(),
+            Some(Path::new("/tmp/a.rs"))
+        );
+        assert_eq!(
+            path_from_file_uri("file://LOCALHOST/tmp/a.rs").as_deref(),
+            Some(Path::new("/tmp/a.rs"))
+        );
+        assert!(path_from_file_uri("file://localhost.evil/tmp/a.rs").is_none());
         assert!(path_from_file_uri("file://server/share/a.rs").is_none());
+        assert!(path_from_file_uri("file:////server/share/a.rs").is_none());
+        assert!(path_from_file_uri("file:///%2F%2Fserver/share/a.rs").is_none());
     }
 
     #[test]

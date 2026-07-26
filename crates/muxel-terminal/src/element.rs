@@ -937,7 +937,7 @@ fn link_at(
             while end < columns && same(end) {
                 end += 1;
             }
-            let url = normalize_link_uri(&raw_uri, session);
+            let url = checked_link_uri(&normalize_link_uri(&raw_uri, session), session)?;
             return Some(HoveredLink {
                 line: point.line.0,
                 start,
@@ -977,7 +977,14 @@ fn link_at(
             // guards against joining unrelated text.
             let next_text = first_text_column(line + 1);
             let end = last_text_column(line);
-            if end == 0 || next_text > 12 || next_text >= columns {
+            // A hard-wrapped token should end near the TUI's right edge. Without
+            // this bound, an ordinary URL at the end of a short paragraph absorbs
+            // the next line as though it were one long URL.
+            if end == 0
+                || end.saturating_add(16) < columns
+                || next_text > 12
+                || next_text >= columns
+            {
                 return false;
             }
             let chars: Vec<char> = (0..end)
@@ -1015,6 +1022,9 @@ fn link_at(
             .collect();
         let clicked_row = (point.line.0 - first_line.0) as usize;
         let stitched = crate::links::stitch_rows(&rows, clicked_row, point.column.0);
+        if !stitched.clicked_in_content {
+            return None;
+        }
         let chars = stitched.chars;
         let logical_column = stitched.clicked_col;
         let row_base = stitched.row_base;
@@ -1043,6 +1053,9 @@ fn link_at(
             return Some(hovered(start, end, url));
         }
         if let Some((start, end, raw)) = crate::links::path_span_at(&chars, logical_column) {
+            // Remote sessions have no local cwd. Do not resolve an absolute
+            // remote path against a coincidentally matching local file.
+            session.cwd()?;
             let home = std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(std::path::PathBuf::from);
@@ -1087,8 +1100,10 @@ fn checked_link_uri(uri: &str, session: &TerminalSession) -> Option<String> {
         return Some(uri.to_string());
     }
     if uri.starts_with("file://") {
+        // Remote sessions have no safe local filesystem namespace.
+        session.cwd()?;
         return crate::links::path_from_file_uri(uri)
-            .filter(|path| path.is_file())
+            .filter(|path| path.exists())
             .map(|_| uri.to_string());
     }
     let normalized = normalize_link_uri(uri, session);
