@@ -6,7 +6,7 @@
 //! the bytes through the VTE `Processor` into the `Term` (see `process_output`),
 //! so the `Term` is only ever touched from the GPUI thread.
 
-use crate::colors::TerminalPalette;
+use crate::colors::{TerminalPalette, index_to_rgb};
 use crate::listener::{MuxelListener, SharedWriter};
 use crate::profile;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -224,6 +224,7 @@ pub struct TerminalSession {
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
+    session_id_hint: Arc<Mutex<Option<String>>>,
     bell: Arc<AtomicBool>,
     /// OSC-52 copies parsed from output, pending pickup by the view (which owns
     /// the gpui context a clipboard write needs).
@@ -464,22 +465,25 @@ impl TerminalSession {
         // `pair.slave` is dropped at the end of this function, closing the
         // parent's copy so the reader sees EOF when the child exits.
 
+        let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let (tx, rx) = async_channel::unbounded::<PtyChunk>();
+        let reply_writer = writer.clone();
+        let reply_palette = palette.clone();
         let reader_handle = std::thread::Builder::new()
             .name("muxel-pty-reader".to_string())
-            .spawn(move || read_loop(reader, child, tx))
+            .spawn(move || read_loop(reader, child, tx, reply_writer, reply_palette))
             .context("spawn reader thread")?;
 
         let title = Arc::new(Mutex::new(None));
+        let session_id_hint = Arc::new(Mutex::new(None));
         let bell = Arc::new(AtomicBool::new(false));
         let clipboard_store = Arc::new(Mutex::new(Vec::new()));
-        let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let listener = MuxelListener {
             writer: writer.clone(),
             title: title.clone(),
+            session_id_hint: session_id_hint.clone(),
             bell: bell.clone(),
             clipboard_store: clipboard_store.clone(),
-            palette: palette.clone(),
         };
 
         let term = Term::new(
@@ -503,6 +507,7 @@ impl TerminalSession {
             killer: Mutex::new(killer),
             child_pid,
             title,
+            session_id_hint,
             bell,
             clipboard_store,
             palette,
@@ -1120,6 +1125,12 @@ impl TerminalSession {
         self.title.lock().clone()
     }
 
+    /// Latest UUID-shaped OSC title retained when an agent replaces it with a
+    /// display name. Muxel uses this as an exact agent session identity hint.
+    pub fn session_id_hint(&self) -> Option<String> {
+        self.session_id_hint.lock().clone()
+    }
+
     /// Drain the OSC-52 copies parsed since the last call. The view lands them
     /// on the system clipboard (this crate has no gpui context of its own here).
     pub(crate) fn take_clipboard_stores(&self) -> Vec<(ClipboardType, String)> {
@@ -1513,6 +1524,119 @@ impl Drop for TerminalSession {
     }
 }
 
+/// Answers OSC color queries in the PTY reader thread, before terminal output
+/// crosses the async channel to GPUI. Querying TUIs briefly switch the tty into
+/// a response-reading mode; a reply generated later by the UI drain can arrive
+/// after that mode ends and become visible prompt input.
+struct ImmediateColorQueries {
+    state: OscScanState,
+    body: Vec<u8>,
+    writer: SharedWriter,
+    palette: Arc<Mutex<TerminalPalette>>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum OscScanState {
+    #[default]
+    Ground,
+    Escape,
+    Osc,
+    OscEscape,
+}
+
+#[derive(Clone, Copy)]
+enum OscTerminator {
+    Bell,
+    StringTerminator,
+}
+
+impl ImmediateColorQueries {
+    const MAX_BODY: usize = 1024;
+
+    fn new(writer: SharedWriter, palette: Arc<Mutex<TerminalPalette>>) -> Self {
+        Self {
+            state: OscScanState::Ground,
+            body: Vec::new(),
+            writer,
+            palette,
+        }
+    }
+
+    fn advance(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.state = match (self.state, byte) {
+                (OscScanState::Ground, 0x1b) => OscScanState::Escape,
+                (OscScanState::Escape, b']') => {
+                    self.body.clear();
+                    OscScanState::Osc
+                }
+                (OscScanState::Escape, 0x1b) => OscScanState::Escape,
+                (OscScanState::Osc, 0x07) => {
+                    self.answer(OscTerminator::Bell);
+                    OscScanState::Ground
+                }
+                (OscScanState::Osc, 0x9c) => {
+                    self.answer(OscTerminator::StringTerminator);
+                    OscScanState::Ground
+                }
+                (OscScanState::Osc, 0x1b) => OscScanState::OscEscape,
+                (OscScanState::Osc, 0x18 | 0x1a) => OscScanState::Ground,
+                (OscScanState::Osc, byte) if self.body.len() < Self::MAX_BODY => {
+                    self.body.push(byte);
+                    OscScanState::Osc
+                }
+                (OscScanState::Osc, _) => {
+                    self.body.clear();
+                    OscScanState::Ground
+                }
+                (OscScanState::OscEscape, b'\\') => {
+                    self.answer(OscTerminator::StringTerminator);
+                    OscScanState::Ground
+                }
+                (OscScanState::OscEscape, 0x18 | 0x1a) => OscScanState::Ground,
+                (OscScanState::OscEscape, _) => OscScanState::Ground,
+                _ => OscScanState::Ground,
+            };
+        }
+    }
+
+    fn answer(&mut self, terminator: OscTerminator) {
+        let Ok(body) = std::str::from_utf8(&self.body) else {
+            return;
+        };
+        let Some(request) = body.strip_suffix(";?") else {
+            return;
+        };
+        let (prefix, index) = match request {
+            "10" => ("10".to_string(), 256),
+            "11" => ("11".to_string(), 257),
+            "12" => ("12".to_string(), 258),
+            _ => {
+                let Some(index) = request.strip_prefix("4;").and_then(|s| s.parse().ok()) else {
+                    return;
+                };
+                (request.to_string(), index)
+            }
+        };
+        let Some(rgb) = index_to_rgb(&self.palette.lock(), index) else {
+            return;
+        };
+        let end = match terminator {
+            OscTerminator::Bell => "\x07",
+            OscTerminator::StringTerminator => "\x1b\\",
+        };
+        let reply = format!(
+            "\x1b]{prefix};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}{end}",
+            r = rgb.r,
+            g = rgb.g,
+            b = rgb.b,
+        );
+        let mut writer = self.writer.lock();
+        let _ = writer.write_all(reply.as_bytes());
+        let _ = writer.flush();
+    }
+}
+
 /// Blocking PTY reader. Owns the `Child` so that after EOF it can harvest the
 /// exit code — letting the app tell a clean `exit` from a crash (resume
 /// recovery must not treat a deliberate quit as recoverable).
@@ -1520,8 +1644,11 @@ fn read_loop(
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn Child + Send + Sync>,
     tx: async_channel::Sender<PtyChunk>,
+    writer: SharedWriter,
+    palette: Arc<Mutex<TerminalPalette>>,
 ) {
     let mut buf = [0u8; 65536];
+    let mut color_queries = ImmediateColorQueries::new(writer, palette);
     // Only a clean EOF or a real error ends the session. EINTR is a signal
     // interruption, not an exit — retrying it keeps a healthy pane from being
     // torn down. Any other error is recorded so the app can log/show it.
@@ -1531,6 +1658,7 @@ fn read_loop(
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF → every slave fd closed; child is (probably) gone
             Ok(n) => {
+                color_queries.advance(&buf[..n]);
                 if tx
                     .send_blocking(PtyChunk::Output(buf[..n].to_vec()))
                     .is_err()
@@ -1805,6 +1933,44 @@ mod windows_spawn_resolve {
     }
 }
 
+#[cfg(test)]
+mod immediate_color_tests {
+    use super::*;
+
+    fn responder() -> (ImmediateColorQueries, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter(tx))));
+        let palette = Arc::new(Mutex::new(TerminalPalette {
+            background: 0x112233,
+            ..Default::default()
+        }));
+        (ImmediateColorQueries::new(writer, palette), rx)
+    }
+
+    #[test]
+    fn color_query_is_answered_immediately_across_reader_chunks() {
+        let (mut responder, rx) = responder();
+        responder.advance(b"\x1b]11;");
+        assert!(rx.try_recv().is_err());
+        responder.advance(b"?\x07");
+        assert_eq!(rx.recv().unwrap(), b"\x1b]11;rgb:1111/2222/3333\x07");
+    }
+
+    #[test]
+    fn indexed_query_preserves_index_and_string_terminator() {
+        let (mut responder, rx) = responder();
+        responder.advance(b"\x1b]4;1;?\x1b\\");
+        assert_eq!(rx.recv().unwrap(), b"\x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\");
+    }
+
+    #[test]
+    fn ordinary_osc_title_does_not_write_to_the_pty() {
+        let (mut responder, rx) = responder();
+        responder.advance(b"\x1b]0;Review changes\x07");
+        assert!(rx.try_recv().is_err());
+    }
+}
+
 // These tests spawn `/bin/sh` and `/bin/cat`, so they are Unix-only.
 #[cfg(all(test, unix))]
 mod tests {
@@ -2026,22 +2192,20 @@ mod tests {
         session.kill();
     }
 
-    /// OSC 11 (default background) query: answered from the session palette so
-    /// TUIs detect dark/light from what's actually painted.
+    #[cfg(unix)]
     #[test]
-    fn color_query_reports_palette_background() {
-        let (session, rx) =
+    fn uuid_title_tracks_session_switch_and_ignores_display_title() {
+        let (session, _rx) =
             TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 80, 24)
                 .expect("spawn");
-        session.set_palette(crate::colors::TerminalPalette {
-            background: 0x112233,
-            ..Default::default()
-        });
-        session.process_output(b"\x1b]11;?\x07");
-        assert!(
-            wait_for_reply(&rx, b"]11;rgb:1111/2222/3333"),
-            "background query should answer with the set palette"
-        );
+        let id = "019f95d7-db31-7db0-904d-9e08330e0000";
+        let resumed = "019f95d7-db31-7db0-904d-9e08330e0001";
+        session.process_output(format!("\x1b]0;{id}\x07").as_bytes());
+        session.process_output(b"\x1b]0;Review changes\x07");
+        assert_eq!(session.title().as_deref(), Some("Review changes"));
+        assert_eq!(session.session_id_hint().as_deref(), Some(id));
+        session.process_output(format!("\x1b]0;{resumed}\x07").as_bytes());
+        assert_eq!(session.session_id_hint().as_deref(), Some(resumed));
         session.kill();
     }
 
