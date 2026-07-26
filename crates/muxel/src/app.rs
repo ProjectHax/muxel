@@ -7026,12 +7026,19 @@ impl MuxelApp {
     /// separate muxel browser window.
     fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = muxel_terminal::path_from_file_uri(url) {
+            let source_position = muxel_terminal::source_position_from_uri(url);
             if path.exists()
                 && let Some(pid) = self.workspace.active_project
-                && self
-                    .open_editor_at(pid, Some(path), self.active_instance, window, cx)
-                    .is_some()
+                && let Some(iid) =
+                    self.open_editor_at(pid, Some(path), self.active_instance, window, cx)
             {
+                if let Some((line, column)) = source_position
+                    && let Some(editor) = self.editors.get(&iid)
+                {
+                    editor.update(cx, |editor, cx| {
+                        editor.goto_position(line, column, window, cx);
+                    });
+                }
                 return;
             }
             // Fall through to the OS if no project / editor open failed.

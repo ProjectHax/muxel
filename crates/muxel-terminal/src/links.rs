@@ -217,6 +217,20 @@ pub fn source_fragment(token: &str) -> Option<String> {
     Some(format!("#L{line}"))
 }
 
+/// Parse a `#L<line>C<column>` file-link fragment into a zero-based editor
+/// position. The column is optional and defaults to the start of the line.
+pub fn source_position_from_uri(uri: &str) -> Option<(u32, u32)> {
+    let fragment = uri.split_once('#')?.1.strip_prefix('L')?;
+    let (line, column) = fragment
+        .split_once('C')
+        .map_or((fragment, None), |(line, column)| (line, Some(column)));
+    let line = line.parse::<u32>().ok()?.checked_sub(1)?;
+    let column = column
+        .map(|value| value.parse::<u32>().ok()?.checked_sub(1))
+        .unwrap_or(Some(0))?;
+    Some((line, column))
+}
+
 /// Characters that may appear inside a file path. `:` is included so a trailing
 /// `:line[:col]` suffix stays inside the visual span (it's stripped from the
 /// returned path string). `\` is accepted so Windows paths (`D:\dev\foo.rs`) are
@@ -429,8 +443,8 @@ pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
 mod tests {
     use super::{
         file_uri, markdown_link_at, path_from_file_uri, path_span_at, path_spans,
-        rendered_markdown_link_at, resolve_path, source_fragment, stitch_rows, url_span_at,
-        url_spans,
+        rendered_markdown_link_at, resolve_path, source_fragment, source_position_from_uri,
+        stitch_rows, url_span_at, url_spans,
     };
     use std::path::{Path, PathBuf};
 
@@ -624,6 +638,19 @@ mod tests {
             Some("#L42C7")
         );
         assert_eq!(source_fragment("src/main.rs:42").as_deref(), Some("#L42"));
+    }
+
+    #[test]
+    fn parses_source_fragments_for_editor_navigation() {
+        assert_eq!(
+            source_position_from_uri("file:///D:/x.rs#L12C4"),
+            Some((11, 3))
+        );
+        assert_eq!(
+            source_position_from_uri("file:///D:/x.rs#L12"),
+            Some((11, 0))
+        );
+        assert_eq!(source_position_from_uri("file:///D:/x.rs#L0C1"), None);
     }
 
     #[test]
