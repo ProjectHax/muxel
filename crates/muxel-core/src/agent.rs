@@ -491,6 +491,15 @@ pub struct ResolvedLaunch {
 /// Resolve an instance into program/args (+ any startup input + env), applying
 /// its system-prompt injection mode.
 pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
+    resolve_launch_for_session(instance, false)
+}
+
+/// Resolve a launch while respecting whether it resumes an existing conversation.
+///
+/// Type-in injection is a real user turn. It belongs only to a new conversation;
+/// submitting it again on process restart mutates the resumed transcript. CLI
+/// flags remain launch configuration and may need to be applied on every process.
+pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> ResolvedLaunch {
     let mut args = instance.args.clone();
     let mut startup_input = None;
 
@@ -500,11 +509,12 @@ pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
                 args.push(flag.clone());
                 args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
             }
-            InjectionMode::TypeIn => {
+            InjectionMode::TypeIn if !resuming => {
                 // A raw newline is Enter in TUIs without bracketed-paste mode.
                 // Keep the instruction bundle to one startup turn everywhere.
                 startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
             }
+            InjectionMode::TypeIn => {}
             InjectionMode::None => {}
         }
     }
@@ -1046,6 +1056,27 @@ mod tests {
         assert_eq!(r.program.as_deref(), Some("opencode"));
         assert!(r.args.is_empty());
         assert_eq!(r.startup_input.as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn type_in_does_not_submit_another_user_turn_on_resume() {
+        let r = resolve_launch_for_session(
+            &instance(&AgentPreset::opencode(), Some("hello there")),
+            true,
+        );
+        assert!(r.args.is_empty());
+        assert_eq!(r.startup_input, None);
+    }
+
+    #[test]
+    fn cli_flag_remains_launch_configuration_on_resume() {
+        let r =
+            resolve_launch_for_session(&instance(&AgentPreset::claude(), Some("be terse")), true);
+        assert_eq!(
+            r.args,
+            vec!["--append-system-prompt".to_string(), "be terse".to_string()]
+        );
+        assert_eq!(r.startup_input, None);
     }
 
     #[test]

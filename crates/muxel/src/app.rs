@@ -26,8 +26,9 @@ use muxel_core::{
     WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, append_agent_instruction,
     codex_developer_instructions_override, file_link_instruction, focus_in_direction,
     memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
-    move_pane_beside, move_tab_to, remove, resolve_launch, set_active_tab, set_split_sizes,
-    set_tab_order, split, split_beside, ssh, swap_instances, swap_panes, sync_codex_approval_args,
+    move_pane_beside, move_tab_to, remove, resolve_launch_for_session, set_active_tab,
+    set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
+    sync_agent_injection_modes, sync_codex_approval_args,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
@@ -3245,6 +3246,9 @@ impl MuxelApp {
         // Presets can change after a pane is created. Codex approval policy must
         // follow the current preset instead of its stale per-pane argument snapshot.
         sync_codex_approval_args(&mut workspace, &self.presets);
+        // Instruction transport is preset capability, not conversation state. In
+        // particular, legacy Grok panes must move from visible TypeIn to --rules.
+        sync_agent_injection_modes(&mut workspace, &self.presets);
         // Repair a workspace holding two panes on one tmux session — they would
         // mirror each other, and closing one would kill the session under the other.
         // Normally a no-op.
@@ -3515,9 +3519,20 @@ impl MuxelApp {
         let resume_args = self.session_resume_for(instance_id);
         let inst = self.workspace.instance(instance_id);
         let project = inst.and_then(|i| self.workspace.project(i.project_id));
+        let resuming = inst
+            .and_then(|i| {
+                let preset = i
+                    .preset_id
+                    .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
+                    .or_else(|| self.presets.iter().find(|p| p.name == i.preset))?;
+                Some((preset.resume_flag.as_deref()?, resume_args.as_ref()?))
+            })
+            .is_some_and(|(flag, args)| args.first().is_some_and(|arg| arg == flag));
         // Build one instruction bundle, then let the preset's injection transport
         // deliver it. CliFlag and Codex are hidden launch-time instructions;
-        // TypeIn intentionally submits one visible startup turn; None opts out.
+        // TypeIn submits one visible turn only for a new conversation. Codex's
+        // developer-instructions override also becomes a submitted turn when it is
+        // supplied to `resume`, so a resumed Codex receives no launch bundle.
         let mut codex_instructions = Vec::new();
         let inst_owned = inst.cloned().map(|mut i| {
             let is_codex = i
@@ -3526,25 +3541,32 @@ impl MuxelApp {
                 .and_then(|program| std::path::Path::new(program).file_stem())
                 .and_then(|stem| stem.to_str())
                 .is_some_and(|stem| stem.eq_ignore_ascii_case("codex"));
-            if is_codex
-                && i.injection != InjectionMode::None
-                && let Some(custom) = i.system_prompt.take().filter(|prompt| !prompt.is_empty())
-            {
-                codex_instructions.push(custom);
+            if is_codex {
+                let custom = i.system_prompt.take().filter(|prompt| !prompt.is_empty());
+                if !resuming
+                    && i.injection != InjectionMode::None
+                    && let Some(custom) = custom
+                {
+                    codex_instructions.push(custom);
+                }
             }
             let mut add_automatic = |instruction: String, i: &mut Instance| {
                 if is_codex {
-                    codex_instructions.push(instruction);
+                    if !resuming {
+                        codex_instructions.push(instruction);
+                    }
                 } else if i.injection != InjectionMode::None {
                     append_agent_instruction(&mut i.system_prompt, instruction);
                 }
             };
-            if i.injection != InjectionMode::None
+            if !resuming
+                && i.injection != InjectionMode::None
                 && project.is_none_or(|project| project.remote.is_none())
             {
                 add_automatic(file_link_instruction().to_string(), &mut i);
             }
-            if let Some(p) = project
+            if !resuming
+                && let Some(p) = project
                 && p.memory_enabled
                 && i.injection != InjectionMode::None
             {
@@ -3563,7 +3585,7 @@ impl MuxelApp {
         });
         let mut resolved = inst_owned
             .as_ref()
-            .map(resolve_launch)
+            .map(|instance| resolve_launch_for_session(instance, resuming))
             .unwrap_or(ResolvedLaunch {
                 program: None,
                 args: Vec::new(),
