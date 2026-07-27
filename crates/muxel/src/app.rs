@@ -1097,6 +1097,15 @@ enum RemoteScanState {
     Failed(String),
 }
 
+struct TerminalSpawnMeta {
+    instance_id: Uuid,
+    token: u64,
+    program: String,
+    cwd: String,
+    was_resume: bool,
+    started: Instant,
+}
+
 pub struct MuxelApp {
     workspace: Workspace,
     /// Live terminals, keyed by instance id.
@@ -1236,6 +1245,11 @@ pub struct MuxelApp {
     /// resume launch that exits almost immediately means the saved session was
     /// invalid — we recover by re-spawning the agent with a fresh session.
     terminal_launches: HashMap<Uuid, (std::time::Instant, bool)>,
+    /// PTY/process creation currently running on the launch worker. This closes
+    /// the gap where the pane has no view yet and another ensure pass could
+    /// start the same agent twice.
+    terminal_launching: HashMap<Uuid, u64>,
+    next_terminal_launch_token: u64,
     /// Instances whose launch failed *completely* (even the fallback shell
     /// couldn't spawn), with the error. The pane shows it in place; Restart
     /// retries. Runtime-only, cleared on success / teardown.
@@ -3141,6 +3155,8 @@ impl MuxelApp {
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
             terminal_launches: HashMap::new(),
+            terminal_launching: HashMap::new(),
+            next_terminal_launch_token: 0,
             failed_launches: HashMap::new(),
             save_errors: HashMap::new(),
             split_even_nonce: HashMap::new(),
@@ -3433,7 +3449,7 @@ impl MuxelApp {
                 // Hold the password in memory for the session (keyed by the secret
                 // owner, so every host on this identity reuses it) and spawn the panes.
                 self.session_passwords.insert(p.owner_id, pw);
-                self.ensure_project_terminals(pid, window, cx);
+                self.ensure_project_terminals_deferred(pid, window, cx);
             }
             PasswordAction::Verify(idx) => {
                 // Test once with the entered password; do not store it.
@@ -3446,8 +3462,9 @@ impl MuxelApp {
     /// Build the launch command for an instance (program/args + system-prompt
     /// injection, rooted at its project).
     /// Session-resume args for a resume-capable agent, doing the `&mut`
-    /// bookkeeping: mint/capture a session id, flip `session_started`, and
-    /// persist. Returns the CLI args to inject, or `None` for agents without
+    /// bookkeeping: mint/capture a session id and choose fresh versus resume.
+    /// `session_started` is persisted only after the process is installed.
+    /// Returns the CLI args to inject, or `None` for agents without
     /// resume (or a bare first launch for agent-minted ids).
     ///
     /// - **Host-minted** (`session_id_flag` set): first launch
@@ -3506,8 +3523,6 @@ impl MuxelApp {
             }
         }
         let snapshot = inst.clone();
-        inst.session_started = true;
-        self.persist();
         muxel_core::session_resume_args(&preset, &snapshot)
     }
 
@@ -3683,6 +3698,9 @@ impl MuxelApp {
 
     /// Spawn (or replace) the live terminal for an instance id.
     fn spawn_terminal(&mut self, instance_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        // An explicit/immediate spawn supersedes a deferred launch still creating
+        // its PTY. Its token will fail validation and dropping it kills the child.
+        self.terminal_launching.remove(&instance_id);
         self.reset_terminal_runtime(instance_id);
         // A remote password host with no saved/session password: prompt for it
         // first (storing it in memory), then this spawn is retried via
@@ -3696,8 +3714,7 @@ impl MuxelApp {
             return;
         }
         // Whether this launch will `--resume` a saved session (true on every
-        // launch after the first, for resume-capable agents). Captured before
-        // `command_for`, which flips `session_started` to true.
+        // launch after the first, for resume-capable agents).
         let was_resume = self
             .workspace
             .instance(instance_id)
@@ -3719,40 +3736,154 @@ impl MuxelApp {
             .and_then(|i| i.grid)
             .or_else(|| self.sibling_grid(instance_id, cx))
             .unwrap_or((80, 24));
-        let startup_started = Instant::now();
-        let launch = match TerminalLaunch::spawn(spec, size) {
+        let meta = TerminalSpawnMeta {
+            instance_id,
+            token: 0,
+            program: prog,
+            cwd,
+            was_resume,
+            started: Instant::now(),
+        };
+        let result = TerminalLaunch::spawn(spec, size);
+        self.install_terminal_spawn(meta, result, window, cx);
+    }
+
+    fn mark_terminal_session_started(&mut self, instance_id: Uuid) -> bool {
+        let resume_capable = self.workspace.instance(instance_id).is_some_and(|inst| {
+            inst.preset_id
+                .and_then(|id| self.presets.iter().find(|preset| preset.id == id))
+                .or_else(|| {
+                    self.presets
+                        .iter()
+                        .find(|preset| preset.name == inst.preset)
+                })
+                .is_some_and(|preset| preset.resume_flag.is_some())
+        });
+        if resume_capable
+            && let Some(inst) = self.workspace.instance_mut(instance_id)
+            && !inst.session_started
+        {
+            inst.session_started = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Prepare the stateful/UI half of a deferred terminal launch. The returned
+    /// spec can be spawned on a worker; completion must come back through
+    /// `finish_deferred_terminal_spawn`.
+    fn prepare_terminal_spawn(
+        &mut self,
+        instance_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
+        if self.terminals.contains_key(&instance_id)
+            || self.failed_launches.contains_key(&instance_id)
+            || self.terminal_launching.contains_key(&instance_id)
+        {
+            return None;
+        }
+        self.next_terminal_launch_token = self.next_terminal_launch_token.wrapping_add(1);
+        let token = self.next_terminal_launch_token;
+        self.terminal_launching.insert(instance_id, token);
+        self.reset_terminal_runtime(instance_id);
+        if let Some(host) = self.remote_host_for_instance(instance_id)
+            && host.auth == SshAuth::Password
+            && self.remote_password(&host).is_none()
+            && let Some(pid) = self.workspace.instance(instance_id).map(|i| i.project_id)
+        {
+            self.terminal_launching.remove(&instance_id);
+            self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
+            return None;
+        }
+        let was_resume = self
+            .workspace
+            .instance(instance_id)
+            .is_some_and(|i| i.session_started);
+        let spec = self.command_for(instance_id);
+        let meta = TerminalSpawnMeta {
+            instance_id,
+            token,
+            program: spec.program.clone(),
+            cwd: spec.cwd.clone().unwrap_or_default(),
+            was_resume,
+            started: Instant::now(),
+        };
+        let size = self
+            .workspace
+            .instance(instance_id)
+            .and_then(|i| i.grid)
+            .or_else(|| self.sibling_grid(instance_id, cx))
+            .unwrap_or((80, 24));
+        Some((meta, spec, size))
+    }
+
+    fn finish_terminal_spawn(
+        &mut self,
+        meta: TerminalSpawnMeta,
+        result: anyhow::Result<TerminalLaunch>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let instance_id = meta.instance_id;
+        let token = meta.token;
+        // The pane may have closed/restarted or a newer launch may own this iid
+        // while ConPTY was being created. Dropping the stale result kills it.
+        if self.terminal_launching.get(&instance_id) != Some(&token)
+            || self.workspace.instance(instance_id).is_none()
+        {
+            if self.terminal_launching.get(&instance_id) == Some(&token) {
+                self.terminal_launching.remove(&instance_id);
+            }
+            return;
+        }
+        self.terminal_launching.remove(&instance_id);
+        self.install_terminal_spawn(meta, result, window, cx);
+    }
+
+    /// Install a completed launch. Both immediate and deferred spawning use this
+    /// single tail so failure reporting, view setup, and durable session state
+    /// cannot drift between the two paths.
+    fn install_terminal_spawn(
+        &mut self,
+        meta: TerminalSpawnMeta,
+        result: anyhow::Result<TerminalLaunch>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let TerminalSpawnMeta {
+            instance_id,
+            token: _,
+            program,
+            cwd,
+            was_resume,
+            started,
+        } = meta;
+        let launch = match result {
             Ok(launch) => launch,
-            Err(e) => {
-                // Total failure — even the fallback shell couldn't spawn. Show
-                // it in the pane (Restart retries) and the feed instead of
-                // crashing; drop any stale view (this is "spawn or replace").
+            Err(error) => {
                 self.terminals.remove(&instance_id);
                 self.terminal_launches.remove(&instance_id);
-                self.failed_launches.insert(instance_id, format!("{e:#}"));
+                self.failed_launches
+                    .insert(instance_id, format!("{error:#}"));
                 self.add_event(
                     NotifKind::Error,
-                    tf("Launch failed: {prog}", &[("prog", &prog)]),
-                    format!("tried `{prog}` in `{cwd}` — {e:#}"),
+                    tf("Launch failed: {prog}", &[("prog", &program)]),
+                    format!("tried `{program}` in `{cwd}` — {error:#}"),
                 );
                 cx.notify();
                 return;
             }
         };
-        muxel_terminal::startup_event(
-            instance_id,
-            &prog,
-            "pty-spawn",
-            startup_started.elapsed(),
-            0,
-        );
+        muxel_terminal::startup_event(instance_id, &program, "pty-spawn", started.elapsed(), 0);
         self.failed_launches.remove(&instance_id);
-        // A failed launch of the requested program (the fallback shell is
-        // running instead) goes to the dev console.
-        if let Some(err) = launch.launch_error().map(str::to_string) {
+        if let Some(error) = launch.launch_error().map(str::to_string) {
             self.add_event(
                 NotifKind::Error,
-                tf("Launch failed: {prog}", &[("prog", &prog)]),
-                format!("tried `{prog}` in `{cwd}` — {err}"),
+                tf("Launch failed: {prog}", &[("prog", &program)]),
+                format!("tried `{program}` in `{cwd}` — {error}"),
             );
         }
         let palette = theme::palette_from_theme(cx);
@@ -3760,7 +3891,7 @@ impl MuxelApp {
         let font_size = self.settings.font_size * self.settings.zoom;
         let mouse_mode = TerminalMouseMode::from_setting(&self.settings.terminal_mouse);
         let view = cx.new(move |cx| {
-            let mut view = TerminalView::new(launch, instance_id, startup_started, window, cx);
+            let mut view = TerminalView::new(launch, instance_id, started, window, cx);
             view.set_palette(palette);
             view.set_config(font_family, font_size);
             view.set_mouse_mode(mouse_mode);
@@ -3768,16 +3899,20 @@ impl MuxelApp {
         });
         self.terminals.insert(instance_id, view);
         self.terminal_launches
-            .insert(instance_id, (std::time::Instant::now(), was_resume));
-        // A runner submits only on its first launch; clear auto_submit afterward
-        // so reopening the app re-types the prompt but doesn't auto-submit it.
+            .insert(instance_id, (Instant::now(), was_resume));
+        let mut state_changed = false;
         if let Some(inst) = self.workspace.instance_mut(instance_id)
             && inst.is_runner
             && inst.auto_submit
         {
             inst.auto_submit = false;
+            state_changed = true;
+        }
+        state_changed |= self.mark_terminal_session_started(instance_id);
+        if state_changed {
             self.persist();
         }
+        cx.notify();
     }
 
     /// Re-derive the terminal palette from the active theme and apply it to all
@@ -4176,7 +4311,7 @@ impl MuxelApp {
         // Force the layout re-sync too — a long outage may have left the remote
         // copy newer than ours.
         self.remote_synced.remove(&pid);
-        self.ensure_project_terminals(pid, window, cx);
+        self.ensure_project_terminals_deferred(pid, window, cx);
         cx.notify();
     }
 
@@ -4304,12 +4439,19 @@ impl MuxelApp {
             .project(pid)
             .map(|p| p.instances())
             .unwrap_or_default();
-        // Start the pane the user can see first. The remaining fleet follows one
-        // per turn, so a slow background pane cannot delay useful input.
+        // Start the pane the user can see first. Admit terminal processes in
+        // bounded waves: enough parallelism to avoid a long fleet tail without
+        // firing the entire workspace at Windows in one burst.
         if let Some(active) = self.active_instance
             && let Some(index) = instances.iter().position(|iid| *iid == active)
         {
             instances.swap(0, index);
+        }
+        // A new activation owns this project's pending panes. Invalidate an
+        // older wave now so this run can launch them immediately; old results
+        // fail their token check and are killed on drop.
+        for iid in &instances {
+            self.terminal_launching.remove(iid);
         }
         let generation = {
             let generation = self.deferred_activation_generation.entry(pid).or_default();
@@ -4317,39 +4459,98 @@ impl MuxelApp {
             *generation
         };
         cx.spawn_in(window, async move |this, cx| {
-            for (index, iid) in instances.into_iter().enumerate() {
+            const LAUNCH_CONCURRENCY: usize = 4;
+            let mut owned_tokens = Vec::new();
+            for wave_start in (0..instances.len()).step_by(LAUNCH_CONCURRENCY) {
                 // Yield even before the first launch so the selected layout paints.
                 cx.background_executor()
                     .timer(Duration::from_millis(1))
                     .await;
-                let keep_going = this
-                    .update_in(cx, |this, window, cx| {
-                        if this.deferred_activation_generation.get(&pid) != Some(&generation)
-                            || !this.project_is_shown_in_window(pid, window)
-                        {
-                            return false;
-                        }
-                        this.spawn_project_pane(iid, window, cx);
-                        // `focus_instance` puts a not-yet-created pane on the app
-                        // root. Focus the first visible pane only if that neutral
-                        // focus is still present; a modal/input opened meanwhile wins.
-                        if index == 0
-                            && this.active_instance == Some(iid)
-                            && this.focus_handle.is_focused(window)
-                        {
-                            this.focus_instance(iid, window, cx);
-                        }
-                        true
-                    })
-                    .unwrap_or(false);
-                if !keep_going {
+                let wave_end = (wave_start + LAUNCH_CONCURRENCY).min(instances.len());
+                let mut launches = Vec::new();
+                let mut cancelled = false;
+                for (index, iid) in instances[wave_start..wave_end]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(offset, iid)| (wave_start + offset, iid))
+                {
+                    let prepared = this
+                        .update_in(cx, |this, window, cx| {
+                            if this.deferred_activation_generation.get(&pid) != Some(&generation)
+                                || !this.project_is_shown_in_window(pid, window)
+                            {
+                                return Err(());
+                            }
+                            if this.workspace.instance(iid).map(|i| i.kind)
+                                == Some(InstanceKind::Terminal)
+                            {
+                                Ok(this.prepare_terminal_spawn(iid, window, cx))
+                            } else {
+                                this.spawn_project_pane(iid, window, cx);
+                                Ok(None)
+                            }
+                        })
+                        .unwrap_or(Err(()));
+                    let Ok(prepared) = prepared else {
+                        cancelled = true;
+                        break;
+                    };
+                    if let Some((meta, spec, size)) = prepared {
+                        owned_tokens.push((iid, meta.token));
+                        let task = cx
+                            .background_executor()
+                            .spawn(async move { TerminalLaunch::spawn(spec, size) });
+                        launches.push((index, iid, meta, task));
+                    }
+                }
+                if cancelled {
+                    break;
+                }
+                // All four workers are already running. Awaiting their handles in
+                // pane order controls admission/focus order, not concurrency.
+                for (index, iid, meta, task) in launches {
+                    let result = task.await;
+                    let keep_going = this
+                        .update_in(cx, |this, window, cx| {
+                            if this.deferred_activation_generation.get(&pid) != Some(&generation)
+                                || !this.project_is_shown_in_window(pid, window)
+                            {
+                                if this.terminal_launching.get(&iid) == Some(&meta.token) {
+                                    this.terminal_launching.remove(&iid);
+                                }
+                                return false;
+                            }
+                            this.finish_terminal_spawn(meta, result, window, cx);
+                            // `focus_instance` puts a not-yet-created pane on the
+                            // app root. Focus the first visible pane only if that
+                            // neutral focus is still present; a modal/input wins.
+                            if index == 0
+                                && this.active_instance == Some(iid)
+                                && this.focus_handle.is_focused(window)
+                            {
+                                this.focus_instance(iid, window, cx);
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !keep_going {
+                        cancelled = true;
+                        break;
+                    }
+                }
+                if cancelled {
                     break;
                 }
             }
-            let _ = this.update_in(cx, |this, _, _| {
-                if this.deferred_activation_generation.get(&pid) == Some(&generation) {
-                    this.deferred_activation_generation.remove(&pid);
+            let _ = this.update(cx, |this, _| {
+                for (iid, token) in owned_tokens {
+                    if this.terminal_launching.get(&iid) == Some(&token) {
+                        this.terminal_launching.remove(&iid);
+                    }
                 }
+                // Keep the counter entry: generation numbers must never be reused
+                // while an older worker can still return.
             });
         })
         .detach();
@@ -4487,6 +4688,10 @@ impl MuxelApp {
         self.workspace_lock = Some(lock);
 
         self.failed_launches.clear();
+        // Invalidate background launches from the old workspace before ids from
+        // the new document can be admitted.
+        self.terminal_launching.clear();
+        self.terminal_launches.clear();
         let views: Vec<_> = self.terminals.drain().map(|(_, v)| v).collect();
         for view in views {
             view.read(cx).session().kill();
@@ -8218,6 +8423,9 @@ impl MuxelApp {
     /// Close an instance. `kill_remote_session` is false for auto-close-on-exit,
     /// so a dropped remote connection doesn't tear down a still-running session.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
+        // Invalidate a PTY still being created. Its eventual result sees the
+        // missing token, drops, and kills the child instead of becoming invisible.
+        self.terminal_launching.remove(&iid);
         self.clear_notifications_for(iid);
         // Durable trace of every close: with stderr often discarded, this log is
         // what distinguishes "I closed it" from "it vanished" after the fact.
@@ -10088,7 +10296,7 @@ impl MuxelApp {
                 .find(|id| *id != pid);
             self.active_instance = self.workspace.active().and_then(|p| p.first_instance());
             if let Some(next) = self.workspace.active_project {
-                self.spawn_project_terminals_now(next, window, cx);
+                self.spawn_project_terminals_deferred(next, window, cx);
             }
         }
 
@@ -10181,6 +10389,15 @@ impl MuxelApp {
                         },
                     );
                     this.persist();
+                    let app = cx.weak_entity();
+                    let ensure_handle = any;
+                    cx.defer(move |cx| {
+                        let _ = ensure_handle.update(cx, |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.ensure_project_terminals_deferred(pid, window, cx);
+                            });
+                        });
+                    });
                     cx.notify();
                 }
                 Err(e) => {
@@ -10242,6 +10459,16 @@ impl MuxelApp {
         self.workspace.active_project = Some(sec.pid);
         self.active_instance = self.workspace.active().and_then(|p| p.first_instance());
         self.persist();
+        if let Some(main) = self.main_window {
+            let app = cx.weak_entity();
+            cx.defer(move |cx| {
+                let _ = main.update(cx, |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.ensure_project_terminals_deferred(sec.pid, window, cx);
+                    });
+                });
+            });
+        }
         cx.notify();
     }
 
@@ -11124,7 +11351,9 @@ impl MuxelApp {
     fn retry_after_trust(&mut self, retry: SshRetry, window: &mut Window, cx: &mut Context<Self>) {
         match retry {
             SshRetry::None => {}
-            SshRetry::ConnectProject(pid) => self.ensure_project_terminals(pid, window, cx),
+            SshRetry::ConnectProject(pid) => {
+                self.ensure_project_terminals_deferred(pid, window, cx)
+            }
             SshRetry::VerifyHost { idx, password } => self.run_ssh_check(idx, password, window, cx),
             SshRetry::VerifyRemoteDir => self.verify_remote_dir(window, cx),
             SshRetry::ScanRemoteDirs => self.scan_remote_dirs(window, cx),
@@ -13337,6 +13566,8 @@ impl MuxelApp {
     }
 
     fn terminal_starting(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        // gpui-component defaults to ease-in-out, which visibly accelerates and
+        // decelerates every 800 ms. Terminal startup wants a steady activity cue.
         div()
             .id(format!("terminal-loading-{iid}"))
             .size_full()
@@ -13346,7 +13577,7 @@ impl MuxelApp {
             .justify_center()
             .gap_2()
             .text_color(cx.theme().muted_foreground)
-            .child(Spinner::new().small())
+            .child(Spinner::new().small().ease(linear))
             .child(t("Starting terminal…"))
             .into_any_element()
     }

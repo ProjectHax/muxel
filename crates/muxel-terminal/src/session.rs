@@ -213,7 +213,10 @@ pub struct TerminalSession {
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
     writer: SharedWriter,
-    master: Box<dyn MasterPty + Send>,
+    // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
+    // Unix foreground-process query), so a mutex lets a fully spawned session
+    // move from the launch worker to the UI thread without weakening safety.
+    master: Mutex<Box<dyn MasterPty + Send>>,
     /// Kill handle for the child. The `Child` itself lives in the reader thread,
     /// which harvests the exit code after EOF (see `read_loop`).
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -503,7 +506,7 @@ impl TerminalSession {
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
             writer,
-            master: pair.master,
+            master: Mutex::new(pair.master),
             killer: Mutex::new(killer),
             child_pid,
             title,
@@ -854,7 +857,7 @@ impl TerminalSession {
             return true; // same target, still settling
         }
         // Settled — apply to the PTY (SIGWINCH) and the grid together.
-        let _ = self.master.resize(PtySize {
+        let _ = self.master.lock().resize(PtySize {
             rows,
             cols,
             pixel_width: 0,
@@ -1176,7 +1179,7 @@ impl TerminalSession {
     pub fn is_idle_foreground(&self) -> bool {
         #[cfg(unix)]
         {
-            match (self.master.process_group_leader(), self.child_pid) {
+            match (self.master.lock().process_group_leader(), self.child_pid) {
                 (Some(fg), Some(pid)) => fg == pid as libc::pid_t,
                 _ => false,
             }
