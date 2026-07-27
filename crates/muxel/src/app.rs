@@ -3255,11 +3255,11 @@ impl MuxelApp {
             .or_else(|| self.workspace.projects.first().map(|p| p.id));
         self.workspace.active_project = active;
         if let Some(pid) = active {
-            self.ensure_project_terminals(pid, window, cx);
             self.active_instance = self.workspace.project(pid).and_then(|p| p.first_instance());
             if let Some(iid) = self.active_instance {
                 self.focus_instance(iid, window, cx);
             }
+            self.ensure_project_terminals_deferred(pid, window, cx);
         }
         // Bring every OTHER remote project's tmux panes back in the background, so an
         // agent left running on a host reconnects on launch instead of waiting to be
@@ -3813,6 +3813,28 @@ impl MuxelApp {
     /// **before** opening the panes — telling the user what went wrong on failure
     /// instead of filling each pane with an ssh error.
     fn ensure_project_terminals(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_project_terminals_with(pid, false, window, cx);
+    }
+
+    /// Restore a project without holding the UI thread across its whole pane fleet.
+    /// Each missing pane starts in a separate turn, leaving paint and input between
+    /// terminal launches. Other call sites keep immediate spawning for now.
+    fn ensure_project_terminals_deferred(
+        &mut self,
+        pid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_project_terminals_with(pid, true, window, cx);
+    }
+
+    fn ensure_project_terminals_with(
+        &mut self,
+        pid: Uuid,
+        defer_spawns: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Make sure the shared memory file/gitignore exist (once per session) —
         // handles fresh clones where `.muxel/` was git-ignored away.
         if self
@@ -3913,7 +3935,11 @@ impl MuxelApp {
                                 this.adopt_remote_sessions(pid, &sessions, window, cx);
                             }
                         }
-                        this.spawn_project_terminals_now(pid, window, cx);
+                        if defer_spawns {
+                            this.spawn_project_terminals_deferred(pid, window, cx);
+                        } else {
+                            this.spawn_project_terminals_now(pid, window, cx);
+                        }
                         // A pull may have replaced the layout (and the focused pane
                         // no longer exists) — land focus on the (new) first pane.
                         if first_sync
@@ -3959,7 +3985,11 @@ impl MuxelApp {
             let has_memory = loc.as_ref().is_some_and(integrations::memory_file_exists);
             self.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
         }
-        self.spawn_project_terminals_now(pid, window, cx);
+        if defer_spawns {
+            self.spawn_project_terminals_deferred(pid, window, cx);
+        } else {
+            self.spawn_project_terminals_now(pid, window, cx);
+        }
     }
 
     /// The grid of a live terminal sharing this instance's pane (a sibling tab).
@@ -4246,58 +4276,100 @@ impl MuxelApp {
             .map(|p| p.instances())
             .unwrap_or_default()
         {
-            let kind = self
-                .workspace
-                .instance(iid)
-                .map(|i| i.kind)
-                .unwrap_or(InstanceKind::Terminal);
-            match kind {
-                InstanceKind::Terminal => {
-                    // A totally-failed launch (fallback shell included) shows an
-                    // error pane; don't respawn/re-notify on every project
-                    // switch — the toolbar Restart is the retry path.
-                    if !self.terminals.contains_key(&iid)
-                        && !self.failed_launches.contains_key(&iid)
-                    {
-                        self.spawn_terminal(iid, window, cx);
-                    }
+            self.spawn_project_pane(iid, window, cx);
+        }
+    }
+
+    fn spawn_project_terminals_deferred(
+        &mut self,
+        pid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut instances = self
+            .workspace
+            .project(pid)
+            .map(|p| p.instances())
+            .unwrap_or_default();
+        // Start the pane the user can see first. The remaining fleet follows one
+        // per turn, so a slow background pane cannot delay useful input.
+        if let Some(active) = self.active_instance
+            && let Some(index) = instances.iter().position(|iid| *iid == active)
+        {
+            instances.swap(0, index);
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            for iid in instances {
+                // Yield even before the first launch so the selected layout paints.
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.spawn_project_pane(iid, window, cx);
+                        if this.active_instance == Some(iid) {
+                            this.focus_instance(iid, window, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
                 }
-                InstanceKind::Editor => {
-                    if !self.editors.contains_key(&iid) {
-                        let path = self
-                            .workspace
-                            .instance(iid)
-                            .and_then(|i| i.editor_path.clone());
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_project_pane(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        // A workspace can change while a deferred activation task is yielding.
+        // UUIDs from the old document must become no-ops, never fallback shells.
+        let Some(kind) = self.workspace.instance(iid).map(|i| i.kind) else {
+            return;
+        };
+        match kind {
+            InstanceKind::Terminal => {
+                // A totally-failed launch (fallback shell included) shows an
+                // error pane; don't respawn/re-notify on every project
+                // switch — the toolbar Restart is the retry path.
+                if !self.terminals.contains_key(&iid) && !self.failed_launches.contains_key(&iid) {
+                    self.spawn_terminal(iid, window, cx);
+                }
+            }
+            InstanceKind::Editor => {
+                if !self.editors.contains_key(&iid) {
+                    let path = self
+                        .workspace
+                        .instance(iid)
+                        .and_then(|i| i.editor_path.clone());
+                    let config = self.editor_config();
+                    let ed = cx.new(|cx| EditorView::open(path, config, window, cx));
+                    self.editors.insert(iid, ed);
+                }
+            }
+            InstanceKind::Diff => {
+                if !self.editors.contains_key(&iid) {
+                    // `editor_path` holds the directory to diff; re-run it so a
+                    // restored diff pane reflects the current working tree.
+                    if let Some(dir) = self
+                        .workspace
+                        .instance(iid)
+                        .and_then(|i| i.editor_path.clone())
+                    {
                         let config = self.editor_config();
-                        let ed = cx.new(|cx| EditorView::open(path, config, window, cx));
+                        let ed = cx.new(|cx| EditorView::diff(dir, config, window, cx));
                         self.editors.insert(iid, ed);
                     }
                 }
-                InstanceKind::Diff => {
-                    if !self.editors.contains_key(&iid) {
-                        // `editor_path` holds the directory to diff; re-run it so a
-                        // restored diff pane reflects the current working tree.
-                        if let Some(dir) = self
-                            .workspace
-                            .instance(iid)
-                            .and_then(|i| i.editor_path.clone())
-                        {
-                            let config = self.editor_config();
-                            let ed = cx.new(|cx| EditorView::diff(dir, config, window, cx));
-                            self.editors.insert(iid, ed);
-                        }
-                    }
-                }
-                InstanceKind::Browser => {
-                    if !self.browsers.contains_key(&iid) {
-                        let url = self
-                            .workspace
-                            .instance(iid)
-                            .and_then(|i| i.browser_url.clone())
-                            .unwrap_or_else(|| "about:blank".to_string());
-                        let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
-                        self.browsers.insert(iid, view);
-                    }
+            }
+            InstanceKind::Browser => {
+                if !self.browsers.contains_key(&iid) {
+                    let url = self
+                        .workspace
+                        .instance(iid)
+                        .and_then(|i| i.browser_url.clone())
+                        .unwrap_or_else(|| "about:blank".to_string());
+                    let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                    self.browsers.insert(iid, view);
                 }
             }
         }
@@ -4794,11 +4866,11 @@ impl MuxelApp {
         {
             self.current_preset = idx;
         }
-        self.ensure_project_terminals(pid, window, cx);
         self.active_instance = self.workspace.project(pid).and_then(|p| p.first_instance());
         if let Some(iid) = self.active_instance {
             self.focus_instance(iid, window, cx);
         }
+        self.ensure_project_terminals_deferred(pid, window, cx);
         // Keep the file browser pointed at the project being shown.
         if self.show_file_browser {
             self.load_file_browser(pid, cx);
@@ -10169,11 +10241,11 @@ impl MuxelApp {
         if self.secondary_sidebar_shown.remove(&old_pid) {
             self.secondary_sidebar_shown.insert(pid);
         }
-        self.ensure_project_terminals(pid, window, cx);
         self.active_instance = self.workspace.project(pid).and_then(|p| p.first_instance());
         if let Some(iid) = self.active_instance {
             self.focus_instance(iid, window, cx);
         }
+        self.ensure_project_terminals_deferred(pid, window, cx);
         self.persist();
         cx.notify();
     }
