@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_STDERR: OnceLock<bool> = OnceLock::new();
@@ -162,6 +163,30 @@ fn emit_line(line: &str) {
             let _ = f.flush();
         }
     }
+}
+
+/// One-shot terminal startup milestone. These lines share the profiler's file,
+/// rotation, timestamp, and opt-in gate so a workspace trace can correlate UI
+/// activation with ConPTY creation and the agent's first visible frame.
+pub fn startup_event(
+    instance_id: Uuid,
+    program: &str,
+    phase: &str,
+    elapsed: Duration,
+    bytes: usize,
+) {
+    if !enabled() {
+        return;
+    }
+    let program = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+        .replace(['\r', '\n', ' '], "_");
+    emit_line(&format!(
+        "term-start pane={instance_id} program={program} phase={phase} elapsed={}ms bytes={bytes}",
+        elapsed.as_millis()
+    ));
 }
 
 struct Counters {

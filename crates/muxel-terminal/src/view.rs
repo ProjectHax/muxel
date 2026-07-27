@@ -12,6 +12,7 @@ use anyhow::Context as _;
 use gpui::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 /// Stop draining after this many bytes in a single turn so one noisy terminal
 /// can't starve the UI; the rest stays buffered for the next turn.
@@ -238,6 +239,9 @@ pub struct TerminalView {
     /// Error from a failed launch (e.g. the agent program isn't on PATH), captured
     /// for the dev console. `None` when the program launched fine.
     launch_error: Option<String>,
+    /// Latched when the child first draws non-whitespace content. Kept here so
+    /// an animated loading overlay does not rescan the terminal grid every frame.
+    has_visible_content: bool,
     /// On-screen markers that classify the agent's status (per-agent).
     working_markers: Vec<String>,
     blocked_markers: Vec<String>,
@@ -377,7 +381,13 @@ impl TerminalView {
     }
 
     /// Wrap a spawned terminal in a view and wire up its output drain.
-    pub fn new(launch: TerminalLaunch, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        launch: TerminalLaunch,
+        instance_id: Uuid,
+        startup_started: Instant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let TerminalLaunch {
             spec,
             session,
@@ -390,6 +400,7 @@ impl TerminalView {
         let submit = spec.submit;
         let working_markers = spec.working_markers.clone();
         let blocked_markers = spec.blocked_markers.clone();
+        let startup_program = spec.program.clone();
         let focus_handle = cx.focus_handle();
 
         // Forward focus in/out to the PTY (DECSET 1004) so agents like Claude
@@ -475,6 +486,7 @@ impl TerminalView {
         let drain_session = session.clone();
         let drain = cx.spawn(async move |view: WeakEntity<Self>, cx| {
             let session = drain_session;
+            let mut first_output = true;
             loop {
                 let chunk = match rx.recv().await {
                     Ok(c) => c,
@@ -517,12 +529,34 @@ impl TerminalView {
                 }
 
                 let batch_len = output.len();
+                if first_output && batch_len > 0 {
+                    profile::startup_event(
+                        instance_id,
+                        &startup_program,
+                        "first-output",
+                        startup_started.elapsed(),
+                        batch_len,
+                    );
+                    first_output = false;
+                }
                 let stop = view
                     .update(cx, |view, cx| {
                         let focused = view.session.is_focused();
                         if !output.is_empty() {
                             let t0 = Instant::now();
                             view.session.process_output(&output);
+                            if !view.has_visible_content
+                                && !view.session.visible_text().trim().is_empty()
+                            {
+                                view.has_visible_content = true;
+                                profile::startup_event(
+                                    instance_id,
+                                    &startup_program,
+                                    "first-screen",
+                                    startup_started.elapsed(),
+                                    batch_len,
+                                );
+                            }
                             profile::process_output(batch_len, t0.elapsed(), focused);
                             if focused && profile::is_enabled() {
                                 let (col, row, text) = view.session.cursor_probe();
@@ -566,6 +600,7 @@ impl TerminalView {
             exit_signal: None,
             exit_read_error: None,
             launch_error,
+            has_visible_content: false,
             working_markers,
             blocked_markers,
             prev_raw: std::cell::Cell::new(None),
@@ -584,6 +619,13 @@ impl TerminalView {
 
     pub fn exited(&self) -> bool {
         self.exited
+    }
+
+    /// Whether the child has drawn anything a person can see. Agent TUIs often
+    /// emit control sequences immediately, then spend seconds starting before
+    /// their first text; those bytes must not dismiss loading UI.
+    pub fn has_visible_content(&self) -> bool {
+        self.has_visible_content
     }
 
     /// The child's exit code if it has exited and the OS reported one. `None`
