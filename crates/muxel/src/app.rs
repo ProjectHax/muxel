@@ -14,6 +14,7 @@ use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis};
+use gpui_component::spinner::Spinner;
 use gpui_component::tag::Tag;
 use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
@@ -1260,6 +1261,9 @@ pub struct MuxelApp {
     layout_keys: HashMap<Uuid, String>,
     /// Pending debounced layout pushes: project id → earliest time to push.
     remote_push_due: HashMap<Uuid, Instant>,
+    /// Per-project generation for deferred pane fleets. Starting a newer restore
+    /// cancels the older task before it can launch or focus another pane.
+    deferred_activation_generation: HashMap<Uuid, u64>,
     focus_handle: FocusHandle,
     /// Periodically refreshes status indicators + fires notifications.
     _status_timer: Task<()>,
@@ -3145,6 +3149,7 @@ impl MuxelApp {
             remote_connecting: HashSet::new(),
             layout_keys: HashMap::new(),
             remote_push_due: HashMap::new(),
+            deferred_activation_generation: HashMap::new(),
             focus_handle: cx.focus_handle(),
             settings,
             _status_timer: status_timer,
@@ -3714,6 +3719,7 @@ impl MuxelApp {
             .and_then(|i| i.grid)
             .or_else(|| self.sibling_grid(instance_id, cx))
             .unwrap_or((80, 24));
+        let startup_started = Instant::now();
         let launch = match TerminalLaunch::spawn(spec, size) {
             Ok(launch) => launch,
             Err(e) => {
@@ -3732,6 +3738,13 @@ impl MuxelApp {
                 return;
             }
         };
+        muxel_terminal::startup_event(
+            instance_id,
+            &prog,
+            "pty-spawn",
+            startup_started.elapsed(),
+            0,
+        );
         self.failed_launches.remove(&instance_id);
         // A failed launch of the requested program (the fallback shell is
         // running instead) goes to the dev console.
@@ -3747,7 +3760,7 @@ impl MuxelApp {
         let font_size = self.settings.font_size * self.settings.zoom;
         let mouse_mode = TerminalMouseMode::from_setting(&self.settings.terminal_mouse);
         let view = cx.new(move |cx| {
-            let mut view = TerminalView::new(launch, window, cx);
+            let mut view = TerminalView::new(launch, instance_id, startup_started, window, cx);
             view.set_palette(palette);
             view.set_config(font_family, font_size);
             view.set_mouse_mode(mouse_mode);
@@ -4298,26 +4311,61 @@ impl MuxelApp {
         {
             instances.swap(0, index);
         }
+        let generation = {
+            let generation = self.deferred_activation_generation.entry(pid).or_default();
+            *generation = generation.wrapping_add(1);
+            *generation
+        };
         cx.spawn_in(window, async move |this, cx| {
-            for iid in instances {
+            for (index, iid) in instances.into_iter().enumerate() {
                 // Yield even before the first launch so the selected layout paints.
                 cx.background_executor()
                     .timer(Duration::from_millis(1))
                     .await;
-                if this
+                let keep_going = this
                     .update_in(cx, |this, window, cx| {
+                        if this.deferred_activation_generation.get(&pid) != Some(&generation)
+                            || !this.project_is_shown_in_window(pid, window)
+                        {
+                            return false;
+                        }
                         this.spawn_project_pane(iid, window, cx);
-                        if this.active_instance == Some(iid) {
+                        // `focus_instance` puts a not-yet-created pane on the app
+                        // root. Focus the first visible pane only if that neutral
+                        // focus is still present; a modal/input opened meanwhile wins.
+                        if index == 0
+                            && this.active_instance == Some(iid)
+                            && this.focus_handle.is_focused(window)
+                        {
                             this.focus_instance(iid, window, cx);
                         }
+                        true
                     })
-                    .is_err()
-                {
+                    .unwrap_or(false);
+                if !keep_going {
                     break;
                 }
             }
+            let _ = this.update_in(cx, |this, _, _| {
+                if this.deferred_activation_generation.get(&pid) == Some(&generation) {
+                    this.deferred_activation_generation.remove(&pid);
+                }
+            });
         })
         .detach();
+    }
+
+    fn project_is_shown_in_window(&self, pid: Uuid, window: &Window) -> bool {
+        match self.secondary_pid_for(window) {
+            Some(shown) => shown == pid,
+            None => {
+                self.workspace.active_project == Some(pid)
+                    && !self
+                        .secondary_windows
+                        .iter()
+                        .any(|secondary| secondary.pid == pid)
+            }
+        }
     }
 
     fn spawn_project_pane(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -4906,6 +4954,11 @@ impl MuxelApp {
             // own chords too. Selecting a browser pane with a keyboard shortcut must
             // leave those working — only a click *into the page* should hand the
             // keyboard over (see the click handler in the tick).
+        } else {
+            // Deferred activation has selected the pane but has not created its
+            // window-bound view yet. Neutral focus records the intent without
+            // leaving keyboard input on a now-hidden pane from the old project.
+            window.focus(&self.focus_handle, cx);
         }
         cx.notify();
     }
@@ -13283,6 +13336,21 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    fn terminal_starting(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(format!("terminal-loading-{iid}"))
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_color(cx.theme().muted_foreground)
+            .child(Spinner::new().small())
+            .child(t("Starting terminal…"))
+            .into_any_element()
+    }
+
     fn render_pane(&self, node: &PaneNode, cx: &mut Context<Self>) -> AnyElement {
         match node {
             PaneNode::Leaf(ld) => {
@@ -13378,6 +13446,8 @@ impl MuxelApp {
                                     ),
                             )
                             .into_any_element()
+                    } else if !v.has_visible_content() {
+                        self.terminal_starting(iid, cx)
                     } else {
                         terminal_pane_element(view, cx)
                     }
@@ -13440,14 +13510,7 @@ impl MuxelApp {
                         )
                         .into_any_element()
                 } else {
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t("(terminal exited)"))
-                        .into_any_element()
+                    self.terminal_starting(iid, cx)
                 };
                 // Each pane is a rounded card with a thin header that doubles as
                 // the drag handle — so the terminal body stays free for text
