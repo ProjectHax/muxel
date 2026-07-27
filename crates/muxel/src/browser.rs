@@ -110,11 +110,30 @@ mod imp {
     /// and why the clicked pane never became the active one. The page itself is the
     /// only thing that *can* see the click, so it tells us. Capture phase, so a
     /// page that stops propagation on its own handlers can't hide the click.
-    const CLICK_SCRIPT: &str = r#"
+    const INTERACTION_SCRIPT: &str = r#"
         (function () {
           window.addEventListener('mousedown', function (event) {
             if (event.button === 0) {
               try { window.ipc.postMessage('muxel:page-click'); } catch (e) {}
+            }
+          }, true);
+
+          // WebView2 hosted as a child window does not always run its built-in
+          // copy accelerator. The native context-menu command still works, so
+          // invoke that same document copy operation from the standard keys.
+          window.addEventListener('keydown', function (event) {
+            const key = String(event.key || '').toLowerCase();
+            const copy = !event.altKey && !event.shiftKey && (
+              ((event.ctrlKey || event.metaKey) && key === 'c') ||
+              (event.ctrlKey && (key === 'insert' || event.code === 'Insert'))
+            );
+            if (copy) {
+              try {
+                if (document.execCommand('copy')) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }
+              } catch (e) {}
             }
           }, true);
         })();
@@ -128,9 +147,12 @@ mod imp {
         webview_failed: bool,
         address: Entity<InputState>,
         url: String,
+        /// Previous URL while a requested navigation has not committed yet.
+        /// WebView2 reports the old page during that gap; do not sync it back.
+        pending_navigation_from: Option<String>,
         /// What the app last asked of the native child (dedupes plaform calls).
         native_visible: bool,
-        /// Clicks the page reported over IPC (see [`CLICK_SCRIPT`]). Drained each
+        /// Clicks the page reported over IPC (see [`INTERACTION_SCRIPT`]). Drained each
         /// tick by [`BrowserView::take_page_click`].
         clicks: std::sync::mpsc::Receiver<()>,
     }
@@ -222,7 +244,7 @@ mod imp {
 
                         builder
                             .with_url(&requested)
-                            .with_initialization_script(CLICK_SCRIPT)
+                            .with_initialization_script(INTERACTION_SCRIPT)
                             .with_ipc_handler(move |req| {
                                 if req.body().as_str() == CLICK_MSG {
                                     // The receiver is dropped with the pane; a click
@@ -264,6 +286,7 @@ mod imp {
                 webview_failed: false,
                 address,
                 url,
+                pending_navigation_from: None,
                 native_visible: true,
                 clicks,
             }
@@ -353,7 +376,10 @@ mod imp {
             if let Some(wv) = &self.webview {
                 wv.update(cx, |wv, _| wv.load_url(url));
             }
-            self.url = url.to_string();
+            if self.url != url {
+                self.pending_navigation_from =
+                    Some(std::mem::replace(&mut self.url, url.to_string()));
+            }
             cx.notify();
         }
 
@@ -363,6 +389,10 @@ mod imp {
         pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
             let wv = self.webview.as_ref()?;
             let current = wv.read(cx).url().ok()?;
+            if self.pending_navigation_from.as_deref() == Some(current.as_str()) {
+                return None;
+            }
+            self.pending_navigation_from = None;
             if current.is_empty() || current == self.url {
                 return None;
             }
