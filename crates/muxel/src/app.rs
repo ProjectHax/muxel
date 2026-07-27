@@ -670,6 +670,17 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     // so a focused agent (e.g. opencode, which uses Ctrl+P) receives it, while
     // deselecting a pane (or focusing the sidebar/editor) routes Ctrl+P to muxel.
     bindings.push(KeyBinding::new("ctrl-p", GlobalSearch, Some("!Terminal")));
+    // gpui-component binds Ctrl+C for inputs and selectable rendered text, but
+    // omits the other standard Windows/Linux copy chord. Bind it at each
+    // selection context; the focused/deepest context handles the action.
+    #[cfg(not(target_os = "macos"))]
+    for context in ["Input", "TextView", "Root"] {
+        bindings.push(KeyBinding::new(
+            "ctrl-insert",
+            gpui_component::input::Copy,
+            Some(context),
+        ));
+    }
     // Cmd+Q (macOS) / Ctrl+Q (elsewhere) quits from any focus, including a
     // focused terminal — `secondary` resolves to the platform's quit modifier.
     bindings.push(KeyBinding::new("secondary-q", Quit, None));
