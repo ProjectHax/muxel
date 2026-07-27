@@ -30,6 +30,36 @@ use gpui::*;
 use gpui_component::{Root, TitleBar, *};
 use std::borrow::Cow;
 
+/// Persist panic details even when the GUI executable has no useful stderr.
+///
+/// Panics inside a native WebView/COM callback abort after the hook runs because
+/// unwinding cannot cross that boundary. Windows Error Reporting then records
+/// only `std::process::abort`, so without this file the actual Rust caller is
+/// lost.
+fn install_panic_reporter() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = muxel_store::data_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("panic.log"))
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    file,
+                    "\n=== {:?} thread {:?} ===\n{info}\n{}",
+                    std::time::SystemTime::now(),
+                    std::thread::current().name(),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
+        default_hook(info);
+    }));
+}
+
 /// muxel's own bundled SVG assets: agent logos under `icons/agent-*.svg`, plus
 /// the app icon `muxel.svg` (shown in the welcome dialog).
 #[derive(rust_embed::RustEmbed)]
@@ -68,6 +98,7 @@ fn spawn_present_pump() {
 }
 
 fn main() {
+    install_panic_reporter();
     // gpui reports real render failures (swap-chain present, scene-too-large
     // draw errors, GPU device loss) through `log` and swallows the Result;
     // without a logger they vanish silently. Errors/warnings go to stderr.
