@@ -426,6 +426,10 @@ feature is added or changed, update the matching entry here in the same change**
   markdown and image files (`png`, `jpg`, `gif`, `webp`, `bmp`, `svg`, …) render as
   images, both by default, with a header **Raw / Rendered** toggle to view the
   source (e.g. an SVG's XML or the markdown text).
+- **Resource reuse** — opening a local file that already has an editor tab focuses
+  that tab and reloads it from disk when its buffer is clean; dirty buffers are
+  never overwritten. File links can jump to `#L12C4`, and local HTML links open in
+  the browser preview while HTML source panes offer a **Preview** action.
 - **Git diff panel** — a toolbar button (far right) toggles a collapsible
   right-side panel with two tabs:
   - **Files** — the active project's changed files (added / modified / deleted /

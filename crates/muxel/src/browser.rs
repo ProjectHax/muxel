@@ -438,16 +438,27 @@ mod imp {
         pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
             let wv = self.webview.as_ref()?;
             let current = wv.read(cx).url().ok()?;
+            // A requested navigation hasn't committed yet: the webview still
+            // reports the page we're leaving, so don't sync it back.
             if self.pending_navigation_from.as_deref() == Some(current.as_str()) {
                 return None;
             }
             self.pending_navigation_from = None;
-            if current.is_empty() || current == self.url {
+            // Deliberately no `current == self.url` early return: an unchanged URL
+            // can still leave the address bar stale (a reused pane re-shown at the
+            // same URL), and the address resync below is what fixes that.
+            if current.is_empty() {
                 return None;
             }
-            self.url = current.clone();
+            let changed = current != self.url;
+            if changed {
+                self.url = current.clone();
+            }
             // Don't stomp the address bar while the user is editing it.
-            if !self.address.read(cx).focus_handle(cx).is_focused(window) {
+            let address = self.address.read(cx);
+            let address_stale = address.value() != current;
+            let address_focused = address.focus_handle(cx).is_focused(window);
+            if address_stale && !address_focused {
                 let url = current.clone();
                 self.address.update(cx, |s, cx| {
                     s.set_value(url, window, cx);
@@ -458,8 +469,10 @@ mod imp {
                     .focus_handle(cx)
                     .dispatch_action(&MoveToStart, window, cx);
             }
-            cx.notify();
-            Some(current)
+            if changed || address_stale {
+                cx.notify();
+            }
+            changed.then_some(current)
         }
 
         /// Show/hide the NATIVE child window. The app drives this every frame:

@@ -18,9 +18,17 @@ pub fn normalize_url(input: &str) -> String {
     }
 }
 
+/// Browser resources are reusable only when they name the same full URL.
+///
+/// This deliberately compares path, query, and fragment too. Reusing merely by
+/// origin makes opening `/b` silently replace an existing `/a` tab.
+pub fn same_resource_url(existing: &str, requested: &str) -> bool {
+    normalize_url(existing) == normalize_url(requested)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize_url;
+    use super::{normalize_url, same_resource_url};
 
     #[test]
     fn adds_scheme_to_bare_domain() {
@@ -47,5 +55,21 @@ mod tests {
         );
         assert_eq!(normalize_url(""), "");
         assert_eq!(normalize_url("   "), "");
+    }
+
+    #[test]
+    fn browser_resource_reuse_requires_the_full_url() {
+        assert!(same_resource_url(
+            "https://example.com/a?q=1#x",
+            "https://example.com/a?q=1#x"
+        ));
+        assert!(!same_resource_url(
+            "https://example.com/a",
+            "https://example.com/b"
+        ));
+        assert!(!same_resource_url(
+            "https://example.com/a?q=1",
+            "https://example.com/a?q=2"
+        ));
     }
 }

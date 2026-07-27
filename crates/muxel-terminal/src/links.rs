@@ -8,6 +8,15 @@
 
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileLinkTarget {
+    pub path: PathBuf,
+    /// One-based source line from a `#L12` fragment.
+    pub line: Option<u32>,
+    /// One-based source column from a `#L12C4` fragment.
+    pub column: Option<u32>,
+}
+
 /// A logical line reconstructed from terminal rows, plus the clicked row's
 /// location inside it so a match can be painted back onto that row.
 pub struct StitchedRows {
@@ -220,20 +229,6 @@ pub fn source_fragment(token: &str) -> Option<String> {
     Some(format!("#L{line}"))
 }
 
-/// Parse a `#L<line>C<column>` file-link fragment into a zero-based editor
-/// position. The column is optional and defaults to the start of the line.
-pub fn source_position_from_uri(uri: &str) -> Option<(u32, u32)> {
-    let fragment = uri.split_once('#')?.1.strip_prefix('L')?;
-    let (line, column) = fragment
-        .split_once('C')
-        .map_or((fragment, None), |(line, column)| (line, Some(column)));
-    let line = line.parse::<u32>().ok()?.checked_sub(1)?;
-    let column = column
-        .map(|value| value.parse::<u32>().ok()?.checked_sub(1))
-        .unwrap_or(Some(0))?;
-    Some((line, column))
-}
-
 /// Characters that may appear inside a file path. `:` is included so a trailing
 /// `:line[:col]` suffix stays inside the visual span (it's stripped from the
 /// returned path string). `\` is accepted so Windows paths (`D:\dev\foo.rs`) are
@@ -385,7 +380,12 @@ pub fn file_uri(path: &Path) -> String {
 /// Decode a `file://` URI back to a filesystem path, or `None` if `uri` is not
 /// a file URL. Handles `file:///tmp/x`, `file:///D:/x`, and percent-encoding.
 pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?.split('#').next()?;
+    file_target_from_uri(uri).map(|target| target.path)
+}
+
+pub fn file_target_from_uri(uri: &str) -> Option<FileLinkTarget> {
+    let rest = uri.strip_prefix("file://")?;
+    let (rest, fragment) = rest.split_once('#').unwrap_or((rest, ""));
     // `file:///path` → path starts with `/`; `file://localhost/path` rare, skip.
     let path_part = if rest.len() >= "localhost".len()
         && rest[.."localhost".len()].eq_ignore_ascii_case("localhost")
@@ -439,20 +439,39 @@ pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
                 }
             })
             .unwrap_or(decoded);
-        Some(PathBuf::from(trimmed))
+        Some(FileLinkTarget {
+            path: PathBuf::from(trimmed),
+            line: parse_source_fragment(fragment).map(|p| p.0),
+            column: parse_source_fragment(fragment).and_then(|p| p.1),
+        })
     }
     #[cfg(not(windows))]
     {
-        Some(PathBuf::from(decoded))
+        Some(FileLinkTarget {
+            path: PathBuf::from(decoded),
+            line: parse_source_fragment(fragment).map(|p| p.0),
+            column: parse_source_fragment(fragment).and_then(|p| p.1),
+        })
     }
+}
+
+fn parse_source_fragment(fragment: &str) -> Option<(u32, Option<u32>)> {
+    let source = fragment.strip_prefix('L')?;
+    let (line, column) = source
+        .split_once('C')
+        .map(|(line, column)| (line, Some(column)))
+        .unwrap_or((source, None));
+    let line = line.parse().ok()?;
+    let column = column.and_then(|column| column.parse().ok());
+    Some((line, column))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        file_uri, markdown_link_at, path_from_file_uri, path_span_at, path_spans,
-        rendered_markdown_link_at, resolve_path, source_fragment, source_position_from_uri,
-        stitch_rows, url_span_at, url_spans,
+        file_target_from_uri, file_uri, markdown_link_at, path_from_file_uri, path_span_at,
+        path_spans, rendered_markdown_link_at, resolve_path, source_fragment, stitch_rows,
+        url_span_at, url_spans,
     };
     use std::path::{Path, PathBuf};
 
@@ -654,19 +673,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_source_fragments_for_editor_navigation() {
-        assert_eq!(
-            source_position_from_uri("file:///D:/x.rs#L12C4"),
-            Some((11, 3))
-        );
-        assert_eq!(
-            source_position_from_uri("file:///D:/x.rs#L12"),
-            Some((11, 0))
-        );
-        assert_eq!(source_position_from_uri("file:///D:/x.rs#L0C1"), None);
-    }
-
-    #[test]
     fn strips_trailing_punctuation_from_paths() {
         let line = chars("wrote src/main.rs.");
         assert_eq!(path_span_at(&line, 8).unwrap().2, "src/main.rs");
@@ -760,6 +766,9 @@ mod tests {
             path_from_file_uri("file:///tmp/a.rs#L12C4").as_deref(),
             Some(Path::new("/tmp/a.rs"))
         );
+        let target = file_target_from_uri("file:///tmp/a.rs#L12C4").unwrap();
+        assert_eq!(target.line, Some(12));
+        assert_eq!(target.column, Some(4));
         assert_eq!(
             path_from_file_uri("file://localhost/tmp/a.rs").as_deref(),
             Some(Path::new("/tmp/a.rs"))

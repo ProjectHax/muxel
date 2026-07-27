@@ -37,7 +37,7 @@ pub use pane::{
 pub use shell::{join_words, split_words};
 pub use stt::SttEngine;
 pub use tts::TtsEngine;
-pub use url::normalize_url;
+pub use url::{normalize_url, same_resource_url};
 pub use worktree::Worktree;
 
 use serde::{Deserialize, Serialize};
