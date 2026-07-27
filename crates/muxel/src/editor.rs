@@ -44,9 +44,6 @@ pub struct EditorView {
     input: Entity<InputState>,
     path: Option<PathBuf>,
     dirty: bool,
-    /// Programmatic `set_value` calls emit deferred Change events. Count the
-    /// events that must not be mistaken for user edits.
-    suppressed_changes: usize,
     config: EditorConfig,
     /// Set for read-only diff panes: the directory whose `git diff` is shown.
     diff_dir: Option<PathBuf>,
@@ -143,13 +140,9 @@ impl EditorView {
             &input,
             window,
             |this: &mut Self, _input, ev: &InputEvent, _window, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    if this.suppressed_changes > 0 {
-                        this.suppressed_changes -= 1;
-                    } else if !this.dirty {
-                        this.dirty = true;
-                        cx.notify();
-                    }
+                if matches!(ev, InputEvent::Change) && !this.dirty {
+                    this.dirty = true;
+                    cx.notify();
                 }
             },
         )
@@ -163,7 +156,6 @@ impl EditorView {
             input,
             path,
             dirty,
-            suppressed_changes: 0,
             config,
             diff_dir: None,
             is_image,
@@ -194,7 +186,6 @@ impl EditorView {
             input,
             path: None,
             dirty: false,
-            suppressed_changes: 0,
             config,
             diff_dir: Some(dir),
             is_image: false,
@@ -323,7 +314,6 @@ impl EditorView {
             return;
         };
         if &*self.input.read(cx).value() != content.as_str() {
-            self.suppressed_changes += 1;
             self.input.update(cx, |s, cx| {
                 let offset = s.scroll_offset();
                 s.set_value(content, window, cx);
@@ -387,10 +377,7 @@ impl EditorView {
     /// Replace the buffer contents (used after an async remote read), keeping the
     /// path/language, and clear the dirty flag.
     pub fn set_content(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        if &*self.input.read(cx).value() != text.as_str() {
-            self.suppressed_changes += 1;
-            self.input.update(cx, |s, cx| s.set_value(text, window, cx));
-        }
+        self.input.update(cx, |s, cx| s.set_value(text, window, cx));
         self.dirty = false;
         cx.notify();
     }
