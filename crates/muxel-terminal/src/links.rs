@@ -186,10 +186,13 @@ pub fn rendered_markdown_link_at(line: &[char], col: usize) -> Option<(usize, us
         else {
             continue;
         };
-        let label_end = line[..target_open]
+        let Some(label_end) = line[..target_open]
             .iter()
-            .rposition(|c| !c.is_whitespace())?
-            + 1;
+            .rposition(|c| !c.is_whitespace())
+            .map(|index| index + 1)
+        else {
+            continue;
+        };
         let label_start = line[..label_end]
             .iter()
             .rposition(|c| c.is_whitespace())
@@ -324,7 +327,7 @@ pub fn resolve_path(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Optio
     // Windows perform an SMB authentication to the named host, a well-known way to
     // capture a user's NetNTLM hash. A malicious repo could print such a string to
     // a build log; it must never become a clickable/probed link.
-    if raw.starts_with("\\\\") || raw.starts_with("//") {
+    if has_network_prefix(raw) {
         return None;
     }
     if let Some(rest) = raw.strip_prefix("~/") {
@@ -346,6 +349,11 @@ pub fn resolve_path(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Optio
 fn is_windows_drive_abs(raw: &str) -> bool {
     let b = raw.as_bytes();
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+fn has_network_prefix(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    bytes.len() >= 2 && matches!(bytes[0], b'/' | b'\\') && matches!(bytes[1], b'/' | b'\\')
 }
 
 /// A `file://` URI for an absolute path, percent-encoding everything outside
@@ -411,7 +419,7 @@ pub fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
     // Never turn a URI into a UNC/network path. Link validation calls
     // `exists()` on hover; probing an attacker-controlled SMB host can leak
     // Windows credentials. Check after percent-decoding to block smuggling.
-    if decoded.starts_with("//") || decoded.starts_with("\\\\") {
+    if has_network_prefix(&decoded) {
         return None;
     }
     // Unix: `/tmp/x`. Windows: `/D:/x` or `/D|/x` (some emitters) → `D:/x`.
@@ -515,6 +523,11 @@ mod tests {
         let rendered = chars("bad (https://broken good (https://example.com)");
         assert_eq!(
             rendered_markdown_link_at(&rendered, 21).map(|(_, _, target)| target),
+            Some("https://example.com".to_string())
+        );
+        let rendered = chars("(https://ignored) good (https://example.com)");
+        assert_eq!(
+            rendered_markdown_link_at(&rendered, 19).map(|(_, _, target)| target),
             Some("https://example.com".to_string())
         );
     }
@@ -708,6 +721,10 @@ mod tests {
             resolve_path("//attacker.example.com/share/x", Some(cwd), Some(home)),
             None
         );
+        assert_eq!(
+            resolve_path(r"/\attacker.example.com\share\x", Some(cwd), Some(home)),
+            None
+        );
     }
 
     #[test]
@@ -755,6 +772,7 @@ mod tests {
         assert!(path_from_file_uri("file://server/share/a.rs").is_none());
         assert!(path_from_file_uri("file:////server/share/a.rs").is_none());
         assert!(path_from_file_uri("file:///%2F%2Fserver/share/a.rs").is_none());
+        assert!(path_from_file_uri("file:///%5Cserver/share/a.rs").is_none());
     }
 
     #[test]
