@@ -117,6 +117,7 @@ objc2-foundation = "0.3"
 # Present pump (see `spawn_present_pump` in main.rs): the same `windows` crate
 # version gpui_windows already pins, so this adds nothing new to the tree.
 [target.'cfg(target_os = "windows")'.dependencies]
+webview2-com = "=0.38.2"
 windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

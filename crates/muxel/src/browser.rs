@@ -33,6 +33,17 @@ pub fn spawn_browser_window(url: &str) -> bool {
 
 /// A short label for a browser tab: the URL's host (falls back to the URL).
 fn tab_label(url: &str) -> String {
+    let url_without_fragment = url.split('#').next().unwrap_or(url);
+    if let Some(name) = muxel_terminal::path_from_file_uri(url_without_fragment)
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.is_empty())
+    {
+        return name;
+    }
+
     let trimmed = url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
@@ -44,6 +55,19 @@ fn tab_label(url: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::tab_label;
+
+    #[test]
+    fn local_file_tab_uses_decoded_filename() {
+        assert_eq!(
+            tab_label("file:///D:/business/report%202026.html#L12"),
+            "report 2026.html"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // macOS / Windows: the real embedded webview pane.
 // ---------------------------------------------------------------------------
@@ -51,8 +75,14 @@ fn tab_label(url: &str) -> String {
 mod imp {
     use super::*;
     use gpui_component::button::{Button, ButtonVariants as _};
-    use gpui_component::input::{Input, InputEvent, InputState};
+    use gpui_component::input::{
+        Input, InputEvent, InputState, MoveToEnd, MoveToStart, SelectToStart,
+    };
     use gpui_component::{Icon, IconName, Sizable as _, h_flex};
+    #[cfg(target_os = "windows")]
+    use webview2_com::FocusChangedEventHandler;
+    #[cfg(target_os = "windows")]
+    use wry::WebViewExtWindows as _;
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     /// The gpui window's native handle, detached from the `&Window` it came from.
@@ -74,6 +104,7 @@ mod imp {
 
     /// IPC message the page posts when it is clicked. Namespaced so it can't
     /// collide with a site that uses `window.ipc` for its own purposes.
+    #[cfg(target_os = "macos")]
     const CLICK_MSG: &str = "muxel:page-click";
 
     /// Injected into every page (and every frame) before its own scripts run.
@@ -84,10 +115,38 @@ mod imp {
     /// and why the clicked pane never became the active one. The page itself is the
     /// only thing that *can* see the click, so it tells us. Capture phase, so a
     /// page that stops propagation on its own handlers can't hide the click.
-    const CLICK_SCRIPT: &str = r#"
+    #[cfg(target_os = "macos")]
+    const PAGE_CLICK_SCRIPT: &str = r#"
         (function () {
-          window.addEventListener('mousedown', function () {
-            try { window.ipc.postMessage('muxel:page-click'); } catch (e) {}
+          window.addEventListener('mousedown', function (event) {
+            if (event.button === 0 &&
+                (window.location.protocol === 'http:' ||
+                 window.location.protocol === 'https:')) {
+              try { window.ipc.postMessage('muxel:page-click'); } catch (e) {}
+            }
+          }, true);
+        })();
+    "#;
+
+    const COPY_SCRIPT: &str = r#"
+        (function () {
+          // WebView2 hosted as a child window does not always run its built-in
+          // copy accelerator. The native context-menu command still works, so
+          // invoke that same document copy operation from the standard keys.
+          window.addEventListener('keydown', function (event) {
+            const key = String(event.key || '').toLowerCase();
+            const copy = !event.altKey && !event.shiftKey && (
+              ((event.ctrlKey || event.metaKey) && key === 'c') ||
+              (event.ctrlKey && (key === 'insert' || event.code === 'Insert'))
+            );
+            if (copy) {
+              try {
+                if (document.execCommand('copy')) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }
+              } catch (e) {}
+            }
           }, true);
         })();
     "#;
@@ -100,25 +159,49 @@ mod imp {
         webview_failed: bool,
         address: Entity<InputState>,
         url: String,
+        /// Previous URL while a requested navigation has not committed yet.
+        /// WebView2 reports the old page during that gap; do not sync it back.
+        pending_navigation_from: Option<String>,
         /// What the app last asked of the native child (dedupes plaform calls).
         native_visible: bool,
-        /// Clicks the page reported over IPC (see [`CLICK_SCRIPT`]). Drained each
-        /// tick by [`BrowserView::take_page_click`].
-        clicks: std::sync::mpsc::Receiver<()>,
+        /// Native page-focus events. WebView2 reports these from its controller;
+        /// macOS uses guarded page IPC until WKWebView exposes the same seam.
+        focus_events: std::sync::mpsc::Receiver<bool>,
     }
 
     impl BrowserView {
         pub fn new(url: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
             let address = cx.new(|cx| InputState::new(window, cx).default_value(url.clone()));
-            cx.subscribe(
+            cx.subscribe_in(
                 &address,
-                |this: &mut Self, input, event: &InputEvent, cx| {
-                    if let InputEvent::PressEnter { .. } = event {
+                window,
+                |this: &mut Self, input, event: &InputEvent, window, cx| match event {
+                    InputEvent::Focus => {
+                        let handle = input.read(cx).focus_handle(cx);
+                        // Select end-to-start so the whole URL is selected while
+                        // the scheme and host remain at the visible edge.
+                        handle.dispatch_action(&MoveToEnd, window, cx);
+                        handle.dispatch_action(&SelectToStart, window, cx);
+                    }
+                    InputEvent::PressEnter { .. } => {
                         let typed = input.read(cx).value().trim().to_string();
                         if !typed.is_empty() {
                             this.navigate(&muxel_core::normalize_url(&typed), cx);
+                            // Navigation is done. Return GPUI focus to the pane,
+                            // then hand OS keyboard focus back to the page.
+                            this.focus_handle.focus(window, cx);
+                            this.focus_native(cx);
                         }
                     }
+                    InputEvent::Blur => {
+                        // An unfocused address bar should show its scheme/host,
+                        // not remain scrolled to the tail where editing ended.
+                        input
+                            .read(cx)
+                            .focus_handle(cx)
+                            .dispatch_action(&MoveToStart, window, cx);
+                    }
+                    _ => {}
                 },
             )
             .detach();
@@ -144,23 +227,80 @@ mod imp {
                 .ok()
                 .map(|h| ParentWindow(h.as_raw()));
             let requested = url.clone();
-            let (click_tx, clicks) = std::sync::mpsc::channel();
+            let (focus_tx, focus_events) = std::sync::mpsc::channel();
 
             cx.spawn_in(window, async move |this, cx| {
+                #[cfg(target_os = "windows")]
+                let mut web_context = muxel_store::data_dir().and_then(|dir| {
+                    let dir = dir.join("webview2");
+                    std::fs::create_dir_all(&dir)
+                        .ok()
+                        .map(|()| wry::WebContext::new(Some(dir)))
+                });
+
                 let built = match parent.as_ref() {
-                    Some(parent) => wry::WebViewBuilder::new()
-                        .with_url(&requested)
-                        .with_initialization_script(CLICK_SCRIPT)
-                        .with_ipc_handler(move |req| {
-                            if req.body().as_str() == CLICK_MSG {
-                                // The receiver is dropped with the pane; a click
-                                // arriving after that is simply nobody's business.
-                                let _ = click_tx.send(());
+                    Some(parent) => {
+                        #[cfg(target_os = "windows")]
+                        let Some(builder) = web_context
+                            .as_mut()
+                            .map(wry::WebViewBuilder::new_with_web_context)
+                        else {
+                            let _ = this.update_in(cx, |this, _window, cx| {
+                                this.webview_failed = true;
+                                cx.notify();
+                            });
+                            return;
+                        };
+                        #[cfg(target_os = "macos")]
+                        let builder = wry::WebViewBuilder::new();
+
+                        let builder = builder
+                            .with_url(&requested)
+                            .with_initialization_script(COPY_SCRIPT);
+                        #[cfg(target_os = "macos")]
+                        let builder = builder
+                            .with_initialization_script(PAGE_CLICK_SCRIPT)
+                            .with_ipc_handler(move |req| {
+                                if req.body().as_str() == CLICK_MSG {
+                                    let _ = focus_tx.send(true);
+                                }
+                            });
+                        let built = builder.build_as_child_async(parent).await.ok();
+
+                        #[cfg(target_os = "windows")]
+                        if let Some(webview) = built.as_ref() {
+                            let got_tx = focus_tx.clone();
+                            let got_focus =
+                                FocusChangedEventHandler::create(Box::new(move |_, _| {
+                                    let _ = got_tx.send(true);
+                                    Ok(())
+                                }));
+                            let lost_tx = focus_tx.clone();
+                            let lost_focus =
+                                FocusChangedEventHandler::create(Box::new(move |_, _| {
+                                    let _ = lost_tx.send(false);
+                                    Ok(())
+                                }));
+                            let mut got_token = 0;
+                            if let Err(error) = unsafe {
+                                webview
+                                    .controller()
+                                    .add_GotFocus(&got_focus, &mut got_token)
+                            } {
+                                log::warn!("failed to observe WebView2 focus: {error}");
                             }
-                        })
-                        .build_as_child_async(parent)
-                        .await
-                        .ok(),
+                            let mut lost_token = 0;
+                            if let Err(error) = unsafe {
+                                webview
+                                    .controller()
+                                    .add_LostFocus(&lost_focus, &mut lost_token)
+                            } {
+                                log::warn!("failed to observe WebView2 blur: {error}");
+                            }
+                        }
+
+                        built
+                    }
                     None => None,
                 };
 
@@ -191,8 +331,9 @@ mod imp {
                 webview_failed: false,
                 address,
                 url,
+                pending_navigation_from: None,
                 native_visible: true,
-                clicks,
+                focus_events,
             }
         }
 
@@ -202,12 +343,12 @@ mod imp {
         /// click never reaches gpui on its own, so without this the pane keeps its
         /// old highlight and keyboard actions (paste, restart, close) go to
         /// whichever pane was focused before.
-        pub fn take_page_click(&mut self) -> bool {
-            let mut clicked = false;
-            while self.clicks.try_recv().is_ok() {
-                clicked = true;
+        pub fn take_native_focus(&mut self) -> Option<bool> {
+            let mut focused = None;
+            while let Ok(next) = self.focus_events.try_recv() {
+                focused = Some(next);
             }
-            clicked
+            focused
         }
 
         /// Hand the OS keyboard focus to the native webview, so typing (and paste)
@@ -221,6 +362,10 @@ mod imp {
             if let Some(wv) = &self.webview {
                 let _ = wv.read(cx).raw().focus();
             }
+        }
+
+        pub fn address_focused(&self, window: &Window, cx: &App) -> bool {
+            self.address.read(cx).focus_handle(cx).is_focused(window)
         }
 
         /// Reload the page the webview is *currently* on.
@@ -260,6 +405,10 @@ mod imp {
             self.history_go(1, cx);
         }
 
+        pub fn open_external(&self, cx: &mut Context<Self>) {
+            cx.open_url(&self.url);
+        }
+
         pub fn tab_title(&self) -> String {
             super::tab_label(&self.url)
         }
@@ -276,7 +425,10 @@ mod imp {
             if let Some(wv) = &self.webview {
                 wv.update(cx, |wv, _| wv.load_url(url));
             }
-            self.url = url.to_string();
+            if self.url != url {
+                self.pending_navigation_from =
+                    Some(std::mem::replace(&mut self.url, url.to_string()));
+            }
             cx.notify();
         }
 
@@ -286,6 +438,10 @@ mod imp {
         pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
             let wv = self.webview.as_ref()?;
             let current = wv.read(cx).url().ok()?;
+            if self.pending_navigation_from.as_deref() == Some(current.as_str()) {
+                return None;
+            }
+            self.pending_navigation_from = None;
             if current.is_empty() || current == self.url {
                 return None;
             }
@@ -293,8 +449,14 @@ mod imp {
             // Don't stomp the address bar while the user is editing it.
             if !self.address.read(cx).focus_handle(cx).is_focused(window) {
                 let url = current.clone();
+                self.address.update(cx, |s, cx| {
+                    s.set_value(url, window, cx);
+                    s.set_scroll_offset(point(px(0.), px(0.)), cx);
+                });
                 self.address
-                    .update(cx, |s, cx| s.set_value(url, window, cx));
+                    .read(cx)
+                    .focus_handle(cx)
+                    .dispatch_action(&MoveToStart, window, cx);
             }
             cx.notify();
             Some(current)
@@ -327,6 +489,12 @@ mod imp {
                 .px_2()
                 .py_1()
                 .bg(cx.theme().secondary)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        this.focus_handle.focus(window, cx);
+                    }),
+                )
                 .child(
                     Button::new("browser-back")
                         .ghost()
@@ -351,7 +519,23 @@ mod imp {
                         .tooltip(t("Reload this page"))
                         .on_click(cx.listener(|this, _e, _w, cx| this.reload(cx))),
                 )
-                .child(div().flex_1().child(Input::new(&self.address)));
+                .child(
+                    Button::new("browser-open-external")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ExternalLink)
+                        .tooltip(t("Open in system browser"))
+                        .on_click(cx.listener(|this, _e, _w, cx| this.open_external(cx))),
+                )
+                .child(
+                    // gpui-wry returns focus to the native page for clicks outside
+                    // its bounds. Claim this press after Input handles it so the
+                    // window-level webview handler cannot steal focus back.
+                    div()
+                        .flex_1()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(Input::new(&self.address)),
+                );
 
             let content: AnyElement = match &self.webview {
                 Some(wv) => div()
@@ -420,12 +604,16 @@ mod imp {
         /// No embedded webview here, so clicks land on ordinary gpui elements and
         /// the pane's own `on_mouse_down` already focuses it (see the macOS/Windows
         /// impl for why that isn't true there).
-        pub fn take_page_click(&mut self) -> bool {
-            false
+        pub fn take_native_focus(&mut self) -> Option<bool> {
+            None
         }
 
         /// No native child to focus.
         pub fn focus_native(&self, _cx: &App) {}
+
+        pub fn address_focused(&self, _window: &Window, _cx: &App) -> bool {
+            false
+        }
 
         // No `reload` here: the placeholder has no toolbar and no page. Reload is
         // called only from the macOS/Windows toolbar, inside that impl.
