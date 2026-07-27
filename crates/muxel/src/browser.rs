@@ -113,7 +113,13 @@ mod imp {
     const INTERACTION_SCRIPT: &str = r#"
         (function () {
           window.addEventListener('mousedown', function (event) {
-            if (event.button === 0) {
+            // lb-wry 0.53.3 parses the WebView2 message source with `http::Uri`
+            // and unwraps the result. Windows file URIs are rejected by that
+            // parser, so posting from a file:// page aborts the process inside
+            // the COM callback. Only origins lb-wry can represent may use IPC.
+            if (event.button === 0 &&
+                (window.location.protocol === 'http:' ||
+                 window.location.protocol === 'https:')) {
               try { window.ipc.postMessage('muxel:page-click'); } catch (e) {}
             }
           }, true);
