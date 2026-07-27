@@ -13252,15 +13252,23 @@ impl MuxelApp {
         let scroll = self.panes_scroll.entry(pid).or_default().clone();
         let min_w = px(root.min_width(f32::from(MIN_PANE_WIDTH)));
         let panes = self.render_pane(root, cx);
+        // X is the only scrolling axis here, and gpui redirects a *vertical* wheel
+        // onto whichever single axis scrolls. Without this, rolling the wheel over
+        // a terminal to walk its scrollback also dragged the whole pane strip
+        // sideways (only visible once the panes overflow the window). Restrict this
+        // container to genuine horizontal input — Shift+wheel, a trackpad swipe, or
+        // the scrollbar below — so a pane's own wheel handling is left alone.
+        let mut panes_scroller = div()
+            .id("panes-scroll")
+            .size_full()
+            .overflow_x_scroll()
+            .track_scroll(&scroll);
+        panes_scroller.style().restrict_scroll_to_axis = Some(true);
         div()
             .relative()
             .size_full()
             .child(
-                div()
-                    .id("panes-scroll")
-                    .size_full()
-                    .overflow_x_scroll()
-                    .track_scroll(&scroll)
+                panes_scroller
                     // Width and height are sized differently on purpose. Width is the
                     // scroll axis, where a percentage collapses (the same reason the
                     // settings pane sizes its content block absolutely): `flex_1` fills

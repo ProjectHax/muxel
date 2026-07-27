@@ -21,7 +21,9 @@ feature is added or changed, update the matching entry here in the same change**
   remote host that had one. The pane area scrolls horizontally in that case, so the
   panes that don't fit can still be reached instead of falling off the right edge.
   Panes still shrink to fill a window they do fit in; scrolling only begins once
-  they can shrink no further.
+  they can shrink no further. Drag its scrollbar, swipe a trackpad sideways, or
+  hold **Shift** and use the wheel — a plain wheel is left to the pane under the
+  pointer, so scrolling an agent's scrollback never drags the strip sideways.
 - **Drag-to-dock split (Zed-style)** — drag a tab onto a pane edge to pull it out
   into a new split, or onto the center to add it as a tab; drag a pane by its
   title bar to relocate the whole pane, with a highlighted drop zone.

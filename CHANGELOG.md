@@ -5,6 +5,15 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **Scrolling one agent no longer slides every pane sideways** — once enough panes
+  are open that the pane area scrolls horizontally, rolling the wheel over a
+  terminal to read back through its output also dragged the whole strip left and
+  right. gpui redirects a vertical wheel onto whichever single axis a container
+  scrolls, and the pane strip scrolls only on X. It now takes real horizontal
+  input — its scrollbar, a sideways trackpad swipe, or `Shift`+wheel — so a plain
+  wheel belongs to the pane under the pointer.
+
 ## [0.1.5] — 2026-07-24
 
 ### Fixed
