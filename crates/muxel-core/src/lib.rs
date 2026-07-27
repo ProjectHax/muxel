@@ -21,9 +21,10 @@ pub mod worktree;
 
 pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
-    claude_session_path, codex_latest_session_id, codex_session_exists,
-    codex_session_id_from_title, memory_header, memory_instruction, memory_reference,
-    resolve_launch, session_resume_args,
+    append_agent_instruction, claude_session_path, codex_developer_instructions_override,
+    codex_latest_session_id, codex_session_exists, codex_session_id_from_title,
+    file_link_instruction, memory_header, memory_instruction, memory_reference, resolve_launch,
+    resolve_launch_for_session, session_resume_args,
 };
 pub use appimage::foreign_muxel_appimage_mounts;
 pub use diff::{SplitRow, split_diff};
@@ -907,6 +908,30 @@ pub fn sync_codex_approval_args(workspace: &mut Workspace, presets: &[AgentPrese
     changed
 }
 
+/// Keep restored panes on their preset's current instruction transport.
+///
+/// Instances snapshot the transport when created. A built-in preset can move from
+/// visible type-in to a real system-rules flag later; leaving old panes untouched
+/// would keep submitting capability text as user turns on their next fresh session.
+/// This updates transport metadata only. It does not inject into a resumed session.
+pub fn sync_agent_injection_modes(workspace: &mut Workspace, presets: &[AgentPreset]) -> bool {
+    let mut changed = false;
+    for instance in &mut workspace.instances {
+        let Some(preset) = instance
+            .preset_id
+            .and_then(|id| presets.iter().find(|preset| preset.id == id))
+            .or_else(|| presets.iter().find(|preset| preset.name == instance.preset))
+        else {
+            continue;
+        };
+        if instance.injection != preset.injection {
+            instance.injection = preset.injection.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod codex_approval_sync_tests {
     use super::*;
@@ -928,6 +953,34 @@ mod codex_approval_sync_tests {
             &mut workspace,
             &[AgentPreset::codex()]
         ));
+    }
+}
+
+#[cfg(test)]
+mod agent_injection_sync_tests {
+    use super::*;
+
+    #[test]
+    fn restored_grok_pane_adopts_rules_transport_without_changing_its_prompt() {
+        let preset = AgentPreset::grok();
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &preset);
+        instance.injection = InjectionMode::TypeIn;
+        instance.system_prompt = Some("pane-specific rules".into());
+        let mut workspace = Workspace {
+            instances: vec![instance],
+            ..Workspace::default()
+        };
+
+        assert!(sync_agent_injection_modes(
+            &mut workspace,
+            std::slice::from_ref(&preset)
+        ));
+        assert_eq!(workspace.instances[0].injection, preset.injection);
+        assert_eq!(
+            workspace.instances[0].system_prompt.as_deref(),
+            Some("pane-specific rules")
+        );
+        assert!(!sync_agent_injection_modes(&mut workspace, &[preset]));
     }
 }
 

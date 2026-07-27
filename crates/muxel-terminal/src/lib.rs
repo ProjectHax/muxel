@@ -20,7 +20,7 @@ mod session;
 mod view;
 
 pub use colors::TerminalPalette;
-pub use links::path_from_file_uri;
+pub use links::{path_from_file_uri, source_position_from_uri};
 pub use present_flag::{mark_present_needed, take_present_needed};
 pub use session::{CommandSpec, PtyChunk, TerminalSession};
 pub use view::{

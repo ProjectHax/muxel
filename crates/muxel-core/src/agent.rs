@@ -364,7 +364,9 @@ impl AgentPreset {
             effort_flag: None,
             args: Vec::new(),
             system_prompt: None,
-            injection: InjectionMode::TypeIn,
+            injection: InjectionMode::CliFlag {
+                flag: "--rules".to_string(),
+            },
             env: Vec::new(),
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -489,6 +491,15 @@ pub struct ResolvedLaunch {
 /// Resolve an instance into program/args (+ any startup input + env), applying
 /// its system-prompt injection mode.
 pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
+    resolve_launch_for_session(instance, false)
+}
+
+/// Resolve a launch while respecting whether it resumes an existing conversation.
+///
+/// Type-in injection is a real user turn. It belongs only to a new conversation;
+/// submitting it again on process restart mutates the resumed transcript. CLI
+/// flags remain launch configuration and may need to be applied on every process.
+pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> ResolvedLaunch {
     let mut args = instance.args.clone();
     let mut startup_input = None;
 
@@ -496,9 +507,14 @@ pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
         match &instance.injection {
             InjectionMode::CliFlag { flag } => {
                 args.push(flag.clone());
-                args.push(prompt.clone());
+                args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
             }
-            InjectionMode::TypeIn => startup_input = Some(prompt.clone()),
+            InjectionMode::TypeIn if !resuming => {
+                // A raw newline is Enter in TUIs without bracketed-paste mode.
+                // Keep the instruction bundle to one startup turn everywhere.
+                startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            InjectionMode::TypeIn => {}
             InjectionMode::None => {}
         }
     }
@@ -759,6 +775,37 @@ delete other entries, and don't repeat what's already there."
     )
 }
 
+/// System-prompt guidance for file citations muxel can open directly.
+pub fn file_link_instruction() -> &'static str {
+    "When citing a local file, use a Markdown link with an absolute file:/// URI \
+and an optional source fragment such as #L12C4, for example \
+[browser.rs:112](file:///D:/dev/muxel/crates/muxel/src/browser.rs#L112). Keep the \
+label readable and never invent a target."
+}
+
+/// Add one capability instruction to the prompt bundle delivered by the
+/// preset's configured transport.
+pub fn append_agent_instruction(prompt: &mut Option<String>, instruction: String) {
+    *prompt = Some(match prompt.take() {
+        Some(base) if !base.is_empty() => format!("{base}\n\n{instruction}"),
+        _ => instruction,
+    });
+}
+
+/// Add instructions through Codex's one-run `--config` override.
+///
+/// An invalid TOML value is treated as a raw string by Codex. Keeping this
+/// value unquoted matters on Windows: npm's `codex.cmd` reparses argv and turns
+/// TOML's escaped inner quotes into shell syntax. A single line also avoids
+/// command-script newline handling without changing the instruction.
+pub fn codex_developer_instructions_override(instructions: &str) -> String {
+    let flattened = instructions
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("developer_instructions={flattened}")
+}
+
 /// Seed contents written when a project's `MEMORY.md` is first created. Delegates to
 /// the memory model so the seeded file matches muxel's maintained format exactly.
 pub fn memory_header() -> &'static str {
@@ -1009,6 +1056,54 @@ mod tests {
         assert_eq!(r.program.as_deref(), Some("opencode"));
         assert!(r.args.is_empty());
         assert_eq!(r.startup_input.as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn type_in_does_not_submit_another_user_turn_on_resume() {
+        let r = resolve_launch_for_session(
+            &instance(&AgentPreset::opencode(), Some("hello there")),
+            true,
+        );
+        assert!(r.args.is_empty());
+        assert_eq!(r.startup_input, None);
+    }
+
+    #[test]
+    fn cli_flag_remains_launch_configuration_on_resume() {
+        let r =
+            resolve_launch_for_session(&instance(&AgentPreset::claude(), Some("be terse")), true);
+        assert_eq!(
+            r.args,
+            vec!["--append-system-prompt".to_string(), "be terse".to_string()]
+        );
+        assert_eq!(r.startup_input, None);
+    }
+
+    #[test]
+    fn prompt_transports_keep_multiline_bundles_to_one_turn() {
+        let cli = resolve_launch(&instance(&AgentPreset::claude(), Some("one\n\ntwo")));
+        assert_eq!(cli.args.last().map(String::as_str), Some("one two"));
+        let typed = resolve_launch(&instance(&AgentPreset::opencode(), Some("one\n\ntwo")));
+        assert_eq!(typed.startup_input.as_deref(), Some("one two"));
+    }
+
+    #[test]
+    fn codex_developer_instructions_use_a_batch_safe_raw_config_value() {
+        assert_eq!(
+            codex_developer_instructions_override("open \"D:\\dev\\x\"\nnext"),
+            "developer_instructions=open \"D:\\dev\\x\" next"
+        );
+    }
+
+    #[test]
+    fn combines_custom_prompt_and_capabilities_once_for_any_transport() {
+        let mut prompt = Some("custom rules".to_string());
+        append_agent_instruction(&mut prompt, "file links".to_string());
+        append_agent_instruction(&mut prompt, "project memory".to_string());
+        assert_eq!(
+            prompt.as_deref(),
+            Some("custom rules\n\nfile links\n\nproject memory")
+        );
     }
 
     #[test]

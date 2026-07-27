@@ -278,8 +278,19 @@ impl EditorView {
 
     /// Move the cursor to a 0-based line (used by find-in-project navigation).
     pub fn goto_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.goto_position(line, 0, window, cx);
+    }
+
+    /// Move the cursor to a zero-based source position.
+    pub fn goto_position(
+        &self,
+        line: u32,
+        character: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.input.update(cx, |s, cx| {
-            s.set_cursor_position(Position { line, character: 0 }, window, cx);
+            s.set_cursor_position(Position { line, character }, window, cx);
         });
     }
 

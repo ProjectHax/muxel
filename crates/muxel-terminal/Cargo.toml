@@ -16,6 +16,7 @@ portable-pty = "0.9"
 
 parking_lot = "0.12"
 async-channel = "2.3"
+base64 = "0.22"
 libc = "0.2"
 
 muxel-core.workspace = true

@@ -356,8 +356,9 @@ feature is added or changed, update the matching entry here in the same change**
   scanning the full history.
 - **Clickable links** — `Ctrl`/`Cmd`+click opens what's under the cursor: an
   `http(s)` URL, an OSC 8 hyperlink (e.g. `ls --hyperlink` or agent markdown
-  links), or a **file path** (absolute, `~/`, or relative to the pane's working
-  directory). Local files open in a muxel editor pane; only paths that exist are
+  links), a literal Markdown inline link, a `file://` URI, or a **file path**
+  (Windows/Unix absolute, `~/`, or relative to the pane's working directory).
+  Local files open in a muxel editor pane; only paths that exist are
   clickable, and a trailing `:line:col` is understood. `Ctrl`/`Cmd`+hover
   underlines the link and shows a pointing-hand cursor (Ctrl/Cmd down re-hit-tests
   without requiring a mouse move).
