@@ -79,6 +79,10 @@ mod imp {
         Input, InputEvent, InputState, MoveToEnd, MoveToStart, SelectToStart,
     };
     use gpui_component::{Icon, IconName, Sizable as _, h_flex};
+    #[cfg(target_os = "windows")]
+    use webview2_com::FocusChangedEventHandler;
+    #[cfg(target_os = "windows")]
+    use wry::WebViewExtWindows as _;
     use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     /// The gpui window's native handle, detached from the `&Window` it came from.
@@ -100,6 +104,7 @@ mod imp {
 
     /// IPC message the page posts when it is clicked. Namespaced so it can't
     /// collide with a site that uses `window.ipc` for its own purposes.
+    #[cfg(target_os = "macos")]
     const CLICK_MSG: &str = "muxel:page-click";
 
     /// Injected into every page (and every frame) before its own scripts run.
@@ -110,20 +115,21 @@ mod imp {
     /// and why the clicked pane never became the active one. The page itself is the
     /// only thing that *can* see the click, so it tells us. Capture phase, so a
     /// page that stops propagation on its own handlers can't hide the click.
-    const INTERACTION_SCRIPT: &str = r#"
+    #[cfg(target_os = "macos")]
+    const PAGE_CLICK_SCRIPT: &str = r#"
         (function () {
           window.addEventListener('mousedown', function (event) {
-            // lb-wry 0.53.3 parses the WebView2 message source with `http::Uri`
-            // and unwraps the result. Windows file URIs are rejected by that
-            // parser, so posting from a file:// page aborts the process inside
-            // the COM callback. Only origins lb-wry can represent may use IPC.
             if (event.button === 0 &&
                 (window.location.protocol === 'http:' ||
                  window.location.protocol === 'https:')) {
               try { window.ipc.postMessage('muxel:page-click'); } catch (e) {}
             }
           }, true);
+        })();
+    "#;
 
+    const COPY_SCRIPT: &str = r#"
+        (function () {
           // WebView2 hosted as a child window does not always run its built-in
           // copy accelerator. The native context-menu command still works, so
           // invoke that same document copy operation from the standard keys.
@@ -158,9 +164,9 @@ mod imp {
         pending_navigation_from: Option<String>,
         /// What the app last asked of the native child (dedupes plaform calls).
         native_visible: bool,
-        /// Clicks the page reported over IPC (see [`INTERACTION_SCRIPT`]). Drained each
-        /// tick by [`BrowserView::take_page_click`].
-        clicks: std::sync::mpsc::Receiver<()>,
+        /// Native page-focus events. WebView2 reports these from its controller;
+        /// macOS uses guarded page IPC until WKWebView exposes the same seam.
+        focus_events: std::sync::mpsc::Receiver<bool>,
     }
 
     impl BrowserView {
@@ -221,7 +227,7 @@ mod imp {
                 .ok()
                 .map(|h| ParentWindow(h.as_raw()));
             let requested = url.clone();
-            let (click_tx, clicks) = std::sync::mpsc::channel();
+            let (focus_tx, focus_events) = std::sync::mpsc::channel();
 
             cx.spawn_in(window, async move |this, cx| {
                 #[cfg(target_os = "windows")]
@@ -248,19 +254,52 @@ mod imp {
                         #[cfg(target_os = "macos")]
                         let builder = wry::WebViewBuilder::new();
 
-                        builder
+                        let builder = builder
                             .with_url(&requested)
-                            .with_initialization_script(INTERACTION_SCRIPT)
+                            .with_initialization_script(COPY_SCRIPT);
+                        #[cfg(target_os = "macos")]
+                        let builder = builder
+                            .with_initialization_script(PAGE_CLICK_SCRIPT)
                             .with_ipc_handler(move |req| {
                                 if req.body().as_str() == CLICK_MSG {
-                                    // The receiver is dropped with the pane; a click
-                                    // arriving after that is simply nobody's business.
-                                    let _ = click_tx.send(());
+                                    let _ = focus_tx.send(true);
                                 }
-                            })
-                            .build_as_child_async(parent)
-                            .await
-                            .ok()
+                            });
+                        let built = builder.build_as_child_async(parent).await.ok();
+
+                        #[cfg(target_os = "windows")]
+                        if let Some(webview) = built.as_ref() {
+                            let got_tx = focus_tx.clone();
+                            let got_focus =
+                                FocusChangedEventHandler::create(Box::new(move |_, _| {
+                                    let _ = got_tx.send(true);
+                                    Ok(())
+                                }));
+                            let lost_tx = focus_tx.clone();
+                            let lost_focus =
+                                FocusChangedEventHandler::create(Box::new(move |_, _| {
+                                    let _ = lost_tx.send(false);
+                                    Ok(())
+                                }));
+                            let mut got_token = 0;
+                            if let Err(error) = unsafe {
+                                webview
+                                    .controller()
+                                    .add_GotFocus(&got_focus, &mut got_token)
+                            } {
+                                log::warn!("failed to observe WebView2 focus: {error}");
+                            }
+                            let mut lost_token = 0;
+                            if let Err(error) = unsafe {
+                                webview
+                                    .controller()
+                                    .add_LostFocus(&lost_focus, &mut lost_token)
+                            } {
+                                log::warn!("failed to observe WebView2 blur: {error}");
+                            }
+                        }
+
+                        built
                     }
                     None => None,
                 };
@@ -294,7 +333,7 @@ mod imp {
                 url,
                 pending_navigation_from: None,
                 native_visible: true,
-                clicks,
+                focus_events,
             }
         }
 
@@ -304,12 +343,12 @@ mod imp {
         /// click never reaches gpui on its own, so without this the pane keeps its
         /// old highlight and keyboard actions (paste, restart, close) go to
         /// whichever pane was focused before.
-        pub fn take_page_click(&mut self) -> bool {
-            let mut clicked = false;
-            while self.clicks.try_recv().is_ok() {
-                clicked = true;
+        pub fn take_native_focus(&mut self) -> Option<bool> {
+            let mut focused = None;
+            while let Ok(next) = self.focus_events.try_recv() {
+                focused = Some(next);
             }
-            clicked
+            focused
         }
 
         /// Hand the OS keyboard focus to the native webview, so typing (and paste)
@@ -323,6 +362,10 @@ mod imp {
             if let Some(wv) = &self.webview {
                 let _ = wv.read(cx).raw().focus();
             }
+        }
+
+        pub fn address_focused(&self, window: &Window, cx: &App) -> bool {
+            self.address.read(cx).focus_handle(cx).is_focused(window)
         }
 
         /// Reload the page the webview is *currently* on.
@@ -561,12 +604,16 @@ mod imp {
         /// No embedded webview here, so clicks land on ordinary gpui elements and
         /// the pane's own `on_mouse_down` already focuses it (see the macOS/Windows
         /// impl for why that isn't true there).
-        pub fn take_page_click(&mut self) -> bool {
-            false
+        pub fn take_native_focus(&mut self) -> Option<bool> {
+            None
         }
 
         /// No native child to focus.
         pub fn focus_native(&self, _cx: &App) {}
+
+        pub fn address_focused(&self, _window: &Window, _cx: &App) -> bool {
+            false
+        }
 
         // No `reload` here: the placeholder has no toolbar and no page. Reload is
         // called only from the macOS/Windows toolbar, inside that impl.

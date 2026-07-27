@@ -5767,26 +5767,22 @@ impl MuxelApp {
                     inst.browser_url = Some(url);
                     changed = true;
                 }
-                // A click inside the native webview never reaches gpui — the child
-                // window sits above it and consumes the event — so the page reports
-                // it over IPC instead. Without this, clicking a browser pane left the
-                // highlight (and keyboard actions like paste) on whichever pane was
-                // focused before.
-                if view.update(cx, |v, _| v.take_page_click()) {
-                    if self.active_instance != Some(iid) {
-                        self.focus_instance(iid, window, cx);
-                    } else {
-                        // Even when the pane is already active, move GPUI focus
-                        // off its address input before the native page takes the
-                        // OS keyboard. Otherwise InputEvent::Blur never fires.
-                        let handle = view.read(cx).focus_handle(cx);
-                        window.focus(&handle, cx);
+                // Native WebView focus never reaches GPUI. Mirror it into Muxel's
+                // active-pane state, and blur a focused address input once.
+                if view.update(cx, |v, _| v.take_native_focus()) == Some(true) {
+                    let address_focused = view.read(cx).address_focused(window, cx);
+                    if self.active_instance != Some(iid) || address_focused {
+                        if self.active_instance != Some(iid) {
+                            self.focus_instance(iid, window, cx);
+                        } else {
+                            let handle = view.read(cx).focus_handle(cx);
+                            window.focus(&handle, cx);
+                        }
+                        // GPUI focus bookkeeping may move OS focus to the parent.
+                        // Return it once; the resulting GotFocus event is ignored
+                        // next tick because pane and address state are settled.
+                        view.read(cx).focus_native(cx);
                     }
-                    // The user clicked *into the page*, so the keyboard belongs to it
-                    // — and `focus_instance` above may have just pulled focus back to
-                    // gpui. This is the ONLY path that hands the OS keyboard to a
-                    // webview; see the note in `focus_instance`.
-                    view.read(cx).focus_native(cx);
                 }
             }
             if changed {
