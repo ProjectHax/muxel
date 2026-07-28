@@ -1140,6 +1140,11 @@ pub struct MuxelApp {
     /// Cached git status (refreshed each tick) so the sidebar doesn't shell out
     /// per render: each project's current branch, and each worktree's change count.
     project_branches: HashMap<Uuid, Option<String>>,
+    /// Cached branch lists for project context menus. Populated beside
+    /// `project_branches` so opening a menu never waits on a git subprocess.
+    project_branch_lists: HashMap<Uuid, Vec<String>>,
+    /// Prevent slow git probes from accumulating overlapping one-second refresh jobs.
+    status_refresh_in_flight: bool,
     worktree_changes: HashMap<Uuid, usize>,
     /// Whether the GitHub CLI (`gh`) is installed (gates worktree PR actions).
     gh_available: bool,
@@ -3046,6 +3051,8 @@ impl MuxelApp {
             current_preset,
             available_programs,
             project_branches: HashMap::new(),
+            project_branch_lists: HashMap::new(),
+            status_refresh_in_flight: false,
             worktree_changes: HashMap::new(),
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
@@ -5889,6 +5896,10 @@ impl MuxelApp {
                 GitDiffTab::Worktrees => self.refresh_git_diff_worktrees(cx),
             }
         }
+        if self.status_refresh_in_flight {
+            return;
+        }
+        self.status_refresh_in_flight = true;
         let presets = self.presets.clone();
         let locals: Vec<(Uuid, PathBuf)> = self
             .workspace
@@ -5911,11 +5922,15 @@ impl MuxelApp {
                     let gh = program_on_path("gh");
                     let sshpass = program_on_path("sshpass");
                     let tmux = cfg!(unix) && program_on_path("tmux");
-                    let branches: Vec<(Uuid, Option<String>)> = locals
+                    let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
                         .into_iter()
                         .map(|(id, root)| {
                             let loc = integrations::RepoLoc::Local(root);
-                            (id, integrations::repo_current_branch(&loc))
+                            (
+                                id,
+                                integrations::repo_current_branch(&loc),
+                                integrations::list_branches(&loc),
+                            )
                         })
                         .collect();
                     let changes: Vec<(Uuid, usize)> = worktrees
@@ -5926,6 +5941,7 @@ impl MuxelApp {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                this.status_refresh_in_flight = false;
                 this.available_programs = available;
                 this.gh_available = gh;
                 this.sshpass_available = sshpass;
@@ -5934,8 +5950,10 @@ impl MuxelApp {
                 // branches. Remote ones are maintained by `poll_remote_branches`.
                 let ids: HashSet<Uuid> = this.workspace.projects.iter().map(|p| p.id).collect();
                 this.project_branches.retain(|id, _| ids.contains(id));
-                for (id, b) in branches {
+                this.project_branch_lists.retain(|id, _| ids.contains(id));
+                for (id, b, list) in branches {
                     this.project_branches.insert(id, b);
+                    this.project_branch_lists.insert(id, list);
                 }
                 this.worktree_changes = changes.into_iter().collect();
                 cx.notify();
@@ -5977,13 +5995,18 @@ impl MuxelApp {
                 .background_executor()
                 .spawn(async move {
                     jobs.into_iter()
-                        .map(|(pid, loc)| (pid, integrations::repo_current_branch(&loc)))
+                        .map(|(pid, loc)| {
+                            let branch = integrations::repo_current_branch(&loc);
+                            let branches = integrations::list_branches(&loc);
+                            (pid, branch, branches)
+                        })
                         .collect::<Vec<_>>()
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                for (pid, branch) in results {
+                for (pid, branch, branches) in results {
                     this.project_branches.insert(pid, branch);
+                    this.project_branch_lists.insert(pid, branches);
                 }
                 cx.notify();
             });
@@ -15961,28 +15984,15 @@ impl MuxelApp {
             let name: SharedString = project.name.clone().into();
             let has_startup = !project.startup.is_empty();
             let memory_on = project.memory_enabled;
-            // Where this project's git runs (local, or remote over its host). No
-            // keychain read here — menu git ops reuse the pane's ControlMaster.
-            let menu_loc: integrations::RepoLoc = match project.remote.as_ref().and_then(|r| {
-                let host = self
-                    .remotes
-                    .iter()
-                    .find(|h| h.id == r.host_id)?
-                    .effective(&self.identities);
-                Some((host, r))
-            }) {
-                Some((host, r)) => integrations::RepoLoc::remote(
-                    host,
-                    r.remote_root.clone(),
-                    Self::control_path_for(r.host_id),
-                    None,
-                ),
-                None => integrations::RepoLoc::Local(project.root_path.clone()),
-            };
             let is_repo = self.project_branches.get(&pid).is_some_and(|b| b.is_some());
             let is_local = project.remote.is_none();
             let remote_host_id = project.remote.as_ref().map(|r| r.host_id);
             let current_branch = self.project_branches.get(&pid).cloned().flatten();
+            let branches = self
+                .project_branch_lists
+                .get(&pid)
+                .cloned()
+                .unwrap_or_default();
             let drop_hl = cx.theme().sidebar_accent;
             let chevron = if collapsed {
                 IconName::ChevronRight
@@ -16335,17 +16345,17 @@ impl MuxelApp {
                                             )),
                                     );
                                 }
-                                let branches = integrations::list_branches(&menu_loc);
                                 if !branches.is_empty() {
                                     let entity_sb = entity.clone();
                                     let cur = current_branch.clone();
+                                    let submenu_branches = branches.clone();
                                     menu = menu.submenu_with_icon(
                                         Some(Icon::empty().path("icons/git-branch.svg")),
                                         t("Switch branch"),
                                         window,
                                         cx,
                                         move |mut sm, window, _c| {
-                                            for b in &branches {
+                                            for b in &submenu_branches {
                                                 let is_cur = Some(b) == cur.as_ref();
                                                 let bn = b.clone();
                                                 let mut item = PopupMenuItem::new(b.clone());
