@@ -216,8 +216,10 @@ fn working_set_bytes() -> Option<u64> {
         };
         use windows::Win32::System::Threading::GetCurrentProcess;
         unsafe {
-            let mut pmc = PROCESS_MEMORY_COUNTERS::default();
-            pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            let mut pmc = PROCESS_MEMORY_COUNTERS {
+                cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                ..Default::default()
+            };
             if GetProcessMemoryInfo(
                 GetCurrentProcess(),
                 &mut pmc,
