@@ -190,16 +190,6 @@ pub fn spawn() {
                 }
 
                 let needed = muxel_terminal::take_present_needed();
-                if move_size {
-                    // Windows' modal loop is already painting the resized window.
-                    // A synchronous RDW_UPDATENOW here competes with it and caused
-                    // 100-200 ms present-pump spikes under startup load.
-                    if needed {
-                        muxel_terminal::mark_present_needed();
-                    }
-                    std::thread::sleep(Duration::from_millis(33));
-                    continue;
-                }
                 let keepalive = last_keepalive.elapsed() >= Duration::from_millis(33);
                 if needed || keepalive {
                     if keepalive {

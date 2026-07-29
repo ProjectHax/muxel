@@ -4738,26 +4738,19 @@ impl MuxelApp {
             let mut owned_tokens = Vec::new();
             let mut wave_start = 0;
             while wave_start < instances.len() {
-                // Yield even before the first launch so the selected layout paints.
+                // Give an immediate drag a chance to enter Windows' modal loop
+                // before any ConPTY work starts. Later waves need only yield.
                 cx.background_executor()
-                    .timer(Duration::from_millis(1))
+                    .timer(Duration::from_millis(if wave_start == 0 { 250 } else { 1 }))
                     .await;
-                if wave_start > 0 {
-                    // Let the focused pane become usable before background panes
-                    // add process-start and first-paint pressure. This grace also
-                    // gives the move/size sampler time to observe an immediate drag.
+                #[cfg(target_os = "windows")]
+                while crate::present_pump::move_size_active() {
                     cx.background_executor()
-                        .timer(Duration::from_millis(200))
+                        .timer(Duration::from_millis(50))
                         .await;
-                    #[cfg(target_os = "windows")]
-                    while crate::present_pump::move_size_active() {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(50))
-                            .await;
-                    }
                 }
-                let concurrency = if wave_start == 0 { 1 } else { 2 };
-                let wave_end = (wave_start + concurrency).min(instances.len());
+                const LAUNCH_CONCURRENCY: usize = 4;
+                let wave_end = (wave_start + LAUNCH_CONCURRENCY).min(instances.len());
                 let mut launches = Vec::new();
                 let mut cancelled = false;
                 for (index, iid) in instances[wave_start..wave_end]
