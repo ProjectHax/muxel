@@ -18,9 +18,11 @@ use gpui::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use uuid::Uuid;
 
 /// gpui element rendering one [`TerminalSession`].
 pub struct TerminalElement {
+    instance_id: Uuid,
     session: Arc<TerminalSession>,
     /// The owning [`crate::view::TerminalView`] entity. Event handlers repaint by
     /// `cx.notify(view_id)` — NOT `window.request_animation_frame()`, which reads
@@ -36,7 +38,11 @@ pub struct TerminalElement {
 }
 
 impl TerminalElement {
+    // Render construction already carries the view, terminal, focus, and style;
+    // the profiler UUID is diagnostic identity, not another rendering concept.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        instance_id: Uuid,
         session: Arc<TerminalSession>,
         view_id: EntityId,
         focus_handle: FocusHandle,
@@ -46,6 +52,7 @@ impl TerminalElement {
         mouse_mode: TerminalMouseMode,
     ) -> Self {
         Self {
+            instance_id,
             session,
             view_id,
             focus_handle,
@@ -196,6 +203,7 @@ impl Element for TerminalElement {
         window.handle_input(
             &self.focus_handle,
             TerminalInputHandler {
+                instance_id: self.instance_id,
                 session: self.session.clone(),
             },
             cx,
@@ -399,7 +407,13 @@ impl Element for TerminalElement {
                 ));
             }
         });
-        profile::paint_with_phases(paint_t0.elapsed(), focused, paint_mode, phases);
+        profile::paint_with_phases(
+            self.instance_id,
+            paint_t0.elapsed(),
+            focused,
+            paint_mode,
+            phases,
+        );
     }
 }
 
@@ -1195,6 +1209,7 @@ struct BgRect {
 /// Routes committed text (including IME) to the PTY. Special keys are handled
 /// separately via the view's `on_key_down` + `keymap::key_to_bytes`.
 pub struct TerminalInputHandler {
+    instance_id: Uuid,
     session: Arc<TerminalSession>,
 }
 
@@ -1240,7 +1255,7 @@ impl InputHandler for TerminalInputHandler {
             let t0 = Instant::now();
             self.session.write_input(text.as_bytes());
             // InputHandler has no is_held; key-repeat for letters often lands here.
-            profile::key_handled(false, t0.elapsed());
+            profile::key_handled(self.instance_id, false, t0.elapsed());
         }
     }
 

@@ -26,12 +26,15 @@
 //! ```
 //! Hold a key in a terminal; open the log file (no paste needed).
 //!
-//! Lines are `term-prof[v5 …]` and include paint phase splits
+//! Lines are `term-prof[v6 …]` and include paint phase splits
 //! (`build=` / `shape=` / `submit=` / `runs=` / `reuse=`) plus felt-latency
 //! samples: `key→echo` (keypress until the focused pane's PTY echo is parsed —
 //! high here = ConPTY/agent/scheduling, not paint) and `echo→paint` (parsed
 //! echo until the focused pane finishes painting — high here = muxel).
+//! Slow chains also emit `term-lat[v6]` with the pane UUID and separate
+//! echo→notify and notify→paint stages.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -216,10 +219,6 @@ struct Counters {
     paint_spikes_3ms: AtomicU64,
     /// Paints whose total time exceeded 8ms.
     paint_spikes_8ms: AtomicU64,
-    /// µs-epoch of the earliest key not yet answered by a focused echo (0 = none).
-    pending_echo: AtomicU64,
-    /// µs-epoch of the last focused echo not yet painted (0 = none).
-    pending_paint: AtomicU64,
     echo_lat_us: AtomicU64,
     echo_lat_max: AtomicU64,
     echo_lat_n: AtomicU64,
@@ -258,8 +257,6 @@ fn counters() -> &'static Counters {
         runs_reused: AtomicU64::new(0),
         paint_spikes_3ms: AtomicU64::new(0),
         paint_spikes_8ms: AtomicU64::new(0),
-        pending_echo: AtomicU64::new(0),
-        pending_paint: AtomicU64::new(0),
         echo_lat_us: AtomicU64::new(0),
         echo_lat_max: AtomicU64::new(0),
         echo_lat_n: AtomicU64::new(0),
@@ -281,20 +278,100 @@ fn now_us() -> u64 {
     (EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64).max(1)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaintRequest {
+    Now,
+    Timer,
+}
+
+impl PaintRequest {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Now => "now",
+            Self::Timer => "timer",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PaneLatency {
+    pending_key_at: u64,
+    key_at: u64,
+    echo_at: u64,
+    notify_at: u64,
+    request: Option<PaintRequest>,
+    min_interval_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LatencySample {
+    key_echo_us: u64,
+    echo_notify_us: Option<u64>,
+    notify_paint_us: Option<u64>,
+    echo_paint_us: u64,
+    request: Option<PaintRequest>,
+    min_interval_us: u64,
+}
+
+impl PaneLatency {
+    fn key(&mut self, now: u64) {
+        if self.pending_key_at == 0 {
+            self.pending_key_at = now;
+        }
+    }
+
+    fn output(&mut self, now: u64) {
+        if self.echo_at != 0 || self.pending_key_at == 0 {
+            return;
+        }
+        self.key_at = std::mem::take(&mut self.pending_key_at);
+        if now.saturating_sub(self.key_at) < LATENCY_STALE_US {
+            self.echo_at = now;
+        } else {
+            self.key_at = 0;
+        }
+    }
+
+    fn notified(&mut self, now: u64, request: PaintRequest, min_interval: Duration) {
+        if self.echo_at != 0 && self.notify_at == 0 {
+            self.notify_at = now;
+            self.request = Some(request);
+            self.min_interval_us = min_interval.as_micros() as u64;
+        }
+    }
+
+    fn painted(&mut self, now: u64) -> Option<LatencySample> {
+        if self.echo_at == 0 {
+            return None;
+        }
+        let echo_paint_us = now.saturating_sub(self.echo_at);
+        let sample = (echo_paint_us < LATENCY_STALE_US).then(|| LatencySample {
+            key_echo_us: self.echo_at.saturating_sub(self.key_at),
+            echo_notify_us: (self.notify_at != 0)
+                .then(|| self.notify_at.saturating_sub(self.echo_at)),
+            notify_paint_us: (self.notify_at != 0).then(|| now.saturating_sub(self.notify_at)),
+            echo_paint_us,
+            request: self.request,
+            min_interval_us: self.min_interval_us,
+        });
+        self.key_at = 0;
+        self.echo_at = 0;
+        self.notify_at = 0;
+        self.request = None;
+        self.min_interval_us = 0;
+        sample
+    }
+}
+
+static PANE_LATENCY: OnceLock<std::sync::Mutex<HashMap<Uuid, PaneLatency>>> = OnceLock::new();
+
+fn pane_latency() -> &'static std::sync::Mutex<HashMap<Uuid, PaneLatency>> {
+    PANE_LATENCY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 /// Samples older than this are dropped as stale — the key had no echo (arrow
 /// keys in some TUIs), or the echo was for something else entirely.
 const LATENCY_STALE_US: u64 = 500_000;
-
-/// Record `now - t0` into a sum/max/count triple, dropping stale samples.
-fn record_latency(t0: u64, sum: &AtomicU64, max: &AtomicU64, n: &AtomicU64) {
-    let d = now_us().saturating_sub(t0);
-    if t0 == 0 || d >= LATENCY_STALE_US {
-        return;
-    }
-    sum.fetch_add(d, Ordering::Relaxed);
-    max.fetch_max(d, Ordering::Relaxed);
-    n.fetch_add(1, Ordering::Relaxed);
-}
 
 /// Whether a terminal paint walked the grid or replayed a cached draw list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -444,9 +521,9 @@ fn dump(tag: &str) {
     let echo_avg = echo_us.checked_div(echo_n).unwrap_or(0);
     let plat_avg = plat_us.checked_div(plat_n).unwrap_or(0);
 
-    // v5: v4 + felt latency (key→echo = ConPTY/agent side, echo→paint = ours).
+    // v6: v5 latency samples are paired per pane; slow chains get stage lines.
     let line = format!(
-        "term-prof[v5 {tag}] Δ={win_ms}ms keys={keys} (held={keys_held}, ~{key_hz}/s, avg={key_avg}µs) \
+        "term-prof[v6 {tag}] Δ={win_ms}ms keys={keys} (held={keys_held}, ~{key_hz}/s, avg={key_avg}µs) \
          notify={notify} (~{notify_hz}/s) \
          process={batches} batches/{bytes}B avg={proc_avg}µs max={process_max}µs \
          paint={paints} (focus={paints_f} bg={paints_bg} full={paint_full} replay={paint_replay}, ~{paint_hz}/s) \
@@ -475,7 +552,7 @@ fn dump(tag: &str) {
 }
 
 /// Time a key path that writes to the PTY.
-pub fn key_handled(held: bool, elapsed: Duration) {
+pub fn key_handled(instance_id: Uuid, held: bool, elapsed: Duration) {
     if !enabled() {
         return;
     }
@@ -486,23 +563,27 @@ pub fn key_handled(held: bool, elapsed: Duration) {
     }
     c.key_us
         .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
-    // Arm the key→echo latency sample with the FIRST unanswered key (a later
-    // key must not shrink an in-flight measurement).
-    let _ = c
-        .pending_echo
-        .compare_exchange(0, now_us(), Ordering::Relaxed, Ordering::Relaxed);
+    if let Ok(mut panes) = pane_latency().lock() {
+        panes.entry(instance_id).or_default().key(now_us());
+    }
     touch();
 }
 
-pub fn notify_scheduled() {
+pub fn notify_scheduled(instance_id: Uuid, request: PaintRequest, min_interval: Duration) {
     if !enabled() {
         return;
     }
     counters().notify.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut panes) = pane_latency().lock() {
+        panes
+            .entry(instance_id)
+            .or_default()
+            .notified(now_us(), request, min_interval);
+    }
     touch();
 }
 
-pub fn process_output(bytes: usize, elapsed: Duration, focused: bool) {
+pub fn process_output(instance_id: Uuid, bytes: usize, elapsed: Duration, focused: bool) {
     if !enabled() {
         return;
     }
@@ -512,19 +593,22 @@ pub fn process_output(bytes: usize, elapsed: Duration, focused: bool) {
     let us = elapsed.as_micros() as u64;
     c.process_us.fetch_add(us, Ordering::Relaxed);
     c.process_max_us.fetch_max(us, Ordering::Relaxed);
-    // Focused-pane echo: close the key→echo sample and arm echo→paint. Only the
-    // focused pane — a background agent's stream must not answer for a keypress.
-    if focused && bytes > 0 {
-        let t0 = c.pending_echo.swap(0, Ordering::Relaxed);
-        record_latency(t0, &c.echo_lat_us, &c.echo_lat_max, &c.echo_lat_n);
-        let _ = c
-            .pending_paint
-            .compare_exchange(0, now_us(), Ordering::Relaxed, Ordering::Relaxed);
+    if focused
+        && bytes > 0
+        && let Ok(mut panes) = pane_latency().lock()
+    {
+        panes.entry(instance_id).or_default().output(now_us());
     }
     touch();
 }
 
-pub fn paint_with_phases(elapsed: Duration, focused: bool, mode: PaintMode, phases: PaintPhases) {
+pub fn paint_with_phases(
+    instance_id: Uuid,
+    elapsed: Duration,
+    focused: bool,
+    mode: PaintMode,
+    phases: PaintPhases,
+) {
     if !enabled() {
         return;
     }
@@ -551,8 +635,41 @@ pub fn paint_with_phases(elapsed: Duration, focused: bool, mode: PaintMode, phas
         }
     }
     if focused {
-        let t0 = c.pending_paint.swap(0, Ordering::Relaxed);
-        record_latency(t0, &c.paint_lat_us, &c.paint_lat_max, &c.paint_lat_n);
+        let sample = pane_latency()
+            .lock()
+            .ok()
+            .and_then(|mut panes| panes.entry(instance_id).or_default().painted(now_us()));
+        if let Some(sample) = sample {
+            c.echo_lat_us
+                .fetch_add(sample.key_echo_us, Ordering::Relaxed);
+            c.echo_lat_max
+                .fetch_max(sample.key_echo_us, Ordering::Relaxed);
+            c.echo_lat_n.fetch_add(1, Ordering::Relaxed);
+            c.paint_lat_us
+                .fetch_add(sample.echo_paint_us, Ordering::Relaxed);
+            c.paint_lat_max
+                .fetch_max(sample.echo_paint_us, Ordering::Relaxed);
+            c.paint_lat_n.fetch_add(1, Ordering::Relaxed);
+            if sample.key_echo_us >= 50_000
+                || sample.echo_paint_us >= 50_000
+                || sample.notify_paint_us.is_some_and(|us| us >= 30_000)
+            {
+                let echo_notify = sample
+                    .echo_notify_us
+                    .map_or_else(|| "missing".to_string(), |us| format!("{}ms", us / 1000));
+                let notify_paint = sample
+                    .notify_paint_us
+                    .map_or_else(|| "missing".to_string(), |us| format!("{}ms", us / 1000));
+                let request = sample.request.map_or("missing", PaintRequest::label);
+                emit_line(&format!(
+                    "term-lat[v6] pane={instance_id} key_echo={}ms echo_notify={echo_notify} notify_paint={notify_paint} echo_paint={}ms paint={}ms request={request} min={}ms focused=true",
+                    sample.key_echo_us / 1000,
+                    sample.echo_paint_us / 1000,
+                    elapsed.as_millis(),
+                    sample.min_interval_us / 1000,
+                ));
+            }
+        }
     }
     let us = elapsed.as_micros() as u64;
     c.paint_us.fetch_add(us, Ordering::Relaxed);
@@ -574,4 +691,57 @@ pub fn sync_expired() {
     }
     counters().sync_expired.fetch_add(1, Ordering::Relaxed);
     touch();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_latency_keeps_each_chain_self_contained() {
+        let mut first = PaneLatency::default();
+        let mut second = PaneLatency::default();
+        first.key(10);
+        second.key(20);
+        first.output(14);
+        first.notified(16, PaintRequest::Now, Duration::from_millis(8));
+
+        assert_eq!(second.painted(30), None);
+        assert_eq!(
+            first.painted(40),
+            Some(LatencySample {
+                key_echo_us: 4,
+                echo_notify_us: Some(2),
+                notify_paint_us: Some(24),
+                echo_paint_us: 26,
+                request: Some(PaintRequest::Now),
+                min_interval_us: 8_000,
+            })
+        );
+        second.output(50);
+        assert_eq!(second.painted(60).unwrap().key_echo_us, 30);
+    }
+
+    #[test]
+    fn repeated_keys_keep_earliest_unanswered_key() {
+        let mut pane = PaneLatency::default();
+        pane.key(10);
+        pane.key(12);
+        pane.output(20);
+        assert_eq!(pane.painted(25).unwrap().key_echo_us, 10);
+    }
+
+    #[test]
+    fn missing_notify_and_stale_samples_are_explicit() {
+        let mut pane = PaneLatency::default();
+        pane.key(10);
+        pane.output(20);
+        let sample = pane.painted(30).unwrap();
+        assert_eq!(sample.echo_notify_us, None);
+        assert_eq!(sample.notify_paint_us, None);
+
+        pane.key(1);
+        pane.output(LATENCY_STALE_US + 1);
+        assert_eq!(pane.painted(LATENCY_STALE_US + 2), None);
+    }
 }
