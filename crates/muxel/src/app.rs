@@ -4020,7 +4020,7 @@ impl MuxelApp {
             was_resume,
             started: Instant::now(),
         };
-        let result = TerminalLaunch::spawn(spec, size);
+        let result = TerminalLaunch::spawn_for_instance(spec, size, instance_id);
         self.install_terminal_spawn(meta, result, window, cx);
     }
 
@@ -4055,6 +4055,18 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
+        let token = self.reserve_terminal_spawn(instance_id, window, cx)?;
+        self.prepare_reserved_terminal_spawn(instance_id, token, cx)
+    }
+
+    /// Claim one generation without doing command discovery or PTY work. This
+    /// is the only launch work an interactive pane creation does before paint.
+    fn reserve_terminal_spawn(
+        &mut self,
+        instance_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
         if self.terminals.contains_key(&instance_id)
             || self.failed_launches.contains_key(&instance_id)
             || self.terminal_launching.contains_key(&instance_id)
@@ -4072,6 +4084,22 @@ impl MuxelApp {
         {
             self.terminal_launching.remove(&instance_id);
             self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
+            return None;
+        }
+        Some(token)
+    }
+
+    /// Build the owned command after the pane has painted. The token check
+    /// prevents a closed or superseded pane from doing discovery work.
+    fn prepare_reserved_terminal_spawn(
+        &mut self,
+        instance_id: Uuid,
+        token: u64,
+        cx: &App,
+    ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
+        if self.terminal_launching.get(&instance_id) != Some(&token)
+            || self.workspace.instance(instance_id).is_none()
+        {
             return None;
         }
         let was_resume = self
@@ -4117,6 +4145,48 @@ impl MuxelApp {
         }
         self.terminal_launching.remove(&instance_id);
         self.install_terminal_spawn(meta, result, window, cx);
+    }
+
+    /// Queue one interactive terminal launch after its pane already exists.
+    /// PTY creation and child startup can take seconds on Windows, so neither
+    /// belongs in the click handler that inserts and focuses the new tab.
+    fn spawn_terminal_deferred(
+        &mut self,
+        instance_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(token) = self.reserve_terminal_spawn(instance_id, window, cx) else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            // Give GPUI a frame to paint the selected pane's loading state before
+            // the worker begins process discovery and ConPTY construction.
+            cx.background_executor()
+                .timer(Duration::from_millis(1))
+                .await;
+            let Some((meta, spec, size)) = this
+                .update(cx, |this, cx| {
+                    this.prepare_reserved_terminal_spawn(instance_id, token, cx)
+                })
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { TerminalLaunch::spawn_for_instance(spec, size, instance_id) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish_terminal_spawn(meta, result, window, cx);
+                if this.active_instance == Some(instance_id) && this.focus_handle.is_focused(window)
+                {
+                    this.focus_instance_with_attendance(instance_id, false, window, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Install a completed launch. Both immediate and deferred spawning use this
@@ -4774,9 +4844,9 @@ impl MuxelApp {
                     };
                     if let Some((meta, spec, size)) = prepared {
                         owned_tokens.push((iid, meta.token));
-                        let task = cx
-                            .background_executor()
-                            .spawn(async move { TerminalLaunch::spawn(spec, size) });
+                        let task = cx.background_executor().spawn(async move {
+                            TerminalLaunch::spawn_for_instance(spec, size, iid)
+                        });
                         launches.push((index, iid, meta, task));
                     }
                 }
@@ -7622,7 +7692,7 @@ impl MuxelApp {
                 let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
                 self.browsers.insert(iid, view);
             }
-            _ => self.spawn_terminal(iid, window, cx),
+            _ => self.spawn_terminal_deferred(iid, window, cx),
         }
         self.focus_instance(iid, window, cx);
         self.persist();
