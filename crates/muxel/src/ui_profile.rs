@@ -357,6 +357,20 @@ pub fn pump_coalesced() {
     PUMP_COALESCE.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Mark entry to and exit from Windows' modal move/size loop.
+#[allow(dead_code)]
+pub fn move_size_changed(active: bool) {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    emit(if active {
+        "ui-prof[move-size enter]"
+    } else {
+        "ui-prof[move-size exit]"
+    });
+}
+
 /// Wndproc side of the UI latency probe (µs of queue delay).
 #[allow(dead_code)]
 pub fn probe_completed(rtt_us: u64) {

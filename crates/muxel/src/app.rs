@@ -4735,14 +4735,29 @@ impl MuxelApp {
             *generation
         };
         cx.spawn_in(window, async move |this, cx| {
-            const LAUNCH_CONCURRENCY: usize = 4;
             let mut owned_tokens = Vec::new();
-            for wave_start in (0..instances.len()).step_by(LAUNCH_CONCURRENCY) {
+            let mut wave_start = 0;
+            while wave_start < instances.len() {
                 // Yield even before the first launch so the selected layout paints.
                 cx.background_executor()
                     .timer(Duration::from_millis(1))
                     .await;
-                let wave_end = (wave_start + LAUNCH_CONCURRENCY).min(instances.len());
+                if wave_start > 0 {
+                    // Let the focused pane become usable before background panes
+                    // add process-start and first-paint pressure. This grace also
+                    // gives the move/size sampler time to observe an immediate drag.
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    #[cfg(target_os = "windows")]
+                    while crate::present_pump::move_size_active() {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(50))
+                            .await;
+                    }
+                }
+                let concurrency = if wave_start == 0 { 1 } else { 2 };
+                let wave_end = (wave_start + concurrency).min(instances.len());
                 let mut launches = Vec::new();
                 let mut cancelled = false;
                 for (index, iid) in instances[wave_start..wave_end]
@@ -4820,6 +4835,7 @@ impl MuxelApp {
                 if cancelled {
                     break;
                 }
+                wave_start = wave_end;
             }
             let _ = this.update(cx, |this, _| {
                 for (iid, token) in owned_tokens {
