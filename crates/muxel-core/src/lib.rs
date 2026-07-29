@@ -1220,7 +1220,9 @@ pub fn sync_agent_injection_modes(workspace: &mut Workspace, presets: &[AgentPre
         else {
             continue;
         };
-        if instance.injection != preset.injection {
+        // Runner prompts are one-shot tasks, not reusable capability rules.
+        // Their explicit TypeIn transport must survive preset migrations.
+        if !instance.is_runner && instance.injection != preset.injection {
             instance.injection = preset.injection.clone();
             changed = true;
         }
@@ -1277,6 +1279,22 @@ mod agent_injection_sync_tests {
             Some("pane-specific rules")
         );
         assert!(!sync_agent_injection_modes(&mut workspace, &[preset]));
+    }
+
+    #[test]
+    fn restored_runner_keeps_one_shot_type_in_transport() {
+        let preset = AgentPreset::grok();
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &preset);
+        instance.injection = InjectionMode::TypeIn;
+        instance.system_prompt = Some("one-shot task".into());
+        instance.is_runner = true;
+        let mut workspace = Workspace {
+            instances: vec![instance],
+            ..Workspace::default()
+        };
+
+        assert!(!sync_agent_injection_modes(&mut workspace, &[preset]));
+        assert_eq!(workspace.instances[0].injection, InjectionMode::TypeIn);
     }
 }
 
@@ -1982,7 +2000,9 @@ impl Default for Settings {
 /// v11: Grok preset gains `--session-id`/`--resume` session resume.
 /// v12: added the Codex preset (agent-minted session resume).
 /// v13: added the built-in Browser preset (opens a browser pane).
-pub const PRESET_SEED_VERSION: u32 = 13;
+/// v14: migrated the built-in Grok preset from delayed TypeIn to `--rules`.
+/// v15: repaired Grok presets saved with the generic Claude-only prompt flag.
+pub const PRESET_SEED_VERSION: u32 = 15;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
@@ -2001,6 +2021,29 @@ impl Settings {
         for builtin in AgentPreset::defaults() {
             if !self.presets.iter().any(|p| p.name == builtin.name) {
                 self.presets.push(builtin);
+            }
+        }
+        // Old Grok presets typed capability instructions into the live prompt
+        // after startup. If the user began typing first, delayed text could
+        // append to and submit their question. Migrate only the exact legacy
+        // built-in shape; preserve explicit None and custom flag choices.
+        let grok_rules = AgentPreset::grok().injection;
+        for preset in &mut self.presets {
+            let is_grok_program = preset
+                .program
+                .as_deref()
+                .and_then(|program| std::path::Path::new(program).file_stem())
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("grok"));
+            let wrong_generic_flag = matches!(
+                &preset.injection,
+                InjectionMode::CliFlag { flag } if flag == "--append-system-prompt"
+            );
+            if preset.name == "Grok"
+                && is_grok_program
+                && (preset.injection == InjectionMode::TypeIn || wrong_generic_flag)
+            {
+                preset.injection = grok_rules.clone();
             }
         }
         for builtin in Runner::defaults() {
@@ -2132,6 +2175,40 @@ mod settings_tests {
         s2.seed_builtin_presets();
         let claude2 = s2.presets.iter().find(|p| p.name == "Claude").unwrap();
         assert_eq!(claude2.working_markers, vec!["mine".to_string()]);
+    }
+
+    #[test]
+    fn seed_repairs_legacy_grok_instruction_transports() {
+        let mut legacy = AgentPreset::grok();
+        legacy.injection = InjectionMode::TypeIn;
+        let mut generic_flag = AgentPreset::grok();
+        generic_flag.injection = InjectionMode::CliFlag {
+            flag: "--append-system-prompt".into(),
+        };
+        let mut disabled = AgentPreset::grok();
+        disabled.name = "Grok disabled".into();
+        disabled.injection = InjectionMode::None;
+        let mut settings = Settings {
+            preset_seed_version: 13,
+            presets: vec![legacy, generic_flag, disabled],
+            ..Settings::default()
+        };
+
+        assert!(settings.seed_builtin_presets());
+        assert_eq!(
+            settings.presets[0].injection,
+            InjectionMode::CliFlag {
+                flag: "--rules".into()
+            }
+        );
+        assert_eq!(
+            settings.presets[1].injection,
+            InjectionMode::CliFlag {
+                flag: "--rules".into()
+            }
+        );
+        assert_eq!(settings.presets[2].injection, InjectionMode::None);
+        assert!(!settings.seed_builtin_presets());
     }
 
     #[test]

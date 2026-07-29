@@ -49,6 +49,25 @@ const MIN_PANE_WIDTH: Pixels = px(340.0);
 /// Minimum height a vertical split's pane can shrink to (a few rows).
 const MIN_PANE_HEIGHT: Pixels = px(120.0);
 
+/// Browser tabs identify web resources by their full URL, but local files by
+/// their decoded path. A source fragment moves within the same file; it must not
+/// create another pane.
+#[cfg(any(not(target_os = "linux"), test))]
+fn same_browser_resource(existing: &str, requested: &str) -> bool {
+    match (
+        muxel_terminal::path_from_file_uri(existing),
+        muxel_terminal::path_from_file_uri(requested),
+    ) {
+        (Some(existing), Some(requested)) => {
+            let existing = std::fs::canonicalize(&existing).unwrap_or(existing);
+            let requested = std::fs::canonicalize(&requested).unwrap_or(requested);
+            existing == requested
+        }
+        (None, None) => muxel_core::same_resource_url(existing, requested),
+        _ => false,
+    }
+}
+
 /// Status indicator color, taken from the active theme.
 fn status_hsla(status: AgentStatus, cx: &App) -> Hsla {
     let t = cx.theme();
@@ -7563,6 +7582,15 @@ impl MuxelApp {
     /// separate muxel browser window.
     fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(mut target) = muxel_terminal::file_target_from_uri(url) {
+            let mut canonical_url = muxel_terminal::file_uri(&target.path);
+            if let Some((_, fragment)) = url.split_once('#')
+                && !fragment.is_empty()
+            {
+                canonical_url.push('#');
+                canonical_url.push_str(fragment);
+            }
+            // Keep the browser URL free of Windows' `\\?\` canonical-path
+            // prefix, but use the canonical path for file identity/editor IO.
             if let Ok(canonical) = std::fs::canonicalize(&target.path) {
                 target.path = canonical;
             }
@@ -7578,7 +7606,7 @@ impl MuxelApp {
             if is_html
                 && self.settings.browser_enabled
                 && self
-                    .open_browser_at(url.to_string(), self.active_instance, window, cx)
+                    .open_browser_at(canonical_url.clone(), self.active_instance, window, cx)
                     .is_some()
             {
                 return;
@@ -7608,7 +7636,7 @@ impl MuxelApp {
                 return;
             }
             // Fall through to the OS if no project / editor open failed.
-            cx.open_url(url);
+            cx.open_url(&canonical_url);
             return;
         }
         if !self.settings.browser_enabled || url.starts_with("file://") {
@@ -7652,9 +7680,8 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
         let pid = self.workspace.active_project?;
-        // Reuse and refresh only the exact resource. A different path, query, or
-        // fragment is a different tab; silently replacing the first browser in
-        // the project loses the page the user already opened.
+        // Web resources require an exact URL match. Local files reuse by decoded
+        // path so raw/file URI spellings and source fragments share one pane.
         if let Some(iid) = self
             .workspace
             .project(pid)
@@ -7662,16 +7689,26 @@ impl MuxelApp {
             .unwrap_or_default()
             .into_iter()
             .find(|iid| {
-                self.browsers.contains_key(iid)
-                    && self
-                        .workspace
-                        .instance(*iid)
-                        .and_then(|instance| instance.browser_url.as_deref())
-                        .is_some_and(|existing| muxel_core::same_resource_url(existing, &url))
+                self.workspace.instance(*iid).is_some_and(|instance| {
+                    instance.kind == InstanceKind::Browser
+                        && instance
+                            .browser_url
+                            .as_deref()
+                            .is_some_and(|existing| same_browser_resource(existing, &url))
+                })
             })
         {
+            if let Some(instance) = self.workspace.instance_mut(iid) {
+                instance.browser_url = Some(url.clone());
+            }
             if let Some(view) = self.browsers.get(&iid).cloned() {
-                view.update(cx, |v, cx| v.reload(cx));
+                view.update(cx, |v, cx| {
+                    if v.url() == url {
+                        v.reload(cx);
+                    } else {
+                        v.navigate(&url, cx);
+                    }
+                });
             }
             self.focus_instance(iid, window, cx);
             self.persist();
@@ -18354,6 +18391,17 @@ impl MuxelApp {
             InjectionMode::CliFlag { flag } => flag.clone(),
             _ => String::new(),
         };
+        let default_inj_flag = if p
+            .program
+            .as_deref()
+            .and_then(|program| std::path::Path::new(program).file_stem())
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("grok"))
+        {
+            "--rules"
+        } else {
+            "--append-system-prompt"
+        };
         let ui = &self.settings_ui;
         ui.p_name
             .update(cx, |s, cx| s.set_value(p.name.clone(), window, cx));
@@ -18382,8 +18430,10 @@ impl MuxelApp {
         ui.p_prompt.update(cx, |s, cx| {
             s.set_value(p.system_prompt.clone().unwrap_or_default(), window, cx)
         });
-        ui.p_inj_flag
-            .update(cx, |s, cx| s.set_value(inj_flag, window, cx));
+        ui.p_inj_flag.update(cx, |s, cx| {
+            s.set_value(inj_flag, window, cx);
+            s.set_placeholder(default_inj_flag, window, cx);
+        });
         ui.p_env.update(cx, |s, cx| {
             s.set_value(settings_view::format_env(&p.env), window, cx)
         });
@@ -18493,7 +18543,13 @@ impl MuxelApp {
         let injection = match self.settings_ui.p_injection {
             InjectionMode::CliFlag { .. } => InjectionMode::CliFlag {
                 flag: if inj_flag.is_empty() {
-                    "--append-system-prompt".to_string()
+                    match std::path::Path::new(&program)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                    {
+                        Some(stem) if stem.eq_ignore_ascii_case("grok") => "--rules".to_string(),
+                        _ => "--append-system-prompt".to_string(),
+                    }
                 } else {
                     inj_flag
                 },
@@ -23536,5 +23592,34 @@ mod file_walk_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod browser_resource_tests {
+    use super::same_browser_resource;
+
+    #[test]
+    fn local_file_fragments_share_one_browser_resource() {
+        assert!(same_browser_resource(
+            "file:///D:/dev/moxie/joke.html",
+            "file:///D:/dev/moxie/joke.html#L42"
+        ));
+        assert!(same_browser_resource(
+            "file:///D:/dev/moxie/joke.html#",
+            "file:///D:/dev/moxie/joke.html"
+        ));
+        assert!(!same_browser_resource(
+            "file:///D:/dev/moxie/joke.html",
+            "file:///D:/dev/moxie/other.html"
+        ));
+    }
+
+    #[test]
+    fn web_fragments_remain_distinct_resources() {
+        assert!(!same_browser_resource(
+            "https://example.com/page#a",
+            "https://example.com/page#b"
+        ));
     }
 }

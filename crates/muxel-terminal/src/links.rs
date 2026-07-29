@@ -28,6 +28,28 @@ pub struct StitchedRows {
     pub row_len: usize,
 }
 
+/// Blank the chrome outside a TUI row's paired vertical box borders.
+///
+/// Grok renders Markdown inside `│ ... │`. Those border cells are real terminal
+/// characters, so joining wrapped rows without removing them produces targets
+/// such as `file:///│D:/path/│file.html`.
+pub fn strip_box_margins(row: &mut [char]) {
+    let is_vertical = |c: char| matches!(c, '│' | '┃' | '║');
+    let Some(first) = row.iter().position(|c| is_vertical(*c)) else {
+        return;
+    };
+    let Some(last) = row.iter().rposition(|c| is_vertical(*c)) else {
+        return;
+    };
+    // Internal table/tree separators are content, not box chrome. A box must
+    // have one border near each edge of the captured terminal row.
+    if first == last || first > 4 || last.saturating_add(5) < row.len() {
+        return;
+    }
+    row[..=first].fill(' ');
+    row[last..].fill(' ');
+}
+
 /// Join rows selected as one visual token.
 ///
 /// A terminal soft wrap preserves every column. A TUI-generated hard wrap has
@@ -76,6 +98,43 @@ pub fn stitch_rows(
         row_start,
         row_len,
     }
+}
+
+/// Whether a TUI row plausibly hard-wraps a link/path onto the next row.
+/// Grok can render inside a narrower content column, so a `file:///` target and
+/// its path continuation may end well before the terminal's right edge.
+pub fn hard_wraps_to_next(row: &[char], next_text_column: usize) -> bool {
+    let Some(end) = row
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+        .map(|column| column + 1)
+    else {
+        return false;
+    };
+    // TUI content boxes can be inset well beyond a dozen terminal columns.
+    // A continuation still has to begin in the left half; URI/path parsing and
+    // existence checks remain the final guards against joining ordinary rows.
+    if next_text_column >= row.len() / 2 {
+        return false;
+    }
+    let content = &row[..end];
+    let url_at_end = url_spans(content)
+        .into_iter()
+        .find(|(_, span_end)| *span_end == end);
+    let path_at_end = path_spans(content)
+        .into_iter()
+        .find(|(_, span_end, _)| *span_end == end);
+    let near_grid_edge = end.saturating_add(16) >= row.len();
+    let path_only = path_at_end
+        .as_ref()
+        .is_some_and(|(start, _, _)| content[..*start].iter().all(|c| c.is_whitespace()));
+    let parenthesized_file_url = url_at_end.is_some_and(|(start, _)| {
+        let url: String = content[start..].iter().collect();
+        url.starts_with("file:///") && url.ends_with('/') && content[..start].contains(&'(')
+    });
+    path_at_end.is_some() && (near_grid_edge || path_only)
+        || parenthesized_file_url
+        || near_grid_edge && url_at_end.is_some()
 }
 
 /// Does the text starting at `i` begin a supported URI scheme?
@@ -170,9 +229,57 @@ pub fn markdown_link_at(line: &[char], col: usize) -> Option<(usize, usize, Stri
             i = target_start;
             continue;
         };
-        if col > i && col < label_end && target_end > target_start {
+        let valid_target = !line[target_start..target_end]
+            .iter()
+            .any(|c| c.is_whitespace());
+        if col > i && col < label_end && target_end > target_start && valid_target {
             let target: String = line[target_start..target_end].iter().collect();
             return Some((i + 1, label_end, target));
+        }
+        i = target_end + 1;
+    }
+    None
+}
+
+/// A literal Markdown inline link whose destination covers `col`.
+///
+/// This complements [`markdown_link_at`]: TUIs can expose both the readable
+/// label and the wrapped `(file:///...)` destination. Clicking either should
+/// open the complete destination, not the row-local URI fragment.
+pub fn markdown_target_at(line: &[char], col: usize) -> Option<(usize, usize, String)> {
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] != '[' {
+            i += 1;
+            continue;
+        }
+        let Some(label_end) = line[i + 1..]
+            .iter()
+            .position(|c| *c == ']')
+            .map(|end| end + i + 1)
+        else {
+            i += 1;
+            continue;
+        };
+        if line.get(label_end + 1) != Some(&'(') {
+            i = label_end + 1;
+            continue;
+        }
+        let target_start = label_end + 2;
+        let Some(target_end) = line[target_start..]
+            .iter()
+            .position(|c| *c == ')')
+            .map(|end| end + target_start)
+        else {
+            i = target_start;
+            continue;
+        };
+        let valid_target = !line[target_start..target_end]
+            .iter()
+            .any(|c| c.is_whitespace());
+        if col >= target_start && col < target_end && target_end > target_start && valid_target {
+            let target: String = line[target_start..target_end].iter().collect();
+            return Some((target_start, target_end, target));
         }
         i = target_end + 1;
     }
@@ -206,7 +313,10 @@ pub fn rendered_markdown_link_at(line: &[char], col: usize) -> Option<(usize, us
             .iter()
             .rposition(|c| c.is_whitespace())
             .map_or(0, |index| index + 1);
-        if col >= label_start && col < label_end {
+        let valid_target = !line[target_start..target_end]
+            .iter()
+            .any(|c| c.is_whitespace());
+        if col >= label_start && col < label_end && valid_target {
             return Some((
                 label_start,
                 label_end,
@@ -469,9 +579,9 @@ fn parse_source_fragment(fragment: &str) -> Option<(u32, Option<u32>)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_target_from_uri, file_uri, markdown_link_at, path_from_file_uri, path_span_at,
-        path_spans, rendered_markdown_link_at, resolve_path, source_fragment, stitch_rows,
-        url_span_at, url_spans,
+        file_target_from_uri, file_uri, hard_wraps_to_next, markdown_link_at, markdown_target_at,
+        path_from_file_uri, path_span_at, path_spans, rendered_markdown_link_at, resolve_path,
+        source_fragment, stitch_rows, strip_box_margins, url_span_at, url_spans,
     };
     use std::path::{Path, PathBuf};
 
@@ -530,6 +640,10 @@ mod tests {
             Some((1, 15, "file:///D:/dev/muxel/browser.rs#L112".to_string()))
         );
         assert!(markdown_link_at(&line, 20).is_none());
+        assert_eq!(
+            markdown_target_at(&line, 25),
+            Some((17, 53, "file:///D:/dev/muxel/browser.rs#L112".to_string()))
+        );
     }
 
     #[test]
@@ -608,6 +722,106 @@ mod tests {
                 .as_deref(),
             Some("file:///D:/dev/moxie/joke.html")
         );
+    }
+
+    #[test]
+    fn grok_inset_file_uri_rows_are_hard_wrap_candidates() {
+        let mut opening = chars("Draft at issue.md (file:///");
+        opening.resize(100, ' ');
+        assert!(hard_wraps_to_next(&opening, 0));
+
+        let mut continuation = chars("D:/dev/orez-desk/issues/routing-pack.md");
+        continuation.resize(100, ' ');
+        assert!(hard_wraps_to_next(&continuation, 0));
+
+        let mut ordinary_url = chars("See https://example.com/complete");
+        ordinary_url.resize(100, ' ');
+        assert!(!hard_wraps_to_next(&ordinary_url, 0));
+    }
+
+    #[test]
+    fn grok_wide_inset_file_uri_rows_are_hard_wrap_candidates() {
+        let mut opening = chars("                [joke.html](file:///");
+        opening.resize(80, ' ');
+        assert!(hard_wraps_to_next(&opening, 16));
+
+        let mut continuation = chars("                D:/dev/moxie/");
+        continuation.resize(80, ' ');
+        assert!(hard_wraps_to_next(&continuation, 16));
+    }
+
+    #[test]
+    fn ordinary_prose_ending_in_a_path_is_not_joined() {
+        let mut row = chars("Compiled src/main.rs");
+        row.resize(120, ' ');
+        assert!(!hard_wraps_to_next(&row, 0));
+    }
+
+    #[test]
+    fn parenthesized_file_uri_can_continue_after_a_directory_fragment() {
+        let mut row = chars("Draft at joke.html (file:///D:/dev/");
+        row.resize(120, ' ');
+        assert!(hard_wraps_to_next(&row, 0));
+    }
+
+    #[test]
+    fn markdown_destinations_cannot_absorb_unrelated_prose() {
+        let line = chars("[WARN](https://example.com is down)");
+        assert!(markdown_link_at(&line, 2).is_none());
+        assert!(markdown_target_at(&line, 10).is_none());
+    }
+
+    #[test]
+    fn literal_markdown_target_survives_wide_inset_hard_wraps() {
+        let rows = vec![
+            (
+                chars("                [joke.html](file:///          "),
+                false,
+            ),
+            (
+                chars("                D:/dev/moxie/                 "),
+                false,
+            ),
+            (
+                chars("                joke.html#L42)                "),
+                false,
+            ),
+        ];
+        let stitched = stitch_rows(&rows, 1, 20);
+        assert_eq!(
+            markdown_target_at(&stitched.chars, stitched.clicked_col)
+                .map(|(_, _, target)| target)
+                .as_deref(),
+            Some("file:///D:/dev/moxie/joke.html#L42")
+        );
+    }
+
+    #[test]
+    fn box_margins_do_not_split_wrapped_markdown_targets() {
+        let mut rows = vec![
+            chars(" │   [joke.html](file:///              │"),
+            chars(" │   D:/dev/moxie/                     │"),
+            chars(" │   joke.html)                        │"),
+        ];
+        for row in &mut rows {
+            strip_box_margins(row);
+        }
+        let rows: Vec<_> = rows.into_iter().map(|row| (row, false)).collect();
+        let stitched = stitch_rows(&rows, 1, 8);
+        assert_eq!(
+            markdown_target_at(&stitched.chars, stitched.clicked_col)
+                .map(|(_, _, target)| target)
+                .as_deref(),
+            Some("file:///D:/dev/moxie/joke.html")
+        );
+    }
+
+    #[test]
+    fn internal_table_separators_are_not_treated_as_box_margins() {
+        let mut row = chars("column one │ column two │ column three");
+        let original = row.clone();
+        strip_box_margins(&mut row);
+        assert_eq!(row, original);
     }
 
     #[test]
