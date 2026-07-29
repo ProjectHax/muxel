@@ -519,6 +519,11 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
         }
     }
 
+    if instance.program.as_deref().is_some_and(is_codex_program) {
+        args.push("--config".to_string());
+        args.push(codex_terminal_title_override().to_string());
+    }
+
     ResolvedLaunch {
         program: instance.program.clone(),
         args,
@@ -622,8 +627,13 @@ pub fn codex_session_id_from_title(preset: &AgentPreset, title: &str) -> Option<
     {
         return None;
     }
-    Uuid::parse_str(title.trim()).ok()?;
-    Some(title.trim().to_string())
+    title
+        .split(|ch: char| {
+            ch.is_ascii_whitespace() || matches!(ch, '|' | ':' | '(' | ')' | '[' | ']')
+        })
+        .map(str::trim)
+        .find(|part| Uuid::parse_str(part).is_ok())
+        .map(str::to_string)
 }
 
 /// Most recently modified Codex session id whose `session_meta.cwd` matches `cwd`.
@@ -806,6 +816,22 @@ pub fn codex_developer_instructions_override(instructions: &str) -> String {
     format!("developer_instructions={flattened}")
 }
 
+fn is_codex_program(program: &str) -> bool {
+    let leaf = program
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(leaf.as_str(), "codex" | "codex.exe" | "codex.cmd")
+}
+
+/// One-run Codex title contract consumed by Muxel's lifecycle parser.
+/// Single-quoted TOML strings survive the npm `.cmd` wrapper on Windows.
+pub fn codex_terminal_title_override() -> &'static str {
+    "tui.terminal_title=['thread','run-state','activity']"
+}
+
 /// Seed contents written when a project's `MEMORY.md` is first created. Delegates to
 /// the memory model so the seeded file matches muxel's maintained format exactly.
 pub fn memory_header() -> &'static str {
@@ -821,6 +847,31 @@ mod tests {
         let mut i = Instance::from_preset(Uuid::new_v4(), preset);
         i.system_prompt = prompt.map(|p| p.to_string());
         i
+    }
+
+    #[test]
+    fn codex_title_override_is_an_argv_safe_toml_array() {
+        assert_eq!(
+            codex_terminal_title_override(),
+            "tui.terminal_title=['thread','run-state','activity']"
+        );
+        let launch = resolve_launch(&instance(&AgentPreset::codex(), None));
+        assert!(launch.args.windows(2).any(|pair| {
+            pair == [
+                "--config",
+                "tui.terminal_title=['thread','run-state','activity']",
+            ]
+        }));
+    }
+
+    #[test]
+    fn codex_session_id_is_extracted_from_semantic_title() {
+        let id = Uuid::new_v4().to_string();
+        let title = format!("{id} | Working ⠏");
+        assert_eq!(
+            codex_session_id_from_title(&AgentPreset::codex(), &title).as_deref(),
+            Some(id.as_str())
+        );
     }
 
     #[test]
