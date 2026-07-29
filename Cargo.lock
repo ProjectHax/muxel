@@ -5150,6 +5150,7 @@ dependencies = [
  "muxel-core",
  "parking_lot",
  "portable-pty",
+ "serde_json",
  "uuid",
 ]
 

@@ -7,7 +7,8 @@ use alacritty_terminal::term::ClipboardType;
 use parking_lot::Mutex;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 /// Shared, thread-safe handle to the PTY's input side.
 pub(crate) type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -19,6 +20,10 @@ pub(crate) type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 pub(crate) struct MuxelListener {
     pub writer: SharedWriter,
     pub title: Arc<Mutex<Option<String>>>,
+    /// Monotonic sequence for OSC title changes, including ResetTitle. Consumers
+    /// use it to distinguish a repeated title event from an unchanged snapshot.
+    pub title_generation: Arc<AtomicU64>,
+    pub title_changed_at: Arc<Mutex<Option<Instant>>>,
     /// Latest UUID-shaped OSC title published by the child. Agent UIs may replace
     /// it with a human title immediately or switch sessions in-place.
     pub session_id_hint: Arc<Mutex<Option<String>>>,
@@ -26,6 +31,15 @@ pub(crate) struct MuxelListener {
     /// OSC-52 copies from the child, drained by the view onto the system
     /// clipboard (a clipboard write needs a gpui context this thread lacks).
     pub clipboard_store: Arc<Mutex<Vec<(ClipboardType, String)>>>,
+}
+
+fn uuid_in_title(title: &str) -> Option<&str> {
+    title
+        .split(|ch: char| {
+            ch.is_ascii_whitespace() || matches!(ch, '|' | ':' | '(' | ')' | '[' | ']')
+        })
+        .map(str::trim)
+        .find(|part| uuid::Uuid::parse_str(part).is_ok())
 }
 
 impl MuxelListener {
@@ -41,12 +55,18 @@ impl EventListener for MuxelListener {
         match event {
             Event::Title(title) => {
                 let mut hint = self.session_id_hint.lock();
-                if uuid::Uuid::parse_str(title.trim()).is_ok() {
-                    *hint = Some(title.trim().to_string());
+                if let Some(id) = uuid_in_title(&title) {
+                    *hint = Some(id.to_string());
                 }
                 *self.title.lock() = Some(title);
+                *self.title_changed_at.lock() = Some(Instant::now());
+                self.title_generation.fetch_add(1, Ordering::Relaxed);
             }
-            Event::ResetTitle => *self.title.lock() = None,
+            Event::ResetTitle => {
+                *self.title.lock() = None;
+                *self.title_changed_at.lock() = Some(Instant::now());
+                self.title_generation.fetch_add(1, Ordering::Relaxed);
+            }
             Event::Bell => self.bell.store(true, Ordering::Relaxed),
             // Apps query the terminal (cursor position, device attributes, …);
             // the reply must go back to the PTY's stdin.
@@ -89,6 +109,8 @@ mod tests {
         let listener = MuxelListener {
             writer: Arc::new(Mutex::new(Box::new(Vec::<u8>::new()))),
             title: Arc::new(Mutex::new(None)),
+            title_generation: Arc::new(AtomicU64::new(0)),
+            title_changed_at: Arc::new(Mutex::new(None)),
             session_id_hint: hint.clone(),
             bell: Arc::new(AtomicBool::new(false)),
             clipboard_store: Arc::new(Mutex::new(Vec::new())),
@@ -96,11 +118,17 @@ mod tests {
         let first = "019f95d7-db31-7db0-904d-9e08330e0000";
         let resumed = "019f95d7-db31-7db0-904d-9e08330e0001";
 
-        listener.send_event(Event::Title(first.to_string()));
+        listener.send_event(Event::Title(format!("{first} | Starting ⠏")));
+        assert_eq!(listener.title_generation.load(Ordering::Relaxed), 1);
+        assert_eq!(hint.lock().as_deref(), Some(first));
         listener.send_event(Event::Title("Review changes".to_string()));
+        assert_eq!(listener.title_generation.load(Ordering::Relaxed), 2);
         assert_eq!(hint.lock().as_deref(), Some(first));
 
         listener.send_event(Event::Title(resumed.to_string()));
         assert_eq!(hint.lock().as_deref(), Some(resumed));
+        listener.send_event(Event::ResetTitle);
+        assert_eq!(listener.title_generation.load(Ordering::Relaxed), 4);
+        assert_eq!(*listener.title.lock(), None);
     }
 }

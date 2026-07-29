@@ -21,18 +21,20 @@ use gpui_component::{button::*, *};
 use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::{
-    AgentPreset, FocusDir, Identity, InjectionMode, Instance, InstanceKind, Loop, LoopSchedule,
-    MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project, RemoteHost, RemoteLayout, RemoteRef,
-    ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace,
-    WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at, append_agent_instruction,
-    codex_developer_instructions_override, file_link_instruction, focus_in_direction,
-    memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
-    move_pane_beside, move_tab_to, remove, resolve_launch_for_session, set_active_tab,
-    set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
-    sync_agent_injection_modes, sync_codex_approval_args,
+    AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity, InjectionMode, Instance,
+    InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project,
+    RemoteHost, RemoteLayout, RemoteRef, ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth,
+    StartupAgent, Workspace, WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at,
+    agent_activity_label, append_agent_instruction, codex_developer_instructions_override,
+    file_link_instruction, focus_in_direction, memory_instruction, memory_reference,
+    migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove,
+    resolve_launch_for_session, set_active_tab, set_split_sizes, set_tab_order, split,
+    split_beside, ssh, swap_instances, swap_panes, sync_agent_injection_modes,
+    sync_codex_approval_args,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
+    clean_agent_title,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,6 +58,45 @@ fn status_hsla(status: AgentStatus, cx: &App) -> Hsla {
         AgentStatus::Blocked => t.warning,
         AgentStatus::Done => t.success,
     }
+}
+
+fn activity_state(status: AgentStatus) -> AgentActivityState {
+    match status {
+        AgentStatus::Working => AgentActivityState::Working,
+        AgentStatus::Idle => AgentActivityState::Idle,
+        AgentStatus::Blocked => AgentActivityState::Blocked,
+        AgentStatus::Done => AgentActivityState::Done,
+    }
+}
+
+fn persisted_status(status: AgentStatus, instance: Option<&Instance>) -> AgentStatus {
+    // An unseen completion is a latch, not a sample. In particular, restored
+    // terminals emit startup output that looks like fresh work before the agent
+    // settles. Do not let that transient state hide the saved completion or age.
+    if status != AgentStatus::Blocked
+        && instance.is_some_and(|instance| instance.activity.has_unattended_completion())
+    {
+        AgentStatus::Done
+    } else {
+        status
+    }
+}
+
+fn localized_activity_label(status: AgentStatus, activity: &AgentActivity, now: i64) -> String {
+    let label = agent_activity_label(activity_state(status), activity, now);
+    let (word, age) = label
+        .split_once(" · ")
+        .map_or((label.as_str(), None), |(word, age)| (word, Some(age)));
+    let word = match word {
+        "working" => t("working").to_string(),
+        "idle" => t("idle").to_string(),
+        "blocked" => t("blocked").to_string(),
+        "done" => t("done").to_string(),
+        // New key: catalogs fall back to English until regenerated.
+        "stale" => t("stale").to_string(),
+        _ => word.to_string(),
+    };
+    age.map_or(word.clone(), |age| format!("{word} · {age}"))
 }
 
 /// Asset path for an agent's icon, chosen from its program name.
@@ -190,12 +231,12 @@ fn preset_icon_obj(preset: &AgentPreset) -> Icon {
 }
 
 /// A small status pill for an agent.
-fn status_tag(status: AgentStatus) -> Tag {
+fn status_tag(status: AgentStatus, label: String) -> Tag {
     match status {
-        AgentStatus::Working => Tag::primary().small().child(t("working")),
-        AgentStatus::Idle => Tag::new().small().child(t("idle")),
-        AgentStatus::Blocked => Tag::warning().small().child(t("blocked")),
-        AgentStatus::Done => Tag::success().small().child(t("done")),
+        AgentStatus::Working => Tag::primary().small().child(label),
+        AgentStatus::Idle => Tag::new().small().child(label),
+        AgentStatus::Blocked => Tag::warning().small().child(label),
+        AgentStatus::Done => Tag::success().small().child(label),
     }
 }
 
@@ -283,7 +324,11 @@ fn shell_dir_title(osc: &str) -> &str {
 /// Ignore the transient command-shell title shown before an agent emits its own
 /// OSC title. Let the instance's preset/auto fallback render during startup.
 fn terminal_auto_title(instance: &Instance, title: &str) -> Option<String> {
-    if !muxel_core::is_useful_auto_name(title) {
+    let title = match instance.program.as_deref() {
+        Some(program) => clean_agent_title(program, title)?,
+        None => title.to_string(),
+    };
+    if !muxel_core::is_useful_auto_name(&title) {
         return None;
     }
     let leaf = title
@@ -321,9 +366,9 @@ fn terminal_auto_title(instance: &Instance, title: &str) -> Option<String> {
         return None;
     }
     Some(if instance.program.is_none() {
-        shell_dir_title(title).to_string()
+        shell_dir_title(&title).to_string()
     } else {
-        title.to_string()
+        title
     })
 }
 
@@ -1246,6 +1291,9 @@ pub struct MuxelApp {
     dev_console_window: Option<WindowHandle<gpui_component::Root>>,
     /// Last seen status per instance, to fire notifications on transitions.
     last_status: HashMap<Uuid, AgentStatus>,
+    /// Last rendered lifecycle copy per instance. Age labels change at coarse
+    /// minute/hour/day boundaries without changing the underlying status.
+    last_activity_labels: HashMap<Uuid, String>,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
     /// user has armed appear here; runtime-only, never persisted.
     auto: HashMap<Uuid, AutoContinue>,
@@ -3170,6 +3218,7 @@ impl MuxelApp {
             dev_log: Vec::new(),
             dev_console_window: None,
             last_status: HashMap::new(),
+            last_activity_labels: HashMap::new(),
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashSet::new(),
@@ -3741,7 +3790,8 @@ impl MuxelApp {
             .filter(|v| !v.is_empty())
             .unwrap_or(def_blocked);
         let startup_delay = preset.map(|p| p.startup_delay_ms).unwrap_or(0);
-        spec.with_startup_delay(startup_delay)
+        spec.with_status_program(agent_program)
+            .with_startup_delay(startup_delay)
             .with_markers(working, blocked)
     }
 
@@ -4164,7 +4214,7 @@ impl MuxelApp {
                             && let Some(iid) =
                                 this.workspace.project(pid).and_then(|p| p.first_instance())
                         {
-                            this.focus_instance(iid, window, cx);
+                            this.focus_instance_with_attendance(iid, false, window, cx);
                         }
                         cx.notify();
                     }
@@ -4598,7 +4648,9 @@ impl MuxelApp {
                                 && this.active_instance == Some(iid)
                                 && this.focus_handle.is_focused(window)
                             {
-                                this.focus_instance(iid, window, cx);
+                                // Restoring keyboard focus is not user attendance.
+                                // Keep an unseen completion and its age latched.
+                                this.focus_instance_with_attendance(iid, false, window, cx);
                             }
                             true
                         })
@@ -5153,6 +5205,16 @@ impl MuxelApp {
     }
 
     fn select_project(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_project_with_attendance(pid, true, window, cx);
+    }
+
+    fn select_project_with_attendance(
+        &mut self,
+        pid: Uuid,
+        attend_first_pane: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Multi-window routing: a project shown in another window is RAISED, not
         // stolen (one project renders in exactly one window at a time).
         let this_window = window.window_handle().window_id();
@@ -5190,7 +5252,7 @@ impl MuxelApp {
         }
         self.active_instance = self.workspace.project(pid).and_then(|p| p.first_instance());
         if let Some(iid) = self.active_instance {
-            self.focus_instance(iid, window, cx);
+            self.focus_instance_with_attendance(iid, attend_first_pane, window, cx);
         }
         self.ensure_project_terminals_deferred(pid, window, cx);
         // Keep the file browser pointed at the project being shown.
@@ -5202,19 +5264,67 @@ impl MuxelApp {
     }
 
     fn focus_instance(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_instance_with_attendance(iid, true, window, cx);
+    }
+
+    fn focus_instance_with_attendance(
+        &mut self,
+        iid: Uuid,
+        attend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.active_instance = Some(iid);
-        // Attending a pane (by any means) clears its pending notification.
-        self.clear_notifications_for(iid);
+        if attend {
+            // Deliberately selecting a pane clears its pending notification.
+            self.clear_notifications_for(iid);
+        }
         // Make `iid` the active tab of its pane, so the right tab is shown.
         if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id)
             && let Some(p) = self.workspace.project_mut(pid)
         {
             set_active_tab(&mut p.layout, iid);
         }
+        let persisted_completion = self
+            .workspace
+            .instance(iid)
+            .is_some_and(|instance| instance.activity.has_unattended_completion());
+        let runtime_completion = self
+            .terminals
+            .get(&iid)
+            .is_some_and(|view| view.read(cx).status() == AgentStatus::Done);
+        let can_attend = self
+            .workspace
+            .instance(iid)
+            .is_some_and(|instance| instance.kind == InstanceKind::Terminal)
+            && self
+                .terminals
+                .get(&iid)
+                .is_some_and(|view| view.read(cx).has_visible_content());
+        if attend
+            && can_attend
+            && let Some(instance) = self.workspace.instance_mut(iid)
+        {
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut activity_changed = false;
+            if runtime_completion && !persisted_completion {
+                activity_changed |= instance.activity.observe(
+                    self.last_status.get(&iid).copied().map(activity_state),
+                    AgentActivityState::Done,
+                    now,
+                );
+            }
+            activity_changed |= instance.activity.attend(now);
+            if activity_changed {
+                self.persist();
+            }
+        }
         if let Some(view) = self.terminals.get(&iid) {
-            // Attending to a pane clears its "awaiting input" bell + "done" latch.
-            view.read(cx).session().clear_bell();
-            view.read(cx).clear_done();
+            if attend {
+                // Attending to a pane clears its "awaiting input" bell + "done" latch.
+                view.read(cx).session().clear_bell();
+                view.read(cx).clear_done();
+            }
             let handle = view.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
         } else if let Some(ed) = self.editors.get(&iid) {
@@ -6225,7 +6335,7 @@ impl MuxelApp {
             .iter()
             .map(|(iid, view)| {
                 let v = view.read(cx);
-                let status = v.status();
+                let status = persisted_status(v.status(), self.workspace.instance(*iid));
                 let session_id_hint = v.session_id_hint();
                 let exited = v.exited();
                 let exit_code = v.exit_code();
@@ -6277,6 +6387,8 @@ impl MuxelApp {
         // (rather than a respawn that's about to fail again on a still-down host).
         const RECONNECT_SETTLE_SECS: u64 = 4;
         let mut dirty = false;
+        let mut activity_changed = false;
+        let now_epoch = chrono::Utc::now().timestamp_millis();
         for Snap {
             iid,
             status,
@@ -6313,7 +6425,36 @@ impl MuxelApp {
                 inst.session_id = Some(id);
                 self.persist();
             }
-            let changed = self.last_status.insert(iid, status) != Some(status);
+            // A completion that happens in the pane the user is actively watching
+            // is already attended. Record that at the same transition timestamp so
+            // it cannot reappear as unseen after restart.
+            let attended = self.instance_window_active(iid) && Some(iid) == focused;
+            let restored_unattended = self
+                .workspace
+                .instance(iid)
+                .is_some_and(|instance| instance.activity.has_unattended_completion());
+            let restored_blocked = self
+                .workspace
+                .instance(iid)
+                .is_some_and(|instance| instance.activity.blocked_at.is_some());
+            let previous = self.last_status.insert(iid, status);
+            let changed = previous != Some(status);
+            if changed && let Some(instance) = self.workspace.instance_mut(iid) {
+                activity_changed |= instance.activity.observe(
+                    previous.map(activity_state),
+                    activity_state(status),
+                    now_epoch,
+                );
+                if attended && status == AgentStatus::Done {
+                    activity_changed |= instance.activity.attend(now_epoch);
+                }
+            }
+            if let Some(instance) = self.workspace.instance(iid) {
+                let label =
+                    agent_activity_label(activity_state(status), &instance.activity, now_epoch);
+                let previous_label = self.last_activity_labels.insert(iid, label.clone());
+                dirty |= previous_label.as_ref() != Some(&label);
+            }
             dirty |= changed;
             // A reconnecting remote pane that's stayed alive since its last respawn
             // has reattached — clear the state and say so, once.
@@ -6351,10 +6492,12 @@ impl MuxelApp {
                 }
                 muxel_store::append_event_log(&line);
             }
-            // A pane counts as attended only if it's active AND the window is
-            // focused; otherwise its agent's bell/exit is worth recording.
-            let attended = self.instance_window_active(iid) && Some(iid) == focused;
-            if changed && !attended {
+            // The first live sample after restore describes durable state, not a
+            // new event. Do not notify again for a saved completion/block.
+            let restored_transition = previous.is_none()
+                && ((status == AgentStatus::Done && restored_unattended)
+                    || (status == AgentStatus::Blocked && restored_blocked));
+            if changed && !attended && !restored_transition {
                 let kind = match status {
                     AgentStatus::Blocked => Some(NotifKind::Blocked),
                     AgentStatus::Done => Some(NotifKind::Done),
@@ -6536,8 +6679,14 @@ impl MuxelApp {
             self.close_instance_inner(iid, "auto-close (exit)", cx); // re-renders on its own
         }
 
+        if activity_changed {
+            self.persist();
+        }
+
         let live: HashSet<Uuid> = self.terminals.keys().copied().collect();
         self.last_status.retain(|iid, _| live.contains(iid));
+        self.last_activity_labels
+            .retain(|iid, _| live.contains(iid));
         self.exit_logged.retain(|iid| live.contains(iid));
         self.reconnecting.retain(|iid| live.contains(iid));
         self.auto.retain(|iid, _| live.contains(iid));
@@ -12620,7 +12769,9 @@ impl MuxelApp {
         if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id)
             && self.workspace.active_project != Some(pid)
         {
-            self.select_project(pid, window, cx);
+            // The target pane is attended below. Do not consume the first pane's
+            // unseen completion merely because project selection stages it first.
+            self.select_project_with_attendance(pid, false, window, cx);
         }
         self.focus_instance(iid, window, cx);
     }
@@ -12633,13 +12784,12 @@ impl MuxelApp {
             return;
         };
         if self.workspace.instance(iid).is_some() {
-            // Switch to the pane the notification pointed at. We deliberately do
-            // NOT call `window.activate_window()`: a background app raising itself
-            // trips GNOME/Wayland focus-stealing prevention, which posts the
-            // "muxel is ready" hand-off notification. The notification's
-            // desktop-entry hint (see `notify`) lets the shell raise muxel's
-            // window itself on click instead.
+            // Switch first so Windows reveals the requested pane when it raises
+            // the existing window. Linux relies on the desktop-entry hint in
+            // `notify`: raising ourselves there trips Wayland focus protection.
             self.select_instance(iid, window, cx);
+            #[cfg(target_os = "windows")]
+            window.activate_window();
         }
     }
 
@@ -13722,6 +13872,23 @@ impl MuxelApp {
             .child(Spinner::new().small().ease(linear))
             .child(t("Starting terminal…"))
             .into_any_element()
+    }
+
+    /// True while a newly spawned terminal has not drawn any content yet. Keep
+    /// this as presentation state: startup must not manufacture lifecycle edges
+    /// or overwrite a completion restored from disk.
+    fn terminal_is_loading(&self, iid: Uuid, cx: &App) -> bool {
+        const STARTUP_WINDOW: Duration = Duration::from_secs(60);
+        if self.terminal_launching.contains_key(&iid) {
+            return true;
+        }
+        self.terminal_launches
+            .get(&iid)
+            .is_some_and(|&(at, _)| at.elapsed() <= STARTUP_WINDOW)
+            && self.terminals.get(&iid).is_some_and(|view| {
+                let view = view.read(cx);
+                !view.exited() && !view.has_visible_content()
+            })
     }
 
     fn render_pane(&self, node: &PaneNode, cx: &mut Context<Self>) -> AnyElement {
@@ -15118,7 +15285,10 @@ impl MuxelApp {
                     .map(|i| i.display_name().to_string())
                     .unwrap_or_default();
                 let program = inst.and_then(|i| i.program.clone());
-                let status = self.terminals.get(&iid).map(|v| v.read(cx).status());
+                let status = self
+                    .terminals
+                    .get(&iid)
+                    .map(|v| persisted_status(v.read(cx).status(), inst));
                 let color = status
                     .map(|s| status_hsla(s, cx))
                     .unwrap_or(cx.theme().muted_foreground);
@@ -15149,7 +15319,18 @@ impl MuxelApp {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(status_label(status)),
+                                .child(
+                                    status
+                                        .zip(inst)
+                                        .map(|(status, instance)| {
+                                            localized_activity_label(
+                                                status,
+                                                &instance.activity,
+                                                chrono::Utc::now().timestamp_millis(),
+                                            )
+                                        })
+                                        .unwrap_or_else(|| status_label(status).to_string()),
+                                ),
                         ),
                 );
             }
@@ -16565,6 +16746,7 @@ impl MuxelApp {
                     let meta = inst
                         .map(|i| i.display_name().to_string())
                         .unwrap_or_default();
+                    let loading = self.terminal_is_loading(iid, cx);
                     let (app_title, status) = if let Some(view) = self.terminals.get(&iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
@@ -16584,6 +16766,7 @@ impl MuxelApp {
                     } else {
                         (meta, AgentStatus::Idle)
                     };
+                    let status = persisted_status(status, inst);
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
                     let display = match custom {
@@ -16614,7 +16797,14 @@ impl MuxelApp {
                         .child(agent_icon(
                             program.as_deref(),
                             px(15.0),
-                            status_hsla(status, cx),
+                            status_hsla(
+                                if loading {
+                                    AgentStatus::Working
+                                } else {
+                                    status
+                                },
+                                cx,
+                            ),
                         ))
                         // Worktree dot (matches the pane outline color).
                         .children(
@@ -16659,11 +16849,29 @@ impl MuxelApp {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
                                     .text_xs()
                                     .text_color(cx.theme().sidebar_foreground)
                                     .child(display),
                             )
-                            .child(status_tag(status))
+                            .child(div().flex_none().child(if loading {
+                                status_tag(AgentStatus::Working, t("loading").to_string())
+                            } else {
+                                status_tag(
+                                    status,
+                                    inst.map(|instance| {
+                                        localized_activity_label(
+                                            status,
+                                            &instance.activity,
+                                            chrono::Utc::now().timestamp_millis(),
+                                        )
+                                    })
+                                    .unwrap_or_else(|| status_label(Some(status)).to_string()),
+                                )
+                            }))
                             .on_drag(DragInstance { iid }, move |_, offset, _, cx| {
                                 let label = ghost_label.clone();
                                 cx.new(move |_| DragGhost { label, offset })

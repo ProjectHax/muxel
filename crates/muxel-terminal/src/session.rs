@@ -53,6 +53,9 @@ pub enum PtyChunk {
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
     pub program: String,
+    /// Logical agent program when `program` is a transport/wrapper such as ssh
+    /// or tmux. Lifecycle title parsing keys off this, not the local child name.
+    pub status_program: Option<String>,
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub env: Vec<(String, String)>,
@@ -85,6 +88,7 @@ impl CommandSpec {
         let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         Self {
             program,
+            status_program: None,
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
@@ -99,8 +103,10 @@ impl CommandSpec {
 
     /// Run an arbitrary program with arguments.
     pub fn program(program: impl Into<String>, args: Vec<String>) -> Self {
+        let program = program.into();
         Self {
-            program: program.into(),
+            status_program: Some(program.clone()),
+            program,
             args,
             cwd: None,
             env: Vec::new(),
@@ -117,6 +123,11 @@ impl CommandSpec {
     pub fn with_markers(mut self, working: Vec<String>, blocked: Vec<String>) -> Self {
         self.working_markers = working;
         self.blocked_markers = blocked;
+        self
+    }
+
+    pub fn with_status_program(mut self, program: Option<String>) -> Self {
+        self.status_program = program;
         self
     }
 
@@ -227,6 +238,8 @@ pub struct TerminalSession {
     #[cfg_attr(not(unix), allow(dead_code))]
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
+    title_generation: Arc<AtomicU64>,
+    title_changed_at: Arc<Mutex<Option<Instant>>>,
     session_id_hint: Arc<Mutex<Option<String>>>,
     bell: Arc<AtomicBool>,
     /// OSC-52 copies parsed from output, pending pickup by the view (which owns
@@ -266,6 +279,9 @@ pub struct TerminalSession {
     output_seen: AtomicBool,
     /// Whether this terminal currently has keyboard focus (UI thread + drain).
     focused: AtomicBool,
+    /// Set once Muxel deliberately submits a turn with Enter. Startup title
+    /// activity alone is not evidence that a turn completed.
+    turn_submitted: AtomicBool,
     /// Bumped whenever pixels that depend on the grid/selection/scroll/search
     /// would change. [`crate::element`] skips the full cell walk when this matches
     /// the last painted generation (draw-list replay).
@@ -479,12 +495,16 @@ impl TerminalSession {
             .context("spawn reader thread")?;
 
         let title = Arc::new(Mutex::new(None));
+        let title_generation = Arc::new(AtomicU64::new(0));
+        let title_changed_at = Arc::new(Mutex::new(None));
         let session_id_hint = Arc::new(Mutex::new(None));
         let bell = Arc::new(AtomicBool::new(false));
         let clipboard_store = Arc::new(Mutex::new(Vec::new()));
         let listener = MuxelListener {
             writer: writer.clone(),
             title: title.clone(),
+            title_generation: title_generation.clone(),
+            title_changed_at: title_changed_at.clone(),
             session_id_hint: session_id_hint.clone(),
             bell: bell.clone(),
             clipboard_store: clipboard_store.clone(),
@@ -511,6 +531,8 @@ impl TerminalSession {
             killer: Mutex::new(killer),
             child_pid,
             title,
+            title_generation,
+            title_changed_at,
             session_id_hint,
             bell,
             clipboard_store,
@@ -531,6 +553,7 @@ impl TerminalSession {
             last_output: Mutex::new(Instant::now()),
             output_seen: AtomicBool::new(false),
             focused: AtomicBool::new(false),
+            turn_submitted: AtomicBool::new(false),
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
@@ -697,6 +720,14 @@ impl TerminalSession {
             self.mark_interactive();
         }
         self.write_raw(data);
+    }
+
+    pub fn mark_turn_submitted(&self) {
+        self.turn_submitted.store(true, Ordering::Relaxed);
+    }
+
+    pub fn has_submitted_turn(&self) -> bool {
+        self.turn_submitted.load(Ordering::Relaxed)
     }
 
     /// Paste text into the PTY, honoring bracketed-paste mode (so the program
@@ -1129,6 +1160,28 @@ impl TerminalSession {
         self.title.lock().clone()
     }
 
+    /// Feed PTY bytes through the production parser from the developer title
+    /// probe. Product code should let `TerminalView` drain output instead.
+    #[doc(hidden)]
+    pub fn process_probe_output(&self, data: &[u8]) {
+        self.process_output(data);
+    }
+
+    /// Latest OSC title plus its change generation. Unlike [`Self::title`], this
+    /// lets lifecycle consumers observe a ResetTitle or a repeated title event.
+    pub fn title_snapshot(&self) -> (u64, Option<String>) {
+        (
+            self.title_generation.load(Ordering::Relaxed),
+            self.title.lock().clone(),
+        )
+    }
+
+    /// Age of the latest title event. Title-derived lifecycle claims must expire
+    /// rather than treating a cached spinner frame as permanent Working.
+    pub fn title_age(&self) -> Option<Duration> {
+        self.title_changed_at.lock().as_ref().map(Instant::elapsed)
+    }
+
     /// Latest UUID-shaped OSC title retained when an agent replaces it with a
     /// display name. Muxel uses this as an exact agent session identity hint.
     pub fn session_id_hint(&self) -> Option<String> {
@@ -1382,8 +1435,8 @@ fn command_builder_for_spawn(program: &str, args: &[String]) -> CommandBuilder {
         // instead of silently launching a different command.
         const BATCH_RUNNER: &str = concat!(
             "$program = $env:MUXEL_BATCH_PROGRAM; ",
-            "$argv = for ($i = 0; $i -lt [int]$env:MUXEL_BATCH_ARG_COUNT; $i++) { ",
-            "[Environment]::GetEnvironmentVariable(('MUXEL_BATCH_ARG_' + $i)) }; ",
+            "$argv = @(for ($i = 0; $i -lt [int]$env:MUXEL_BATCH_ARG_COUNT; $i++) { ",
+            "[Environment]::GetEnvironmentVariable(('MUXEL_BATCH_ARG_' + $i)) }); ",
             "$unsafe = [char[]]'\"%&|<>^' + [char[]]([char]13,[char]10); ",
             "if ($argv | Where-Object { $_.IndexOfAny($unsafe) -ge 0 }) { ",
             "[Console]::Error.WriteLine('muxel: batch-file arguments contain characters cmd.exe can reinterpret'); exit 2 }; ",
@@ -2116,6 +2169,40 @@ mod windows_spawn_resolve {
         }
 
         assert_eq!(std::path::PathBuf::from(resolved), native);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_runner_keeps_one_argument_as_one_token() {
+        let dir = std::env::temp_dir().join(format!("muxel-batch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let command = dir.join("echo-one.cmd");
+        std::fs::write(&command, "@echo off\r\necho ARG=[%~1]\r\n").unwrap();
+        let spec = CommandSpec::program(
+            command.to_string_lossy(),
+            vec!["Reply with exactly OK".to_string()],
+        );
+        let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn batch fixture");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+                        session.write_input(b"\x1b[1;1R");
+                    }
+                    output.extend(bytes);
+                }
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
+                Err(async_channel::TryRecvError::Empty) => {}
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("ARG=[Reply with exactly OK]"),
+            "batch runner split one argument: {output:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

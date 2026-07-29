@@ -95,6 +95,190 @@ pub enum AgentStatus {
     Done,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TitleProvider {
+    Claude,
+    Codex,
+    Grok,
+    Other,
+}
+
+impl TitleProvider {
+    fn from_program(program: &str) -> Self {
+        let leaf = program
+            .trim()
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let stem = leaf
+            .strip_suffix(".exe")
+            .or_else(|| leaf.strip_suffix(".cmd"))
+            .or_else(|| leaf.strip_suffix(".bat"))
+            .unwrap_or(&leaf);
+        match stem {
+            "claude" => Self::Claude,
+            "codex" => Self::Codex,
+            "grok" => Self::Grok,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Parse only provider-owned, structurally constrained title state. Unknown
+/// shapes are no evidence; they must never turn an arbitrary pane title into a
+/// lifecycle claim.
+fn title_status(
+    provider: TitleProvider,
+    title: Option<&str>,
+    age: Option<Duration>,
+) -> Option<AgentStatus> {
+    let title = title?.trim_start();
+    match provider {
+        TitleProvider::Claude => match title.chars().next()? {
+            // Claude owns this title protocol: the braille frames mean Working
+            // and the star means Idle. Long-running tools can leave one frame
+            // unchanged for minutes, so title age is not completion evidence.
+            '⠂' | '⠐' => Some(AgentStatus::Working),
+            '✳' => Some(AgentStatus::Idle),
+            _ => None,
+        },
+        TitleProvider::Codex => {
+            // Muxel forces the title to run-state + activity only, so these words
+            // cannot come from a project/session name. Activity supplies a fresh
+            // spinner heartbeat and the action-required phrase.
+            let lower = title.to_ascii_lowercase();
+            if lower.contains("action required") {
+                Some(AgentStatus::Blocked)
+            } else if lower
+                .split(|c: char| !c.is_alphabetic())
+                .any(|part| matches!(part, "starting" | "working" | "thinking"))
+                && age.is_some_and(|age| age <= Duration::from_secs(5))
+            {
+                Some(AgentStatus::Working)
+            } else if lower
+                .split(|c: char| !c.is_alphabetic())
+                .any(|part| part == "ready")
+            {
+                // Ready is authoritative until Codex publishes the next state.
+                // This keeps a background server's PTY repaint from claiming the
+                // agent itself is still working.
+                Some(AgentStatus::Idle)
+            } else {
+                None
+            }
+        }
+        TitleProvider::Grok => {
+            let parts = title.split(" - ").map(str::trim).collect::<Vec<_>>();
+            if title.contains("⚠ Action Required") {
+                Some(AgentStatus::Blocked)
+            } else if parts
+                .iter()
+                .any(|part| is_grok_spinner(part) || is_grok_activity(part))
+                && age.is_some_and(|age| age <= Duration::from_secs(2))
+            {
+                Some(AgentStatus::Working)
+            } else if title == "grok" || parts.last() == Some(&"grok") {
+                // Grok removes the spinner/activity items when AgentState returns
+                // to Idle, leaving the generated session title and `grok` item.
+                Some(AgentStatus::Idle)
+            } else {
+                None
+            }
+        }
+        TitleProvider::Other => None,
+    }
+}
+
+fn is_grok_spinner(part: &str) -> bool {
+    matches!(part, "⠋" | "⠙" | "⠹" | "⠸" | "⠼" | "⠴" | "⠦" | "⠧")
+}
+
+fn is_grok_activity(part: &str) -> bool {
+    matches!(
+        part,
+        "Thinking" | "Responding" | "Running tool" | "Compacting"
+    ) || part.starts_with("Waiting")
+        || part.starts_with("Running:")
+        || part.starts_with("Retrying (")
+}
+
+fn combine_title_status(
+    exited: bool,
+    base: AgentStatus,
+    title: Option<AgentStatus>,
+) -> AgentStatus {
+    if exited {
+        return AgentStatus::Done;
+    }
+    if base == AgentStatus::Blocked {
+        return AgentStatus::Blocked;
+    }
+    match title {
+        Some(AgentStatus::Blocked) => AgentStatus::Blocked,
+        Some(AgentStatus::Working) => AgentStatus::Working,
+        // A bell is a stronger completion edge than an idle title.
+        Some(AgentStatus::Idle) if base != AgentStatus::Done => AgentStatus::Idle,
+        _ => base,
+    }
+}
+
+/// Grok blinks its action-required title item off for roughly half of each
+/// second while unfocused. Hold Blocked through that documented off-frame; a
+/// stable Idle title clears it immediately, while approval may leave at most a
+/// short tail before Working becomes visible.
+fn hold_grok_blocked(
+    status: Option<AgentStatus>,
+    blocked_age: Option<Duration>,
+) -> Option<AgentStatus> {
+    match status {
+        Some(AgentStatus::Working)
+            if blocked_age.is_some_and(|age| age <= Duration::from_millis(750)) =>
+        {
+            Some(AgentStatus::Blocked)
+        }
+        other => other,
+    }
+}
+
+/// Remove provider lifecycle decoration before a title is considered for the
+/// pane's persisted automatic name. A title containing only state is not a name.
+pub fn clean_agent_title(program: &str, title: &str) -> Option<String> {
+    match TitleProvider::from_program(program) {
+        TitleProvider::Claude => {
+            let title = title.trim_start();
+            let first = title.chars().next()?;
+            let cleaned = if matches!(first, '⠂' | '⠐' | '✳') {
+                title[first.len_utf8()..].trim_start()
+            } else {
+                title
+            };
+            (!cleaned.is_empty()).then(|| cleaned.to_string())
+        }
+        TitleProvider::Codex
+            if title_status(TitleProvider::Codex, Some(title), Some(Duration::ZERO)).is_some() =>
+        {
+            None
+        }
+        TitleProvider::Grok => {
+            let mut parts = title
+                .split(" - ")
+                .map(str::trim)
+                .filter(|part| {
+                    !part.is_empty()
+                        && *part != "grok"
+                        && *part != "⚠ Action Required"
+                        && !is_grok_spinner(part)
+                        && !is_grok_activity(part)
+                })
+                .peekable();
+            parts.peek()?;
+            Some(parts.collect::<Vec<_>>().join(" - "))
+        }
+        _ => Some(title.to_string()),
+    }
+}
+
 /// Decide an agent's lifecycle state from its signals. Pure (unit-testable):
 /// exit wins; then on-screen markers (working spinner, blocked prompt); then a
 /// rung bell means a finished turn; then recent output is the activity fallback.
@@ -109,11 +293,13 @@ fn classify(
     if exited {
         return AgentStatus::Done;
     }
-    if working.iter().any(|m| screen.contains(m)) {
-        return AgentStatus::Working;
-    }
     if blocked.iter().any(|m| screen.contains(m)) {
         return AgentStatus::Blocked;
+    }
+    // User-actionable input wins when a provider leaves its working marker on
+    // screen behind an approval prompt.
+    if working.iter().any(|m| screen.contains(m)) {
+        return AgentStatus::Working;
     }
     if bell {
         return AgentStatus::Done;
@@ -132,12 +318,9 @@ fn classify(
 /// Pure half of [`TerminalView::status`]'s done-latch, so a finished turn shows
 /// Done even when the agent never rang the bell.
 ///
-/// `can_latch` gates the whole mechanism to agents whose `Working` state comes
-/// from a reliable on-screen marker. For marker-less terminals (plain shells, or
-/// agents with no configured markers) `Working` is inferred from recent output
-/// alone — and incidental output (a focus-change redraw when you click the pane,
-/// a prompt repaint, …) would otherwise flip them Working→Idle and latch a bogus
-/// `Done`. Those terminals report `Done` only from the bell or process exit.
+/// `can_latch` gates the mechanism to agents whose `Working` state has reliable
+/// marker or semantic-title evidence. Other terminals infer Working from recent
+/// output alone, where incidental repaint output would create a bogus Done.
 fn latch_done(
     prev_raw: Option<AgentStatus>,
     raw: AgentStatus,
@@ -155,6 +338,27 @@ fn latch_done(
             }
         }
     }
+}
+
+fn latch_done_after_readiness(
+    prev_raw: Option<AgentStatus>,
+    raw: AgentStatus,
+    latched: bool,
+    can_latch: bool,
+    armed: bool,
+    submitted: bool,
+) -> (AgentStatus, bool, bool) {
+    let armed_before_edge = armed || submitted;
+    let (status, latched) = latch_done(prev_raw, raw, latched, can_latch && armed_before_edge);
+    (
+        status,
+        latched,
+        armed_before_edge || raw == AgentStatus::Idle,
+    )
+}
+
+fn can_latch_completion(has_working_markers: bool, semantic_title_seen: bool) -> bool {
+    has_working_markers || semantic_title_seen
 }
 
 /// How the mouse copies/pastes in a terminal pane (a global setting parsed from
@@ -246,12 +450,23 @@ pub struct TerminalView {
     /// On-screen markers that classify the agent's status (per-agent).
     working_markers: Vec<String>,
     blocked_markers: Vec<String>,
+    title_provider: TitleProvider,
     /// Latches `Done` from a working→finished transition so a completed turn shows
     /// Done (and notifies) even when the agent didn't ring the bell. `prev_raw` is
     /// the previous *raw* classification; the latch clears when the agent works
     /// again or the pane is attended (see `clear_done`).
     prev_raw: std::cell::Cell<Option<AgentStatus>>,
     done_latch: std::cell::Cell<bool>,
+    /// Ready/Idle must be observed once, or a turn submitted, before a
+    /// Working→Idle edge can mean Done. This rejects startup spinners.
+    completion_armed: std::cell::Cell<bool>,
+    /// A provider-specific semantic title has been recognized at least once.
+    /// Until then Codex/Grok without title support retain the marker-only
+    /// fallback and may not turn incidental PTY activity into Done.
+    semantic_title_seen: std::cell::Cell<bool>,
+    /// Grok's action-required title item intentionally blinks when unfocused.
+    /// Retain the last positive edge briefly so the sidebar does not blink too.
+    grok_blocked_at: std::cell::Cell<Option<std::time::Instant>>,
     /// Last time we `cx.notify()`'d a paint from the drain loop (background throttle).
     last_paint_notify: std::cell::Cell<std::time::Instant>,
     /// A throttled batch must still paint if output stops before the next batch.
@@ -259,8 +474,8 @@ pub struct TerminalView {
     /// brings the deadline forward.
     pending_paint_deadline: std::cell::Cell<Option<std::time::Instant>>,
     paint_timer_generation: std::cell::Cell<u64>,
-    /// Cached agent status for the current session content generation.
-    status_cache: std::cell::Cell<Option<(u64, AgentStatus)>>,
+    /// Cached agent status for the current grid and OSC-title generations.
+    status_cache: std::cell::Cell<Option<(u64, u64, AgentStatus)>>,
     _drain: Task<()>,
 }
 
@@ -410,6 +625,8 @@ impl TerminalView {
         let working_markers = spec.working_markers.clone();
         let blocked_markers = spec.blocked_markers.clone();
         let startup_program = spec.program.clone();
+        let title_provider =
+            TitleProvider::from_program(spec.status_program.as_deref().unwrap_or(&startup_program));
         let focus_handle = cx.focus_handle();
 
         // Forward focus in/out to the PTY (DECSET 1004) so agents like Claude
@@ -485,6 +702,7 @@ impl TerminalView {
                     // On restore, leave the prompt typed but unsubmitted.
                     if submit {
                         timer(SUBMIT_DELAY_MS).await;
+                        session.mark_turn_submitted();
                         session.write_input(b"\r");
                     }
                 }
@@ -613,8 +831,12 @@ impl TerminalView {
             has_visible_content: false,
             working_markers,
             blocked_markers,
+            title_provider,
             prev_raw: std::cell::Cell::new(None),
             done_latch: std::cell::Cell::new(false),
+            completion_armed: std::cell::Cell::new(false),
+            semantic_title_seen: std::cell::Cell::new(false),
+            grok_blocked_at: std::cell::Cell::new(None),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
             pending_paint_deadline: std::cell::Cell::new(None),
             paint_timer_generation: std::cell::Cell::new(0),
@@ -670,10 +892,12 @@ impl TerminalView {
         // Cache against content gen so sidebar/tick don't re-scan the grid every
         // frame while the agent is idle. Bell and idle-time still force a recheck.
         let content_gen = self.session.content_generation();
+        let (title_gen, title_text) = self.session.title_snapshot();
         let bell = self.session.has_bell();
         if !bell
-            && let Some((cached_gen, cached)) = self.status_cache.get()
+            && let Some((cached_gen, cached_title_gen, cached)) = self.status_cache.get()
             && cached_gen == content_gen
+            && cached_title_gen == title_gen
             && !self.exited
         {
             // Idle duration can advance Working→Idle without a content gen bump
@@ -683,33 +907,70 @@ impl TerminalView {
             }
         }
 
+        let mut title = title_status(
+            self.title_provider,
+            title_text.as_deref(),
+            self.session.title_age(),
+        );
+        if title.is_some() {
+            self.semantic_title_seen.set(true);
+        }
+        // Once a known provider has proved its title protocol, that protocol owns
+        // Working/Idle. Keep screen markers only as a compatibility fallback for
+        // older/custom clients; blocked prompts remain independent evidence.
+        let title_protocol_live = self.semantic_title_seen.get();
+        let working_markers = if title_protocol_live {
+            &[][..]
+        } else {
+            self.working_markers.as_slice()
+        };
         // Only scan the grid when there are markers to look for.
-        let screen = if self.working_markers.is_empty() && self.blocked_markers.is_empty() {
+        let screen = if working_markers.is_empty() && self.blocked_markers.is_empty() {
             String::new()
         } else {
             self.session.visible_text()
         };
-        let raw = classify(
+        let base = classify(
             self.exited,
             &screen,
-            &self.working_markers,
+            working_markers,
             &self.blocked_markers,
             bell,
             self.session.idle_for(),
         );
-        // Only agents with a real working marker may latch Done from a
-        // working→idle transition; marker-less terminals infer Working from raw
-        // output activity, which incidental redraws (e.g. a focus-change repaint
-        // when you click the pane) would otherwise misread as a finished turn.
-        let can_latch = !self.working_markers.is_empty();
-        let (status, latch) = latch_done(
+        if self.title_provider == TitleProvider::Grok {
+            if title == Some(AgentStatus::Blocked) {
+                self.grok_blocked_at.set(Some(std::time::Instant::now()));
+            } else {
+                let blocked_age = self.grok_blocked_at.get().map(|at| at.elapsed());
+                title = hold_grok_blocked(title, blocked_age);
+                if matches!(title, Some(AgentStatus::Idle))
+                    || blocked_age.is_some_and(|age| age > Duration::from_millis(750))
+                {
+                    self.grok_blocked_at.set(None);
+                }
+            }
+        }
+        let raw = combine_title_status(self.exited, base, title);
+        // Marker-less providers may latch only after proving that their semantic
+        // title protocol is live. Older/custom CLIs otherwise infer Working from
+        // typing echo and turn two seconds of quiet into a false completion.
+        let can_latch = can_latch_completion(
+            !self.working_markers.is_empty(),
+            self.semantic_title_seen.get(),
+        );
+        let (status, latch, armed) = latch_done_after_readiness(
             self.prev_raw.replace(Some(raw)),
             raw,
             self.done_latch.get(),
             can_latch,
+            self.completion_armed.get(),
+            self.session.has_submitted_turn(),
         );
         self.done_latch.set(latch);
-        self.status_cache.set(Some((content_gen, status)));
+        self.completion_armed.set(armed);
+        self.status_cache
+            .set(Some((content_gen, title_gen, status)));
         status
     }
 
@@ -853,6 +1114,9 @@ impl TerminalView {
             // selection was actually cleared. This halves repaints when a key is
             // held down (e.g. Enter), keeping output smooth.
             let cleared = self.session.clear_selection();
+            if event.keystroke.key.eq_ignore_ascii_case("enter") {
+                self.session.mark_turn_submitted();
+            }
             self.session.write_input(&bytes);
             if cleared {
                 cx.notify();
@@ -992,13 +1256,224 @@ mod tests {
     // macro, not gpui's glob-imported `test` attribute.
     use super::{
         AgentStatus, BACKGROUND_PAINT_INTERVAL, FOCUSED_INTERACTION_INTERVAL,
-        FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, classify, latch_done,
-        next_paint_schedule, paint_min_interval,
+        FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, TitleProvider,
+        can_latch_completion, classify, clean_agent_title, combine_title_status, hold_grok_blocked,
+        latch_done, latch_done_after_readiness, next_paint_schedule, paint_min_interval,
+        title_status,
     };
     use std::time::Duration;
 
     fn m(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn markerless_provider_must_prove_semantic_titles_before_latching() {
+        assert!(!can_latch_completion(false, false));
+        assert!(can_latch_completion(false, true));
+        assert!(can_latch_completion(true, false));
+    }
+
+    #[test]
+    fn claude_title_frames_remain_working_until_explicit_idle() {
+        assert_eq!(
+            title_status(
+                TitleProvider::Claude,
+                Some("⠂ Review changes"),
+                Some(Duration::from_millis(200))
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Claude,
+                Some("⠂ Review changes"),
+                Some(Duration::from_secs(4))
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Claude,
+                Some("✳ Review changes"),
+                Some(Duration::from_secs(30))
+            ),
+            Some(AgentStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn codex_forced_title_contract_separates_agent_from_background_output() {
+        assert_eq!(
+            title_status(
+                TitleProvider::Codex,
+                Some("Ready ·"),
+                Some(Duration::from_secs(20))
+            ),
+            Some(AgentStatus::Idle)
+        );
+        assert_eq!(
+            combine_title_status(false, AgentStatus::Working, Some(AgentStatus::Idle)),
+            AgentStatus::Idle
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Codex,
+                Some("Starting ⠦"),
+                Some(Duration::from_millis(500))
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Codex,
+                Some("Working · ⠋"),
+                Some(Duration::from_millis(500))
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Codex,
+                Some("Ready · action required"),
+                Some(Duration::from_secs(30))
+            ),
+            Some(AgentStatus::Blocked)
+        );
+    }
+
+    #[test]
+    fn grok_title_contract_has_working_blocked_and_idle_edges() {
+        assert_eq!(
+            title_status(
+                TitleProvider::Grok,
+                Some("⠦ - Waiting for response… - Review title - grok"),
+                Some(Duration::from_millis(300))
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Grok,
+                Some("⚠ Action Required - ⠋ - Running tool - Review title - grok"),
+                Some(Duration::from_millis(300))
+            ),
+            Some(AgentStatus::Blocked)
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Grok,
+                Some("Review title - grok"),
+                Some(Duration::from_secs(30))
+            ),
+            Some(AgentStatus::Idle)
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Grok,
+                Some("Custom title with no provider state"),
+                Some(Duration::ZERO)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn grok_action_required_blink_does_not_flicker_status() {
+        assert_eq!(
+            hold_grok_blocked(Some(AgentStatus::Working), Some(Duration::from_millis(500))),
+            Some(AgentStatus::Blocked)
+        );
+        assert_eq!(
+            hold_grok_blocked(Some(AgentStatus::Working), Some(Duration::from_millis(751))),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            hold_grok_blocked(Some(AgentStatus::Idle), Some(Duration::from_millis(100))),
+            Some(AgentStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn traced_title_edges_override_pty_noise_and_latch_done() {
+        let grok_working = title_status(
+            TitleProvider::Grok,
+            Some("⠹ - Responding - Review title - grok"),
+            Some(Duration::from_millis(300)),
+        );
+        let raw_working = combine_title_status(false, AgentStatus::Idle, grok_working);
+        assert_eq!(raw_working, AgentStatus::Working);
+
+        let grok_idle = title_status(
+            TitleProvider::Grok,
+            Some("Review title - grok"),
+            Some(Duration::from_millis(300)),
+        );
+        let raw_idle = combine_title_status(
+            false,
+            AgentStatus::Working, // incidental PTY redraw/background output
+            grok_idle,
+        );
+        assert_eq!(raw_idle, AgentStatus::Idle);
+        assert_eq!(
+            latch_done(Some(AgentStatus::Working), raw_idle, false, true),
+            (AgentStatus::Done, true)
+        );
+
+        // Typing while an already-idle title is present cannot manufacture a
+        // Working→Done edge from the PTY activity heuristic.
+        let typed = combine_title_status(false, AgentStatus::Working, grok_idle);
+        assert_eq!(
+            latch_done(Some(AgentStatus::Idle), typed, false, true),
+            (AgentStatus::Idle, false)
+        );
+    }
+
+    #[test]
+    fn foreign_titles_never_become_lifecycle_state() {
+        assert_eq!(
+            title_status(TitleProvider::Other, Some("Thinking"), Some(Duration::ZERO)),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_detection_requires_an_exact_executable_name() {
+        assert_eq!(
+            TitleProvider::from_program("C:\\tools\\codex.cmd"),
+            TitleProvider::Codex
+        );
+        assert_eq!(
+            TitleProvider::from_program("claude.exe"),
+            TitleProvider::Claude
+        );
+        assert_eq!(TitleProvider::from_program("grok"), TitleProvider::Grok);
+        assert_eq!(
+            TitleProvider::from_program("codex-title-proxy.exe"),
+            TitleProvider::Other
+        );
+    }
+
+    #[test]
+    fn lifecycle_decoration_does_not_leak_into_pane_names() {
+        assert_eq!(
+            clean_agent_title("claude", "✳ Review changes").as_deref(),
+            Some("Review changes")
+        );
+        assert_eq!(clean_agent_title("codex", "Ready · ⠋"), None);
+        assert_eq!(
+            clean_agent_title(
+                "grok",
+                "⠦ - Waiting for response… - User requests exact OK reply - grok"
+            )
+            .as_deref(),
+            Some("User requests exact OK reply")
+        );
+        assert_eq!(clean_agent_title("grok", "grok"), None);
+        assert_eq!(
+            clean_agent_title("pwsh", "D:\\dev\\muxel").as_deref(),
+            Some("D:\\dev\\muxel")
+        );
     }
 
     #[test]
@@ -1028,7 +1503,7 @@ mod tests {
             classify(true, "esc to interrupt", &working, &blocked, true, busy),
             AgentStatus::Done
         );
-        // Working marker beats a stale bell.
+        // Working marker beats a stale bell when no input request is present.
         assert_eq!(
             classify(false, "… esc to interrupt", &working, &blocked, true, quiet),
             AgentStatus::Working
@@ -1042,6 +1517,19 @@ mod tests {
                 &blocked,
                 true,
                 quiet
+            ),
+            AgentStatus::Blocked
+        );
+        // A permission prompt is actionable even if the provider leaves its
+        // ordinary working footer visible behind the modal.
+        assert_eq!(
+            classify(
+                false,
+                "esc to interrupt\nDo you want to proceed?",
+                &working,
+                &blocked,
+                false,
+                busy
             ),
             AgentStatus::Blocked
         );
@@ -1115,6 +1603,33 @@ mod tests {
         assert_eq!(latch_done(Some(Idle), Idle, true, false), (Idle, false));
         // The bell/exit `Done` still passes straight through (precise signals).
         assert_eq!(latch_done(Some(Working), Done, false, false), (Done, false));
+    }
+
+    #[test]
+    fn startup_working_to_idle_arms_without_claiming_done() {
+        use AgentStatus::{Done, Idle, Working};
+        let (status, latch, armed) =
+            latch_done_after_readiness(None, Working, false, true, false, false);
+        assert_eq!((status, latch, armed), (Working, false, false));
+        let (status, latch, armed) =
+            latch_done_after_readiness(Some(Working), Idle, latch, true, armed, false);
+        assert_eq!((status, latch, armed), (Idle, false, true));
+        let (_, latch, armed) =
+            latch_done_after_readiness(Some(Idle), Working, latch, true, armed, false);
+        assert_eq!(
+            latch_done_after_readiness(Some(Working), Idle, latch, true, armed, false),
+            (Done, true, true)
+        );
+    }
+
+    #[test]
+    fn immediate_submission_arms_a_turn_during_startup() {
+        use AgentStatus::{Done, Idle, Working};
+        let (_, latch, armed) = latch_done_after_readiness(None, Working, false, true, false, true);
+        assert_eq!(
+            latch_done_after_readiness(Some(Working), Idle, latch, true, armed, true),
+            (Done, true, true)
+        );
     }
 
     #[test]

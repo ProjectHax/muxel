@@ -23,8 +23,8 @@ pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
     append_agent_instruction, claude_session_path, codex_developer_instructions_override,
     codex_latest_session_id, codex_session_exists, codex_session_id_from_title,
-    file_link_instruction, memory_header, memory_instruction, memory_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args,
+    codex_terminal_title_override, file_link_instruction, memory_header, memory_instruction,
+    memory_reference, resolve_launch, resolve_launch_for_session, session_resume_args,
 };
 pub use appimage::foreign_muxel_appimage_mounts;
 pub use diff::{SplitRow, split_diff};
@@ -60,6 +60,297 @@ pub enum InstanceKind {
     /// Only macOS/Windows render these embedded; Linux opens links in a
     /// separate browser window instead.
     Browser,
+}
+
+/// Persisted lifecycle timestamps for an agent pane.
+///
+/// These are Unix milliseconds. The live terminal owns status detection; the core
+/// model owns the durable facts needed to retain unattended completion and
+/// derive compact age labels after a restart.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActivity {
+    #[serde(default)]
+    pub work_started_at: Option<i64>,
+    #[serde(default)]
+    pub completed_at: Option<i64>,
+    #[serde(default)]
+    pub blocked_at: Option<i64>,
+    #[serde(default)]
+    pub last_attended_at: Option<i64>,
+}
+
+/// Provider-neutral lifecycle state used by the persisted activity reducer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentActivityState {
+    Working,
+    Idle,
+    Blocked,
+    Done,
+}
+
+impl AgentActivity {
+    /// Whether a completed turn is newer than the last time the pane was
+    /// attended. A missing attendance timestamp means the completion is unseen.
+    pub fn has_unattended_completion(&self) -> bool {
+        self.completed_at
+            .is_some_and(|done| self.last_attended_at.is_none_or(|seen| done > seen))
+    }
+
+    /// Apply one displayed-status transition. Returns whether durable state
+    /// changed, so callers can avoid rewriting the workspace on idle ticks.
+    pub fn observe(
+        &mut self,
+        previous: Option<AgentActivityState>,
+        status: AgentActivityState,
+        now: i64,
+    ) -> bool {
+        let now = now.max(0);
+        let before = self.clone();
+        match status {
+            AgentActivityState::Working => {
+                if previous != Some(AgentActivityState::Working) {
+                    self.work_started_at = Some(now);
+                }
+                self.blocked_at = None;
+            }
+            AgentActivityState::Blocked => {
+                if previous != Some(AgentActivityState::Blocked)
+                    && !(previous.is_none() && self.blocked_at.is_some())
+                {
+                    self.blocked_at = Some(now);
+                }
+            }
+            AgentActivityState::Done => {
+                // A restored unseen completion already has its correct timestamp;
+                // keep it until the user attends the pane. Restored terminals can
+                // emit a false Working -> Done cycle while their CLI boots.
+                if !self.has_unattended_completion() && previous != Some(AgentActivityState::Done) {
+                    self.completed_at = Some(now);
+                }
+                self.blocked_at = None;
+            }
+            AgentActivityState::Idle => {
+                if previous == Some(AgentActivityState::Blocked) {
+                    self.blocked_at = None;
+                }
+            }
+        }
+        *self != before
+    }
+
+    /// Record deliberate attendance. This clears unattended completion by
+    /// ordering rather than by maintaining a second persisted boolean.
+    pub fn attend(&mut self, now: i64) -> bool {
+        let now = now.max(0);
+        if self.last_attended_at == Some(now) {
+            return false;
+        }
+        self.last_attended_at = Some(now);
+        true
+    }
+}
+
+/// Compact sidebar copy derived from lifecycle state and durable timestamps.
+pub fn agent_activity_label(
+    status: AgentActivityState,
+    activity: &AgentActivity,
+    now: i64,
+) -> String {
+    match status {
+        AgentActivityState::Working => "working".to_string(),
+        AgentActivityState::Done => state_with_age("done", activity.completed_at, now),
+        AgentActivityState::Blocked => state_with_age("blocked", activity.blocked_at, now),
+        AgentActivityState::Idle => {
+            let Some(age) = age_millis(activity.last_attended_at, now) else {
+                return "idle".to_string();
+            };
+            if age < MINUTE_MS {
+                "idle".to_string()
+            } else if age < HOUR_MS {
+                format!("idle · {}m", age / MINUTE_MS)
+            } else if age < 6 * HOUR_MS {
+                format!("idle · {}h", age / HOUR_MS)
+            } else if age < 3 * DAY_MS {
+                "idle".to_string()
+            } else {
+                format!("stale · {}d", age / DAY_MS)
+            }
+        }
+    }
+}
+
+fn state_with_age(state: &str, at: Option<i64>, now: i64) -> String {
+    let Some(age) = age_millis(at, now) else {
+        return state.to_string();
+    };
+    if age < MINUTE_MS {
+        state.to_string()
+    } else if age < HOUR_MS {
+        format!("{state} · {}m", age / MINUTE_MS)
+    } else if age < DAY_MS {
+        format!("{state} · {}h", age / HOUR_MS)
+    } else {
+        format!("{state} · {}d", age / DAY_MS)
+    }
+}
+
+const MINUTE_MS: i64 = 60_000;
+const HOUR_MS: i64 = 60 * MINUTE_MS;
+const DAY_MS: i64 = 24 * HOUR_MS;
+
+fn age_millis(at: Option<i64>, now: i64) -> Option<i64> {
+    at.map(|at| now.saturating_sub(at).max(0))
+}
+
+#[cfg(test)]
+mod agent_activity_tests {
+    use super::{
+        AgentActivity, AgentActivityState, DAY_MS, HOUR_MS, Instance, MINUTE_MS,
+        agent_activity_label,
+    };
+
+    #[test]
+    fn old_instance_json_defaults_activity() {
+        let mut value = serde_json::to_value(Instance::shell(uuid::Uuid::new_v4())).unwrap();
+        value.as_object_mut().unwrap().remove("activity");
+        let restored: Instance = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.activity, AgentActivity::default());
+    }
+
+    #[test]
+    fn completion_remains_unattended_until_attendance() {
+        let mut activity = AgentActivity::default();
+        assert!(activity.observe(None, AgentActivityState::Working, 100_000));
+        assert!(activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            200_000
+        ));
+        assert!(activity.has_unattended_completion());
+        assert!(!activity.observe(None, AgentActivityState::Done, 300_000));
+        assert_eq!(activity.completed_at, Some(200_000));
+
+        assert!(activity.attend(400_000));
+        assert!(!activity.has_unattended_completion());
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Idle, &activity, 460_000),
+            "idle · 1m"
+        );
+    }
+
+    #[test]
+    fn startup_work_cycle_does_not_replace_an_unattended_completion() {
+        let mut activity = AgentActivity::default();
+        assert!(activity.observe(None, AgentActivityState::Working, 50));
+        assert!(activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            60
+        ));
+        assert!(activity.has_unattended_completion());
+        assert!(activity.observe(
+            Some(AgentActivityState::Done),
+            AgentActivityState::Working,
+            70
+        ));
+        assert!(!activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            80
+        ));
+        assert_eq!(activity.completed_at, Some(60));
+    }
+
+    #[test]
+    fn completion_one_millisecond_after_attendance_is_unseen() {
+        let mut activity = AgentActivity {
+            last_attended_at: Some(100_000),
+            ..AgentActivity::default()
+        };
+        assert!(activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            100_001
+        ));
+        assert!(activity.has_unattended_completion());
+    }
+
+    #[test]
+    fn completion_attended_at_the_transition_does_not_survive_as_unseen() {
+        let mut activity = AgentActivity::default();
+        assert!(activity.observe(None, AgentActivityState::Working, 100));
+        assert!(activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            200
+        ));
+        assert!(activity.attend(200));
+        assert!(!activity.has_unattended_completion());
+    }
+
+    #[test]
+    fn restored_blocked_timestamp_is_not_replaced_by_first_live_sample() {
+        let mut activity = AgentActivity {
+            blocked_at: Some(100),
+            ..AgentActivity::default()
+        };
+        assert!(!activity.observe(None, AgentActivityState::Blocked, 500));
+        assert_eq!(activity.blocked_at, Some(100));
+    }
+
+    #[test]
+    fn label_boundaries_keep_the_middle_quiet() {
+        let activity = AgentActivity {
+            last_attended_at: Some(0),
+            ..AgentActivity::default()
+        };
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Idle, &activity, 59 * MINUTE_MS),
+            "idle · 59m"
+        );
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Idle, &activity, HOUR_MS),
+            "idle · 1h"
+        );
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Idle, &activity, 6 * HOUR_MS),
+            "idle"
+        );
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Idle, &activity, 3 * DAY_MS),
+            "stale · 3d"
+        );
+    }
+
+    #[test]
+    fn done_and_blocked_age_without_expiring() {
+        let activity = AgentActivity {
+            completed_at: Some(100_000),
+            blocked_at: Some(200_000),
+            ..AgentActivity::default()
+        };
+        let now = 20 * DAY_MS;
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Done, &activity, now),
+            "done · 19d"
+        );
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Blocked, &activity, now),
+            "blocked · 19d"
+        );
+    }
+
+    #[test]
+    fn future_timestamps_clamp_to_now() {
+        let activity = AgentActivity {
+            last_attended_at: Some(500_000),
+            ..AgentActivity::default()
+        };
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Idle, &activity, 100_000),
+            "idle"
+        );
+    }
 }
 
 /// A single agent/terminal instance's persistent metadata. The live terminal
@@ -105,6 +396,9 @@ pub struct Instance {
     /// Environment variables for the process.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// Durable lifecycle/attention timestamps for terminal instances.
+    #[serde(default)]
+    pub activity: AgentActivity,
     /// Run inside a persistent tmux session (Unix only).
     #[serde(default)]
     pub use_tmux: bool,
@@ -216,6 +510,7 @@ impl Instance {
             preset: preset.name.clone(),
             preset_id: Some(preset.id),
             env: preset.env.clone(),
+            activity: AgentActivity::default(),
             use_tmux: false,
             use_worktree: false,
             tmux_session: None,
@@ -277,6 +572,7 @@ impl Instance {
             preset: String::new(),
             preset_id: None,
             env: Vec::new(),
+            activity: AgentActivity::default(),
             use_tmux: false,
             use_worktree: false,
             tmux_session: None,
