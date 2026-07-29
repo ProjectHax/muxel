@@ -220,6 +220,7 @@ fn coalesce_pending(
 }
 
 pub struct TerminalView {
+    instance_id: Uuid,
     session: Arc<TerminalSession>,
     focus_handle: FocusHandle,
     palette: TerminalPalette,
@@ -352,7 +353,11 @@ impl TerminalView {
                     .set(self.paint_timer_generation.get().wrapping_add(1));
                 self.last_paint_notify.set(now);
                 cx.notify();
-                profile::notify_scheduled();
+                profile::notify_scheduled(
+                    self.instance_id,
+                    profile::PaintRequest::Now,
+                    min_interval,
+                );
                 crate::present_flag::mark_present_needed();
                 return;
             }
@@ -373,7 +378,11 @@ impl TerminalView {
                 view.pending_paint_deadline.set(None);
                 view.last_paint_notify.set(Instant::now());
                 cx.notify();
-                profile::notify_scheduled();
+                profile::notify_scheduled(
+                    view.instance_id,
+                    profile::PaintRequest::Timer,
+                    min_interval,
+                );
                 crate::present_flag::mark_present_needed();
             });
         })
@@ -557,7 +566,7 @@ impl TerminalView {
                                     batch_len,
                                 );
                             }
-                            profile::process_output(batch_len, t0.elapsed(), focused);
+                            profile::process_output(instance_id, batch_len, t0.elapsed(), focused);
                             if focused && profile::is_enabled() {
                                 let (col, row, text) = view.session.cursor_probe();
                                 profile::screen_probe_update(col, row, text);
@@ -589,6 +598,7 @@ impl TerminalView {
         });
 
         Self {
+            instance_id,
             session,
             focus_handle,
             palette: TerminalPalette::default(),
@@ -850,7 +860,7 @@ impl TerminalView {
             // Key path: gpui may sync-draw without presenting — arm the pump.
             crate::present_flag::mark_present_needed();
             cx.stop_propagation();
-            profile::key_handled(held, t0.elapsed());
+            profile::key_handled(self.instance_id, held, t0.elapsed());
         }
     }
 }
@@ -926,6 +936,7 @@ impl Render for TerminalView {
             .bg(self.palette.background_hsla())
             .p(TERM_INSET)
             .child(TerminalElement::new(
+                self.instance_id,
                 self.session.clone(),
                 cx.entity_id(),
                 self.focus_handle.clone(),
