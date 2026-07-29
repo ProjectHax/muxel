@@ -1182,10 +1182,26 @@ impl TerminalSession {
         self.title_changed_at.lock().as_ref().map(Instant::elapsed)
     }
 
+    /// Drop a provider title that belongs to a conversation the running TUI has
+    /// switched away from. The next OSC title repopulates it.
+    pub fn clear_title(&self) {
+        *self.title.lock() = None;
+        self.title_generation.fetch_add(1, Ordering::Relaxed);
+        *self.title_changed_at.lock() = Some(Instant::now());
+        self.bump_content();
+    }
+
     /// Latest UUID-shaped OSC title retained when an agent replaces it with a
     /// display name. Muxel uses this as an exact agent session identity hint.
     pub fn session_id_hint(&self) -> Option<String> {
         self.session_id_hint.lock().clone()
+    }
+
+    /// PID of the process attached directly to this PTY. On Windows agent
+    /// launchers may insert a PowerShell/cmd wrapper; provider processes remain
+    /// descendants of this PID.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child_pid
     }
 
     /// Drain the OSC-52 copies parsed since the last call. The view lands them
@@ -2183,7 +2199,8 @@ mod windows_spawn_resolve {
             vec!["Reply with exactly OK".to_string()],
         );
         let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn batch fixture");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        const EXPECTED: &[u8] = b"ARG=[Reply with exactly OK]";
+        let deadline = Instant::now() + Duration::from_secs(15);
         let mut output = Vec::new();
         while Instant::now() < deadline {
             match rx.try_recv() {
@@ -2192,6 +2209,12 @@ mod windows_spawn_resolve {
                         session.write_input(b"\x1b[1;1R");
                     }
                     output.extend(bytes);
+                    if output
+                        .windows(EXPECTED.len())
+                        .any(|window| window == EXPECTED)
+                    {
+                        break;
+                    }
                 }
                 Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
                 Err(async_channel::TryRecvError::Empty) => {}
@@ -2200,7 +2223,10 @@ mod windows_spawn_resolve {
         }
         let output = String::from_utf8_lossy(&output);
         assert!(
-            output.contains("ARG=[Reply with exactly OK]"),
+            output
+                .as_bytes()
+                .windows(EXPECTED.len())
+                .any(|window| window == EXPECTED),
             "batch runner split one argument: {output:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);

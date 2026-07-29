@@ -773,6 +773,139 @@ fn home_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GrokActiveSession {
+    session_id: String,
+    pid: u32,
+    opened_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(windows)]
+fn grok_home_dir() -> Option<PathBuf> {
+    std::env::var_os("GROK_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".grok")))
+}
+
+#[cfg(windows)]
+fn read_grok_active_sessions() -> Vec<GrokActiveSession> {
+    let Some(path) = grok_home_dir().map(|home| home.join("active_sessions.json")) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    parse_grok_active_sessions(&bytes)
+}
+
+#[cfg(any(windows, test))]
+fn parse_grok_active_sessions(bytes: &[u8]) -> Vec<GrokActiveSession> {
+    let Ok(serde_json::Value::Array(rows)) = serde_json::from_slice(bytes) else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .filter_map(|row| {
+            let session_id = row.get("session_id")?.as_str()?;
+            Uuid::parse_str(session_id).ok()?;
+            let pid = u32::try_from(row.get("pid")?.as_u64()?).ok()?;
+            // Older Grok registries have only session_id + pid. Preserve those
+            // rows; a timestamp is ordering evidence, not schema validity.
+            let opened_at = row
+                .get("opened_at")
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH);
+            Some(GrokActiveSession {
+                session_id: session_id.to_string(),
+                pid,
+                opened_at,
+            })
+        })
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+fn process_descends_from(parents: &HashMap<u32, u32>, mut process: u32, root: u32) -> bool {
+    for _ in 0..64 {
+        if process == root {
+            return true;
+        }
+        let Some(parent) = parents.get(&process).copied() else {
+            return false;
+        };
+        if parent == 0 || parent == process {
+            return false;
+        }
+        process = parent;
+    }
+    false
+}
+
+#[cfg(windows)]
+fn process_parent_map() -> HashMap<u32, u32> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return HashMap::new();
+    };
+    let mut parents = HashMap::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
+        loop {
+            parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    parents
+}
+
+#[cfg(all(not(windows), test))]
+#[allow(dead_code)]
+fn process_parent_map() -> HashMap<u32, u32> {
+    HashMap::new()
+}
+
+#[cfg(any(windows, test))]
+fn active_grok_session_for_process(
+    root_pid: u32,
+    active: &[GrokActiveSession],
+    parents: &HashMap<u32, u32>,
+) -> Option<String> {
+    active
+        .iter()
+        // Grok keeps the starter registration when `/resume` loads another
+        // session in-process. Both rows share one PID; the load path registers
+        // the selected session later, so newest is the current binding.
+        .filter(|session| process_descends_from(parents, session.pid, root_pid))
+        .max_by_key(|session| session.opened_at)
+        .map(|session| session.session_id.clone())
+}
+
+#[cfg(any(windows, test))]
+fn is_grok_program(program: Option<&str>) -> bool {
+    let Some(name) = program.and_then(|program| program.rsplit(['/', '\\']).next()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name.strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".cmd"))
+        .or_else(|| name.strip_suffix(".bat"))
+        .or_else(|| name.strip_suffix(".ps1"))
+        .unwrap_or(&name)
+        == "grok"
+}
+
 /// Whether a Claude agent's saved session transcript is missing from disk (so a
 /// `--resume` would just hang on "No conversation found"). Only Claude's session
 /// path is known, so other agents — or an undeterminable home/cwd — return `false`
@@ -1200,6 +1333,9 @@ pub struct MuxelApp {
     tmux_available: bool,
     /// Tick counter throttling remote branch-label polling (every 5th tick).
     remote_poll_count: u32,
+    /// A background Grok PID→session-id refresh is already in flight.
+    #[cfg(windows)]
+    grok_session_syncing: bool,
     /// Full persisted settings (source of truth for config not mirrored above).
     settings: muxel_core::Settings,
     /// Active theme name + mode override (persisted).
@@ -3107,6 +3243,8 @@ impl MuxelApp {
             tmux_available: cfg!(unix) && program_on_path("tmux"),
             remote_connect_failed: HashMap::new(),
             remote_poll_count: 0,
+            #[cfg(windows)]
+            grok_session_syncing: false,
             theme: settings.theme.clone(),
             theme_mode: settings.theme_mode.clone(),
             use_tmux: settings.default_use_tmux,
@@ -6211,6 +6349,87 @@ impl MuxelApp {
         true
     }
 
+    /// Refresh persisted Grok session IDs after an in-process `/resume` switch.
+    /// Grok records the active session against its own process PID; walk through
+    /// the shell launchers between that process and Muxel's direct PTY child.
+    /// Windows supplies the required process ancestry snapshot. Other platforms
+    /// keep the previously persisted session binding and skip this poll.
+    #[cfg(windows)]
+    fn sync_grok_session_ids(&mut self, cx: &mut Context<Self>) {
+        if self.grok_session_syncing {
+            return;
+        }
+        let processes: Vec<(Uuid, u32)> = self
+            .terminals
+            .iter()
+            .filter_map(|(iid, view)| {
+                let instance = self.workspace.instance(*iid)?;
+                let local_plain_process = self
+                    .workspace
+                    .project(instance.project_id)
+                    .is_some_and(|project| project.remote.is_none())
+                    && instance.tmux_session.is_none();
+                if !local_plain_process || !is_grok_program(instance.program.as_deref()) {
+                    return None;
+                }
+                view.read(cx).child_pid().map(|pid| (*iid, pid))
+            })
+            .collect();
+        if processes.is_empty() {
+            return;
+        }
+        self.grok_session_syncing = true;
+        cx.spawn(async move |this, cx| {
+            let roots = processes.clone();
+            let bindings = cx
+                .background_executor()
+                .spawn(async move {
+                    let active = read_grok_active_sessions();
+                    let parents = process_parent_map();
+                    roots
+                        .into_iter()
+                        .filter_map(|(iid, pid)| {
+                            active_grok_session_for_process(pid, &active, &parents)
+                                .map(|session_id| (iid, pid, session_id))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.grok_session_syncing = false;
+                let mut changed = false;
+                for (iid, pid, session_id) in bindings {
+                    let same_process = this
+                        .terminals
+                        .get(&iid)
+                        .is_some_and(|view| view.read(cx).child_pid() == Some(pid));
+                    if same_process
+                        && let Some(instance) = this.workspace.instance_mut(iid)
+                        && instance.session_id.as_deref() != Some(session_id.as_str())
+                    {
+                        instance.session_id = Some(session_id);
+                        instance.session_started = true;
+                        // A pane name generated by the prior conversation is
+                        // actively misleading after an in-process session
+                        // switch. Grok's next useful OSC title repopulates it.
+                        instance.auto_name = None;
+                        if let Some(view) = this.terminals.get(&iid) {
+                            view.read(cx).clear_title();
+                        }
+                        changed = true;
+                    }
+                }
+                if changed {
+                    this.persist();
+                }
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(not(windows))]
+    fn sync_grok_session_ids(&mut self, _cx: &mut Context<Self>) {}
+
     /// Status-refresh tick: re-render and fire desktop notifications for
     /// unfocused agents when they finish or ring the terminal bell. The bell is
     /// the agent's deliberate "I need you" signal (e.g. Claude on a permission
@@ -6312,6 +6531,10 @@ impl MuxelApp {
             self.fetch_remote_layouts(cx);
         }
         self.remote_poll_count = (self.remote_poll_count + 1) % 5;
+        // Session switches happen inside Grok without replacing the PTY child.
+        // Poll independently of the slower remote-project cadence so a normal
+        // quit shortly after `/resume` is unlikely to persist the old binding.
+        self.sync_grok_session_ids(cx);
         let focused = self.active_instance;
         // A `--resume` launch has this long to prove its saved session is valid;
         // past that we stop watching it for recovery signals.
@@ -23389,6 +23612,79 @@ impl Render for MuxelApp {
             }))
             // No toast layer: all notifications go to the sidebar feed instead.
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod grok_session_tests {
+    use super::{
+        GrokActiveSession, active_grok_session_for_process, is_grok_program,
+        parse_grok_active_sessions,
+    };
+    use chrono::{TimeZone, Utc};
+    use std::collections::HashMap;
+
+    #[test]
+    fn binds_active_session_through_windows_launcher_descendants() {
+        let active = vec![GrokActiveSession {
+            session_id: "559929ad-a189-4107-9acf-bf63458be632".to_string(),
+            pid: 300,
+            opened_at: Utc.timestamp_opt(1, 0).unwrap(),
+        }];
+        let parents = HashMap::from([(300, 200), (200, 100)]);
+
+        assert_eq!(
+            active_grok_session_for_process(100, &active, &parents).as_deref(),
+            Some("559929ad-a189-4107-9acf-bf63458be632")
+        );
+        assert_eq!(
+            active_grok_session_for_process(999, &active, &parents),
+            None
+        );
+    }
+
+    #[test]
+    fn newest_registration_wins_after_in_process_resume() {
+        let active = vec![
+            GrokActiveSession {
+                session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                pid: 300,
+                opened_at: Utc.timestamp_opt(1, 0).unwrap(),
+            },
+            GrokActiveSession {
+                session_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                pid: 300,
+                opened_at: Utc.timestamp_opt(2, 0).unwrap(),
+            },
+        ];
+
+        assert_eq!(
+            active_grok_session_for_process(300, &active, &HashMap::new()).as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+    }
+
+    #[test]
+    fn recognizes_grok_program_paths_only() {
+        assert!(is_grok_program(Some("grok")));
+        assert!(is_grok_program(Some(r"D:\agent-worker\bin\grok.CMD")));
+        assert!(is_grok_program(Some(r"D:\agent-worker\bin\grok.ps1")));
+        assert!(!is_grok_program(Some("codex")));
+        assert!(!is_grok_program(None));
+    }
+
+    #[test]
+    fn legacy_registry_rows_without_opened_at_remain_eligible() {
+        let sessions = parse_grok_active_sessions(
+            br#"[{"session_id":"559929ad-a189-4107-9acf-bf63458be632","pid":300}]"#,
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].opened_at, chrono::DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn malformed_registry_is_a_safe_noop() {
+        assert!(parse_grok_active_sessions(br#"[{"session_id": "#).is_empty());
     }
 }
 
