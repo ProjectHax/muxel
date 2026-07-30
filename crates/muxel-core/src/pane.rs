@@ -863,10 +863,49 @@ pub fn move_tab_to(
     }
     // Cross-leaf: detach (fixes source active / collapses empty source), then
     // re-find the target (a collapse can shift paths) and insert at `index`.
+    // When the source leaf vanishes beside the target, give its split span to
+    // the destination. Otherwise the remaining siblings absorb that space and
+    // the pane the user dropped onto stays roughly its old width.
+    transfer_vanishing_leaf_size(tree, &pd, &pt);
     if !remove(tree, dragged) {
         return false;
     }
     add_tab_at(tree, target_anchor, dragged, index)
+}
+
+fn transfer_vanishing_leaf_size(
+    tree: &mut Option<PaneNode>,
+    source_path: &[usize],
+    target_path: &[usize],
+) {
+    let (Some((&source_index, source_parent)), Some((&target_index, target_parent))) =
+        (source_path.split_last(), target_path.split_last())
+    else {
+        return;
+    };
+    if source_parent != target_parent {
+        return;
+    }
+    let Some(root) = tree.as_mut() else {
+        return;
+    };
+    let source_is_sole_tab = root
+        .get_at_path(source_path)
+        .and_then(PaneNode::tabs)
+        .is_some_and(|(tabs, _)| tabs.len() == 1);
+    if !source_is_sole_tab {
+        return;
+    }
+    let Some(PaneNode::Split { children, sizes, .. }) = root.get_at_path_mut(source_parent) else {
+        return;
+    };
+    if sizes.len() != children.len()
+        || source_index >= sizes.len()
+        || target_index >= sizes.len()
+    {
+        return;
+    }
+    sizes[target_index] += sizes[source_index];
 }
 
 /// Remove `target` from the tree. If it's one of several tabs in its pane, only
@@ -1781,6 +1820,53 @@ mod tests {
         assert!(move_tab_to(&mut tree, a, b, 2));
         // left pane collapsed; a inserted at index 2 of [b, c, d] → [b, c, a, d]
         assert_eq!(tree.as_ref().unwrap().tabs(), Some((&[b, c, a, d][..], 2)));
+    }
+
+    #[test]
+    fn move_tab_to_transfers_vanishing_source_width_to_destination() {
+        let (a, b, c) = (id(), id(), id());
+        let mut tree = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![200.0, 300.0, 500.0],
+            children: vec![
+                PaneNode::leaf(a),
+                PaneNode::leaf(b),
+                PaneNode::leaf(c),
+            ],
+        });
+
+        assert!(move_tab_to(&mut tree, a, b, usize::MAX));
+
+        let Some(PaneNode::Split {
+            sizes, children, ..
+        }) = tree.as_ref()
+        else {
+            panic!("expected the two remaining columns");
+        };
+        assert_eq!(sizes, &[500.0, 500.0]);
+        assert_eq!(children[0].tabs(), Some((&[b, a][..], 1)));
+        assert_eq!(children[1].tabs(), Some((&[c][..], 0)));
+    }
+
+    #[test]
+    fn move_tab_to_keeps_sizes_when_source_leaf_survives() {
+        let (a, b, c, d) = (id(), id(), id(), id());
+        let mut tree = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![200.0, 300.0, 500.0],
+            children: vec![
+                tabs_leaf(vec![a, d], 0),
+                PaneNode::leaf(b),
+                PaneNode::leaf(c),
+            ],
+        });
+
+        assert!(move_tab_to(&mut tree, a, b, usize::MAX));
+
+        let Some(PaneNode::Split { sizes, .. }) = tree.as_ref() else {
+            panic!("expected all three columns to remain");
+        };
+        assert_eq!(sizes, &[200.0, 300.0, 500.0]);
     }
 
     #[test]
