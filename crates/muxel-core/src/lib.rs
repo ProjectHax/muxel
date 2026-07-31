@@ -749,6 +749,10 @@ pub struct Project {
     pub root_path: PathBuf,
     /// The pane tree; `None` when the project has no panes.
     pub layout: Option<PaneNode>,
+    /// Last pane deliberately focused in this project. Local navigation state:
+    /// remote layout sync must validate it, not replace it.
+    #[serde(default)]
+    pub last_focused_instance: Option<Uuid>,
     /// Default preset id for new panes in this project (None = use the global default).
     #[serde(default)]
     pub default_preset: Option<Uuid>,
@@ -788,6 +792,7 @@ impl Project {
             name: name.into(),
             root_path: root_path.into(),
             layout: None,
+            last_focused_instance: None,
             default_preset: None,
             startup: Vec::new(),
             remote: None,
@@ -813,8 +818,46 @@ impl Project {
         self.layout.as_ref().and_then(|l| l.first_instance())
     }
 
+    /// Restore remembered focus only while that instance remains in the layout.
+    pub fn preferred_instance(&self) -> Option<Uuid> {
+        self.last_focused_instance
+            .filter(|iid| self.instances().contains(iid))
+            .or_else(|| self.first_instance())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.layout.is_none()
+    }
+}
+
+#[cfg(test)]
+mod project_focus_tests {
+    use super::{PaneNode, Project, add_tab};
+    use uuid::Uuid;
+
+    #[test]
+    fn preferred_instance_restores_valid_focus_and_rejects_stale_focus() {
+        let first = Uuid::new_v4();
+        let remembered = Uuid::new_v4();
+        let mut project = Project::new("repo", "/repo");
+        project.layout = Some(PaneNode::leaf(first));
+        assert!(add_tab(&mut project.layout, first, remembered));
+        project.last_focused_instance = Some(remembered);
+        assert_eq!(project.preferred_instance(), Some(remembered));
+
+        project.last_focused_instance = Some(Uuid::new_v4());
+        assert_eq!(project.preferred_instance(), Some(first));
+    }
+
+    #[test]
+    fn old_project_json_defaults_remembered_focus_to_none() {
+        let project = Project::new("repo", "/repo");
+        let mut json = serde_json::to_value(project).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("last_focused_instance");
+        let restored: Project = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.last_focused_instance, None);
     }
 }
 
