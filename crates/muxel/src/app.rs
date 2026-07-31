@@ -888,7 +888,7 @@ fn authoritative_terminal_auto_title(
 /// frame re-renders and re-paints every visible terminal (GPUI multipaint). With
 /// it, siblings reuse last frame's paint until that view's `cx.notify()` (or a
 /// full `window.refresh`). This is the main multi-agent key-repeat win.
-fn cached_terminal_view(view: Entity<TerminalView>) -> AnyView {
+fn cached_terminal_view(view: Entity<TerminalView>) -> impl IntoElement {
     AnyView::from(view).cached(StyleRefinement::default().size_full())
 }
 

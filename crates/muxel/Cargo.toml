@@ -130,7 +130,7 @@ windows = { version = "0.57", features = [
 ] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "e416af7f4dad861f251d357b6aa677dbc13a500e" }
+gpui-wry = { git = "https://github.com/longbridge/gpui-component", rev = "3cb3cc139619ce704387b69deb17822b0fc22497" }
 # The same lb-wry release gpui-wry pins, so the `wry` types unify.
 wry = { version = "0.53.3", package = "lb-wry" }
 

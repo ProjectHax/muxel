@@ -11,24 +11,24 @@ repository = "https://github.com/projecthax/muxel"
 
 [workspace.dependencies]
 # --- GPUI (Zed's UI framework) ---
-# Pinned to the exact rev that gpui-component is built against, so the `gpui`
-# types pulled in directly and transitively (via gpui-component) unify. See
-# gpui-component's own workspace Cargo.toml.
-gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = [
+# Keep the direct dependencies on the same unqualified Git source used by
+# gpui-component so Cargo resolves one GPUI type family. Cargo.lock pins that
+# shared source to cc053a4a, gpui-component's tested Zed revision.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "font-kit",
     "x11",
     "wayland",
 ] }
 
 # --- UI component library (Longbridge) ---
-# Pinned to the commit we verified locally; it internally pins gpui to the rev above.
+# Pinned to the merged accessibility and link-handler changes verified locally.
 # `tree-sitter-languages` enables all bundled syntax-highlighting grammars for
 # the code-editor panes (InputState::code_editor).
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "e416af7f4dad861f251d357b6aa677dbc13a500e", features = [
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "3cb3cc139619ce704387b69deb17822b0fc22497", features = [
     "tree-sitter-languages",
 ] }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "e416af7f4dad861f251d357b6aa677dbc13a500e", package = "gpui-component-assets" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "3cb3cc139619ce704387b69deb17822b0fc22497", package = "gpui-component-assets" }
 
 # --- workspace-internal crates (added in later phases) ---
 muxel-core = { path = "crates/muxel-core" }
