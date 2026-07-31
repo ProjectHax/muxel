@@ -196,14 +196,26 @@ fn title_status(
 /// already moved to its idle shape.
 fn continuing_screen_status(provider: TitleProvider, screen: &str) -> Option<AgentStatus> {
     match provider {
-        TitleProvider::Claude => {
-            let lower = screen.to_ascii_lowercase();
-            (lower.contains("command still running")
-                || lower.contains("commands still running"))
-            .then_some(AgentStatus::Working)
-        }
+        TitleProvider::Claude => screen
+            .lines()
+            .any(is_claude_background_command_row)
+            .then_some(AgentStatus::Working),
         _ => None,
     }
+}
+
+fn is_claude_background_command_row(line: &str) -> bool {
+    let words: Vec<_> = line.split_whitespace().collect();
+    if words.len() != 11
+        || words[0] != "·"
+        || words[4..] != ["running", "·", "send", "a", "message", "to", "interrupt"]
+    {
+        return false;
+    }
+    let Ok(count) = words[1].parse::<usize>() else {
+        return false;
+    };
+    count > 0 && words[2] == if count == 1 { "command" } else { "commands" } && words[3] == "still"
 }
 
 fn is_grok_spinner(part: &str) -> bool {
@@ -942,7 +954,8 @@ impl TerminalView {
         };
         // Claude may declare its title idle while a background command remains
         // live. Scan its visible grid for that provider-owned continuation row.
-        let needs_continuation_scan = self.title_provider == TitleProvider::Claude;
+        let needs_continuation_scan = self.title_provider == TitleProvider::Claude
+            && matches!(title, None | Some(AgentStatus::Idle));
         let screen = if working_markers.is_empty()
             && self.blocked_markers.is_empty()
             && !needs_continuation_scan
@@ -1004,6 +1017,7 @@ impl TerminalView {
     /// turn drops back to Idle once you've looked at it.
     pub fn clear_done(&self) {
         self.done_latch.set(false);
+        self.status_cache.set(None);
     }
 
     /// Whether `needle` appears in the current visible grid — used by the app to
@@ -1432,6 +1446,27 @@ mod tests {
         assert_eq!(
             continuing_screen_status(TitleProvider::Claude, "Ready for another prompt"),
             None
+        );
+        assert_eq!(
+            continuing_screen_status(
+                TitleProvider::Claude,
+                "The log says: 1 command still running; investigate it."
+            ),
+            None
+        );
+        assert_eq!(
+            continuing_screen_status(
+                TitleProvider::Claude,
+                "quoted: · 1 command still running · send a message to interrupt later"
+            ),
+            None
+        );
+        assert_eq!(
+            continuing_screen_status(
+                TitleProvider::Claude,
+                "  · 2 commands still running · send a message to interrupt  "
+            ),
+            Some(AgentStatus::Working)
         );
         assert_eq!(
             continuing_screen_status(
