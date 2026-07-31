@@ -14883,7 +14883,7 @@ impl MuxelApp {
                         Button::new(SharedString::from(format!("newtab-{sid}")))
                             .ghost()
                             .xsmall()
-                            .label("+")
+                            .icon(IconName::Plus)
                             .tooltip(t("New tab; right-click to choose agent"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
                                 this.place_like_instance(anchor, PlacementMode::Tab, window, cx)
