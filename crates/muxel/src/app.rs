@@ -399,19 +399,40 @@ fn cached_terminal_view(view: Entity<TerminalView>) -> AnyView {
     AnyView::from(view).cached(StyleRefinement::default().size_full())
 }
 
+/// Terminal tabs below one split. Keeping this scope explicit prevents a
+/// divider drag from invalidating every cached terminal in the workspace.
+fn split_resize_terminal_ids(
+    children: &[PaneNode],
+    is_terminal: impl Fn(Uuid) -> bool,
+) -> Vec<Uuid> {
+    children
+        .iter()
+        .flat_map(PaneNode::collect_instances)
+        .filter(|iid| is_terminal(*iid))
+        .collect()
+}
+
 /// Render a terminal pane. In `RightClickMenu` mouse mode it wraps the view in a
 /// right-click Copy/Paste context menu (the menu component lives in this crate, not
 /// in muxel-terminal); the other modes handle the mouse inside the terminal element
 /// itself. Shared by the main pane and pop-out windows.
-fn terminal_pane_element(view: &Entity<TerminalView>, cx: &App) -> AnyElement {
-    let cached = cached_terminal_view(view.clone());
+fn terminal_pane_element(view: &Entity<TerminalView>, cache_paint: bool, cx: &App) -> AnyElement {
+    // GPUI cached-paint replay transfers mouse listeners with `take()`. A second
+    // reuse before a real paint can therefore leave a visible terminal without
+    // selection or wheel handlers. The active/pop-out terminal stays uncached;
+    // background panes retain the multipaint performance win.
+    let terminal = if cache_paint {
+        cached_terminal_view(view.clone()).into_any_element()
+    } else {
+        view.clone().into_any_element()
+    };
     if view.read(cx).mouse_mode() != TerminalMouseMode::RightClickMenu {
-        return cached.into_any_element();
+        return terminal;
     }
     let view = view.clone();
     div()
         .size_full()
-        .child(cached)
+        .child(terminal)
         .context_menu(move |menu, window, _cx| {
             menu.item(PopupMenuItem::new(t("Copy")).icon(IconName::Copy).on_click(
                 window.listener_for(&view, |this, _e, _w, cx| {
@@ -1483,6 +1504,10 @@ pub struct MuxelApp {
     /// Per-split id nonce, bumped to reset a split's resizable state when its
     /// panes are evened out (double-click a divider).
     split_even_nonce: HashMap<String, u32>,
+    /// Trailing-edge repaint for cached terminals after a divider drag. During
+    /// the drag terminal PTY resizes are intentionally suppressed; this wakes
+    /// only the affected terminal views once the split stops changing.
+    split_resize_notify_task: Option<Task<()>>,
     /// Projects whose `.muxel/MEMORY.md` we've ensured this session (once each).
     memory_ensured: HashSet<Uuid>,
     /// Remote projects whose layout we've reconciled with the host this session
@@ -1920,7 +1945,7 @@ impl PopoutView {
 
     fn content(&self, cx: &App) -> AnyElement {
         match &self.view {
-            PaneView::Terminal(v) => terminal_pane_element(v, cx),
+            PaneView::Terminal(v) => terminal_pane_element(v, false, cx),
             PaneView::Editor(v) => v.clone().into_any_element(),
             PaneView::Browser(v) => v.clone().into_any_element(),
         }
@@ -3387,6 +3412,7 @@ impl MuxelApp {
             failed_launches: HashMap::new(),
             save_errors: HashMap::new(),
             split_even_nonce: HashMap::new(),
+            split_resize_notify_task: None,
             memory_ensured: HashSet::new(),
             remote_synced: HashSet::new(),
             remote_connecting: HashSet::new(),
@@ -13428,7 +13454,13 @@ impl MuxelApp {
 
     /// Record dragged split sizes into the active project's layout + persist, so
     /// pane proportions restore on next launch. Called from `on_resize`.
-    fn update_split_sizes(&mut self, key: SharedString, sizes: Vec<f32>, _cx: &mut Context<Self>) {
+    fn update_split_sizes(
+        &mut self,
+        key: SharedString,
+        sizes: Vec<f32>,
+        terminal_ids: Vec<Uuid>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(pid) = self.workspace.active_project else {
             return;
         };
@@ -13440,6 +13472,27 @@ impl MuxelApp {
         if changed {
             self.persist();
         }
+
+        // Resizable panels update child bounds without invalidating an
+        // AnyView::cached terminal. TerminalElement also skips PTY/grid resize
+        // during an active drag. Wake only this split's terminals after the
+        // final pointer move so their grids receive the settled dimensions.
+        self.split_resize_notify_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(75))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let views: Vec<_> = terminal_ids
+                    .iter()
+                    .filter_map(|iid| this.terminals.get(iid).cloned())
+                    .collect();
+                for view in views {
+                    view.update(cx, |_view, cx| cx.notify());
+                }
+                muxel_terminal::mark_present_needed();
+                this.split_resize_notify_task = None;
+            });
+        }));
     }
 
     /// Even out a split's panes (double-click a divider): reset its sizes to
@@ -14228,7 +14281,7 @@ impl MuxelApp {
                                 div()
                                     .flex_1()
                                     .overflow_hidden()
-                                    .child(terminal_pane_element(view, cx)),
+                                    .child(terminal_pane_element(view, !is_active, cx)),
                             )
                             .child(
                                 div()
@@ -14249,7 +14302,7 @@ impl MuxelApp {
                     } else if !v.has_visible_content() {
                         self.terminal_starting(iid, cx)
                     } else {
-                        terminal_pane_element(view, cx)
+                        terminal_pane_element(view, !is_active, cx)
                     }
                 } else if let Some(ed) = self.editors.get(&iid) {
                     // Clicking the editor makes it the active pane (so toolbar
@@ -15147,6 +15200,8 @@ impl MuxelApp {
                     group = group.child(panel.size_range(min_extent..Pixels::MAX).child(pane));
                 }
                 let resize_key = SharedString::from(key.clone());
+                let resize_terminal_ids =
+                    split_resize_terminal_ids(children, |iid| self.terminals.contains_key(&iid));
                 group = group.on_resize(move |state, _window, cx| {
                     let sizes: Vec<f32> = state
                         .read(cx)
@@ -15157,7 +15212,10 @@ impl MuxelApp {
                     let weak = cx.try_global::<MuxelHandle>().map(|h| h.0.clone());
                     if let Some(app) = weak.and_then(|w| w.upgrade()) {
                         let key = resize_key.clone();
-                        app.update(cx, |app, cx| app.update_split_sizes(key, sizes, cx));
+                        let terminal_ids = resize_terminal_ids.clone();
+                        app.update(cx, |app, cx| {
+                            app.update_split_sizes(key, sizes, terminal_ids, cx)
+                        });
                     }
                 });
 
@@ -23917,5 +23975,37 @@ mod browser_resource_tests {
             "https://example.com/page#a",
             "https://example.com/page#b"
         ));
+    }
+}
+
+#[cfg(test)]
+mod split_resize_tests {
+    use super::split_resize_terminal_ids;
+    use muxel_core::{LeafData, PaneNode, SplitDirection};
+    use uuid::Uuid;
+
+    #[test]
+    fn wakes_only_terminals_below_the_resized_split() {
+        let terminal_a = Uuid::new_v4();
+        let editor = Uuid::new_v4();
+        let terminal_b = Uuid::new_v4();
+        let outside = Uuid::new_v4();
+        let children = vec![
+            PaneNode::Leaf(LeafData {
+                tabs: vec![terminal_a, editor],
+                active: 0,
+            }),
+            PaneNode::Split {
+                direction: SplitDirection::Vertical,
+                sizes: vec![1.0, 1.0],
+                children: vec![PaneNode::leaf(terminal_b), PaneNode::leaf(Uuid::new_v4())],
+            },
+        ];
+
+        let ids = split_resize_terminal_ids(&children, |iid| {
+            iid == terminal_a || iid == terminal_b || iid == outside
+        });
+
+        assert_eq!(ids, vec![terminal_a, terminal_b]);
     }
 }
