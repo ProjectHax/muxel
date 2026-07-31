@@ -996,8 +996,16 @@ impl TerminalView {
         self.session.title()
     }
 
+    pub fn clear_title(&self) {
+        self.session.clear_title();
+    }
+
     pub fn session_id_hint(&self) -> Option<String> {
         self.session.session_id_hint()
+    }
+
+    pub fn child_pid(&self) -> Option<u32> {
+        self.session.child_pid()
     }
 
     /// Replace the color palette used to render this terminal. Also pushed into
