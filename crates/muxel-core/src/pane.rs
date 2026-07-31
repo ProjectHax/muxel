@@ -283,15 +283,44 @@ impl PaneNode {
         }
     }
 
-    /// Stable key for a split node: its descendant instance ids, simple-joined.
-    /// The renderer uses this as the split's element id, so size persistence can
-    /// match a resize event back to the right split.
+    /// Stable structural key for a split node. Leaf boundaries are part of the
+    /// identity so moving a tab between panes resets the renderer's cached panel
+    /// sizes even when the flat descendant instance order does not change.
     pub fn split_key(&self) -> String {
-        self.collect_instances()
-            .iter()
-            .map(|id| id.simple().to_string())
-            .collect::<Vec<_>>()
-            .join("-")
+        fn append(node: &PaneNode, out: &mut String) {
+            match node {
+                PaneNode::Leaf(leaf) => {
+                    let mut ids: Vec<_> =
+                        leaf.tabs.iter().map(|id| id.simple().to_string()).collect();
+                    ids.sort_unstable();
+                    out.push_str("l(");
+                    out.push_str(&ids.join(","));
+                    out.push(')');
+                }
+                PaneNode::Split {
+                    direction,
+                    children,
+                    ..
+                } => {
+                    out.push(match direction {
+                        SplitDirection::Horizontal => 'h',
+                        SplitDirection::Vertical => 'v',
+                    });
+                    out.push('(');
+                    for (index, child) in children.iter().enumerate() {
+                        if index > 0 {
+                            out.push('|');
+                        }
+                        append(child, out);
+                    }
+                    out.push(')');
+                }
+            }
+        }
+
+        let mut key = String::new();
+        append(self, &mut key);
+        key
     }
 
     /// The narrowest this tree lays out in, given a pane that will not shrink below
@@ -878,12 +907,16 @@ fn transfer_vanishing_leaf_size(
     source_path: &[usize],
     target_path: &[usize],
 ) {
-    let (Some((&source_index, source_parent)), Some((&target_index, target_parent))) =
-        (source_path.split_last(), target_path.split_last())
-    else {
+    let Some((&source_index, source_parent)) = source_path.split_last() else {
         return;
     };
-    if source_parent != target_parent {
+    if !target_path.starts_with(source_parent) || target_path.len() <= source_parent.len() {
+        return;
+    }
+    // The destination leaf may be nested inside the adjacent column. Transfer
+    // to that direct child of the source split, not the leaf's immediate parent.
+    let target_index = target_path[source_parent.len()];
+    if source_index.abs_diff(target_index) != 1 {
         return;
     }
     let Some(root) = tree.as_mut() else {
@@ -896,13 +929,13 @@ fn transfer_vanishing_leaf_size(
     if !source_is_sole_tab {
         return;
     }
-    let Some(PaneNode::Split { children, sizes, .. }) = root.get_at_path_mut(source_parent) else {
+    let Some(PaneNode::Split {
+        children, sizes, ..
+    }) = root.get_at_path_mut(source_parent)
+    else {
         return;
     };
-    if sizes.len() != children.len()
-        || source_index >= sizes.len()
-        || target_index >= sizes.len()
-    {
+    if sizes.len() != children.len() || source_index >= sizes.len() || target_index >= sizes.len() {
         return;
     }
     sizes[target_index] += sizes[source_index];
@@ -1023,6 +1056,7 @@ pub fn swap_panes(tree: &mut Option<PaneNode>, a: Uuid, b: Uuid) -> bool {
 /// Returns true if a matching split was found.
 pub fn set_split_sizes(tree: &mut Option<PaneNode>, key: &str, sizes: &[f32]) -> bool {
     fn walk(node: &mut PaneNode, key: &str, sizes: &[f32]) -> bool {
+        let this_key = node.split_key();
         match node {
             PaneNode::Leaf(..) => false,
             PaneNode::Split {
@@ -1030,12 +1064,6 @@ pub fn set_split_sizes(tree: &mut Option<PaneNode>, key: &str, sizes: &[f32]) ->
                 children,
                 ..
             } => {
-                let this_key: String = children
-                    .iter()
-                    .flat_map(|c| c.collect_instances())
-                    .map(|id| id.simple().to_string())
-                    .collect::<Vec<_>>()
-                    .join("-");
                 if this_key == key {
                     if sizes.len() == children.len() {
                         *node_sizes = sizes.to_vec();
@@ -1365,6 +1393,24 @@ mod tests {
         }
         // Unknown key + wrong-length sizes are no-ops.
         assert!(!set_split_sizes(&mut tree, "nope", &[1.0, 1.0]));
+    }
+
+    #[test]
+    fn split_key_changes_when_flat_instance_order_keeps_new_leaf_boundaries() {
+        let (a, b, c) = (id(), id(), id());
+        let separate = PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![1.0, 1.0, 1.0],
+            children: vec![PaneNode::leaf(a), PaneNode::leaf(b), PaneNode::leaf(c)],
+        };
+        let grouped = PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![2.0, 1.0],
+            children: vec![tabs_leaf(vec![a, b], 0), PaneNode::leaf(c)],
+        };
+
+        assert_eq!(separate.collect_instances(), grouped.collect_instances());
+        assert_ne!(separate.split_key(), grouped.split_key());
     }
 
     #[test]
@@ -1828,11 +1874,7 @@ mod tests {
         let mut tree = Some(PaneNode::Split {
             direction: SplitDirection::Horizontal,
             sizes: vec![200.0, 300.0, 500.0],
-            children: vec![
-                PaneNode::leaf(a),
-                PaneNode::leaf(b),
-                PaneNode::leaf(c),
-            ],
+            children: vec![PaneNode::leaf(a), PaneNode::leaf(b), PaneNode::leaf(c)],
         });
 
         assert!(move_tab_to(&mut tree, a, b, usize::MAX));
@@ -1867,6 +1909,64 @@ mod tests {
             panic!("expected all three columns to remain");
         };
         assert_eq!(sizes, &[200.0, 300.0, 500.0]);
+    }
+
+    #[test]
+    fn move_tab_to_transfers_width_to_adjacent_nested_destination_column() {
+        let (a, b, c, d) = (id(), id(), id(), id());
+        let destination = PaneNode::Split {
+            direction: SplitDirection::Vertical,
+            sizes: vec![1.0, 1.0],
+            children: vec![PaneNode::leaf(b), PaneNode::leaf(c)],
+        };
+        let mut tree = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![200.0, 300.0, 500.0],
+            children: vec![PaneNode::leaf(a), destination, PaneNode::leaf(d)],
+        });
+
+        assert!(move_tab_to(&mut tree, a, b, usize::MAX));
+
+        let Some(PaneNode::Split {
+            sizes, children, ..
+        }) = tree.as_ref()
+        else {
+            panic!("expected the two remaining columns");
+        };
+        assert_eq!(sizes, &[500.0, 500.0]);
+        assert_eq!(
+            children[0].get_at_path(&[0]).unwrap().tabs(),
+            Some((&[b, a][..], 1))
+        );
+    }
+
+    #[test]
+    fn move_tab_to_transfers_width_from_right_into_nested_destination_column() {
+        let (a, b, c, d) = (id(), id(), id(), id());
+        let destination = PaneNode::Split {
+            direction: SplitDirection::Vertical,
+            sizes: vec![1.0, 1.0],
+            children: vec![PaneNode::leaf(b), PaneNode::leaf(c)],
+        };
+        let mut tree = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![500.0, 300.0, 200.0],
+            children: vec![PaneNode::leaf(d), destination, PaneNode::leaf(a)],
+        });
+
+        assert!(move_tab_to(&mut tree, a, c, usize::MAX));
+
+        let Some(PaneNode::Split {
+            sizes, children, ..
+        }) = tree.as_ref()
+        else {
+            panic!("expected the two remaining columns");
+        };
+        assert_eq!(sizes, &[500.0, 500.0]);
+        assert_eq!(
+            children[1].get_at_path(&[1]).unwrap().tabs(),
+            Some((&[c, a][..], 1))
+        );
     }
 
     #[test]
