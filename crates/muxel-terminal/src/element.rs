@@ -936,6 +936,7 @@ fn link_at(
         // same URI (the hyperlink id/uri, not the visible text, is the link).
         // Agents sometimes put a bare relative path in the URI; resolve those
         // the same way as plain path text so the open target is a real file://.
+        let mut osc_link = None;
         if let Some(link) = grid[point].hyperlink() {
             let raw_uri = link.uri().to_string();
             let same = |c: usize| {
@@ -951,13 +952,18 @@ fn link_at(
             while end < columns && same(end) {
                 end += 1;
             }
-            let url = checked_link_uri(&normalize_link_uri(&raw_uri, session), session)?;
-            return Some(HoveredLink {
-                line: point.line.0,
-                start,
-                end,
-                url,
-            });
+            if let Some(url) = checked_link_uri(&normalize_link_uri(&raw_uri, session), session) {
+                osc_link = Some(HoveredLink {
+                    line: point.line.0,
+                    start,
+                    end,
+                    url,
+                });
+            }
+            // Grok can emit OSC 8 metadata truncated at its own hard wrap while
+            // printing the complete Markdown target across adjacent rows. Defer
+            // the OSC candidate until visible-text parsing has had a chance to
+            // reconstruct the full target.
         }
 
         // Reconstruct the logical line around the pointer. Alacritty marks a soft
@@ -991,25 +997,27 @@ fn link_at(
             // guards against joining unrelated text.
             let next_text = first_text_column(line + 1);
             let end = last_text_column(line);
-            // A hard-wrapped token should end near the TUI's right edge. Without
-            // this bound, an ordinary URL at the end of a short paragraph absorbs
-            // the next line as though it were one long URL.
-            if end == 0
-                || end.saturating_add(16) < columns
-                || next_text > 12
-                || next_text >= columns
-            {
+            if end == 0 || next_text >= columns {
                 return false;
+            }
+            // Some TUIs hard-wrap a rendered Markdown target inside their own
+            // content column. The grid has a real newline, but both fragments
+            // remain hyperlink-decorated. That is a stronger continuation
+            // signal than proximity to the terminal's right edge.
+            if grid[GridPoint::new(line, Column(end - 1))]
+                .hyperlink()
+                .is_some()
+                && grid[GridPoint::new(line + 1, Column(next_text))]
+                    .hyperlink()
+                    .is_some()
+            {
+                return true;
             }
             let chars: Vec<char> = (0..end)
                 .map(|column| grid[GridPoint::new(line, Column(column))].c)
+                .chain(std::iter::repeat_n(' ', columns - end))
                 .collect();
-            crate::links::url_spans(&chars)
-                .into_iter()
-                .any(|(_, span_end)| span_end == end)
-                || crate::links::path_spans(&chars)
-                    .into_iter()
-                    .any(|(_, span_end, _)| span_end == end)
+            crate::links::hard_wraps_to_next(&chars, next_text)
         };
         let mut first_line = point.line;
         while first_line > grid.topmost_line()
@@ -1037,7 +1045,7 @@ fn link_at(
         let clicked_row = (point.line.0 - first_line.0) as usize;
         let stitched = crate::links::stitch_rows(&rows, clicked_row, point.column.0);
         if !stitched.clicked_in_content {
-            return None;
+            return osc_link;
         }
         let chars = stitched.chars;
         let logical_column = stitched.clicked_col;
@@ -1050,38 +1058,112 @@ fn link_at(
             end: end.min(row_base + row_len) - row_base + row_start,
             url,
         };
+        // OSC 8 is authoritative unless visible reconstruction strictly extends
+        // its URI. Grok can truncate OSC metadata at a hard wrap; ordinary TUIs
+        // more often truncate only the painted label, where OSC must win.
+        let prefer_candidate = |candidate: HoveredLink| {
+            osc_link.as_ref().map_or(candidate.clone(), |osc| {
+                if candidate.url.len() > osc.url.len() && candidate.url.starts_with(&osc.url) {
+                    candidate
+                } else {
+                    osc.clone()
+                }
+            })
+        };
 
         if let Some((start, end, target)) = crate::links::markdown_link_at(&chars, logical_column)
             && let Some(url) = checked_link_uri(&target, session)
         {
-            return Some(hovered(start, end, url));
+            return Some(prefer_candidate(hovered(start, end, url)));
         }
         if let Some((start, end, target)) =
             crate::links::rendered_markdown_link_at(&chars, logical_column)
             && let Some(url) = checked_link_uri(&target, session)
         {
-            return Some(hovered(start, end, url));
+            return Some(prefer_candidate(hovered(start, end, url)));
         }
-        if let Some((start, end, url)) = crate::links::url_span_at(&chars, logical_column) {
-            let url = checked_link_uri(&url, session)?;
-            return Some(hovered(start, end, url));
+
+        // Literal Markdown can span real TUI rows whose wrap metadata is not
+        // recoverable from terminal margins. Scan the surrounding nonblank
+        // paragraph as one bounded token so every destination row carries the
+        // complete target.
+        let content_chars = |line: Line| {
+            let mut chars: Vec<char> = (0..columns)
+                .map(|column| grid[GridPoint::new(line, Column(column))].c)
+                .collect();
+            crate::links::strip_box_margins(&mut chars);
+            chars
+        };
+        let content_is_empty = |line: Line| content_chars(line).iter().all(|c| c.is_whitespace());
+        let mut paragraph_first = point.line;
+        while paragraph_first > grid.topmost_line()
+            && point.line.0 - paragraph_first.0 < 8
+            && !content_is_empty(paragraph_first - 1)
+        {
+            paragraph_first -= 1;
+        }
+        let mut paragraph_last = point.line;
+        while paragraph_last < grid.bottommost_line()
+            && paragraph_last.0 - point.line.0 < 8
+            && !content_is_empty(paragraph_last + 1)
+        {
+            paragraph_last += 1;
+        }
+        let paragraph_rows: Vec<(Vec<char>, bool)> = (paragraph_first.0..=paragraph_last.0)
+            .map(|line_number| {
+                let line = Line(line_number);
+                (content_chars(line), false)
+            })
+            .collect();
+        let paragraph_clicked_row = (point.line.0 - paragraph_first.0) as usize;
+        let paragraph =
+            crate::links::stitch_rows(&paragraph_rows, paragraph_clicked_row, point.column.0);
+        if paragraph.clicked_in_content {
+            let paragraph_hovered = |start: usize, end: usize, url: String| HoveredLink {
+                line: point.line.0,
+                start: start.max(paragraph.row_base) - paragraph.row_base + paragraph.row_start,
+                end: end.min(paragraph.row_base + paragraph.row_len) - paragraph.row_base
+                    + paragraph.row_start,
+                url,
+            };
+            if let Some((start, end, target)) =
+                crate::links::markdown_link_at(&paragraph.chars, paragraph.clicked_col)
+                && let Some(url) = checked_link_uri(&target, session)
+            {
+                return Some(prefer_candidate(paragraph_hovered(start, end, url)));
+            }
+            if let Some((start, end, target)) =
+                crate::links::markdown_target_at(&paragraph.chars, paragraph.clicked_col)
+                && let Some(url) = checked_link_uri(&target, session)
+            {
+                return Some(prefer_candidate(paragraph_hovered(start, end, url)));
+            }
+        }
+        if let Some((start, end, url)) = crate::links::url_span_at(&chars, logical_column)
+            && let Some(url) = checked_link_uri(&url, session)
+        {
+            return Some(prefer_candidate(hovered(start, end, url)));
+        }
+        if osc_link.is_some() {
+            return osc_link;
         }
         if let Some((start, end, raw)) = crate::links::path_span_at(&chars, logical_column) {
             // Remote sessions have no local cwd. Do not resolve an absolute
             // remote path against a coincidentally matching local file.
-            session.cwd()?;
-            let home = std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(std::path::PathBuf::from);
-            if let Some(abs) = crate::links::resolve_path(&raw, session.cwd(), home.as_deref())
-                && abs.exists()
-            {
-                let visible: String = chars[start..end].iter().collect();
-                let mut url = crate::links::file_uri(&abs);
-                if let Some(fragment) = crate::links::source_fragment(&visible) {
-                    url.push_str(&fragment);
+            if session.cwd().is_some() {
+                let home = std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(std::path::PathBuf::from);
+                if let Some(abs) = crate::links::resolve_path(&raw, session.cwd(), home.as_deref())
+                    && abs.exists()
+                {
+                    let visible: String = chars[start..end].iter().collect();
+                    let mut url = crate::links::file_uri(&abs);
+                    if let Some(fragment) = crate::links::source_fragment(&visible) {
+                        url.push_str(&fragment);
+                    }
+                    return Some(prefer_candidate(hovered(start, end, url)));
                 }
-                return Some(hovered(start, end, url));
             }
         }
         None

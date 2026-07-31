@@ -438,6 +438,13 @@ mod imp {
         pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
             let wv = self.webview.as_ref()?;
             let current = wv.read(cx).url().ok()?;
+            // A newly created WebView2 reports its bootstrap document before
+            // the requested navigation commits. Persisting that transient URL
+            // loses the resource identity and lets a fast second click create
+            // a duplicate pane.
+            if current == "about:blank" && self.url != "about:blank" {
+                return None;
+            }
             // A requested navigation hasn't committed yet: the webview still
             // reports the page we're leaving, so don't sync it back.
             if self.pending_navigation_from.as_deref() == Some(current.as_str()) {
