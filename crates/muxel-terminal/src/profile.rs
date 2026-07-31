@@ -569,6 +569,19 @@ pub fn key_handled(instance_id: Uuid, held: bool, elapsed: Duration) {
     touch();
 }
 
+/// Record that a terminal pointer listener ran and whether the child currently
+/// owns mouse input. A missing line during a reported mouse outage distinguishes
+/// lost GPUI listeners from a TUI that enabled mouse reporting.
+pub fn pointer_routed(instance_id: Uuid, event: &str, mouse_reporting: bool, shift: bool) {
+    if !enabled() {
+        return;
+    }
+    emit_line(&format!(
+        "term-pointer[v1] pane={instance_id} event={event} mouse_reporting={mouse_reporting} shift={shift}"
+    ));
+    touch();
+}
+
 pub fn notify_scheduled(instance_id: Uuid, request: PaintRequest, min_interval: Duration) {
     if !enabled() {
         return;
