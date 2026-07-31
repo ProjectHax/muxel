@@ -37,6 +37,8 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
+- **Direct pane creation controls** — pane-local tab and split buttons clone the
+  shown pane's agent in one click; right-click opens the alternate-agent picker.
 - **Drag & reorder** — drag tab pills to reorder within a pane, move them to other
   panes, or drop at a precise insertion point.
 - **Pinned tabs** — pin a tab to the leftmost block; pins behave fluidly when

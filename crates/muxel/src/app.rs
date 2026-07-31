@@ -1608,9 +1608,6 @@ pub struct MuxelApp {
     waking: bool,
     /// Set once the user confirms quitting, so the close hook stops vetoing.
     confirm_quit: bool,
-    /// An in-progress split/new-tab button press (target pane + placement). A
-    /// short release places with the current preset; holding opens the picker.
-    place_pending: Option<(Uuid, PlacementMode)>,
     /// When set, the agent picker is shown: (target, placement, anchor point).
     place_menu: Option<(Uuid, PlacementMode, Point<Pixels>)>,
     /// While dragging a tab over a pane: (leaf anchor, insertion index) for the
@@ -3331,7 +3328,6 @@ impl MuxelApp {
             stt_hold: false,
             waking: false,
             confirm_quit: false,
-            place_pending: None,
             place_menu: None,
             tab_drop: None,
             pane_drop: None,
@@ -7477,14 +7473,18 @@ impl MuxelApp {
     /// Tab / New Pane shortcuts clone, so a new pane matches whatever you're on
     /// rather than the toolbar's "new agent" selector. `None` when there's no
     /// active instance or its preset no longer exists.
-    fn active_preset_index(&self) -> Option<usize> {
-        let inst = self.workspace.instance(self.active_instance?)?;
+    fn preset_index_for_instance(&self, iid: Uuid) -> Option<usize> {
+        let inst = self.workspace.instance(iid)?;
         if let Some(pid) = inst.preset_id
             && let Some(idx) = self.presets.iter().position(|p| p.id == pid)
         {
             return Some(idx);
         }
         self.presets.iter().position(|p| p.name == inst.preset)
+    }
+
+    fn active_preset_index(&self) -> Option<usize> {
+        self.preset_index_for_instance(self.active_instance?)
     }
 
     /// New tab / new pane from the **active pane's** preset (the keyboard
@@ -8836,44 +8836,31 @@ impl MuxelApp {
         );
     }
 
-    /// Mouse-down on a split / new-tab button: remember the press and, after a
-    /// hold, open the agent picker (anchored at `pos`) instead of placing.
-    fn begin_place_press(
+    /// Open the alternate-agent picker for a pane-local placement action.
+    fn open_place_menu(
         &mut self,
         iid: Uuid,
         placement: PlacementMode,
         pos: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.place_pending = Some((iid, placement));
-        cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(400))
-                .await;
-            let _ = view.update(cx, |this, cx| {
-                if this.place_pending == Some((iid, placement)) {
-                    this.place_pending = None;
-                    this.place_menu = Some((iid, placement, pos));
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.place_menu = Some((iid, placement, pos));
+        cx.notify();
     }
 
-    /// Mouse-up on a split / new-tab button: a short press (the hold timer hasn't
-    /// fired) places with the current preset.
-    fn end_place_press(
+    /// Create beside `iid` using that pane's preset. Resource panes and removed
+    /// presets fall back to the toolbar selection.
+    fn place_like_instance(
         &mut self,
         iid: Uuid,
         placement: PlacementMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.place_pending == Some((iid, placement)) {
-            self.place_pending = None;
-            self.place_with_preset(Some(iid), placement, self.current_preset, window, cx);
-        }
+        let preset = self
+            .preset_index_for_instance(iid)
+            .unwrap_or(self.current_preset);
+        self.place_with_preset(Some(iid), placement, preset, window, cx);
     }
 
     /// Pick an agent from the picker → create the pane or tab.
@@ -14363,27 +14350,25 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(IconName::PanelRight)
-                            .tooltip(t("Split right (hold to choose agent)"))
+                            .tooltip(t("Split right; right-click to choose agent"))
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                this.place_like_instance(
+                                    iid,
+                                    PlacementMode::Split(SplitDirection::Horizontal),
+                                    window,
+                                    cx,
+                                )
+                            }))
                             .on_mouse_down(
-                                MouseButton::Left,
+                                MouseButton::Right,
                                 cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
-                                    this.begin_place_press(
+                                    cx.stop_propagation();
+                                    this.open_place_menu(
                                         iid,
                                         PlacementMode::Split(SplitDirection::Horizontal),
                                         e.position,
                                         cx,
-                                    )
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _e, window, cx| {
-                                    this.end_place_press(
-                                        iid,
-                                        PlacementMode::Split(SplitDirection::Horizontal),
-                                        window,
-                                        cx,
-                                    )
+                                    );
                                 }),
                             ),
                     )
@@ -14392,27 +14377,25 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(IconName::PanelBottom)
-                            .tooltip(t("Split down (hold to choose agent)"))
+                            .tooltip(t("Split down; right-click to choose agent"))
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                this.place_like_instance(
+                                    iid,
+                                    PlacementMode::Split(SplitDirection::Vertical),
+                                    window,
+                                    cx,
+                                )
+                            }))
                             .on_mouse_down(
-                                MouseButton::Left,
+                                MouseButton::Right,
                                 cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
-                                    this.begin_place_press(
+                                    cx.stop_propagation();
+                                    this.open_place_menu(
                                         iid,
                                         PlacementMode::Split(SplitDirection::Vertical),
                                         e.position,
                                         cx,
-                                    )
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _e, window, cx| {
-                                    this.end_place_press(
-                                        iid,
-                                        PlacementMode::Split(SplitDirection::Vertical),
-                                        window,
-                                        cx,
-                                    )
+                                    );
                                 }),
                             ),
                     )
@@ -14891,9 +14874,8 @@ impl MuxelApp {
                     tab_row.push(mk_line());
                 }
 
-                // A quick click adds a tab with the current preset; holding opens
-                // the agent picker (same as the split buttons). Wrapped so the
-                // press doesn't also start the strip's pane drag.
+                // Click clones the shown pane into a new tab. Right-click opens
+                // the alternate-agent picker. The wrapper prevents pane drag.
                 let plus = div()
                     .flex_none()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -14902,22 +14884,20 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .label("+")
-                            .tooltip(t("New tab (hold to choose agent)"))
+                            .tooltip(t("New tab; right-click to choose agent"))
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                this.place_like_instance(anchor, PlacementMode::Tab, window, cx)
+                            }))
                             .on_mouse_down(
-                                MouseButton::Left,
+                                MouseButton::Right,
                                 cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
-                                    this.begin_place_press(
+                                    cx.stop_propagation();
+                                    this.open_place_menu(
                                         anchor,
                                         PlacementMode::Tab,
                                         e.position,
                                         cx,
-                                    )
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _e, window, cx| {
-                                    this.end_place_press(anchor, PlacementMode::Tab, window, cx)
+                                    );
                                 }),
                             ),
                     );
@@ -17370,25 +17350,6 @@ impl MuxelApp {
                     .selected(self.use_worktree)
                     .tooltip(t("Create a git worktree"))
                     .on_click(cx.listener(|this, _ev, _window, cx| this.toggle_worktree(cx))),
-            )
-            .child(div().w(px(6.0)))
-            .child(
-                Button::new("split-right")
-                    .ghost()
-                    .icon(IconName::PanelRight)
-                    .tooltip(t("Split right"))
-                    .on_click(cx.listener(|this, _ev, window, cx| {
-                        this.add_agent(SplitDirection::Horizontal, window, cx)
-                    })),
-            )
-            .child(
-                Button::new("split-down")
-                    .ghost()
-                    .icon(IconName::PanelBottom)
-                    .tooltip(t("Split down"))
-                    .on_click(cx.listener(|this, _ev, window, cx| {
-                        this.add_agent(SplitDirection::Vertical, window, cx)
-                    })),
             )
             .child(
                 Button::new("restart")
