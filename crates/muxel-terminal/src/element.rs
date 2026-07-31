@@ -1436,6 +1436,31 @@ impl TerminalElement {
                 }
             });
         }
+        // ---- Middle-click: open under the cursor in a background Muxel tab. ----
+        {
+            let session = self.session.clone();
+            let hitbox = hitbox.clone();
+            let focus = self.focus_handle.clone();
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || e.button != MouseButton::Middle
+                    || !hitbox.is_hovered(window)
+                {
+                    return;
+                }
+                if let Some(link) = link_at(
+                    &session,
+                    e.position - origin,
+                    cell_width,
+                    line_height,
+                    cols,
+                    rows,
+                ) {
+                    focus.dispatch_action(&crate::view::OpenLinkBackground(link.url), window, cx);
+                    cx.stop_propagation();
+                }
+            });
+        }
         // ---- Ctrl/Cmd+hover: underline the link under the cursor ----
         // Always remember the pointer so Ctrl pressed *without* a move still
         // hit-tests (users often park the mouse, then press Ctrl).

@@ -81,6 +81,11 @@ const TERM_INSET: Pixels = px(6.0);
 #[action(namespace = terminal, no_json)]
 pub struct OpenLink(pub String);
 
+/// Open a terminal link without moving focus away from the terminal.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = terminal, no_json)]
+pub struct OpenLinkBackground(pub String);
+
 /// Lifecycle state of a terminal/agent, shown as a badge. Inferred from the
 /// agent's TUI (per-agent markers), the bell, output activity, and process exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

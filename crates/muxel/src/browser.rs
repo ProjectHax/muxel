@@ -167,6 +167,9 @@ mod imp {
         /// Native page-focus events. WebView2 reports these from its controller;
         /// macOS uses guarded page IPC until WKWebView exposes the same seam.
         focus_events: std::sync::mpsc::Receiver<bool>,
+        /// URLs requested through target=_blank, window.open, Ctrl+click, or
+        /// middle-click. The app turns these into normal Muxel browser tabs.
+        new_window_events: std::sync::mpsc::Receiver<String>,
     }
 
     impl BrowserView {
@@ -228,6 +231,7 @@ mod imp {
                 .map(|h| ParentWindow(h.as_raw()));
             let requested = url.clone();
             let (focus_tx, focus_events) = std::sync::mpsc::channel();
+            let (new_window_tx, new_window_events) = std::sync::mpsc::channel();
 
             cx.spawn_in(window, async move |this, cx| {
                 #[cfg(target_os = "windows")]
@@ -256,7 +260,13 @@ mod imp {
 
                         let builder = builder
                             .with_url(&requested)
-                            .with_initialization_script(COPY_SCRIPT);
+                            .with_initialization_script(COPY_SCRIPT)
+                            .with_new_window_req_handler(move |url, _features| {
+                                // A dropped receiver means this BrowserView was already torn down;
+                                // still deny the native popup so no orphan OS window escapes.
+                                let _ = new_window_tx.send(url);
+                                wry::NewWindowResponse::Deny
+                            });
                         #[cfg(target_os = "macos")]
                         let builder = builder
                             .with_initialization_script(PAGE_CLICK_SCRIPT)
@@ -334,7 +344,19 @@ mod imp {
                 pending_navigation_from: None,
                 native_visible: true,
                 focus_events,
+                new_window_events,
             }
+        }
+
+        /// Drain page requests for a separate browsing context. Keeping this at
+        /// the app boundary gives all browser entry points the same dedupe and
+        /// tab-placement policy.
+        pub fn take_new_window_requests(&mut self) -> Vec<String> {
+            let mut urls = Vec::new();
+            while let Ok(url) = self.new_window_events.try_recv() {
+                urls.push(url);
+            }
+            urls
         }
 
         /// Whether the page was clicked since the last check (drains the queue).
