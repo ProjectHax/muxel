@@ -2893,9 +2893,17 @@ fn link_source_project(workspace: &Workspace, source: Option<Uuid>) -> Option<Uu
         .or(workspace.active_project)
 }
 
+/// Web content may request a new browsing context, but it must not gain the
+/// broader file and OS-protocol powers intentionally available to terminal links.
+fn browser_popup_url_allowed(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    })
+}
+
 #[cfg(test)]
 mod link_source_tests {
-    use super::{Instance, Project, Workspace, link_source_project};
+    use super::{Instance, Project, Workspace, browser_popup_url_allowed, link_source_project};
 
     #[test]
     fn emitting_pane_beats_the_later_active_project() {
@@ -2912,6 +2920,18 @@ mod link_source_tests {
             Some(source_project)
         );
         assert_eq!(link_source_project(&workspace, None), Some(later_project));
+    }
+
+    #[test]
+    fn browser_popups_only_enter_the_router_for_web_urls() {
+        assert!(browser_popup_url_allowed("https://example.com/new"));
+        assert!(browser_popup_url_allowed("HTTP://example.com/new"));
+        assert!(!browser_popup_url_allowed(
+            "file:///C:/Users/test/secret.txt"
+        ));
+        assert!(!browser_popup_url_allowed("mailto:test@example.com"));
+        assert!(!browser_popup_url_allowed("custom-protocol:payload"));
+        assert!(!browser_popup_url_allowed("//example.com/scheme-relative"));
     }
 }
 
@@ -6573,7 +6593,9 @@ impl MuxelApp {
                 );
             }
             for (source, url) in new_windows {
-                self.open_link_from(&url, Some(source), window, cx);
+                if browser_popup_url_allowed(&url) {
+                    self.open_link_from(&url, Some(source), window, cx);
+                }
             }
             if changed {
                 self.persist();
