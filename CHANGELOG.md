@@ -5,7 +5,54 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-07-31
+
+### Added
+- **Click a file citation in terminal output to open it** — agents cite files
+  constantly, and reading them meant retyping the path. A cited file now opens in
+  an editor pane at the referenced line and column. Links are reconstructed across
+  the soft wraps and hanging indents a TUI introduces, so a path broken over two
+  rows still opens as one target instead of a row-local fragment, and Markdown
+  labels (including Grok's rendered `label (file:///path)` form) resolve to their
+  destination. Terminal `OSC 8` hyperlinks stay authoritative unless the visible
+  text strictly extends a truncated URI, and UNC/network paths are refused.
+- **Opening the same file or URL twice reuses its pane** — a second citation for a
+  file you already have open focuses that tab rather than stacking another copy of
+  it. A clean buffer refreshes from disk first (a dirty one is left alone, never
+  silently replaced) and jumps to the newest requested position. Browser panes
+  reuse only on the exact canonical URL, so two pages on one domain stay separate,
+  and equivalent spellings of a path resolve to one resource.
+- **Agent panes show what the agent is actually doing** — Claude, Codex, and Grok
+  publish a semantic terminal title, and muxel now reads lifecycle state from it
+  instead of treating any output as work; screen markers remain a fallback for
+  older or customized clients. A long tool call no longer drifts into `done`
+  because one frame stopped animating. Completion, attendance, and idle timestamps
+  persist, so a finished agent you never looked at still reads `done · age` after a
+  restart, recently idle panes show minutes or hours, and old attended ones fade to
+  `stale · days`. A pane that hasn't drawn yet shows `loading` rather than a
+  manufactured state.
+- **Agent names survive a restart** — the changing title a program reports is now
+  persisted (debounced, and flushed on quit), so restored panes keep the name you
+  recognize instead of falling back to the preset name. A manual rename stays a
+  separate override that always wins; clearing it reveals the latest auto-title.
+  Bare session UUIDs and startup noise like `cmd.exe` are never adopted as names.
+- **Browser panes gained an open-in-system-browser button**, copy shortcuts that
+  work inside the page, and tab labels that show a local file's name.
+
 ### Fixed
+- **Opening a workspace no longer freezes the window** — restoring a workspace
+  created every terminal on the UI thread, so a handful of agent panes could stop
+  painting long enough for Windows to show "Not Responding". The selected layout
+  now paints first, the pane you can see starts first, and the rest are admitted in
+  bounded waves off the UI thread. Panes that haven't drawn yet show a loading
+  spinner. A launch that is superseded or cancelled kills its child rather than
+  leaving it orphaned, and a pane's saved session is marked started only once its
+  terminal actually exists — so a cancelled launch can't turn a fresh pane into a
+  false resume.
+- **Right-clicking a project no longer freezes the window** — the project menu
+  enumerated git branches synchronously, so a slow `git` call stalled the message
+  pump. Branch lists are now cached by the existing background refresh and the menu
+  reads only that.
 - **Scrolling one agent no longer slides every pane sideways** — once enough panes
   are open that the pane area scrolls horizontally, rolling the wheel over a
   terminal to read back through its output also dragged the whole strip left and
@@ -13,6 +60,36 @@ All notable changes to muxel are documented here. This project adheres to
   scrolls, and the pane strip scrolls only on X. It now takes real horizontal
   input — its scrollbar, a sideways trackpad swipe, or `Shift`+wheel — so a plain
   wheel belongs to the pane under the pointer.
+- **Two Codex panes in one project stop resuming each other's conversation** —
+  muxel recovered a Codex session by picking the newest rollout matching the
+  working directory, so concurrent panes aliased onto one conversation. Each pane
+  now binds to the UUID Codex publishes for it, and a `/resume` inside the running
+  TUI updates that binding. A saved id that has since disappeared starts fresh
+  instead of stealing a sibling's transcript.
+- **A Grok `/resume` survives a restart** — switching conversations inside a
+  running Grok pane left muxel bound to the conversation it started with, so a
+  restart reopened the wrong one. muxel now follows the switch and reopens what you
+  were actually in. (Local Windows panes; remote and tmux panes are unchanged.)
+- **Duplicating a pane no longer shares the original's conversation** — Duplicate
+  copied the resumable session id, so two live agents could write branches into one
+  transcript and only one pane came back after a restart. A duplicate now starts
+  its own conversation and keeps your manual name.
+- **Terminal color queries can't leak into an agent's prompt** — a reply generated
+  after the TUI stopped listening could appear as typed text. Replies are now
+  produced on the PTY reader thread, while the program is still waiting.
+- **Clicking into a browser pane behaves** — the address bar reliably accepts
+  clicks and typing after the page has held focus, right-click menus survive, and
+  a `file://` page no longer crashes the pane.
+- **Renaming a pane opens a usable editor** — the rename field is full width with
+  the current value selected, and the click that opened it can no longer commit it
+  immediately.
+
+### Changed
+- **Grok receives muxel's capability instructions as launch rules** — they were
+  typed into the prompt shortly after startup, which could append to and submit a
+  question you had already begun typing. They now go in via Grok's `--rules` flag
+  at launch. Existing Grok presets are migrated on upgrade; a runner or loop keeps
+  its one-shot typed prompt, since that's a task rather than durable rules.
 
 ## [0.1.5] — 2026-07-24
 
@@ -743,7 +820,8 @@ All notable changes to muxel are documented here. This project adheres to
 
 Initial public release.
 
-[Unreleased]: https://github.com/ProjectHax/muxel/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/ProjectHax/muxel/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/ProjectHax/muxel/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ProjectHax/muxel/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ProjectHax/muxel/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ProjectHax/muxel/compare/v0.1.2...v0.1.3
