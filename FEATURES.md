@@ -373,7 +373,7 @@ feature is added or changed, update the matching entry here in the same change**
   underlines the link and shows a pointing-hand cursor (Ctrl/Cmd down re-hit-tests
   without requiring a mouse move).
 - **Links in new tabs** — middle-clicking a terminal link opens it without stealing
-  terminal focus; browser 	arget=_blank, window.open, Ctrl+click, and middle-click
+  terminal focus; browser target=_blank, window.open, Ctrl+click, and middle-click
   requests stay in the source project and open as Muxel tabs.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
