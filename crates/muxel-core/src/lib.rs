@@ -504,7 +504,7 @@ impl Instance {
             .or_else(|| {
                 self.auto_name
                     .as_deref()
-                    .filter(|name| is_useful_auto_name(name))
+                    .filter(|name| is_useful_auto_name_for_program(name, self.program.as_deref()))
             })
             .unwrap_or(&self.title)
     }
@@ -513,7 +513,9 @@ impl Instance {
     /// changed, so callers can debounce disk writes without losing the last
     /// non-empty title.
     pub fn update_auto_name(&mut self, name: String) -> bool {
-        if !is_useful_auto_name(&name) || self.auto_name.as_ref() == Some(&name) {
+        if !is_useful_auto_name_for_program(&name, self.program.as_deref())
+            || self.auto_name.as_ref() == Some(&name)
+        {
             return false;
         }
         self.auto_name = Some(name);
@@ -1873,6 +1875,39 @@ pub fn is_useful_auto_name(name: &str) -> bool {
     !name.is_empty() && Uuid::parse_str(name).is_err()
 }
 
+/// Reject launcher-generated absolute paths such as Codex's packaged
+/// `.../codex-win32-x64.exe`. They identify an implementation binary, not a
+/// conversation. Ordinary titles and shell directory titles remain valid.
+fn is_useful_auto_name_for_program(name: &str, program: Option<&str>) -> bool {
+    if !is_useful_auto_name(name) {
+        return false;
+    }
+    let Some(program) = program else {
+        return true;
+    };
+    let name = name.trim().trim_matches('"');
+    let bytes = name.as_bytes();
+    let absolute = name.starts_with('/')
+        || name.starts_with("\\\\")
+        || bytes.get(1) == Some(&b':') && bytes.first().is_some_and(u8::is_ascii_alphabetic);
+    if !absolute {
+        return true;
+    }
+    let stem = |value: &str| {
+        let leaf = value.rsplit(['/', '\\']).next().unwrap_or(value);
+        leaf.strip_suffix(".exe")
+            .or_else(|| leaf.strip_suffix(".cmd"))
+            .or_else(|| leaf.strip_suffix(".bat"))
+            .unwrap_or(leaf)
+            .to_ascii_lowercase()
+    };
+    let program_stem = stem(program);
+    let title_stem = stem(name);
+    title_stem != program_stem
+        && !title_stem.starts_with(&format!("{program_stem}-"))
+        && !title_stem.starts_with(&format!("{program_stem}_"))
+}
+
 #[cfg(test)]
 mod instance_tests {
     use super::*;
@@ -1900,6 +1935,22 @@ mod instance_tests {
 
         instance.auto_name = Some("\t".into());
         assert_eq!(instance.display_name(), "Claude");
+    }
+
+    #[test]
+    fn packaged_agent_executable_path_is_not_a_display_name() {
+        let mut instance = Instance::shell(Uuid::new_v4());
+        instance.title = "Codex".into();
+        instance.program = Some("codex".into());
+        let leaked = r"C:\tools\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\codex-win32-x64.exe";
+
+        instance.auto_name = Some(leaked.into());
+        assert_eq!(instance.display_name(), "Codex");
+        instance.auto_name = None;
+        assert!(!instance.update_auto_name(leaked.into()));
+        assert_eq!(instance.auto_name, None);
+        assert!(instance.update_auto_name("Fix restore behavior".into()));
+        assert_eq!(instance.display_name(), "Fix restore behavior");
     }
 
     #[test]
