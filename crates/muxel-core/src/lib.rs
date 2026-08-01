@@ -128,10 +128,13 @@ impl AgentActivity {
                 }
             }
             AgentActivityState::Done => {
-                // A restored unseen completion already has its correct timestamp;
-                // keep it until the user attends the pane. Restored terminals can
-                // emit a false Working -> Done cycle while their CLI boots.
-                if !self.has_unattended_completion() && previous != Some(AgentActivityState::Done) {
+                // A restored completion already has its correct timestamp.
+                // Its first live sample is not a new event, even when focus marked it
+                // attended while the terminal was loading.
+                if !self.has_unattended_completion()
+                    && previous != Some(AgentActivityState::Done)
+                    && !(previous.is_none() && self.completed_at.is_some())
+                {
                     self.completed_at = Some(now);
                 }
                 self.blocked_at = None;
@@ -293,6 +296,22 @@ mod agent_activity_tests {
         ));
         assert!(activity.attend(200));
         assert!(!activity.has_unattended_completion());
+    }
+
+    #[test]
+    fn attended_restored_completion_keeps_its_age_on_first_live_sample() {
+        let mut activity = AgentActivity {
+            completed_at: Some(0),
+            ..AgentActivity::default()
+        };
+        assert!(activity.attend(2 * HOUR_MS));
+        assert!(!activity.has_unattended_completion());
+        assert!(!activity.observe(None, AgentActivityState::Done, 2 * HOUR_MS));
+        assert_eq!(activity.completed_at, Some(0));
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Done, &activity, 2 * HOUR_MS),
+            "done · 2h"
+        );
     }
 
     #[test]
