@@ -374,7 +374,8 @@ feature is added or changed, update the matching entry here in the same change**
   without requiring a mouse move).
 - **Links in new tabs** — middle-clicking a terminal link opens it without stealing
   terminal focus; browser target=_blank, window.open, Ctrl+click, and middle-click
-  requests stay in the source project and open as Muxel tabs.
+  requests stay in the source project and open as Muxel tabs. Right-clicking a
+  terminal link opens link actions instead of copying or pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can

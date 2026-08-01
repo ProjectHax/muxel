@@ -405,14 +405,47 @@ fn cached_terminal_view(view: Entity<TerminalView>) -> AnyView {
 /// itself. Shared by the main pane and pop-out windows.
 fn terminal_pane_element(view: &Entity<TerminalView>, cx: &App) -> AnyElement {
     let cached = cached_terminal_view(view.clone());
-    if view.read(cx).mouse_mode() != TerminalMouseMode::RightClickMenu {
-        return cached.into_any_element();
-    }
+    let mouse_mode = view.read(cx).mouse_mode();
     let view = view.clone();
     div()
         .size_full()
         .child(cached)
-        .context_menu(move |menu, window, _cx| {
+        .context_menu(move |mut menu, window, cx| {
+            if let Some(url) = view.read(cx).link_at_pointer() {
+                let foreground_url = url.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t("Open link")).on_click(window.listener_for(
+                        &view,
+                        move |this, _e, window, cx| {
+                            this.focus_handle(cx).dispatch_action(
+                                &muxel_terminal::OpenLink(foreground_url.clone()),
+                                window,
+                                cx,
+                            );
+                        },
+                    )),
+                );
+                let background_url = url.clone();
+                menu = menu.item(PopupMenuItem::new(t("Open in new tab")).on_click(
+                    window.listener_for(&view, move |this, _e, window, cx| {
+                        this.focus_handle(cx).dispatch_action(
+                            &muxel_terminal::OpenLinkBackground(background_url.clone()),
+                            window,
+                            cx,
+                        );
+                    }),
+                ));
+                return menu.item(
+                    PopupMenuItem::new(t("Copy link"))
+                        .icon(IconName::Copy)
+                        .on_click(window.listener_for(&view, move |_this, _e, _w, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                        })),
+                );
+            }
+            if mouse_mode != TerminalMouseMode::RightClickMenu {
+                return menu;
+            }
             menu.item(PopupMenuItem::new(t("Copy")).icon(IconName::Copy).on_click(
                 window.listener_for(&view, |this, _e, _w, cx| {
                     if let Some(text) = this

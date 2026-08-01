@@ -1032,6 +1032,20 @@ impl TerminalView {
         self.mouse_mode
     }
 
+    /// Link under the last pointer position, if the terminal grid can resolve one.
+    pub fn link_at_pointer(&self) -> Option<String> {
+        let hit = self.session.pointer_hit()?;
+        crate::element::link_at(
+            &self.session,
+            point(px(hit.local_x), px(hit.local_y)),
+            px(hit.cell_width),
+            px(hit.line_height),
+            hit.cols,
+            hit.rows,
+        )
+        .map(|link| link.url)
+    }
+
     /// Set the mouse copy/paste mode (pushed from settings).
     pub fn set_mouse_mode(&mut self, mode: TerminalMouseMode) {
         self.mouse_mode = mode;
