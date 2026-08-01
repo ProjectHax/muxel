@@ -14884,9 +14884,14 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(IconName::Plus)
-                            .tooltip(t("New tab; right-click to choose agent"))
+                            .tooltip(t("New tab"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
-                                this.place_like_instance(anchor, PlacementMode::Tab, window, cx)
+                                this.open_place_menu(
+                                    anchor,
+                                    PlacementMode::Tab,
+                                    window.mouse_position(),
+                                    cx,
+                                );
                             }))
                             .on_mouse_down(
                                 MouseButton::Right,
