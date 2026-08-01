@@ -88,6 +88,57 @@ fn activity_state(status: AgentStatus) -> AgentActivityState {
     }
 }
 
+/// A restored terminal may emit a synthetic Working cycle while its CLI boots.
+/// Preserve durable lifecycle timestamps through that cycle. A submitted turn is
+/// direct evidence of new work and ends the guard immediately; otherwise the first
+/// settled non-Working sample ends it after preserving that sample.
+fn restored_activity_sample(
+    guarded: bool,
+    submitted_turn: bool,
+    status: AgentStatus,
+) -> (bool, bool) {
+    let preserve = guarded && !submitted_turn;
+    let keep_guard = preserve && status == AgentStatus::Working;
+    (preserve, keep_guard)
+}
+
+#[cfg(test)]
+mod restored_activity_tests {
+    use super::{AgentStatus, restored_activity_sample};
+
+    #[test]
+    fn bootstrap_working_then_done_preserves_both_samples_and_settles() {
+        assert_eq!(
+            restored_activity_sample(true, false, AgentStatus::Working),
+            (true, true)
+        );
+        assert_eq!(
+            restored_activity_sample(true, false, AgentStatus::Done),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn bootstrap_working_then_idle_preserves_stale_age_and_settles() {
+        assert_eq!(
+            restored_activity_sample(true, false, AgentStatus::Working),
+            (true, true)
+        );
+        assert_eq!(
+            restored_activity_sample(true, false, AgentStatus::Idle),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn submitted_turn_ends_the_guard_as_real_work() {
+        assert_eq!(
+            restored_activity_sample(true, true, AgentStatus::Working),
+            (false, false)
+        );
+    }
+}
+
 fn persisted_status(status: AgentStatus, instance: Option<&Instance>) -> AgentStatus {
     // An unseen completion is a latch, not a sample. In particular, restored
     // terminals emit startup output that looks like fresh work before the agent
@@ -1449,6 +1500,8 @@ pub struct MuxelApp {
     /// Last rendered lifecycle copy per instance. Age labels change at coarse
     /// minute/hour/day boundaries without changing the underlying status.
     last_activity_labels: HashMap<Uuid, String>,
+    /// Restored panes whose CLI bootstrap status must not rewrite durable age.
+    restoring_activity: HashSet<Uuid>,
     /// Per-pane auto-continue state (the pane's **Auto** toggle). Only panes the
     /// user has armed appear here; runtime-only, never persisted.
     auto: HashMap<Uuid, AutoContinue>,
@@ -3376,6 +3429,7 @@ impl MuxelApp {
             dev_console_window: None,
             last_status: HashMap::new(),
             last_activity_labels: HashMap::new(),
+            restoring_activity: HashSet::new(),
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashSet::new(),
@@ -4173,6 +4227,19 @@ impl MuxelApp {
             view.set_mouse_mode(mouse_mode);
             view
         });
+        let has_durable_activity = self
+            .workspace
+            .instance(instance_id)
+            .is_some_and(|instance| {
+                instance.activity.work_started_at.is_some()
+                    || instance.activity.completed_at.is_some()
+                    || instance.activity.blocked_at.is_some()
+            });
+        if has_durable_activity {
+            self.restoring_activity.insert(instance_id);
+        } else {
+            self.restoring_activity.remove(&instance_id);
+        }
         self.terminals.insert(instance_id, view);
         self.terminal_launches
             .insert(instance_id, (Instant::now(), was_resume));
@@ -6560,6 +6627,7 @@ impl MuxelApp {
         struct Snap {
             iid: Uuid,
             status: AgentStatus,
+            raw_status: AgentStatus,
             session_id_hint: Option<String>,
             exited: bool,
             exit_code: Option<i32>,
@@ -6570,14 +6638,17 @@ impl MuxelApp {
             title: String,
             project: String,
             resume_error: bool,
+            submitted_turn: bool,
         }
         let snapshot: Vec<Snap> = self
             .terminals
             .iter()
             .map(|(iid, view)| {
                 let v = view.read(cx);
-                let status = persisted_status(v.status(), self.workspace.instance(*iid));
+                let raw_status = v.status();
+                let status = persisted_status(raw_status, self.workspace.instance(*iid));
                 let session_id_hint = v.session_id_hint();
+                let submitted_turn = v.session().has_submitted_turn();
                 let exited = v.exited();
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
@@ -6604,6 +6675,7 @@ impl MuxelApp {
                 Snap {
                     iid: *iid,
                     status,
+                    raw_status,
                     session_id_hint,
                     exited,
                     exit_code,
@@ -6612,6 +6684,7 @@ impl MuxelApp {
                     title,
                     project,
                     resume_error,
+                    submitted_turn,
                 }
             })
             .collect();
@@ -6633,6 +6706,7 @@ impl MuxelApp {
         for Snap {
             iid,
             status,
+            raw_status,
             session_id_hint,
             exited,
             exit_code,
@@ -6641,6 +6715,7 @@ impl MuxelApp {
             title,
             project,
             resume_error,
+            submitted_turn,
         } in snapshot
         {
             // Codex mints its own session id and publishes it as this pane's
@@ -6680,7 +6755,16 @@ impl MuxelApp {
                 .is_some_and(|instance| instance.activity.blocked_at.is_some());
             let previous = self.last_status.insert(iid, status);
             let changed = previous != Some(status);
-            if changed && let Some(instance) = self.workspace.instance_mut(iid) {
+            let guarded = self.restoring_activity.contains(&iid);
+            let (preserve_restored, keep_restore_guard) =
+                restored_activity_sample(guarded, submitted_turn, raw_status);
+            if !keep_restore_guard {
+                self.restoring_activity.remove(&iid);
+            }
+            if changed
+                && !preserve_restored
+                && let Some(instance) = self.workspace.instance_mut(iid)
+            {
                 activity_changed |= instance.activity.observe(
                     previous.map(activity_state),
                     activity_state(status),
@@ -6735,9 +6819,10 @@ impl MuxelApp {
             }
             // The first live sample after restore describes durable state, not a
             // new event. Do not notify again for a saved completion/block.
-            let restored_transition = previous.is_none()
-                && ((status == AgentStatus::Done && restored_unattended)
-                    || (status == AgentStatus::Blocked && restored_blocked));
+            let restored_transition = preserve_restored
+                || previous.is_none()
+                    && ((status == AgentStatus::Done && restored_unattended)
+                        || (status == AgentStatus::Blocked && restored_blocked));
             if changed && !attended && !restored_transition {
                 let kind = match status {
                     AgentStatus::Blocked => Some(NotifKind::Blocked),
