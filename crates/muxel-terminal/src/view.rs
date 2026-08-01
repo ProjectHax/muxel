@@ -342,7 +342,7 @@ fn classify(
 }
 
 /// Promote a working→idle transition to `Done`, latching it until the agent works
-/// again or the pane is attended. Returns `(displayed status, new latch state)`.
+/// again. Returns `(displayed status, new latch state)`.
 /// Pure half of [`TerminalView::status`]'s done-latch, so a finished turn shows
 /// Done even when the agent never rang the bell.
 ///
@@ -482,7 +482,7 @@ pub struct TerminalView {
     /// Latches `Done` from a working→finished transition so a completed turn shows
     /// Done (and notifies) even when the agent didn't ring the bell. `prev_raw` is
     /// the previous *raw* classification; the latch clears when the agent works
-    /// again or the pane is attended (see `clear_done`).
+    /// again.
     prev_raw: std::cell::Cell<Option<AgentStatus>>,
     done_latch: std::cell::Cell<bool>,
     /// Ready/Idle must be observed once, or a turn submitted, before a
@@ -1011,13 +1011,6 @@ impl TerminalView {
         self.status_cache
             .set(Some((content_gen, title_gen, status)));
         status
-    }
-
-    /// Clear the `Done` latch — called when the pane is attended, so a finished
-    /// turn drops back to Idle once you've looked at it.
-    pub fn clear_done(&self) {
-        self.done_latch.set(false);
-        self.status_cache.set(None);
     }
 
     /// Whether `needle` appears in the current visible grid — used by the app to

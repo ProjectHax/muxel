@@ -5478,9 +5478,8 @@ impl MuxelApp {
         }
         if let Some(view) = self.terminals.get(&iid) {
             if attend {
-                // Attending to a pane clears its "awaiting input" bell + "done" latch.
+                // Attendance clears notification emphasis, not lifecycle state.
                 view.read(cx).session().clear_bell();
-                view.read(cx).clear_done();
             }
             let handle = view.read(cx).focus_handle(cx);
             window.focus(&handle, cx);

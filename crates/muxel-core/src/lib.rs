@@ -89,6 +89,13 @@ pub enum AgentActivityState {
 }
 
 impl AgentActivity {
+    fn last_lifecycle_at(&self) -> Option<i64> {
+        [self.work_started_at, self.completed_at, self.blocked_at]
+            .into_iter()
+            .flatten()
+            .max()
+    }
+
     /// Whether a completed turn is newer than the last time the pane was
     /// attended. A missing attendance timestamp means the completion is unseen.
     pub fn has_unattended_completion(&self) -> bool {
@@ -161,7 +168,7 @@ pub fn agent_activity_label(
         AgentActivityState::Done => state_with_age("done", activity.completed_at, now),
         AgentActivityState::Blocked => state_with_age("blocked", activity.blocked_at, now),
         AgentActivityState::Idle => {
-            let Some(age) = age_millis(activity.last_attended_at, now) else {
+            let Some(age) = age_millis(activity.last_lifecycle_at(), now) else {
                 return "idle".to_string();
             };
             if age < MINUTE_MS {
@@ -234,7 +241,7 @@ mod agent_activity_tests {
         assert!(!activity.has_unattended_completion());
         assert_eq!(
             agent_activity_label(AgentActivityState::Idle, &activity, 460_000),
-            "idle · 1m"
+            "idle · 4m"
         );
     }
 
@@ -301,7 +308,8 @@ mod agent_activity_tests {
     #[test]
     fn label_boundaries_keep_the_middle_quiet() {
         let activity = AgentActivity {
-            last_attended_at: Some(0),
+            work_started_at: Some(0),
+            last_attended_at: Some(58 * MINUTE_MS),
             ..AgentActivity::default()
         };
         assert_eq!(
@@ -319,6 +327,19 @@ mod agent_activity_tests {
         assert_eq!(
             agent_activity_label(AgentActivityState::Idle, &activity, 3 * DAY_MS),
             "stale · 3d"
+        );
+    }
+
+    #[test]
+    fn attendance_does_not_reset_idle_age() {
+        let mut activity = AgentActivity {
+            completed_at: Some(0),
+            ..AgentActivity::default()
+        };
+        assert!(activity.attend(4 * DAY_MS));
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Idle, &activity, 4 * DAY_MS),
+            "stale · 4d"
         );
     }
 
@@ -343,7 +364,7 @@ mod agent_activity_tests {
     #[test]
     fn future_timestamps_clamp_to_now() {
         let activity = AgentActivity {
-            last_attended_at: Some(500_000),
+            work_started_at: Some(500_000),
             ..AgentActivity::default()
         };
         assert_eq!(

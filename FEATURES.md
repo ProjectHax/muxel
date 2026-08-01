@@ -178,9 +178,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A marker-based agent whose turn finishes
-  is held at **done** until you attend the pane — even if it never rang the bell —
-  and that unattended completion survives a muxel restart. Sidebar badges include
-  coarse age while work is blocked or done, show recently attended panes briefly
+  is held at **done** until the agent works again — even if it never rang the bell —
+  and that completion survives a muxel restart. Focusing the pane marks its
+  notification read without rewriting lifecycle state or age. Sidebar badges include
+  coarse age while work is blocked or done, show recent idle activity briefly
   (`idle · 12m`), omit ordinary middle age, and call out panes idle for three days
   or more (`stale · 4d`). Long pane titles ellipsize before the badge instead of
   pushing status out of the sidebar.
