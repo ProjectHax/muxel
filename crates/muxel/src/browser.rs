@@ -641,6 +641,11 @@ mod imp {
             None
         }
 
+        /// Linux has no embedded webview, so it cannot emit native popup requests.
+        pub fn take_new_window_requests(&mut self) -> Vec<String> {
+            Vec::new()
+        }
+
         pub fn set_native_visible(&mut self, _visible: bool, _cx: &mut Context<Self>) {}
 
         /// No embedded webview here, so clicks land on ordinary gpui elements and
