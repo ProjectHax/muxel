@@ -1195,6 +1195,51 @@ enum PlacementMode {
     /// Add the agent as a new tab in the target pane.
     Tab,
 }
+fn nearest_kind_instance(
+    instances: &[(Uuid, InstanceKind)],
+    kind: InstanceKind,
+    requested_anchor: Option<Uuid>,
+) -> Option<Uuid> {
+    let requested_index = requested_anchor.and_then(|anchor| {
+        instances
+            .iter()
+            .position(|(candidate, _)| *candidate == anchor)
+    });
+    instances
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, candidate_kind))| *candidate_kind == kind)
+        .min_by_key(|(index, _)| requested_index.map_or(*index, |anchor| index.abs_diff(anchor)))
+        .map(|(_, (candidate, _))| *candidate)
+}
+
+#[cfg(test)]
+mod resource_lane_tests {
+    use super::{InstanceKind, Uuid, nearest_kind_instance};
+
+    #[test]
+    fn chooses_same_kind_lane_nearest_the_requested_anchor() {
+        let left_browser = Uuid::new_v4();
+        let left_terminal = Uuid::new_v4();
+        let right_terminal = Uuid::new_v4();
+        let right_browser = Uuid::new_v4();
+        let instances = [
+            (left_browser, InstanceKind::Browser),
+            (left_terminal, InstanceKind::Terminal),
+            (right_terminal, InstanceKind::Terminal),
+            (right_browser, InstanceKind::Browser),
+        ];
+
+        assert_eq!(
+            nearest_kind_instance(&instances, InstanceKind::Browser, Some(right_terminal)),
+            Some(right_browser)
+        );
+        assert_eq!(
+            nearest_kind_instance(&instances, InstanceKind::Browser, Some(left_terminal)),
+            Some(left_browser)
+        );
+    }
+}
 
 fn selected_copy_text(text: String) -> Option<String> {
     (!text.is_empty()).then_some(text)
@@ -7714,11 +7759,10 @@ impl MuxelApp {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let Some(pid) = self.workspace.active_project else {
-                return;
-            };
-            let instance = Instance::browser(pid, url);
-            self.place_and_spawn(pid, instance, placement, target, None, window, cx);
+            // Browser presets are resource opens, not requests for another agent
+            // process. Route them through the canonical opener so the same full
+            // URL focuses and refreshes its existing tab before placement runs.
+            self.open_browser_at_with_placement(url, target, Some(placement), window, cx);
         }
     }
 
@@ -8162,6 +8206,18 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
+        self.open_browser_at_with_placement(url, target, None, window, cx)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open_browser_at_with_placement(
+        &mut self,
+        url: String,
+        target: Option<Uuid>,
+        placement: Option<PlacementMode>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
         let pid = self.workspace.active_project?;
         // Web resources require an exact URL match. Local files reuse by decoded
         // path so raw/file URI spellings and source fragments share one pane.
@@ -8200,25 +8256,8 @@ impl MuxelApp {
         }
         let instance = Instance::browser(pid, url.clone());
         let iid = instance.id;
-        let empty = self.workspace.project(pid).is_some_and(|p| p.is_empty());
-        let split_target = if empty { None } else { target };
-        match split_target {
-            Some(active) => {
-                let ok = self
-                    .workspace
-                    .project_mut(pid)
-                    .is_some_and(|p| split(&mut p.layout, active, SplitDirection::Horizontal, iid));
-                if !ok {
-                    return None;
-                }
-                self.workspace.add_instance(instance);
-            }
-            None => {
-                self.workspace.add_instance(instance);
-                if let Some(project) = self.workspace.project_mut(pid) {
-                    project.layout = Some(PaneNode::leaf(iid));
-                }
-            }
+        if !self.place_resource_instance(pid, instance, target, placement) {
+            return None;
         }
         let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
         self.browsers.insert(iid, view);
@@ -8379,25 +8418,8 @@ impl MuxelApp {
         }
         let instance = Instance::editor(pid, path.clone());
         let iid = instance.id;
-        let empty = self.workspace.project(pid).is_some_and(|p| p.is_empty());
-        let split_target = if empty { None } else { target };
-        match split_target {
-            Some(active) => {
-                let ok = self
-                    .workspace
-                    .project_mut(pid)
-                    .is_some_and(|p| split(&mut p.layout, active, SplitDirection::Horizontal, iid));
-                if !ok {
-                    return None;
-                }
-                self.workspace.add_instance(instance);
-            }
-            None => {
-                self.workspace.add_instance(instance);
-                if let Some(project) = self.workspace.project_mut(pid) {
-                    project.layout = Some(PaneNode::leaf(iid));
-                }
-            }
+        if !self.place_resource_instance(pid, instance, target, None) {
+            return None;
         }
         let config = self.editor_config();
         let ed = cx.new(|cx| EditorView::open(path.clone(), config, window, cx));
@@ -8502,32 +8524,69 @@ impl MuxelApp {
 
         let instance = Instance::diff(pid, dir.clone());
         let iid = instance.id;
-        let ok = self
-            .workspace
-            .project_mut(pid)
-            .is_some_and(|p| match anchor {
-                // Add the diff as a new tab in the anchor's pane (beside the agent
-                // it's diffing) rather than splitting off a whole new pane.
-                Some(a) => add_tab(&mut p.layout, a, iid),
-                None => {
-                    if p.is_empty() {
-                        p.layout = Some(PaneNode::leaf(iid));
-                        true
-                    } else {
-                        false
-                    }
-                }
-            });
-        if !ok {
+        if !self.place_resource_instance(pid, instance, anchor, None) {
             return;
         }
-        self.workspace.add_instance(instance);
         let config = self.editor_config();
         let ed = cx.new(|cx| EditorView::diff(dir, config, window, cx));
         self.editors.insert(iid, ed);
         self.focus_instance(iid, window, cx);
         self.persist();
         cx.notify();
+    }
+
+    /// Place a non-agent resource. Explicit New Tab/New Pane commands keep their
+    /// requested placement. Default opens join the nearest same-kind lane, or
+    /// create one beside the requested anchor when no such lane exists.
+    fn place_resource_instance(
+        &mut self,
+        pid: Uuid,
+        instance: Instance,
+        requested_anchor: Option<Uuid>,
+        placement: Option<PlacementMode>,
+    ) -> bool {
+        let iid = instance.id;
+        let kind = instance.kind;
+        let Some(project) = self.workspace.project(pid) else {
+            return false;
+        };
+        if project.is_empty() {
+            self.workspace.add_instance(instance);
+            if let Some(project) = self.workspace.project_mut(pid) {
+                project.layout = Some(PaneNode::leaf(iid));
+            }
+            return true;
+        }
+        let instances: Vec<_> = project
+            .instances()
+            .into_iter()
+            .filter_map(|candidate| {
+                self.workspace
+                    .instance(candidate)
+                    .map(|existing| (candidate, existing.kind))
+            })
+            .collect();
+        let same_kind = nearest_kind_instance(&instances, kind, requested_anchor);
+        let placed = self.workspace.project_mut(pid).is_some_and(|project| {
+            let fallback = || requested_anchor.or_else(|| project.first_instance());
+            match placement {
+                Some(PlacementMode::Tab) => {
+                    fallback().is_some_and(|anchor| add_tab(&mut project.layout, anchor, iid))
+                }
+                Some(PlacementMode::Split(direction)) => fallback()
+                    .is_some_and(|anchor| split(&mut project.layout, anchor, direction, iid)),
+                None if same_kind.is_some() => {
+                    add_tab(&mut project.layout, same_kind.unwrap(), iid)
+                }
+                None => fallback().is_some_and(|anchor| {
+                    split(&mut project.layout, anchor, SplitDirection::Horizontal, iid)
+                }),
+            }
+        });
+        if placed {
+            self.workspace.add_instance(instance);
+        }
+        placed
     }
 
     /// Re-run `git diff` for an open diff pane.

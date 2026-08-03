@@ -444,6 +444,9 @@ feature is added or changed, update the matching entry here in the same change**
   that tab and reloads it from disk when its buffer is clean; dirty buffers are
   never overwritten. File links can jump to `#L12C4`, and local HTML links open in
   the browser preview while HTML source panes offer a **Preview** action.
+- **Resource tab grouping** — files, diffs, and browser pages opened by default join
+  the nearest pane of the same type; explicit New Tab and New Pane commands still
+  use the requested tab or split placement.
 - **Git diff panel** — a toolbar button (far right) toggles a collapsible
   right-side panel with two tabs:
   - **Files** — the active project's changed files (added / modified / deleted /
