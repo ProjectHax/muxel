@@ -15400,8 +15400,8 @@ impl MuxelApp {
                     tab_row.push(mk_line());
                 }
 
-                // Click clones the shown pane into a new tab. Right-click opens
-                // the alternate-agent picker. The wrapper prevents pane drag.
+                // Both mouse buttons open the agent picker for a new tab. The
+                // wrapper prevents pane drag.
                 let plus = div()
                     .flex_none()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -15410,7 +15410,7 @@ impl MuxelApp {
                             .ghost()
                             .xsmall()
                             .icon(IconName::Plus)
-                            .tooltip(t("New tab"))
+                            .tooltip(t("New tab agent"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
                                 this.open_place_menu(
                                     anchor,
