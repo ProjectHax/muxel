@@ -132,10 +132,10 @@ render time.
 Muxel adopts a Codex UUID only while the pane is unbound and only when the UUID is
 the complete thread field of a valid semantic title. Later OSC titles cannot
 replace the saved UUID because terminal-title events carry no sender process
-identity. In-process conversation switches therefore require a pane restart to
-change the durable resume binding. The parser must still detect capability from
-title values actually observed; it must not infer correctness from a version
-string alone.
+identity. In-process conversation switches are therefore not persisted; creating
+a new pane establishes a different durable resume binding. The parser must still
+detect capability from title values actually observed; it must not infer
+correctness from a version string alone.
 
 Muxel does not install or upgrade Codex. Diagnostics may recommend upgrading when
 the expected semantic title contract is absent.

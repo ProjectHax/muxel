@@ -870,8 +870,18 @@ fn authoritative_terminal_auto_title(
     remote: bool,
     live_title: Option<&str>,
 ) -> Option<String> {
-    codex_session_auto_title(instance, codex_names, remote)
-        .or_else(|| live_title.and_then(|title| terminal_auto_title(instance, title)))
+    if let Some(name) = codex_session_auto_title(instance, codex_names, remote) {
+        return Some(name);
+    }
+    if !remote && is_codex_program(instance.program.as_deref()) && instance.session_id.is_some() {
+        return instance
+            .auto_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| muxel_core::is_useful_auto_name(name))
+            .map(str::to_string);
+    }
+    live_title.and_then(|title| terminal_auto_title(instance, title))
 }
 
 /// Terminal as a **cached** view element. Without `.cached(...)`, every window
@@ -1497,7 +1507,7 @@ fn claude_session_gone(
 /// Whether an agent-minted session id is no longer on disk (Codex today).
 fn agent_minted_session_gone(preset: &muxel_core::AgentPreset, session_id: &str) -> bool {
     let program = preset.program.as_deref().unwrap_or_default();
-    if !program.contains("codex") {
+    if !is_codex_program(Some(program)) {
         return false;
     }
     let Some(home) = home_dir() else {
@@ -24742,8 +24752,8 @@ mod grok_session_tests {
 #[cfg(test)]
 mod shell_title_tests {
     use super::{
-        authoritative_terminal_auto_title, codex_session_auto_title, initial_codex_session_id,
-        shell_dir_title, terminal_auto_title,
+        agent_minted_session_gone, authoritative_terminal_auto_title, codex_session_auto_title,
+        initial_codex_session_id, shell_dir_title, terminal_auto_title,
     };
     use muxel_core::{AgentPreset, Instance};
     use std::collections::HashMap;
@@ -24829,6 +24839,26 @@ mod shell_title_tests {
             ),
             Some("foo".to_string())
         );
+        codex.auto_name = Some("last saved name".to_string());
+        assert_eq!(
+            authoritative_terminal_auto_title(
+                &codex,
+                &HashMap::new(),
+                false,
+                Some("Forged child name | Ready ·"),
+            ),
+            Some("last saved name".to_string())
+        );
+        codex.auto_name = None;
+        assert_eq!(
+            authoritative_terminal_auto_title(
+                &codex,
+                &HashMap::new(),
+                false,
+                Some("Forged child name | Ready ·"),
+            ),
+            None
+        );
         assert_eq!(
             terminal_auto_title(&codex, "npm run test-v8-historical"),
             None
@@ -24862,6 +24892,12 @@ mod shell_title_tests {
             initial_codex_session_id(&preset, Some(&first), Some(&later_frame)),
             None
         );
+
+        let proxy = AgentPreset {
+            program: Some("codex-title-proxy.exe".to_string()),
+            ..preset
+        };
+        assert!(!agent_minted_session_gone(&proxy, &first));
     }
 
     #[test]
