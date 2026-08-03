@@ -236,8 +236,36 @@ enum PaneTree {
             tree = newRoot
             return true
         }
+        // When the source leaf vanishes beside the target, give its split span
+        // to the destination instead of the remaining siblings.
+        transferVanishingLeafSize(&tree, sourcePath: pd, targetPath: pt)
         guard remove(&tree, target: dragged) else { return false }
         return addTabAt(&tree, target: targetAnchor, newInstance: dragged, index: index)
+    }
+
+    private static func transferVanishingLeafSize(_ tree: inout PaneNode?,
+                                                  sourcePath: [Int], targetPath: [Int]) {
+        guard let sourceIndex = sourcePath.last else { return }
+        let sourceParent = Array(sourcePath.dropLast())
+        guard targetPath.starts(with: sourceParent), targetPath.count > sourceParent.count else { return }
+
+        // The destination leaf may be nested inside the adjacent column. Transfer
+        // to that direct child of the source split, not the leaf's immediate parent.
+        let targetIndex = targetPath[sourceParent.count]
+        guard Swift.abs(sourceIndex - targetIndex) == 1,
+              var root = tree,
+              root.node(atPath: sourcePath)?.leafTabs?.tabs.count == 1,
+              case let .split(direction, sizes, children)? = root.node(atPath: sourceParent),
+              sizes.count == children.count,
+              sourceIndex < sizes.count,
+              targetIndex < sizes.count else { return }
+
+        var nextSizes = sizes
+        nextSizes[targetIndex] += nextSizes[sourceIndex]
+        root = root.replacingNode(atPath: sourceParent) { _ in
+            .split(direction: direction, sizes: nextSizes, children: children)
+        }
+        tree = root
     }
 
     /// Move `dragged` out of its pane and append it as the active tab of `target`'s

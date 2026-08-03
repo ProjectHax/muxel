@@ -245,6 +245,75 @@ final class PaneMutationTests: XCTestCase {
         XCTAssertEqual(tree?.leafTabs?.tabs, ["a", "b"])
     }
 
+    func testMoveTabToTransfersVanishingSourceWidthToDestination() {
+        var tree: PaneNode? = .split(
+            direction: .horizontal,
+            sizes: [200, 300, 500],
+            children: [single("a"), single("b"), single("c")]
+        )
+
+        XCTAssertTrue(PaneTree.moveTabTo(&tree, dragged: "a", targetAnchor: "b", index: Int.max))
+
+        guard case let .split(_, sizes, children)? = tree else { return XCTFail("expected two columns") }
+        XCTAssertEqual(sizes, [500, 500])
+        XCTAssertEqual(children[0].leafTabs?.tabs, ["b", "a"])
+        XCTAssertEqual(children[0].leafTabs?.active, 1)
+        XCTAssertEqual(children[1].leafTabs?.tabs, ["c"])
+    }
+
+    func testMoveTabToKeepsSizesWhenSourceLeafSurvives() {
+        var tree: PaneNode? = .split(
+            direction: .horizontal,
+            sizes: [200, 300, 500],
+            children: [tabsLeaf(["a", "d"]), single("b"), single("c")]
+        )
+
+        XCTAssertTrue(PaneTree.moveTabTo(&tree, dragged: "a", targetAnchor: "b", index: Int.max))
+
+        guard case let .split(_, sizes, _)? = tree else { return XCTFail("expected three columns") }
+        XCTAssertEqual(sizes, [200, 300, 500])
+    }
+
+    func testMoveTabToTransfersWidthToAdjacentNestedDestinationColumn() {
+        let destination = PaneNode.split(
+            direction: .vertical,
+            sizes: [1, 1],
+            children: [single("b"), single("c")]
+        )
+        var tree: PaneNode? = .split(
+            direction: .horizontal,
+            sizes: [200, 300, 500],
+            children: [single("a"), destination, single("d")]
+        )
+
+        XCTAssertTrue(PaneTree.moveTabTo(&tree, dragged: "a", targetAnchor: "b", index: Int.max))
+
+        guard case let .split(_, sizes, children)? = tree else { return XCTFail("expected two columns") }
+        XCTAssertEqual(sizes, [500, 500])
+        XCTAssertEqual(children[0].node(atPath: [0])?.leafTabs?.tabs, ["b", "a"])
+        XCTAssertEqual(children[0].node(atPath: [0])?.leafTabs?.active, 1)
+    }
+
+    func testMoveTabToTransfersWidthFromRightIntoNestedDestinationColumn() {
+        let destination = PaneNode.split(
+            direction: .vertical,
+            sizes: [1, 1],
+            children: [single("b"), single("c")]
+        )
+        var tree: PaneNode? = .split(
+            direction: .horizontal,
+            sizes: [500, 300, 200],
+            children: [single("d"), destination, single("a")]
+        )
+
+        XCTAssertTrue(PaneTree.moveTabTo(&tree, dragged: "a", targetAnchor: "c", index: Int.max))
+
+        guard case let .split(_, sizes, children)? = tree else { return XCTFail("expected two columns") }
+        XCTAssertEqual(sizes, [500, 500])
+        XCTAssertEqual(children[1].node(atPath: [1])?.leafTabs?.tabs, ["c", "a"])
+        XCTAssertEqual(children[1].node(atPath: [1])?.leafTabs?.active, 1)
+    }
+
     func testSetSplitSizesByKey() {
         var tree: PaneNode? = single("a")
         PaneTree.split(&tree, target: "a", direction: .horizontal, newInstance: "b")
