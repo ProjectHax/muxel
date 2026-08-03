@@ -505,14 +505,47 @@ fn cached_terminal_view(view: Entity<TerminalView>) -> AnyView {
 /// itself. Shared by the main pane and pop-out windows.
 fn terminal_pane_element(view: &Entity<TerminalView>, cx: &App) -> AnyElement {
     let cached = cached_terminal_view(view.clone());
-    if view.read(cx).mouse_mode() != TerminalMouseMode::RightClickMenu {
-        return cached.into_any_element();
-    }
+    let mouse_mode = view.read(cx).mouse_mode();
     let view = view.clone();
     div()
         .size_full()
         .child(cached)
-        .context_menu(move |menu, window, _cx| {
+        .context_menu(move |mut menu, window, cx| {
+            if let Some(url) = view.read(cx).link_at_pointer() {
+                let foreground_url = url.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t("Open link")).on_click(window.listener_for(
+                        &view,
+                        move |this, _e, window, cx| {
+                            this.focus_handle(cx).dispatch_action(
+                                &muxel_terminal::OpenLink(foreground_url.clone()),
+                                window,
+                                cx,
+                            );
+                        },
+                    )),
+                );
+                let background_url = url.clone();
+                menu = menu.item(PopupMenuItem::new(t("Open in new tab")).on_click(
+                    window.listener_for(&view, move |this, _e, window, cx| {
+                        this.focus_handle(cx).dispatch_action(
+                            &muxel_terminal::OpenLinkBackground(background_url.clone()),
+                            window,
+                            cx,
+                        );
+                    }),
+                ));
+                return menu.item(
+                    PopupMenuItem::new(t("Copy link"))
+                        .icon(IconName::Copy)
+                        .on_click(window.listener_for(&view, move |_this, _e, _w, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                        })),
+                );
+            }
+            if mouse_mode != TerminalMouseMode::RightClickMenu {
+                return menu;
+            }
             menu.item(PopupMenuItem::new(t("Copy")).icon(IconName::Copy).on_click(
                 window.listener_for(&view, |this, _e, _w, cx| {
                     if let Some(text) = this
@@ -3054,6 +3087,55 @@ enum GitDiffTab {
     #[default]
     Files,
     Worktrees,
+}
+
+fn link_source_project(workspace: &Workspace, source: Option<Uuid>) -> Option<Uuid> {
+    source
+        .and_then(|iid| workspace.instance(iid))
+        .map(|instance| instance.project_id)
+        .or(workspace.active_project)
+}
+
+/// Web content may request a new browsing context, but it must not gain the
+/// broader file and OS-protocol powers intentionally available to terminal links.
+fn browser_popup_url_allowed(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    })
+}
+
+#[cfg(test)]
+mod link_source_tests {
+    use super::{Instance, Project, Workspace, browser_popup_url_allowed, link_source_project};
+
+    #[test]
+    fn emitting_pane_beats_the_later_active_project() {
+        let mut workspace = Workspace::default();
+        let source_project = workspace.add_project(Project::new("source", "/source"));
+        let later_project = workspace.add_project(Project::new("later", "/later"));
+        workspace.active_project = Some(later_project);
+        let source = Instance::shell(source_project);
+        let source_id = source.id;
+        workspace.add_instance(source);
+
+        assert_eq!(
+            link_source_project(&workspace, Some(source_id)),
+            Some(source_project)
+        );
+        assert_eq!(link_source_project(&workspace, None), Some(later_project));
+    }
+
+    #[test]
+    fn browser_popups_only_enter_the_router_for_web_urls() {
+        assert!(browser_popup_url_allowed("https://example.com/new"));
+        assert!(browser_popup_url_allowed("HTTP://example.com/new"));
+        assert!(!browser_popup_url_allowed(
+            "file:///C:/Users/test/secret.txt"
+        ));
+        assert!(!browser_popup_url_allowed("mailto:test@example.com"));
+        assert!(!browser_popup_url_allowed("custom-protocol:payload"));
+        assert!(!browser_popup_url_allowed("//example.com/scheme-relative"));
+    }
 }
 
 impl MuxelApp {
@@ -6799,6 +6881,7 @@ impl MuxelApp {
             let views: Vec<(Uuid, Entity<crate::browser::BrowserView>)> =
                 self.browsers.iter().map(|(i, v)| (*i, v.clone())).collect();
             let mut changed = false;
+            let mut new_windows: Vec<(Uuid, String)> = Vec::new();
             for (iid, view) in views {
                 if let Some(url) = view.update(cx, |v, cx| v.sync(window, cx))
                     && let Some(inst) = self.workspace.instance_mut(iid)
@@ -6822,6 +6905,16 @@ impl MuxelApp {
                         // next tick because pane and address state are settled.
                         view.read(cx).focus_native(cx);
                     }
+                }
+                new_windows.extend(
+                    view.update(cx, |v, _| v.take_new_window_requests())
+                        .into_iter()
+                        .map(|url| (iid, url)),
+                );
+            }
+            for (source, url) in new_windows {
+                if browser_popup_url_allowed(&url) {
+                    self.open_link_from(&url, Some(source), window, cx);
                 }
             }
             if changed {
@@ -8108,6 +8201,19 @@ impl MuxelApp {
     /// otherwise macOS/Windows open an embedded browser pane and Linux spawns the
     /// separate muxel browser window.
     fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_link_from(url, self.active_instance, window, cx);
+    }
+
+    /// Route relative to the pane that emitted the link. Native browser popup
+    /// events arrive on a later tick, when the globally active pane may differ.
+    fn open_link_from(
+        &mut self,
+        url: &str,
+        source: Option<Uuid>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source_project = link_source_project(&self.workspace, source);
         if let Some(mut target) = muxel_terminal::file_target_from_uri(url) {
             let mut canonical_url = muxel_terminal::file_uri(&target.path);
             if let Some((_, fragment)) = url.split_once('#')
@@ -8132,21 +8238,17 @@ impl MuxelApp {
             #[cfg(not(target_os = "linux"))]
             if is_html
                 && self.settings.browser_enabled
-                && self
-                    .open_browser_at(canonical_url.clone(), self.active_instance, window, cx)
-                    .is_some()
+                && source_project.is_some_and(|pid| {
+                    self.open_browser_in_project(pid, canonical_url.clone(), source, None, window, cx)
+                        .is_some()
+                })
             {
                 return;
             }
             if target.path.is_file()
-                && let Some(pid) = self.workspace.active_project
-                && let Some(iid) = self.open_editor_at(
-                    pid,
-                    Some(target.path.clone()),
-                    self.active_instance,
-                    window,
-                    cx,
-                )
+                && let Some(pid) = source_project
+                && let Some(iid) =
+                    self.open_editor_at(pid, Some(target.path.clone()), source, window, cx)
             {
                 if let Some(line) = target.line
                     && let Some(editor) = self.editors.get(&iid)
@@ -8185,12 +8287,24 @@ impl MuxelApp {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            if self
-                .open_browser_at(url.to_string(), self.active_instance, window, cx)
-                .is_none()
-            {
+            if source_project.is_none_or(|pid| {
+                self.open_browser_in_project(pid, url.to_string(), source, None, window, cx)
+                    .is_none()
+            }) {
                 cx.open_url(url);
             }
+        }
+    }
+
+    /// Route a link normally, then restore the pane that initiated it. Used by
+    /// middle-click so opening a reference does not interrupt terminal input.
+    fn open_link_background(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let previous = self.active_instance;
+        self.open_link_from(url, previous, window, cx);
+        if let Some(previous) = previous
+            && self.workspace.instance(previous).is_some()
+        {
+            self.focus_instance(previous, window, cx);
         }
     }
 
@@ -8219,6 +8333,19 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
         let pid = self.workspace.active_project?;
+        self.open_browser_in_project(pid, url, target, placement, window, cx)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open_browser_in_project(
+        &mut self,
+        pid: Uuid,
+        url: String,
+        target: Option<Uuid>,
+        placement: Option<PlacementMode>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
         // Web resources require an exact URL match. Local files reuse by decoded
         // path so raw/file URI spellings and source fragments share one pane.
         if let Some(iid) = self
@@ -11559,6 +11686,12 @@ impl MuxelApp {
                     window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
                 }
             }))
+            .on_action(
+                cx.listener(|this, a: &muxel_terminal::OpenLinkBackground, window, cx| {
+                    let url = a.0.clone();
+                    this.open_link_background(&url, window, cx);
+                }),
+            )
     }
 
     /// The full workspace UI for a secondary window: title bar, toolbar, the
