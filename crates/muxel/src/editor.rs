@@ -5,10 +5,12 @@
 
 use crate::i18n::{t, tf};
 use gpui::*;
-use gpui_component::ActiveTheme;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState, Position, TabSize};
 use gpui_component::text::markdown;
+use gpui_component::{ActiveTheme, Sizable};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Don't try to open files larger than this (treated as non-text).
 pub const MAX_EDITOR_BYTES: u64 = 8 * 1024 * 1024;
@@ -53,6 +55,54 @@ pub struct EditorView {
     is_markdown: bool,
     /// Show the rendered view (image / markdown) vs the raw text editor.
     show_rendered: bool,
+    /// Latest external change that could not be applied without discarding edits.
+    external_change: Option<ExternalChange>,
+    /// Last observed on-disk revision; polled off the UI thread.
+    disk_stamp: Option<DiskStamp>,
+}
+
+#[derive(Clone)]
+pub(crate) enum ExternalChange {
+    Modified(String),
+    Deleted,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DiskStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+pub(crate) enum DiskChange {
+    Content { stamp: DiskStamp, content: String },
+    Deleted,
+    Unavailable { stamp: DiskStamp },
+}
+
+fn disk_stamp(path: &Path) -> Option<DiskStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(DiskStamp {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
+}
+
+/// Poll one text file. Metadata is cheap; content is read only after its stamp changes.
+pub(crate) fn read_disk_change(path: &Path, known: Option<DiskStamp>) -> Option<DiskChange> {
+    let Some(stamp) = disk_stamp(path) else {
+        return known.is_some().then_some(DiskChange::Deleted);
+    };
+    if known == Some(stamp) {
+        return None;
+    }
+    if stamp.len > MAX_EDITOR_BYTES {
+        return Some(DiskChange::Unavailable { stamp });
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => Some(DiskChange::Content { stamp, content }),
+        Err(_) => Some(DiskChange::Unavailable { stamp }),
+    }
 }
 
 /// Whether `path` is a markdown file by extension.
@@ -98,17 +148,22 @@ impl EditorView {
     /// window, so the view must be rebuilt rather than moved). Undo history is
     /// not preserved.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_state(
+    pub(crate) fn from_state(
         text: String,
         path: Option<PathBuf>,
         language: String,
         cursor: Option<Position>,
         dirty: bool,
+        external_change: Option<ExternalChange>,
+        disk_stamp: Option<DiskStamp>,
         config: EditorConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(path, text, language, cursor, dirty, config, window, cx)
+        let mut editor = Self::build(path, text, language, cursor, dirty, config, window, cx);
+        editor.external_change = external_change;
+        editor.disk_stamp = disk_stamp;
+        editor
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -150,6 +205,7 @@ impl EditorView {
         if let Some(pos) = cursor {
             input.update(cx, |s, cx| s.set_cursor_position(pos, window, cx));
         }
+        let stamp = path.as_deref().and_then(disk_stamp);
         let is_markdown = path.as_deref().is_some_and(is_markdown_path);
         let is_image = path.as_deref().is_some_and(is_image_path);
         Self {
@@ -161,6 +217,8 @@ impl EditorView {
             is_image,
             is_markdown,
             show_rendered: is_markdown || is_image,
+            external_change: None,
+            disk_stamp: stamp,
         }
     }
 
@@ -191,6 +249,8 @@ impl EditorView {
             is_image: false,
             is_markdown: false,
             show_rendered: false,
+            external_change: None,
+            disk_stamp: None,
         }
     }
 
@@ -204,6 +264,9 @@ impl EditorView {
         self.is_markdown || self.is_image
     }
 
+    pub(crate) fn is_pollable_text(&self) -> bool {
+        self.path.is_some() && self.diff_dir.is_none() && !self.is_image
+    }
     pub fn is_html(&self) -> bool {
         self.path
             .as_deref()
@@ -307,19 +370,65 @@ impl EditorView {
         if self.dirty {
             return;
         }
-        let Some(path) = self.path.as_deref() else {
+        let Some(path) = self.path.clone() else {
             return;
         };
-        let Some(content) = read_text_file(path) else {
+        let Some(content) = read_text_file(&path) else {
             return;
         };
-        if &*self.input.read(cx).value() != content.as_str() {
-            self.input.update(cx, |s, cx| {
-                let offset = s.scroll_offset();
-                s.set_value(content, window, cx);
-                s.set_scroll_offset(offset, cx);
-            });
+        self.disk_stamp = disk_stamp(&path);
+        self.replace_disk_content(content, window, cx);
+    }
+
+    /// Apply a poll result, or retain the disk version beside dirty local edits.
+    /// Keeping this state on the editor makes the same conflict UI work in main,
+    /// secondary, and popped-out windows without app-level pane bookkeeping.
+    pub(crate) fn apply_disk_change(
+        &mut self,
+        change: DiskChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match change {
+            DiskChange::Content { stamp, content } => {
+                self.disk_stamp = Some(stamp);
+                if self.dirty {
+                    self.external_change = Some(ExternalChange::Modified(content));
+                } else {
+                    self.external_change = None;
+                    self.replace_disk_content(content, window, cx);
+                }
+            }
+            DiskChange::Deleted => {
+                self.disk_stamp = None;
+                self.external_change = Some(ExternalChange::Deleted);
+            }
+            DiskChange::Unavailable { stamp } => {
+                self.disk_stamp = Some(stamp);
+                self.external_change = Some(ExternalChange::Unavailable);
+            }
         }
+        cx.notify();
+    }
+
+    fn replace_disk_content(
+        &mut self,
+        content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if &*self.input.read(cx).value() == content.as_str() {
+            return;
+        }
+        self.input.update(cx, |s, cx| {
+            let offset = s.scroll_offset();
+            let cursor = s.cursor_position();
+            s.set_value(content, window, cx);
+            s.set_scroll_offset(offset, cx);
+            s.set_cursor_position(cursor, window, cx);
+        });
+        self.dirty = false;
+        cx.notify();
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -327,6 +436,12 @@ impl EditorView {
     }
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+    pub(crate) fn external_change(&self) -> Option<ExternalChange> {
+        self.external_change.clone()
+    }
+    pub(crate) fn disk_stamp(&self) -> Option<DiskStamp> {
+        self.disk_stamp
     }
     pub fn text(&self, cx: &App) -> String {
         self.input.read(cx).value().to_string()
@@ -368,8 +483,13 @@ impl EditorView {
 
     /// Mark the buffer as saved (clears the dirty flag).
     pub fn mark_saved(&mut self, cx: &mut Context<Self>) {
+        let was_dirty = self.dirty;
+        let changed = self.external_change.take().is_some();
+        self.disk_stamp = self.path.as_deref().and_then(disk_stamp);
         if self.dirty {
             self.dirty = false;
+        }
+        if was_dirty || changed {
             cx.notify();
         }
     }
@@ -379,6 +499,8 @@ impl EditorView {
     pub fn set_content(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |s, cx| s.set_value(text, window, cx));
         self.dirty = false;
+        self.external_change = None;
+        self.disk_stamp = self.path.as_deref().and_then(disk_stamp);
         cx.notify();
     }
 
@@ -386,10 +508,73 @@ impl EditorView {
     /// syntax language, and clear the dirty flag.
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let lang = language_for_path(&path).to_string();
+        let stamp = disk_stamp(&path);
         self.input.update(cx, |s, cx| s.set_highlighter(lang, cx));
         self.path = Some(path);
         self.dirty = false;
+        self.external_change = None;
+        self.disk_stamp = stamp;
         cx.notify();
+    }
+
+    fn render_external_change(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let no_disk_version = matches!(
+            self.external_change,
+            Some(ExternalChange::Deleted | ExternalChange::Unavailable)
+        );
+        let label = match self.external_change {
+            Some(ExternalChange::Deleted) => t("Moved, deleted, or inaccessible on disk"),
+            Some(ExternalChange::Unavailable) => t("Couldn't read file from disk"),
+            _ => t("File changed on disk"),
+        };
+        let mut actions = div().flex().items_center().gap_1();
+        if !no_disk_version {
+            actions = actions.child(
+                Button::new("editor-external-reload")
+                    .xsmall()
+                    .label(t("Reload"))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        let Some(ExternalChange::Modified(content)) = this.external_change.take()
+                        else {
+                            return;
+                        };
+                        this.replace_disk_content(content, window, cx);
+                        this.dirty = false;
+                        cx.notify();
+                    })),
+            );
+        }
+        actions = actions.child(
+            Button::new("editor-external-keep")
+                .ghost()
+                .xsmall()
+                .label(if no_disk_version {
+                    t("Keep open")
+                } else {
+                    t("Keep mine")
+                })
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.external_change = None;
+                    cx.notify();
+                })),
+        );
+
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(cx.theme().warning.opacity(0.14))
+                .text_color(cx.theme().warning)
+                .text_xs()
+                .child(label)
+                .child(actions)
+                .into_any_element(),
+        )
     }
 }
 
@@ -401,12 +586,16 @@ impl Focusable for EditorView {
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let notice = self
+            .external_change
+            .as_ref()
+            .and_then(|_| self.render_external_change(cx));
         // Rendered image view (incl. SVG, which `img` rasterizes).
-        if self.is_image
+        let content = if self.is_image
             && self.show_rendered
             && let Some(path) = self.path.clone()
         {
-            return div()
+            div()
                 .id("img-view")
                 .size_full()
                 .overflow_scroll()
@@ -415,31 +604,38 @@ impl Render for EditorView {
                 .bg(cx.theme().background)
                 .p_4()
                 .child(img(path).max_w_full())
-                .into_any_element();
-        }
+                .into_any_element()
         // Rendered markdown view: a fixed-size scrollable container holding the
         // formatted markdown (the InputState text stays the source of truth, so
         // edits made in raw mode show here when toggled back).
-        if self.is_markdown && self.show_rendered {
+        } else if self.is_markdown && self.show_rendered {
             let src = self.input.read(cx).value().to_string();
-            return div()
+            div()
                 .id("md-view")
                 .size_full()
                 .bg(cx.theme().background)
                 .child(markdown(src).selectable(true).scrollable(true).p_4())
-                .into_any_element();
-        }
-        let family: SharedString = if self.config.font_family.trim().is_empty() {
-            cx.theme().mono_font_family.clone()
+                .into_any_element()
         } else {
-            self.config.font_family.clone().into()
+            let family: SharedString = if self.config.font_family.trim().is_empty() {
+                cx.theme().mono_font_family.clone()
+            } else {
+                self.config.font_family.clone().into()
+            };
+            Input::new(&self.input)
+                .h_full()
+                .bordered(false)
+                .focus_bordered(false)
+                .font_family(family)
+                .text_size(px(self.config.font_size))
+                .into_any_element()
         };
-        Input::new(&self.input)
-            .h_full()
-            .bordered(false)
-            .focus_bordered(false)
-            .font_family(family)
-            .text_size(px(self.config.font_size))
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(notice)
+            .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
     }
 }
@@ -501,7 +697,7 @@ pub fn language_for_path(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::language_for_path;
+    use super::{DiskChange, disk_stamp, language_for_path, read_disk_change};
     use std::path::Path;
 
     #[test]
@@ -512,5 +708,56 @@ mod tests {
         assert_eq!(language_for_path(Path::new("s.unknownext")), "text");
         assert_eq!(language_for_path(Path::new("Makefile")), "text"); // no extension
         assert_eq!(language_for_path(Path::new("notes.md")), "markdown");
+    }
+
+    #[test]
+    fn disk_poll_reads_only_changed_text_and_reports_deletion() {
+        let root = std::env::temp_dir().join(format!(
+            "muxel-editor-poll-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("notes.md");
+        std::fs::write(&path, "one").unwrap();
+        let initial = disk_stamp(&path).unwrap();
+        assert!(read_disk_change(&path, Some(initial)).is_none());
+
+        std::fs::write(&path, "two lines").unwrap();
+        let changed = read_disk_change(&path, Some(initial)).unwrap();
+        let stamp = match changed {
+            DiskChange::Content { stamp, content } => {
+                assert_eq!(content, "two lines");
+                stamp
+            }
+            _ => panic!("changed UTF-8 text was not read"),
+        };
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            read_disk_change(&path, Some(stamp)),
+            Some(DiskChange::Deleted)
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disk_poll_reports_changed_non_utf8_content_as_unavailable() {
+        let root = std::env::temp_dir().join(format!(
+            "muxel-editor-poll-binary-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("notes.md");
+        std::fs::write(&path, "text").unwrap();
+        let initial = disk_stamp(&path).unwrap();
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        assert!(matches!(
+            read_disk_change(&path, Some(initial)),
+            Some(DiskChange::Unavailable { .. })
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

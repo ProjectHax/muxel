@@ -3,7 +3,9 @@
 //! renders the active project's pane tree. Live terminals are kept in
 //! `terminals`, keyed by instance id.
 
-use crate::editor::{EditorConfig, EditorView};
+use crate::editor::{
+    DiskChange, DiskStamp, EditorConfig, EditorView, ExternalChange, read_disk_change,
+};
 use crate::i18n::{t, tf, tn};
 use crate::integrations;
 use crate::settings_view::{self, RemoteTestState, SettingsSection, SettingsUi};
@@ -2176,6 +2178,8 @@ pub struct MuxelApp {
     _loop_timer: Task<()>,
     /// Periodically re-runs `git diff` for open diff panes (off the UI thread).
     _diff_timer: Task<()>,
+    /// Polls open local text files and reads changed content off the UI thread.
+    _resource_timer: Task<()>,
     /// Debounce handle for persisting the window geometry on resize/move.
     bounds_save_task: Option<Task<()>>,
     /// Inline rename editor: the target being renamed + the shared input widget.
@@ -2439,6 +2443,8 @@ struct EditorSnapshot {
     language: String,
     cursor: Option<Position>,
     dirty: bool,
+    external_change: Option<ExternalChange>,
+    disk_stamp: Option<DiskStamp>,
     /// Set when the snapshot is of a diff pane (rebuilds via `EditorView::diff`).
     diff_dir: Option<PathBuf>,
 }
@@ -2452,6 +2458,8 @@ impl EditorSnapshot {
             language: e.language(),
             cursor: Some(e.cursor(cx)),
             dirty: e.is_dirty(),
+            external_change: e.external_change(),
+            disk_stamp: e.disk_stamp(),
             diff_dir: e.diff_dir().map(|p| p.to_path_buf()),
         }
     }
@@ -2466,6 +2474,8 @@ impl EditorSnapshot {
                 self.language,
                 self.cursor,
                 self.dirty,
+                self.external_change,
+                self.disk_stamp,
                 config,
                 window,
                 cx,
@@ -3673,6 +3683,44 @@ impl MuxelApp {
             }
         });
 
+        // Poll metadata for open local text files off the UI thread. Content is
+        // read only when a file's revision changes.
+        let resource_timer = cx.spawn_in(window, async move |view: WeakEntity<Self>, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let Ok(jobs) = view.update(cx, |this, cx| this.resource_poll_jobs(cx)) else {
+                    break;
+                };
+                if jobs.is_empty() {
+                    continue;
+                }
+                let changes = cx
+                    .background_executor()
+                    .spawn(async move {
+                        jobs.into_iter()
+                            .filter_map(|(iid, path, known)| {
+                                read_disk_change(&path, known)
+                                    .map(|change| (iid, path, known, change))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                if changes.is_empty() {
+                    continue;
+                }
+                if view
+                    .update_in(cx, |this, window, cx| {
+                        this.apply_resource_changes(changes, window, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         // Check GitHub for a newer release shortly after launch, then once a day.
         let update_timer = cx.spawn(async move |view: WeakEntity<Self>, cx| {
             cx.background_executor().timer(Duration::from_secs(2)).await;
@@ -4115,6 +4163,7 @@ impl MuxelApp {
             _status_timer: status_timer,
             _loop_timer: loop_timer,
             _diff_timer: diff_timer,
+            _resource_timer: resource_timer,
             bounds_save_task: None,
             show_terms,
             install_kind,
@@ -9277,6 +9326,99 @@ impl MuxelApp {
         placed
     }
 
+    fn open_editor_resources(&self) -> Vec<(Uuid, Entity<EditorView>)> {
+        self.editors
+            .iter()
+            .map(|(iid, editor)| (*iid, editor.clone()))
+            .chain(
+                self.popouts
+                    .iter()
+                    .filter_map(|(iid, popout)| match &popout.view {
+                        PaneView::Editor(editor) => Some((*iid, editor.clone())),
+                        _ => None,
+                    }),
+            )
+            .collect()
+    }
+
+    fn resource_poll_jobs(&self, cx: &App) -> Vec<(Uuid, PathBuf, Option<DiskStamp>)> {
+        self.open_editor_resources()
+            .into_iter()
+            .filter_map(|(iid, editor)| {
+                let local = self
+                    .workspace
+                    .instance(iid)
+                    .and_then(|instance| self.workspace.project(instance.project_id))
+                    .is_some_and(|project| !project.is_remote());
+                let editor = editor.read(cx);
+                (local && editor.is_pollable_text()).then(|| {
+                    (
+                        iid,
+                        editor
+                            .path()
+                            .expect("pollable editor has a path")
+                            .to_path_buf(),
+                        editor.disk_stamp(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn apply_resource_changes(
+        &self,
+        changes: Vec<(Uuid, PathBuf, Option<DiskStamp>, DiskChange)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editors: HashMap<_, _> = self.open_editor_resources().into_iter().collect();
+        for (iid, path, known, change) in changes {
+            let Some(editor) = editors.get(&iid).cloned() else {
+                continue;
+            };
+            let still_current = {
+                let current = editor.read(cx);
+                current.path() == Some(path.as_path()) && current.disk_stamp() == known
+            };
+            if !still_current {
+                continue;
+            }
+            self.apply_resource_change(iid, editor, change, window, cx);
+        }
+    }
+
+    fn editor_secondary_window(&self, iid: Uuid) -> Option<AnyWindowHandle> {
+        if let Some(popout) = self.popouts.get(&iid) {
+            return Some(gpui::AnyWindowHandle::from(popout.window));
+        }
+        let pid = self.workspace.instance(iid)?.project_id;
+        self.secondary_windows
+            .iter()
+            .find(|window| window.pid == pid)
+            .map(|window| window.handle)
+    }
+
+    fn apply_resource_change(
+        &self,
+        iid: Uuid,
+        editor: Entity<EditorView>,
+        change: DiskChange,
+        main_window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.editor_secondary_window(iid) {
+            let _ = handle.update(cx, move |_root, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.apply_disk_change(change, window, cx);
+                });
+            });
+        } else {
+            editor.update(cx, |editor, cx| {
+                editor.apply_disk_change(change, main_window, cx);
+            });
+        }
+    }
+
     /// Re-run `git diff` for an open diff pane.
     fn refresh_diff_pane(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ed) = self.editors.get(&iid).cloned() {
@@ -12534,6 +12676,8 @@ impl MuxelApp {
                     snap.language,
                     snap.cursor,
                     snap.dirty,
+                    snap.external_change,
+                    snap.disk_stamp,
                     config,
                     window,
                     cx,
