@@ -850,6 +850,19 @@ fn terminal_auto_title(instance: &Instance, title: &str) -> Option<String> {
     })
 }
 
+/// Codex persists `/rename` against its own session id. Prefer that parent-owned
+/// name over OSC text, which can also be emitted by commands inside the pane.
+fn codex_session_auto_title(
+    instance: &Instance,
+    names: &HashMap<String, String>,
+) -> Option<String> {
+    if !is_codex_program(instance.program.as_deref()) {
+        return None;
+    }
+    let name = names.get(instance.session_id.as_deref()?)?.trim();
+    muxel_core::is_useful_auto_name(name).then(|| name.to_string())
+}
+
 /// Terminal as a **cached** view element. Without `.cached(...)`, every window
 /// frame re-renders and re-paints every visible terminal (GPUI multipaint). With
 /// it, siblings reuse last frame's paint until that view's `cx.notify()` (or a
@@ -1437,6 +1450,16 @@ fn is_grok_program(program: Option<&str>) -> bool {
         == "grok"
 }
 
+fn is_codex_program(program: Option<&str>) -> bool {
+    let Some(name) = program.and_then(|program| program.rsplit(['/', '\\']).next()) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "codex" | "codex.exe" | "codex.cmd"
+    )
+}
+
 /// Whether a Claude agent's saved session transcript is missing from disk (so a
 /// `--resume` would just hang on "No conversation found"). Only Claude's session
 /// path is known, so other agents — or an undeterminable home/cwd — return `false`
@@ -1478,7 +1501,7 @@ fn capture_agent_session_id(
     cwd: Option<&std::path::Path>,
 ) -> Option<String> {
     let program = preset.program.as_deref().unwrap_or_default();
-    if !program.contains("codex") {
+    if !is_codex_program(Some(program)) {
         return None;
     }
     let home = home_dir()?;
@@ -1923,6 +1946,9 @@ pub struct MuxelApp {
     project_branch_lists: HashMap<Uuid, Vec<String>>,
     /// Prevent slow git probes from accumulating overlapping one-second refresh jobs.
     status_refresh_in_flight: bool,
+    /// Parent-owned Codex thread names, keyed by the session UUID captured from
+    /// that pane. Refreshed from Codex's append-only session index.
+    codex_session_names: HashMap<String, String>,
     worktree_changes: HashMap<Uuid, usize>,
     /// Whether the GitHub CLI (`gh`) is installed (gates worktree PR actions).
     gh_available: bool,
@@ -3889,6 +3915,7 @@ impl MuxelApp {
             project_branches: HashMap::new(),
             project_branch_lists: HashMap::new(),
             status_refresh_in_flight: false,
+            codex_session_names: HashMap::new(),
             worktree_changes: HashMap::new(),
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
@@ -6923,8 +6950,17 @@ impl MuxelApp {
             .iter()
             .map(|w| (w.id, w.path.clone()))
             .collect();
+        let codex_home = self
+            .workspace
+            .instances
+            .iter()
+            .any(|instance| {
+                instance.session_id.is_some() && is_codex_program(instance.program.as_deref())
+            })
+            .then(home_dir)
+            .flatten();
         cx.spawn(async move |this, cx| {
-            let (available, gh, sshpass, tmux, branches, changes) = cx
+            let (available, gh, sshpass, tmux, branches, changes, codex_names) = cx
                 .background_executor()
                 .spawn(async move {
                     let available = installed_programs(&presets);
@@ -6946,7 +6982,10 @@ impl MuxelApp {
                         .into_iter()
                         .map(|(id, path)| (id, integrations::worktree_change_count(&path)))
                         .collect();
-                    (available, gh, sshpass, tmux, branches, changes)
+                    let codex_names = codex_home
+                        .map(|home| muxel_core::codex_session_names(&home))
+                        .unwrap_or_default();
+                    (available, gh, sshpass, tmux, branches, changes, codex_names)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -6965,6 +7004,27 @@ impl MuxelApp {
                     this.project_branch_lists.insert(id, list);
                 }
                 this.worktree_changes = changes.into_iter().collect();
+                if !codex_names.is_empty() {
+                    this.codex_session_names = codex_names;
+                }
+                let updates: Vec<(Uuid, String)> = this
+                    .workspace
+                    .instances
+                    .iter()
+                    .filter_map(|instance| {
+                        codex_session_auto_title(instance, &this.codex_session_names)
+                            .map(|name| (instance.id, name))
+                    })
+                    .collect();
+                let mut name_changed = false;
+                for (id, name) in updates {
+                    if let Some(instance) = this.workspace.instance_mut(id) {
+                        name_changed |= instance.update_auto_name(name);
+                    }
+                }
+                if name_changed && this.auto_name_save_due.is_none() {
+                    this.auto_name_save_due = Some(Instant::now() + Duration::from_secs(3));
+                }
                 cx.notify();
             });
         })
@@ -7230,7 +7290,9 @@ impl MuxelApp {
             let Some(instance) = self.workspace.instance(iid) else {
                 continue;
             };
-            let Some(name) = name.and_then(|name| terminal_auto_title(instance, &name)) else {
+            let name = codex_session_auto_title(instance, &self.codex_session_names)
+                .or_else(|| name.and_then(|name| terminal_auto_title(instance, &name)));
+            let Some(name) = name else {
                 continue;
             };
             if let Some(inst) = self.workspace.instance_mut(iid) {
@@ -24621,8 +24683,9 @@ mod grok_session_tests {
 
 #[cfg(test)]
 mod shell_title_tests {
-    use super::{shell_dir_title, terminal_auto_title};
+    use super::{codex_session_auto_title, shell_dir_title, terminal_auto_title};
     use muxel_core::{AgentPreset, Instance};
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     #[test]
@@ -24682,6 +24745,33 @@ mod shell_title_tests {
         assert_eq!(
             terminal_auto_title(&grok, "Review session names - grok"),
             Some("Review session names".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_rename_uses_the_bound_parent_session() {
+        let session_id = Uuid::new_v4().to_string();
+        let mut codex = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        codex.session_id = Some(session_id.clone());
+        let names = HashMap::from([(session_id.clone(), "foo".to_string())]);
+
+        assert_eq!(
+            codex_session_auto_title(&codex, &names),
+            Some("foo".to_string())
+        );
+        assert_eq!(
+            terminal_auto_title(&codex, "npm run test-v8-historical"),
+            None
+        );
+
+        codex.program = Some("npm".to_string());
+        assert_eq!(codex_session_auto_title(&codex, &names), None);
+
+        codex.program = Some(r"D:\bin\codex.CMD".to_string());
+        let renamed = HashMap::from([(session_id, "renamed again".to_string())]);
+        assert_eq!(
+            codex_session_auto_title(&codex, &renamed),
+            Some("renamed again".to_string())
         );
     }
 

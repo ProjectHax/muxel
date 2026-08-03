@@ -109,19 +109,25 @@ Terminal programs set their title with OSC escape sequences. Muxel already parse
 and retains the latest title for pane naming and Codex session identity. Lifecycle
 detection adds a separate parser so provider state decorations never leak into the
 persisted display name. OSC events carry no sender process identity, so known agent
-panes accept name and lifecycle observations only from their provider's structural
-title contract. A child command's foreign title updates neither; plain shell panes
-retain ordinary OSC-title behavior.
+panes accept lifecycle observations only from their provider's structural title
+contract. Automatic names also require provider ownership: Claude and Grok expose
+it in their structural title, while Codex persists it against a session UUID. A
+child command's foreign title updates neither; plain shell panes retain ordinary
+OSC-title behavior.
 
 ### Codex
 
 V1 supports the current Codex semantic title contract (minimum supported version:
 0.145.0). Muxel requests `thread`, `run-state`, and `activity` at launch. The
 parser reads lifecycle only from the final state/activity segment and returns the
-thread segment separately for pane naming, so words such as `working` or `ready`
-inside a thread name cannot forge status. The parser must still detect capability
-from title values actually observed; it must not infer correctness from a version
-string alone.
+thread segment as a naming fallback, so words such as `working` or `ready` inside a
+thread name cannot forge status. For a bound Codex pane, Muxel reads the latest
+nonblank `thread_name` for that exact session UUID from Codex's append-only
+`session_index.jsonl`. That parent-owned value takes precedence over OSC text, so
+`/rename` updates the pane while an `npm` child cannot. Manual Muxel names remain a
+separate override and still win at render time. The parser must still detect
+capability from title values actually observed; it must not infer correctness from
+a version string alone.
 
 Muxel does not install or upgrade Codex. Diagnostics may recommend upgrading when
 the expected semantic title contract is absent.
@@ -225,13 +231,16 @@ capped history later without forcing replay machinery into ordinary rendering.
    generation, rather than exposing only the latest string.
 2. `TerminalView` parses unseen title changes into a provider-neutral lifecycle
    observation and combines it with existing marker, bell, output, and exit signals.
-3. `MuxelApp::tick` compares the displayed status with its previous status and
+3. The existing background status refresh reads Codex's session index once per
+   refresh when any bound Codex pane exists. It maps names by exact session UUID;
+   later valid rows win and malformed or blank rows are ignored.
+4. `MuxelApp::tick` compares the displayed status with its previous status and
    applies one pure transition to the instance's persisted `AgentActivity`.
-4. Changed activity data is persisted. Repeated identical one-second samples do
-   not write the workspace file.
-5. Focusing a Done pane records attendance and clears notification emphasis; the
+5. Changed activity or automatic names are persisted. Repeated identical
+   one-second samples do not write the workspace file.
+6. Focusing a Done pane records attendance and clears notification emphasis; the
    runtime and persisted Done state remain unchanged.
-6. Sidebar rendering derives a compact label from status, activity, and current
+7. Sidebar rendering derives a compact label from status, activity, and current
    time. It schedules no continuous animation; the existing tick is enough for
    minute/hour/day bucket changes.
 

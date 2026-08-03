@@ -612,6 +612,40 @@ pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
     found
 }
 
+/// Latest saved display name for each Codex session id.
+///
+/// Codex appends an entry to `~/.codex/session_index.jsonl` when `/rename`
+/// changes a thread name. Session ids make this a parent-owned name source:
+/// commands running inside the terminal cannot replace it with their own OSC
+/// title. Later rows win because the index is append-only.
+pub fn codex_session_names(home: &Path) -> std::collections::HashMap<String, String> {
+    use std::io::{BufRead, BufReader};
+
+    let mut names = std::collections::HashMap::new();
+    let path = home.join(".codex").join("session_index.jsonl");
+    let Ok(file) = std::fs::File::open(path) else {
+        return names;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = value.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(name) = value
+            .get("thread_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        names.insert(id.to_string(), name.to_string());
+    }
+    names
+}
+
 /// A Codex terminal title that directly identifies its session.
 ///
 /// Codex publishes its agent-minted UUID as an OSC terminal title.
@@ -1045,6 +1079,46 @@ mod tests {
         );
         assert!(codex_session_exists(&tmp, "id-new"));
         assert!(!codex_session_exists(&tmp, "missing"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn codex_session_names_use_the_latest_valid_index_row() {
+        use std::io::Write;
+
+        let tmp = std::env::temp_dir().join(format!("muxel-codex-index-{}", Uuid::new_v4()));
+        let index_dir = tmp.join(".codex");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let mut index = std::fs::File::create(index_dir.join("session_index.jsonl")).unwrap();
+        writeln!(
+            index,
+            r#"{{"id":"session-a","thread_name":"First name","updated_at":"1"}}"#
+        )
+        .unwrap();
+        writeln!(index, "not json").unwrap();
+        writeln!(
+            index,
+            r#"{{"id":"session-b","thread_name":"Other name","updated_at":"2"}}"#
+        )
+        .unwrap();
+        writeln!(
+            index,
+            r#"{{"id":"session-a","thread_name":"  foo  ","updated_at":"3"}}"#
+        )
+        .unwrap();
+        writeln!(
+            index,
+            r#"{{"id":"session-a","thread_name":"   ","updated_at":"4"}}"#
+        )
+        .unwrap();
+
+        let names = codex_session_names(&tmp);
+        assert_eq!(names.get("session-a").map(String::as_str), Some("foo"));
+        assert_eq!(
+            names.get("session-b").map(String::as_str),
+            Some("Other name")
+        );
+        assert_eq!(names.len(), 2);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -194,9 +194,11 @@ feature is added or changed, update the matching entry here in the same change**
   coarse age while work is blocked or done, show recent idle activity briefly
   (`idle · 12m`), omit ordinary middle age, and call out panes idle for three days
   or more (`stale · 4d`). Long pane titles ellipsize before the badge instead of
-  pushing status out of the sidebar. Known agent panes accept names and lifecycle
-  updates only from their provider's semantic title shape, so child commands such
-  as npm cannot replace the session name or forge a state transition.
+  pushing status out of the sidebar. Known agent panes accept lifecycle updates
+  only from their provider's semantic title shape. Names also require a
+  provider-owned source: Codex `/rename` values are read from its session index by
+  the pane's captured session UUID, so child commands such as npm cannot replace
+  the session name or forge a state transition.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
   defaults per agent and **editable working/blocked markers per preset**.
