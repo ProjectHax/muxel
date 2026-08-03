@@ -81,6 +81,11 @@ const TERM_INSET: Pixels = px(6.0);
 #[action(namespace = terminal, no_json)]
 pub struct OpenLink(pub String);
 
+/// Open a terminal link without moving focus away from the terminal.
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = terminal, no_json)]
+pub struct OpenLinkBackground(pub String);
+
 /// Lifecycle state of a terminal/agent, shown as a badge. Inferred from the
 /// agent's TUI (per-agent markers), the bell, output activity, and process exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,8 +180,10 @@ fn title_status(
             } else if parts
                 .iter()
                 .any(|part| is_grok_spinner(part) || is_grok_activity(part))
-                && age.is_some_and(|age| age <= Duration::from_secs(2))
             {
+                // Grok removes these provider-owned items when it returns to
+                // Idle. A long tool or response can leave the same title in
+                // place for minutes, so age is not completion evidence.
                 Some(AgentStatus::Working)
             } else if title == "grok" || parts.last() == Some(&"grok") {
                 // Grok removes the spinner/activity items when AgentState returns
@@ -188,6 +195,32 @@ fn title_status(
         }
         TitleProvider::Other => None,
     }
+}
+
+/// Provider-owned screen text that proves work continues even if the title has
+/// already moved to its idle shape.
+fn continuing_screen_status(provider: TitleProvider, screen: &str) -> Option<AgentStatus> {
+    match provider {
+        TitleProvider::Claude => screen
+            .lines()
+            .any(is_claude_background_command_row)
+            .then_some(AgentStatus::Working),
+        _ => None,
+    }
+}
+
+fn is_claude_background_command_row(line: &str) -> bool {
+    let words: Vec<_> = line.split_whitespace().collect();
+    if words.len() != 11
+        || words[0] != "·"
+        || words[4..] != ["running", "·", "send", "a", "message", "to", "interrupt"]
+    {
+        return false;
+    }
+    let Ok(count) = words[1].parse::<usize>() else {
+        return false;
+    };
+    count > 0 && words[2] == if count == 1 { "command" } else { "commands" } && words[3] == "still"
 }
 
 fn is_grok_spinner(part: &str) -> bool {
@@ -314,7 +347,7 @@ fn classify(
 }
 
 /// Promote a working→idle transition to `Done`, latching it until the agent works
-/// again or the pane is attended. Returns `(displayed status, new latch state)`.
+/// again. Returns `(displayed status, new latch state)`.
 /// Pure half of [`TerminalView::status`]'s done-latch, so a finished turn shows
 /// Done even when the agent never rang the bell.
 ///
@@ -454,7 +487,7 @@ pub struct TerminalView {
     /// Latches `Done` from a working→finished transition so a completed turn shows
     /// Done (and notifies) even when the agent didn't ring the bell. `prev_raw` is
     /// the previous *raw* classification; the latch clears when the agent works
-    /// again or the pane is attended (see `clear_done`).
+    /// again.
     prev_raw: std::cell::Cell<Option<AgentStatus>>,
     done_latch: std::cell::Cell<bool>,
     /// Ready/Idle must be observed once, or a turn submitted, before a
@@ -501,7 +534,16 @@ impl TerminalLaunch {
     /// [`TerminalSession::size`]. Getting it right up front is what keeps a
     /// `tmux attach` from painting its first frame at the wrong size.
     pub fn spawn(spec: CommandSpec, size: (u16, u16)) -> anyhow::Result<Self> {
-        Self::spawn_with_fallback(spec, CommandSpec::shell(), size)
+        Self::spawn_with_fallback(spec, CommandSpec::shell(), size, None)
+    }
+
+    /// Spawn while attributing PTY sub-phase timings to one pane.
+    pub fn spawn_for_instance(
+        spec: CommandSpec,
+        size: (u16, u16),
+        instance_id: Uuid,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with_fallback(spec, CommandSpec::shell(), size, Some(instance_id))
     }
 
     /// Testable inner half of [`Self::spawn`]: the fallback spec is injectable.
@@ -509,8 +551,13 @@ impl TerminalLaunch {
         spec: CommandSpec,
         fallback: CommandSpec,
         (cols, rows): (u16, u16),
+        instance_id: Option<Uuid>,
     ) -> anyhow::Result<Self> {
-        match TerminalSession::spawn(spec.clone(), cols, rows) {
+        let spawn = |spec| match instance_id {
+            Some(instance_id) => TerminalSession::spawn_profiled(spec, cols, rows, instance_id),
+            None => TerminalSession::spawn(spec, cols, rows),
+        };
+        match spawn(spec.clone()) {
             Ok((session, rx)) => Ok(Self {
                 spec,
                 session,
@@ -527,7 +574,7 @@ impl TerminalLaunch {
                 let shell = fallback.with_startup_input(format!(
                     "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
                 ));
-                let (session, rx) = TerminalSession::spawn(shell.clone(), cols, rows)
+                let (session, rx) = spawn(shell.clone())
                     .with_context(|| format!("fallback shell (after `{prog}` failed: {detail})"))?;
                 Ok(Self {
                     spec: shell,
@@ -924,8 +971,14 @@ impl TerminalView {
         } else {
             self.working_markers.as_slice()
         };
-        // Only scan the grid when there are markers to look for.
-        let screen = if working_markers.is_empty() && self.blocked_markers.is_empty() {
+        // Claude may declare its title idle while a background command remains
+        // live. Scan its visible grid for that provider-owned continuation row.
+        let needs_continuation_scan = self.title_provider == TitleProvider::Claude
+            && matches!(title, None | Some(AgentStatus::Idle));
+        let screen = if working_markers.is_empty()
+            && self.blocked_markers.is_empty()
+            && !needs_continuation_scan
+        {
             String::new()
         } else {
             self.session.visible_text()
@@ -951,6 +1004,11 @@ impl TerminalView {
                 }
             }
         }
+        if title != Some(AgentStatus::Blocked)
+            && let Some(continuing) = continuing_screen_status(self.title_provider, &screen)
+        {
+            title = Some(continuing);
+        }
         let raw = combine_title_status(self.exited, base, title);
         // Marker-less providers may latch only after proving that their semantic
         // title protocol is live. Older/custom CLIs otherwise infer Working from
@@ -972,12 +1030,6 @@ impl TerminalView {
         self.status_cache
             .set(Some((content_gen, title_gen, status)));
         status
-    }
-
-    /// Clear the `Done` latch — called when the pane is attended, so a finished
-    /// turn drops back to Idle once you've looked at it.
-    pub fn clear_done(&self) {
-        self.done_latch.set(false);
     }
 
     /// Whether `needle` appears in the current visible grid — used by the app to
@@ -1025,6 +1077,20 @@ impl TerminalView {
     /// The active mouse copy/paste mode.
     pub fn mouse_mode(&self) -> TerminalMouseMode {
         self.mouse_mode
+    }
+
+    /// Link under the last pointer position, if the terminal grid can resolve one.
+    pub fn link_at_pointer(&self) -> Option<String> {
+        let hit = self.session.pointer_hit()?;
+        crate::element::link_at(
+            &self.session,
+            point(px(hit.local_x), px(hit.local_y)),
+            px(hit.cell_width),
+            px(hit.line_height),
+            hit.cols,
+            hit.rows,
+        )
+        .map(|link| link.url)
     }
 
     /// Set the mouse copy/paste mode (pushed from settings).
@@ -1245,7 +1311,7 @@ mod launch_tests {
     #[test]
     fn double_failure_is_an_error_not_a_panic() {
         let bogus = CommandSpec::program("/definitely/not/here-muxel", vec![]);
-        let result = TerminalLaunch::spawn_with_fallback(bogus.clone(), bogus, (80, 24));
+        let result = TerminalLaunch::spawn_with_fallback(bogus.clone(), bogus, (80, 24), None);
         assert!(result.is_err(), "total failure must surface as Err");
     }
 
@@ -1265,9 +1331,9 @@ mod tests {
     use super::{
         AgentStatus, BACKGROUND_PAINT_INTERVAL, FOCUSED_INTERACTION_INTERVAL,
         FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, TitleProvider,
-        can_latch_completion, classify, clean_agent_title, combine_title_status, hold_grok_blocked,
-        latch_done, latch_done_after_readiness, next_paint_schedule, paint_min_interval,
-        title_status,
+        can_latch_completion, classify, clean_agent_title, combine_title_status,
+        continuing_screen_status, hold_grok_blocked, latch_done, latch_done_after_readiness,
+        next_paint_schedule, paint_min_interval, title_status,
     };
     use std::time::Duration;
 
@@ -1355,6 +1421,14 @@ mod tests {
         assert_eq!(
             title_status(
                 TitleProvider::Grok,
+                Some("⠦ - Responding - Review title - grok"),
+                Some(Duration::from_secs(30))
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Grok,
                 Some("⠦ - Waiting for response… - Review title - grok"),
                 Some(Duration::from_millis(300))
             ),
@@ -1381,6 +1455,49 @@ mod tests {
                 TitleProvider::Grok,
                 Some("Custom title with no provider state"),
                 Some(Duration::ZERO)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_background_command_overrides_idle_title() {
+        assert_eq!(
+            continuing_screen_status(
+                TitleProvider::Claude,
+                "· 1 command still running · send a message to interrupt"
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            continuing_screen_status(TitleProvider::Claude, "Ready for another prompt"),
+            None
+        );
+        assert_eq!(
+            continuing_screen_status(
+                TitleProvider::Claude,
+                "The log says: 1 command still running; investigate it."
+            ),
+            None
+        );
+        assert_eq!(
+            continuing_screen_status(
+                TitleProvider::Claude,
+                "quoted: · 1 command still running · send a message to interrupt later"
+            ),
+            None
+        );
+        assert_eq!(
+            continuing_screen_status(
+                TitleProvider::Claude,
+                "  · 2 commands still running · send a message to interrupt  "
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            continuing_screen_status(
+                TitleProvider::Grok,
+                "· 1 command still running · send a message to interrupt"
             ),
             None
         );

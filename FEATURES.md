@@ -13,6 +13,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Recursive split layout** — panes form a horizontal/vertical split tree; any
   pane can be split again, nesting freely.
 - **Resizable splits** — drag the divider between panes; sizes persist per project.
+  Cached terminals receive the final size after the drag, so responsive TUIs redraw
+  without requiring a keypress or scroll.
 - **Minimum pane width** — panes can't shrink so narrow that an agent TUI becomes
   unusable (keeps a sane terminal width).
 - **Scrollable pane area** — because panes have that minimum width, a layout with
@@ -29,6 +31,8 @@ feature is added or changed, update the matching entry here in the same change**
   title bar to relocate the whole pane, with a highlighted drop zone.
 - **Swap panes** — drop a dragged pane on another pane's center to swap their
   positions.
+- **Per-project focus** — switching away from a project and back restores the
+  pane that was last focused there, falling back safely if that pane was removed.
 - **Maximize** — temporarily expand one pane to fill the work area.
 - **Pane cards** — rounded "card" panes with an accent ring + glow on the active
   pane, hover highlight, and a configurable border style.
@@ -37,6 +41,12 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
+- **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
+  creation and child startup run on a worker, with stale launches discarded if the
+  tab closes or is replaced before startup completes.
+- **Direct pane creation controls** — the pane-local tab button opens the agent
+  picker and creates the chosen agent in that tab group. Split buttons clone the
+  shown pane's agent in one click; right-click opens the alternate-agent picker.
 - **Drag & reorder** — drag tab pills to reorder within a pane, move them to other
   panes, or drop at a precise insertion point.
 - **Pinned tabs** — pin a tab to the leftmost block; pins behave fluidly when
@@ -178,9 +188,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A marker-based agent whose turn finishes
-  is held at **done** until you attend the pane — even if it never rang the bell —
-  and that unattended completion survives a muxel restart. Sidebar badges include
-  coarse age while work is blocked or done, show recently attended panes briefly
+  is held at **done** until the agent works again — even if it never rang the bell —
+  and that completion survives a muxel restart. Focusing the pane marks its
+  notification read without rewriting lifecycle state or age. Sidebar badges include
+  coarse age while work is blocked or done, show recent idle activity briefly
   (`idle · 12m`), omit ordinary middle age, and call out panes idle for three days
   or more (`stale · 4d`). Long pane titles ellipsize before the badge instead of
   pushing status out of the sidebar.
@@ -372,6 +383,10 @@ feature is added or changed, update the matching entry here in the same change**
   clickable, and a trailing `:line:col` is understood. `Ctrl`/`Cmd`+hover
   underlines the link and shows a pointing-hand cursor (Ctrl/Cmd down re-hit-tests
   without requiring a mouse move).
+- **Links in new tabs** — middle-clicking a terminal link opens it without stealing
+  terminal focus; browser target=_blank, window.open, Ctrl+click, and middle-click
+  requests stay in the source project and open as Muxel tabs. Right-clicking a
+  terminal link opens link actions instead of copying or pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
 - **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can
@@ -431,10 +446,16 @@ feature is added or changed, update the matching entry here in the same change**
   markdown and image files (`png`, `jpg`, `gif`, `webp`, `bmp`, `svg`, …) render as
   images, both by default, with a header **Raw / Rendered** toggle to view the
   source (e.g. an SVG's XML or the markdown text).
+- **Rendered-text copy parity** — Ctrl+C and Ctrl+Insert copy the exact selected
+  text in rendered Markdown, images, and settings fields without intercepting Ctrl+C
+  from a focused terminal.
 - **Resource reuse** — opening a local file that already has an editor tab focuses
   that tab and reloads it from disk when its buffer is clean; dirty buffers are
   never overwritten. File links can jump to `#L12C4`, and local HTML links open in
   the browser preview while HTML source panes offer a **Preview** action.
+- **Resource tab grouping** — files, diffs, and browser pages opened by default join
+  the nearest pane of the same type; explicit New Tab and New Pane commands still
+  use the requested tab or split placement.
 - **Git diff panel** — a toolbar button (far right) toggles a collapsible
   right-side panel with two tabs:
   - **Files** — the active project's changed files (added / modified / deleted /

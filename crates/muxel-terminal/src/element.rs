@@ -911,7 +911,7 @@ fn apply_scrollbar_drag(session: &TerminalSession, track_h: f32, cursor_y: f32, 
 /// line text, or a file path that resolves to an existing local file (relative
 /// paths resolve against the session's spawn cwd — remote panes have none, so
 /// their paths never match).
-fn link_at(
+pub(crate) fn link_at(
     session: &TerminalSession,
     local: Point<Pixels>,
     cell_width: Pixels,
@@ -1436,6 +1436,31 @@ impl TerminalElement {
                 }
             });
         }
+        // ---- Middle-click: open under the cursor in a background Muxel tab. ----
+        {
+            let session = self.session.clone();
+            let hitbox = hitbox.clone();
+            let focus = self.focus_handle.clone();
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || e.button != MouseButton::Middle
+                    || !hitbox.is_hovered(window)
+                {
+                    return;
+                }
+                if let Some(link) = link_at(
+                    &session,
+                    e.position - origin,
+                    cell_width,
+                    line_height,
+                    cols,
+                    rows,
+                ) {
+                    focus.dispatch_action(&crate::view::OpenLinkBackground(link.url), window, cx);
+                    cx.stop_propagation();
+                }
+            });
+        }
         // ---- Ctrl/Cmd+hover: underline the link under the cursor ----
         // Always remember the pointer so Ctrl pressed *without* a move still
         // hit-tests (users often park the mouse, then press Ctrl).
@@ -1507,6 +1532,7 @@ impl TerminalElement {
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
+            let instance_id = self.instance_id;
             let mouse_mode = self.mouse_mode;
             let cw = f32::from(cell_width);
             let lh = f32::from(line_height);
@@ -1518,6 +1544,12 @@ impl TerminalElement {
                 if !hitbox.is_hovered(window) {
                     return;
                 }
+                profile::pointer_routed(
+                    instance_id,
+                    "down",
+                    session.mouse_reporting(),
+                    e.modifiers.shift,
+                );
                 // Scrollbar owns left-click in its strip.
                 if e.button == MouseButton::Left
                     && f32::from(e.position.x) >= bar_x
@@ -1540,8 +1572,10 @@ impl TerminalElement {
                 // In RightClickMenu mode, right-click is reserved for the local
                 // Copy/Paste menu (the muxel crate's context-menu wrapper owns it),
                 // so don't *also* forward it to the app — that double-fires.
-                let right_click_owned_by_menu =
-                    button == 2 && mouse_mode == TerminalMouseMode::RightClickMenu;
+                let right_click_on_link = button == 2
+                    && link_at(&session, local, cell_width, line_height, cols, rows).is_some();
+                let right_click_owned_by_menu = button == 2
+                    && (mouse_mode == TerminalMouseMode::RightClickMenu || right_click_on_link);
                 if session.mouse_reporting() && !e.modifiers.shift && !right_click_owned_by_menu {
                     let _ = session.clear_selection();
                     session.report_mouse_button(
@@ -1678,10 +1712,17 @@ impl TerminalElement {
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
+            let instance_id = self.instance_id;
             window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
                     return;
                 }
+                profile::pointer_routed(
+                    instance_id,
+                    "wheel",
+                    session.mouse_reporting(),
+                    e.modifiers.shift,
+                );
                 let dy = f32::from(e.delta.pixel_delta(line_height).y);
                 // Cell under the pointer — only used when the wheel is forwarded
                 // to a mouse-reporting app as a mouse event.
@@ -1764,6 +1805,18 @@ impl TerminalElement {
                 // When the app owns the mouse, don't steal right-click for paste
                 // (already reported as a mouse event by the click handler).
                 if session.mouse_reporting() && !e.modifiers.shift {
+                    return;
+                }
+                if link_at(
+                    &session,
+                    e.position - origin,
+                    cell_width,
+                    line_height,
+                    cols,
+                    rows,
+                )
+                .is_some()
+                {
                     return;
                 }
                 match mouse_mode {

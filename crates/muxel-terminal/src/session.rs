@@ -408,10 +408,31 @@ impl TerminalSession {
         cols: u16,
         rows: u16,
     ) -> Result<(Arc<Self>, async_channel::Receiver<PtyChunk>)> {
+        Self::spawn_inner(spec, cols, rows, None)
+    }
+
+    /// Spawn with phase timings attributed to one Muxel pane.
+    pub fn spawn_profiled(
+        spec: CommandSpec,
+        cols: u16,
+        rows: u16,
+        instance_id: uuid::Uuid,
+    ) -> Result<(Arc<Self>, async_channel::Receiver<PtyChunk>)> {
+        Self::spawn_inner(spec, cols, rows, Some(instance_id))
+    }
+
+    fn spawn_inner(
+        spec: CommandSpec,
+        cols: u16,
+        rows: u16,
+        instance_id: Option<uuid::Uuid>,
+    ) -> Result<(Arc<Self>, async_channel::Receiver<PtyChunk>)> {
         let cols = cols.max(1);
         let rows = rows.max(1);
 
+        let program_name = spec.program.clone();
         let pty_system = native_pty_system();
+        let phase = std::time::Instant::now();
         let pair = pty_system
             .openpty(PtySize {
                 rows,
@@ -420,13 +441,32 @@ impl TerminalSession {
                 pixel_height: 0,
             })
             .context("open pty")?;
+        if let Some(instance_id) = instance_id {
+            crate::profile::startup_event(
+                instance_id,
+                &program_name,
+                "openpty",
+                phase.elapsed(),
+                0,
+            );
+        }
 
         // On Windows, resolve bare names like `codex` to a real CreateProcess
         // target (`codex.cmd` / `codex.exe`). npm installs an extension-less
         // `#!/bin/sh` shim *before* the `.cmd` wrapper; portable-pty's search
         // returns the shim first and CreateProcessW fails with
         // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
+        let phase = std::time::Instant::now();
         let program = resolve_program_for_spawn(&spec.program);
+        if let Some(instance_id) = instance_id {
+            crate::profile::startup_event(
+                instance_id,
+                &program_name,
+                "program-resolution",
+                phase.elapsed(),
+                0,
+            );
+        }
         let mut builder = command_builder_for_spawn(&program, &spec.args);
         // Remembered for resolving relative file paths on ctrl+click.
         let cwd = spec.cwd.as_ref().map(std::path::PathBuf::from);
@@ -452,7 +492,18 @@ impl TerminalSession {
         // program or argv that Muxel resolved.
         apply_windows_batch_runner_env(&mut builder, &program, &spec.args);
 
+        let phase = std::time::Instant::now();
         let child = pair.slave.spawn_command(builder).context("spawn command")?;
+        if let Some(instance_id) = instance_id {
+            crate::profile::startup_event(
+                instance_id,
+                &program_name,
+                "child-spawn",
+                phase.elapsed(),
+                0,
+            );
+        }
+        let setup_started = std::time::Instant::now();
         let child_pid = child.process_id();
         let killer = child.clone_killer();
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
@@ -560,6 +611,16 @@ impl TerminalSession {
             interactive_until: Mutex::new(None),
             _reader: reader_handle,
         });
+
+        if let Some(instance_id) = instance_id {
+            crate::profile::startup_event(
+                instance_id,
+                &program_name,
+                "pty-setup",
+                setup_started.elapsed(),
+                0,
+            );
+        }
 
         Ok((session, rx))
     }
