@@ -44,6 +44,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
+- **Direct pane creation controls** — the pane-local tab button opens the agent
+  picker and creates the chosen agent in that tab group. Split buttons clone the
+  shown pane's agent in one click; right-click opens the alternate-agent picker.
 - **Drag & reorder** — drag tab pills to reorder within a pane, move them to other
   panes, or drop at a precise insertion point.
 - **Pinned tabs** — pin a tab to the leftmost block; pins behave fluidly when
