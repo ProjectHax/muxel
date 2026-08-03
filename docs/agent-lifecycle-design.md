@@ -16,8 +16,8 @@ different questions without moving rows or filling every row with noise:
 
 The existing detector combines terminal-screen markers, bell events, recent PTY
 output, and process exit. It also latches a reliable Working-to-Idle transition as
-Done until the pane is focused. This is a sound base, but its timestamps are not
-persisted and marker-less agents can mistake echoed typing for work.
+Done. This is a sound base, but its lifecycle was coupled to focus, its timestamps
+were not persisted, and marker-less agents can mistake echoed typing for work.
 
 PTY means pseudoterminal: the OS interface through which Muxel runs an interactive
 CLI and receives its screen-control byte stream. PTY output is useful evidence of
@@ -43,7 +43,7 @@ V1 changes only the existing row:
 - `working`: live work.
 - `blocked · 2h`: waiting for user input; age starts when Blocked begins.
 - `done · 8h`: completed work not yet attended; Done never expires.
-- `idle · 12m`: recently attended; age starts when Done is acknowledged.
+- `idle · 12m`: recently active; age follows the latest lifecycle transition.
 - `idle`: ordinary middle age; no extra text.
 - `stale · 4d`: an old attended pane that may deserve cleanup.
 
@@ -65,25 +65,25 @@ if the current Tag component cannot expose a useful tooltip without more UI work
 `ancient` is intentionally deferred. A playful word repeated across an old project
 quickly becomes wallpaper. The stored timestamps let us test alternate copy later.
 
-### Done is attention debt; Idle age is time since attention
+### Done is lifecycle; attendance is notification state
 
 Done and recency are different concepts.
 
 - A semantic or reliable marker-based completion sets `completed_at` and latches
-  Done until attendance. It survives restarts and has no timeout.
-- Attending the pane records `last_attended_at`, clears the live terminal latch,
-  and starts the visible Idle clock.
+  Done until later Working or Blocked evidence. It survives focus and restarts and
+  has no timeout.
+- Attending the pane records `last_attended_at` and clears notification emphasis.
+  It does not rewrite lifecycle state or age.
 - Every deliberate terminal selection refreshes `last_attended_at`, even when no
-  completion is pending. This lets ordinary long-lived panes become Stale; it also
-  means Stale literally means “not visited,” not “process produced no bytes.”
+  completion is pending. This keeps read/unread notification state independent
+  from the last lifecycle observation.
 - Merely having PTY output remains weak runtime evidence. It never creates a
-  durable unseen-completion claim.
+  durable completion claim.
 - Blocked remains Blocked until the detector reports another state. Its age is
   derived from the first transition into Blocked.
 
-V1 preserves Muxel's existing attendance action: explicitly selecting/focusing the
-pane. A dwell timer is deferred because it changes every keyboard and programmatic
-focus path; durable persistence and correct status signals should land first.
+V1 attendance remains explicit pane selection/focus. It is an acknowledgement
+action for notifications, not a lifecycle transition.
 
 ### Evidence must remain honest
 
@@ -108,16 +108,20 @@ only observation was `last output`.
 Terminal programs set their title with OSC escape sequences. Muxel already parses
 and retains the latest title for pane naming and Codex session identity. Lifecycle
 detection adds a separate parser so provider state decorations never leak into the
-persisted display name.
+persisted display name. OSC events carry no sender process identity, so known agent
+panes accept name and lifecycle observations only from their provider's structural
+title contract. A child command's foreign title updates neither; plain shell panes
+retain ordinary OSC-title behavior.
 
 ### Codex
 
 V1 supports the current Codex semantic title contract (minimum supported version:
-0.145.0). Muxel should request the activity/run-state title items at launch when a
-stable invocation-local configuration is available. The parser must still detect
-capability from title values actually observed; it must not infer correctness from
-a version string alone. An unrecognized title falls back to existing markers/bell/
-PTY behavior.
+0.145.0). Muxel requests `thread`, `run-state`, and `activity` at launch. The
+parser reads lifecycle only from the final state/activity segment and returns the
+thread segment separately for pane naming, so words such as `working` or `ready`
+inside a thread name cannot forge status. The parser must still detect capability
+from title values actually observed; it must not infer correctness from a version
+string alone.
 
 Muxel does not install or upgrade Codex. Diagnostics may recommend upgrading when
 the expected semantic title contract is absent.
@@ -126,9 +130,10 @@ the expected semantic title contract is absent.
 
 Claude 2.1.220 publishes `✳ <session>` while idle, alternates `⠂` and `⠐`
 roughly once a second for the full turn, then restores `✳` on completion. Treat
-only those confirmed prefixes as semantic state, and expire a working frame after
-three seconds in case the process or transport freezes. Strip the prefix before
-accepting the remainder as an automatic pane name. Keep the on-screen
+only those confirmed prefixes as semantic state. A frame remains authoritative
+until the next provider-owned frame or process exit; elapsed time alone is not
+completion evidence. Strip the prefix before accepting the remainder as an
+automatic pane name. Keep the on-screen
 `esc to interrupt` marker as corroboration and backward-compatible fallback.
 
 Claude also supports OSC 9;4 terminal progress, controlled by
@@ -150,11 +155,13 @@ grok
 <generated session title> - grok
 ```
 
-Treat an exact spinner segment plus freshness as Working, `⚠ Action Required` as
-Blocked, and the stable title without a spinner as Idle. Strip the state/activity
-segments and trailing `grok` before pane naming. The title config is user-editable,
-so an unknown custom shape falls back rather than being guessed. Muxel must not
-rewrite the global Grok config.
+Treat a complete leading spinner/activity prefix as Working, a complete leading
+`⚠ Action Required`/spinner/activity prefix as Blocked, and the stable title
+without that prefix as Idle. Strip only those leading protocol fields and trailing
+`grok` before pane naming; reserved words inside the generated session name are
+still name text. The title config is user-editable, so an incomplete reserved
+prefix makes no lifecycle claim; a title with the provider sentinel may still
+update the session name. Muxel must not rewrite the global Grok config.
 
 Grok intentionally blinks the action-required title item while unfocused. Muxel
 holds the last positive Blocked edge for 750 ms through that off-frame. A stable
@@ -178,6 +185,7 @@ pub struct AgentActivity {
     pub completed_at: Option<i64>,
     pub blocked_at: Option<i64>,
     pub last_attended_at: Option<i64>,
+    pub last_state: Option<AgentActivityState>,
 }
 ```
 
@@ -187,10 +195,12 @@ timezone-independent and
 compare directly. UI formatting uses local time only when an exact tooltip is
 shown. Negative ages caused by clock adjustment clamp to zero.
 
-The unseen Done state is derived:
+Lifecycle and unread notification state are separate. `last_state` is the
+authoritative lifecycle value; workspaces written before that field existed infer
+it from their newest transition timestamp. An unread completion is derived:
 
 ```text
-completed_at > last_attended_at
+last_state == Done && completed_at > last_attended_at
 ```
 
 There is no persisted `unseen` boolean that can disagree with the timestamps.
@@ -201,7 +211,8 @@ Transition rules are pure and live in `muxel-core`:
 - entering Working records `work_started_at` for the new run;
 - entering Blocked records `blocked_at` once;
 - entering Done records `completed_at` once for that completion;
-- attending records `last_attended_at` and makes the persisted display Idle;
+- every transition records the latest lifecycle state;
+- attending records `last_attended_at` without changing lifecycle state;
 - returning to Working clears the active Blocked timestamp but retains history;
 - PTY-only activity remains a runtime fallback and never records completion.
 
@@ -218,7 +229,8 @@ capped history later without forcing replay machinery into ordinary rendering.
    applies one pure transition to the instance's persisted `AgentActivity`.
 4. Changed activity data is persisted. Repeated identical one-second samples do
    not write the workspace file.
-5. Focusing a Done pane records attendance before clearing the runtime Done latch.
+5. Focusing a Done pane records attendance and clears notification emphasis; the
+   runtime and persisted Done state remain unchanged.
 6. Sidebar rendering derives a compact label from status, activity, and current
    time. It schedules no continuous animation; the existing tick is enough for
    minute/hour/day bucket changes.
@@ -293,7 +305,7 @@ Build and run it as:
 ```powershell
 cargo build -p muxel-terminal --bin agent-title-probe
 target/debug/agent-title-probe.exe --log D:/tmp/codex-title.jsonl `
-  --include-title-text -- codex --config "tui.terminal_title=['run-state','activity']"
+  --include-title-text -- codex --config "tui.terminal_title=['thread','run-state','activity']"
 ```
 
 Add `--script D:/tmp/probe-actions.json` before `--` for unattended runs. The JSON
@@ -337,8 +349,9 @@ is not a durable product contract.
 - old workspaces deserialize with default activity data;
 - Working, Blocked, Done, and attendance transitions stamp only intended fields;
 - repeated samples do not reset transition timestamps;
-- Done survives serialization and derives unseen after reload;
-- attendance clears unseen and starts Idle age;
+- Done survives serialization whether its notification is read or unread;
+- old activity records infer lifecycle from their transition timestamps;
+- attendance clears unseen notification state without changing lifecycle or age;
 - future timestamps clamp to a zero-age display;
 - label boundaries cover 59m/60m, 5h/6h, and 2d/3d;
 - Done and Blocked never lose their state word at old ages.
@@ -347,16 +360,27 @@ is not a durable product contract.
 
 - each confirmed provider title fixture maps to the expected neutral observation;
 - lifecycle decorations strip cleanly from display titles;
-- unrelated user/program titles remain untouched;
+- known agent panes reject unrelated program titles for both lifecycle and naming;
+- a foreign title cannot erase the last provider-owned lifecycle observation;
+- Codex thread words cannot be parsed as run state;
 - title generation advances for changes and ResetTitle;
 - weak PTY Working-to-Idle does not latch Done;
-- marker/title semantic Working-to-Idle does latch Done.
+- marker/title semantic Working-to-Idle and bell completion both latch Done.
 
 ### `muxel`
 
 - a status transition updates and persists instance activity once;
-- focusing a Done pane records attendance and clears the runtime latch;
-- restored unseen completion renders Done before new PTY output;
+- focusing a Done pane records attendance without clearing lifecycle;
+- restored read and unread completions ignore bootstrap Working noise for the
+  existing 30-second startup wait plus any configured delay. Provider-owned
+  Ready/Idle or an explicit submission ends the guard; fallback PTY quiet does
+  not. Blocked
+  applies immediately, Idle does not replace Done, and continuous Working wins
+  when the startup bound ends;
+- later real Working or Blocked evidence replaces persisted Done;
+- attention navigation selects Blocked panes and unread Done notifications, not
+  attended Done lifecycle;
+- agent auto-names accept provider-owned titles and reject child-command titles;
 - title and status remain within a narrow row layout by construction.
 
 ## Manual test plan
@@ -370,14 +394,18 @@ Use `target/debug/muxel.exe`, never `muxel-live.exe`.
    plain-shell PTY activity may briefly show Working but must return to Idle.
 4. Run a short task. Confirm Working appears during the run and Done remains after
    completion while another pane is focused.
-5. Restart Muxel without attending that pane. Confirm Done and its age survive.
-6. Focus the Done pane. Confirm it becomes Idle and its recent age starts then.
-7. Leave or fixture an attended pane beyond the recent window. Confirm ordinary
-   medium-age Idle has no suffix and 3-day Idle reads `stale · 3d`.
+5. Focus the Done pane. Confirm the notification clears while Done and its age
+   remain.
+6. Restart Muxel. Confirm both attended and unattended Done panes retain Done and
+   their original completion ages.
+7. Start another turn. Confirm Working replaces Done, then the next completion
+   produces a new Done timestamp.
 8. Trigger a provider permission prompt. Confirm Blocked and its age remain until
    the prompt is resolved.
-9. Resize the sidebar and terminal repeatedly. Confirm no false Done transition.
-10. Verify browser/editor/diff panes are unchanged.
+9. While each provider is idle and working, emit a foreign command title. Confirm
+   it changes neither pane name nor lifecycle; the next provider title still wins.
+10. Resize the sidebar and terminal repeatedly. Confirm no false Done transition.
+11. Verify plain-shell titles and browser/editor/diff panes are unchanged.
 
 ## Build gate
 
@@ -402,7 +430,8 @@ into `next`. A stalled build is not a pass.
 - Capped run history and overnight digest.
 - Per-provider capability diagnostics and update guidance.
 - Configurable stale thresholds or playful labels such as `ancient`.
-- Dwell-based attendance if accidental focus proves to clear Done too easily.
+- Optional explicit lifecycle reset if permanently retained Done proves noisy.
 
-V1 succeeds if the fixed tree reliably shows current work, durable unattended
-completion, recent attendance, and genuinely stale panes without false claims.
+V1 succeeds if the fixed tree reliably shows current work, durable completion,
+independent notification attendance, and genuinely stale panes without false
+claims.
