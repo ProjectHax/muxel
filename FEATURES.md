@@ -29,6 +29,8 @@ feature is added or changed, update the matching entry here in the same change**
   title bar to relocate the whole pane, with a highlighted drop zone.
 - **Swap panes** — drop a dragged pane on another pane's center to swap their
   positions.
+- **Per-project focus** — switching away from a project and back restores the
+  pane that was last focused there, falling back safely if that pane was removed.
 - **Maximize** — temporarily expand one pane to fill the work area.
 - **Pane cards** — rounded "card" panes with an accent ring + glow on the active
   pane, hover highlight, and a configurable border style.

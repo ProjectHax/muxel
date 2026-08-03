@@ -3506,7 +3506,10 @@ impl MuxelApp {
             .or_else(|| self.workspace.projects.first().map(|p| p.id));
         self.workspace.active_project = active;
         if let Some(pid) = active {
-            self.active_instance = self.workspace.project(pid).and_then(|p| p.first_instance());
+            self.active_instance = self
+                .workspace
+                .project(pid)
+                .and_then(|p| p.preferred_instance());
             if let Some(iid) = self.active_instance {
                 self.focus_instance(iid, window, cx);
             }
@@ -5407,7 +5410,10 @@ impl MuxelApp {
         {
             self.current_preset = idx;
         }
-        self.active_instance = self.workspace.project(pid).and_then(|p| p.first_instance());
+        self.active_instance = self
+            .workspace
+            .project(pid)
+            .and_then(|p| p.preferred_instance());
         if let Some(iid) = self.active_instance {
             self.focus_instance_with_attendance(iid, attend_first_pane, window, cx);
         }
@@ -5441,6 +5447,7 @@ impl MuxelApp {
             && let Some(p) = self.workspace.project_mut(pid)
         {
             set_active_tab(&mut p.layout, iid);
+            p.last_focused_instance = Some(iid);
         }
         let persisted_completion = self
             .workspace
@@ -9800,7 +9807,10 @@ impl MuxelApp {
             let key = RemoteLayout::capture(p, &self.workspace, now_epoch).content_key();
             self.layout_keys.insert(pid, key);
         }
-        self.active_instance = self.workspace.project(pid).and_then(|p| p.first_instance());
+        self.active_instance = self
+            .workspace
+            .project(pid)
+            .and_then(|p| p.preferred_instance());
         self.persist();
         self.add_event(
             NotifKind::Success,
@@ -10837,7 +10847,7 @@ impl MuxelApp {
                 .iter()
                 .map(|p| p.id)
                 .find(|id| *id != pid);
-            self.active_instance = self.workspace.active().and_then(|p| p.first_instance());
+            self.active_instance = self.workspace.active().and_then(|p| p.preferred_instance());
             if let Some(next) = self.workspace.active_project {
                 self.spawn_project_terminals_deferred(next, window, cx);
             }
@@ -11000,7 +11010,7 @@ impl MuxelApp {
         // rather than in `bring_project_to_main` covers every way the window can
         // close: the title-bar X, the OS close button, and Bring back to main window.
         self.workspace.active_project = Some(sec.pid);
-        self.active_instance = self.workspace.active().and_then(|p| p.first_instance());
+        self.active_instance = self.workspace.active().and_then(|p| p.preferred_instance());
         self.persist();
         if let Some(main) = self.main_window {
             let app = cx.weak_entity();
@@ -11064,7 +11074,10 @@ impl MuxelApp {
         if self.secondary_sidebar_shown.remove(&old_pid) {
             self.secondary_sidebar_shown.insert(pid);
         }
-        self.active_instance = self.workspace.project(pid).and_then(|p| p.first_instance());
+        self.active_instance = self
+            .workspace
+            .project(pid)
+            .and_then(|p| p.preferred_instance());
         if let Some(iid) = self.active_instance {
             self.focus_instance(iid, window, cx);
         }
