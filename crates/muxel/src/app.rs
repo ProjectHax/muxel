@@ -619,6 +619,8 @@ actions!(
         // of letting gpui-component's Root move keyboard focus.
         SendTab,
         SendBackTab,
+        // Copy selected rendered text or delegate to the focused input.
+        CopySelection,
     ]
 );
 
@@ -738,16 +740,13 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     // so a focused agent (e.g. opencode, which uses Ctrl+P) receives it, while
     // deselecting a pane (or focusing the sidebar/editor) routes Ctrl+P to muxel.
     bindings.push(KeyBinding::new("ctrl-p", GlobalSearch, Some("!Terminal")));
-    // gpui-component binds Ctrl+C for inputs and selectable rendered text, but
-    // omits the other standard Windows/Linux copy chord. Bind it at each
-    // selection context; the focused/deepest context handles the action.
+    // Own both Windows copy chords. The component-level binding was unreliable
+    // when selectable Markdown or a settings input lived below Muxel's root.
     #[cfg(not(target_os = "macos"))]
-    for context in ["Input", "TextView", "Root"] {
-        bindings.push(KeyBinding::new(
-            "ctrl-insert",
-            gpui_component::input::Copy,
-            Some(context),
-        ));
+    for keystroke in ["ctrl-c", "ctrl-insert"] {
+        for context in ["Input", "TextView"] {
+            bindings.push(KeyBinding::new(keystroke, CopySelection, Some(context)));
+        }
     }
     // Cmd+Q (macOS) / Ctrl+Q (elsewhere) quits from any focus, including a
     // focused terminal — `secondary` resolves to the platform's quit modifier.
@@ -1095,6 +1094,30 @@ enum PlacementMode {
     Split(SplitDirection),
     /// Add the agent as a new tab in the target pane.
     Tab,
+}
+
+fn selected_copy_text(text: String) -> Option<String> {
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(test)]
+mod copy_selection_tests {
+    use super::selected_copy_text;
+
+    #[test]
+    fn preserves_selected_whitespace_exactly() {
+        let selected = "  indented\n\n".to_string();
+        assert_eq!(selected_copy_text(selected.clone()), Some(selected));
+        assert_eq!(
+            selected_copy_text("   ".to_string()),
+            Some("   ".to_string())
+        );
+    }
+
+    #[test]
+    fn delegates_only_when_there_is_no_rendered_selection() {
+        assert_eq!(selected_copy_text(String::new()), None);
+    }
 }
 
 /// Which region of a pane body a drag is hovering — drives the drop highlight
@@ -11239,6 +11262,14 @@ impl MuxelApp {
                     this.open_link(&url, window, cx);
                 }),
             )
+            .on_action(cx.listener(|_this, _: &CopySelection, window, cx| {
+                use gpui_component::WindowExt as _;
+                if let Some(text) = selected_copy_text(window.selected_text(cx)) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                } else {
+                    window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
+                }
+            }))
     }
 
     /// The full workspace UI for a secondary window: title bar, toolbar, the
