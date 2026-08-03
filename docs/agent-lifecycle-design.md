@@ -121,13 +121,21 @@ V1 supports the current Codex semantic title contract (minimum supported version
 0.145.0). Muxel requests `thread`, `run-state`, and `activity` at launch. The
 parser reads lifecycle only from the final state/activity segment and returns the
 thread segment as a naming fallback, so words such as `working` or `ready` inside a
-thread name cannot forge status. For a bound Codex pane, Muxel reads the latest
-nonblank `thread_name` for that exact session UUID from Codex's append-only
-`session_index.jsonl`. That parent-owned value takes precedence over OSC text, so
-`/rename` updates the pane while an `npm` child cannot. Manual Muxel names remain a
-separate override and still win at render time. The parser must still detect
-capability from title values actually observed; it must not infer correctness from
-a version string alone.
+thread name cannot forge status. For a bound local Codex pane, Muxel reads the
+latest nonblank `thread_name` for that exact session UUID from Codex's append-only
+`session_index.jsonl`. That parent-owned value takes precedence in persistence,
+tabs, and the sidebar, so `/rename` updates the pane while an `npm` child cannot.
+Remote Codex panes cannot read the remote host's index and retain the structural
+OSC-title fallback. Manual Muxel names remain a separate override and still win at
+render time.
+
+Muxel adopts a Codex UUID only while the pane is unbound and only when the UUID is
+the complete thread field of a valid semantic title. Later OSC titles cannot
+replace the saved UUID because terminal-title events carry no sender process
+identity. In-process conversation switches therefore require a pane restart to
+change the durable resume binding. The parser must still detect capability from
+title values actually observed; it must not infer correctness from a version
+string alone.
 
 Muxel does not install or upgrade Codex. Diagnostics may recommend upgrading when
 the expected semantic title contract is absent.
@@ -231,9 +239,9 @@ capped history later without forcing replay machinery into ordinary rendering.
    generation, rather than exposing only the latest string.
 2. `TerminalView` parses unseen title changes into a provider-neutral lifecycle
    observation and combines it with existing marker, bell, output, and exit signals.
-3. The existing background status refresh reads Codex's session index once per
-   refresh when any bound Codex pane exists. It maps names by exact session UUID;
-   later valid rows win and malformed or blank rows are ignored.
+3. The existing background status refresh reads the local Codex session index
+   once per refresh when any bound local Codex pane exists. It maps names by exact
+   session UUID; later valid rows win and malformed or blank rows are ignored.
 4. `MuxelApp::tick` compares the displayed status with its previous status and
    applies one pure transition to the instance's persisted `AgentActivity`.
 5. Changed activity or automatic names are persisted. Repeated identical

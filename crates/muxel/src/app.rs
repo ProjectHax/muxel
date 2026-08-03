@@ -855,12 +855,23 @@ fn terminal_auto_title(instance: &Instance, title: &str) -> Option<String> {
 fn codex_session_auto_title(
     instance: &Instance,
     names: &HashMap<String, String>,
+    remote: bool,
 ) -> Option<String> {
-    if !is_codex_program(instance.program.as_deref()) {
+    if remote || !is_codex_program(instance.program.as_deref()) {
         return None;
     }
     let name = names.get(instance.session_id.as_deref()?)?.trim();
     muxel_core::is_useful_auto_name(name).then(|| name.to_string())
+}
+
+fn authoritative_terminal_auto_title(
+    instance: &Instance,
+    codex_names: &HashMap<String, String>,
+    remote: bool,
+    live_title: Option<&str>,
+) -> Option<String> {
+    codex_session_auto_title(instance, codex_names, remote)
+        .or_else(|| live_title.and_then(|title| terminal_auto_title(instance, title)))
 }
 
 /// Terminal as a **cached** view element. Without `.cached(...)`, every window
@@ -1507,6 +1518,17 @@ fn capture_agent_session_id(
     let home = home_dir()?;
     let cwd = cwd?;
     muxel_core::codex_latest_session_id(&home, cwd)
+}
+
+fn initial_codex_session_id(
+    preset: &AgentPreset,
+    current: Option<&str>,
+    title_hint: Option<&str>,
+) -> Option<String> {
+    if current.is_some() {
+        return None;
+    }
+    muxel_core::codex_session_id_from_title(preset, title_hint?)
 }
 
 /// "NewPane" -> "New Pane", "NewAgent1" -> "New Agent 1" for the shortcut
@@ -6955,7 +6977,12 @@ impl MuxelApp {
             .instances
             .iter()
             .any(|instance| {
-                instance.session_id.is_some() && is_codex_program(instance.program.as_deref())
+                instance.session_id.is_some()
+                    && is_codex_program(instance.program.as_deref())
+                    && self
+                        .workspace
+                        .project(instance.project_id)
+                        .is_some_and(|project| !project.is_remote())
             })
             .then(home_dir)
             .flatten();
@@ -6982,9 +7009,7 @@ impl MuxelApp {
                         .into_iter()
                         .map(|(id, path)| (id, integrations::worktree_change_count(&path)))
                         .collect();
-                    let codex_names = codex_home
-                        .map(|home| muxel_core::codex_session_names(&home))
-                        .unwrap_or_default();
+                    let codex_names = codex_home.map(|home| muxel_core::codex_session_names(&home));
                     (available, gh, sshpass, tmux, branches, changes, codex_names)
                 })
                 .await;
@@ -7004,15 +7029,24 @@ impl MuxelApp {
                     this.project_branch_lists.insert(id, list);
                 }
                 this.worktree_changes = changes.into_iter().collect();
-                if !codex_names.is_empty() {
-                    this.codex_session_names = codex_names;
+                match codex_names {
+                    Some(Ok(names)) => this.codex_session_names = names,
+                    Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        this.codex_session_names.clear();
+                    }
+                    Some(Err(_)) => {}
+                    None => this.codex_session_names.clear(),
                 }
                 let updates: Vec<(Uuid, String)> = this
                     .workspace
                     .instances
                     .iter()
                     .filter_map(|instance| {
-                        codex_session_auto_title(instance, &this.codex_session_names)
+                        let remote = this
+                            .workspace
+                            .project(instance.project_id)
+                            .is_some_and(Project::is_remote);
+                        codex_session_auto_title(instance, &this.codex_session_names, remote)
                             .map(|name| (instance.id, name))
                     })
                     .collect();
@@ -7290,8 +7324,16 @@ impl MuxelApp {
             let Some(instance) = self.workspace.instance(iid) else {
                 continue;
             };
-            let name = codex_session_auto_title(instance, &self.codex_session_names)
-                .or_else(|| name.and_then(|name| terminal_auto_title(instance, &name)));
+            let remote = self
+                .workspace
+                .project(instance.project_id)
+                .is_some_and(Project::is_remote);
+            let name = authoritative_terminal_auto_title(
+                instance,
+                &self.codex_session_names,
+                remote,
+                name.as_deref(),
+            );
             let Some(name) = name else {
                 continue;
             };
@@ -7496,24 +7538,24 @@ impl MuxelApp {
             // Codex mints its own session id and publishes it as this pane's
             // initial OSC title. Capture that exact id instead of guessing from
             // the newest rollout in the cwd, which aliases concurrent panes.
-            // A later UUID updates the binding when `/resume` switches sessions
-            // inside the running Codex TUI.
+            // Once bound, later titles cannot replace the durable session id:
+            // OSC carries no sender identity, so a child process could forge one.
             let captured_codex_id = self.workspace.instance(iid).and_then(|inst| {
                 let preset = inst
                     .preset_id
                     .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                     .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
-                let id =
-                    muxel_core::codex_session_id_from_title(preset, session_id_hint.as_deref()?)?;
-                if inst.session_id.as_deref() == Some(id.as_str()) {
-                    return None;
-                }
-                Some(id)
+                initial_codex_session_id(
+                    preset,
+                    inst.session_id.as_deref(),
+                    session_id_hint.as_deref(),
+                )
             });
             if let Some(id) = captured_codex_id
                 && let Some(inst) = self.workspace.instance_mut(iid)
             {
                 inst.session_id = Some(id);
+                inst.auto_name = None;
                 self.persist();
             }
             // A completion that happens in the pane the user is actively watching
@@ -14958,13 +15000,20 @@ impl MuxelApp {
         if let Some(bv) = self.browsers.get(&iid) {
             return bv.read(cx).tab_title().into();
         }
-        if let Some(osc) = self
-            .terminals
-            .get(&iid)
-            .and_then(|v| v.read(cx).title())
-            .and_then(|title| inst.and_then(|instance| terminal_auto_title(instance, &title)))
-        {
-            return osc.into();
+        if let Some(instance) = inst {
+            let remote = self
+                .workspace
+                .project(instance.project_id)
+                .is_some_and(Project::is_remote);
+            let live_title = self.terminals.get(&iid).and_then(|v| v.read(cx).title());
+            if let Some(name) = authoritative_terminal_auto_title(
+                instance,
+                &self.codex_session_names,
+                remote,
+                live_title.as_deref(),
+            ) {
+                return name.into();
+            }
         }
         if let Some(instance) = inst {
             if instance.program.is_none()
@@ -17967,11 +18016,20 @@ impl MuxelApp {
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
                         // Agent titles have no such prefix and pass through unchanged.
                         (
-                            view.title()
-                                .and_then(|title| {
-                                    inst.and_then(|instance| terminal_auto_title(instance, &title))
-                                })
-                                .unwrap_or(meta),
+                            inst.and_then(|instance| {
+                                let remote = self
+                                    .workspace
+                                    .project(instance.project_id)
+                                    .is_some_and(Project::is_remote);
+                                let live_title = view.title();
+                                authoritative_terminal_auto_title(
+                                    instance,
+                                    &self.codex_session_names,
+                                    remote,
+                                    live_title.as_deref(),
+                                )
+                            })
+                            .unwrap_or(meta),
                             view.status(),
                         )
                     } else if let Some(ed) = self.editors.get(&iid) {
@@ -24683,7 +24741,10 @@ mod grok_session_tests {
 
 #[cfg(test)]
 mod shell_title_tests {
-    use super::{codex_session_auto_title, shell_dir_title, terminal_auto_title};
+    use super::{
+        authoritative_terminal_auto_title, codex_session_auto_title, initial_codex_session_id,
+        shell_dir_title, terminal_auto_title,
+    };
     use muxel_core::{AgentPreset, Instance};
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -24756,22 +24817,50 @@ mod shell_title_tests {
         let names = HashMap::from([(session_id.clone(), "foo".to_string())]);
 
         assert_eq!(
-            codex_session_auto_title(&codex, &names),
+            codex_session_auto_title(&codex, &names, false),
+            Some("foo".to_string())
+        );
+        assert_eq!(
+            authoritative_terminal_auto_title(
+                &codex,
+                &names,
+                false,
+                Some("Forged child name | Ready ·"),
+            ),
             Some("foo".to_string())
         );
         assert_eq!(
             terminal_auto_title(&codex, "npm run test-v8-historical"),
             None
         );
+        assert_eq!(codex_session_auto_title(&codex, &names, true), None);
 
         codex.program = Some("npm".to_string());
-        assert_eq!(codex_session_auto_title(&codex, &names), None);
+        assert_eq!(codex_session_auto_title(&codex, &names, false), None);
 
         codex.program = Some(r"D:\bin\codex.CMD".to_string());
         let renamed = HashMap::from([(session_id, "renamed again".to_string())]);
         assert_eq!(
-            codex_session_auto_title(&codex, &renamed),
+            codex_session_auto_title(&codex, &renamed, false),
             Some("renamed again".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_session_binding_is_initial_only() {
+        let first = Uuid::new_v4().to_string();
+        let later = Uuid::new_v4().to_string();
+        let preset = AgentPreset::codex();
+        let initial_frame = format!("{first} | Ready ·");
+        let later_frame = format!("{later} | Ready ·");
+
+        assert_eq!(
+            initial_codex_session_id(&preset, None, Some(&initial_frame)).as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            initial_codex_session_id(&preset, Some(&first), Some(&later_frame)),
+            None
         );
     }
 

@@ -618,14 +618,14 @@ pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
 /// changes a thread name. Session ids make this a parent-owned name source:
 /// commands running inside the terminal cannot replace it with their own OSC
 /// title. Later rows win because the index is append-only.
-pub fn codex_session_names(home: &Path) -> std::collections::HashMap<String, String> {
+pub fn codex_session_names(
+    home: &Path,
+) -> std::io::Result<std::collections::HashMap<String, String>> {
     use std::io::{BufRead, BufReader};
 
     let mut names = std::collections::HashMap::new();
     let path = home.join(".codex").join("session_index.jsonl");
-    let Ok(file) = std::fs::File::open(path) else {
-        return names;
-    };
+    let file = std::fs::File::open(path)?;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
@@ -643,7 +643,7 @@ pub fn codex_session_names(home: &Path) -> std::collections::HashMap<String, Str
         };
         names.insert(id.to_string(), name.to_string());
     }
-    names
+    Ok(names)
 }
 
 /// A Codex terminal title that directly identifies its session.
@@ -653,21 +653,34 @@ pub fn codex_session_names(home: &Path) -> std::collections::HashMap<String, Str
 /// Codex panes share a working directory. The normal pre-resume existence check
 /// still rejects a stale or missing UUID before it reaches the CLI.
 pub fn codex_session_id_from_title(preset: &AgentPreset, title: &str) -> Option<String> {
-    if !preset
-        .program
-        .as_deref()
-        .unwrap_or_default()
-        .contains("codex")
-    {
+    if !preset.program.as_deref().is_some_and(is_codex_program) {
         return None;
     }
-    title
-        .split(|ch: char| {
-            ch.is_ascii_whitespace() || matches!(ch, '|' | ':' | '(' | ')' | '[' | ']')
-        })
-        .map(str::trim)
-        .find(|part| Uuid::parse_str(part).is_ok())
-        .map(str::to_string)
+    let title = title.trim();
+    if Uuid::parse_str(title).is_ok() {
+        return Some(title.to_string());
+    }
+
+    // The invocation-local Codex contract is `thread | run-state · activity`.
+    // Accept a UUID only when it owns the complete thread field. A UUID merely
+    // mentioned inside a renamed thread must never rebind the pane.
+    let (thread, state) = title.rsplit_once(" | ")?;
+    let (run_state, activity) = state.split_once('·')?;
+    if activity.contains('·') {
+        return None;
+    }
+    let run_state = run_state.trim().to_ascii_lowercase();
+    let activity = activity.trim();
+    let activity_lower = activity.to_ascii_lowercase();
+    let valid_state = (run_state == "ready"
+        && matches!(activity_lower.as_str(), "" | "action required"))
+        || (matches!(run_state.as_str(), "starting" | "working" | "thinking")
+            && !activity.is_empty());
+    if !valid_state {
+        return None;
+    }
+    let thread = thread.trim();
+    Uuid::parse_str(thread).ok().map(|_| thread.to_string())
 }
 
 /// Most recently modified Codex session id whose `session_meta.cwd` matches `cwd`.
@@ -901,10 +914,35 @@ mod tests {
     #[test]
     fn codex_session_id_is_extracted_from_semantic_title() {
         let id = Uuid::new_v4().to_string();
-        let title = format!("{id} | Working ⠏");
+        let title = format!("{id} | Working · Responding");
         assert_eq!(
             codex_session_id_from_title(&AgentPreset::codex(), &title).as_deref(),
             Some(id.as_str())
+        );
+
+        assert_eq!(
+            codex_session_id_from_title(
+                &AgentPreset::codex(),
+                &format!("Review {id} carefully | Ready ·")
+            ),
+            None
+        );
+        assert_eq!(
+            codex_session_id_from_title(
+                &AgentPreset {
+                    program: Some("codex-title-proxy.exe".to_string()),
+                    ..AgentPreset::codex()
+                },
+                &title
+            ),
+            None
+        );
+        assert_eq!(
+            codex_session_id_from_title(
+                &AgentPreset::codex(),
+                &format!("{id} | unowned child title")
+            ),
+            None
         );
     }
 
@@ -1112,7 +1150,7 @@ mod tests {
         )
         .unwrap();
 
-        let names = codex_session_names(&tmp);
+        let names = codex_session_names(&tmp).unwrap();
         assert_eq!(names.get("session-a").map(String::as_str), Some("foo"));
         assert_eq!(
             names.get("session-b").map(String::as_str),

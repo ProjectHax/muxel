@@ -104,8 +104,9 @@ feature is added or changed, update the matching entry here in the same change**
   - **Agent-minted** (Codex): only `resume_flag` (`resume`) — first launch is bare;
     muxel captures the UUID Codex publishes for that pane, validates it against
     `~/.codex/sessions` before restart, and relaunches as `codex resume <id>`. Multiple Codex
-    panes can share a project without resuming one another's conversations;
-    switching conversations inside Codex updates that pane's saved UUID.
+    panes can share a project without resuming one another's conversations. Once
+    bound, later OSC titles cannot replace the saved UUID because terminal-title
+    events do not identify which process emitted them.
   If the saved session is gone, the pane quietly starts fresh.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
@@ -196,9 +197,10 @@ feature is added or changed, update the matching entry here in the same change**
   or more (`stale · 4d`). Long pane titles ellipsize before the badge instead of
   pushing status out of the sidebar. Known agent panes accept lifecycle updates
   only from their provider's semantic title shape. Names also require a
-  provider-owned source: Codex `/rename` values are read from its session index by
-  the pane's captured session UUID, so child commands such as npm cannot replace
-  the session name or forge a state transition.
+  provider-owned source: local Codex `/rename` values are read from its session
+  index by the pane's captured session UUID, so child commands such as npm cannot
+  replace the session name or forge a state transition. Remote Codex panes retain
+  the provider's structural title fallback.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
   defaults per agent and **editable working/blocked markers per preset**.
