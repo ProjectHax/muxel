@@ -1532,6 +1532,7 @@ impl TerminalElement {
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
+            let instance_id = self.instance_id;
             let mouse_mode = self.mouse_mode;
             let cw = f32::from(cell_width);
             let lh = f32::from(line_height);
@@ -1543,6 +1544,12 @@ impl TerminalElement {
                 if !hitbox.is_hovered(window) {
                     return;
                 }
+                profile::pointer_routed(
+                    instance_id,
+                    "down",
+                    session.mouse_reporting(),
+                    e.modifiers.shift,
+                );
                 // Scrollbar owns left-click in its strip.
                 if e.button == MouseButton::Left
                     && f32::from(e.position.x) >= bar_x
@@ -1705,10 +1712,17 @@ impl TerminalElement {
         {
             let session = self.session.clone();
             let hitbox = hitbox.clone();
+            let instance_id = self.instance_id;
             window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
                     return;
                 }
+                profile::pointer_routed(
+                    instance_id,
+                    "wheel",
+                    session.mouse_reporting(),
+                    e.modifiers.shift,
+                );
                 let dy = f32::from(e.delta.pixel_delta(line_height).y);
                 // Cell under the pointer — only used when the wheel is forwarded
                 // to a mouse-reporting app as a mouse event.
