@@ -42,9 +42,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, EnumThreadWindows, GetForegroundWindow,
-    GetWindowThreadProcessId, HWND_MESSAGE, PostMessageW, RegisterClassW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_USER, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, EnumThreadWindows, GUI_INMOVESIZE, GUITHREADINFO,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, HWND_MESSAGE, PostMessageW,
+    RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_USER, WNDCLASSW,
 };
 use windows::core::PCWSTR;
 
@@ -56,6 +56,22 @@ const WM_MUXEL_PROBE: u32 = WM_USER + 0x6D59;
 static PRESENT_PENDING: AtomicBool = AtomicBool::new(false);
 static HWND_COUNT: AtomicU32 = AtomicU32::new(0);
 static LAST_PUMP_US: AtomicU64 = AtomicU64::new(0);
+static MOVE_SIZE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether Windows currently owns the foreground thread's modal move/size loop.
+/// Updated by the present-pump sampler, so callers never query Win32 themselves.
+pub fn move_size_active() -> bool {
+    MOVE_SIZE_ACTIVE.load(Ordering::Acquire)
+}
+
+fn sample_move_size() -> bool {
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe { GetGUIThreadInfo(0, &mut info).is_ok() };
+    ok && (info.flags.0 & GUI_INMOVESIZE.0) != 0
+}
 
 pub fn spawn() {
     if std::env::var_os("MUXEL_NO_PRESENT_PUMP").is_some() {
@@ -153,6 +169,7 @@ pub fn spawn() {
         .name("muxel-present-pump".to_string())
         .spawn(move || {
             let mut last_keepalive = Instant::now();
+            let mut was_move_size = false;
             loop {
                 let last_us = LAST_PUMP_US.load(Ordering::Relaxed);
                 let interval_ms: u64 = if last_us > 40_000 {
@@ -164,6 +181,13 @@ pub fn spawn() {
                 } else {
                     16
                 };
+
+                let move_size = sample_move_size();
+                MOVE_SIZE_ACTIVE.store(move_size, Ordering::Release);
+                if move_size != was_move_size {
+                    crate::ui_profile::move_size_changed(move_size);
+                    was_move_size = move_size;
+                }
 
                 let needed = muxel_terminal::take_present_needed();
                 let keepalive = last_keepalive.elapsed() >= Duration::from_millis(33);

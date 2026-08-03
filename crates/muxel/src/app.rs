@@ -68,6 +68,55 @@ fn same_browser_resource(existing: &str, requested: &str) -> bool {
     }
 }
 
+const RESTORE_LAUNCH_CONCURRENCY: usize = 4;
+const RESTORE_FIRST_WAVE_DEBOUNCE_MS: u64 = 250;
+const RESTORE_WAVE_YIELD_MS: u64 = 1;
+const RESTORE_MOVE_SIZE_POLL_MS: u64 = 50;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestoreWaveDecision {
+    Cancel,
+    Pause,
+    Launch { wave_end: usize },
+}
+
+fn restore_wave_delay(wave_start: usize, target_is_windows: bool) -> Duration {
+    Duration::from_millis(if target_is_windows && wave_start == 0 {
+        RESTORE_FIRST_WAVE_DEBOUNCE_MS
+    } else {
+        RESTORE_WAVE_YIELD_MS
+    })
+}
+
+fn restore_wave_decision(
+    wave_start: usize,
+    instance_count: usize,
+    activation_is_current: bool,
+    project_is_visible: bool,
+    move_size_active: bool,
+) -> RestoreWaveDecision {
+    if !activation_is_current || !project_is_visible {
+        RestoreWaveDecision::Cancel
+    } else if move_size_active {
+        RestoreWaveDecision::Pause
+    } else {
+        RestoreWaveDecision::Launch {
+            wave_end: (wave_start + RESTORE_LAUNCH_CONCURRENCY).min(instance_count),
+        }
+    }
+}
+
+fn restore_move_size_active() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        crate::present_pump::move_size_active()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 /// Status indicator color, taken from the active theme.
 fn status_hsla(status: AgentStatus, cx: &App) -> Hsla {
     let t = cx.theme();
@@ -4898,14 +4947,40 @@ impl MuxelApp {
             *generation
         };
         cx.spawn_in(window, async move |this, cx| {
-            const LAUNCH_CONCURRENCY: usize = 4;
             let mut owned_tokens = Vec::new();
-            for wave_start in (0..instances.len()).step_by(LAUNCH_CONCURRENCY) {
-                // Yield even before the first launch so the selected layout paints.
+            let mut wave_start = 0;
+            while wave_start < instances.len() {
+                // On Windows, give an immediate drag a chance to enter the modal
+                // move/size loop before any ConPTY work starts. Other platforms
+                // and later waves retain the ordinary one-millisecond yield.
                 cx.background_executor()
-                    .timer(Duration::from_millis(1))
+                    .timer(restore_wave_delay(wave_start, cfg!(target_os = "windows")))
                     .await;
-                let wave_end = (wave_start + LAUNCH_CONCURRENCY).min(instances.len());
+                let wave_end = loop {
+                    let decision = this
+                        .update_in(cx, |this, window, _| {
+                            restore_wave_decision(
+                                wave_start,
+                                instances.len(),
+                                this.deferred_activation_generation.get(&pid) == Some(&generation),
+                                this.project_is_shown_in_window(pid, window),
+                                restore_move_size_active(),
+                            )
+                        })
+                        .unwrap_or(RestoreWaveDecision::Cancel);
+                    match decision {
+                        RestoreWaveDecision::Cancel => break None,
+                        RestoreWaveDecision::Pause => {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(RESTORE_MOVE_SIZE_POLL_MS))
+                                .await;
+                        }
+                        RestoreWaveDecision::Launch { wave_end } => break Some(wave_end),
+                    }
+                };
+                let Some(wave_end) = wave_end else {
+                    break;
+                };
                 let mut launches = Vec::new();
                 let mut cancelled = false;
                 for (index, iid) in instances[wave_start..wave_end]
@@ -4983,6 +5058,7 @@ impl MuxelApp {
                 if cancelled {
                     break;
                 }
+                wave_start = wave_end;
             }
             let _ = this.update(cx, |this, _| {
                 for (iid, token) in owned_tokens {
@@ -23980,6 +24056,51 @@ mod shell_title_tests {
         assert_eq!(
             terminal_auto_title(&instance, "user@host:~/dev/muxel"),
             Some("~/dev/muxel".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod restore_wave_policy_tests {
+    use super::{RestoreWaveDecision, restore_wave_decision, restore_wave_delay};
+    use std::time::Duration;
+
+    #[test]
+    fn only_the_first_windows_wave_gets_the_resize_debounce() {
+        assert_eq!(restore_wave_delay(0, true), Duration::from_millis(250));
+        assert_eq!(restore_wave_delay(4, true), Duration::from_millis(1));
+        assert_eq!(restore_wave_delay(0, false), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn an_active_move_size_loop_pauses_before_admission() {
+        assert_eq!(
+            restore_wave_decision(0, 8, true, true, true),
+            RestoreWaveDecision::Pause
+        );
+    }
+
+    #[test]
+    fn stale_or_hidden_activations_cancel_even_while_paused() {
+        assert_eq!(
+            restore_wave_decision(0, 8, false, true, true),
+            RestoreWaveDecision::Cancel
+        );
+        assert_eq!(
+            restore_wave_decision(0, 8, true, false, true),
+            RestoreWaveDecision::Cancel
+        );
+    }
+
+    #[test]
+    fn launch_admission_stays_four_wide_and_caps_the_final_wave() {
+        assert_eq!(
+            restore_wave_decision(0, 6, true, true, false),
+            RestoreWaveDecision::Launch { wave_end: 4 }
+        );
+        assert_eq!(
+            restore_wave_decision(4, 6, true, true, false),
+            RestoreWaveDecision::Launch { wave_end: 6 }
         );
     }
 }
