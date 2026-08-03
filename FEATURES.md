@@ -39,6 +39,9 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
+- **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
+  creation and child startup run on a worker, with stale launches discarded if the
+  tab closes or is replaced before startup completes.
 - **Drag & reorder** — drag tab pills to reorder within a pane, move them to other
   panes, or drop at a precise insertion point.
 - **Pinned tabs** — pin a tab to the leftmost block; pins behave fluidly when

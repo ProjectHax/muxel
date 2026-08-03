@@ -501,7 +501,16 @@ impl TerminalLaunch {
     /// [`TerminalSession::size`]. Getting it right up front is what keeps a
     /// `tmux attach` from painting its first frame at the wrong size.
     pub fn spawn(spec: CommandSpec, size: (u16, u16)) -> anyhow::Result<Self> {
-        Self::spawn_with_fallback(spec, CommandSpec::shell(), size)
+        Self::spawn_with_fallback(spec, CommandSpec::shell(), size, None)
+    }
+
+    /// Spawn while attributing PTY sub-phase timings to one pane.
+    pub fn spawn_for_instance(
+        spec: CommandSpec,
+        size: (u16, u16),
+        instance_id: Uuid,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with_fallback(spec, CommandSpec::shell(), size, Some(instance_id))
     }
 
     /// Testable inner half of [`Self::spawn`]: the fallback spec is injectable.
@@ -509,8 +518,13 @@ impl TerminalLaunch {
         spec: CommandSpec,
         fallback: CommandSpec,
         (cols, rows): (u16, u16),
+        instance_id: Option<Uuid>,
     ) -> anyhow::Result<Self> {
-        match TerminalSession::spawn(spec.clone(), cols, rows) {
+        let spawn = |spec| match instance_id {
+            Some(instance_id) => TerminalSession::spawn_profiled(spec, cols, rows, instance_id),
+            None => TerminalSession::spawn(spec, cols, rows),
+        };
+        match spawn(spec.clone()) {
             Ok((session, rx)) => Ok(Self {
                 spec,
                 session,
@@ -527,7 +541,7 @@ impl TerminalLaunch {
                 let shell = fallback.with_startup_input(format!(
                     "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
                 ));
-                let (session, rx) = TerminalSession::spawn(shell.clone(), cols, rows)
+                let (session, rx) = spawn(shell.clone())
                     .with_context(|| format!("fallback shell (after `{prog}` failed: {detail})"))?;
                 Ok(Self {
                     spec: shell,
@@ -1245,7 +1259,7 @@ mod launch_tests {
     #[test]
     fn double_failure_is_an_error_not_a_panic() {
         let bogus = CommandSpec::program("/definitely/not/here-muxel", vec![]);
-        let result = TerminalLaunch::spawn_with_fallback(bogus.clone(), bogus, (80, 24));
+        let result = TerminalLaunch::spawn_with_fallback(bogus.clone(), bogus, (80, 24), None);
         assert!(result.is_err(), "total failure must surface as Err");
     }
 
