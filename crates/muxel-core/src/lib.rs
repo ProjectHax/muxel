@@ -89,6 +89,13 @@ pub enum AgentActivityState {
 }
 
 impl AgentActivity {
+    fn last_lifecycle_at(&self) -> Option<i64> {
+        [self.work_started_at, self.completed_at, self.blocked_at]
+            .into_iter()
+            .flatten()
+            .max()
+    }
+
     /// Whether a completed turn is newer than the last time the pane was
     /// attended. A missing attendance timestamp means the completion is unseen.
     pub fn has_unattended_completion(&self) -> bool {
@@ -121,10 +128,13 @@ impl AgentActivity {
                 }
             }
             AgentActivityState::Done => {
-                // A restored unseen completion already has its correct timestamp;
-                // keep it until the user attends the pane. Restored terminals can
-                // emit a false Working -> Done cycle while their CLI boots.
-                if !self.has_unattended_completion() && previous != Some(AgentActivityState::Done) {
+                // A restored completion already has its correct timestamp.
+                // Its first live sample is not a new event, even when focus marked it
+                // attended while the terminal was loading.
+                if !self.has_unattended_completion()
+                    && previous != Some(AgentActivityState::Done)
+                    && !(previous.is_none() && self.completed_at.is_some())
+                {
                     self.completed_at = Some(now);
                 }
                 self.blocked_at = None;
@@ -161,7 +171,7 @@ pub fn agent_activity_label(
         AgentActivityState::Done => state_with_age("done", activity.completed_at, now),
         AgentActivityState::Blocked => state_with_age("blocked", activity.blocked_at, now),
         AgentActivityState::Idle => {
-            let Some(age) = age_millis(activity.last_attended_at, now) else {
+            let Some(age) = age_millis(activity.last_lifecycle_at(), now) else {
                 return "idle".to_string();
             };
             if age < MINUTE_MS {
@@ -234,7 +244,7 @@ mod agent_activity_tests {
         assert!(!activity.has_unattended_completion());
         assert_eq!(
             agent_activity_label(AgentActivityState::Idle, &activity, 460_000),
-            "idle · 1m"
+            "idle · 4m"
         );
     }
 
@@ -289,6 +299,22 @@ mod agent_activity_tests {
     }
 
     #[test]
+    fn attended_restored_completion_keeps_its_age_on_first_live_sample() {
+        let mut activity = AgentActivity {
+            completed_at: Some(0),
+            ..AgentActivity::default()
+        };
+        assert!(activity.attend(2 * HOUR_MS));
+        assert!(!activity.has_unattended_completion());
+        assert!(!activity.observe(None, AgentActivityState::Done, 2 * HOUR_MS));
+        assert_eq!(activity.completed_at, Some(0));
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Done, &activity, 2 * HOUR_MS),
+            "done · 2h"
+        );
+    }
+
+    #[test]
     fn restored_blocked_timestamp_is_not_replaced_by_first_live_sample() {
         let mut activity = AgentActivity {
             blocked_at: Some(100),
@@ -301,7 +327,8 @@ mod agent_activity_tests {
     #[test]
     fn label_boundaries_keep_the_middle_quiet() {
         let activity = AgentActivity {
-            last_attended_at: Some(0),
+            work_started_at: Some(0),
+            last_attended_at: Some(58 * MINUTE_MS),
             ..AgentActivity::default()
         };
         assert_eq!(
@@ -319,6 +346,19 @@ mod agent_activity_tests {
         assert_eq!(
             agent_activity_label(AgentActivityState::Idle, &activity, 3 * DAY_MS),
             "stale · 3d"
+        );
+    }
+
+    #[test]
+    fn attendance_does_not_reset_idle_age() {
+        let mut activity = AgentActivity {
+            completed_at: Some(0),
+            ..AgentActivity::default()
+        };
+        assert!(activity.attend(4 * DAY_MS));
+        assert_eq!(
+            agent_activity_label(AgentActivityState::Idle, &activity, 4 * DAY_MS),
+            "stale · 4d"
         );
     }
 
@@ -343,7 +383,7 @@ mod agent_activity_tests {
     #[test]
     fn future_timestamps_clamp_to_now() {
         let activity = AgentActivity {
-            last_attended_at: Some(500_000),
+            work_started_at: Some(500_000),
             ..AgentActivity::default()
         };
         assert_eq!(
@@ -464,7 +504,7 @@ impl Instance {
             .or_else(|| {
                 self.auto_name
                     .as_deref()
-                    .filter(|name| is_useful_auto_name(name))
+                    .filter(|name| is_useful_auto_name_for_program(name, self.program.as_deref()))
             })
             .unwrap_or(&self.title)
     }
@@ -473,7 +513,9 @@ impl Instance {
     /// changed, so callers can debounce disk writes without losing the last
     /// non-empty title.
     pub fn update_auto_name(&mut self, name: String) -> bool {
-        if !is_useful_auto_name(&name) || self.auto_name.as_ref() == Some(&name) {
+        if !is_useful_auto_name_for_program(&name, self.program.as_deref())
+            || self.auto_name.as_ref() == Some(&name)
+        {
             return false;
         }
         self.auto_name = Some(name);
@@ -1876,6 +1918,39 @@ pub fn is_useful_auto_name(name: &str) -> bool {
     !name.is_empty() && Uuid::parse_str(name).is_err()
 }
 
+/// Reject launcher-generated absolute paths such as Codex's packaged
+/// `.../codex-win32-x64.exe`. They identify an implementation binary, not a
+/// conversation. Ordinary titles and shell directory titles remain valid.
+fn is_useful_auto_name_for_program(name: &str, program: Option<&str>) -> bool {
+    if !is_useful_auto_name(name) {
+        return false;
+    }
+    let Some(program) = program else {
+        return true;
+    };
+    let name = name.trim().trim_matches('"');
+    let bytes = name.as_bytes();
+    let absolute = name.starts_with('/')
+        || name.starts_with("\\\\")
+        || bytes.get(1) == Some(&b':') && bytes.first().is_some_and(u8::is_ascii_alphabetic);
+    if !absolute {
+        return true;
+    }
+    let stem = |value: &str| {
+        let leaf = value.rsplit(['/', '\\']).next().unwrap_or(value);
+        leaf.strip_suffix(".exe")
+            .or_else(|| leaf.strip_suffix(".cmd"))
+            .or_else(|| leaf.strip_suffix(".bat"))
+            .unwrap_or(leaf)
+            .to_ascii_lowercase()
+    };
+    let program_stem = stem(program);
+    let title_stem = stem(name);
+    title_stem != program_stem
+        && !title_stem.starts_with(&format!("{program_stem}-"))
+        && !title_stem.starts_with(&format!("{program_stem}_"))
+}
+
 #[cfg(test)]
 mod instance_tests {
     use super::*;
@@ -1903,6 +1978,22 @@ mod instance_tests {
 
         instance.auto_name = Some("\t".into());
         assert_eq!(instance.display_name(), "Claude");
+    }
+
+    #[test]
+    fn packaged_agent_executable_path_is_not_a_display_name() {
+        let mut instance = Instance::shell(Uuid::new_v4());
+        instance.title = "Codex".into();
+        instance.program = Some("codex".into());
+        let leaked = r"C:\tools\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\codex-win32-x64.exe";
+
+        instance.auto_name = Some(leaked.into());
+        assert_eq!(instance.display_name(), "Codex");
+        instance.auto_name = None;
+        assert!(!instance.update_auto_name(leaked.into()));
+        assert_eq!(instance.auto_name, None);
+        assert!(instance.update_auto_name("Fix restore behavior".into()));
+        assert_eq!(instance.display_name(), "Fix restore behavior");
     }
 
     #[test]
