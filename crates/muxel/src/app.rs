@@ -8265,8 +8265,15 @@ impl MuxelApp {
             if is_html
                 && self.settings.browser_enabled
                 && source_project.is_some_and(|pid| {
-                    self.open_browser_in_project(pid, canonical_url.clone(), source, None, window, cx)
-                        .is_some()
+                    self.open_browser_in_project(
+                        pid,
+                        canonical_url.clone(),
+                        source,
+                        None,
+                        window,
+                        cx,
+                    )
+                    .is_some()
                 })
             {
                 return;
