@@ -108,6 +108,12 @@ enum TitleProvider {
     Other,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentTitleFrame {
+    status: Option<AgentStatus>,
+    name: Option<String>,
+}
+
 impl TitleProvider {
     fn from_program(program: &str) -> Self {
         let leaf = program
@@ -130,71 +136,123 @@ impl TitleProvider {
     }
 }
 
-/// Parse only provider-owned, structurally constrained title state. Unknown
-/// shapes are no evidence; they must never turn an arbitrary pane title into a
-/// lifecycle claim.
-fn title_status(
-    provider: TitleProvider,
-    title: Option<&str>,
-    age: Option<Duration>,
-) -> Option<AgentStatus> {
-    let title = title?.trim_start();
+/// Parse one provider-owned title frame into independent lifecycle and naming
+/// observations. Unknown titles produce neither: every process sharing the PTY
+/// can emit OSC titles, and those events carry no process identity.
+fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<AgentTitleFrame> {
+    let title = title?.trim();
     match provider {
-        TitleProvider::Claude => match title.chars().next()? {
-            // Claude owns this title protocol: the braille frames mean Working
-            // and the star means Idle. Long-running tools can leave one frame
-            // unchanged for minutes, so title age is not completion evidence.
-            '⠂' | '⠐' => Some(AgentStatus::Working),
-            '✳' => Some(AgentStatus::Idle),
-            _ => None,
-        },
-        TitleProvider::Codex => {
-            // Muxel forces the title to run-state + activity only, so these words
-            // cannot come from a project/session name. Activity supplies a fresh
-            // spinner heartbeat and the action-required phrase.
-            let lower = title.to_ascii_lowercase();
-            if lower.contains("action required") {
-                Some(AgentStatus::Blocked)
-            } else if lower
-                .split(|c: char| !c.is_alphabetic())
-                .any(|part| matches!(part, "starting" | "working" | "thinking"))
-                && age.is_some_and(|age| age <= Duration::from_secs(5))
-            {
-                Some(AgentStatus::Working)
-            } else if lower
-                .split(|c: char| !c.is_alphabetic())
-                .any(|part| part == "ready")
-            {
-                // Ready is authoritative until Codex publishes the next state.
-                // This keeps a background server's PTY repaint from claiming the
-                // agent itself is still working.
-                Some(AgentStatus::Idle)
-            } else {
-                None
+        TitleProvider::Claude => {
+            let marker = title.chars().next()?;
+            let status = match marker {
+                // Claude owns this title protocol: the braille frames mean
+                // Working and the star means Idle. Long-running tools can leave
+                // one frame unchanged for minutes, so age is not completion
+                // evidence.
+                '⠂' | '⠐' => AgentStatus::Working,
+                '✳' => AgentStatus::Idle,
+                _ => return None,
+            };
+            let rest = &title[marker.len_utf8()..];
+            if !rest.is_empty() && !rest.chars().next().is_some_and(char::is_whitespace) {
+                return None;
             }
+            let name = rest.trim().to_string();
+            Some(AgentTitleFrame {
+                status: Some(status),
+                name: (!name.is_empty()).then_some(name),
+            })
+        }
+        TitleProvider::Codex => {
+            // Muxel forces `thread | run-state · activity`. Parse the state only
+            // from the final segment: thread names may legitimately contain words
+            // such as "working", "ready", or "action required".
+            let (name, state) = title.rsplit_once(" | ")?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let (run_state, activity) = state.split_once('·')?;
+            if activity.contains('·') {
+                return None;
+            }
+            let run_state = run_state.trim().to_ascii_lowercase();
+            let activity = activity.trim();
+            let activity_lower = activity.to_ascii_lowercase();
+            let status = match (run_state.as_str(), activity_lower.as_str()) {
+                ("ready", "action required") => AgentStatus::Blocked,
+                ("ready", "") => AgentStatus::Idle,
+                ("starting" | "working" | "thinking", _) if !activity_lower.is_empty() => {
+                    AgentStatus::Working
+                }
+                _ => return None,
+            };
+            Some(AgentTitleFrame {
+                status: Some(status),
+                name: Some(name.to_string()),
+            })
         }
         TitleProvider::Grok => {
             let parts = title.split(" - ").map(str::trim).collect::<Vec<_>>();
-            if title.contains("⚠ Action Required") {
-                Some(AgentStatus::Blocked)
-            } else if parts
-                .iter()
-                .any(|part| is_grok_spinner(part) || is_grok_activity(part))
-            {
-                // Grok removes these provider-owned items when it returns to
-                // Idle. A long tool or response can leave the same title in
-                // place for minutes, so age is not completion evidence.
-                Some(AgentStatus::Working)
-            } else if title == "grok" || parts.last() == Some(&"grok") {
-                // Grok removes the spinner/activity items when AgentState returns
-                // to Idle, leaving the generated session title and `grok` item.
-                Some(AgentStatus::Idle)
-            } else {
-                None
+            if parts.last() != Some(&"grok") {
+                return None;
             }
+            let payload = &parts[..parts.len() - 1];
+            let (status, name_start) = match payload {
+                ["⚠ Action Required", spinner, activity, ..]
+                    if is_grok_spinner(spinner) && is_grok_activity(activity) =>
+                {
+                    (Some(AgentStatus::Blocked), 3)
+                }
+                [spinner, activity, ..]
+                    if is_grok_spinner(spinner) && is_grok_activity(activity) =>
+                {
+                    // Grok removes these provider-owned leading items when it
+                    // returns to Idle. A long tool or response can leave the
+                    // same frame in place for minutes, so age is not evidence.
+                    (Some(AgentStatus::Working), 2)
+                }
+                [reserved, ..] if *reserved == "⚠ Action Required" || is_grok_spinner(reserved) =>
+                {
+                    // A partial reserved prefix may come from a custom title
+                    // layout or a generated name. Keep the name, but make no
+                    // lifecycle claim without the complete provider frame.
+                    (None, 0)
+                }
+                // With no complete state/activity prefix, every segment before
+                // the provider sentinel belongs to the generated session name.
+                _ => (Some(AgentStatus::Idle), 0),
+            };
+            let name = payload[name_start..]
+                .iter()
+                .filter(|part| !part.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" - ");
+            Some(AgentTitleFrame {
+                status,
+                name: (!name.is_empty()).then_some(name),
+            })
         }
         TitleProvider::Other => None,
     }
+}
+
+fn title_status(
+    provider: TitleProvider,
+    title: Option<&str>,
+    _age: Option<Duration>,
+) -> Option<AgentStatus> {
+    parse_agent_title(provider, title).and_then(|frame| frame.status)
+}
+
+/// Once a provider proves its semantic title protocol, an unrelated OSC title
+/// must not erase that observation or reactivate the weak PTY activity heuristic.
+fn sticky_title_status(
+    previous: Option<AgentStatus>,
+    observed: Option<AgentStatus>,
+) -> Option<AgentStatus> {
+    observed.or(previous)
 }
 
 /// Provider-owned screen text that proves work continues even if the title has
@@ -278,37 +336,8 @@ fn hold_grok_blocked(
 /// pane's persisted automatic name. A title containing only state is not a name.
 pub fn clean_agent_title(program: &str, title: &str) -> Option<String> {
     match TitleProvider::from_program(program) {
-        TitleProvider::Claude => {
-            let title = title.trim_start();
-            let first = title.chars().next()?;
-            let cleaned = if matches!(first, '⠂' | '⠐' | '✳') {
-                title[first.len_utf8()..].trim_start()
-            } else {
-                title
-            };
-            (!cleaned.is_empty()).then(|| cleaned.to_string())
-        }
-        TitleProvider::Codex
-            if title_status(TitleProvider::Codex, Some(title), Some(Duration::ZERO)).is_some() =>
-        {
-            None
-        }
-        TitleProvider::Grok => {
-            let mut parts = title
-                .split(" - ")
-                .map(str::trim)
-                .filter(|part| {
-                    !part.is_empty()
-                        && *part != "grok"
-                        && *part != "⚠ Action Required"
-                        && !is_grok_spinner(part)
-                        && !is_grok_activity(part)
-                })
-                .peekable();
-            parts.peek()?;
-            Some(parts.collect::<Vec<_>>().join(" - "))
-        }
-        _ => Some(title.to_string()),
+        TitleProvider::Other => Some(title.to_string()),
+        provider => parse_agent_title(provider, Some(title))?.name,
     }
 }
 
@@ -361,8 +390,11 @@ fn latch_done(
     can_latch: bool,
 ) -> (AgentStatus, bool) {
     match raw {
-        // Active again, blocked, or already Done (bell/exit) — no latch needed.
-        AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done => (raw, false),
+        // New activity or an input request replaces the previous completion.
+        AgentStatus::Working | AgentStatus::Blocked => (raw, false),
+        // Bell/exit is precise completion evidence. Latch it so acknowledging the
+        // notification cannot turn lifecycle back into Idle.
+        AgentStatus::Done => (AgentStatus::Done, true),
         AgentStatus::Idle => {
             if can_latch && (latched || prev_raw == Some(AgentStatus::Working)) {
                 (AgentStatus::Done, true)
@@ -392,6 +424,14 @@ fn latch_done_after_readiness(
 
 fn can_latch_completion(has_working_markers: bool, semantic_title_seen: bool) -> bool {
     has_working_markers || semantic_title_seen
+}
+
+fn provider_settled_after_title(
+    settled: bool,
+    observed_title: Option<AgentStatus>,
+    submitted: bool,
+) -> bool {
+    settled || submitted || observed_title == Some(AgentStatus::Idle)
 }
 
 /// How the mouse copies/pastes in a terminal pane (a global setting parsed from
@@ -493,10 +533,12 @@ pub struct TerminalView {
     /// Ready/Idle must be observed once, or a turn submitted, before a
     /// Working→Idle edge can mean Done. This rejects startup spinners.
     completion_armed: std::cell::Cell<bool>,
-    /// A provider-specific semantic title has been recognized at least once.
-    /// Until then Codex/Grok without title support retain the marker-only
-    /// fallback and may not turn incidental PTY activity into Done.
-    semantic_title_seen: std::cell::Cell<bool>,
+    /// A provider-owned Ready/Idle title, unlike fallback PTY quiet, proves the
+    /// restored CLI has finished booting. This bounds startup-state suppression.
+    provider_settled: std::cell::Cell<bool>,
+    /// Last provider-owned title state. Foreign OSC titles cannot erase it or
+    /// reactivate the weak PTY activity fallback.
+    semantic_title_status: std::cell::Cell<Option<AgentStatus>>,
     /// Grok's action-required title item intentionally blinks when unfocused.
     /// Retain the last positive edge briefly so the sidebar does not blink too.
     grok_blocked_at: std::cell::Cell<Option<std::time::Instant>>,
@@ -882,7 +924,8 @@ impl TerminalView {
             prev_raw: std::cell::Cell::new(None),
             done_latch: std::cell::Cell::new(false),
             completion_armed: std::cell::Cell::new(false),
-            semantic_title_seen: std::cell::Cell::new(false),
+            provider_settled: std::cell::Cell::new(false),
+            semantic_title_status: std::cell::Cell::new(None),
             grok_blocked_at: std::cell::Cell::new(None),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
             pending_paint_deadline: std::cell::Cell::new(None),
@@ -954,18 +997,25 @@ impl TerminalView {
             }
         }
 
-        let mut title = title_status(
+        let observed_title = title_status(
             self.title_provider,
             title_text.as_deref(),
             self.session.title_age(),
         );
-        if title.is_some() {
-            self.semantic_title_seen.set(true);
+        let submitted_turn = self.session.has_submitted_turn();
+        self.provider_settled.set(provider_settled_after_title(
+            self.provider_settled.get(),
+            observed_title,
+            submitted_turn,
+        ));
+        if let Some(status) = observed_title {
+            self.semantic_title_status.set(Some(status));
         }
+        let mut title = sticky_title_status(self.semantic_title_status.get(), observed_title);
         // Once a known provider has proved its title protocol, that protocol owns
         // Working/Idle. Keep screen markers only as a compatibility fallback for
         // older/custom clients; blocked prompts remain independent evidence.
-        let title_protocol_live = self.semantic_title_seen.get();
+        let title_protocol_live = self.semantic_title_status.get().is_some();
         let working_markers = if title_protocol_live {
             &[][..]
         } else {
@@ -1015,7 +1065,7 @@ impl TerminalView {
         // typing echo and turn two seconds of quiet into a false completion.
         let can_latch = can_latch_completion(
             !self.working_markers.is_empty(),
-            self.semantic_title_seen.get(),
+            self.semantic_title_status.get().is_some(),
         );
         let (status, latch, armed) = latch_done_after_readiness(
             self.prev_raw.replace(Some(raw)),
@@ -1023,13 +1073,19 @@ impl TerminalView {
             self.done_latch.get(),
             can_latch,
             self.completion_armed.get(),
-            self.session.has_submitted_turn(),
+            submitted_turn,
         );
         self.done_latch.set(latch);
         self.completion_armed.set(armed);
         self.status_cache
             .set(Some((content_gen, title_gen, status)));
         status
+    }
+
+    /// Whether this terminal has observed provider-owned Ready/Idle or a
+    /// submitted turn. Fallback PTY quiet is not startup-readiness evidence.
+    pub fn completion_ready(&self) -> bool {
+        self.provider_settled.get() || self.session.has_submitted_turn()
     }
 
     /// Whether `needle` appears in the current visible grid — used by the app to
@@ -1333,7 +1389,8 @@ mod tests {
         FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, TitleProvider,
         can_latch_completion, classify, clean_agent_title, combine_title_status,
         continuing_screen_status, hold_grok_blocked, latch_done, latch_done_after_readiness,
-        next_paint_schedule, paint_min_interval, title_status,
+        next_paint_schedule, paint_min_interval, provider_settled_after_title, sticky_title_status,
+        title_status,
     };
     use std::time::Duration;
 
@@ -1381,7 +1438,7 @@ mod tests {
         assert_eq!(
             title_status(
                 TitleProvider::Codex,
-                Some("Ready ·"),
+                Some("Review title | Ready ·"),
                 Some(Duration::from_secs(20))
             ),
             Some(AgentStatus::Idle)
@@ -1393,7 +1450,7 @@ mod tests {
         assert_eq!(
             title_status(
                 TitleProvider::Codex,
-                Some("Starting ⠦"),
+                Some("Review title | Starting · ⠦"),
                 Some(Duration::from_millis(500))
             ),
             Some(AgentStatus::Working)
@@ -1401,19 +1458,34 @@ mod tests {
         assert_eq!(
             title_status(
                 TitleProvider::Codex,
-                Some("Working · ⠋"),
-                Some(Duration::from_millis(500))
+                Some("action required audit | Working · ⠋"),
+                Some(Duration::from_secs(30))
             ),
             Some(AgentStatus::Working)
         );
         assert_eq!(
             title_status(
                 TitleProvider::Codex,
-                Some("Ready · action required"),
+                Some("working on ready handling | Ready ·"),
+                Some(Duration::from_secs(30))
+            ),
+            Some(AgentStatus::Idle)
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Codex,
+                Some("Review title | Ready · action required"),
                 Some(Duration::from_secs(30))
             ),
             Some(AgentStatus::Blocked)
         );
+        for foreign in ["Ready", "Ready ·", "Working on tests", "Working · ⠋"] {
+            assert_eq!(
+                title_status(TitleProvider::Codex, Some(foreign), Some(Duration::ZERO)),
+                None,
+                "accepted foreign title {foreign:?}"
+            );
+        }
     }
 
     #[test]
@@ -1556,10 +1628,101 @@ mod tests {
 
     #[test]
     fn foreign_titles_never_become_lifecycle_state() {
+        for provider in [
+            TitleProvider::Claude,
+            TitleProvider::Codex,
+            TitleProvider::Grok,
+            TitleProvider::Other,
+        ] {
+            assert_eq!(
+                title_status(
+                    provider,
+                    Some("npm run test-v8-historical"),
+                    Some(Duration::ZERO)
+                ),
+                None
+            );
+        }
         assert_eq!(
-            title_status(TitleProvider::Other, Some("Thinking"), Some(Duration::ZERO)),
+            title_status(
+                TitleProvider::Codex,
+                Some("npm run ready"),
+                Some(Duration::ZERO)
+            ),
             None
         );
+        assert_eq!(
+            title_status(
+                TitleProvider::Claude,
+                Some("✳not a Claude frame"),
+                Some(Duration::ZERO)
+            ),
+            None
+        );
+        assert_eq!(
+            title_status(
+                TitleProvider::Grok,
+                Some("Thinking - Review title"),
+                Some(Duration::ZERO)
+            ),
+            None
+        );
+        for name in [
+            "Thinking",
+            "Responding",
+            "Running tool",
+            "Compacting",
+            "Waiting for tests",
+            "Running: npm",
+            "Retrying (1)",
+        ] {
+            let title = format!("{name} - grok");
+            assert_eq!(
+                title_status(TitleProvider::Grok, Some(&title), Some(Duration::ZERO)),
+                Some(AgentStatus::Idle),
+                "session name forged lifecycle: {name:?}"
+            );
+            assert_eq!(clean_agent_title("grok", &title).as_deref(), Some(name));
+        }
+        for title in [
+            "⚠ Action Required - grok",
+            "⚠ Action Required - Review - grok",
+            "⠋ - Review - grok",
+        ] {
+            assert_eq!(
+                title_status(TitleProvider::Grok, Some(title), Some(Duration::ZERO)),
+                None,
+                "incomplete reserved prefix forged lifecycle: {title:?}"
+            );
+            assert!(clean_agent_title("grok", title).is_some());
+        }
+    }
+
+    #[test]
+    fn foreign_titles_cannot_erase_a_provider_lifecycle_observation() {
+        use AgentStatus::{Idle, Working};
+
+        let working = title_status(
+            TitleProvider::Codex,
+            Some("Review changes | Working · ⠋"),
+            Some(Duration::ZERO),
+        );
+        assert_eq!(sticky_title_status(None, working), Some(Working));
+        assert_eq!(sticky_title_status(working, None), Some(Working));
+        assert_eq!(
+            sticky_title_status(
+                working,
+                title_status(TitleProvider::Codex, Some("Ready ·"), Some(Duration::ZERO))
+            ),
+            Some(Working)
+        );
+
+        let idle = title_status(
+            TitleProvider::Codex,
+            Some("Review changes | Ready ·"),
+            Some(Duration::ZERO),
+        );
+        assert_eq!(sticky_title_status(working, idle), Some(Idle));
     }
 
     #[test]
@@ -1587,6 +1750,10 @@ mod tests {
         );
         assert_eq!(clean_agent_title("codex", "Ready · ⠋"), None);
         assert_eq!(
+            clean_agent_title("codex", "Review changes | Ready ·").as_deref(),
+            Some("Review changes")
+        );
+        assert_eq!(
             clean_agent_title(
                 "grok",
                 "⠦ - Waiting for response… - User requests exact OK reply - grok"
@@ -1595,6 +1762,12 @@ mod tests {
             Some("User requests exact OK reply")
         );
         assert_eq!(clean_agent_title("grok", "grok"), None);
+        for program in ["claude", "codex", "grok"] {
+            assert_eq!(
+                clean_agent_title(program, "npm run test-v8-historical"),
+                None
+            );
+        }
         assert_eq!(
             clean_agent_title("pwsh", "D:\\dev\\muxel").as_deref(),
             Some("D:\\dev\\muxel")
@@ -1706,8 +1879,9 @@ mod tests {
             latch_done(Some(Idle), Working, true, true),
             (Working, false)
         );
-        // A bell/exit Done passes straight through (no latch needed).
-        assert_eq!(latch_done(Some(Working), Done, false, true), (Done, false));
+        // A bell/exit Done latches through later Idle samples.
+        assert_eq!(latch_done(Some(Working), Done, false, true), (Done, true));
+        assert_eq!(latch_done(Some(Done), Idle, true, true), (Done, true));
         // Idle not preceded by working stays idle (a fresh pane).
         assert_eq!(latch_done(None, Idle, false, true), (Idle, false));
         // Blocked passes through and clears the latch.
@@ -1726,8 +1900,9 @@ mod tests {
         assert_eq!(latch_done(Some(Working), Idle, false, false), (Idle, false));
         // A stuck latch can't survive once latching is disallowed.
         assert_eq!(latch_done(Some(Idle), Idle, true, false), (Idle, false));
-        // The bell/exit `Done` still passes straight through (precise signals).
-        assert_eq!(latch_done(Some(Working), Done, false, false), (Done, false));
+        // Bell/exit is precise enough to latch without semantic Working evidence.
+        assert_eq!(latch_done(Some(Working), Done, false, false), (Done, true));
+        assert_eq!(latch_done(Some(Done), Idle, true, false), (Idle, false));
     }
 
     #[test]
@@ -1755,6 +1930,18 @@ mod tests {
             latch_done_after_readiness(Some(Working), Idle, latch, true, armed, true),
             (Done, true, true)
         );
+    }
+
+    #[test]
+    fn provider_readiness_ignores_fallback_idle_before_semantic_startup() {
+        use AgentStatus::{Idle, Working};
+        let settled = provider_settled_after_title(false, None, false);
+        assert!(!settled);
+        let settled = provider_settled_after_title(settled, Some(Working), false);
+        assert!(!settled);
+        let settled = provider_settled_after_title(settled, Some(Idle), false);
+        assert!(settled);
+        assert!(provider_settled_after_title(settled, Some(Working), false));
     }
 
     #[test]

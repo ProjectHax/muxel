@@ -137,23 +137,90 @@ fn activity_state(status: AgentStatus) -> AgentActivityState {
     }
 }
 
+const RESTORE_ACTIVITY_MAX_WAIT_MS: u64 = 30_000;
+
+fn restore_activity_guard_active(
+    pending: bool,
+    submitted_turn: bool,
+    completion_ready: bool,
+    elapsed: Option<Duration>,
+    startup_delay_ms: u32,
+) -> bool {
+    let budget = Duration::from_millis(
+        RESTORE_ACTIVITY_MAX_WAIT_MS.saturating_add(u64::from(startup_delay_ms)),
+    );
+    pending
+        && !submitted_turn
+        && !completion_ready
+        && elapsed.is_some_and(|elapsed| elapsed < budget)
+}
+
 /// A restored terminal may emit a synthetic Working cycle while its CLI boots.
-/// Preserve durable lifecycle timestamps through that cycle. A submitted turn is
-/// direct evidence of new work and ends the guard immediately; otherwise the first
-/// settled non-Working sample ends it after preserving that sample.
+/// Preserve durable lifecycle through fallback Idle and startup Working until a
+/// provider-owned settled edge. Precise Done/Blocked states apply immediately;
+/// a submitted turn also ends the guard.
 fn restored_activity_sample(
     guarded: bool,
     submitted_turn: bool,
     status: AgentStatus,
 ) -> (bool, bool) {
-    let preserve = guarded && !submitted_turn;
-    let keep_guard = preserve && status == AgentStatus::Working;
+    let preserve =
+        guarded && !submitted_turn && matches!(status, AgentStatus::Working | AgentStatus::Idle);
+    let keep_guard = preserve;
     (preserve, keep_guard)
+}
+
+fn activity_needs_observation(
+    previous: Option<AgentStatus>,
+    status: AgentStatus,
+    activity: &AgentActivity,
+) -> bool {
+    previous != Some(status) || activity.current_state() != Some(activity_state(status))
+}
+
+/// Record a visible runtime completion before marking its notification read.
+/// This ordering keeps bell-derived Done as lifecycle state after focus clears
+/// the bell that supplied the live signal.
+fn attend_agent_activity(
+    activity: &mut AgentActivity,
+    previous: Option<AgentStatus>,
+    runtime_completion: bool,
+    now: i64,
+) -> bool {
+    let mut changed = false;
+    if runtime_completion && activity.current_state() != Some(AgentActivityState::Done) {
+        let previous = activity
+            .current_state()
+            .or_else(|| previous.map(activity_state));
+        changed |= activity.observe(previous, AgentActivityState::Done, now);
+    }
+    changed |= activity.attend(now);
+    changed
 }
 
 #[cfg(test)]
 mod restored_activity_tests {
-    use super::{AgentStatus, restored_activity_sample};
+    use super::{
+        AgentActivityState, AgentPreset, AgentStatus, Instance, activity_needs_observation,
+        attend_agent_activity, attention_rank, is_restored_transition, persisted_status,
+        restore_activity_guard_active, restored_activity_sample,
+    };
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    fn attended_completion() -> Instance {
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        instance
+            .activity
+            .observe(None, AgentActivityState::Working, 100);
+        instance.activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            200,
+        );
+        instance.activity.attend(300);
+        instance
+    }
 
     #[test]
     fn bootstrap_working_then_done_preserves_both_samples_and_settles() {
@@ -163,19 +230,23 @@ mod restored_activity_tests {
         );
         assert_eq!(
             restored_activity_sample(true, false, AgentStatus::Done),
-            (true, false)
+            (false, false)
         );
     }
 
     #[test]
-    fn bootstrap_working_then_idle_preserves_stale_age_and_settles() {
+    fn fallback_idle_keeps_the_restore_guard_until_provider_readiness() {
         assert_eq!(
             restored_activity_sample(true, false, AgentStatus::Working),
             (true, true)
         );
         assert_eq!(
             restored_activity_sample(true, false, AgentStatus::Idle),
-            (true, false)
+            (true, true)
+        );
+        assert_eq!(
+            restored_activity_sample(false, false, AgentStatus::Idle),
+            (false, false)
         );
     }
 
@@ -186,19 +257,307 @@ mod restored_activity_tests {
             (false, false)
         );
     }
+
+    #[test]
+    fn restore_guard_uses_readiness_and_the_real_startup_budget() {
+        let configured_delay_ms = 6_000;
+        assert!(restore_activity_guard_active(
+            true,
+            false,
+            false,
+            Some(Duration::from_millis(35_999)),
+            configured_delay_ms,
+        ));
+        assert!(!restore_activity_guard_active(
+            true,
+            false,
+            false,
+            Some(Duration::from_millis(36_000)),
+            configured_delay_ms,
+        ));
+        assert!(!restore_activity_guard_active(
+            true,
+            false,
+            true,
+            Some(Duration::ZERO),
+            configured_delay_ms,
+        ));
+        assert!(!restore_activity_guard_active(
+            true,
+            true,
+            false,
+            Some(Duration::ZERO),
+            configured_delay_ms,
+        ));
+    }
+
+    #[test]
+    fn fallback_idle_then_semantic_starting_and_ready_preserves_restored_done() {
+        let done = attended_completion();
+
+        let fallback_idle_guarded =
+            restore_activity_guard_active(true, false, false, Some(Duration::ZERO), 0);
+        assert!(fallback_idle_guarded);
+        assert_eq!(
+            persisted_status(AgentStatus::Idle, Some(&done), fallback_idle_guarded),
+            AgentStatus::Done
+        );
+        assert_eq!(
+            restored_activity_sample(fallback_idle_guarded, false, AgentStatus::Idle),
+            (true, true)
+        );
+
+        let startup_working_guarded =
+            restore_activity_guard_active(true, false, false, Some(Duration::from_millis(500)), 0);
+        assert!(startup_working_guarded);
+        assert_eq!(
+            persisted_status(AgentStatus::Working, Some(&done), startup_working_guarded,),
+            AgentStatus::Done
+        );
+
+        let ready_guarded =
+            restore_activity_guard_active(true, false, true, Some(Duration::from_secs(1)), 0);
+        assert!(!ready_guarded);
+        assert_eq!(
+            persisted_status(AgentStatus::Idle, Some(&done), ready_guarded),
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn attended_completion_remains_done_when_runtime_returns_idle() {
+        let instance = attended_completion();
+        assert!(!instance.activity.has_unattended_completion());
+        assert_eq!(
+            persisted_status(AgentStatus::Idle, Some(&instance), false),
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn bell_completion_is_recorded_before_focus_marks_it_attended() {
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        instance
+            .activity
+            .observe(None, AgentActivityState::Working, 100);
+
+        assert!(attend_agent_activity(
+            &mut instance.activity,
+            Some(AgentStatus::Working),
+            true,
+            200,
+        ));
+        assert_eq!(
+            instance.activity.current_state(),
+            Some(AgentActivityState::Done)
+        );
+        assert_eq!(instance.activity.completed_at, Some(200));
+        assert_eq!(instance.activity.last_attended_at, Some(200));
+        assert!(!instance.activity.has_unattended_completion());
+        assert_eq!(
+            persisted_status(AgentStatus::Idle, Some(&instance), false),
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn refocusing_attended_done_does_not_retimestamp_completion() {
+        let mut instance = attended_completion();
+
+        assert!(attend_agent_activity(
+            &mut instance.activity,
+            Some(AgentStatus::Idle),
+            true,
+            400,
+        ));
+        assert_eq!(instance.activity.completed_at, Some(200));
+        assert_eq!(instance.activity.last_attended_at, Some(400));
+        assert_eq!(
+            instance.activity.current_state(),
+            Some(AgentActivityState::Done)
+        );
+    }
+
+    #[test]
+    fn restore_noise_cannot_replace_done_but_new_work_can() {
+        let instance = attended_completion();
+        assert_eq!(
+            persisted_status(AgentStatus::Working, Some(&instance), true),
+            AgentStatus::Done
+        );
+        assert_eq!(
+            persisted_status(AgentStatus::Working, Some(&instance), false),
+            AgentStatus::Working
+        );
+        assert_eq!(
+            persisted_status(AgentStatus::Blocked, Some(&instance), true),
+            AgentStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn restored_transitions_are_persisted_even_when_display_status_did_not_change() {
+        let mut done = attended_completion();
+        let masked = persisted_status(AgentStatus::Working, Some(&done), true);
+        assert_eq!(masked, AgentStatus::Done);
+        assert_eq!(
+            restored_activity_sample(true, false, AgentStatus::Working),
+            (true, true)
+        );
+        assert!(!activity_needs_observation(
+            Some(AgentStatus::Done),
+            masked,
+            &done.activity
+        ));
+
+        let working = persisted_status(AgentStatus::Working, Some(&done), false);
+        assert!(activity_needs_observation(
+            Some(AgentStatus::Done),
+            working,
+            &done.activity
+        ));
+        done.activity.observe(
+            Some(AgentActivityState::Done),
+            AgentActivityState::Working,
+            400,
+        );
+        assert_eq!(
+            done.activity.current_state(),
+            Some(AgentActivityState::Working)
+        );
+
+        let mut done = attended_completion();
+        let blocked_status = persisted_status(AgentStatus::Blocked, Some(&done), true);
+        assert_eq!(blocked_status, AgentStatus::Blocked);
+        assert_eq!(
+            restored_activity_sample(true, false, AgentStatus::Blocked),
+            (false, false)
+        );
+        assert!(activity_needs_observation(
+            None,
+            blocked_status,
+            &done.activity
+        ));
+        let previous = done.activity.current_state();
+        done.activity
+            .observe(previous, AgentActivityState::Blocked, 500);
+        assert_eq!(
+            done.activity.current_state(),
+            Some(AgentActivityState::Blocked)
+        );
+
+        let mut blocked = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+        blocked
+            .activity
+            .observe(None, AgentActivityState::Blocked, 100);
+        assert!(activity_needs_observation(
+            Some(AgentStatus::Idle),
+            AgentStatus::Idle,
+            &blocked.activity
+        ));
+        assert_eq!(
+            restored_activity_sample(false, false, AgentStatus::Idle),
+            (false, false)
+        );
+        let previous = blocked.activity.current_state();
+        blocked
+            .activity
+            .observe(previous, AgentActivityState::Idle, 200);
+        assert_eq!(
+            blocked.activity.current_state(),
+            Some(AgentActivityState::Idle)
+        );
+    }
+
+    #[test]
+    fn attention_navigation_uses_blocked_or_unread_completion() {
+        let attended = attended_completion();
+        assert_eq!(
+            attention_rank(Some(AgentStatus::Done), Some(&attended.activity)),
+            None
+        );
+
+        let mut unread = attended_completion();
+        unread.activity.last_attended_at = Some(100);
+        assert_eq!(
+            attention_rank(Some(AgentStatus::Idle), Some(&unread.activity)),
+            Some(1)
+        );
+        assert_eq!(
+            attention_rank(Some(AgentStatus::Blocked), Some(&attended.activity)),
+            Some(0)
+        );
+
+        let working = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        assert_eq!(
+            attention_rank(Some(AgentStatus::Done), Some(&working.activity)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn startup_working_noise_does_not_repeat_a_restored_blocked_notification() {
+        assert!(is_restored_transition(
+            true,
+            AgentStatus::Working,
+            Some(AgentActivityState::Blocked),
+        ));
+        assert!(is_restored_transition(
+            false,
+            AgentStatus::Blocked,
+            Some(AgentActivityState::Blocked),
+        ));
+        assert!(!is_restored_transition(
+            false,
+            AgentStatus::Blocked,
+            Some(AgentActivityState::Working),
+        ));
+    }
 }
 
-fn persisted_status(status: AgentStatus, instance: Option<&Instance>) -> AgentStatus {
-    // An unseen completion is a latch, not a sample. In particular, restored
-    // terminals emit startup output that looks like fresh work before the agent
-    // settles. Do not let that transient state hide the saved completion or age.
+fn persisted_status(
+    status: AgentStatus,
+    instance: Option<&Instance>,
+    restoring: bool,
+) -> AgentStatus {
+    // Completion is lifecycle, not notification state. Idle cannot erase the
+    // latest completed turn, and startup Working noise cannot erase it while a
+    // restored terminal settles. A real later Working or Blocked observation
+    // replaces it.
     if status != AgentStatus::Blocked
-        && instance.is_some_and(|instance| instance.activity.has_unattended_completion())
+        && instance.is_some_and(|instance| {
+            instance.activity.current_state() == Some(AgentActivityState::Done)
+        })
+        && (status != AgentStatus::Working || restoring)
     {
         AgentStatus::Done
     } else {
         status
     }
+}
+
+fn attention_rank(runtime: Option<AgentStatus>, activity: Option<&AgentActivity>) -> Option<u8> {
+    if runtime == Some(AgentStatus::Blocked) {
+        Some(0)
+    } else if activity.is_some_and(AgentActivity::has_unattended_completion)
+        || runtime == Some(AgentStatus::Done)
+            && activity
+                .is_none_or(|activity| activity.current_state() != Some(AgentActivityState::Done))
+    {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn is_restored_transition(
+    preserve_restored: bool,
+    status: AgentStatus,
+    restored_state: Option<AgentActivityState>,
+) -> bool {
+    preserve_restored
+        || (status == AgentStatus::Done && restored_state == Some(AgentActivityState::Done))
+        || (status == AgentStatus::Blocked && restored_state == Some(AgentActivityState::Blocked))
 }
 
 fn localized_activity_label(status: AgentStatus, activity: &AgentActivity, now: i64) -> String {
@@ -489,6 +848,40 @@ fn terminal_auto_title(instance: &Instance, title: &str) -> Option<String> {
     } else {
         title
     })
+}
+
+/// Codex persists `/rename` against its own session id. Prefer that Codex-owned
+/// name over OSC text, which can also be emitted by commands inside the pane.
+fn codex_session_auto_title(
+    instance: &Instance,
+    names: &HashMap<String, String>,
+    remote: bool,
+) -> Option<String> {
+    if remote || !is_codex_program(instance.program.as_deref()) {
+        return None;
+    }
+    let name = names.get(instance.session_id.as_deref()?)?.trim();
+    muxel_core::is_useful_auto_name(name).then(|| name.to_string())
+}
+
+fn authoritative_terminal_auto_title(
+    instance: &Instance,
+    codex_names: &HashMap<String, String>,
+    remote: bool,
+    live_title: Option<&str>,
+) -> Option<String> {
+    if let Some(name) = codex_session_auto_title(instance, codex_names, remote) {
+        return Some(name);
+    }
+    if !remote && is_codex_program(instance.program.as_deref()) && instance.session_id.is_some() {
+        return instance
+            .auto_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| muxel_core::is_useful_auto_name(name))
+            .map(str::to_string);
+    }
+    live_title.and_then(|title| terminal_auto_title(instance, title))
 }
 
 /// Terminal as a **cached** view element. Without `.cached(...)`, every window
@@ -1078,6 +1471,16 @@ fn is_grok_program(program: Option<&str>) -> bool {
         == "grok"
 }
 
+fn is_codex_program(program: Option<&str>) -> bool {
+    let Some(name) = program.and_then(|program| program.rsplit(['/', '\\']).next()) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "codex" | "codex.exe" | "codex.cmd"
+    )
+}
+
 /// Whether a Claude agent's saved session transcript is missing from disk (so a
 /// `--resume` would just hang on "No conversation found"). Only Claude's session
 /// path is known, so other agents — or an undeterminable home/cwd — return `false`
@@ -1104,7 +1507,7 @@ fn claude_session_gone(
 /// Whether an agent-minted session id is no longer on disk (Codex today).
 fn agent_minted_session_gone(preset: &muxel_core::AgentPreset, session_id: &str) -> bool {
     let program = preset.program.as_deref().unwrap_or_default();
-    if !program.contains("codex") {
+    if !is_codex_program(Some(program)) {
         return false;
     }
     let Some(home) = home_dir() else {
@@ -1113,18 +1516,29 @@ fn agent_minted_session_gone(preset: &muxel_core::AgentPreset, session_id: &str)
     !muxel_core::codex_session_exists(&home, session_id)
 }
 
-/// Capture the real session id an agent-minted CLI wrote for `cwd` (Codex).
+/// Recover a legacy agent-minted session id by cwd when no exact binding was saved.
 fn capture_agent_session_id(
     preset: &muxel_core::AgentPreset,
     cwd: Option<&std::path::Path>,
 ) -> Option<String> {
     let program = preset.program.as_deref().unwrap_or_default();
-    if !program.contains("codex") {
+    if !is_codex_program(Some(program)) {
         return None;
     }
     let home = home_dir()?;
     let cwd = cwd?;
     muxel_core::codex_latest_session_id(&home, cwd)
+}
+
+fn initial_codex_session_id(
+    preset: &AgentPreset,
+    current: Option<&str>,
+    title_hint: Option<&str>,
+) -> Option<String> {
+    if current.is_some() {
+        return None;
+    }
+    muxel_core::codex_session_id_from_title(preset, title_hint?)
 }
 
 /// "NewPane" -> "New Pane", "NewAgent1" -> "New Agent 1" for the shortcut
@@ -1564,6 +1978,9 @@ pub struct MuxelApp {
     project_branch_lists: HashMap<Uuid, Vec<String>>,
     /// Prevent slow git probes from accumulating overlapping one-second refresh jobs.
     status_refresh_in_flight: bool,
+    /// Parent-owned Codex thread names, keyed by the session UUID captured from
+    /// that pane. Refreshed from Codex's append-only session index.
+    codex_session_names: HashMap<String, String>,
     worktree_changes: HashMap<Uuid, usize>,
     /// Whether the GitHub CLI (`gh`) is installed (gates worktree PR actions).
     gh_available: bool,
@@ -3530,6 +3947,7 @@ impl MuxelApp {
             project_branches: HashMap::new(),
             project_branch_lists: HashMap::new(),
             status_refresh_in_flight: false,
+            codex_session_names: HashMap::new(),
             worktree_changes: HashMap::new(),
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
@@ -3978,7 +4396,8 @@ impl MuxelApp {
     /// - **Host-minted** (`session_id_flag` set): first launch
     ///   `--session-id <id>`; later `--resume <id>` (or the preset's flag).
     /// - **Agent-minted** (only `resume_flag`, e.g. Codex): first launch bare;
-    ///   on restart, capture the real id from disk then `resume <id>`.
+    ///   bound panes resume their saved id. A legacy started pane with no saved id
+    ///   recovers the newest cwd-matching rollout before `resume <id>`.
     fn session_resume_for(&mut self, iid: Uuid) -> Option<Vec<String>> {
         let inst = self.workspace.instance(iid)?;
         let preset = inst
@@ -5834,10 +6253,6 @@ impl MuxelApp {
             set_active_tab(&mut p.layout, iid);
             p.last_focused_instance = Some(iid);
         }
-        let persisted_completion = self
-            .workspace
-            .instance(iid)
-            .is_some_and(|instance| instance.activity.has_unattended_completion());
         let runtime_completion = self
             .terminals
             .get(&iid)
@@ -5855,16 +6270,12 @@ impl MuxelApp {
             && let Some(instance) = self.workspace.instance_mut(iid)
         {
             let now = chrono::Utc::now().timestamp_millis();
-            let mut activity_changed = false;
-            if runtime_completion && !persisted_completion {
-                activity_changed |= instance.activity.observe(
-                    self.last_status.get(&iid).copied().map(activity_state),
-                    AgentActivityState::Done,
-                    now,
-                );
-            }
-            activity_changed |= instance.activity.attend(now);
-            if activity_changed {
+            if attend_agent_activity(
+                &mut instance.activity,
+                self.last_status.get(&iid).copied(),
+                runtime_completion,
+                now,
+            ) {
                 self.persist();
             }
         }
@@ -6572,8 +6983,22 @@ impl MuxelApp {
             .iter()
             .map(|w| (w.id, w.path.clone()))
             .collect();
+        let codex_home = self
+            .workspace
+            .instances
+            .iter()
+            .any(|instance| {
+                instance.session_id.is_some()
+                    && is_codex_program(instance.program.as_deref())
+                    && self
+                        .workspace
+                        .project(instance.project_id)
+                        .is_some_and(|project| !project.is_remote())
+            })
+            .then(home_dir)
+            .flatten();
         cx.spawn(async move |this, cx| {
-            let (available, gh, sshpass, tmux, branches, changes) = cx
+            let (available, gh, sshpass, tmux, branches, changes, codex_names) = cx
                 .background_executor()
                 .spawn(async move {
                     let available = installed_programs(&presets);
@@ -6595,7 +7020,8 @@ impl MuxelApp {
                         .into_iter()
                         .map(|(id, path)| (id, integrations::worktree_change_count(&path)))
                         .collect();
-                    (available, gh, sshpass, tmux, branches, changes)
+                    let codex_names = codex_home.map(|home| muxel_core::codex_session_names(&home));
+                    (available, gh, sshpass, tmux, branches, changes, codex_names)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -6614,6 +7040,36 @@ impl MuxelApp {
                     this.project_branch_lists.insert(id, list);
                 }
                 this.worktree_changes = changes.into_iter().collect();
+                match codex_names {
+                    Some(Ok(names)) => this.codex_session_names = names,
+                    Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        this.codex_session_names.clear();
+                    }
+                    Some(Err(_)) => {}
+                    None => this.codex_session_names.clear(),
+                }
+                let updates: Vec<(Uuid, String)> = this
+                    .workspace
+                    .instances
+                    .iter()
+                    .filter_map(|instance| {
+                        let remote = this
+                            .workspace
+                            .project(instance.project_id)
+                            .is_some_and(Project::is_remote);
+                        codex_session_auto_title(instance, &this.codex_session_names, remote)
+                            .map(|name| (instance.id, name))
+                    })
+                    .collect();
+                let mut name_changed = false;
+                for (id, name) in updates {
+                    if let Some(instance) = this.workspace.instance_mut(id) {
+                        name_changed |= instance.update_auto_name(name);
+                    }
+                }
+                if name_changed && this.auto_name_save_due.is_none() {
+                    this.auto_name_save_due = Some(Instant::now() + Duration::from_secs(3));
+                }
                 cx.notify();
             });
         })
@@ -6879,7 +7335,17 @@ impl MuxelApp {
             let Some(instance) = self.workspace.instance(iid) else {
                 continue;
             };
-            let Some(name) = name.and_then(|name| terminal_auto_title(instance, &name)) else {
+            let remote = self
+                .workspace
+                .project(instance.project_id)
+                .is_some_and(Project::is_remote);
+            let name = authoritative_terminal_auto_title(
+                instance,
+                &self.codex_session_names,
+                remote,
+                name.as_deref(),
+            );
+            let Some(name) = name else {
                 continue;
             };
             if let Some(inst) = self.workspace.instance_mut(iid) {
@@ -6975,6 +7441,7 @@ impl MuxelApp {
             project: String,
             resume_error: bool,
             submitted_turn: bool,
+            restoring: bool,
         }
         let snapshot: Vec<Snap> = self
             .terminals
@@ -6982,9 +7449,32 @@ impl MuxelApp {
             .map(|(iid, view)| {
                 let v = view.read(cx);
                 let raw_status = v.status();
-                let status = persisted_status(raw_status, self.workspace.instance(*iid));
                 let session_id_hint = v.session_id_hint();
                 let submitted_turn = v.session().has_submitted_turn();
+                let startup_delay_ms = self
+                    .workspace
+                    .instance(*iid)
+                    .and_then(|instance| {
+                        instance
+                            .preset_id
+                            .and_then(|preset_id| {
+                                self.presets.iter().find(|preset| preset.id == preset_id)
+                            })
+                            .or_else(|| {
+                                self.presets
+                                    .iter()
+                                    .find(|preset| preset.name == instance.preset)
+                            })
+                    })
+                    .map_or(0, |preset| preset.startup_delay_ms);
+                let restoring = restore_activity_guard_active(
+                    self.restoring_activity.contains(iid),
+                    submitted_turn,
+                    v.completion_ready(),
+                    self.terminal_launches.get(iid).map(|&(at, _)| at.elapsed()),
+                    startup_delay_ms,
+                );
+                let status = persisted_status(raw_status, self.workspace.instance(*iid), restoring);
                 let exited = v.exited();
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
@@ -7021,6 +7511,7 @@ impl MuxelApp {
                     project,
                     resume_error,
                     submitted_turn,
+                    restoring,
                 }
             })
             .collect();
@@ -7052,60 +7543,59 @@ impl MuxelApp {
             project,
             resume_error,
             submitted_turn,
+            restoring,
         } in snapshot
         {
             // Codex mints its own session id and publishes it as this pane's
             // initial OSC title. Capture that exact id instead of guessing from
             // the newest rollout in the cwd, which aliases concurrent panes.
-            // A later UUID updates the binding when `/resume` switches sessions
-            // inside the running Codex TUI.
+            // Once bound, later titles cannot replace the durable session id:
+            // OSC carries no sender identity, so a child process could forge one.
             let captured_codex_id = self.workspace.instance(iid).and_then(|inst| {
                 let preset = inst
                     .preset_id
                     .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                     .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
-                let id =
-                    muxel_core::codex_session_id_from_title(preset, session_id_hint.as_deref()?)?;
-                if inst.session_id.as_deref() == Some(id.as_str()) {
-                    return None;
-                }
-                Some(id)
+                initial_codex_session_id(
+                    preset,
+                    inst.session_id.as_deref(),
+                    session_id_hint.as_deref(),
+                )
             });
             if let Some(id) = captured_codex_id
                 && let Some(inst) = self.workspace.instance_mut(iid)
             {
                 inst.session_id = Some(id);
+                inst.auto_name = None;
                 self.persist();
             }
             // A completion that happens in the pane the user is actively watching
             // is already attended. Record that at the same transition timestamp so
             // it cannot reappear as unseen after restart.
             let attended = self.instance_window_active(iid) && Some(iid) == focused;
-            let restored_unattended = self
+            let restored_state = self
                 .workspace
                 .instance(iid)
-                .is_some_and(|instance| instance.activity.has_unattended_completion());
-            let restored_blocked = self
-                .workspace
-                .instance(iid)
-                .is_some_and(|instance| instance.activity.blocked_at.is_some());
+                .and_then(|instance| instance.activity.current_state());
             let previous = self.last_status.insert(iid, status);
             let changed = previous != Some(status);
-            let guarded = self.restoring_activity.contains(&iid);
             let (preserve_restored, keep_restore_guard) =
-                restored_activity_sample(guarded, submitted_turn, raw_status);
+                restored_activity_sample(restoring, submitted_turn, raw_status);
             if !keep_restore_guard {
                 self.restoring_activity.remove(&iid);
             }
-            if changed
-                && !preserve_restored
+            if !preserve_restored
                 && let Some(instance) = self.workspace.instance_mut(iid)
+                && activity_needs_observation(previous, status, &instance.activity)
             {
-                activity_changed |= instance.activity.observe(
-                    previous.map(activity_state),
-                    activity_state(status),
-                    now_epoch,
-                );
+                let previous_activity = instance
+                    .activity
+                    .current_state()
+                    .or_else(|| previous.map(activity_state));
+                activity_changed |=
+                    instance
+                        .activity
+                        .observe(previous_activity, activity_state(status), now_epoch);
                 if attended && status == AgentStatus::Done {
                     activity_changed |= instance.activity.attend(now_epoch);
                 }
@@ -7155,10 +7645,8 @@ impl MuxelApp {
             }
             // The first live sample after restore describes durable state, not a
             // new event. Do not notify again for a saved completion/block.
-            let restored_transition = preserve_restored
-                || previous.is_none()
-                    && ((status == AgentStatus::Done && restored_unattended)
-                        || (status == AgentStatus::Blocked && restored_blocked));
+            let restored_transition =
+                is_restored_transition(preserve_restored, status, restored_state);
             if changed && !attended && !restored_transition {
                 let kind = match status {
                     AgentStatus::Blocked => Some(NotifKind::Blocked),
@@ -13283,11 +13771,12 @@ impl MuxelApp {
             .flat_map(|p| p.instances())
             .collect();
         let rank = |iid: &Uuid| -> Option<u8> {
-            match self.terminals.get(iid).map(|v| v.read(cx).status()) {
-                Some(AgentStatus::Blocked) => Some(0),
-                Some(AgentStatus::Done) => Some(1),
-                _ => None,
-            }
+            attention_rank(
+                self.terminals.get(iid).map(|v| v.read(cx).status()),
+                self.workspace
+                    .instance(*iid)
+                    .map(|instance| &instance.activity),
+            )
         };
         // Rotate the list so the search starts just after the active instance,
         // then take blocked over done, earliest first.
@@ -14522,13 +15011,20 @@ impl MuxelApp {
         if let Some(bv) = self.browsers.get(&iid) {
             return bv.read(cx).tab_title().into();
         }
-        if let Some(osc) = self
-            .terminals
-            .get(&iid)
-            .and_then(|v| v.read(cx).title())
-            .and_then(|title| inst.and_then(|instance| terminal_auto_title(instance, &title)))
-        {
-            return osc.into();
+        if let Some(instance) = inst {
+            let remote = self
+                .workspace
+                .project(instance.project_id)
+                .is_some_and(Project::is_remote);
+            let live_title = self.terminals.get(&iid).and_then(|v| v.read(cx).title());
+            if let Some(name) = authoritative_terminal_auto_title(
+                instance,
+                &self.codex_session_names,
+                remote,
+                live_title.as_deref(),
+            ) {
+                return name.into();
+            }
         }
         if let Some(instance) = inst {
             if instance.program.is_none()
@@ -16061,10 +16557,13 @@ impl MuxelApp {
                     .map(|i| i.display_name().to_string())
                     .unwrap_or_default();
                 let program = inst.and_then(|i| i.program.clone());
-                let status = self
-                    .terminals
-                    .get(&iid)
-                    .map(|v| persisted_status(v.read(cx).status(), inst));
+                let status = self.terminals.get(&iid).map(|v| {
+                    persisted_status(
+                        v.read(cx).status(),
+                        inst,
+                        self.restoring_activity.contains(&iid),
+                    )
+                });
                 let color = status
                     .map(|s| status_hsla(s, cx))
                     .unwrap_or(cx.theme().muted_foreground);
@@ -17528,11 +18027,20 @@ impl MuxelApp {
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
                         // Agent titles have no such prefix and pass through unchanged.
                         (
-                            view.title()
-                                .and_then(|title| {
-                                    inst.and_then(|instance| terminal_auto_title(instance, &title))
-                                })
-                                .unwrap_or(meta),
+                            inst.and_then(|instance| {
+                                let remote = self
+                                    .workspace
+                                    .project(instance.project_id)
+                                    .is_some_and(Project::is_remote);
+                                let live_title = view.title();
+                                authoritative_terminal_auto_title(
+                                    instance,
+                                    &self.codex_session_names,
+                                    remote,
+                                    live_title.as_deref(),
+                                )
+                            })
+                            .unwrap_or(meta),
                             view.status(),
                         )
                     } else if let Some(ed) = self.editors.get(&iid) {
@@ -17542,7 +18050,8 @@ impl MuxelApp {
                     } else {
                         (meta, AgentStatus::Idle)
                     };
-                    let status = persisted_status(status, inst);
+                    let status =
+                        persisted_status(status, inst, self.restoring_activity.contains(&iid));
                     // A user-assigned name fully replaces the agent's own title
                     // (no "custom — title" composite).
                     let display = match custom {
@@ -24243,8 +24752,12 @@ mod grok_session_tests {
 
 #[cfg(test)]
 mod shell_title_tests {
-    use super::{shell_dir_title, terminal_auto_title};
+    use super::{
+        agent_minted_session_gone, authoritative_terminal_auto_title, codex_session_auto_title,
+        initial_codex_session_id, shell_dir_title, terminal_auto_title,
+    };
     use muxel_core::{AgentPreset, Instance};
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     #[test]
@@ -24261,15 +24774,131 @@ mod shell_title_tests {
     }
 
     #[test]
-    fn agent_ignores_launcher_shell_until_a_real_title_arrives() {
-        let instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+    fn agent_accepts_only_provider_owned_automatic_titles() {
+        let mut codex = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
 
-        assert_eq!(terminal_auto_title(&instance, "cmd.exe"), None);
-        assert_eq!(terminal_auto_title(&instance, "codex"), None);
+        assert_eq!(terminal_auto_title(&codex, "cmd.exe"), None);
+        assert_eq!(terminal_auto_title(&codex, "codex"), None);
         assert_eq!(
-            terminal_auto_title(&instance, "Review session names"),
+            terminal_auto_title(&codex, "npm run test-v8-historical"),
+            None
+        );
+        assert_eq!(
+            terminal_auto_title(&codex, "Review session names | Ready ·"),
             Some("Review session names".to_string())
         );
+        let first_name = terminal_auto_title(&codex, "Review session names | Ready ·").unwrap();
+        codex.update_auto_name(first_name);
+        assert_eq!(
+            terminal_auto_title(&codex, "npm run test-v8-historical"),
+            None
+        );
+        assert_eq!(codex.display_name(), "Review session names");
+        let next_name =
+            terminal_auto_title(&codex, "Review session names again | Ready ·").unwrap();
+        codex.update_auto_name(next_name);
+        assert_eq!(codex.display_name(), "Review session names again");
+
+        let claude = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+        assert_eq!(
+            terminal_auto_title(&claude, "npm run test-v8-historical"),
+            None
+        );
+        assert_eq!(
+            terminal_auto_title(&claude, "✳ Review session names"),
+            Some("Review session names".to_string())
+        );
+
+        let grok = Instance::from_preset(Uuid::new_v4(), &AgentPreset::grok());
+        assert_eq!(
+            terminal_auto_title(&grok, "npm run test-v8-historical"),
+            None
+        );
+        assert_eq!(
+            terminal_auto_title(&grok, "Review session names - grok"),
+            Some("Review session names".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_rename_uses_the_bound_parent_session() {
+        let session_id = Uuid::new_v4().to_string();
+        let mut codex = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        codex.session_id = Some(session_id.clone());
+        let names = HashMap::from([(session_id.clone(), "foo".to_string())]);
+
+        assert_eq!(
+            codex_session_auto_title(&codex, &names, false),
+            Some("foo".to_string())
+        );
+        assert_eq!(
+            authoritative_terminal_auto_title(
+                &codex,
+                &names,
+                false,
+                Some("Forged child name | Ready ·"),
+            ),
+            Some("foo".to_string())
+        );
+        codex.auto_name = Some("last saved name".to_string());
+        assert_eq!(
+            authoritative_terminal_auto_title(
+                &codex,
+                &HashMap::new(),
+                false,
+                Some("Forged child name | Ready ·"),
+            ),
+            Some("last saved name".to_string())
+        );
+        codex.auto_name = None;
+        assert_eq!(
+            authoritative_terminal_auto_title(
+                &codex,
+                &HashMap::new(),
+                false,
+                Some("Forged child name | Ready ·"),
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_auto_title(&codex, "npm run test-v8-historical"),
+            None
+        );
+        assert_eq!(codex_session_auto_title(&codex, &names, true), None);
+
+        codex.program = Some("npm".to_string());
+        assert_eq!(codex_session_auto_title(&codex, &names, false), None);
+
+        codex.program = Some(r"D:\bin\codex.CMD".to_string());
+        let renamed = HashMap::from([(session_id, "renamed again".to_string())]);
+        assert_eq!(
+            codex_session_auto_title(&codex, &renamed, false),
+            Some("renamed again".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_session_binding_is_initial_only() {
+        let first = Uuid::new_v4().to_string();
+        let later = Uuid::new_v4().to_string();
+        let preset = AgentPreset::codex();
+        let initial_frame = format!("{first} | Ready ·");
+        let later_frame = format!("{later} | Ready ·");
+
+        assert_eq!(
+            initial_codex_session_id(&preset, None, Some(&initial_frame)).as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            initial_codex_session_id(&preset, Some(&first), Some(&later_frame)),
+            None
+        );
+
+        let proxy = AgentPreset {
+            program: Some("codex-title-proxy.exe".to_string()),
+            ..preset
+        };
+        assert!(!agent_minted_session_gone(&proxy, &first));
     }
 
     #[test]

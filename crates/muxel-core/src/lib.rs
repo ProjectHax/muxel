@@ -23,8 +23,9 @@ pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
     append_agent_instruction, claude_session_path, codex_developer_instructions_override,
     codex_latest_session_id, codex_session_exists, codex_session_id_from_title,
-    codex_terminal_title_override, file_link_instruction, memory_header, memory_instruction,
-    memory_reference, resolve_launch, resolve_launch_for_session, session_resume_args,
+    codex_session_names, codex_terminal_title_override, file_link_instruction, memory_header,
+    memory_instruction, memory_reference, resolve_launch, resolve_launch_for_session,
+    session_resume_args,
 };
 pub use appimage::foreign_muxel_appimage_mounts;
 pub use diff::{SplitRow, split_diff};
@@ -65,8 +66,8 @@ pub enum InstanceKind {
 /// Persisted lifecycle timestamps for an agent pane.
 ///
 /// These are Unix milliseconds. The live terminal owns status detection; the core
-/// model owns the durable facts needed to retain unattended completion and
-/// derive compact age labels after a restart.
+/// model owns the durable lifecycle and notification-attendance facts needed to
+/// retain completion and derive compact age labels after a restart.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentActivity {
     #[serde(default)]
@@ -77,10 +78,15 @@ pub struct AgentActivity {
     pub blocked_at: Option<i64>,
     #[serde(default)]
     pub last_attended_at: Option<i64>,
+    /// Latest lifecycle state, independent from whether its notification was read.
+    /// Older workspaces infer it from their existing transition timestamps.
+    #[serde(default)]
+    pub last_state: Option<AgentActivityState>,
 }
 
 /// Provider-neutral lifecycle state used by the persisted activity reducer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentActivityState {
     Working,
     Idle,
@@ -96,11 +102,30 @@ impl AgentActivity {
             .max()
     }
 
+    pub fn current_state(&self) -> Option<AgentActivityState> {
+        self.last_state.or_else(|| {
+            [
+                self.work_started_at
+                    .map(|at| (at, 0, AgentActivityState::Working)),
+                self.completed_at
+                    .map(|at| (at, 1, AgentActivityState::Done)),
+                self.blocked_at
+                    .map(|at| (at, 2, AgentActivityState::Blocked)),
+            ]
+            .into_iter()
+            .flatten()
+            .max_by_key(|(at, priority, _)| (*at, *priority))
+            .map(|(_, _, state)| state)
+        })
+    }
+
     /// Whether a completed turn is newer than the last time the pane was
     /// attended. A missing attendance timestamp means the completion is unseen.
     pub fn has_unattended_completion(&self) -> bool {
-        self.completed_at
-            .is_some_and(|done| self.last_attended_at.is_none_or(|seen| done > seen))
+        self.current_state() == Some(AgentActivityState::Done)
+            && self
+                .completed_at
+                .is_some_and(|done| self.last_attended_at.is_none_or(|seen| done > seen))
     }
 
     /// Apply one displayed-status transition. Returns whether durable state
@@ -113,6 +138,7 @@ impl AgentActivity {
     ) -> bool {
         let now = now.max(0);
         let before = self.clone();
+        let previous_persisted = self.current_state();
         match status {
             AgentActivityState::Working => {
                 if previous != Some(AgentActivityState::Working) {
@@ -131,9 +157,8 @@ impl AgentActivity {
                 // A restored completion already has its correct timestamp.
                 // Its first live sample is not a new event, even when focus marked it
                 // attended while the terminal was loading.
-                if !self.has_unattended_completion()
-                    && previous != Some(AgentActivityState::Done)
-                    && !(previous.is_none() && self.completed_at.is_some())
+                if previous != Some(AgentActivityState::Done)
+                    && !(previous.is_none() && previous_persisted == Some(AgentActivityState::Done))
                 {
                     self.completed_at = Some(now);
                 }
@@ -144,6 +169,9 @@ impl AgentActivity {
                     self.blocked_at = None;
                 }
             }
+        }
+        if self.last_state.is_some() || previous_persisted != Some(status) {
+            self.last_state = Some(status);
         }
         *self != before
     }
@@ -228,6 +256,21 @@ mod agent_activity_tests {
     }
 
     #[test]
+    fn old_activity_json_infers_current_state_from_timestamps() {
+        let activity: AgentActivity = serde_json::from_value(serde_json::json!({
+            "work_started_at": 100,
+            "completed_at": 200,
+            "blocked_at": null,
+            "last_attended_at": 300
+        }))
+        .unwrap();
+
+        assert_eq!(activity.last_state, None);
+        assert_eq!(activity.current_state(), Some(AgentActivityState::Done));
+        assert!(!activity.has_unattended_completion());
+    }
+
+    #[test]
     fn completion_remains_unattended_until_attendance() {
         let mut activity = AgentActivity::default();
         assert!(activity.observe(None, AgentActivityState::Working, 100_000));
@@ -242,6 +285,11 @@ mod agent_activity_tests {
 
         assert!(activity.attend(400_000));
         assert!(!activity.has_unattended_completion());
+        assert_eq!(activity.current_state(), Some(AgentActivityState::Done));
+        let restored: AgentActivity =
+            serde_json::from_value(serde_json::to_value(&activity).unwrap()).unwrap();
+        assert_eq!(restored.current_state(), Some(AgentActivityState::Done));
+        assert!(!restored.has_unattended_completion());
         assert_eq!(
             agent_activity_label(AgentActivityState::Idle, &activity, 460_000),
             "idle · 4m"
@@ -249,7 +297,7 @@ mod agent_activity_tests {
     }
 
     #[test]
-    fn startup_work_cycle_does_not_replace_an_unattended_completion() {
+    fn new_work_supersedes_an_unattended_completion() {
         let mut activity = AgentActivity::default();
         assert!(activity.observe(None, AgentActivityState::Working, 50));
         assert!(activity.observe(
@@ -263,12 +311,30 @@ mod agent_activity_tests {
             AgentActivityState::Working,
             70
         ));
-        assert!(!activity.observe(
+        assert_eq!(activity.current_state(), Some(AgentActivityState::Working));
+        assert!(!activity.has_unattended_completion());
+        assert!(activity.observe(
             Some(AgentActivityState::Working),
             AgentActivityState::Done,
             80
         ));
-        assert_eq!(activity.completed_at, Some(60));
+        assert_eq!(activity.completed_at, Some(80));
+        assert_eq!(activity.current_state(), Some(AgentActivityState::Done));
+        assert!(activity.has_unattended_completion());
+    }
+
+    #[test]
+    fn first_runtime_done_after_restored_work_gets_a_new_timestamp() {
+        let mut activity = AgentActivity {
+            work_started_at: Some(200),
+            completed_at: Some(100),
+            last_state: Some(AgentActivityState::Working),
+            ..AgentActivity::default()
+        };
+
+        assert!(activity.observe(None, AgentActivityState::Done, 300));
+        assert_eq!(activity.completed_at, Some(300));
+        assert_eq!(activity.current_state(), Some(AgentActivityState::Done));
     }
 
     #[test]

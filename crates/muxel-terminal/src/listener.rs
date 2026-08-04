@@ -24,8 +24,8 @@ pub(crate) struct MuxelListener {
     /// use it to distinguish a repeated title event from an unchanged snapshot.
     pub title_generation: Arc<AtomicU64>,
     pub title_changed_at: Arc<Mutex<Option<Instant>>>,
-    /// Latest UUID-shaped OSC title published by the child. Agent UIs may replace
-    /// it with a human title immediately or switch sessions in-place.
+    /// Latest OSC title whose complete thread field is UUID-shaped. The app
+    /// validates the provider's full title contract before adopting it.
     pub session_id_hint: Arc<Mutex<Option<String>>>,
     pub bell: Arc<AtomicBool>,
     /// OSC-52 copies from the child, drained by the view onto the system
@@ -33,13 +33,12 @@ pub(crate) struct MuxelListener {
     pub clipboard_store: Arc<Mutex<Vec<(ClipboardType, String)>>>,
 }
 
-fn uuid_in_title(title: &str) -> Option<&str> {
-    title
-        .split(|ch: char| {
-            ch.is_ascii_whitespace() || matches!(ch, '|' | ':' | '(' | ')' | '[' | ']')
-        })
-        .map(str::trim)
-        .find(|part| uuid::Uuid::parse_str(part).is_ok())
+fn has_uuid_thread_field(title: &str) -> bool {
+    let title = title.trim();
+    let thread = title
+        .split_once(" | ")
+        .map_or(title, |(thread, _)| thread.trim());
+    uuid::Uuid::parse_str(thread).is_ok()
 }
 
 impl MuxelListener {
@@ -55,8 +54,8 @@ impl EventListener for MuxelListener {
         match event {
             Event::Title(title) => {
                 let mut hint = self.session_id_hint.lock();
-                if let Some(id) = uuid_in_title(&title) {
-                    *hint = Some(id.to_string());
+                if has_uuid_thread_field(&title) {
+                    *hint = Some(title.clone());
                 }
                 *self.title.lock() = Some(title);
                 *self.title_changed_at.lock() = Some(Instant::now());
@@ -104,7 +103,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uuid_title_hint_follows_an_in_place_session_switch() {
+    fn uuid_title_hint_keeps_only_complete_thread_candidates() {
         let hint = Arc::new(Mutex::new(None));
         let listener = MuxelListener {
             writer: Arc::new(Mutex::new(Box::new(Vec::<u8>::new()))),
@@ -118,12 +117,13 @@ mod tests {
         let first = "019f95d7-db31-7db0-904d-9e08330e0000";
         let resumed = "019f95d7-db31-7db0-904d-9e08330e0001";
 
-        listener.send_event(Event::Title(format!("{first} | Starting ⠏")));
+        let first_frame = format!("{first} | Starting · Booting");
+        listener.send_event(Event::Title(first_frame.clone()));
         assert_eq!(listener.title_generation.load(Ordering::Relaxed), 1);
-        assert_eq!(hint.lock().as_deref(), Some(first));
-        listener.send_event(Event::Title("Review changes".to_string()));
+        assert_eq!(hint.lock().as_deref(), Some(first_frame.as_str()));
+        listener.send_event(Event::Title(format!("Review {resumed} | Ready ·")));
         assert_eq!(listener.title_generation.load(Ordering::Relaxed), 2);
-        assert_eq!(hint.lock().as_deref(), Some(first));
+        assert_eq!(hint.lock().as_deref(), Some(first_frame.as_str()));
 
         listener.send_event(Event::Title(resumed.to_string()));
         assert_eq!(hint.lock().as_deref(), Some(resumed));

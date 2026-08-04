@@ -104,8 +104,9 @@ feature is added or changed, update the matching entry here in the same change**
   - **Agent-minted** (Codex): only `resume_flag` (`resume`) — first launch is bare;
     muxel captures the UUID Codex publishes for that pane, validates it against
     `~/.codex/sessions` before restart, and relaunches as `codex resume <id>`. Multiple Codex
-    panes can share a project without resuming one another's conversations;
-    switching conversations inside Codex updates that pane's saved UUID.
+    panes can share a project without resuming one another's conversations. Once
+    bound, later OSC titles cannot replace the saved UUID because terminal-title
+    events do not identify which process emitted them.
   If the saved session is gone, the pane quietly starts fresh.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
@@ -194,7 +195,13 @@ feature is added or changed, update the matching entry here in the same change**
   coarse age while work is blocked or done, show recent idle activity briefly
   (`idle · 12m`), omit ordinary middle age, and call out panes idle for three days
   or more (`stale · 4d`). Long pane titles ellipsize before the badge instead of
-  pushing status out of the sidebar.
+  pushing status out of the sidebar. Title-derived lifecycle and automatic-name
+  updates on known agent panes are accepted only from that provider's semantic
+  title shape; existing marker, bell, and process-exit signals still apply. Local
+  Codex `/rename` values are read from its session index by the pane's captured
+  session UUID, so child commands such as `npm` cannot replace the session name or
+  forge a title-derived state transition. Remote Codex panes retain the provider's
+  structural title fallback.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
   defaults per agent and **editable working/blocked markers per preset**.

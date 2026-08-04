@@ -612,6 +612,40 @@ pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
     found
 }
 
+/// Latest saved display name for each Codex session id.
+///
+/// Codex appends an entry to `~/.codex/session_index.jsonl` when `/rename`
+/// changes a thread name. Session ids make this a Codex-owned name source:
+/// commands running inside the terminal cannot replace it with their own OSC
+/// title. Later rows win because the index is append-only.
+pub fn codex_session_names(
+    home: &Path,
+) -> std::io::Result<std::collections::HashMap<String, String>> {
+    use std::io::{BufRead, BufReader};
+
+    let mut names = std::collections::HashMap::new();
+    let path = home.join(".codex").join("session_index.jsonl");
+    let file = std::fs::File::open(path)?;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = value.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(name) = value
+            .get("thread_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        names.insert(id.to_string(), name.to_string());
+    }
+    Ok(names)
+}
+
 /// A Codex terminal title that directly identifies its session.
 ///
 /// Codex publishes its agent-minted UUID as an OSC terminal title.
@@ -619,29 +653,41 @@ pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
 /// Codex panes share a working directory. The normal pre-resume existence check
 /// still rejects a stale or missing UUID before it reaches the CLI.
 pub fn codex_session_id_from_title(preset: &AgentPreset, title: &str) -> Option<String> {
-    if !preset
-        .program
-        .as_deref()
-        .unwrap_or_default()
-        .contains("codex")
-    {
+    if !preset.program.as_deref().is_some_and(is_codex_program) {
         return None;
     }
-    title
-        .split(|ch: char| {
-            ch.is_ascii_whitespace() || matches!(ch, '|' | ':' | '(' | ')' | '[' | ']')
-        })
-        .map(str::trim)
-        .find(|part| Uuid::parse_str(part).is_ok())
-        .map(str::to_string)
+    let title = title.trim();
+    if Uuid::parse_str(title).is_ok() {
+        return Some(title.to_string());
+    }
+
+    // The invocation-local Codex contract is `thread | run-state · activity`.
+    // Accept a UUID only when it owns the complete thread field. A UUID merely
+    // mentioned inside a renamed thread must never rebind the pane.
+    let (thread, state) = title.rsplit_once(" | ")?;
+    let (run_state, activity) = state.split_once('·')?;
+    if activity.contains('·') {
+        return None;
+    }
+    let run_state = run_state.trim().to_ascii_lowercase();
+    let activity = activity.trim();
+    let activity_lower = activity.to_ascii_lowercase();
+    let valid_state = (run_state == "ready"
+        && matches!(activity_lower.as_str(), "" | "action required"))
+        || (matches!(run_state.as_str(), "starting" | "working" | "thinking")
+            && !activity.is_empty());
+    if !valid_state {
+        return None;
+    }
+    let thread = thread.trim();
+    Uuid::parse_str(thread).ok().map(|_| thread.to_string())
 }
 
 /// Most recently modified Codex session id whose `session_meta.cwd` matches `cwd`.
 ///
-/// Codex mints its own UUID on first launch (no host-side `--session-id`), so on
-/// restart muxel adopts the latest rollout for this working directory. Multiple
-/// concurrent Codex panes in the *same* cwd may collide on that heuristic — keep
-/// one Codex pane per project for reliable autoresume.
+/// This is a legacy recovery path for a pane that was already started before exact
+/// title binding existed but has no saved session id. New and already-bound panes
+/// use their exact captured id and never replace it with this cwd heuristic.
 pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
     let root = home.join(".codex").join("sessions");
     if !root.is_dir() {
@@ -867,10 +913,35 @@ mod tests {
     #[test]
     fn codex_session_id_is_extracted_from_semantic_title() {
         let id = Uuid::new_v4().to_string();
-        let title = format!("{id} | Working ⠏");
+        let title = format!("{id} | Working · Responding");
         assert_eq!(
             codex_session_id_from_title(&AgentPreset::codex(), &title).as_deref(),
             Some(id.as_str())
+        );
+
+        assert_eq!(
+            codex_session_id_from_title(
+                &AgentPreset::codex(),
+                &format!("Review {id} carefully | Ready ·")
+            ),
+            None
+        );
+        assert_eq!(
+            codex_session_id_from_title(
+                &AgentPreset {
+                    program: Some("codex-title-proxy.exe".to_string()),
+                    ..AgentPreset::codex()
+                },
+                &title
+            ),
+            None
+        );
+        assert_eq!(
+            codex_session_id_from_title(
+                &AgentPreset::codex(),
+                &format!("{id} | unowned child title")
+            ),
+            None
         );
     }
 
@@ -1045,6 +1116,46 @@ mod tests {
         );
         assert!(codex_session_exists(&tmp, "id-new"));
         assert!(!codex_session_exists(&tmp, "missing"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn codex_session_names_use_the_latest_valid_index_row() {
+        use std::io::Write;
+
+        let tmp = std::env::temp_dir().join(format!("muxel-codex-index-{}", Uuid::new_v4()));
+        let index_dir = tmp.join(".codex");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let mut index = std::fs::File::create(index_dir.join("session_index.jsonl")).unwrap();
+        writeln!(
+            index,
+            r#"{{"id":"session-a","thread_name":"First name","updated_at":"1"}}"#
+        )
+        .unwrap();
+        writeln!(index, "not json").unwrap();
+        writeln!(
+            index,
+            r#"{{"id":"session-b","thread_name":"Other name","updated_at":"2"}}"#
+        )
+        .unwrap();
+        writeln!(
+            index,
+            r#"{{"id":"session-a","thread_name":"  foo  ","updated_at":"3"}}"#
+        )
+        .unwrap();
+        writeln!(
+            index,
+            r#"{{"id":"session-a","thread_name":"   ","updated_at":"4"}}"#
+        )
+        .unwrap();
+
+        let names = codex_session_names(&tmp).unwrap();
+        assert_eq!(names.get("session-a").map(String::as_str), Some("foo"));
+        assert_eq!(
+            names.get("session-b").map(String::as_str),
+            Some("Other name")
+        );
+        assert_eq!(names.len(), 2);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
