@@ -12,12 +12,14 @@ different questions without moving rows or filling every row with noise:
 
 1. What is working or blocked now?
 2. Which agent finished work that has not been attended?
-3. Which idle panes are newly attended or old enough to clean up?
+3. Which idle panes are recently active or old enough to clean up?
 
-The existing detector combines terminal-screen markers, bell events, recent PTY
-output, and process exit. It also latches a reliable Working-to-Idle transition as
-Done. This is a sound base, but its lifecycle was coupled to focus, its timestamps
-were not persisted, and marker-less agents can mistake echoed typing for work.
+The detector combines terminal-screen markers, bell events, recent PTY output,
+process exit, and provider-owned terminal titles. Transition timestamps and age
+labels already exist. The remaining correctness requirements are to keep lifecycle
+state independent from notification attendance, preserve durable state through
+restart noise, and reject title updates that cannot be attributed structurally to
+the pane's configured provider.
 
 PTY means pseudoterminal: the OS interface through which Muxel runs an interactive
 CLI and receives its screen-control byte stream. PTY output is useful evidence of
@@ -25,27 +27,24 @@ activity, but it does not by itself prove that an agent started or completed wor
 
 ## Product decisions
 
-This document supersedes the earlier hook-first proposal in
-`D:/dev/muxel-desk/plans/agent-lifecycle-status-bridge.md` for V1 detection.
-Later research found provider terminal titles to be the only high-fidelity signal
-that is cheap enough and available across ordinary interactive TUIs. Hooks remain
-a future option for exact completion/failure events, but their helper packaging,
-trust, configuration attachment, and lack of a scoped Grok seam are not justified
-before the title experiment matrix is proven.
+V1 uses provider terminal titles as the highest-fidelity signal available across
+ordinary interactive TUIs, while retaining markers, bells, process exit, and a
+weak PTY fallback. Hooks remain a future option for exact completion or failure
+events, but are not part of the current product contract.
 
 ### Stable tree, informative labels
 
 The project tree never reorders itself by activity. Stable placement is more
-valuable than automatic recency sorting in a flight desk with ten or more panes.
+useful than automatic recency sorting in a busy workspace.
 
 V1 changes only the existing row:
 
 - `working`: live work.
 - `blocked · 2h`: waiting for user input; age starts when Blocked begins.
-- `done · 8h`: completed work not yet attended; Done never expires.
+- `done · 8h`: latest completed work, attended or unread; age starts at completion.
 - `idle · 12m`: recently active; age follows the latest lifecycle transition.
 - `idle`: ordinary middle age; no extra text.
-- `stale · 4d`: an old attended pane that may deserve cleanup.
+- `stale · 4d`: an old Idle pane that may deserve cleanup.
 
 Initial age buckets:
 
@@ -109,45 +108,47 @@ Terminal programs set their title with OSC escape sequences. Muxel already parse
 and retains the latest title for pane naming and Codex session identity. Lifecycle
 detection adds a separate parser so provider state decorations never leak into the
 persisted display name. OSC events carry no sender process identity, so known agent
-panes accept lifecycle observations only from their provider's structural title
-contract. Automatic names also require provider ownership: Claude and Grok expose
-it in their structural title, while Codex persists it against a session UUID. A
-child command's foreign title updates neither; plain shell panes retain ordinary
-OSC-title behavior.
+panes accept title-derived lifecycle observations only from their provider's
+structural title contract. Automatic names also require provider ownership: Claude
+and Grok expose it in their structural title, while Codex persists it against a
+session UUID. A child command's foreign title updates neither the automatic name
+nor title-derived lifecycle state; plain shell panes retain ordinary OSC-title
+behavior.
 
 ### Codex
 
-V1 supports the current Codex semantic title contract (minimum supported version:
-0.145.0). Muxel requests `thread`, `run-state`, and `activity` at launch. The
+V1 uses the Codex semantic title contract verified with version 0.145.0. Muxel
+does not version-gate the parser; it validates title values actually observed.
+Muxel requests `thread`, `run-state`, and `activity` at launch. The
 parser reads lifecycle only from the final state/activity segment and returns the
 thread segment as a naming fallback, so words such as `working` or `ready` inside a
 thread name cannot forge status. For a bound local Codex pane, Muxel reads the
 latest nonblank `thread_name` for that exact session UUID from Codex's append-only
-`session_index.jsonl`. That parent-owned value takes precedence in persistence,
+`session_index.jsonl`. That Codex-owned value takes precedence in persistence,
 tabs, and the sidebar, so `/rename` updates the pane while an `npm` child cannot.
 Remote Codex panes cannot read the remote host's index and retain the structural
 OSC-title fallback. Manual Muxel names remain a separate override and still win at
-render time.
+render time. If the local index is briefly unavailable, a bound pane keeps its
+last persisted automatic name, then its preset label; it never falls back to live
+OSC naming.
 
 Muxel adopts a Codex UUID only while the pane is unbound and only when the UUID is
 the complete thread field of a valid semantic title. Later OSC titles cannot
 replace the saved UUID because terminal-title events carry no sender process
 identity. In-process conversation switches are therefore not persisted; creating
-a new pane establishes a different durable resume binding. The parser must still
-detect capability from title values actually observed; it must not infer
-correctness from a version string alone.
+a new pane establishes a different durable resume binding.
 
 Muxel does not install or upgrade Codex. Diagnostics may recommend upgrading when
 the expected semantic title contract is absent.
 
 ### Claude
 
-Claude 2.1.220 publishes `✳ <session>` while idle, alternates `⠂` and `⠐`
-roughly once a second for the full turn, then restores `✳` on completion. Treat
-only those confirmed prefixes as semantic state. A frame remains authoritative
-until the next provider-owned frame or process exit; elapsed time alone is not
-completion evidence. Strip the prefix before accepting the remainder as an
-automatic pane name. Keep the on-screen
+The captured Claude Code 2.1.220 trace publishes `✳ <session>` while idle,
+alternates `⠂` and `⠐` roughly once a second for the full turn, then restores `✳`
+on completion. Treat only those confirmed prefixes as semantic state. A parsed
+title state does not expire on elapsed time alone; the next provider-owned frame
+or process exit replaces it. Strip the prefix before accepting the remainder as
+an automatic pane name. Keep the on-screen
 `esc to interrupt` marker as corroboration and backward-compatible fallback.
 
 Claude also supports OSC 9;4 terminal progress, controlled by
@@ -158,9 +159,9 @@ to enable a redundant signal.
 
 ### Grok
 
-Grok 0.2.112 defaults its title items to action-required, spinner, activity,
-session-name, and `grok`. Its source holds each of eight braille frames for about
-264 ms. A valid trace observed:
+The captured Grok 0.2.112 trace uses its default title items: action-required,
+spinner, activity, session-name, and `grok`. Its source holds each of eight braille
+frames for about 264 ms. The trace observed:
 
 ```text
 grok
@@ -214,7 +215,9 @@ authoritative lifecycle value; workspaces written before that field existed infe
 it from their newest transition timestamp. An unread completion is derived:
 
 ```text
-last_state == Done && completed_at > last_attended_at
+last_state == Done
+  && completed_at exists
+  && (last_attended_at is missing || completed_at > last_attended_at)
 ```
 
 There is no persisted `unseen` boolean that can disagree with the timestamps.
@@ -227,7 +230,7 @@ Transition rules are pure and live in `muxel-core`:
 - entering Done records `completed_at` once for that completion;
 - every transition records the latest lifecycle state;
 - attending records `last_attended_at` without changing lifecycle state;
-- returning to Working clears the active Blocked timestamp but retains history;
+- leaving Blocked for Working, Idle, or Done clears the active `blocked_at` value;
 - PTY-only activity remains a runtime fallback and never records completion.
 
 V1 does not store an event log or run ring buffer. The fields leave room for a
@@ -298,9 +301,6 @@ token; scripted typing remains useful for the separate type-without-submit case.
 - None emitted OSC 9;4 under Muxel's current terminal identity. This is expected
   from the Claude and Grok support documentation, not evidence that the protocol
   does not exist.
-- The first Claude/Grok traces were invalid: the probe omitted cwd, and the
-  Windows batch runner collapsed a one-item argv collection. Both harness faults
-  were fixed and regression-tested before the valid traces above were accepted.
 
 Primary references:
 
@@ -321,15 +321,15 @@ Build and run it as:
 
 ```powershell
 cargo build -p muxel-terminal --bin agent-title-probe
-target/debug/agent-title-probe.exe --log D:/tmp/codex-title.jsonl `
+target/debug/agent-title-probe.exe --log "$env:TEMP/muxel-codex-title.jsonl" `
   --include-title-text -- codex --config "tui.terminal_title=['thread','run-state','activity']"
 ```
 
-Add `--script D:/tmp/probe-actions.json` before `--` for unattended runs. The JSON
-is an array of relative-delay actions, for example
+Add `--script "$env:TEMP/muxel-probe-actions.json"` before `--` for unattended
+runs. The JSON is an array of relative-delay actions, for example
 `[{"after_ms":5000,"input":"Reply OK.\r"},{"after_ms":15000,"kill":true}]`.
 Input text is sent to the provider but only its byte count enters the trace. Keep
-scripts under `D:/tmp`; never commit prompts or captured titles.
+scripts in the OS temporary directory; never commit prompts or captured titles.
 
 Probe scenarios per provider:
 
@@ -359,7 +359,7 @@ not whether any descendant process is alive. A future `background · N` state ne
 structured job-count evidence; provider prose such as `1 command still running`
 is not a durable product contract.
 
-## Automated test plan
+## Automated coverage
 
 ### `muxel-core`
 
@@ -398,11 +398,10 @@ is not a durable product contract.
 - attention navigation selects Blocked panes and unread Done notifications, not
   attended Done lifecycle;
 - agent auto-names accept provider-owned titles and reject child-command titles;
-- title and status remain within a narrow row layout by construction.
 
-## Manual test plan
+## Manual validation
 
-Use `target/debug/muxel.exe`, never `muxel-live.exe`.
+Build and run `target/debug/muxel.exe`.
 
 1. Open a project containing Claude, Codex, Grok, a plain shell, and one pane with
    a deliberately long title.
@@ -434,10 +433,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build -p muxel
 ```
-
-If the hosted shell stalls in the native Whisper build, stop only that build tree
-and have Chris run the remaining command in `D:/dev/muxel` after merging the feature
-into `next`. A stalled build is not a pass.
 
 ## V2, deliberately deferred
 

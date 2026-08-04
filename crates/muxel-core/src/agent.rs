@@ -615,7 +615,7 @@ pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
 /// Latest saved display name for each Codex session id.
 ///
 /// Codex appends an entry to `~/.codex/session_index.jsonl` when `/rename`
-/// changes a thread name. Session ids make this a parent-owned name source:
+/// changes a thread name. Session ids make this a Codex-owned name source:
 /// commands running inside the terminal cannot replace it with their own OSC
 /// title. Later rows win because the index is append-only.
 pub fn codex_session_names(
@@ -685,10 +685,9 @@ pub fn codex_session_id_from_title(preset: &AgentPreset, title: &str) -> Option<
 
 /// Most recently modified Codex session id whose `session_meta.cwd` matches `cwd`.
 ///
-/// Codex mints its own UUID on first launch (no host-side `--session-id`), so on
-/// restart muxel adopts the latest rollout for this working directory. Multiple
-/// concurrent Codex panes in the *same* cwd may collide on that heuristic — keep
-/// one Codex pane per project for reliable autoresume.
+/// This is a legacy recovery path for a pane that was already started before exact
+/// title binding existed but has no saved session id. New and already-bound panes
+/// use their exact captured id and never replace it with this cwd heuristic.
 pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
     let root = home.join(".codex").join("sessions");
     if !root.is_dir() {

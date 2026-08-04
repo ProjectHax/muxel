@@ -850,7 +850,7 @@ fn terminal_auto_title(instance: &Instance, title: &str) -> Option<String> {
     })
 }
 
-/// Codex persists `/rename` against its own session id. Prefer that parent-owned
+/// Codex persists `/rename` against its own session id. Prefer that Codex-owned
 /// name over OSC text, which can also be emitted by commands inside the pane.
 fn codex_session_auto_title(
     instance: &Instance,
@@ -1516,7 +1516,7 @@ fn agent_minted_session_gone(preset: &muxel_core::AgentPreset, session_id: &str)
     !muxel_core::codex_session_exists(&home, session_id)
 }
 
-/// Capture the real session id an agent-minted CLI wrote for `cwd` (Codex).
+/// Recover a legacy agent-minted session id by cwd when no exact binding was saved.
 fn capture_agent_session_id(
     preset: &muxel_core::AgentPreset,
     cwd: Option<&std::path::Path>,
@@ -4396,7 +4396,8 @@ impl MuxelApp {
     /// - **Host-minted** (`session_id_flag` set): first launch
     ///   `--session-id <id>`; later `--resume <id>` (or the preset's flag).
     /// - **Agent-minted** (only `resume_flag`, e.g. Codex): first launch bare;
-    ///   on restart, capture the real id from disk then `resume <id>`.
+    ///   bound panes resume their saved id. A legacy started pane with no saved id
+    ///   recovers the newest cwd-matching rollout before `resume <id>`.
     fn session_resume_for(&mut self, iid: Uuid) -> Option<Vec<String>> {
         let inst = self.workspace.instance(iid)?;
         let preset = inst
