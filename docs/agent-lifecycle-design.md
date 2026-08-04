@@ -148,8 +148,9 @@ alternates `⠂` and `⠐` roughly once a second for the full turn, then restore
 on completion. Treat only those confirmed prefixes as semantic state. A parsed
 title state does not expire on elapsed time alone; the next provider-owned frame
 or process exit replaces it. Strip the prefix before accepting the remainder as
-an automatic pane name. Keep the on-screen
-`esc to interrupt` marker as corroboration and backward-compatible fallback.
+an automatic pane name. Keep the on-screen `esc to interrupt` marker as independent
+Working evidence: Claude can leave its title in the Idle shape while review or
+orchestration work is still active.
 
 Claude also supports OSC 9;4 terminal progress, controlled by
 `terminalProgressBarEnabled`, but emits it only for terminals it recognizes as
@@ -379,6 +380,8 @@ is not a durable product contract.
 - lifecycle decorations strip cleanly from display titles;
 - known agent panes reject unrelated program titles for both lifecycle and naming;
 - a foreign title cannot erase the last provider-owned lifecycle observation;
+- a configured Claude Working marker overrides an Idle title and clears an older
+  Done latch;
 - Codex thread words cannot be parsed as run state;
 - title generation advances for changes and ResetTitle;
 - weak PTY Working-to-Idle does not latch Done;
@@ -410,18 +413,21 @@ Build and run `target/debug/muxel.exe`.
    plain-shell PTY activity may briefly show Working but must return to Idle.
 4. Run a short task. Confirm Working appears during the run and Done remains after
    completion while another pane is focused.
-5. Focus the Done pane. Confirm the notification clears while Done and its age
+5. Exercise a Claude review or orchestration state that still shows
+   `esc to interrupt` while its title is Idle. Confirm Working replaces an older
+   Done state immediately.
+6. Focus the Done pane. Confirm the notification clears while Done and its age
    remain.
-6. Restart Muxel. Confirm both attended and unattended Done panes retain Done and
+7. Restart Muxel. Confirm both attended and unattended Done panes retain Done and
    their original completion ages.
-7. Start another turn. Confirm Working replaces Done, then the next completion
+8. Start another turn. Confirm Working replaces Done, then the next completion
    produces a new Done timestamp.
-8. Trigger a provider permission prompt. Confirm Blocked and its age remain until
+9. Trigger a provider permission prompt. Confirm Blocked and its age remain until
    the prompt is resolved.
-9. While each provider is idle and working, emit a foreign command title. Confirm
+10. While each provider is idle and working, emit a foreign command title. Confirm
    it changes neither pane name nor lifecycle; the next provider title still wins.
-10. Resize the sidebar and terminal repeatedly. Confirm no false Done transition.
-11. Verify plain-shell titles and browser/editor/diff panes are unchanged.
+11. Resize the sidebar and terminal repeatedly. Confirm no false Done transition.
+12. Verify plain-shell titles and browser/editor/diff panes are unchanged.
 
 ## Build gate
 

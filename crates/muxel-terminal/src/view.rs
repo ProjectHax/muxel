@@ -298,15 +298,21 @@ fn combine_title_status(
     exited: bool,
     base: AgentStatus,
     title: Option<AgentStatus>,
+    screen_working: bool,
 ) -> AgentStatus {
     if exited {
         return AgentStatus::Done;
     }
-    if base == AgentStatus::Blocked {
+    if base == AgentStatus::Blocked || title == Some(AgentStatus::Blocked) {
         return AgentStatus::Blocked;
     }
+    // A configured provider marker is independent strong evidence. Claude can
+    // leave its semantic title in the Idle shape while an orchestration/review
+    // status line still says `esc to interrupt`.
+    if screen_working {
+        return AgentStatus::Working;
+    }
     match title {
-        Some(AgentStatus::Blocked) => AgentStatus::Blocked,
         Some(AgentStatus::Working) => AgentStatus::Working,
         // A bell is a stronger completion edge than an idle title.
         Some(AgentStatus::Idle) if base != AgentStatus::Done => AgentStatus::Idle,
@@ -1012,15 +1018,11 @@ impl TerminalView {
             self.semantic_title_status.set(Some(status));
         }
         let mut title = sticky_title_status(self.semantic_title_status.get(), observed_title);
-        // Once a known provider has proved its title protocol, that protocol owns
-        // Working/Idle. Keep screen markers only as a compatibility fallback for
-        // older/custom clients; blocked prompts remain independent evidence.
-        let title_protocol_live = self.semantic_title_status.get().is_some();
-        let working_markers = if title_protocol_live {
-            &[][..]
-        } else {
-            self.working_markers.as_slice()
-        };
+        // Provider-owned titles and configured screen markers are independent
+        // strong evidence. Titles prevent PTY noise from forging state; they do
+        // not suppress a visible provider marker such as Claude's
+        // `esc to interrupt` status line.
+        let working_markers = self.working_markers.as_slice();
         // Claude may declare its title idle while a background command remains
         // live. Scan its visible grid for that provider-owned continuation row.
         let needs_continuation_scan = self.title_provider == TitleProvider::Claude
@@ -1041,6 +1043,7 @@ impl TerminalView {
             bell,
             self.session.idle_for(),
         );
+        let screen_working = working_markers.iter().any(|marker| screen.contains(marker));
         if self.title_provider == TitleProvider::Grok {
             if title == Some(AgentStatus::Blocked) {
                 self.grok_blocked_at.set(Some(std::time::Instant::now()));
@@ -1059,7 +1062,7 @@ impl TerminalView {
         {
             title = Some(continuing);
         }
-        let raw = combine_title_status(self.exited, base, title);
+        let raw = combine_title_status(self.exited, base, title, screen_working);
         // Marker-less providers may latch only after proving that their semantic
         // title protocol is live. Older/custom CLIs otherwise infer Working from
         // typing echo and turn two seconds of quiet into a false completion.
@@ -1434,6 +1437,55 @@ mod tests {
     }
 
     #[test]
+    fn claude_visible_working_marker_overrides_idle_title() {
+        let working = m(&["esc to interrupt"]);
+        let screen = "Reviewing 2 approval requests (5m 11s · esc to interrupt)";
+        let base = classify(false, screen, &working, &[], false, Duration::from_secs(10));
+        assert_eq!(base, AgentStatus::Working);
+        let status = combine_title_status(false, base, Some(AgentStatus::Idle), true);
+        assert_eq!(status, AgentStatus::Working);
+        assert_eq!(
+            latch_done(Some(AgentStatus::Idle), status, true, true),
+            (AgentStatus::Working, false)
+        );
+        assert_eq!(
+            combine_title_status(false, base, Some(AgentStatus::Blocked), true),
+            AgentStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn lifecycle_signal_precedence_is_explicit() {
+        use AgentStatus::{Blocked, Done, Idle, Working};
+
+        let cases = [
+            ("exit", true, Working, Some(Blocked), true, Done),
+            (
+                "screen blocked",
+                false,
+                Blocked,
+                Some(Working),
+                true,
+                Blocked,
+            ),
+            ("title blocked", false, Idle, Some(Blocked), true, Blocked),
+            ("screen working", false, Working, Some(Idle), true, Working),
+            ("title working", false, Idle, Some(Working), false, Working),
+            ("title idle", false, Working, Some(Idle), false, Idle),
+            ("bell done", false, Done, Some(Idle), false, Done),
+            ("base fallback", false, Idle, None, false, Idle),
+        ];
+
+        for (name, exited, base, title, screen_working, expected) in cases {
+            assert_eq!(
+                combine_title_status(exited, base, title, screen_working),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn codex_forced_title_contract_separates_agent_from_background_output() {
         assert_eq!(
             title_status(
@@ -1444,7 +1496,7 @@ mod tests {
             Some(AgentStatus::Idle)
         );
         assert_eq!(
-            combine_title_status(false, AgentStatus::Working, Some(AgentStatus::Idle)),
+            combine_title_status(false, AgentStatus::Working, Some(AgentStatus::Idle), false),
             AgentStatus::Idle
         );
         assert_eq!(
@@ -1598,7 +1650,7 @@ mod tests {
             Some("⠹ - Responding - Review title - grok"),
             Some(Duration::from_millis(300)),
         );
-        let raw_working = combine_title_status(false, AgentStatus::Idle, grok_working);
+        let raw_working = combine_title_status(false, AgentStatus::Idle, grok_working, false);
         assert_eq!(raw_working, AgentStatus::Working);
 
         let grok_idle = title_status(
@@ -1610,6 +1662,7 @@ mod tests {
             false,
             AgentStatus::Working, // incidental PTY redraw/background output
             grok_idle,
+            false,
         );
         assert_eq!(raw_idle, AgentStatus::Idle);
         assert_eq!(
@@ -1619,7 +1672,7 @@ mod tests {
 
         // Typing while an already-idle title is present cannot manufacture a
         // Working→Done edge from the PTY activity heuristic.
-        let typed = combine_title_status(false, AgentStatus::Working, grok_idle);
+        let typed = combine_title_status(false, AgentStatus::Working, grok_idle, false);
         assert_eq!(
             latch_done(Some(AgentStatus::Idle), typed, false, true),
             (AgentStatus::Idle, false)
