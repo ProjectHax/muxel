@@ -5,6 +5,90 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-08-05
+
+### Added
+- **Opening a file, diff, or web page joins the pane that already holds that kind
+  of thing** — a citation used to split off a new pane every time, so reading three
+  files left you with three columns. Default opens now land in the nearest pane of
+  the same type, turning it into a reading lane beside your agent. Explicit **New
+  Tab** and **New Pane** commands still place exactly where you asked.
+- **Middle-click a terminal link to open it without leaving the terminal** — the
+  link opens in a background muxel tab and your keyboard focus stays in the agent,
+  so you can queue up a reference mid-sentence. Right-clicking a link now offers
+  **Open link**, **Open in new tab**, and **Copy link** instead of passing the click
+  through to the PTY as a paste.
+- **muxel returns you to the pane you were last using in each project** — switching
+  projects and coming back landed on the first pane in the layout, not the one you
+  were working in. The remembered pane is per project and falls back safely if it
+  was closed.
+- **`Ctrl+C` and `Ctrl+Insert` copy the selection outside terminals** — rendered
+  Markdown, image and resource views, and settings fields now copy the exact
+  selected text, whitespace included. A focused terminal keeps `Ctrl+C` as
+  interrupt.
+- **Split buttons create in one click** — the pane's split buttons now clone the
+  agent you are looking at rather than requiring a press-and-hold, and right-click
+  opens the picker when you want a different agent. The pane `+` button opens the
+  agent picker for that tab group.
+
+### Fixed
+- **Creating an agent pane no longer stalls the window** — PTY creation and child
+  startup ran before the new tab could paint, which on Windows read as a freeze.
+  The tab now appears and takes focus first while startup runs on a worker; a
+  launch superseded by a closed or replaced tab is discarded instead of attaching
+  to nothing.
+- **A child command can no longer rename your agent pane or fake its status** —
+  every process sharing a pane's terminal can emit a title, and those events carry
+  no sender identity, so an `npm` script could overwrite the pane name or push it
+  to "working". Titles are now accepted only in the exact shape their agent
+  publishes, and local Codex `/rename` names are read from Codex's own session
+  index keyed by that pane's session id.
+- **A finished agent keeps its completion after you look at it** — focusing a pane
+  marked its notification read *and* reset the lifecycle badge to idle, discarding
+  when the turn actually finished. Reading the notification and the lifecycle state
+  are now separate, and a restored pane keeps its original completion age through
+  startup instead of being overwritten by boot noise.
+- **Claude stays "working" while reviewing** — during review and orchestration
+  Claude leaves its title in the idle shape while the screen still shows `esc to
+  interrupt`. That visible marker is honored again, so those panes no longer read
+  idle mid-turn.
+- **Dragging the last tab out of a pane no longer shrinks where it lands** — the
+  vanishing pane's width was redistributed across the whole layout instead of
+  following the tab, so the column you dropped onto got narrower. Its width now
+  transfers to the destination.
+- **Terminals redraw at their final size after a divider drag** — a responsive TUI
+  could stay drawn at its old dimensions until a keypress or scroll woke it. Only
+  the terminals under the resized split are woken, once the drag settles.
+- **Resizing the window while a workspace restores no longer compounds the lag**
+  (Windows) — background terminal launches were admitted during the modal
+  move/size loop and competed with resize painting. They now pause while that loop
+  is active and resume when it ends.
+- **A page can no longer open non-web URLs through a browser pane** — `target=_blank`
+  and `window.open` requests are accepted only for `http` and `https`, so page
+  content cannot reach `file://` or OS protocol handlers. Those requests also stay
+  in the project that raised them rather than following whichever project is
+  active by the time they arrive.
+- **Packaged agent executables stop showing up as pane names** — a launcher path
+  like `codex-win32-x64.exe` was adopted as the pane title; it names an
+  implementation binary, not a conversation.
+
+### Changed
+- **A Codex pane keeps the session it was bound to** — 0.1.6 followed a `/resume`
+  inside the running TUI and re-bound the pane. Because terminal titles do not
+  identify which process emitted them, that same path let any child process
+  redirect the pane's saved session. Binding is now captured once and never
+  replaced, so a conversation switched inside Codex will reopen as the originally
+  bound one after a restart.
+- **A completed turn stays `done` until the agent works again** — it used to drop
+  back to idle as soon as you looked at the pane, which erased the only signal that
+  a turn had finished. New work or a new prompt replaces it.
+- **The toolbar's global split buttons are gone** — pane creation lives on the
+  panes themselves, where it can act on the pane you mean.
+
+### iOS companion app (distributed via TestFlight / App Store, not in these downloads)
+- The Swift pane-tree port matches the desktop's new collapsed-pane width
+  transfer, so a tab dragged out of its last pane sizes the same on both.
+
 ## [0.1.6] — 2026-07-31
 
 ### Added
@@ -820,7 +904,8 @@ All notable changes to muxel are documented here. This project adheres to
 
 Initial public release.
 
-[Unreleased]: https://github.com/ProjectHax/muxel/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/ProjectHax/muxel/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/ProjectHax/muxel/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/ProjectHax/muxel/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ProjectHax/muxel/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ProjectHax/muxel/compare/v0.1.3...v0.1.4
