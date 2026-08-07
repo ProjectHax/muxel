@@ -71,10 +71,19 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Built-in agent presets** — Shell, Claude, opencode, Amp (ampcode), Grok
   (x.ai), Hermes, Ollama, **Ollama Code**, Pi, and a **Browser** preset, each with
-  its own icon. On Windows the default shell is **PowerShell**, with **Cmd**
-  offered as a second preset (instead of the single "Shell"). A preset is either
-  a terminal agent or a **Browser** (opens a browser pane at its homepage) —
-  switch the type and edit the fields in Settings → Agents.
+  its own icon. On Windows the default shell is **PowerShell**, with **Cmd** and
+  **Git Bash** offered as additional presets (instead of the single "Shell"). A
+  preset is either a terminal agent or a **Browser** (opens a browser pane at its
+  homepage) — switch the type and edit the fields in Settings → Agents.
+- **Git Bash on Windows** — when Git for Windows is installed, a **Git Bash**
+  preset runs its `bash.exe` as an interactive login shell, so the pane gets the
+  MSYS tools (`ls`, `grep`, `ssh`, …) rather than a bare shell. muxel finds bash
+  by walking the standard install locations, the root of whichever `git.exe` is on
+  `PATH` (so a custom install directory works), and Scoop's app directory; set
+  `MUXEL_GIT_BASH` to point at a portable install. It never resolves a bare
+  `bash`, which on Windows is the WSL launcher rather than Git Bash. Panes open in
+  the project or worktree directory instead of jumping to your home directory, and
+  the preset is hidden when Git isn't installed.
 - **Ollama Code** — runs a coding agent backed by an Ollama model via
   `ollama launch <agent> --model <model>` (seeded as `ollama launch opencode
   --model glm-5.2:cloud`); change the agent or model in the preset's args.

@@ -2202,7 +2202,8 @@ impl Default for Settings {
 /// v13: added the built-in Browser preset (opens a browser pane).
 /// v14: migrated the built-in Grok preset from delayed TypeIn to `--rules`.
 /// v15: repaired Grok presets saved with the generic Claude-only prompt flag.
-pub const PRESET_SEED_VERSION: u32 = 15;
+/// v16: added the Windows Git Bash preset.
+pub const PRESET_SEED_VERSION: u32 = 16;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see

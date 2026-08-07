@@ -163,6 +163,41 @@ impl AgentPreset {
         }
     }
 
+    /// Git for Windows' bash, offered alongside PowerShell and cmd. Only seeded
+    /// on Windows (see [`AgentPreset::defaults`]).
+    ///
+    /// `-i -l` matches what Windows Terminal and VS Code launch: the login shell
+    /// is what sets up the MSYS `PATH`, so without `-l` the pane starts without
+    /// the Unix tools that are the reason to use Git Bash at all. `CHERE_INVOKING`
+    /// is what keeps the pane in its project — Git Bash's `/etc/profile` `cd`s to
+    /// `$HOME` on every login shell unless it is set, which would drop every pane
+    /// out of the worktree muxel just opened it in.
+    pub fn git_bash() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            kind: PresetKind::Terminal,
+            url: String::new(),
+            name: "Git Bash".to_string(),
+            program: Some(git_bash_program()),
+            model: None,
+            model_flag: None,
+            effort: None,
+            effort_flag: None,
+            args: vec!["-i".to_string(), "-l".to_string()],
+            system_prompt: None,
+            injection: InjectionMode::None,
+            env: vec![EnvVar {
+                key: "CHERE_INVOKING".to_string(),
+                value: "1".to_string(),
+            }],
+            working_markers: Vec::new(),
+            blocked_markers: Vec::new(),
+            startup_delay_ms: 0,
+            session_id_flag: None,
+            resume_flag: None,
+        }
+    }
+
     pub fn claude() -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -430,9 +465,12 @@ impl AgentPreset {
 
     pub fn defaults() -> Vec<AgentPreset> {
         let mut presets = vec![Self::shell()];
-        // On Windows, offer cmd.exe alongside the PowerShell default.
+        // On Windows, offer cmd.exe and Git Bash alongside the PowerShell default.
         #[cfg(windows)]
-        presets.push(Self::cmd());
+        {
+            presets.push(Self::cmd());
+            presets.push(Self::git_bash());
+        }
         presets.extend([
             Self::claude(),
             Self::opencode(),
@@ -862,6 +900,105 @@ pub fn codex_developer_instructions_override(instructions: &str) -> String {
     format!("developer_instructions={flattened}")
 }
 
+/// Canonical Git for Windows install path, used when nothing is discoverable so
+/// the preset still names a real target the user can correct in settings.
+pub const GIT_BASH_DEFAULT_PATH: &str = r"C:\Program Files\Git\bin\bash.exe";
+
+/// Absolute paths where Git for Windows' `bash.exe` may live, most preferred
+/// first. Environment lookup is injected so this stays testable off Windows.
+///
+/// `System32\bash.exe` is deliberately unreachable from here: that name is the
+/// WSL launcher, not Git Bash, so resolving a bare `bash` through `PATH` would
+/// frequently start the wrong shell. Every candidate is an explicit Git layout.
+pub fn git_bash_candidates(
+    env: impl Fn(&str) -> Option<String>,
+    git_on_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    };
+
+    // An explicit override wins, so a portable or non-standard install is
+    // reachable without editing the preset.
+    if let Some(explicit) = env("MUXEL_GIT_BASH").filter(|value| !value.trim().is_empty()) {
+        push(PathBuf::from(explicit.trim()));
+    }
+
+    // Git installs `git.exe` in `<root>\cmd` (and `<root>\bin`), with the bash
+    // wrapper in `<root>\bin`. Deriving the root from whichever git is actually
+    // on PATH covers installs in a custom directory.
+    if let Some(root) = git_on_path.and_then(Path::parent).and_then(Path::parent) {
+        push(root.join("bin").join("bash.exe"));
+    }
+
+    for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(base) = env(var).filter(|value| !value.trim().is_empty()) {
+            push(
+                Path::new(base.trim())
+                    .join("Git")
+                    .join("bin")
+                    .join("bash.exe"),
+            );
+        }
+    }
+    // Git for Windows' per-user install, which needs no administrator.
+    if let Some(base) = env("LocalAppData").filter(|value| !value.trim().is_empty()) {
+        push(
+            Path::new(base.trim())
+                .join("Programs")
+                .join("Git")
+                .join("bin")
+                .join("bash.exe"),
+        );
+    }
+    // Scoop keeps a stable `current` junction per app.
+    if let Some(home) = env("USERPROFILE").filter(|value| !value.trim().is_empty()) {
+        push(
+            Path::new(home.trim())
+                .join("scoop")
+                .join("apps")
+                .join("git")
+                .join("current")
+                .join("bin")
+                .join("bash.exe"),
+        );
+    }
+    out
+}
+
+/// First candidate that exists. `exists` is injected so the selection order is
+/// testable without a Git for Windows install.
+pub fn select_git_bash(
+    candidates: Vec<PathBuf>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    candidates.into_iter().find(|path| exists(path))
+}
+
+/// Locate `git.exe` on `PATH`, so a Git installed outside the standard
+/// directories still leads to its bundled bash.
+fn git_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("git.exe"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The Git Bash program a Windows shell preset should launch. Falls back to the
+/// canonical install path when Git is absent, so the preset still points
+/// somewhere meaningful rather than a bare `bash` that could resolve to WSL.
+pub fn git_bash_program() -> String {
+    select_git_bash(
+        git_bash_candidates(|key| std::env::var(key).ok(), git_on_path().as_deref()),
+        |path| path.is_file(),
+    )
+    .map(|path| path.display().to_string())
+    .unwrap_or_else(|| GIT_BASH_DEFAULT_PATH.to_string())
+}
+
 fn is_codex_program(program: &str) -> bool {
     let leaf = program
         .trim()
@@ -991,12 +1128,117 @@ mod tests {
             assert_eq!(AgentPreset::shell().name, "PowerShell");
             assert!(names.contains(&"PowerShell"));
             assert!(names.contains(&"Cmd"));
+            assert!(names.contains(&"Git Bash"));
             assert!(!names.contains(&"Shell"));
         } else {
             assert_eq!(AgentPreset::shell().name, "Shell");
             assert!(names.contains(&"Shell"));
             assert!(!names.contains(&"Cmd"));
+            assert!(!names.contains(&"Git Bash"));
         }
+    }
+
+    #[test]
+    fn git_bash_preset_keeps_its_pane_directory_and_gets_a_login_shell() {
+        let preset = AgentPreset::git_bash();
+        assert_eq!(preset.name, "Git Bash");
+        // A login shell is what populates the MSYS PATH; without it the pane has
+        // none of the Unix tools that are the point of Git Bash.
+        assert_eq!(preset.args, vec!["-i".to_string(), "-l".to_string()]);
+        // Without CHERE_INVOKING, /etc/profile cd's to $HOME and the pane leaves
+        // the project or worktree muxel opened it in.
+        assert_eq!(
+            preset
+                .env
+                .iter()
+                .find(|var| var.key == "CHERE_INVOKING")
+                .map(|var| var.value.as_str()),
+            Some("1")
+        );
+        // Never a bare `bash`: on Windows that resolves to the WSL launcher.
+        let program = preset.program.expect("git bash preset names a program");
+        assert!(
+            program.contains('\\') || program.contains('/'),
+            "expected an absolute path, got {program:?}"
+        );
+    }
+
+    #[test]
+    fn git_bash_candidates_prefer_the_override_then_the_git_on_path_root() {
+        let env = |key: &str| match key {
+            "MUXEL_GIT_BASH" => Some(r"D:\portable\git\bin\bash.exe".to_string()),
+            "ProgramFiles" => Some(r"C:\Program Files".to_string()),
+            _ => None,
+        };
+        // Forward slashes so `Path::parent` splits this on every host: Windows
+        // accepts both separators, but a `\` is an ordinary character elsewhere
+        // and the test would silently stop exercising the root derivation.
+        let git = PathBuf::from("E:/tools/Git/cmd/git.exe");
+        let candidates = git_bash_candidates(env, Some(&git));
+
+        assert_eq!(
+            candidates[0],
+            PathBuf::from(r"D:\portable\git\bin\bash.exe")
+        );
+        assert_eq!(
+            candidates[1],
+            PathBuf::from("E:/tools/Git").join("bin").join("bash.exe")
+        );
+        assert!(
+            candidates.contains(
+                &PathBuf::from(r"C:\Program Files")
+                    .join("Git")
+                    .join("bin")
+                    .join("bash.exe")
+            )
+        );
+    }
+
+    #[test]
+    fn git_bash_candidates_never_offer_the_wsl_launcher() {
+        // A PATH whose only `bash.exe` is System32's WSL launcher must not
+        // produce it as a Git Bash candidate, whatever else is set.
+        let env = |key: &str| match key {
+            "ProgramFiles" => Some(r"C:\Program Files".to_string()),
+            "LocalAppData" => Some(r"C:\Users\dev\AppData\Local".to_string()),
+            "USERPROFILE" => Some(r"C:\Users\dev".to_string()),
+            _ => None,
+        };
+        let candidates = git_bash_candidates(env, None);
+
+        assert!(!candidates.is_empty());
+        for candidate in &candidates {
+            let lower = candidate.display().to_string().to_ascii_lowercase();
+            assert!(
+                !lower.contains("system32"),
+                "WSL launcher offered: {candidate:?}"
+            );
+            assert!(lower.ends_with("bash.exe"));
+        }
+    }
+
+    #[test]
+    fn git_bash_candidates_dedupe_when_roots_overlap() {
+        // ProgramFiles and ProgramW6432 are the same directory on 64-bit installs.
+        let env = |key: &str| match key {
+            "ProgramFiles" | "ProgramW6432" => Some(r"C:\Program Files".to_string()),
+            _ => None,
+        };
+        let candidates = git_bash_candidates(env, None);
+        assert_eq!(candidates.len(), 1, "expected dedupe, got {candidates:?}");
+    }
+
+    #[test]
+    fn select_git_bash_takes_the_first_existing_candidate() {
+        let missing = PathBuf::from(r"D:\nope\bin\bash.exe");
+        let present = PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
+        let candidates = vec![missing.clone(), present.clone()];
+
+        assert_eq!(
+            select_git_bash(candidates.clone(), |path| path == present),
+            Some(present)
+        );
+        assert_eq!(select_git_bash(candidates, |_| false), None);
     }
 
     #[test]
