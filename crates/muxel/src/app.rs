@@ -2445,6 +2445,7 @@ struct EditorSnapshot {
     dirty: bool,
     external_change: Option<ExternalChange>,
     disk_stamp: Option<DiskStamp>,
+    show_rendered: bool,
     /// Set when the snapshot is of a diff pane (rebuilds via `EditorView::diff`).
     diff_dir: Option<PathBuf>,
 }
@@ -2460,6 +2461,7 @@ impl EditorSnapshot {
             dirty: e.is_dirty(),
             external_change: e.external_change(),
             disk_stamp: e.disk_stamp(),
+            show_rendered: e.show_rendered(),
             diff_dir: e.diff_dir().map(|p| p.to_path_buf()),
         }
     }
@@ -2476,6 +2478,7 @@ impl EditorSnapshot {
                 self.dirty,
                 self.external_change,
                 self.disk_stamp,
+                self.show_rendered,
                 config,
                 window,
                 cx,
@@ -12668,21 +12671,7 @@ impl MuxelApp {
         }
         let config = self.editor_config();
         for (iid, snap, redock) in std::mem::take(&mut self.pending_editor_redock) {
-            let config = config.clone();
-            let ed = cx.new(|cx| {
-                EditorView::from_state(
-                    snap.text,
-                    snap.path,
-                    snap.language,
-                    snap.cursor,
-                    snap.dirty,
-                    snap.external_change,
-                    snap.disk_stamp,
-                    config,
-                    window,
-                    cx,
-                )
-            });
+            let ed = snap.build(config.clone(), window, cx);
             self.editors.insert(iid, ed);
             if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) {
                 self.redock_into_layout(iid, pid, redock, cx);

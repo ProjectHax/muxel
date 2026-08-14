@@ -156,6 +156,7 @@ impl EditorView {
         dirty: bool,
         external_change: Option<ExternalChange>,
         disk_stamp: Option<DiskStamp>,
+        show_rendered: bool,
         config: EditorConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -163,6 +164,9 @@ impl EditorView {
         let mut editor = Self::build(path, text, language, cursor, dirty, config, window, cx);
         editor.external_change = external_change;
         editor.disk_stamp = disk_stamp;
+        if editor.is_renderable() {
+            editor.show_rendered = show_rendered;
+        }
         editor
     }
 
