@@ -55,9 +55,13 @@ fn tab_label(url: &str) -> String {
     }
 }
 
+fn should_publish_url(changed: bool, navigation_committed: bool) -> bool {
+    changed || navigation_committed
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tab_label;
+    use super::{should_publish_url, tab_label};
 
     #[test]
     fn local_file_tab_uses_decoded_filename() {
@@ -65,6 +69,13 @@ mod tests {
             tab_label("file:///D:/business/report%202026.html#L12"),
             "report 2026.html"
         );
+    }
+
+    #[test]
+    fn a_committed_requested_navigation_refreshes_workspace_metadata() {
+        assert!(should_publish_url(false, true));
+        assert!(should_publish_url(true, false));
+        assert!(!should_publish_url(false, false));
     }
 }
 
@@ -472,6 +483,7 @@ mod imp {
             if self.pending_navigation_from.as_deref() == Some(current.as_str()) {
                 return None;
             }
+            let navigation_committed = self.pending_navigation_from.is_some();
             self.pending_navigation_from = None;
             // Deliberately no `current == self.url` early return: an unchanged URL
             // can still leave the address bar stale (a reused pane re-shown at the
@@ -501,7 +513,7 @@ mod imp {
             if changed || address_stale {
                 cx.notify();
             }
-            changed.then_some(current)
+            should_publish_url(changed, navigation_committed).then_some(current)
         }
 
         /// Show/hide the NATIVE child window. The app drives this every frame:
