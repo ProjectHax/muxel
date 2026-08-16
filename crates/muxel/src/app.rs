@@ -560,6 +560,28 @@ fn is_restored_transition(
         || (status == AgentStatus::Blocked && restored_state == Some(AgentActivityState::Blocked))
 }
 
+/// The minimum age a dropped tmux pane's last launch must reach before the next
+/// reattach attempt — measured from the launch, so a connection that lived a while
+/// reattaches at once and one that died on sight has to wait.
+///
+/// `attempts` is how many times *this outage* has already respawned the client;
+/// `None` means the drop hasn't been recorded yet. The wait doubles per attempt up
+/// to `REATTACH_BACKOFF_MAX`, so a host that's genuinely gone (asleep, off the
+/// network, rebooting) is polled every half-minute for as long as it takes rather
+/// than hammered — or, worse, given up on after one failed try.
+fn reattach_backoff(attempts: Option<u32>) -> Duration {
+    /// Floor for every attempt: a client that dies within this of launching is
+    /// broken on sight (tmux missing, session unusable) and must not respawn in a
+    /// tight loop.
+    const REATTACH_COOLDOWN: Duration = Duration::from_secs(5);
+    /// Ceiling on the doubling, so a long outage still notices the host coming
+    /// back within half a minute.
+    const REATTACH_BACKOFF_MAX: Duration = Duration::from_secs(30);
+    REATTACH_COOLDOWN
+        .saturating_mul(1u32 << attempts.unwrap_or(0).min(16))
+        .min(REATTACH_BACKOFF_MAX)
+}
+
 fn localized_activity_label(status: AgentStatus, activity: &AgentActivity, now: i64) -> String {
     let label = agent_activity_label(activity_state(status), activity, now);
     let (word, age) = label
@@ -2098,8 +2120,10 @@ pub struct MuxelApp {
     exit_logged: HashSet<Uuid>,
     /// Remote tmux panes whose relay dropped and are being auto-reattached — the
     /// pane shows "reconnecting…" (not "exited") until it settles, and the drop is
-    /// announced only once, not on every retry. Runtime-only.
-    reconnecting: HashSet<Uuid>,
+    /// announced only once, not on every retry. The value is how many reattach
+    /// attempts this outage has made, which sets the backoff before the next one.
+    /// Runtime-only.
+    reconnecting: HashMap<Uuid, u32>,
     /// System-tray handle (when `minimize_to_tray` is on and a tray is available).
     tray: Option<muxel_tray::TrayController>,
     /// Last tray menu we pushed, so we only update on change.
@@ -4070,7 +4094,7 @@ impl MuxelApp {
             restoring_activity: HashSet::new(),
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
-            reconnecting: HashSet::new(),
+            reconnecting: HashMap::new(),
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
             terminal_launches: HashMap::new(),
@@ -7609,7 +7633,7 @@ impl MuxelApp {
             dirty |= changed;
             // A reconnecting remote pane that's stayed alive since its last respawn
             // has reattached — clear the state and say so, once.
-            if self.reconnecting.contains(&iid)
+            if self.reconnecting.contains_key(&iid)
                 && !exited
                 && self
                     .terminal_launches
@@ -7669,7 +7693,6 @@ impl MuxelApp {
                     }
                 }
             }
-            const REATTACH_COOLDOWN_SECS: u64 = 5;
             let tmux_session = self
                 .workspace
                 .instance(iid)
@@ -7705,13 +7728,19 @@ impl MuxelApp {
             // simply exiting, both leave the client at 0 and fall through to the
             // normal close/tombstone paths. The cooldown stops a client that dies on
             // sight (tmux broken, session unusable) from respawning in a tight loop.
-            let tmux_lost = newly_exited
+            //
+            // Deliberately keyed off `exited`, not `newly_exited`: the cooldown must
+            // *delay* the retry, never cancel it. A respawn that dies inside the
+            // cooldown window (resuming a laptop whose Wi-Fi isn't up yet — ssh fails
+            // on DNS/no-route in well under a second) is only ever seen as "newly
+            // exited" on one tick, so gating on that left the pane stuck on "Waiting
+            // for the host…" forever with no retry ever firing again.
+            let tmux_lost = exited
                 && tmux_session.is_some()
                 && (exit_signal.is_some() || exit_code != Some(0))
-                && self
-                    .terminal_launches
-                    .get(&iid)
-                    .is_none_or(|&(at, _)| at.elapsed().as_secs() >= REATTACH_COOLDOWN_SECS);
+                && self.terminal_launches.get(&iid).is_none_or(|&(at, _)| {
+                    at.elapsed() >= reattach_backoff(self.reconnecting.get(&iid).copied())
+                });
 
             if resume_error || exit_recover {
                 to_recover.push((iid, title));
@@ -7725,9 +7754,16 @@ impl MuxelApp {
                 // closing it silently destroys the instance and looks like the
                 // pane randomly vanished.
                 to_close.push((iid, title));
-            } else if newly_exited && exit_code != Some(0) {
+            } else if newly_exited && exit_code != Some(0) && !self.reconnecting.contains_key(&iid)
+            {
                 // Abnormal exit: the pane stays as a tombstone; flag it in the
                 // feed (and as a desktop notification when unattended).
+                //
+                // Not while reconnecting: a retry that fails inside its backoff
+                // window lands here on the tick before the next attempt fires, and
+                // the outage is already reported once as "connection lost —
+                // reconnecting…". Announcing every failed retry would ring the
+                // desktop once a half-minute for as long as the host is down.
                 let detail = match (&read_error, &exit_signal, exit_code) {
                     (Some(err), _, _) => tf("terminal read failed: {err}", &[("err", err)]),
                     (None, Some(sig), _) => tf("killed by signal {sig}", &[("sig", sig)]),
@@ -7759,8 +7795,12 @@ impl MuxelApp {
             // conversation from its transcript — the tmux scrollback is the only
             // casualty. Resetting the id would throw the conversation away.
             let is_remote = self.remote_host_for_instance(iid).is_some();
-            // Announce the drop once per outage, not on every retry.
-            let first_drop = self.reconnecting.insert(iid);
+            // Announce the drop once per outage, not on every retry. The count is
+            // this outage's attempt tally, which backs off the next retry; it is
+            // cleared when the pane settles (or the terminal goes away).
+            let attempts = self.reconnecting.entry(iid).or_default();
+            let first_drop = *attempts == 0;
+            *attempts += 1;
             if is_remote {
                 // The tmux session lives on the host and outlives a dropped relay, so
                 // `tmux_session_exists` (a *local* check) is meaningless here — never
@@ -7838,7 +7878,7 @@ impl MuxelApp {
         self.last_activity_labels
             .retain(|iid, _| live.contains(iid));
         self.exit_logged.retain(|iid| live.contains(iid));
-        self.reconnecting.retain(|iid| live.contains(iid));
+        self.reconnecting.retain(|iid, _| live.contains(iid));
         self.auto.retain(|iid, _| live.contains(iid));
         // Auto-continue: nudge armed panes whose agent has stalled with work left.
         self.tick_auto_continue(cx);
@@ -15195,7 +15235,7 @@ impl MuxelApp {
                         // A remote pane mid-reconnect is NOT a tombstone: its tmux
                         // session is alive on the host and muxel is retrying, so it
                         // reads as "reconnecting…", not "exited".
-                        let reconnecting = self.reconnecting.contains(&iid);
+                        let reconnecting = self.reconnecting.contains_key(&iid);
                         let abnormal = !reconnecting
                             && (v.exit_read_error().is_some() || v.exit_code() != Some(0));
                         // A signalled child reports code 1; say "killed by
@@ -24954,6 +24994,34 @@ mod restore_wave_policy_tests {
             restore_wave_decision(4, 6, true, true, false),
             RestoreWaveDecision::Launch { wave_end: 6 }
         );
+    }
+}
+
+#[cfg(test)]
+mod reattach_backoff_tests {
+    use super::reattach_backoff;
+    use std::time::Duration;
+
+    #[test]
+    fn an_unrecorded_drop_waits_only_the_dies_on_sight_cooldown() {
+        // A relay that had been up for minutes clears this instantly, so the
+        // first reattach is effectively immediate.
+        assert_eq!(reattach_backoff(None), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn each_failed_attempt_doubles_the_wait_up_to_the_cap() {
+        assert_eq!(reattach_backoff(Some(1)), Duration::from_secs(10));
+        assert_eq!(reattach_backoff(Some(2)), Duration::from_secs(20));
+        assert_eq!(reattach_backoff(Some(3)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_long_outage_keeps_polling_at_the_cap_instead_of_giving_up() {
+        // The doubling must never overflow into a never-firing retry: a host left
+        // off overnight is still polled every half-minute.
+        assert_eq!(reattach_backoff(Some(64)), Duration::from_secs(30));
+        assert_eq!(reattach_backoff(Some(u32::MAX)), Duration::from_secs(30));
     }
 }
 

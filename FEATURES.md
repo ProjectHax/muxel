@@ -608,9 +608,11 @@ feature is added or changed, update the matching entry here in the same change**
   reboot) is *detected* — roughly a minute of silence — instead of the pane freezing
   on a dead socket forever. A dropped remote tmux pane then shows **"Connection lost —
   reconnecting…"** (not "exited"), because its session is still running on the host,
-  and muxel keeps retrying on its own until the host is reachable and reattaches the
-  agent right where it left off. (Tune or disable the probe per host in Settings →
-  Remotes → Keepalive; blank uses a 20s default, `0` turns it off.)
+  and muxel keeps retrying on its own — backing off to one attempt every 30s, for as
+  long as the outage lasts — until the host is reachable and reattaches the agent
+  right where it left off. Resuming a laptop whose Wi-Fi isn't up yet just costs a
+  retry or two. (Tune or disable the probe per host in Settings → Remotes →
+  Keepalive; blank uses a 20s default, `0` turns it off.)
 - **Reattaches everything on launch** — on startup muxel reconnects the tmux panes of
   *every* remote project in the background, not just the one you had open, so agents
   left running on your hosts come back automatically. Hosts that would need a password
