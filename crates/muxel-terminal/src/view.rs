@@ -164,31 +164,33 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
             })
         }
         TitleProvider::Codex => {
-            // Muxel forces `thread | run-state · activity`. Parse the state only
-            // from the final segment: thread names may legitimately contain words
-            // such as "working", "ready", or "action required".
+            // Codex 0.147 publishes action-required before the thread field.
+            // Its normal contract is `thread | run-state [spinner]`; older
+            // releases used `thread | run-state · activity`.
+            for prefix in ["[ ! ] Action Required", "[ . ] Action Required"] {
+                if let Some(rest) = title.strip_prefix(prefix) {
+                    let name = if rest.is_empty() {
+                        None
+                    } else {
+                        let name = rest.strip_prefix(" | ")?.trim();
+                        (!name.is_empty()).then_some(name.to_string())
+                    };
+                    return Some(AgentTitleFrame {
+                        status: Some(AgentStatus::Blocked),
+                        name,
+                    });
+                }
+            }
+
+            // Parse state only from the final segment: thread names may contain
+            // words such as "working", "ready", or "action required".
             let (name, state) = title.rsplit_once(" | ")?;
             let name = name.trim();
             if name.is_empty() {
                 return None;
             }
-            let (run_state, activity) = state.split_once('·')?;
-            if activity.contains('·') {
-                return None;
-            }
-            let run_state = run_state.trim().to_ascii_lowercase();
-            let activity = activity.trim();
-            let activity_lower = activity.to_ascii_lowercase();
-            let status = match (run_state.as_str(), activity_lower.as_str()) {
-                ("ready", "action required") => AgentStatus::Blocked,
-                ("ready", "") => AgentStatus::Idle,
-                ("starting" | "working" | "thinking", _) if !activity_lower.is_empty() => {
-                    AgentStatus::Working
-                }
-                _ => return None,
-            };
             Some(AgentTitleFrame {
-                status: Some(status),
+                status: Some(codex_title_state(state)?),
                 name: Some(name.to_string()),
             })
         }
@@ -235,6 +237,49 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
             })
         }
         TitleProvider::Other => None,
+    }
+}
+
+fn is_codex_spinner(value: &str) -> bool {
+    matches!(
+        value,
+        "⠋" | "⠙" | "⠹" | "⠸" | "⠼" | "⠴" | "⠦" | "⠧" | "⠇" | "⠏"
+    )
+}
+
+fn codex_title_state(state: &str) -> Option<AgentStatus> {
+    let state = state.trim();
+    if let Some((run_state, activity)) = state.split_once('·') {
+        if activity.contains('·') {
+            return None;
+        }
+        let run_state = run_state.trim().to_ascii_lowercase();
+        let activity = activity.trim().to_ascii_lowercase();
+        return match (run_state.as_str(), activity.as_str()) {
+            ("ready", "action required") => Some(AgentStatus::Blocked),
+            ("ready", "") => Some(AgentStatus::Idle),
+            ("starting" | "working" | "thinking" | "waiting", activity) if !activity.is_empty() => {
+                Some(AgentStatus::Working)
+            }
+            _ => None,
+        };
+    }
+
+    let mut parts = state.split_whitespace();
+    let run_state = parts.next()?.to_ascii_lowercase();
+    let activity = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    match (run_state.as_str(), activity) {
+        ("ready", None) => Some(AgentStatus::Idle),
+        ("starting" | "working" | "thinking" | "waiting", None) => Some(AgentStatus::Working),
+        ("starting" | "working" | "thinking" | "waiting", Some(spinner))
+            if is_codex_spinner(spinner) =>
+        {
+            Some(AgentStatus::Working)
+        }
+        _ => None,
     }
 }
 
@@ -349,13 +394,15 @@ pub fn clean_agent_title(program: &str, title: &str) -> Option<String> {
 
 /// Decide an agent's lifecycle state from its signals. Pure (unit-testable):
 /// exit wins; then on-screen markers (working spinner, blocked prompt); then a
-/// rung bell means a finished turn; then recent output is the activity fallback.
+/// rung bell means a finished turn; then recent output is an opt-in fallback
+/// for unknown terminals only.
 fn classify(
     exited: bool,
     screen: &str,
     working: &[String],
     blocked: &[String],
     bell: bool,
+    activity_fallback: bool,
     idle: Duration,
 ) -> AgentStatus {
     if exited {
@@ -372,10 +419,9 @@ fn classify(
     if bell {
         return AgentStatus::Done;
     }
-    // Output-activity fallback ONLY for agents without a working marker. With a
-    // marker configured (e.g. Claude), "working" comes solely from the marker —
-    // otherwise just typing (echoed output) would flip it to "working".
-    if working.is_empty() && idle < Duration::from_secs(2) {
+    // Raw PTY churn is useful only for unknown terminals. Known providers own
+    // semantic signals; using echoed typing here would forge Working.
+    if activity_fallback && working.is_empty() && idle < Duration::from_secs(2) {
         return AgentStatus::Working;
     }
     AgentStatus::Idle
@@ -1041,6 +1087,7 @@ impl TerminalView {
             working_markers,
             &self.blocked_markers,
             bell,
+            self.title_provider == TitleProvider::Other,
             self.session.idle_for(),
         );
         let screen_working = working_markers.iter().any(|marker| screen.contains(marker));
@@ -1440,7 +1487,15 @@ mod tests {
     fn claude_visible_working_marker_overrides_idle_title() {
         let working = m(&["esc to interrupt"]);
         let screen = "Reviewing 2 approval requests (5m 11s · esc to interrupt)";
-        let base = classify(false, screen, &working, &[], false, Duration::from_secs(10));
+        let base = classify(
+            false,
+            screen,
+            &working,
+            &[],
+            false,
+            false,
+            Duration::from_secs(10),
+        );
         assert_eq!(base, AgentStatus::Working);
         let status = combine_title_status(false, base, Some(AgentStatus::Idle), true);
         assert_eq!(status, AgentStatus::Working);
@@ -1487,51 +1542,61 @@ mod tests {
 
     #[test]
     fn codex_forced_title_contract_separates_agent_from_background_output() {
-        assert_eq!(
-            title_status(
-                TitleProvider::Codex,
-                Some("Review title | Ready ·"),
-                Some(Duration::from_secs(20))
-            ),
-            Some(AgentStatus::Idle)
-        );
+        for idle in ["Review title | Ready", "Review title | Ready ·"] {
+            assert_eq!(
+                title_status(TitleProvider::Codex, Some(idle), Some(Duration::ZERO)),
+                Some(AgentStatus::Idle),
+                "rejected idle title {idle:?}"
+            );
+        }
+        for working in [
+            "Review title | Starting ⠦",
+            "Review title | Working ⠋",
+            "Review title | Thinking ⠙",
+            "Review title | Waiting ⠹",
+            "Review title | Working",
+            "Review title | Starting · ⠦",
+        ] {
+            assert_eq!(
+                title_status(TitleProvider::Codex, Some(working), Some(Duration::ZERO)),
+                Some(AgentStatus::Working),
+                "rejected working title {working:?}"
+            );
+        }
+        for blocked in [
+            "[ ! ] Action Required | Review title",
+            "[ . ] Action Required | Review | title",
+            "Review title | Ready · action required",
+        ] {
+            assert_eq!(
+                title_status(TitleProvider::Codex, Some(blocked), Some(Duration::ZERO)),
+                Some(AgentStatus::Blocked),
+                "rejected blocked title {blocked:?}"
+            );
+        }
         assert_eq!(
             combine_title_status(false, AgentStatus::Working, Some(AgentStatus::Idle), false),
             AgentStatus::Idle
         );
         assert_eq!(
-            title_status(
-                TitleProvider::Codex,
-                Some("Review title | Starting · ⠦"),
-                Some(Duration::from_millis(500))
+            classify(
+                false,
+                "typing echoed by the TUI",
+                &[],
+                &[],
+                false,
+                false,
+                Duration::from_millis(10),
             ),
-            Some(AgentStatus::Working)
+            AgentStatus::Idle
         );
-        assert_eq!(
-            title_status(
-                TitleProvider::Codex,
-                Some("action required audit | Working · ⠋"),
-                Some(Duration::from_secs(30))
-            ),
-            Some(AgentStatus::Working)
-        );
-        assert_eq!(
-            title_status(
-                TitleProvider::Codex,
-                Some("working on ready handling | Ready ·"),
-                Some(Duration::from_secs(30))
-            ),
-            Some(AgentStatus::Idle)
-        );
-        assert_eq!(
-            title_status(
-                TitleProvider::Codex,
-                Some("Review title | Ready · action required"),
-                Some(Duration::from_secs(30))
-            ),
-            Some(AgentStatus::Blocked)
-        );
-        for foreign in ["Ready", "Ready ·", "Working on tests", "Working · ⠋"] {
+        for foreign in [
+            "Ready",
+            "Ready ·",
+            "Working ⠋",
+            "Review title | Working on tests",
+            "[ ! ] Action Requiredly | Review title",
+        ] {
             assert_eq!(
                 title_status(TitleProvider::Codex, Some(foreign), Some(Duration::ZERO)),
                 None,
@@ -1757,7 +1822,7 @@ mod tests {
 
         let working = title_status(
             TitleProvider::Codex,
-            Some("Review changes | Working · ⠋"),
+            Some("Review changes | Working ⠋"),
             Some(Duration::ZERO),
         );
         assert_eq!(sticky_title_status(None, working), Some(Working));
@@ -1772,7 +1837,7 @@ mod tests {
 
         let idle = title_status(
             TitleProvider::Codex,
-            Some("Review changes | Ready ·"),
+            Some("Review changes | Ready"),
             Some(Duration::ZERO),
         );
         assert_eq!(sticky_title_status(working, idle), Some(Idle));
@@ -1801,9 +1866,9 @@ mod tests {
             clean_agent_title("claude", "✳ Review changes").as_deref(),
             Some("Review changes")
         );
-        assert_eq!(clean_agent_title("codex", "Ready · ⠋"), None);
+        assert_eq!(clean_agent_title("codex", "Ready"), None);
         assert_eq!(
-            clean_agent_title("codex", "Review changes | Ready ·").as_deref(),
+            clean_agent_title("codex", "Review changes | Ready").as_deref(),
             Some("Review changes")
         );
         assert_eq!(
@@ -1851,12 +1916,28 @@ mod tests {
 
         // Exit wins over everything.
         assert_eq!(
-            classify(true, "esc to interrupt", &working, &blocked, true, busy),
+            classify(
+                true,
+                "esc to interrupt",
+                &working,
+                &blocked,
+                true,
+                false,
+                busy,
+            ),
             AgentStatus::Done
         );
         // Working marker beats a stale bell when no input request is present.
         assert_eq!(
-            classify(false, "… esc to interrupt", &working, &blocked, true, quiet),
+            classify(
+                false,
+                "… esc to interrupt",
+                &working,
+                &blocked,
+                true,
+                false,
+                quiet,
+            ),
             AgentStatus::Working
         );
         // Blocked marker beats the bell.
@@ -1867,7 +1948,8 @@ mod tests {
                 &working,
                 &blocked,
                 true,
-                quiet
+                false,
+                quiet,
             ),
             AgentStatus::Blocked
         );
@@ -1880,42 +1962,70 @@ mod tests {
                 &working,
                 &blocked,
                 false,
-                busy
+                false,
+                busy,
             ),
             AgentStatus::Blocked
         );
         // Bell with no marker on screen = finished a turn.
         assert_eq!(
-            classify(false, "all done", &working, &blocked, true, quiet),
+            classify(false, "all done", &working, &blocked, true, false, quiet,),
             AgentStatus::Done
         );
         // With a working marker configured, output activity (e.g. typing) does
         // NOT imply working — only the marker does. So no marker + recent output
         // is still Idle, not Working.
         assert_eq!(
-            classify(false, "", &working, &blocked, false, busy),
+            classify(false, "", &working, &blocked, false, false, busy),
             AgentStatus::Idle
         );
         assert_eq!(
-            classify(false, "", &working, &blocked, false, quiet),
+            classify(false, "", &working, &blocked, false, false, quiet),
             AgentStatus::Idle
         );
     }
 
     #[test]
-    fn classify_marker_less_agent_uses_heuristic() {
-        // No configured markers → bell = done, activity = working, quiet = idle.
+    fn classify_marker_less_agent_uses_heuristic_only_when_opted_in() {
         let none: Vec<String> = Vec::new();
         assert_eq!(
-            classify(false, "", &none, &none, true, Duration::from_secs(10)),
+            classify(false, "", &none, &none, true, true, Duration::from_secs(10),),
             AgentStatus::Done
         );
         assert_eq!(
-            classify(false, "", &none, &none, false, Duration::from_millis(100)),
+            classify(
+                false,
+                "",
+                &none,
+                &none,
+                false,
+                true,
+                Duration::from_millis(100),
+            ),
             AgentStatus::Working
         );
         assert_eq!(
-            classify(false, "", &none, &none, false, Duration::from_secs(10)),
+            classify(
+                false,
+                "",
+                &none,
+                &none,
+                false,
+                true,
+                Duration::from_secs(10),
+            ),
+            AgentStatus::Idle
+        );
+        assert_eq!(
+            classify(
+                false,
+                "typing echoed by a known provider",
+                &none,
+                &none,
+                false,
+                false,
+                Duration::from_millis(100),
+            ),
             AgentStatus::Idle
         );
     }

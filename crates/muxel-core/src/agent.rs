@@ -699,26 +699,57 @@ pub fn codex_session_id_from_title(preset: &AgentPreset, title: &str) -> Option<
         return Some(title.to_string());
     }
 
-    // The invocation-local Codex contract is `thread | run-state · activity`.
     // Accept a UUID only when it owns the complete thread field. A UUID merely
-    // mentioned inside a renamed thread must never rebind the pane.
-    let (thread, state) = title.rsplit_once(" | ")?;
-    let (run_state, activity) = state.split_once('·')?;
-    if activity.contains('·') {
-        return None;
+    // mentioned inside a renamed thread must never rebind the pane. Codex 0.147
+    // uses `thread | run-state [spinner]`; older releases used a middle dot.
+    let thread = if let Some(thread) = title
+        .strip_prefix("[ ! ] Action Required | ")
+        .or_else(|| title.strip_prefix("[ . ] Action Required | "))
+    {
+        thread
+    } else {
+        let (thread, state) = title.rsplit_once(" | ")?;
+        if !is_codex_title_state(state) {
+            return None;
+        }
+        thread
     }
-    let run_state = run_state.trim().to_ascii_lowercase();
-    let activity = activity.trim();
-    let activity_lower = activity.to_ascii_lowercase();
-    let valid_state = (run_state == "ready"
-        && matches!(activity_lower.as_str(), "" | "action required"))
-        || (matches!(run_state.as_str(), "starting" | "working" | "thinking")
-            && !activity.is_empty());
-    if !valid_state {
-        return None;
-    }
-    let thread = thread.trim();
+    .trim();
     Uuid::parse_str(thread).ok().map(|_| thread.to_string())
+}
+
+fn is_codex_title_state(state: &str) -> bool {
+    let state = state.trim();
+    if let Some((run_state, activity)) = state.split_once('·') {
+        if activity.contains('·') {
+            return false;
+        }
+        let run_state = run_state.trim().to_ascii_lowercase();
+        let activity = activity.trim().to_ascii_lowercase();
+        return (run_state == "ready" && matches!(activity.as_str(), "" | "action required"))
+            || (matches!(
+                run_state.as_str(),
+                "starting" | "working" | "thinking" | "waiting"
+            ) && !activity.is_empty());
+    }
+
+    let mut parts = state.split_whitespace();
+    let Some(run_state) = parts.next() else {
+        return false;
+    };
+    let activity = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    match (run_state.to_ascii_lowercase().as_str(), activity) {
+        ("ready", None) => true,
+        ("starting" | "working" | "thinking" | "waiting", None) => true,
+        ("starting" | "working" | "thinking" | "waiting", Some(spinner)) => matches!(
+            spinner,
+            "⠋" | "⠙" | "⠹" | "⠸" | "⠼" | "⠴" | "⠦" | "⠧" | "⠇" | "⠏"
+        ),
+        _ => false,
+    }
 }
 
 /// Most recently modified Codex session id whose `session_meta.cwd` matches `cwd`.
@@ -1050,16 +1081,25 @@ mod tests {
     #[test]
     fn codex_session_id_is_extracted_from_semantic_title() {
         let id = Uuid::new_v4().to_string();
-        let title = format!("{id} | Working · Responding");
-        assert_eq!(
-            codex_session_id_from_title(&AgentPreset::codex(), &title).as_deref(),
-            Some(id.as_str())
-        );
+        for title in [
+            format!("{id} | Working ⠋"),
+            format!("{id} | Working"),
+            format!("{id} | Ready"),
+            format!("{id} | Working · Responding"),
+            format!("[ ! ] Action Required | {id}"),
+        ] {
+            assert_eq!(
+                codex_session_id_from_title(&AgentPreset::codex(), &title).as_deref(),
+                Some(id.as_str()),
+                "rejected semantic title {title:?}"
+            );
+        }
+        let title = format!("{id} | Working ⠋");
 
         assert_eq!(
             codex_session_id_from_title(
                 &AgentPreset::codex(),
-                &format!("Review {id} carefully | Ready ·")
+                &format!("Review {id} carefully | Ready")
             ),
             None
         );
