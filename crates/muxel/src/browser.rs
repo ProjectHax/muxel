@@ -55,6 +55,7 @@ fn tab_label(url: &str) -> String {
     }
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 fn should_publish_url(changed: bool, navigation_committed: bool) -> bool {
     changed || navigation_committed
 }
