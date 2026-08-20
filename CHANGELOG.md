@@ -5,6 +5,41 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-08-20
+
+### Added
+- **A Git Bash preset on Windows** — Git for Windows' `bash.exe` now sits beside the
+  PowerShell and Cmd presets, launched as an interactive login shell so the MSYS
+  tools that are the reason to run it are actually on `PATH`. Panes stay in the
+  project or worktree they were opened from instead of dropping to `$HOME`. muxel
+  locates it from a real Git install — a `MUXEL_GIT_BASH` override, the root of
+  whichever `git.exe` is on `PATH`, the standard per-machine and per-user install
+  locations, or Scoop — and never from a bare `bash`, which on Windows is the WSL
+  launcher rather than Git Bash. The preset stays hidden in the picker until it
+  resolves to a real program.
+
+### Fixed
+- **Codex panes report the right status on Codex 0.147** — Codex changed the shape
+  of the terminal title it publishes, so muxel's parser rejected every frame and
+  fell back to watching raw terminal output. Typing in the pane read as the agent
+  working. muxel now understands the current format, including both Action Required
+  frames, so idle, working, and blocked are accurate again.
+- **A browser pane reopens on the page you left it on** — a URL typed into the
+  address bar was never written to the pane's saved state, so Recently Closed and a
+  restart both brought back the page before it.
+- **A remote pane keeps trying to reconnect after your laptop wakes** — the retry
+  was cancelled rather than delayed when the first reattach failed, which is exactly
+  what happens while Wi-Fi is still coming back: the pane sat on "Waiting for the
+  host…" until you restarted it by hand. Retries now back off from 5s to 30s and
+  continue for as long as the host is away, and the repeated "process exited"
+  notifications during a single outage are suppressed.
+
+### Changed
+- **The interface framework moves to the merged upstream work** — muxel's GPUI and
+  gpui-component pins now track the accepted upstream implementations of control
+  identifiers and TextView link handling instead of the revisions muxel had been
+  carrying, which also brings in seven weeks of upstream interface fixes.
+
 ## [0.1.7] — 2026-08-05
 
 ### Added

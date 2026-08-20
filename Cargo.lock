@@ -5001,7 +5001,7 @@ dependencies = [
 
 [[package]]
 name = "muxel"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5042,7 +5042,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -5051,7 +5051,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-store"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5064,7 +5064,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-terminal"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -5082,7 +5082,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-tray"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ksni",
  "log",
