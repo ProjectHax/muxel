@@ -691,6 +691,71 @@ fn default_markers(program: Option<&str>) -> (Vec<String>, Vec<String>) {
     }
 }
 
+/// Move an ordinary Codex pane's custom rules into its hidden launch config.
+/// Runner and loop prompts are user tasks, so they must remain on the instance
+/// for TypeIn to submit them as the first turn.
+fn take_codex_rules_prompt(instance: &mut Instance, resuming: bool) -> Option<String> {
+    if instance.is_runner {
+        return None;
+    }
+    let prompt = instance
+        .system_prompt
+        .take()
+        .filter(|prompt| !prompt.is_empty());
+    (!resuming && instance.injection != InjectionMode::None)
+        .then_some(prompt)
+        .flatten()
+}
+
+#[cfg(test)]
+mod codex_prompt_transport_tests {
+    use super::{AgentPreset, InjectionMode, Instance, take_codex_rules_prompt};
+    use muxel_core::resolve_launch_for_session;
+    use uuid::Uuid;
+
+    fn codex(prompt: &str, runner: bool) -> Instance {
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        instance.system_prompt = Some(prompt.to_string());
+        instance.injection = InjectionMode::TypeIn;
+        instance.is_runner = runner;
+        instance
+    }
+
+    #[test]
+    fn ordinary_codex_rules_move_to_hidden_config() {
+        let mut instance = codex("pane rules", false);
+        assert_eq!(
+            take_codex_rules_prompt(&mut instance, false).as_deref(),
+            Some("pane rules")
+        );
+        assert_eq!(instance.system_prompt, None);
+
+        let mut resumed = codex("pane rules", false);
+        assert_eq!(take_codex_rules_prompt(&mut resumed, true), None);
+        assert_eq!(resumed.system_prompt, None);
+    }
+
+    #[test]
+    fn codex_runner_task_remains_a_submitted_user_turn() {
+        let mut instance = codex("one-shot task", true);
+        assert_eq!(take_codex_rules_prompt(&mut instance, false), None);
+
+        let launch = resolve_launch_for_session(&instance, false);
+        assert_eq!(launch.startup_input.as_deref(), Some("one-shot task"));
+        assert!(launch.submit);
+    }
+
+    #[test]
+    fn resumed_codex_runner_does_not_repeat_its_task() {
+        let mut instance = codex("one-shot task", true);
+        assert_eq!(take_codex_rules_prompt(&mut instance, true), None);
+        assert_eq!(
+            resolve_launch_for_session(&instance, true).startup_input,
+            None
+        );
+    }
+}
+
 /// An agent's icon (per-program SVG), tinted `color` and sized `size`.
 fn agent_icon(program: Option<&str>, size: Pixels, color: Hsla) -> Svg {
     svg()
@@ -4506,14 +4571,8 @@ impl MuxelApp {
                 .and_then(|program| std::path::Path::new(program).file_stem())
                 .and_then(|stem| stem.to_str())
                 .is_some_and(|stem| stem.eq_ignore_ascii_case("codex"));
-            if is_codex {
-                let custom = i.system_prompt.take().filter(|prompt| !prompt.is_empty());
-                if !resuming
-                    && i.injection != InjectionMode::None
-                    && let Some(custom) = custom
-                {
-                    codex_instructions.push(custom);
-                }
+            if is_codex && let Some(custom) = take_codex_rules_prompt(&mut i, resuming) {
+                codex_instructions.push(custom);
             }
             let mut add_automatic = |instruction: String, i: &mut Instance| {
                 if is_codex {
