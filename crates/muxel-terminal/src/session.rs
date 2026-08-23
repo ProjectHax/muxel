@@ -1513,14 +1513,17 @@ fn command_builder_for_spawn(program: &str, args: &[String]) -> CommandBuilder {
         const BATCH_RUNNER: &str = concat!(
             "$program = $env:MUXEL_BATCH_PROGRAM; ",
             "$argv = @(for ($i = 0; $i -lt [int]$env:MUXEL_BATCH_ARG_COUNT; $i++) { ",
-            "[Environment]::GetEnvironmentVariable(('MUXEL_BATCH_ARG_' + $i)) }); ",
+            "$value = [Environment]::GetEnvironmentVariable(('MUXEL_BATCH_ARG_' + $i)); ",
+            "if ($null -eq $value) { '' } else { $value } }); ",
             "$unsafe = [char[]]'\"%&|<>^' + [char[]]([char]13,[char]10); ",
             "if ($argv | Where-Object { $_.IndexOfAny($unsafe) -ge 0 }) { ",
             "[Console]::Error.WriteLine('muxel: batch-file arguments contain characters cmd.exe can reinterpret'); exit 2 }; ",
-            "Remove-Item Env:MUXEL_BATCH_PROGRAM,Env:MUXEL_BATCH_ARG_COUNT; ",
+            "Remove-Item Env:MUXEL_BATCH_PROGRAM,Env:MUXEL_BATCH_ARG_COUNT -ErrorAction SilentlyContinue; ",
             "for ($i = 0; $i -lt $argv.Count; $i++) { ",
-            "Remove-Item ('Env:MUXEL_BATCH_ARG_' + $i) }; ",
-            "& $program @argv; ",
+            "Remove-Item ('Env:MUXEL_BATCH_ARG_' + $i) -ErrorAction SilentlyContinue }; ",
+            "$invoke_argv = @($argv | ForEach-Object { ",
+            "if ($_.Length -eq 0) { '\"\"' } else { $_ } }); ",
+            "& $program @invoke_argv; ",
             "if ($null -eq $LASTEXITCODE) { exit 1 }; exit $LASTEXITCODE"
         );
         let encoded_runner = {
@@ -2250,17 +2253,21 @@ mod windows_spawn_resolve {
     }
 
     #[test]
-    fn batch_runner_keeps_one_argument_as_one_token() {
+    fn batch_runner_preserves_argument_boundaries_and_empty_positions() {
         let dir = std::env::temp_dir().join(format!("muxel-batch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let command = dir.join("echo-one.cmd");
-        std::fs::write(&command, "@echo off\r\necho ARG=[%~1]\r\n").unwrap();
+        std::fs::write(&command, "@echo off\r\necho ARGS=[%~1][%~2][%~3]\r\n").unwrap();
         let spec = CommandSpec::program(
             command.to_string_lossy(),
-            vec!["Reply with exactly OK".to_string()],
+            vec![
+                "Reply with exactly OK".to_string(),
+                String::new(),
+                "--version".to_string(),
+            ],
         );
         let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn batch fixture");
-        const EXPECTED: &[u8] = b"ARG=[Reply with exactly OK]";
+        const EXPECTED: &[u8] = b"ARGS=[Reply with exactly OK][][--version]";
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut output = Vec::new();
         while Instant::now() < deadline {
@@ -2288,7 +2295,7 @@ mod windows_spawn_resolve {
                 .as_bytes()
                 .windows(EXPECTED.len())
                 .any(|window| window == EXPECTED),
-            "batch runner split one argument: {output:?}"
+            "batch runner changed argument boundaries: {output:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
