@@ -301,11 +301,7 @@ fn sticky_title_status(
 fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<AgentStatus> {
     match provider {
         TitleProvider::Claude if is_claude_blocked_prompt(screen) => Some(AgentStatus::Blocked),
-        TitleProvider::Claude
-            if screen
-                .lines()
-                .any(|line| is_live_background_row(line, &["·"], &["command"], true)) =>
-        {
+        TitleProvider::Claude if screen.lines().any(is_claude_live_background_row) => {
             Some(AgentStatus::Working)
         }
         TitleProvider::Grok
@@ -322,6 +318,21 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
         }
         _ => None,
     }
+}
+
+fn is_claude_live_background_row(line: &str) -> bool {
+    if is_live_background_row(line, &["·"], &["command"], true) {
+        return true;
+    }
+
+    let line = line.trim();
+    let Some((activity, summary)) = line.rsplit_once(" · ") else {
+        return false;
+    };
+    if !activity.trim().starts_with("✻ ") {
+        return false;
+    }
+    is_live_background_row(&format!("· {summary}"), &["·"], &["shell"], false)
 }
 
 fn is_claude_blocked_prompt(screen: &str) -> bool {
@@ -1817,6 +1828,32 @@ mod tests {
             ),
             Some(AgentStatus::Working)
         );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Brewed for 15s · 1 shell still running"
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Crunched for 1m 2s · 2 shells still running"
+            ),
+            Some(AgentStatus::Working)
+        );
+        for false_positive in [
+            "✻ Brewed for 15s · 0 shells still running",
+            "✻ Brewed for 15s · 1 shells still running",
+            "quoted: ✻ Brewed for 15s · 1 shell still running",
+            "✻ Brewed for 15s · 1 shell still running later",
+        ] {
+            assert_eq!(
+                provider_screen_status(TitleProvider::Claude, false_positive),
+                None,
+                "accepted Claude background lookalike {false_positive:?}"
+            );
+        }
         assert_eq!(
             provider_screen_status(
                 TitleProvider::Grok,
