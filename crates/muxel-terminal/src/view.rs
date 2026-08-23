@@ -797,6 +797,15 @@ impl TerminalView {
         // output to actually stop, not a guessed delay. SETTLE_MS is generous so
         // a brief pause mid-load isn't mistaken for ready. Capped by MAX_WAIT in
         // case a UI never goes quiet.
+        if let Some(input) = startup_input.as_ref() {
+            profile::startup_event(
+                instance_id,
+                &startup_program,
+                "automation-armed",
+                startup_started.elapsed(),
+                input.len(),
+            );
+        }
         if auto_mode_presses > 0 || startup_input.is_some() {
             const POLL_MS: u64 = 100;
             const SETTLE_MS: u128 = 2000;
@@ -809,6 +818,7 @@ impl TerminalView {
             const SUBMIT_DELAY_MS: u64 = 400;
             const SHIFT_TAB: &[u8] = b"\x1b[Z";
             let session = session.clone();
+            let automation_program = startup_program.clone();
             cx.spawn(async move |_view: WeakEntity<Self>, cx| {
                 let timer = |ms| cx.background_executor().timer(Duration::from_millis(ms));
                 // Wait for the agent's first output (it has started up).
@@ -817,6 +827,13 @@ impl TerminalView {
                     timer(POLL_MS).await;
                     waited += POLL_MS;
                 }
+                profile::startup_event(
+                    instance_id,
+                    &automation_program,
+                    "automation-first-output",
+                    startup_started.elapsed(),
+                    0,
+                );
                 if startup_delay_ms > 0 {
                     // Preset-configured fixed delay after first output — for agents
                     // that keep loading well past their first draw (e.g. opencode).
@@ -828,6 +845,13 @@ impl TerminalView {
                         waited += POLL_MS;
                     }
                 }
+                profile::startup_event(
+                    instance_id,
+                    &automation_program,
+                    "automation-settled",
+                    startup_started.elapsed(),
+                    0,
+                );
                 for _ in 0..auto_mode_presses {
                     session.write_input(SHIFT_TAB);
                     timer(KEY_GAP_MS).await;
@@ -840,11 +864,25 @@ impl TerminalView {
                 if let Some(input) = startup_input {
                     timer(PRE_TYPE_MS).await;
                     session.paste(&input);
+                    profile::startup_event(
+                        instance_id,
+                        &automation_program,
+                        "automation-pasted",
+                        startup_started.elapsed(),
+                        input.len(),
+                    );
                     // On restore, leave the prompt typed but unsubmitted.
                     if submit {
                         timer(SUBMIT_DELAY_MS).await;
                         session.mark_turn_submitted();
                         session.write_input(b"\r");
+                        profile::startup_event(
+                            instance_id,
+                            &automation_program,
+                            "automation-submitted",
+                            startup_started.elapsed(),
+                            1,
+                        );
                     }
                 }
             })
