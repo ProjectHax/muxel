@@ -2943,6 +2943,22 @@ struct Notification {
     subtitle: String,
 }
 
+/// Drop a pane's stale attention card once authoritative work resumes. The
+/// durable activity reducer already replaces Done with Working; leaving the old
+/// `finished` card behind makes the notification feed contradict the live badge.
+fn clear_stale_agent_notification(
+    notifications: &mut Vec<Notification>,
+    instance: Uuid,
+    status: AgentStatus,
+) -> bool {
+    if status != AgentStatus::Working {
+        return false;
+    }
+    let before = notifications.len();
+    notifications.retain(|notification| notification.instance != Some(instance));
+    notifications.len() != before
+}
+
 /// One line in the developer console — a timestamped error/event with details
 /// (e.g. a failed launch's program, cwd, and OS error). Session-only.
 struct DevLogEntry {
@@ -7631,6 +7647,9 @@ impl MuxelApp {
                 dirty |= previous_label.as_ref() != Some(&label);
             }
             dirty |= changed;
+            if changed {
+                dirty |= clear_stale_agent_notification(&mut self.notifications, iid, status);
+            }
             // A reconnecting remote pane that's stayed alive since its last respawn
             // has reattached — clear the state and say so, once.
             if self.reconnecting.contains_key(&iid)
@@ -25078,6 +25097,62 @@ mod dev_log_tests {
             e.render_text(),
             "[12:34:56] ERROR Launch failed: claude\n    tried `claude` in `/tmp`\n    \
              No such file or directory (os error 2)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod agent_notification_tests {
+    use super::{AgentStatus, NotifKind, Notification, clear_stale_agent_notification};
+    use uuid::Uuid;
+
+    fn notification(instance: Option<Uuid>, kind: NotifKind) -> Notification {
+        Notification {
+            id: Uuid::new_v4(),
+            instance,
+            kind,
+            title: "Agent".to_string(),
+            subtitle: "state · Project".to_string(),
+        }
+    }
+
+    #[test]
+    fn resumed_work_removes_only_that_panes_stale_notification() {
+        let resumed = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mut notifications = vec![
+            notification(Some(resumed), NotifKind::Done),
+            notification(Some(other), NotifKind::Blocked),
+            notification(None, NotifKind::Success),
+        ];
+
+        assert!(!clear_stale_agent_notification(
+            &mut notifications,
+            resumed,
+            AgentStatus::Idle,
+        ));
+        assert_eq!(notifications.len(), 3);
+
+        assert!(clear_stale_agent_notification(
+            &mut notifications,
+            resumed,
+            AgentStatus::Working,
+        ));
+        assert_eq!(notifications.len(), 2);
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| notification.instance != Some(resumed))
+        );
+        assert!(
+            notifications
+                .iter()
+                .any(|notification| notification.instance == Some(other))
+        );
+        assert!(
+            notifications
+                .iter()
+                .any(|notification| notification.instance.is_none())
         );
     }
 }
