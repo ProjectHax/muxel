@@ -18,6 +18,7 @@ mod integrations;
 #[cfg(target_os = "windows")]
 mod present_pump;
 mod secrets;
+mod session_binding;
 mod settings_view;
 mod stt;
 mod theme;
@@ -98,6 +99,23 @@ fn spawn_present_pump() {
 }
 
 fn main() {
+    match session_binding::hook_instance_from_args(std::env::args_os().skip(1)) {
+        Ok(Some(instance_id)) => {
+            let code = match session_binding::run_claude_session_hook(instance_id) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("muxel Claude session hook failed: {error:#}");
+                    1
+                }
+            };
+            std::process::exit(code);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    }
     install_panic_reporter();
     // gpui reports real render failures (swap-chain present, scene-too-large
     // draw errors, GPU device loss) through `log` and swallows the Result;

@@ -1503,6 +1503,16 @@ fn is_codex_program(program: Option<&str>) -> bool {
     )
 }
 
+fn is_claude_program(program: Option<&str>) -> bool {
+    let Some(name) = program.and_then(|program| program.rsplit(['/', '\\']).next()) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "claude" | "claude.exe" | "claude.cmd"
+    )
+}
+
 /// Whether a Claude agent's saved session transcript is missing from disk (so a
 /// `--resume` would just hang on "No conversation found"). Only Claude's session
 /// path is known, so other agents — or an undeterminable home/cwd — return `false`
@@ -1512,12 +1522,7 @@ fn claude_session_gone(
     cwd: Option<&std::path::Path>,
     session_id: &str,
 ) -> bool {
-    if !preset
-        .program
-        .as_deref()
-        .unwrap_or_default()
-        .contains("claude")
-    {
+    if !is_claude_program(preset.program.as_deref()) {
         return false;
     }
     let (Some(home), Some(cwd)) = (home_dir(), cwd) else {
@@ -1552,15 +1557,25 @@ fn capture_agent_session_id(
     muxel_core::codex_latest_session_id(&home, cwd)
 }
 
-fn initial_codex_session_id(
+fn validated_codex_session_id(
     preset: &AgentPreset,
     current: Option<&str>,
     title_hint: Option<&str>,
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    bound_elsewhere: bool,
 ) -> Option<String> {
-    if current.is_some() {
+    let candidate = muxel_core::codex_session_id_from_title(preset, title_hint?)?;
+    if current == Some(candidate.as_str()) || bound_elsewhere {
         return None;
     }
-    muxel_core::codex_session_id_from_title(preset, title_hint?)
+    muxel_core::codex_session_matches_cwd(home, &candidate, cwd).then_some(candidate)
+}
+
+fn session_id_bound_elsewhere(instances: &[Instance], owner: Uuid, session_id: &str) -> bool {
+    instances
+        .iter()
+        .any(|instance| instance.id != owner && instance.session_id.as_deref() == Some(session_id))
 }
 
 /// "NewPane" -> "New Pane", "NewAgent1" -> "New Agent 1" for the shortcut
@@ -4423,20 +4438,30 @@ impl MuxelApp {
     ///   bound panes resume their saved id. A legacy started pane with no saved id
     ///   recovers the newest cwd-matching rollout before `resume <id>`.
     fn session_resume_for(&mut self, iid: Uuid) -> Option<Vec<String>> {
-        let inst = self.workspace.instance(iid)?;
-        let preset = inst
-            .preset_id
-            .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
-            .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
-        preset.resume_flag.as_ref()?;
-        let preset = preset.clone();
-        // The cwd the agent runs in (worktree or project root) — to locate its
-        // on-disk session before we decide resume vs. fresh.
-        let cwd = inst.worktree_path.clone().or_else(|| {
-            self.workspace
-                .project(inst.project_id)
-                .map(|p| p.root_path.clone())
-        });
+        let (preset, cwd, local) = {
+            let inst = self.workspace.instance(iid)?;
+            let preset = inst
+                .preset_id
+                .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
+                .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
+            preset.resume_flag.as_ref()?;
+            let project = self.workspace.project(inst.project_id);
+            let cwd = inst
+                .worktree_path
+                .clone()
+                .or_else(|| project.map(|project| project.root_path.clone()));
+            let local = project.is_some_and(|project| project.remote.is_none());
+            (preset.clone(), cwd, local)
+        };
+        // Claude can replace its conversation inside the same PTY. A process-local
+        // SessionStart hook leaves an exact binding file; consume it before choosing
+        // this launch's `--resume` id so even an immediate app restart is correct.
+        if local
+            && is_claude_program(preset.program.as_deref())
+            && let Some(cwd) = cwd.as_deref()
+        {
+            self.adopt_claude_session_binding(iid, cwd);
+        }
         let inst = self.workspace.instance_mut(iid)?;
         let host_minted = preset.session_id_flag.is_some();
         if host_minted {
@@ -4572,6 +4597,25 @@ impl MuxelApp {
         }
         // Classify on the agent program (the matches below consume resolved.program).
         let agent_program = resolved.program.clone();
+
+        // Claude emits an exact SessionStart event for an in-process `/resume`.
+        // Add one process-local hook through exec-form settings. It neither installs
+        // nor replaces user/project hooks, and remote agents never receive a path to
+        // this local executable. Respect an explicit custom `--settings` argument
+        // instead of guessing how to merge an arbitrary file.
+        let has_custom_settings = resolved
+            .args
+            .iter()
+            .any(|arg| arg == "--settings" || arg.starts_with("--settings="));
+        let local_claude = is_claude_program(agent_program.as_deref())
+            && project.is_some_and(|project| project.remote.is_none());
+        if local_claude
+            && !has_custom_settings
+            && let Some(settings) = crate::session_binding::claude_hook_settings(instance_id)
+        {
+            resolved.args.push("--settings".to_string());
+            resolved.args.push(settings);
+        }
 
         // Remote (SSH) project? Resolve its configured host.
         let remote = project.and_then(|p| p.remote.as_ref()).and_then(|r| {
@@ -7239,6 +7283,90 @@ impl MuxelApp {
         true
     }
 
+    /// Adopt the exact Claude conversation selected by an in-process `/resume`.
+    /// The hook record is keyed by pane id and accepted only when its UUID,
+    /// transcript path, and cwd all agree with Claude's own on-disk transcript.
+    fn adopt_claude_session_binding(&mut self, iid: Uuid, cwd: &std::path::Path) -> bool {
+        let (Some(data_dir), Some(home)) = (muxel_store::data_dir(), home_dir()) else {
+            return false;
+        };
+        let binding_path = crate::session_binding::claude_binding_path(&data_dir, iid);
+        if !binding_path.is_file() {
+            return false;
+        }
+        let Some(session_id) =
+            crate::session_binding::claude_session_id_from_binding(&data_dir, iid, &home, cwd)
+        else {
+            crate::session_binding::clear_claude_binding(&data_dir, iid);
+            return false;
+        };
+        if session_id_bound_elsewhere(&self.workspace.instances, iid, &session_id) {
+            crate::session_binding::clear_claude_binding(&data_dir, iid);
+            return false;
+        }
+        if self
+            .workspace
+            .instance(iid)
+            .and_then(|instance| instance.session_id.as_deref())
+            == Some(session_id.as_str())
+        {
+            crate::session_binding::clear_claude_binding(&data_dir, iid);
+            return false;
+        }
+        let Some(instance) = self.workspace.instance_mut(iid) else {
+            crate::session_binding::clear_claude_binding(&data_dir, iid);
+            return false;
+        };
+        let previous_session_id = instance.session_id.clone();
+        let previous_session_started = instance.session_started;
+        let previous_auto_name = instance.auto_name.clone();
+        instance.session_id = Some(session_id);
+        instance.session_started = true;
+        instance.auto_name = None;
+        if self.try_persist() {
+            crate::session_binding::clear_claude_binding(&data_dir, iid);
+            true
+        } else {
+            let instance = self
+                .workspace
+                .instance_mut(iid)
+                .expect("Claude binding owner disappeared during persistence");
+            instance.session_id = previous_session_id;
+            instance.session_started = previous_session_started;
+            instance.auto_name = previous_auto_name;
+            false
+        }
+    }
+
+    /// Poll the small per-pane Claude binding records. Usually the hook lands
+    /// while Muxel is still open; `session_resume_for` repeats this read before a
+    /// later launch to close the quit-before-next-tick race.
+    fn sync_claude_session_ids(&mut self, cx: &mut Context<Self>) {
+        let candidates: Vec<(Uuid, PathBuf)> = self
+            .workspace
+            .instances
+            .iter()
+            .filter_map(|instance| {
+                let project = self.workspace.project(instance.project_id)?;
+                if project.remote.is_some() || !is_claude_program(instance.program.as_deref()) {
+                    return None;
+                }
+                let cwd = instance
+                    .worktree_path
+                    .clone()
+                    .unwrap_or_else(|| project.root_path.clone());
+                Some((instance.id, cwd))
+            })
+            .collect();
+        let mut changed = false;
+        for (iid, cwd) in candidates {
+            changed |= self.adopt_claude_session_binding(iid, &cwd);
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     /// Refresh persisted Grok session IDs after an in-process `/resume` switch.
     /// Grok records the active session against its own process PID; walk through
     /// the shell launchers between that process and Muxel's direct PTY child.
@@ -7445,6 +7573,7 @@ impl MuxelApp {
         // Session switches happen inside Grok without replacing the PTY child.
         // Poll independently of the slower remote-project cadence so a normal
         // quit shortly after `/resume` is unlikely to persist the old binding.
+        self.sync_claude_session_ids(cx);
         self.sync_grok_session_ids(cx);
         let focused = self.active_instance;
         // A `--resume` launch has this long to prove its saved session is valid;
@@ -7570,20 +7699,36 @@ impl MuxelApp {
             restoring,
         } in snapshot
         {
-            // Codex mints its own session id and publishes it as this pane's
-            // initial OSC title. Capture that exact id instead of guessing from
-            // the newest rollout in the cwd, which aliases concurrent panes.
-            // Once bound, later titles cannot replace the durable session id:
-            // OSC carries no sender identity, so a child process could forge one.
+            // Codex mints its own session id and publishes the active thread as a
+            // semantic OSC title. Accept an initial or later `/resume` title only
+            // after its rollout exists, its recorded cwd matches this pane, and no
+            // sibling pane already owns the id. That closes the common title-spoof
+            // and same-directory alias paths without falling back to "latest".
             let captured_codex_id = self.workspace.instance(iid).and_then(|inst| {
                 let preset = inst
                     .preset_id
                     .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                     .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
-                initial_codex_session_id(
+                let project = self.workspace.project(inst.project_id)?;
+                if project.remote.is_some() {
+                    return None;
+                }
+                let cwd = inst
+                    .worktree_path
+                    .as_deref()
+                    .unwrap_or(project.root_path.as_path());
+                let home = home_dir()?;
+                let candidate =
+                    muxel_core::codex_session_id_from_title(preset, session_id_hint.as_deref()?)?;
+                let bound_elsewhere =
+                    session_id_bound_elsewhere(&self.workspace.instances, iid, &candidate);
+                validated_codex_session_id(
                     preset,
                     inst.session_id.as_deref(),
                     session_id_hint.as_deref(),
+                    &home,
+                    cwd,
+                    bound_elsewhere,
                 )
             });
             if let Some(id) = captured_codex_id
@@ -24794,10 +24939,12 @@ mod grok_session_tests {
 mod shell_title_tests {
     use super::{
         agent_minted_session_gone, authoritative_terminal_auto_title, codex_session_auto_title,
-        initial_codex_session_id, shell_dir_title, terminal_auto_title,
+        session_id_bound_elsewhere, shell_dir_title, terminal_auto_title,
+        validated_codex_session_id,
     };
     use muxel_core::{AgentPreset, Instance};
     use std::collections::HashMap;
+    use std::path::Path;
     use uuid::Uuid;
 
     #[test]
@@ -24918,19 +25065,66 @@ mod shell_title_tests {
     }
 
     #[test]
-    fn codex_session_binding_is_initial_only() {
+    fn codex_session_binding_accepts_only_an_exact_unowned_rollout() {
         let first = Uuid::new_v4().to_string();
         let later = Uuid::new_v4().to_string();
         let preset = AgentPreset::codex();
         let initial_frame = format!("{first} | Ready ·");
         let later_frame = format!("{later} | Ready ·");
+        let home = std::env::temp_dir().join(format!("muxel-codex-binding-{}", Uuid::new_v4()));
+        let cwd = home.join("project");
+        let sessions = home.join(".codex/sessions/2026/08/23");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        for id in [&first, &later] {
+            let meta = serde_json::json!({
+                "type": "session_meta",
+                "payload": { "session_id": id, "cwd": cwd }
+            });
+            std::fs::write(
+                sessions.join(format!("rollout-{id}.jsonl")),
+                meta.to_string(),
+            )
+            .unwrap();
+        }
 
         assert_eq!(
-            initial_codex_session_id(&preset, None, Some(&initial_frame)).as_deref(),
+            validated_codex_session_id(&preset, None, Some(&initial_frame), &home, &cwd, false,)
+                .as_deref(),
             Some(first.as_str())
         );
         assert_eq!(
-            initial_codex_session_id(&preset, Some(&first), Some(&later_frame)),
+            validated_codex_session_id(
+                &preset,
+                Some(&first),
+                Some(&later_frame),
+                &home,
+                &cwd,
+                false,
+            )
+            .as_deref(),
+            Some(later.as_str())
+        );
+        assert_eq!(
+            validated_codex_session_id(
+                &preset,
+                Some(&first),
+                Some(&later_frame),
+                &home,
+                &cwd,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            validated_codex_session_id(
+                &preset,
+                Some(&first),
+                Some(&later_frame),
+                &home,
+                Path::new("D:/different"),
+                false,
+            ),
             None
         );
 
@@ -24939,6 +25133,21 @@ mod shell_title_tests {
             ..preset
         };
         assert!(!agent_minted_session_gone(&proxy, &first));
+
+        let owner = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+        let mut sibling = Instance::from_preset(owner.project_id, &AgentPreset::claude());
+        sibling.session_id = Some(later.clone());
+        assert!(session_id_bound_elsewhere(
+            &[owner.clone(), sibling],
+            owner.id,
+            &later
+        ));
+        assert!(!session_id_bound_elsewhere(
+            std::slice::from_ref(&owner),
+            owner.id,
+            &later
+        ));
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
