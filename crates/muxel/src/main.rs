@@ -99,7 +99,10 @@ fn spawn_present_pump() {
 }
 
 fn main() {
-    match session_binding::hook_instance_from_args(std::env::args_os().skip(1)) {
+    match session_binding::hook_instance_from_args(
+        std::env::args_os().skip(1),
+        std::env::var_os(session_binding::MUXEL_INSTANCE_ID_ENV),
+    ) {
         Ok(Some(instance_id)) => {
             let code = match session_binding::run_claude_session_hook(instance_id) {
                 Ok(()) => 0,

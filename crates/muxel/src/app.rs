@@ -4599,7 +4599,8 @@ impl MuxelApp {
         let agent_program = resolved.program.clone();
 
         // Claude emits an exact SessionStart event for an in-process `/resume`.
-        // Add one process-local hook through exec-form settings. It neither installs
+        // Add one process-local hook through an invocation-only settings file. A file
+        // keeps JSON metacharacters out of Windows batch-file argv. It neither installs
         // nor replaces user/project hooks, and remote agents never receive a path to
         // this local executable. Respect an explicit custom `--settings` argument
         // instead of guessing how to merge an arbitrary file.
@@ -4611,10 +4612,17 @@ impl MuxelApp {
             && project.is_some_and(|project| project.remote.is_none());
         if local_claude
             && !has_custom_settings
-            && let Some(settings) = crate::session_binding::claude_hook_settings(instance_id)
+            && let Some(settings_path) = crate::session_binding::claude_hook_settings()
         {
             resolved.args.push("--settings".to_string());
-            resolved.args.push(settings);
+            resolved.args.push(settings_path);
+            resolved.env.retain(|(key, _)| {
+                !key.eq_ignore_ascii_case(crate::session_binding::MUXEL_INSTANCE_ID_ENV)
+            });
+            resolved.env.push((
+                crate::session_binding::MUXEL_INSTANCE_ID_ENV.to_string(),
+                instance_id.to_string(),
+            ));
         }
 
         // Remote (SSH) project? Resolve its configured host.
