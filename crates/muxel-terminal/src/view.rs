@@ -30,6 +30,11 @@ const FOCUSED_STREAM_INTERVAL: Duration = Duration::from_millis(33);
 /// Focused output shortly after user input: keep TUI feedback crisp.
 const FOCUSED_INTERACTION_INTERVAL: Duration = Duration::from_millis(8);
 
+/// Grok redraws its foreground background-work summary. Keep one exact positive
+/// observation through a brief missing frame so a repaint cannot forge a
+/// Working→Done→Working lifecycle and duplicate completion notifications.
+const GROK_SCREEN_WORKING_HOLD: Duration = Duration::from_secs(2);
+
 /// Pure paint-priority policy (see `docs/terminal-paint-architecture.md`).
 /// Extracted so we can unit-test without a full GPUI window.
 pub(crate) fn paint_min_interval(focused: bool, interactive: bool, stop: bool) -> Duration {
@@ -481,6 +486,12 @@ fn hold_grok_blocked(
     }
 }
 
+/// Grok's exact foreground background-work row can disappear for a repaint.
+/// Debounce only a previously observed positive row; stable absence expires.
+fn hold_grok_screen_working(observed: bool, last_seen_age: Option<Duration>) -> bool {
+    observed || last_seen_age.is_some_and(|age| age <= GROK_SCREEN_WORKING_HOLD)
+}
+
 /// Remove provider lifecycle decoration before a title is considered for the
 /// pane's persisted automatic name. A title containing only state is not a name.
 pub fn clean_agent_title(program: &str, title: &str) -> Option<String> {
@@ -692,6 +703,9 @@ pub struct TerminalView {
     /// Grok's action-required title item intentionally blinks when unfocused.
     /// Retain the last positive edge briefly so the sidebar does not blink too.
     grok_blocked_at: std::cell::Cell<Option<std::time::Instant>>,
+    /// Grok redraws its exact foreground background-work row. Retain a positive
+    /// observation briefly so an off-frame cannot forge completion.
+    grok_screen_working_at: std::cell::Cell<Option<std::time::Instant>>,
     /// Last time we `cx.notify()`'d a paint from the drain loop (background throttle).
     last_paint_notify: std::cell::Cell<std::time::Instant>,
     /// A throttled batch must still paint if output stops before the next batch.
@@ -1115,6 +1129,7 @@ impl TerminalView {
             provider_settled: std::cell::Cell::new(false),
             semantic_title_status: std::cell::Cell::new(None),
             grok_blocked_at: std::cell::Cell::new(None),
+            grok_screen_working_at: std::cell::Cell::new(None),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
             pending_paint_deadline: std::cell::Cell::new(None),
             paint_timer_generation: std::cell::Cell::new(0),
@@ -1228,7 +1243,9 @@ impl TerminalView {
             self.title_provider == TitleProvider::Other,
             self.session.idle_for(),
         );
-        let screen_working = working_markers.iter().any(|marker| screen.contains(marker));
+        let provider_screen = provider_screen_status(self.title_provider, &screen);
+        let mut screen_working = working_markers.iter().any(|marker| screen.contains(marker))
+            || provider_screen == Some(AgentStatus::Working);
         if self.title_provider == TitleProvider::Grok {
             if title == Some(AgentStatus::Blocked) {
                 self.grok_blocked_at.set(Some(std::time::Instant::now()));
@@ -1241,11 +1258,20 @@ impl TerminalView {
                     self.grok_blocked_at.set(None);
                 }
             }
+
+            if provider_screen == Some(AgentStatus::Working) {
+                self.grok_screen_working_at
+                    .set(Some(std::time::Instant::now()));
+            } else {
+                let working_age = self.grok_screen_working_at.get().map(|at| at.elapsed());
+                screen_working = hold_grok_screen_working(screen_working, working_age);
+                if !screen_working {
+                    self.grok_screen_working_at.set(None);
+                }
+            }
         }
-        if title != Some(AgentStatus::Blocked)
-            && let Some(screen_status) = provider_screen_status(self.title_provider, &screen)
-        {
-            title = Some(screen_status);
+        if title != Some(AgentStatus::Blocked) && provider_screen == Some(AgentStatus::Blocked) {
+            title = provider_screen;
         }
         let raw = combine_title_status(self.exited, base, title, screen_working);
         // Marker-less providers may latch only after proving that their semantic
@@ -1576,8 +1602,9 @@ mod tests {
         AgentStatus, BACKGROUND_PAINT_INTERVAL, FOCUSED_INTERACTION_INTERVAL,
         FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, TitleProvider,
         can_latch_completion, classify, clean_agent_title, combine_title_status, hold_grok_blocked,
-        latch_done, latch_done_after_readiness, next_paint_schedule, paint_min_interval,
-        provider_screen_status, provider_settled_after_title, sticky_title_status, title_status,
+        hold_grok_screen_working, latch_done, latch_done_after_readiness, next_paint_schedule,
+        paint_min_interval, provider_screen_status, provider_settled_after_title,
+        sticky_title_status, title_status,
     };
     use std::time::Duration;
 
@@ -1911,6 +1938,35 @@ mod tests {
             provider_screen_status(TitleProvider::Grok, "◎ 1 workflow still running"),
             None
         );
+    }
+
+    #[test]
+    fn grok_background_row_gaps_do_not_complete_until_stable_absence() {
+        use AgentStatus::{Done, Idle, Working};
+
+        assert!(hold_grok_screen_working(true, None));
+        assert!(hold_grok_screen_working(
+            false,
+            Some(Duration::from_millis(1999))
+        ));
+        assert!(!hold_grok_screen_working(
+            false,
+            Some(Duration::from_millis(2001))
+        ));
+        assert!(!hold_grok_screen_working(false, None));
+
+        let (status, latch, armed) =
+            latch_done_after_readiness(Some(Idle), Working, false, true, true, false);
+        assert_eq!(status, Working);
+        let (status, latch, armed) =
+            latch_done_after_readiness(Some(Working), Working, latch, true, armed, false);
+        assert_eq!(status, Working, "one missing row frame forged completion");
+        let (status, latch, _) =
+            latch_done_after_readiness(Some(Working), Idle, latch, true, armed, false);
+        assert_eq!(status, Done, "stable absence did not complete the turn");
+        let (status, _, _) =
+            latch_done_after_readiness(Some(Idle), Idle, latch, true, armed, false);
+        assert_eq!(status, Done, "completion did not remain latched");
     }
 
     #[test]

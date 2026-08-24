@@ -209,8 +209,9 @@ feature is added or changed, update the matching entry here in the same change**
   title shape; existing marker, bell, and process-exit signals still apply.
   Provider-owned screen rows can add precise state that titles omit: Claude
   permission forms report **blocked**, while positive background counts displayed
-  by Claude and Grok remain **working** even when their titles look idle. Ambiguous
-  waiting rows do not claim active work. Local Codex `/rename` values are read
+  by Claude and Grok remain **working** even when their titles look idle. Brief
+  Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
+  active work. Local Codex `/rename` values are read
   from its session index by the pane's captured session UUID, so child commands
   such as `npm` cannot replace the session name or forge a title-derived state
   transition. Remote Codex panes retain the provider's structural title fallback.
