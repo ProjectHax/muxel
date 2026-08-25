@@ -650,6 +650,32 @@ pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
     found
 }
 
+/// Whether Codex has an exact rollout whose session id and recorded cwd both
+/// match this pane. Used when a later provider-owned terminal title reports an
+/// in-process `/resume` switch: existence alone is not enough when sibling panes
+/// share one directory.
+pub fn codex_session_matches_cwd(home: &Path, session_id: &str, cwd: &Path) -> bool {
+    let root = home.join(".codex").join("sessions");
+    if !root.is_dir() {
+        return false;
+    }
+    walk_jsonl(&root, &mut |path| {
+        // Current Codex rollout filenames carry the exact session UUID. Filter
+        // before opening anything so a stale/forged title cannot make the UI
+        // reread every rollout file on every lifecycle tick.
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(session_id))
+        {
+            return false;
+        }
+        codex_session_meta(path).is_some_and(|(id, recorded_cwd)| {
+            id == session_id && paths_loosely_equal(Path::new(&recorded_cwd), cwd)
+        })
+    })
+}
+
 /// Latest saved display name for each Codex session id.
 ///
 /// Codex appends an entry to `~/.codex/session_index.jsonl` when `/rename`
@@ -1363,7 +1389,7 @@ mod tests {
             PathBuf::from("/home/u/other")
         };
         // Older matching session.
-        let older = day.join("rollout-old-aaaa.jsonl");
+        let older = day.join("rollout-old-id-old.jsonl");
         let mut f = std::fs::File::create(&older).unwrap();
         writeln!(
             f,
@@ -1372,7 +1398,7 @@ mod tests {
         )
         .unwrap();
         // Newer matching session.
-        let newer = day.join("rollout-new-bbbb.jsonl");
+        let newer = day.join("rollout-new-id-new.jsonl");
         // Ensure newer mtime.
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut f = std::fs::File::create(&newer).unwrap();
@@ -1383,7 +1409,7 @@ mod tests {
         )
         .unwrap();
         // Different cwd — ignored.
-        let distractor = day.join("rollout-other-cccc.jsonl");
+        let distractor = day.join("rollout-other-id-other.jsonl");
         let mut f = std::fs::File::create(&distractor).unwrap();
         writeln!(
             f,
@@ -1398,6 +1424,23 @@ mod tests {
         );
         assert!(codex_session_exists(&tmp, "id-new"));
         assert!(!codex_session_exists(&tmp, "missing"));
+        assert!(codex_session_matches_cwd(&tmp, "id-new", &cwd));
+        assert!(!codex_session_matches_cwd(
+            &tmp,
+            "id-new",
+            &tmp.join("other")
+        ));
+        assert!(!codex_session_matches_cwd(&tmp, "missing", &cwd));
+        let unindexed = day.join("rollout-without-session-id.jsonl");
+        let mut f = std::fs::File::create(&unindexed).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"session_meta","payload":{{"session_id":"hidden","cwd":"{}"}}}}"#,
+            cwd.display().to_string().replace('\\', "\\\\")
+        )
+        .unwrap();
+        assert!(codex_session_exists(&tmp, "hidden"));
+        assert!(!codex_session_matches_cwd(&tmp, "hidden", &cwd));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
