@@ -6,7 +6,7 @@ use crate::colors::TerminalPalette;
 use crate::element::TerminalElement;
 use crate::keymap::{KeyModifiers, key_to_bytes};
 use crate::profile;
-use crate::session::{CommandSpec, PtyChunk, TerminalSession};
+use crate::session::{CommandSpec, ProfiledPtyChunk, TerminalSession};
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
 use gpui::*;
@@ -619,7 +619,7 @@ impl TerminalMouseMode {
     }
 }
 
-/// How a child ended, carried from `PtyChunk::Exit` to the view in one piece so
+/// How a child ended, carried from `ProfiledPtyChunk::Exit` to the view in one piece so
 /// the three same-typed optionals can't be transposed at a call site.
 struct ExitInfo {
     code: Option<i32>,
@@ -631,14 +631,20 @@ struct ExitInfo {
 /// at an Exit event or once [`MAX_BYTES_PER_TURN`] is buffered (the rest stays
 /// queued for the next drain turn).
 fn coalesce_pending(
-    rx: &async_channel::Receiver<PtyChunk>,
+    rx: &async_channel::Receiver<ProfiledPtyChunk>,
+    instance_id: Uuid,
     output: &mut Vec<u8>,
     exit: &mut Option<ExitInfo>,
 ) {
     while let Ok(more) = rx.try_recv() {
         match more {
-            PtyChunk::Output(b) => output.extend_from_slice(&b),
-            PtyChunk::Exit {
+            ProfiledPtyChunk::Output { bytes, timing } => {
+                if let Some(timing) = timing {
+                    profile::output_drained(instance_id, timing);
+                }
+                output.extend_from_slice(&bytes);
+            }
+            ProfiledPtyChunk::Exit {
                 code,
                 signal,
                 read_error,
@@ -670,10 +676,10 @@ pub struct TerminalView {
     /// code wasn't reported by the OS/PTY). `Some(1)` may mean a signal — see
     /// `exit_signal`.
     exit_code: Option<i32>,
-    /// The signal that killed the child, when one did (see `PtyChunk::Exit`).
+    /// The signal that killed the child, when one did (see `ProfiledPtyChunk::Exit`).
     exit_signal: Option<String>,
     /// Set when the session ended on a PTY read error rather than a clean EOF —
-    /// the child may still have been healthy (see `PtyChunk::Exit`).
+    /// the child may still have been healthy (see `ProfiledPtyChunk::Exit`).
     exit_read_error: Option<String>,
     /// Error from a failed launch (e.g. the agent program isn't on PATH), captured
     /// for the dev console. `None` when the program launched fine.
@@ -718,6 +724,12 @@ pub struct TerminalView {
     _drain: Task<()>,
 }
 
+impl Drop for TerminalView {
+    fn drop(&mut self) {
+        profile::pane_closed(self.instance_id);
+    }
+}
+
 /// A spawned terminal not yet wrapped in a view: the spec that actually ran
 /// (the requested one, or the fallback shell), the live session + its output
 /// receiver, and the launch error when the requested program failed to start.
@@ -726,7 +738,7 @@ pub struct TerminalView {
 pub struct TerminalLaunch {
     spec: CommandSpec,
     session: Arc<TerminalSession>,
-    rx: async_channel::Receiver<PtyChunk>,
+    rx: async_channel::Receiver<ProfiledPtyChunk>,
     launch_error: Option<String>,
 }
 
@@ -759,10 +771,7 @@ impl TerminalLaunch {
         (cols, rows): (u16, u16),
         instance_id: Option<Uuid>,
     ) -> anyhow::Result<Self> {
-        let spawn = |spec| match instance_id {
-            Some(instance_id) => TerminalSession::spawn_profiled(spec, cols, rows, instance_id),
-            None => TerminalSession::spawn(spec, cols, rows),
-        };
+        let spawn = |spec| TerminalSession::spawn_internal(spec, cols, rows, instance_id);
         match spawn(spec.clone()) {
             Ok((session, rx)) => Ok(Self {
                 spec,
@@ -888,13 +897,19 @@ impl TerminalView {
         {
             let s = session.clone();
             window
-                .on_focus_in(&focus_handle, cx, move |_w, _cx| s.report_focus(true))
+                .on_focus_in(&focus_handle, cx, move |_w, _cx| {
+                    profile::focus_changed(instance_id, true);
+                    s.report_focus(true);
+                })
                 .detach();
         }
         {
             let s = session.clone();
             window
-                .on_focus_out(&focus_handle, cx, move |_ev, _w, _cx| s.report_focus(false))
+                .on_focus_out(&focus_handle, cx, move |_ev, _w, _cx| {
+                    profile::focus_changed(instance_id, false);
+                    s.report_focus(false);
+                })
                 .detach();
         }
 
@@ -1014,8 +1029,13 @@ impl TerminalView {
                 let mut output: Vec<u8> = Vec::new();
                 let mut exit: Option<ExitInfo> = None;
                 match chunk {
-                    PtyChunk::Output(b) => output.extend_from_slice(&b),
-                    PtyChunk::Exit {
+                    ProfiledPtyChunk::Output { bytes, timing } => {
+                        if let Some(timing) = timing {
+                            profile::output_drained(instance_id, timing);
+                        }
+                        output.extend_from_slice(&bytes);
+                    }
+                    ProfiledPtyChunk::Exit {
                         code,
                         signal,
                         read_error,
@@ -1027,7 +1047,7 @@ impl TerminalView {
                         });
                     }
                 }
-                coalesce_pending(&rx, &mut output, &mut exit);
+                coalesce_pending(&rx, instance_id, &mut output, &mut exit);
 
                 // Coalesce before taking the UI lock: bg agents always; focused
                 // stream bursts too (interaction priority is decided after parsing).
@@ -1042,7 +1062,7 @@ impl TerminalView {
                     };
                     if let Some(d) = wait {
                         cx.background_executor().timer(d).await;
-                        coalesce_pending(&rx, &mut output, &mut exit);
+                        coalesce_pending(&rx, instance_id, &mut output, &mut exit);
                     }
                 }
 
@@ -1057,10 +1077,14 @@ impl TerminalView {
                     );
                     first_output = false;
                 }
+                if batch_len > 0 {
+                    profile::output_update_requested(instance_id);
+                }
                 let stop = view
                     .update(cx, |view, cx| {
                         let focused = view.session.is_focused();
                         if !output.is_empty() {
+                            profile::output_update_started(instance_id);
                             let t0 = Instant::now();
                             view.session.process_output(&output);
                             if !view.has_visible_content
@@ -1077,8 +1101,8 @@ impl TerminalView {
                             }
                             profile::process_output(instance_id, batch_len, t0.elapsed(), focused);
                             if focused && profile::is_enabled() {
-                                let (col, row, text) = view.session.cursor_probe();
-                                profile::screen_probe_update(col, row, text);
+                                let (col, row) = view.session.cursor_position();
+                                profile::cursor_probe_update(instance_id, col, row);
                             }
                             for (ty, text) in view.session.take_clipboard_stores() {
                                 write_clipboard(ty, text, cx);
@@ -1461,6 +1485,7 @@ impl TerminalView {
             if event.keystroke.key.eq_ignore_ascii_case("enter") {
                 self.session.mark_turn_submitted();
             }
+            profile::key_started(self.instance_id, t0);
             self.session.write_input(&bytes);
             if cleared {
                 cx.notify();
@@ -1468,7 +1493,7 @@ impl TerminalView {
             // Key path: gpui may sync-draw without presenting — arm the pump.
             crate::present_flag::mark_present_needed();
             cx.stop_propagation();
-            profile::key_handled(self.instance_id, held, t0.elapsed());
+            profile::key_finished(held, t0.elapsed());
         }
     }
 }

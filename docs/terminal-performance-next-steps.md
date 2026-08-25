@@ -98,21 +98,37 @@ only with recorded evidence.
 Input-to-grid depends on the child. Report it, but do not assign it to muxel
 unless a deterministic child shows the same regression.
 
-## Fix the profiler before changing architecture
+## Profiler boundaries before changing architecture
 
-The current `term-prof[v5]` names two samples too strongly:
+`term-prof[v8]` now names the observed boundaries without claiming arbitrary
+PTY output is a literal echo:
 
-- `key→echo` closes on the next focused PTY batch. During streaming, that batch
-  may predate the key. Rename it `key→next-output`.
-- `echo→paint` starts at that same arbitrary batch. Rename it
-  `output→paint`.
+- `key→next-read` closes on the first PTY read after the key.
+- `read→process` covers the async channel, intentional coalescing, and GPUI
+  update queue; slow chains split those stages individually.
+- `process→paint` covers parsing and scheduling from the start of the UI update
+  through GPUI paint completion. It does not measure presentation.
+- Writer queue delay and ConPTY write/flush time are measured separately;
+  per-pane `term-write[v1]` lines retain slow writes.
 
 Those samples remain useful as upper-level symptoms. They do not identify the
-slow stage.
+child's input-processing stage after a successful write.
 
-### Add a v6 event path
+### Complete the sequenced output path
 
-Give each processed output batch a sequence number and timestamps for:
+Implemented in v8: each profiled PTY read has a sequence and timestamps at PTY
+read, channel drain, UI-update request, UI-update start, notify, and paint. This
+is enough to assign a typing pause to child/ConPTY, Muxel drain, UI queue, or
+paint without per-event logging. The chain is armed before input enters the PTY
+writer queue. The PTY reader only stamps the batch and updates relaxed counters;
+the UI drain pairs that batch with the pending key, so profiling does not put a
+shared lock in the reader path.
+
+Still future work: fixed-size latency histograms and byte-depth gauges for the
+two queues. Add them only when interval averages/maxima leave a real incident
+ambiguous.
+
+The full target remains:
 
 1. PTY reader received bytes;
 2. bytes entered the output queue;

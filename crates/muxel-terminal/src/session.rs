@@ -25,6 +25,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Identity and timestamp attached to one PTY read while profiling is enabled.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PtyReadTiming {
+    pub(crate) sequence: u64,
+    pub(crate) read_at_us: u64,
+}
+
 /// An item produced by the PTY reader thread.
 pub enum PtyChunk {
     /// Raw bytes read from the PTY.
@@ -47,6 +54,59 @@ pub enum PtyChunk {
         /// EOF — the child may not have exited at all (kept for diagnostics).
         read_error: Option<String>,
     },
+}
+
+/// Internal reader envelope. It preserves the exact public [`PtyChunk`] shape
+/// while carrying opt-in timing from the PTY reader to the GPUI drain path.
+pub(crate) enum ProfiledPtyChunk {
+    Output {
+        bytes: Vec<u8>,
+        timing: Option<PtyReadTiming>,
+    },
+    Exit {
+        code: Option<i32>,
+        signal: Option<String>,
+        read_error: Option<String>,
+    },
+}
+
+enum PtyChunkSender {
+    Public(async_channel::Sender<PtyChunk>),
+    Profiled(async_channel::Sender<ProfiledPtyChunk>),
+}
+
+impl PtyChunkSender {
+    fn carries_timing(&self) -> bool {
+        matches!(self, Self::Profiled(_))
+    }
+
+    fn send_output(&self, bytes: Vec<u8>, timing: Option<PtyReadTiming>) -> bool {
+        match self {
+            Self::Public(tx) => tx.send_blocking(PtyChunk::Output(bytes)).is_ok(),
+            Self::Profiled(tx) => tx
+                .send_blocking(ProfiledPtyChunk::Output { bytes, timing })
+                .is_ok(),
+        }
+    }
+
+    fn send_exit(&self, code: Option<i32>, signal: Option<String>, read_error: Option<String>) {
+        match self {
+            Self::Public(tx) => {
+                let _ = tx.send_blocking(PtyChunk::Exit {
+                    code,
+                    signal,
+                    read_error,
+                });
+            }
+            Self::Profiled(tx) => {
+                let _ = tx.send_blocking(ProfiledPtyChunk::Exit {
+                    code,
+                    signal,
+                    read_error,
+                });
+            }
+        }
+    }
 }
 
 /// What to run in a terminal.
@@ -169,13 +229,38 @@ const NO_MOUSE_PRESS: u8 = u8::MAX;
 /// `Write` adapter that queues bytes to the dedicated PTY writer thread.
 /// `write` never blocks (unbounded channel); byte order is preserved. Errors
 /// only once the writer thread has exited (child gone), mirroring a broken
-/// pipe.
-struct ChannelWriter(std::sync::mpsc::Sender<Vec<u8>>);
+/// pipe. Profiling timestamps are omitted entirely when the profiler is off.
+struct QueuedWrite {
+    bytes: Vec<u8>,
+    queued_at: Option<Instant>,
+}
+
+fn queue_delay_excluding_profiler(
+    queued_at: Instant,
+    dequeued_at: Instant,
+    profiler_interval: Option<(Instant, Instant)>,
+) -> Duration {
+    let raw = dequeued_at.saturating_duration_since(queued_at);
+    let Some((profile_started, profile_finished)) = profiler_interval else {
+        return raw;
+    };
+    let overlap_started = queued_at.max(profile_started);
+    let overlap_finished = dequeued_at.min(profile_finished);
+    raw.saturating_sub(overlap_finished.saturating_duration_since(overlap_started))
+}
+
+struct ChannelWriter {
+    tx: std::sync::mpsc::Sender<QueuedWrite>,
+    profile: bool,
+}
 
 impl Write for ChannelWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .send(buf.to_vec())
+        self.tx
+            .send(QueuedWrite {
+                bytes: buf.to_vec(),
+                queued_at: self.profile.then(Instant::now),
+            })
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty writer gone"))?;
         Ok(buf.len())
     }
@@ -408,7 +493,9 @@ impl TerminalSession {
         cols: u16,
         rows: u16,
     ) -> Result<(Arc<Self>, async_channel::Receiver<PtyChunk>)> {
-        Self::spawn_inner(spec, cols, rows, None)
+        let (tx, rx) = async_channel::unbounded();
+        let session = Self::spawn_inner(spec, cols, rows, None, PtyChunkSender::Public(tx))?;
+        Ok((session, rx))
     }
 
     /// Spawn with phase timings attributed to one Muxel pane.
@@ -418,7 +505,27 @@ impl TerminalSession {
         rows: u16,
         instance_id: uuid::Uuid,
     ) -> Result<(Arc<Self>, async_channel::Receiver<PtyChunk>)> {
-        Self::spawn_inner(spec, cols, rows, Some(instance_id))
+        let (tx, rx) = async_channel::unbounded();
+        let session = Self::spawn_inner(
+            spec,
+            cols,
+            rows,
+            Some(instance_id),
+            PtyChunkSender::Public(tx),
+        )?;
+        Ok((session, rx))
+    }
+
+    pub(crate) fn spawn_internal(
+        spec: CommandSpec,
+        cols: u16,
+        rows: u16,
+        instance_id: Option<uuid::Uuid>,
+    ) -> Result<(Arc<Self>, async_channel::Receiver<ProfiledPtyChunk>)> {
+        let (tx, rx) = async_channel::unbounded();
+        let session =
+            Self::spawn_inner(spec, cols, rows, instance_id, PtyChunkSender::Profiled(tx))?;
+        Ok((session, rx))
     }
 
     fn spawn_inner(
@@ -426,9 +533,14 @@ impl TerminalSession {
         cols: u16,
         rows: u16,
         instance_id: Option<uuid::Uuid>,
-    ) -> Result<(Arc<Self>, async_channel::Receiver<PtyChunk>)> {
+        tx: PtyChunkSender,
+    ) -> Result<Arc<Self>> {
         let cols = cols.max(1);
         let rows = rows.max(1);
+
+        if instance_id.is_some() && crate::profile::is_enabled() {
+            crate::profile::start();
+        }
 
         let program_name = spec.program.clone();
         let pty_system = native_pty_system();
@@ -518,31 +630,70 @@ impl TerminalSession {
         // handler, mouse reports, the VTE listener's query replies) just queue
         // bytes. Windows Terminal threads its PTY input for the same reason.
         let mut pipe_writer = pair.master.take_writer().context("take pty writer")?;
-        let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let profile_writes = instance_id.filter(|_| crate::profile::is_enabled());
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<QueuedWrite>();
         std::thread::Builder::new()
             .name("muxel-pty-writer".to_string())
             .spawn(move || {
                 // Exits when every sender is gone (session dropped) or the
                 // pipe breaks (child gone).
-                while let Ok(bytes) = write_rx.recv() {
-                    if pipe_writer.write_all(&bytes).is_err() {
+                let mut prior_profiler_interval = None;
+                while let Ok(write) = write_rx.recv() {
+                    let dequeued_at = Instant::now();
+                    let queue_delay = write.queued_at.map(|queued_at| {
+                        queue_delay_excluding_profiler(
+                            queued_at,
+                            dequeued_at,
+                            prior_profiler_interval,
+                        )
+                    });
+                    let write_started = write.queued_at.map(|_| Instant::now());
+                    let result = pipe_writer.write_all(&write.bytes);
+                    if result.is_ok() {
+                        let _ = pipe_writer.flush();
+                    }
+                    if let (Some(instance_id), Some(queue_delay), Some(write_started)) =
+                        (profile_writes, queue_delay, write_started)
+                    {
+                        let profile_started = Instant::now();
+                        crate::profile::pty_write(
+                            instance_id,
+                            write.bytes.len(),
+                            queue_delay,
+                            write_started.elapsed(),
+                        );
+                        prior_profiler_interval = Some((profile_started, Instant::now()));
+                    }
+                    if result.is_err() {
                         break;
                     }
-                    let _ = pipe_writer.flush();
                 }
             })
             .context("spawn pty writer thread")?;
-        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter(write_tx))));
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter {
+            tx: write_tx,
+            profile: profile_writes.is_some(),
+        })));
         // `pair.slave` is dropped at the end of this function, closing the
         // parent's copy so the reader sees EOF when the child exits.
 
         let palette = Arc::new(Mutex::new(TerminalPalette::default()));
-        let (tx, rx) = async_channel::unbounded::<PtyChunk>();
         let reply_writer = writer.clone();
         let reply_palette = palette.clone();
+        let profile_reads =
+            tx.carries_timing() && instance_id.is_some() && crate::profile::is_enabled();
         let reader_handle = std::thread::Builder::new()
             .name("muxel-pty-reader".to_string())
-            .spawn(move || read_loop(reader, child, tx, reply_writer, reply_palette))
+            .spawn(move || {
+                read_loop(
+                    reader,
+                    child,
+                    tx,
+                    reply_writer,
+                    reply_palette,
+                    profile_reads,
+                )
+            })
             .context("spawn reader thread")?;
 
         let title = Arc::new(Mutex::new(None));
@@ -622,7 +773,7 @@ impl TerminalSession {
             );
         }
 
-        Ok((session, rx))
+        Ok(session)
     }
 
     /// Feed PTY output through the VTE parser into the terminal grid.
@@ -1102,32 +1253,17 @@ impl TerminalSession {
         f(&term)
     }
 
-    /// The visible screen as text (one row per line, newline-separated). Used for
-    /// marker-based agent-status detection (e.g. scanning for "esc to interrupt").
-    /// Profiler probe: cursor position plus the text of the cursor's row.
-    /// Answers "did the typed characters actually reach the grid?" during a
-    /// visually frozen key-repeat hang — if the row grows here but not on
-    /// screen it's our display path; if it never grows, the bytes never came.
-    pub(crate) fn cursor_probe(&self) -> (usize, i32, String) {
-        use alacritty_terminal::index::{Column, Point as GridPoint};
+    /// Cursor position metadata for the profiler. Terminal contents stay out of
+    /// profiler state and logs.
+    pub(crate) fn cursor_position(&self) -> (usize, i32) {
         self.with_term(|term| {
-            let grid = term.grid();
-            let cursor = grid.cursor.point;
-            let cols = grid.columns();
-            let mut text = String::with_capacity(cols);
-            for col in 0..cols {
-                text.push(
-                    grid[GridPoint {
-                        line: cursor.line,
-                        column: Column(col),
-                    }]
-                    .c,
-                );
-            }
-            (cursor.column.0, cursor.line.0, text.trim_end().to_string())
+            let cursor = term.grid().cursor.point;
+            (cursor.column.0, cursor.line.0)
         })
     }
 
+    /// The visible screen as text (one row per line, newline-separated). Used for
+    /// marker-based agent-status detection (e.g. scanning for "esc to interrupt").
     pub(crate) fn visible_text(&self) -> String {
         use alacritty_terminal::index::{Column, Line, Point as GridPoint};
         self.with_term(|term| {
@@ -1911,9 +2047,10 @@ impl ImmediateColorQueries {
 fn read_loop(
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn Child + Send + Sync>,
-    tx: async_channel::Sender<PtyChunk>,
+    tx: PtyChunkSender,
     writer: SharedWriter,
     palette: Arc<Mutex<TerminalPalette>>,
+    profile_reads: bool,
 ) {
     let mut buf = [0u8; 65536];
     let mut color_queries = ImmediateColorQueries::new(writer, palette);
@@ -1922,15 +2059,17 @@ fn read_loop(
     // torn down. Any other error is recorded so the app can log/show it.
     let mut read_error: Option<String> = None;
     let mut ui_gone = false;
+    let mut read_sequence = 0u64;
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF → every slave fd closed; child is (probably) gone
             Ok(n) => {
+                let timing = profile_reads.then(|| {
+                    read_sequence = read_sequence.wrapping_add(1).max(1);
+                    profile::pty_read(n, read_sequence)
+                });
                 color_queries.advance(&buf[..n]);
-                if tx
-                    .send_blocking(PtyChunk::Output(buf[..n].to_vec()))
-                    .is_err()
-                {
+                if !tx.send_output(buf[..n].to_vec(), timing) {
                     // Receiver dropped — UI is gone. Still fall through to reap
                     // the child, or it lingers as a zombie.
                     ui_gone = true;
@@ -1969,11 +2108,7 @@ fn read_loop(
         }
     }
     if !ui_gone {
-        let _ = tx.send_blocking(PtyChunk::Exit {
-            code,
-            signal,
-            read_error,
-        });
+        tx.send_exit(code, signal.clone(), read_error);
     }
     // Keep waiting until the child is actually reaped. A child that outlives
     // its PTY (daemonized, or slow to die after a kill) parks this thread at a
@@ -2142,6 +2277,67 @@ mod wheel_report_tests {
         push_mouse_report(&mut b, 0, 0, 0, false, false);
         // ESC [ M, release button 3+32=35, cell (1,1) → 33,33
         assert_eq!(b, &[0x1b, b'[', b'M', 35, 33, 33]);
+    }
+}
+
+#[cfg(test)]
+mod profiler_transport_tests {
+    use super::*;
+
+    #[test]
+    fn public_output_variant_keeps_tuple_shape() {
+        let output = PtyChunk::Output(vec![1, 2, 3]);
+        match output {
+            PtyChunk::Output(bytes) => assert_eq!(bytes, [1, 2, 3]),
+            PtyChunk::Exit { .. } => panic!("expected output"),
+        }
+    }
+
+    #[test]
+    fn private_output_envelope_keeps_reader_timing_with_bytes() {
+        let (tx, rx) = async_channel::bounded(1);
+        let sender = PtyChunkSender::Profiled(tx);
+        let timing = PtyReadTiming {
+            sequence: 7,
+            read_at_us: 11,
+        };
+        assert!(sender.send_output(vec![4, 5], Some(timing)));
+        match rx.try_recv().expect("profiled output") {
+            ProfiledPtyChunk::Output {
+                bytes,
+                timing: Some(received),
+            } => {
+                assert_eq!(bytes, [4, 5]);
+                assert_eq!(received.sequence, timing.sequence);
+                assert_eq!(received.read_at_us, timing.read_at_us);
+            }
+            _ => panic!("expected timed output"),
+        }
+    }
+
+    #[test]
+    fn writer_queue_delay_excludes_prior_profiler_work() {
+        let base = Instant::now();
+        let profile_started = base + Duration::from_millis(10);
+        let profile_finished = base + Duration::from_millis(15);
+        let dequeued = base + Duration::from_millis(20);
+
+        assert_eq!(
+            queue_delay_excluding_profiler(
+                base,
+                dequeued,
+                Some((profile_started, profile_finished)),
+            ),
+            Duration::from_millis(15)
+        );
+        assert_eq!(
+            queue_delay_excluding_profiler(
+                base + Duration::from_millis(12),
+                dequeued,
+                Some((profile_started, profile_finished)),
+            ),
+            Duration::from_millis(5)
+        );
     }
 }
 
@@ -2346,9 +2542,13 @@ mod windows_spawn_resolve {
 mod immediate_color_tests {
     use super::*;
 
-    fn responder() -> (ImmediateColorQueries, std::sync::mpsc::Receiver<Vec<u8>>) {
+    fn responder() -> (
+        ImmediateColorQueries,
+        std::sync::mpsc::Receiver<QueuedWrite>,
+    ) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter(tx))));
+        let writer: SharedWriter =
+            Arc::new(Mutex::new(Box::new(ChannelWriter { tx, profile: false })));
         let palette = Arc::new(Mutex::new(TerminalPalette {
             background: 0x112233,
             ..Default::default()
@@ -2362,14 +2562,17 @@ mod immediate_color_tests {
         responder.advance(b"\x1b]11;");
         assert!(rx.try_recv().is_err());
         responder.advance(b"?\x07");
-        assert_eq!(rx.recv().unwrap(), b"\x1b]11;rgb:1111/2222/3333\x07");
+        assert_eq!(rx.recv().unwrap().bytes, b"\x1b]11;rgb:1111/2222/3333\x07");
     }
 
     #[test]
     fn indexed_query_preserves_index_and_string_terminator() {
         let (mut responder, rx) = responder();
         responder.advance(b"\x1b]4;1;?\x1b\\");
-        assert_eq!(rx.recv().unwrap(), b"\x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\");
+        assert_eq!(
+            rx.recv().unwrap().bytes,
+            b"\x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\"
+        );
     }
 
     #[test]
