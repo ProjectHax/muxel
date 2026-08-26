@@ -306,7 +306,7 @@ fn sticky_title_status(
 fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<AgentStatus> {
     match provider {
         TitleProvider::Claude if is_claude_blocked_prompt(screen) => Some(AgentStatus::Blocked),
-        TitleProvider::Claude if screen.lines().any(is_claude_live_background_row) => {
+        TitleProvider::Claude if claude_screen_has_current_work(screen) => {
             Some(AgentStatus::Working)
         }
         TitleProvider::Grok
@@ -323,6 +323,131 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
         }
         _ => None,
     }
+}
+
+fn claude_screen_has_current_work(screen: &str) -> bool {
+    for line in screen.lines().rev() {
+        if is_claude_live_foreground_row(line) || is_claude_live_background_row(line) {
+            return true;
+        }
+        if is_claude_completed_foreground_row(line) {
+            return false;
+        }
+    }
+    false
+}
+
+fn is_claude_live_foreground_row(line: &str) -> bool {
+    let Some(status) = line.trim().strip_prefix("✻ ") else {
+        return false;
+    };
+    let Some((activity, metrics)) = status.rsplit_once(" (") else {
+        return false;
+    };
+    if activity
+        .trim_end()
+        .strip_suffix('…')
+        .is_none_or(|label| label.trim().is_empty())
+    {
+        return false;
+    }
+    let Some(metrics) = metrics.strip_suffix(')') else {
+        return false;
+    };
+    let Some((elapsed, tokens)) = metrics.split_once(" · ") else {
+        return false;
+    };
+    is_claude_elapsed(elapsed.trim())
+        && tokens
+            .trim()
+            .strip_suffix(" tokens")
+            .is_some_and(|count| is_claude_token_count(count.trim()))
+}
+
+fn is_claude_completed_foreground_row(line: &str) -> bool {
+    let Some(status) = line.trim().strip_prefix("✻ ") else {
+        return false;
+    };
+    let Some((summary, finished_at)) = status.rsplit_once(" · done ") else {
+        return false;
+    };
+    let Some((activity, elapsed)) = summary.rsplit_once(" for ") else {
+        return false;
+    };
+    !activity.trim().is_empty()
+        && is_claude_elapsed(elapsed.trim())
+        && is_claude_clock_time(finished_at.trim())
+}
+
+fn is_claude_clock_time(value: &str) -> bool {
+    let Some((clock, meridiem)) = value.rsplit_once(' ') else {
+        return false;
+    };
+    if !matches!(meridiem, "AM" | "PM") {
+        return false;
+    }
+    let Some((hour, minute)) = clock.split_once(':') else {
+        return false;
+    };
+    let Ok(hour) = hour.parse::<u8>() else {
+        return false;
+    };
+    hour != 0
+        && hour <= 12
+        && minute.len() == 2
+        && minute.bytes().all(|byte| byte.is_ascii_digit())
+        && minute.parse::<u8>().is_ok_and(|minute| minute < 60)
+}
+
+fn is_claude_token_count(value: &str) -> bool {
+    let Some(value) = value
+        .strip_prefix("↑ ")
+        .or_else(|| value.strip_prefix("↓ "))
+    else {
+        return false;
+    };
+    let (number, scaled) = value
+        .strip_suffix('k')
+        .or_else(|| value.strip_suffix('m'))
+        .map_or((value, false), |number| (number, true));
+    let mut parts = number.split('.');
+    let Some(whole) = parts.next() else {
+        return false;
+    };
+    let fraction = parts.next();
+    !whole.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|fraction| {
+            scaled && !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && parts.next().is_none()
+}
+
+fn is_claude_elapsed(value: &str) -> bool {
+    let mut previous_rank = 4;
+    for part in value.split_whitespace() {
+        let Some((unit, digits)) = part
+            .char_indices()
+            .next_back()
+            .map(|(index, unit)| (unit, &part[..index]))
+        else {
+            return false;
+        };
+        let rank = match unit {
+            'h' => 3,
+            'm' => 2,
+            's' => 1,
+            _ => return false,
+        };
+        if rank >= previous_rank
+            || digits.is_empty()
+            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return false;
+        }
+        previous_rank = rank;
+    }
+    previous_rank != 4
 }
 
 fn is_claude_live_background_row(line: &str) -> bool {
@@ -1818,6 +1943,70 @@ mod tests {
                 Some(Duration::ZERO)
             ),
             None
+        );
+    }
+
+    #[test]
+    fn claude_live_foreground_row_overrides_idle_title() {
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "⎿  Running…\n\n✻ Unravelling… (3s · ↓ 117 tokens)\n\n  esc to in…"
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Chewing on it… (1m 20s · ↓ 2.6k tokens)"
+            ),
+            Some(AgentStatus::Working)
+        );
+        for idle_or_quoted in [
+            "✻ Brewed for 12s · done 11:22 AM",
+            "quoted: ✻ Chewing on it… (20s · ↓ 171 tokens)",
+            "> ✻ Chewing on it… (20s · ↓ 171 tokens)",
+            "✻ Chewing on it… (soon · ↓ 171 tokens)",
+            "✻ Chewing on it… (20s · tokens)",
+            "✻ … (20s · ↓ 171 tokens)",
+            "✻ Chewing on it… (3s 1h · ↓ 171 tokens)",
+            "✻ Chewing on it… (1m 2m · ↓ 171 tokens)",
+            "✻ Chewing on it… (1s 2m · ↓ 171 tokens)",
+            "✻ Chewing on it… (20s · ↑↓171 tokens)",
+            "✻ Chewing on it… (20s · ↓171 tokens)",
+            "✻ Chewing on it… (20s · 1e3 tokens)",
+            "✻ Chewing on it… (20s · +171 tokens)",
+            "✻ Chewing on it… (20s · ↓ 2.6 tokens)",
+            "✻ Chewing on it… (20s · .5k tokens)",
+            "✻ Chewing on it… (20s · 2..6k tokens)",
+        ] {
+            assert_eq!(
+                provider_screen_status(TitleProvider::Claude, idle_or_quoted),
+                None,
+                "accepted Claude foreground lookalike {idle_or_quoted:?}"
+            );
+        }
+
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Chewing on it… (20s · ↓ 171 tokens)\n\nThat was the exact row under discussion.\n\n✻ Brewed for 21s · done 11:22 AM"
+            ),
+            None,
+            "an earlier exact row must not override newer completion evidence"
+        );
+
+        let live_background_above_long_output = format!(
+            "· 1 command still running · send a message to interrupt\n{}",
+            (0..20)
+                .map(|line| format!("ordinary output {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(
+            provider_screen_status(TitleProvider::Claude, &live_background_above_long_output),
+            Some(AgentStatus::Working),
+            "live background work must not disappear beyond an arbitrary row window"
         );
     }
 
