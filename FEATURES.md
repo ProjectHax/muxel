@@ -469,6 +469,11 @@ feature is added or changed, update the matching entry here in the same change**
   that tab and reloads it from disk when its buffer is clean; dirty buffers are
   never overwritten. File links can jump to `#L12C4`, and local HTML links open in
   the browser preview while HTML source panes offer a **Preview** action.
+- **External file freshness** — open local text files, including rendered Markdown,
+  update within 500 ms when another tool writes them. Refresh keeps cursor and scroll
+  position. Dirty buffers show **Reload / Keep mine** instead of being overwritten;
+  deleted or unreadable files remain open with a warning. The same behavior works in
+  main, secondary, and popped-out editor windows.
 - **Resource tab grouping** — files, diffs, and browser pages opened by default join
   the nearest pane of the same type; explicit New Tab and New Pane commands still
   use the requested tab or split placement.
