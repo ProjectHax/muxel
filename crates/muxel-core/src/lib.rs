@@ -2203,8 +2203,7 @@ impl Default for Settings {
 /// v14: migrated the built-in Grok preset from delayed TypeIn to `--rules`.
 /// v15: repaired Grok presets saved with the generic Claude-only prompt flag.
 /// v16: added the Windows Git Bash preset.
-const CLAUDE_TITLE_STATUS_SEED_VERSION: u32 = 17;
-pub const PRESET_SEED_VERSION: u32 = CLAUDE_TITLE_STATUS_SEED_VERSION;
+pub const PRESET_SEED_VERSION: u32 = 16;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
@@ -2280,28 +2279,9 @@ impl Settings {
                 }
             }
         }
-        // Claude's old built-in marker is ordinary screen prose in current
-        // releases. Remove only that exact seeded value; preserve user markers.
-        if self.preset_seed_version < CLAUDE_TITLE_STATUS_SEED_VERSION {
-            for preset in &mut self.presets {
-                let is_claude_program = preset
-                    .program
-                    .as_deref()
-                    .and_then(|program| std::path::Path::new(program).file_stem())
-                    .and_then(|stem| stem.to_str())
-                    .is_some_and(|stem| stem.eq_ignore_ascii_case("claude"));
-                let has_legacy_marker = matches!(
-                    preset.working_markers.as_slice(),
-                    [marker] if marker == "esc to interrupt"
-                );
-                if preset.name == "Claude" && is_claude_program && has_legacy_marker {
-                    preset.working_markers.clear();
-                }
-            }
-        }
-
-        // Adopt non-empty built-in status markers for matching presets that have
-        // none, without overwriting a user's own markers.
+        // Adopt the built-in status markers (e.g. Claude's "esc to interrupt"
+        // working marker) for matching presets that have none, so existing configs
+        // get reliable status detection without overwriting a user's own markers.
         for builtin in AgentPreset::defaults() {
             if builtin.working_markers.is_empty() {
                 continue;
@@ -2372,36 +2352,30 @@ mod settings_tests {
     }
 
     #[test]
-    fn seed_removes_only_the_legacy_claude_working_marker() {
-        let mut legacy = AgentPreset::claude();
-        legacy.working_markers = vec!["esc to interrupt".to_string()];
-        let mut settings = Settings {
-            preset_seed_version: CLAUDE_TITLE_STATUS_SEED_VERSION - 1,
-            presets: vec![legacy],
+    fn seed_adopts_working_markers_when_missing() {
+        // An old Claude preset with no status markers gains the built-in one.
+        let mut bare = AgentPreset::claude();
+        bare.working_markers.clear();
+        let mut s = Settings {
+            preset_seed_version: 0,
+            presets: vec![bare],
             ..Settings::default()
         };
-        assert!(settings.seed_builtin_presets());
-        let claude = settings
-            .presets
-            .iter()
-            .find(|preset| preset.name == "Claude")
-            .unwrap();
-        assert!(claude.working_markers.is_empty());
+        assert!(s.seed_builtin_presets());
+        let claude = s.presets.iter().find(|p| p.name == "Claude").unwrap();
+        assert_eq!(claude.working_markers, vec!["esc to interrupt".to_string()]);
 
+        // A user's own markers are never overwritten.
         let mut custom = AgentPreset::claude();
         custom.working_markers = vec!["mine".to_string()];
-        let mut custom_settings = Settings {
-            preset_seed_version: CLAUDE_TITLE_STATUS_SEED_VERSION - 1,
+        let mut s2 = Settings {
+            preset_seed_version: 0,
             presets: vec![custom],
             ..Settings::default()
         };
-        custom_settings.seed_builtin_presets();
-        let custom_claude = custom_settings
-            .presets
-            .iter()
-            .find(|preset| preset.name == "Claude")
-            .unwrap();
-        assert_eq!(custom_claude.working_markers, vec!["mine".to_string()]);
+        s2.seed_builtin_presets();
+        let claude2 = s2.presets.iter().find(|p| p.name == "Claude").unwrap();
+        assert_eq!(claude2.working_markers, vec!["mine".to_string()]);
     }
 
     #[test]

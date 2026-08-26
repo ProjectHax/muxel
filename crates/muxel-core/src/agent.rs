@@ -215,9 +215,11 @@ impl AgentPreset {
                 flag: "--append-system-prompt".to_string(),
             },
             env: Vec::new(),
-            // Claude lifecycle comes from its provider-owned terminal title and
-            // visible permission UI. Raw screen prose is not a stable busy signal.
-            working_markers: Vec::new(),
+            // Claude prints "esc to interrupt" on its status line for the whole
+            // duration of a turn, so it's a reliable "working" signal — far more so
+            // than the output-activity timer, which the long "Computing…" phase
+            // (quiet output / a stalled spinner) trips into a false "idle".
+            working_markers: vec!["esc to interrupt".to_string()],
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             session_id_flag: Some("--session-id".to_string()),
@@ -1151,7 +1153,7 @@ mod tests {
         let c = AgentPreset::claude();
         assert_eq!(c.session_id_flag.as_deref(), Some("--session-id"));
         assert_eq!(c.resume_flag.as_deref(), Some("--resume"));
-        assert!(c.working_markers.is_empty());
+        assert_eq!(c.working_markers, vec!["esc to interrupt".to_string()]);
         assert!(AgentPreset::shell().session_id_flag.is_none());
     }
 
