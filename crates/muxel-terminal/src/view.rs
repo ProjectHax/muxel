@@ -30,6 +30,11 @@ const FOCUSED_STREAM_INTERVAL: Duration = Duration::from_millis(33);
 /// Focused output shortly after user input: keep TUI feedback crisp.
 const FOCUSED_INTERACTION_INTERVAL: Duration = Duration::from_millis(8);
 
+/// Grok redraws its foreground background-work summary. Keep one exact positive
+/// observation through a brief missing frame so a repaint cannot forge a
+/// Working→Done→Working lifecycle and duplicate completion notifications.
+const GROK_SCREEN_WORKING_HOLD: Duration = Duration::from_secs(2);
+
 /// Pure paint-priority policy (see `docs/terminal-paint-architecture.md`).
 /// Extracted so we can unit-test without a full GPUI window.
 pub(crate) fn paint_min_interval(focused: bool, interactive: bool, stop: bool) -> Duration {
@@ -145,11 +150,12 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
         TitleProvider::Claude => {
             let marker = title.chars().next()?;
             let status = match marker {
-                // Claude owns this title protocol: the braille frames mean
-                // Working and the star means Idle. Long-running tools can leave
-                // one frame unchanged for minutes, so age is not completion
-                // evidence.
-                '⠂' | '⠐' => AgentStatus::Working,
+                // Claude owns this title protocol. Claude 2.1.228+ uses
+                // half-circle busy frames; older releases used braille frames.
+                // Long-running tools can leave one frame unchanged for minutes,
+                // so age is not completion evidence.
+                '◐' | '◑' | '◒' | '◓' => AgentStatus::Working,
+                marker if ('\u{2800}'..='\u{28ff}').contains(&marker) => AgentStatus::Working,
                 '✳' => AgentStatus::Idle,
                 _ => return None,
             };
@@ -201,17 +207,13 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
             }
             let payload = &parts[..parts.len() - 1];
             let (status, name_start) = match payload {
-                ["⚠ Action Required", spinner, activity, ..]
-                    if is_grok_spinner(spinner) && is_grok_activity(activity) =>
-                {
+                ["⚠ Action Required", spinner, _activity, ..] if is_grok_spinner(spinner) => {
                     (Some(AgentStatus::Blocked), 3)
                 }
-                [spinner, activity, ..]
-                    if is_grok_spinner(spinner) && is_grok_activity(activity) =>
-                {
-                    // Grok removes these provider-owned leading items when it
-                    // returns to Idle. A long tool or response can leave the
-                    // same frame in place for minutes, so age is not evidence.
+                [spinner, _activity, ..] if is_grok_spinner(spinner) => {
+                    // The spinner is Grok's semantic busy bit. Activity prose is
+                    // intentionally open-ended and changes as tools are added.
+                    // Grok removes both fields when it returns to Idle.
                     (Some(AgentStatus::Working), 2)
                 }
                 [reserved, ..] if *reserved == "⚠ Action Required" || is_grok_spinner(reserved) =>
@@ -300,43 +302,144 @@ fn sticky_title_status(
     observed.or(previous)
 }
 
-/// Provider-owned screen text that proves work continues even if the title has
-/// already moved to its idle shape.
-fn continuing_screen_status(provider: TitleProvider, screen: &str) -> Option<AgentStatus> {
+/// Provider-owned visible UI that adds state not carried by the terminal title.
+fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<AgentStatus> {
     match provider {
-        TitleProvider::Claude => screen
-            .lines()
-            .any(is_claude_background_command_row)
-            .then_some(AgentStatus::Working),
+        TitleProvider::Claude if is_claude_blocked_prompt(screen) => Some(AgentStatus::Blocked),
+        TitleProvider::Claude if screen.lines().any(is_claude_live_background_row) => {
+            Some(AgentStatus::Working)
+        }
+        TitleProvider::Grok
+            if screen.lines().any(|line| {
+                is_live_background_row(
+                    line,
+                    &["◎", "·"],
+                    &["command", "monitor", "loop", "subagent"],
+                    false,
+                )
+            }) =>
+        {
+            Some(AgentStatus::Working)
+        }
         _ => None,
     }
 }
 
-fn is_claude_background_command_row(line: &str) -> bool {
+fn is_claude_live_background_row(line: &str) -> bool {
+    if is_live_background_row(line, &["·"], &["command"], true) {
+        return true;
+    }
+
+    let line = line.trim();
+    let Some((activity, summary)) = line.rsplit_once(" · ") else {
+        return false;
+    };
+    if !activity.trim().starts_with("✻ ") {
+        return false;
+    }
+    is_live_background_row(&format!("· {summary}"), &["·"], &["shell"], false)
+}
+
+fn is_claude_blocked_prompt(screen: &str) -> bool {
+    // Prompt chrome is transient and lives near the bottom of the viewport.
+    // Restricting the scan avoids matching an old prompt quoted in scrollback.
+    let recent = screen
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(16)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+    let has_cancel = recent.contains("esc to cancel");
+    if !has_cancel {
+        return false;
+    }
+
+    if recent.contains("run a dynamic workflow?") {
+        return true;
+    }
+
+    let has_choice = recent.lines().any(|line| {
+        let choice = line.trim().trim_start_matches(['┃', '❯']).trim();
+        choice == "yes"
+            || choice.starts_with("1. yes")
+            || choice.starts_with("2. yes")
+            || choice.starts_with("2. no")
+            || choice.starts_with("3. no")
+    });
+    if recent.contains("do you want to proceed?") && has_choice {
+        return true;
+    }
+
+    let has_navigation = [
+        "tab/arrow keys to navigate",
+        "arrow keys to navigate",
+        "arrows to navigate",
+        "↑/↓ to navigate",
+        "↑↓ to navigate",
+    ]
+    .into_iter()
+    .any(|hint| recent.contains(hint));
+    recent.contains("enter to confirm") || (recent.contains("enter to select") && has_navigation)
+}
+
+fn is_live_background_row(
+    line: &str,
+    provider_markers: &[&str],
+    allowed_kinds: &[&str],
+    require_interrupt_hint: bool,
+) -> bool {
     let words: Vec<_> = line.split_whitespace().collect();
-    if words.len() != 11
-        || words[0] != "·"
-        || words[4..] != ["running", "·", "send", "a", "message", "to", "interrupt"]
+    if words
+        .first()
+        .is_none_or(|word| !provider_markers.contains(word))
     {
         return false;
     }
-    let Ok(count) = words[1].parse::<usize>() else {
+
+    const INTERRUPT_HINT: [&str; 6] = ["·", "send", "a", "message", "to", "interrupt"];
+    let summary_end = if words.ends_with(&INTERRUPT_HINT) {
+        words.len() - INTERRUPT_HINT.len()
+    } else if require_interrupt_hint {
         return false;
+    } else {
+        words.len()
     };
-    count > 0 && words[2] == if count == 1 { "command" } else { "commands" } && words[3] == "still"
+    if summary_end < 4 || words[summary_end - 2..summary_end] != ["still", "running"] {
+        return false;
+    }
+
+    let summary = &words[1..summary_end - 2];
+    let mut index = 0;
+    while index < summary.len() {
+        let Some(kind) = summary.get(index + 1) else {
+            return false;
+        };
+        let Ok(count) = summary[index].parse::<usize>() else {
+            return false;
+        };
+        if count == 0
+            || !allowed_kinds.iter().any(|base| {
+                (count == 1 && kind == base) || (count > 1 && kind.strip_suffix('s') == Some(*base))
+            })
+        {
+            return false;
+        }
+        index += 2;
+        if index == summary.len() {
+            return true;
+        }
+        if summary[index] != "·" {
+            return false;
+        }
+        index += 1;
+    }
+    false
 }
 
 fn is_grok_spinner(part: &str) -> bool {
     matches!(part, "⠋" | "⠙" | "⠹" | "⠸" | "⠼" | "⠴" | "⠦" | "⠧")
-}
-
-fn is_grok_activity(part: &str) -> bool {
-    matches!(
-        part,
-        "Thinking" | "Responding" | "Running tool" | "Compacting"
-    ) || part.starts_with("Waiting")
-        || part.starts_with("Running:")
-        || part.starts_with("Retrying (")
 }
 
 fn combine_title_status(
@@ -351,9 +454,9 @@ fn combine_title_status(
     if base == AgentStatus::Blocked || title == Some(AgentStatus::Blocked) {
         return AgentStatus::Blocked;
     }
-    // A configured provider marker is independent strong evidence. Claude can
-    // leave its semantic title in the Idle shape while an orchestration/review
-    // status line still says `esc to interrupt`.
+    // Provider-owned visible UI is independent strong evidence. Claude can
+    // leave its semantic title in the Idle shape while a background command or
+    // permission form remains visible.
     if screen_working {
         return AgentStatus::Working;
     }
@@ -381,6 +484,12 @@ fn hold_grok_blocked(
         }
         other => other,
     }
+}
+
+/// Grok's exact foreground background-work row can disappear for a repaint.
+/// Debounce only a previously observed positive row; stable absence expires.
+fn hold_grok_screen_working(observed: bool, last_seen_age: Option<Duration>) -> bool {
+    observed || last_seen_age.is_some_and(|age| age <= GROK_SCREEN_WORKING_HOLD)
 }
 
 /// Remove provider lifecycle decoration before a title is considered for the
@@ -594,6 +703,9 @@ pub struct TerminalView {
     /// Grok's action-required title item intentionally blinks when unfocused.
     /// Retain the last positive edge briefly so the sidebar does not blink too.
     grok_blocked_at: std::cell::Cell<Option<std::time::Instant>>,
+    /// Grok redraws its exact foreground background-work row. Retain a positive
+    /// observation briefly so an off-frame cannot forge completion.
+    grok_screen_working_at: std::cell::Cell<Option<std::time::Instant>>,
     /// Last time we `cx.notify()`'d a paint from the drain loop (background throttle).
     last_paint_notify: std::cell::Cell<std::time::Instant>,
     /// A throttled batch must still paint if output stops before the next batch.
@@ -1017,6 +1129,7 @@ impl TerminalView {
             provider_settled: std::cell::Cell::new(false),
             semantic_title_status: std::cell::Cell::new(None),
             grok_blocked_at: std::cell::Cell::new(None),
+            grok_screen_working_at: std::cell::Cell::new(None),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
             pending_paint_deadline: std::cell::Cell::new(None),
             paint_timer_generation: std::cell::Cell::new(0),
@@ -1102,18 +1215,20 @@ impl TerminalView {
             self.semantic_title_status.set(Some(status));
         }
         let mut title = sticky_title_status(self.semantic_title_status.get(), observed_title);
-        // Provider-owned titles and configured screen markers are independent
-        // strong evidence. Titles prevent PTY noise from forging state; they do
-        // not suppress a visible provider marker such as Claude's
-        // `esc to interrupt` status line.
+        // Provider-owned titles and visible UI are independent strong evidence.
+        // Titles prevent PTY noise from forging state; they do not suppress a
+        // current permission form or background-work row.
         let working_markers = self.working_markers.as_slice();
-        // Claude may declare its title idle while a background command remains
-        // live. Scan its visible grid for that provider-owned continuation row.
-        let needs_continuation_scan = self.title_provider == TitleProvider::Claude
-            && matches!(title, None | Some(AgentStatus::Idle));
+        // Claude's title does not distinguish Idle from a visible permission
+        // prompt. Claude and Grok can both retain Idle titles while their
+        // foreground UI reports live background work.
+        let needs_provider_screen_scan = matches!(
+            self.title_provider,
+            TitleProvider::Claude | TitleProvider::Grok
+        );
         let screen = if working_markers.is_empty()
             && self.blocked_markers.is_empty()
-            && !needs_continuation_scan
+            && !needs_provider_screen_scan
         {
             String::new()
         } else {
@@ -1128,7 +1243,9 @@ impl TerminalView {
             self.title_provider == TitleProvider::Other,
             self.session.idle_for(),
         );
-        let screen_working = working_markers.iter().any(|marker| screen.contains(marker));
+        let provider_screen = provider_screen_status(self.title_provider, &screen);
+        let mut screen_working = working_markers.iter().any(|marker| screen.contains(marker))
+            || provider_screen == Some(AgentStatus::Working);
         if self.title_provider == TitleProvider::Grok {
             if title == Some(AgentStatus::Blocked) {
                 self.grok_blocked_at.set(Some(std::time::Instant::now()));
@@ -1141,11 +1258,20 @@ impl TerminalView {
                     self.grok_blocked_at.set(None);
                 }
             }
+
+            if provider_screen == Some(AgentStatus::Working) {
+                self.grok_screen_working_at
+                    .set(Some(std::time::Instant::now()));
+            } else {
+                let working_age = self.grok_screen_working_at.get().map(|at| at.elapsed());
+                screen_working = hold_grok_screen_working(screen_working, working_age);
+                if !screen_working {
+                    self.grok_screen_working_at.set(None);
+                }
+            }
         }
-        if title != Some(AgentStatus::Blocked)
-            && let Some(continuing) = continuing_screen_status(self.title_provider, &screen)
-        {
-            title = Some(continuing);
+        if title != Some(AgentStatus::Blocked) && provider_screen == Some(AgentStatus::Blocked) {
+            title = provider_screen;
         }
         let raw = combine_title_status(self.exited, base, title, screen_working);
         // Marker-less providers may latch only after proving that their semantic
@@ -1475,10 +1601,10 @@ mod tests {
     use super::{
         AgentStatus, BACKGROUND_PAINT_INTERVAL, FOCUSED_INTERACTION_INTERVAL,
         FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, TitleProvider,
-        can_latch_completion, classify, clean_agent_title, combine_title_status,
-        continuing_screen_status, hold_grok_blocked, latch_done, latch_done_after_readiness,
-        next_paint_schedule, paint_min_interval, provider_settled_after_title, sticky_title_status,
-        title_status,
+        can_latch_completion, classify, clean_agent_title, combine_title_status, hold_grok_blocked,
+        hold_grok_screen_working, latch_done, latch_done_after_readiness, next_paint_schedule,
+        paint_min_interval, provider_screen_status, provider_settled_after_title,
+        sticky_title_status, title_status,
     };
     use std::time::Duration;
 
@@ -1494,23 +1620,25 @@ mod tests {
     }
 
     #[test]
-    fn claude_title_frames_remain_working_until_explicit_idle() {
-        assert_eq!(
-            title_status(
-                TitleProvider::Claude,
-                Some("⠂ Review changes"),
-                Some(Duration::from_millis(200))
-            ),
-            Some(AgentStatus::Working)
-        );
-        assert_eq!(
-            title_status(
-                TitleProvider::Claude,
-                Some("⠂ Review changes"),
-                Some(Duration::from_secs(4))
-            ),
-            Some(AgentStatus::Working)
-        );
+    fn claude_current_and_legacy_titles_have_explicit_edges() {
+        for working in [
+            "◐ Review changes",
+            "◑ Review changes",
+            "◒ Review changes",
+            "◓ Review changes",
+            "⠂ Review changes",
+            "⠐ Review changes",
+        ] {
+            assert_eq!(
+                title_status(
+                    TitleProvider::Claude,
+                    Some(working),
+                    Some(Duration::from_secs(4)),
+                ),
+                Some(AgentStatus::Working),
+                "rejected Claude busy title {working:?}"
+            );
+        }
         assert_eq!(
             title_status(
                 TitleProvider::Claude,
@@ -1522,29 +1650,33 @@ mod tests {
     }
 
     #[test]
-    fn claude_visible_working_marker_overrides_idle_title() {
-        let working = m(&["esc to interrupt"]);
-        let screen = "Reviewing 2 approval requests (5m 11s · esc to interrupt)";
-        let base = classify(
-            false,
-            screen,
-            &working,
-            &[],
-            false,
-            false,
-            Duration::from_secs(10),
-        );
-        assert_eq!(base, AgentStatus::Working);
-        let status = combine_title_status(false, base, Some(AgentStatus::Idle), true);
-        assert_eq!(status, AgentStatus::Working);
+    fn claude_visible_permission_form_overrides_idle_title() {
+        let permission = "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\nEsc to cancel";
+        let screen_status = provider_screen_status(TitleProvider::Claude, permission);
+        assert_eq!(screen_status, Some(AgentStatus::Blocked));
         assert_eq!(
-            latch_done(Some(AgentStatus::Idle), status, true, true),
-            (AgentStatus::Working, false)
-        );
-        assert_eq!(
-            combine_title_status(false, base, Some(AgentStatus::Blocked), true),
+            combine_title_status(false, AgentStatus::Idle, screen_status, false),
             AgentStatus::Blocked
         );
+
+        let selection =
+            "Choose an answer\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel";
+        assert_eq!(
+            provider_screen_status(TitleProvider::Claude, selection),
+            Some(AgentStatus::Blocked)
+        );
+
+        for screen in [
+            "Select model\nEnter to set as default\nEsc to cancel",
+            "Claude said: Do you want to proceed?\nEsc to cancel",
+            "❯ 1. Yes\nEsc to cancel",
+        ] {
+            assert_eq!(
+                provider_screen_status(TitleProvider::Claude, screen),
+                None,
+                "ordinary UI forged Blocked: {screen:?}"
+            );
+        }
     }
 
     #[test]
@@ -1644,27 +1776,29 @@ mod tests {
     }
 
     #[test]
-    fn grok_title_contract_has_working_blocked_and_idle_edges() {
+    fn grok_spinner_is_working_independent_of_activity_prose() {
+        for working in [
+            "⠦ - Responding - Review title - grok",
+            "⠦ - Waiting for response… - Review title - grok",
+            "⠋ - Writing command… - Review title - grok",
+            "⠙ - Writing file… - Review title - grok",
+            "⠹ - Run harmless Get-Date command… - grok",
+            "⠸ - Preparing MCP tool… - Review title - grok",
+        ] {
+            assert_eq!(
+                title_status(
+                    TitleProvider::Grok,
+                    Some(working),
+                    Some(Duration::from_secs(30)),
+                ),
+                Some(AgentStatus::Working),
+                "rejected Grok busy title {working:?}"
+            );
+        }
         assert_eq!(
             title_status(
                 TitleProvider::Grok,
-                Some("⠦ - Responding - Review title - grok"),
-                Some(Duration::from_secs(30))
-            ),
-            Some(AgentStatus::Working)
-        );
-        assert_eq!(
-            title_status(
-                TitleProvider::Grok,
-                Some("⠦ - Waiting for response… - Review title - grok"),
-                Some(Duration::from_millis(300))
-            ),
-            Some(AgentStatus::Working)
-        );
-        assert_eq!(
-            title_status(
-                TitleProvider::Grok,
-                Some("⚠ Action Required - ⠋ - Running tool - Review title - grok"),
+                Some("⚠ Action Required - ⠋ - Preparing question… - Review title - grok"),
                 Some(Duration::from_millis(300))
             ),
             Some(AgentStatus::Blocked)
@@ -1688,46 +1822,151 @@ mod tests {
     }
 
     #[test]
-    fn claude_background_command_overrides_idle_title() {
+    fn live_background_command_overrides_idle_title() {
         assert_eq!(
-            continuing_screen_status(
+            provider_screen_status(
                 TitleProvider::Claude,
                 "· 1 command still running · send a message to interrupt"
             ),
             Some(AgentStatus::Working)
         );
         assert_eq!(
-            continuing_screen_status(TitleProvider::Claude, "Ready for another prompt"),
+            provider_screen_status(TitleProvider::Claude, "Ready for another prompt"),
             None
         );
         assert_eq!(
-            continuing_screen_status(
+            provider_screen_status(
                 TitleProvider::Claude,
                 "The log says: 1 command still running; investigate it."
             ),
             None
         );
         assert_eq!(
-            continuing_screen_status(
+            provider_screen_status(
                 TitleProvider::Claude,
                 "quoted: · 1 command still running · send a message to interrupt later"
             ),
             None
         );
         assert_eq!(
-            continuing_screen_status(
+            provider_screen_status(
                 TitleProvider::Claude,
                 "  · 2 commands still running · send a message to interrupt  "
             ),
             Some(AgentStatus::Working)
         );
         assert_eq!(
-            continuing_screen_status(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Brewed for 15s · 1 shell still running"
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Crunched for 1m 2s · 2 shells still running"
+            ),
+            Some(AgentStatus::Working)
+        );
+        for false_positive in [
+            "✻ Brewed for 15s · 0 shells still running",
+            "✻ Brewed for 15s · 1 shells still running",
+            "quoted: ✻ Brewed for 15s · 1 shell still running",
+            "✻ Brewed for 15s · 1 shell still running later",
+        ] {
+            assert_eq!(
+                provider_screen_status(TitleProvider::Claude, false_positive),
+                None,
+                "accepted Claude background lookalike {false_positive:?}"
+            );
+        }
+        assert_eq!(
+            provider_screen_status(
                 TitleProvider::Grok,
                 "· 1 command still running · send a message to interrupt"
             ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Grok,
+                "◎ 2 commands still running · send a message to interrupt"
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Grok,
+                "◎ 1 command · 2 monitors · 1 loop · 1 subagent still running"
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            provider_screen_status(TitleProvider::Grok, "◎ 1 monitor · 2 loops still running"),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Grok,
+                "◎ waiting · send a message to interrupt"
+            ),
             None
         );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Grok,
+                "◎ 0 commands still running · send a message to interrupt"
+            ),
+            None
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Grok,
+                "quoted: ◎ 1 command still running · send a message to interrupt later"
+            ),
+            None
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Grok,
+                "◎ 1 commands still running · send a message to interrupt"
+            ),
+            None
+        );
+        assert_eq!(
+            provider_screen_status(TitleProvider::Grok, "◎ 1 workflow still running"),
+            None
+        );
+    }
+
+    #[test]
+    fn grok_background_row_gaps_do_not_complete_until_stable_absence() {
+        use AgentStatus::{Done, Idle, Working};
+
+        assert!(hold_grok_screen_working(true, None));
+        assert!(hold_grok_screen_working(
+            false,
+            Some(Duration::from_millis(1999))
+        ));
+        assert!(!hold_grok_screen_working(
+            false,
+            Some(Duration::from_millis(2001))
+        ));
+        assert!(!hold_grok_screen_working(false, None));
+
+        let (status, latch, armed) =
+            latch_done_after_readiness(Some(Idle), Working, false, true, true, false);
+        assert_eq!(status, Working);
+        let (status, latch, armed) =
+            latch_done_after_readiness(Some(Working), Working, latch, true, armed, false);
+        assert_eq!(status, Working, "one missing row frame forged completion");
+        let (status, latch, _) =
+            latch_done_after_readiness(Some(Working), Idle, latch, true, armed, false);
+        assert_eq!(status, Done, "stable absence did not complete the turn");
+        let (status, _, _) =
+            latch_done_after_readiness(Some(Idle), Idle, latch, true, armed, false);
+        assert_eq!(status, Done, "completion did not remain latched");
     }
 
     #[test]
@@ -1843,7 +2082,8 @@ mod tests {
         for title in [
             "⚠ Action Required - grok",
             "⚠ Action Required - Review - grok",
-            "⠋ - Review - grok",
+            "⚠ Action Required - ⠋ - grok",
+            "⠋ - grok",
         ] {
             assert_eq!(
                 title_status(TitleProvider::Grok, Some(title), Some(Duration::ZERO)),

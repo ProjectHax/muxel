@@ -1153,6 +1153,7 @@ mod tests {
         let c = AgentPreset::claude();
         assert_eq!(c.session_id_flag.as_deref(), Some("--session-id"));
         assert_eq!(c.resume_flag.as_deref(), Some("--resume"));
+        assert_eq!(c.working_markers, vec!["esc to interrupt".to_string()]);
         assert!(AgentPreset::shell().session_id_flag.is_none());
     }
 
