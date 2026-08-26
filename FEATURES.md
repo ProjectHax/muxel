@@ -113,9 +113,15 @@ feature is added or changed, update the matching entry here in the same change**
   - **Agent-minted** (Codex): only `resume_flag` (`resume`) — first launch is bare;
     muxel captures the UUID Codex publishes for that pane, validates it against
     `~/.codex/sessions` before restart, and relaunches as `codex resume <id>`. Multiple Codex
-    panes can share a project without resuming one another's conversations. Once
-    bound, later OSC titles cannot replace the saved UUID because terminal-title
-    events do not identify which process emitted them.
+    panes can share a project without resuming one another's conversations.
+  **Conversation switches stick** — an agent can swap its conversation inside a live
+  pane (`/resume`, `/clear`, a fork) without restarting the PTY, and muxel rebinds the
+  pane to what's actually on screen instead of the conversation it launched. Local
+  Claude panes learn the switch from a process-local `SessionStart` hook keyed to the
+  pane; Codex panes learn it from a later OSC title. Both are accepted only after the
+  new UUID's own on-disk session proves it belongs to this pane's directory and that no
+  sibling pane already owns it — terminal titles carry no sender identity, so an
+  unverified one cannot rebind a pane. Remote Claude panes keep their starter binding.
   If the saved session is gone, the pane quietly starts fresh.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
