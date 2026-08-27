@@ -160,18 +160,28 @@ pub fn focus_in_direction(root: &PaneNode, from: Uuid, dir: FocusDir) -> Option<
 /// the currently active (visible/focused) one. Invariants, upheld by every
 /// mutating function here: `tabs` is never empty and `active < tabs.len()`.
 ///
-/// `Serialize` is derived (emits `{"tabs":[…],"active":N}`); `Deserialize` is
-/// hand-written so legacy single-instance leaves (`{"instance":"<uuid>"}` from
-/// before tabs existed) still load — see the impl below.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+/// `pane_id` is the stable identity of the visual pane, independent of which tabs
+/// it currently contains or how they are ordered. `Deserialize` is hand-written
+/// so layouts saved before that field existed mint one while loading, and legacy
+/// single-instance leaves (`{"instance":"<uuid>"}`) still load.
+#[derive(Clone, Debug, Serialize)]
 pub struct LeafData {
+    pub pane_id: Uuid,
     pub tabs: Vec<Uuid>,
     pub active: usize,
+}
+
+impl PartialEq for LeafData {
+    fn eq(&self, other: &Self) -> bool {
+        // `pane_id` is renderer identity, not user-visible layout content.
+        self.tabs == other.tabs && self.active == other.active
+    }
 }
 
 impl LeafData {
     fn new(instance: Uuid) -> Self {
         Self {
+            pane_id: Uuid::new_v4(),
             tabs: vec![instance],
             active: 0,
         }
@@ -197,11 +207,13 @@ impl<'de> Deserialize<'de> for LeafData {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<LeafData, A::Error> {
                 let mut tabs: Option<Vec<Uuid>> = None;
                 let mut instance: Option<Uuid> = None;
+                let mut pane_id: Option<Uuid> = None;
                 let mut active: usize = 0;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "tabs" => tabs = Some(map.next_value()?),
                         "instance" => instance = Some(map.next_value()?),
+                        "pane_id" => pane_id = Some(map.next_value()?),
                         "active" => active = map.next_value()?,
                         // Ignore unknowns — including the enum's "kind" tag, which
                         // serde leaves in the buffered map for newtype variants.
@@ -219,7 +231,11 @@ impl<'de> Deserialize<'de> for LeafData {
                     }
                 };
                 let active = active.min(tabs.len() - 1);
-                Ok(LeafData { tabs, active })
+                Ok(LeafData {
+                    pane_id: pane_id.unwrap_or_else(Uuid::new_v4),
+                    tabs,
+                    active,
+                })
             }
         }
         d.deserialize_map(LeafVisitor)
@@ -283,18 +299,16 @@ impl PaneNode {
         }
     }
 
-    /// Stable structural key for a split node. Leaf boundaries are part of the
-    /// identity so moving a tab between panes resets the renderer's cached panel
-    /// sizes even when the flat descendant instance order does not change.
+    /// Stable structural key for a split node. Persistent pane identities and
+    /// their boundaries are part of the key; tab membership and order are not.
+    /// Resource tabs can therefore change without recreating the renderer's
+    /// cached sizes, while pane splits and relocation still replace that state.
     pub fn split_key(&self) -> String {
         fn append(node: &PaneNode, out: &mut String) {
             match node {
                 PaneNode::Leaf(leaf) => {
-                    let mut ids: Vec<_> =
-                        leaf.tabs.iter().map(|id| id.simple().to_string()).collect();
-                    ids.sort_unstable();
                     out.push_str("l(");
-                    out.push_str(&ids.join(","));
+                    out.push_str(&leaf.pane_id.simple().to_string());
                     out.push(')');
                 }
                 PaneNode::Split {
@@ -710,6 +724,29 @@ pub fn move_pane_beside(
     if src_path == tgt_path {
         return false; // same leaf
     }
+    // Dropping a pane onto the side it already occupies is a no-op. Rebuilding
+    // that same split would redistribute unequal recorded sizes even though the
+    // pane order and structural render key do not change.
+    if src_path.len() == tgt_path.len() && !src_path.is_empty() {
+        let parent_len = src_path.len() - 1;
+        let same_parent = src_path[..parent_len] == tgt_path[..parent_len];
+        let src_index = src_path[parent_len];
+        let tgt_index = tgt_path[parent_len];
+        let matching_parent_direction = tree
+            .as_ref()
+            .and_then(|root| root.get_at_path(&src_path[..parent_len]))
+            .is_some_and(
+                |parent| matches!(parent, PaneNode::Split { direction: d, .. } if *d == direction),
+            );
+        let already_on_requested_side = if before {
+            src_index + 1 == tgt_index
+        } else {
+            tgt_index + 1 == src_index
+        };
+        if same_parent && matching_parent_direction && already_on_requested_side {
+            return false;
+        }
+    }
     // Snapshot the source leaf before mutating the tree.
     let src_leaf = match tree.as_ref().and_then(|r| r.get_at_path(&src_path)) {
         Some(node @ PaneNode::Leaf(_)) => node.clone(),
@@ -1090,7 +1127,11 @@ mod tests {
 
     /// Build a multi-tab leaf for tests.
     fn tabs_leaf(tabs: Vec<Uuid>, active: usize) -> PaneNode {
-        PaneNode::Leaf(LeafData { tabs, active })
+        PaneNode::Leaf(LeafData {
+            pane_id: id(),
+            tabs,
+            active,
+        })
     }
 
     /// Tabs of the leaf holding `instance`, in order.
@@ -1312,13 +1353,16 @@ mod tests {
     }
 
     #[test]
-    fn move_pane_beside_path_revalidation_three_pane() {
+    fn move_pane_beside_already_adjacent_is_noop() {
         let (a, b, c) = (id(), id(), id());
-        let mut tree = Some(PaneNode::leaf(a));
-        split(&mut tree, a, SplitDirection::Horizontal, b);
-        split(&mut tree, b, SplitDirection::Horizontal, c);
-        // Tree: [a | b | c]. Move pane(b) to the left of c.
-        assert!(move_pane_beside(
+        let mut tree = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![200.0, 300.0, 500.0],
+            children: vec![PaneNode::leaf(a), PaneNode::leaf(b), PaneNode::leaf(c)],
+        });
+        let before_key = tree.as_ref().unwrap().split_key();
+
+        assert!(!move_pane_beside(
             &mut tree,
             b,
             c,
@@ -1326,6 +1370,11 @@ mod tests {
             true
         ));
         assert_eq!(tree.as_ref().unwrap().collect_instances(), vec![a, b, c]);
+        assert_eq!(tree.as_ref().unwrap().split_key(), before_key);
+        let Some(PaneNode::Split { sizes, .. }) = tree.as_ref() else {
+            panic!("expected the original three columns");
+        };
+        assert_eq!(sizes, &[200.0, 300.0, 500.0]);
     }
 
     #[test]
@@ -1411,6 +1460,60 @@ mod tests {
 
         assert_eq!(separate.collect_instances(), grouped.collect_instances());
         assert_ne!(separate.split_key(), grouped.split_key());
+    }
+
+    #[test]
+    fn split_key_stays_stable_across_tab_membership_and_order_changes() {
+        let (left, right, added) = (id(), id(), id());
+        let mut tree = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![900.0, 300.0],
+            children: vec![PaneNode::leaf(left), PaneNode::leaf(right)],
+        });
+        let before = tree.as_ref().unwrap().split_key();
+
+        assert!(add_tab(&mut tree, right, added));
+        assert_eq!(tree.as_ref().unwrap().split_key(), before);
+
+        assert!(set_tab_order(&mut tree, added, &[added, right]));
+        assert_eq!(tree.as_ref().unwrap().split_key(), before);
+
+        assert!(remove(&mut tree, right));
+        assert_eq!(tree.as_ref().unwrap().split_key(), before);
+    }
+
+    #[test]
+    fn split_key_changes_when_panes_relocate_with_the_same_shape() {
+        let (a, b, c) = (id(), id(), id());
+        let mut tree = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![200.0, 300.0, 500.0],
+            children: vec![PaneNode::leaf(a), PaneNode::leaf(b), PaneNode::leaf(c)],
+        });
+        let before = tree.as_ref().unwrap().split_key();
+
+        assert!(move_pane_beside(
+            &mut tree,
+            a,
+            c,
+            SplitDirection::Horizontal,
+            false,
+        ));
+        assert_ne!(tree.as_ref().unwrap().split_key(), before);
+        let Some(PaneNode::Split {
+            sizes, children, ..
+        }) = tree.as_ref()
+        else {
+            panic!("expected the three relocated columns");
+        };
+        assert_eq!(sizes, &[300.0, 250.0, 250.0]);
+        assert_eq!(
+            children
+                .iter()
+                .flat_map(PaneNode::collect_instances)
+                .collect::<Vec<_>>(),
+            [b, c, a]
+        );
     }
 
     #[test]
@@ -1557,6 +1660,7 @@ mod tests {
         assert_eq!(
             node,
             PaneNode::Leaf(LeafData {
+                pane_id: id(),
                 tabs: vec![u],
                 active: 0
             })
@@ -1580,10 +1684,18 @@ mod tests {
     fn new_leaf_round_trips_with_multiple_tabs() {
         let (a, b) = (id(), id());
         let node = tabs_leaf(vec![a, b], 1);
+        let PaneNode::Leaf(before_leaf) = &node else {
+            unreachable!();
+        };
         let json = serde_json::to_string(&node).unwrap();
         assert!(json.contains("\"tabs\""));
+        assert!(json.contains("\"pane_id\""));
         let back: PaneNode = serde_json::from_str(&json).unwrap();
         assert_eq!(back, node);
+        let PaneNode::Leaf(after_leaf) = back else {
+            unreachable!();
+        };
+        assert_eq!(after_leaf.pane_id, before_leaf.pane_id);
     }
 
     #[test]

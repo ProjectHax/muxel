@@ -16521,9 +16521,8 @@ impl MuxelApp {
                 sizes,
             } => {
                 let horizontal = *direction == SplitDirection::Horizontal;
-                // Stable id from the split's instance set: the resize state is
-                // keyed by it (persists across renders; resets only when the
-                // split's membership changes — i.e. a pane is added/removed).
+                // Stable id from persistent pane identities: tab membership/order
+                // changes keep the resize state; pane topology changes replace it.
                 let key = node.split_key();
                 // Bumped when the split is evened out, to restart its resizable
                 // state from the equal layout.
@@ -25657,6 +25656,7 @@ mod split_resize_tests {
         let outside = Uuid::new_v4();
         let children = vec![
             PaneNode::Leaf(LeafData {
+                pane_id: Uuid::new_v4(),
                 tabs: vec![terminal_a, editor],
                 active: 0,
             }),
