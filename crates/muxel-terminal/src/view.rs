@@ -326,15 +326,91 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
 }
 
 fn claude_screen_has_current_work(screen: &str) -> bool {
+    let mut newer_rows = [None, None];
     for line in screen.lines().rev() {
-        if is_claude_live_foreground_row(line) || is_claude_live_background_row(line) {
+        if is_claude_live_task_footer(line, newer_rows)
+            || is_claude_live_foreground_row(line)
+            || is_claude_live_background_row(line)
+        {
             return true;
         }
         if is_claude_completed_foreground_row(line) {
             return false;
         }
+        newer_rows[1] = newer_rows[0];
+        newer_rows[0] = Some(line);
     }
     false
+}
+
+fn is_claude_live_task_footer(line: &str, newer_rows: [Option<&str>; 2]) -> bool {
+    if is_claude_live_task_footer_line(line) {
+        return true;
+    }
+    if !line.trim().starts_with("Auto mode") {
+        return false;
+    }
+
+    let mut footer = line.trim().to_string();
+    let mut previous = line;
+    for row in newer_rows.into_iter().flatten() {
+        if row.trim().is_empty() {
+            return false;
+        }
+        if previous.ends_with(char::is_whitespace) || row.starts_with(char::is_whitespace) {
+            footer.push(' ');
+        }
+        footer.push_str(row.trim());
+        if is_claude_live_task_footer_line(&footer) {
+            return true;
+        }
+        previous = row;
+    }
+    false
+}
+
+fn is_claude_live_task_footer_line(line: &str) -> bool {
+    let Some(summary) = line.trim().strip_prefix("Auto mode on · ") else {
+        return false;
+    };
+    let mut tasks = summary
+        .split(" · ")
+        .flat_map(|group| group.split(", "))
+        .peekable();
+    tasks.peek().is_some() && tasks.all(is_claude_live_task_count)
+}
+
+fn is_claude_live_task_count(task: &str) -> bool {
+    let Some((count, kind)) = task.split_once(' ') else {
+        return false;
+    };
+    let Ok(count) = count.parse::<usize>() else {
+        return false;
+    };
+    if count == 0 {
+        return false;
+    }
+    let base = if count == 1 {
+        kind
+    } else {
+        let Some(base) = kind.strip_suffix('s') else {
+            return false;
+        };
+        base
+    };
+    matches!(
+        base,
+        "shell"
+            | "monitor"
+            | "agent"
+            | "team"
+            | "local agent"
+            | "cloud session"
+            | "background task"
+            | "background dynamic workflow"
+            | "MCP task"
+            | "remote dynamic workflow"
+    )
 }
 
 fn is_claude_live_foreground_row(line: &str) -> bool {
@@ -2058,11 +2134,59 @@ mod tests {
             ),
             Some(AgentStatus::Working)
         );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Brewed for 15s · done 11:22 AM\nAuto mode on · 1 shell ·   \n2 agents"
+            ),
+            Some(AgentStatus::Working),
+            "a footer wrapped at a word boundary must remain live"
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Brewed for 15s · done 11:22 AM\nAuto mode on · 1 shell · 2 ag\nents"
+            ),
+            Some(AgentStatus::Working),
+            "a footer wrapped inside a task kind must remain live"
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Brewed for 15s · done 11:22 AM\nAuto mode on · 1 shell · 2 agents"
+            ),
+            Some(AgentStatus::Working),
+            "Claude's current task footer must override the completed foreground row"
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Brewed for 15s · done 11:22 AM\nAuto mode on · 1 shell, 2 monitors · 1 local agent"
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "Auto mode on · 1 shell · 2 agents\n✻ Brewed for 15s · done 11:22 AM"
+            ),
+            None,
+            "a stale footer must not override a newer completion row"
+        );
         for false_positive in [
             "✻ Brewed for 15s · 0 shells still running",
             "✻ Brewed for 15s · 1 shells still running",
             "quoted: ✻ Brewed for 15s · 1 shell still running",
             "✻ Brewed for 15s · 1 shell still running later",
+            "Auto mode on",
+            "Auto mode on · 0 shells",
+            "Auto mode on · 1 shells",
+            "Auto mode on · 2 shell",
+            "Auto mode on · 1 worker",
+            "Auto mode on · 1 shell · 1 hook",
+            "Auto mode on · 1 shell ·",
+            "quoted: Auto mode on · 1 shell · 2 agents",
+            "Auto mode off · 1 shell · 2 agents",
         ] {
             assert_eq!(
                 provider_screen_status(TitleProvider::Claude, false_positive),
