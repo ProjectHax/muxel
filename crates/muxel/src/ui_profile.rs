@@ -17,20 +17,356 @@
 //!
 //! When disabled: single OnceLock check, no flusher, no probe work.
 
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use gpui::{
+    AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, Pixels, Window,
+};
+use uuid::Uuid;
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 static STARTED: OnceLock<Instant> = OnceLock::new();
 static FLUSHER: AtomicBool = AtomicBool::new(false);
+static DEFERRED: OnceLock<SyncSender<DeferredRecord>> = OnceLock::new();
+static DEFERRED_DROPPED: AtomicU64 = AtomicU64::new(0);
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_RENDER_TOKEN: AtomicU64 = AtomicU64::new(0);
+static RENDER_TOKEN: AtomicU64 = AtomicU64::new(0);
+static RENDER_STARTED_US: AtomicU64 = AtomicU64::new(0);
+static RENDER_VIEW: AtomicU64 = AtomicU64::new(0);
+static RENDER_STAGE: AtomicU64 = AtomicU64::new(0);
 
 const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PENDING_RECORDS: usize = 4096;
+const SLOW_RENDER_US: u64 = 50_000;
+
+enum DeferredRecord {
+    Line {
+        at: SystemTime,
+        line: String,
+    },
+    StaticLine {
+        at: SystemTime,
+        line: &'static str,
+    },
+    Phase {
+        at: SystemTime,
+        boundary: PhaseBoundary,
+        id: u64,
+        category: &'static str,
+        phase: &'static str,
+        pane: Option<Uuid>,
+        elapsed_us: Option<u64>,
+    },
+    RenderBlocked {
+        at: SystemTime,
+        token: u64,
+        view: RenderView,
+        stage: RenderStage,
+        active_us: u64,
+    },
+    SlowRender {
+        at: SystemTime,
+        token: u64,
+        view: RenderView,
+        stage: RenderStage,
+        elapsed_us: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderView {
+    Main = 1,
+    Workspace = 2,
+    Popout = 3,
+    DevConsole = 4,
+    FileDiff = 5,
+}
+
+impl RenderView {
+    fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::Main),
+            2 => Some(Self::Workspace),
+            3 => Some(Self::Popout),
+            4 => Some(Self::DevConsole),
+            5 => Some(Self::FileDiff),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Workspace => "workspace",
+            Self::Popout => "popout",
+            Self::DevConsole => "dev-console",
+            Self::FileDiff => "file-diff",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderStage {
+    Build = 1,
+    Frame = 2,
+    RequestLayout = 3,
+    RootLayoutOrCompute = 4,
+    Prepaint = 5,
+    Paint = 6,
+    RootPaintOrPresent = 7,
+}
+
+impl RenderStage {
+    fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::Build),
+            2 => Some(Self::Frame),
+            3 => Some(Self::RequestLayout),
+            4 => Some(Self::RootLayoutOrCompute),
+            5 => Some(Self::Prepaint),
+            6 => Some(Self::Paint),
+            7 => Some(Self::RootPaintOrPresent),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Frame => "frame",
+            Self::RequestLayout => "request-layout",
+            Self::RootLayoutOrCompute => "root-layout-or-compute",
+            Self::Prepaint => "prepaint",
+            Self::Paint => "paint",
+            Self::RootPaintOrPresent => "root-paint-or-present",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PhaseBoundary {
+    Begin,
+    End,
+}
+
+impl PhaseBoundary {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::End => "end",
+        }
+    }
+}
+
+/// A content-free phase boundary around synchronous work that may occupy the UI
+/// thread. Records are timestamped at the call site and written by a bounded
+/// background worker, so profiling cannot add file I/O or lock waits to the
+/// measured path.
+pub struct PhaseSpan {
+    id: u64,
+    category: &'static str,
+    phase: &'static str,
+    pane: Option<Uuid>,
+    started: Instant,
+}
+
+/// High-frequency render watch. Normal frames only touch atomics and emit
+/// nothing; slow frames and probe timeouts enqueue one typed record.
+pub struct RenderWatch {
+    token: u64,
+    view: RenderView,
+    stage: RenderStage,
+    started: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderSnapshot {
+    token: u64,
+    started_us: u64,
+    view: RenderView,
+    stage: RenderStage,
+}
+
+thread_local! {
+    /// Render watches are created and dropped on GPUI's UI thread. A vector is
+    /// required instead of saved previous values because re-entrant Windows
+    /// draws can defer a nested arena clear and therefore destroy watches out
+    /// of LIFO order.
+    static RENDER_STACK: RefCell<Vec<RenderSnapshot>> = const { RefCell::new(Vec::new()) };
+}
+
+struct ProfiledElement {
+    inner: AnyElement,
+    view: RenderView,
+    frame: Option<RenderWatch>,
+}
+
+impl Drop for PhaseSpan {
+    fn drop(&mut self) {
+        let elapsed_us = self.started.elapsed().as_micros() as u64;
+        defer_record(DeferredRecord::Phase {
+            at: SystemTime::now(),
+            boundary: PhaseBoundary::End,
+            id: self.id,
+            category: self.category,
+            phase: self.phase,
+            pane: self.pane,
+            elapsed_us: Some(elapsed_us),
+        });
+    }
+}
+
+impl Drop for RenderWatch {
+    fn drop(&mut self) {
+        let elapsed_us = self.started.elapsed().as_micros() as u64;
+        RENDER_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            remove_render_snapshot(&mut stack, self.token);
+            publish_render_snapshot(stack.last().copied());
+        });
+        if elapsed_us >= SLOW_RENDER_US {
+            defer_record(DeferredRecord::SlowRender {
+                at: SystemTime::now(),
+                token: self.token,
+                view: self.view,
+                stage: self.stage,
+                elapsed_us,
+            });
+        }
+    }
+}
+
+impl RenderWatch {
+    fn mark_stage(&self, stage: RenderStage) {
+        RENDER_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if mark_render_stage(&mut stack, self.token, stage) {
+                publish_render_snapshot(stack.last().copied());
+            }
+        });
+    }
+}
+
+fn remove_render_snapshot(stack: &mut Vec<RenderSnapshot>, token: u64) -> bool {
+    let Some(index) = stack.iter().rposition(|snapshot| snapshot.token == token) else {
+        return false;
+    };
+    stack.remove(index);
+    true
+}
+
+/// Update one live watch. Returns true only when it is the published top.
+fn mark_render_stage(stack: &mut [RenderSnapshot], token: u64, stage: RenderStage) -> bool {
+    let Some(index) = stack.iter().rposition(|snapshot| snapshot.token == token) else {
+        return false;
+    };
+    stack[index].stage = stage;
+    index + 1 == stack.len()
+}
+
+fn publish_render_snapshot(snapshot: Option<RenderSnapshot>) {
+    // Invalidate the previous snapshot first. Readers that caught its token
+    // will reject the record on their second token read.
+    RENDER_TOKEN.store(0, Ordering::Release);
+    if let Some(snapshot) = snapshot {
+        RENDER_STARTED_US.store(snapshot.started_us, Ordering::Relaxed);
+        RENDER_VIEW.store(snapshot.view as u64, Ordering::Relaxed);
+        RENDER_STAGE.store(snapshot.stage as u64, Ordering::Relaxed);
+        RENDER_TOKEN.store(snapshot.token, Ordering::Release);
+    }
+}
+
+impl IntoElement for ProfiledElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for ProfiledElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let layout = {
+            let _watch = watch_render(self.view, RenderStage::RequestLayout);
+            self.inner.request_layout(window, cx)
+        };
+        if let Some(frame) = &self.frame {
+            // gpui-component's thin Root still finishes its own request-layout
+            // callback before GPUI computes the window layout. This stage names
+            // that combined, otherwise hookless interval without overstating it.
+            frame.mark_stage(RenderStage::RootLayoutOrCompute);
+        }
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        {
+            let _watch = watch_render(self.view, RenderStage::Prepaint);
+            self.inner.prepaint(window, cx);
+        }
+        if let Some(frame) = &self.frame {
+            frame.mark_stage(RenderStage::Frame);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        {
+            let _watch = watch_render(self.view, RenderStage::Paint);
+            self.inner.paint(window, cx);
+        }
+        if let Some(frame) = &self.frame {
+            // gpui-component's Root may still paint after this child returns;
+            // GPUI then finalizes the scene and presents before clearing the
+            // arena. Keep the sentinel through that combined hookless interval.
+            frame.mark_stage(RenderStage::RootPaintOrPresent);
+        }
+    }
+}
 
 /// Present-pump ticks handled on the UI thread.
 static PUMP_N: AtomicU64 = AtomicU64::new(0);
@@ -54,6 +390,8 @@ static PROBE_SPIKE_50MS: AtomicU64 = AtomicU64::new(0);
 static PROBE_SPIKE_200MS: AtomicU64 = AtomicU64::new(0);
 /// Probes that never came back within the wait window.
 static PROBE_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+/// Probes that could not be posted at all (not evidence of a busy UI thread).
+static PROBE_POST_FAILURE: AtomicU64 = AtomicU64::new(0);
 /// Last probe send tick (GetTickCount64); 0 = none in flight / completed.
 #[allow(dead_code)] // present-pump telemetry: only `present_pump` (Windows) writes it
 static PROBE_SENT_TICK: AtomicU64 = AtomicU64::new(0);
@@ -123,13 +461,11 @@ fn open_log(path: &Path) -> Option<std::fs::File> {
     OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
-fn emit(line: &str) {
+fn emit_at(at: SystemTime, line: &str) {
     if !is_enabled() {
         return;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = at.duration_since(UNIX_EPOCH).unwrap_or_default();
     let line = format!("[{}.{:03}] {line}", now.as_secs(), now.subsec_millis());
     let path = log_path();
     let slot = LOG_FILE.get_or_init(|| Mutex::new(open_log(path)));
@@ -149,10 +485,109 @@ fn emit(line: &str) {
     }
 }
 
+fn emit(line: &str) {
+    emit_at(SystemTime::now(), line);
+}
+
+fn deferred_sender() -> &'static SyncSender<DeferredRecord> {
+    DEFERRED.get_or_init(|| {
+        let (tx, rx) = sync_channel(MAX_PENDING_RECORDS);
+        let _ = std::thread::Builder::new()
+            .name("muxel-ui-prof-records".into())
+            .spawn(move || deferred_writer(rx));
+        tx
+    })
+}
+
+fn deferred_writer(rx: Receiver<DeferredRecord>) {
+    while let Ok(record) = rx.recv() {
+        match record {
+            DeferredRecord::Line { at, line } => emit_at(at, &line),
+            DeferredRecord::StaticLine { at, line } => emit_at(at, line),
+            DeferredRecord::Phase {
+                at,
+                boundary,
+                id,
+                category,
+                phase,
+                pane,
+                elapsed_us,
+            } => emit_at(
+                at,
+                &phase_line(boundary.label(), id, category, phase, pane, elapsed_us),
+            ),
+            DeferredRecord::RenderBlocked {
+                at,
+                token,
+                view,
+                stage,
+                active_us,
+            } => emit_at(
+                at,
+                &render_line("blocked", token, view, stage, "active", active_us),
+            ),
+            DeferredRecord::SlowRender {
+                at,
+                token,
+                view,
+                stage,
+                elapsed_us,
+            } => emit_at(
+                at,
+                &render_line("slow", token, view, stage, "elapsed", elapsed_us),
+            ),
+        }
+    }
+}
+
+fn try_defer_to(tx: Option<&SyncSender<DeferredRecord>>, record: DeferredRecord) -> bool {
+    tx.is_some_and(|tx| tx.try_send(record).is_ok())
+}
+
+fn defer_record(record: DeferredRecord) {
+    if !try_defer_to(DEFERRED.get(), record) {
+        DEFERRED_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn phase_line(
+    boundary: &str,
+    id: u64,
+    category: &str,
+    phase: &str,
+    pane: Option<Uuid>,
+    elapsed_us: Option<u64>,
+) -> String {
+    let pane = pane.map_or_else(|| "none".to_string(), |pane| pane.to_string());
+    let elapsed = elapsed_us.map_or_else(String::new, |us| format!(" elapsed={us}µs"));
+    format!(
+        "ui-prof[phase {boundary}] span={id} category={category} phase={phase} pane={pane}{elapsed}"
+    )
+}
+
+fn render_line(
+    event: &str,
+    token: u64,
+    view: RenderView,
+    stage: RenderStage,
+    duration_label: &str,
+    duration_us: u64,
+) -> String {
+    format!(
+        "ui-prof[render {event}] token={token} view={} stage={} {duration_label}={duration_us}µs",
+        view.label(),
+        stage.label(),
+    )
+}
+
 fn ensure_flusher() {
     if !is_enabled() {
         return;
     }
+    // Every caller that can enqueue a record first observes an initialized
+    // sender. This closes the tiny race where a second thread saw `FLUSHER=true`
+    // before the winning thread had published `DEFERRED`.
+    let _ = deferred_sender();
     if FLUSHER
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -160,11 +595,14 @@ fn ensure_flusher() {
         return;
     }
     STARTED.get_or_init(Instant::now);
-    emit(&format!(
-        "ui-prof[start] pid={} path={}",
-        std::process::id(),
-        log_path().display()
-    ));
+    defer_record(DeferredRecord::Line {
+        at: SystemTime::now(),
+        line: format!(
+            "ui-prof[start] pid={} path={}",
+            std::process::id(),
+            log_path().display()
+        ),
+    });
     std::thread::Builder::new()
         .name("muxel-ui-prof".into())
         .spawn(|| {
@@ -206,6 +644,109 @@ fn ensure_flusher() {
             }
         })
         .ok();
+}
+
+/// Record a low-volume, opt-in subsystem event beside the UI health counters.
+pub fn event(category: &str, event: &str) {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    defer_record(DeferredRecord::Line {
+        at: SystemTime::now(),
+        line: format!("ui-prof[{category}] {event}"),
+    });
+}
+
+/// Begin one synchronous profiler phase. The returned guard writes its end
+/// boundary on drop. `category` and `phase` must be fixed labels; `pane` is the
+/// only correlation value, keeping command lines, paths, and session ids out of
+/// the log.
+pub fn phase(category: &'static str, phase: &'static str, pane: Option<Uuid>) -> Option<PhaseSpan> {
+    if !is_enabled() {
+        return None;
+    }
+    ensure_flusher();
+    let id = NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let started = Instant::now();
+    defer_record(DeferredRecord::Phase {
+        at: SystemTime::now(),
+        boundary: PhaseBoundary::Begin,
+        id,
+        category,
+        phase,
+        pane,
+        elapsed_us: None,
+    });
+    Some(PhaseSpan {
+        id,
+        category,
+        phase,
+        pane,
+        started,
+    })
+}
+
+fn profiler_elapsed_us() -> u64 {
+    STARTED.get().map_or(0, |started| {
+        started.elapsed().as_micros().min(u64::MAX as u128) as u64
+    })
+}
+
+fn watch_render(view: RenderView, stage: RenderStage) -> Option<RenderWatch> {
+    if !is_enabled() {
+        return None;
+    }
+    ensure_flusher();
+    let token = NEXT_RENDER_TOKEN
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    let started = Instant::now();
+    let snapshot = RenderSnapshot {
+        token,
+        started_us: profiler_elapsed_us(),
+        view,
+        stage,
+    };
+    RENDER_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        stack.push(snapshot);
+        publish_render_snapshot(stack.last().copied());
+    });
+    Some(RenderWatch {
+        token,
+        view,
+        stage,
+        started,
+    })
+}
+
+/// Mark root-view element construction as the current UI-thread render stage.
+/// Normal frames touch atomics only and produce no log record.
+pub fn watch_render_build(view: RenderView) -> Option<RenderWatch> {
+    watch_render(view, RenderStage::Build)
+}
+
+/// Wrap the application element beneath gpui-component's thin window Root so
+/// request-layout, the remaining root/layout interval, prepaint, paint, and the
+/// remaining root/present interval stay observable after `Render::render`.
+pub fn finish_render(
+    view: RenderView,
+    build: Option<RenderWatch>,
+    element: impl IntoElement,
+) -> AnyElement {
+    let inner = element.into_any_element();
+    drop(build);
+    if !is_enabled() {
+        inner
+    } else {
+        ProfiledElement {
+            inner,
+            view,
+            frame: watch_render(view, RenderStage::Frame),
+        }
+        .into_any_element()
+    }
 }
 
 fn working_set_bytes() -> Option<u64> {
@@ -253,8 +794,17 @@ fn dump_interval(tag: &str) {
     let p50 = PROBE_SPIKE_50MS.swap(0, Ordering::Relaxed);
     let p200 = PROBE_SPIKE_200MS.swap(0, Ordering::Relaxed);
     let pto = PROBE_TIMEOUT.swap(0, Ordering::Relaxed);
+    let post_fail = PROBE_POST_FAILURE.swap(0, Ordering::Relaxed);
+    let deferred_dropped = DEFERRED_DROPPED.swap(0, Ordering::Relaxed);
 
-    if n == 0 && pn == 0 && coal == 0 && posts == 0 && pto == 0 {
+    if n == 0
+        && pn == 0
+        && coal == 0
+        && posts == 0
+        && pto == 0
+        && post_fail == 0
+        && deferred_dropped == 0
+    {
         return;
     }
 
@@ -269,9 +819,11 @@ fn dump_interval(tag: &str) {
         || p50 > 0
         || p200 > 0
         || pto > 0
+        || post_fail > 0
         || pmax >= 50_000
         || max >= 8_000
-        || coal > posts.saturating_add(n).max(1); // heavy coalesce
+        || coal > posts.saturating_add(n).max(1)
+        || deferred_dropped > 0; // heavy coalesce / saturated record worker
 
     if !interesting && tag == "tick" {
         return;
@@ -280,7 +832,8 @@ fn dump_interval(tag: &str) {
     emit(&format!(
         "ui-prof[v1 {tag}] pump={n} avg={pump_avg}µs max={max}µs spikes(>8ms={s8} >30ms={s30}) \
          hwnds/tick≈{hwnd_avg} posts={posts} coalesce={coal} \
-         probe n={pn} avg={probe_avg}µs max={pmax}µs spikes(>50ms={p50} >200ms={p200}) timeout={pto}"
+         probe n={pn} avg={probe_avg}µs max={pmax}µs spikes(>50ms={p50} >200ms={p200}) timeout={pto} post_fail={post_fail} \
+         deferred_dropped={deferred_dropped}"
     ));
 }
 
@@ -299,6 +852,8 @@ fn dump_snapshot(tag: &str) {
     let p50 = PROBE_SPIKE_50MS.swap(0, Ordering::Relaxed);
     let p200 = PROBE_SPIKE_200MS.swap(0, Ordering::Relaxed);
     let pto = PROBE_TIMEOUT.swap(0, Ordering::Relaxed);
+    let post_fail = PROBE_POST_FAILURE.swap(0, Ordering::Relaxed);
+    let deferred_dropped = DEFERRED_DROPPED.swap(0, Ordering::Relaxed);
     let _ = PUMP_HWNDS.swap(0, Ordering::Relaxed);
 
     let up_s = STARTED.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
@@ -311,7 +866,8 @@ fn dump_snapshot(tag: &str) {
     emit(&format!(
         "ui-prof[v1 snapshot {tag}] up={up_s}s ws={ws} \
          pump={n} avg={pump_avg}µs max={max}µs spikes(>8ms={s8} >30ms={s30}) posts={posts} coalesce={coal} \
-         probe n={pn} avg={probe_avg}µs max={pmax}µs spikes(>50ms={p50} >200ms={p200}) timeout={pto}"
+         probe n={pn} avg={probe_avg}µs max={pmax}µs spikes(>50ms={p50} >200ms={p200}) timeout={pto} post_fail={post_fail} \
+         deferred_dropped={deferred_dropped}"
     ));
 }
 
@@ -364,10 +920,13 @@ pub fn move_size_changed(active: bool) {
         return;
     }
     ensure_flusher();
-    emit(if active {
-        "ui-prof[move-size enter]"
-    } else {
-        "ui-prof[move-size exit]"
+    defer_record(DeferredRecord::StaticLine {
+        at: SystemTime::now(),
+        line: if active {
+            "ui-prof[move-size enter]"
+        } else {
+            "ui-prof[move-size exit]"
+        },
     });
 }
 
@@ -399,6 +958,44 @@ pub fn probe_timeout() {
     }
     ensure_flusher();
     PROBE_TIMEOUT.fetch_add(1, Ordering::Relaxed);
+    let token = RENDER_TOKEN.load(Ordering::Acquire);
+    if token == 0 {
+        defer_record(DeferredRecord::StaticLine {
+            at: SystemTime::now(),
+            line: "ui-prof[probe timeout] no-render-active",
+        });
+        return;
+    }
+    let started_us = RENDER_STARTED_US.load(Ordering::Relaxed);
+    let view = RenderView::from_code(RENDER_VIEW.load(Ordering::Relaxed));
+    let stage = RenderStage::from_code(RENDER_STAGE.load(Ordering::Relaxed));
+    std::sync::atomic::fence(Ordering::Acquire);
+    // Re-read the token after the associated fields. A changed or cleared token
+    // means the render stage ended while the probe thread sampled it.
+    if token != RENDER_TOKEN.load(Ordering::Acquire) {
+        return;
+    }
+    if let (Some(view), Some(stage)) = (view, stage) {
+        defer_record(DeferredRecord::RenderBlocked {
+            at: SystemTime::now(),
+            token,
+            view,
+            stage,
+            active_us: profiler_elapsed_us().saturating_sub(started_us),
+        });
+    }
+}
+
+/// Record failure to enqueue the probe itself. This is transport evidence, not
+/// proof that the UI thread failed to answer, so it must not sample render state.
+#[allow(dead_code)]
+pub fn probe_post_failed() {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    PROBE_SENT_TICK.store(0, Ordering::Relaxed);
+    PROBE_POST_FAILURE.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Force an immediate snapshot (future hotkey / debugger). Best-effort.
@@ -429,4 +1026,89 @@ pub fn probe_mark_sent(tick_ms: u64) {
 #[allow(dead_code)]
 pub fn probe_last_sent() -> u64 {
     PROBE_SENT_TICK.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_record_queue_is_bounded_and_nonblocking() {
+        let (tx, _rx) = sync_channel(1);
+        assert!(try_defer_to(
+            Some(&tx),
+            DeferredRecord::Line {
+                at: UNIX_EPOCH,
+                line: "first".into(),
+            }
+        ));
+        assert!(!try_defer_to(
+            Some(&tx),
+            DeferredRecord::Line {
+                at: UNIX_EPOCH,
+                line: "second".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn phase_records_only_fixed_labels_and_pane_identity() {
+        let pane = Uuid::nil();
+        assert_eq!(
+            phase_line("end", 7, "activation", "resume-scan", Some(pane), Some(42)),
+            "ui-prof[phase end] span=7 category=activation phase=resume-scan pane=00000000-0000-0000-0000-000000000000 elapsed=42µs"
+        );
+    }
+
+    #[test]
+    fn render_records_use_bounded_view_and_stage_labels() {
+        assert_eq!(
+            render_line(
+                "blocked",
+                9,
+                RenderView::Workspace,
+                RenderStage::RootLayoutOrCompute,
+                "active",
+                15_281_000,
+            ),
+            "ui-prof[render blocked] token=9 view=workspace stage=root-layout-or-compute active=15281000µs"
+        );
+        assert_eq!(RenderView::from_code(99), None);
+        assert_eq!(RenderStage::from_code(99), None);
+    }
+
+    #[test]
+    fn reentrant_render_drops_never_resurrect_a_dead_watch() {
+        let snapshot = |token, stage| RenderSnapshot {
+            token,
+            started_us: token * 10,
+            view: RenderView::Main,
+            stage,
+        };
+        let mut stack = vec![
+            snapshot(1, RenderStage::Frame),
+            snapshot(2, RenderStage::Paint),
+            snapshot(3, RenderStage::Frame),
+        ];
+
+        // A nested draw survives while an outer stage guard is destroyed.
+        assert!(remove_render_snapshot(&mut stack, 2));
+        assert_eq!(stack.last().map(|watch| watch.token), Some(3));
+        // The hidden outer frame can progress without replacing the nested top.
+        assert!(!mark_render_stage(
+            &mut stack,
+            1,
+            RenderStage::RootPaintOrPresent,
+        ));
+        assert_eq!(stack.last().map(|watch| watch.token), Some(3));
+        // Once the nested draw dies, only the still-live outer frame resurfaces.
+        assert!(remove_render_snapshot(&mut stack, 3));
+        assert_eq!(
+            stack.last(),
+            Some(&snapshot(1, RenderStage::RootPaintOrPresent))
+        );
+        assert!(remove_render_snapshot(&mut stack, 1));
+        assert!(stack.is_empty());
+        assert!(!remove_render_snapshot(&mut stack, 2));
+    }
 }

@@ -235,7 +235,7 @@ pub fn spawn() {
                     PostMessageW(sink, WM_MUXEL_PROBE, WPARAM(sent as usize), LPARAM(0)).is_ok()
                 };
                 if !ok {
-                    crate::ui_profile::probe_timeout();
+                    crate::ui_profile::probe_post_failed();
                     continue;
                 }
                 std::thread::sleep(Duration::from_millis(1000));

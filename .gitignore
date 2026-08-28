@@ -9,6 +9,8 @@
 # local performance captures and derived analysis; never publish trace data
 /.muxel-local/
 /.perf-analysis/
+/term-prof*.log
+/ui-prof*.log
 
 # local-only dev config (per-developer; not part of the public repo)
 /.claude/
