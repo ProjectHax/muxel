@@ -118,6 +118,7 @@ objc2-foundation = "0.3"
 # version gpui_windows already pins, so this adds nothing new to the tree.
 [target.'cfg(target_os = "windows")'.dependencies]
 webview2-com = "=0.38.2"
+windows-webview = { package = "windows", version = "0.61" }
 windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

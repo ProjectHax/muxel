@@ -60,9 +60,21 @@ fn should_publish_url(changed: bool, navigation_committed: bool) -> bool {
     changed || navigation_committed
 }
 
+fn should_sample_native_visibility(
+    visibility_changed: bool,
+    reason: crate::ui_profile::BrowserVisibilityReason,
+) -> bool {
+    visibility_changed
+        || matches!(
+            reason,
+            crate::ui_profile::BrowserVisibilityReason::Project
+                | crate::ui_profile::BrowserVisibilityReason::Overlay
+        )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{should_publish_url, tab_label};
+    use super::{should_publish_url, should_sample_native_visibility, tab_label};
 
     #[test]
     fn local_file_tab_uses_decoded_filename() {
@@ -77,6 +89,16 @@ mod tests {
         assert!(should_publish_url(false, true));
         assert!(should_publish_url(true, false));
         assert!(!should_publish_url(false, false));
+    }
+
+    #[test]
+    fn project_and_overlay_boundaries_probe_even_without_a_native_transition() {
+        use crate::ui_profile::BrowserVisibilityReason::{Overlay, Pane, Project};
+
+        assert!(should_sample_native_visibility(false, Project));
+        assert!(should_sample_native_visibility(false, Overlay));
+        assert!(!should_sample_native_visibility(false, Pane));
+        assert!(should_sample_native_visibility(true, Pane));
     }
 }
 
@@ -164,6 +186,8 @@ mod imp {
     "#;
 
     pub struct BrowserView {
+        instance_id: uuid::Uuid,
+        project_id: uuid::Uuid,
         focus_handle: FocusHandle,
         webview: Option<Entity<gpui_wry::WebView>>,
         /// Set once the deferred build finished *and* failed, so `render` can
@@ -176,6 +200,10 @@ mod imp {
         pending_navigation_from: Option<String>,
         /// What the app last asked of the native child (dedupes plaform calls).
         native_visible: bool,
+        profile_project_active: bool,
+        profile_pane_active: bool,
+        profile_overlay: bool,
+        last_profile_bounds: Option<Bounds<Pixels>>,
         /// Native page-focus events. WebView2 reports these from its controller;
         /// macOS uses guarded page IPC until WKWebView exposes the same seam.
         focus_events: std::sync::mpsc::Receiver<bool>,
@@ -185,7 +213,14 @@ mod imp {
     }
 
     impl BrowserView {
-        pub fn new(url: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        pub fn new(
+            instance_id: uuid::Uuid,
+            project_id: uuid::Uuid,
+            url: String,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
+            crate::ui_profile::register_focus_pane(instance_id, window);
             let address = cx.new(|cx| InputState::new(window, cx).default_value(url.clone()));
             cx.subscribe_in(
                 &address,
@@ -294,6 +329,10 @@ mod imp {
                             let got_tx = focus_tx.clone();
                             let got_focus =
                                 FocusChangedEventHandler::create(Box::new(move |_, _| {
+                                    crate::ui_profile::focus_action_for_pane(
+                                        crate::ui_profile::FocusActionReason::NativeBrowserGain,
+                                        instance_id,
+                                    );
                                     let _ = got_tx.send(true);
                                     Ok(())
                                 }));
@@ -334,9 +373,34 @@ mod imp {
                     };
                     let wv = cx.new(|cx2| gpui_wry::WebView::new(wv, window, cx2));
                     // Re-apply whatever the pane changed while the build ran.
-                    if !this.native_visible {
-                        wv.update(cx, |wv, _| wv.hide());
-                    }
+                    let visible = this.native_visible;
+                    let bounds = wv.read(cx).bounds();
+                    let bounds_changed = this
+                        .last_profile_bounds
+                        .replace(bounds)
+                        .is_some_and(|previous| previous != bounds);
+                    let project_active = this.profile_project_active;
+                    let pane_active = this.profile_pane_active;
+                    wv.update(cx, |wv, _| {
+                        if visible {
+                            wv.show()
+                        } else {
+                            wv.hide()
+                        }
+                        #[cfg(target_os = "windows")]
+                        crate::ui_profile::profile_browser_native_visibility(
+                            crate::ui_profile::BrowserVisibilityContext {
+                                project: project_id,
+                                pane: instance_id,
+                                reason: crate::ui_profile::BrowserVisibilityReason::Initial,
+                                requested: visible,
+                                project_active,
+                                pane_active,
+                                bounds_changed,
+                            },
+                            wv.raw(),
+                        );
+                    });
                     if this.url != requested {
                         let current = this.url.clone();
                         wv.update(cx, |wv, _| wv.load_url(&current));
@@ -348,6 +412,8 @@ mod imp {
             .detach();
 
             Self {
+                instance_id,
+                project_id,
                 focus_handle: cx.focus_handle(),
                 webview: None,
                 webview_failed: false,
@@ -355,6 +421,10 @@ mod imp {
                 url,
                 pending_navigation_from: None,
                 native_visible: true,
+                profile_project_active: true,
+                profile_pane_active: true,
+                profile_overlay: false,
+                last_profile_bounds: None,
                 focus_events,
                 new_window_events,
             }
@@ -393,6 +463,10 @@ mod imp {
             if !self.native_visible {
                 return;
             }
+            crate::ui_profile::focus_action_for_pane(
+                crate::ui_profile::FocusActionReason::NativeBrowserAccepted,
+                self.instance_id,
+            );
             if let Some(wv) = &self.webview {
                 let _ = wv.read(cx).raw().focus();
             }
@@ -520,13 +594,57 @@ mod imp {
         /// Show/hide the NATIVE child window. The app drives this every frame:
         /// hidden whenever an overlay covers the pane area or this tab isn't
         /// the active one (the native view otherwise floats above everything).
-        pub fn set_native_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
-            if self.native_visible == visible {
+        pub fn set_native_visible(
+            &mut self,
+            visible: bool,
+            project_active: bool,
+            pane_active: bool,
+            overlay: bool,
+            cx: &mut Context<Self>,
+        ) {
+            let reason = if self.profile_overlay != overlay {
+                crate::ui_profile::BrowserVisibilityReason::Overlay
+            } else if self.profile_project_active != project_active {
+                crate::ui_profile::BrowserVisibilityReason::Project
+            } else {
+                crate::ui_profile::BrowserVisibilityReason::Pane
+            };
+            self.profile_project_active = project_active;
+            self.profile_pane_active = pane_active;
+            self.profile_overlay = overlay;
+            let visibility_changed = self.native_visible != visible;
+            if !should_sample_native_visibility(visibility_changed, reason) {
                 return;
             }
-            self.native_visible = visible;
+            if visibility_changed {
+                self.native_visible = visible;
+            }
             if let Some(wv) = &self.webview {
-                wv.update(cx, |wv, _| if visible { wv.show() } else { wv.hide() });
+                let instance_id = self.instance_id;
+                let project_id = self.project_id;
+                let bounds = wv.read(cx).bounds();
+                let bounds_changed = self
+                    .last_profile_bounds
+                    .replace(bounds)
+                    .is_some_and(|previous| previous != bounds);
+                wv.update(cx, |wv, _| {
+                    if visibility_changed {
+                        if visible { wv.show() } else { wv.hide() }
+                    }
+                    #[cfg(target_os = "windows")]
+                    crate::ui_profile::profile_browser_native_visibility(
+                        crate::ui_profile::BrowserVisibilityContext {
+                            project: project_id,
+                            pane: instance_id,
+                            reason,
+                            requested: visible,
+                            project_active,
+                            pane_active,
+                            bounds_changed,
+                        },
+                        wv.raw(),
+                    );
+                });
             }
         }
     }
@@ -547,6 +665,10 @@ mod imp {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _event, window, cx| {
+                        crate::ui_profile::focus_action_for_pane(
+                            crate::ui_profile::FocusActionReason::PanePointer,
+                            this.instance_id,
+                        );
                         this.focus_handle.focus(window, cx);
                     }),
                 )
@@ -634,7 +756,13 @@ mod imp {
     }
 
     impl BrowserView {
-        pub fn new(url: String, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+        pub fn new(
+            _instance_id: uuid::Uuid,
+            _project_id: uuid::Uuid,
+            url: String,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Self {
             Self {
                 focus_handle: cx.focus_handle(),
                 url,
@@ -659,7 +787,15 @@ mod imp {
             Vec::new()
         }
 
-        pub fn set_native_visible(&mut self, _visible: bool, _cx: &mut Context<Self>) {}
+        pub fn set_native_visible(
+            &mut self,
+            _visible: bool,
+            _project_active: bool,
+            _pane_active: bool,
+            _overlay: bool,
+            _cx: &mut Context<Self>,
+        ) {
+        }
 
         /// No embedded webview here, so clicks land on ordinary gpui elements and
         /// the pane's own `on_mouse_down` already focuses it (see the macOS/Windows
