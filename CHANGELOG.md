@@ -5,6 +5,52 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-08-28
+
+### Added
+- **Open files follow changes made outside muxel** — an agent writing a file you
+  already had open left you reading a stale copy until you closed the tab and
+  opened it again. Editors now notice when a file changes on disk and refresh
+  themselves, keeping your cursor and scroll position where they were. If you had
+  unsaved edits of your own, nothing is overwritten: the editor keeps your text and
+  offers **Reload** or **Keep mine** so the choice stays yours. A file that is
+  deleted or becomes unreadable stays open with a warning instead of vanishing, and
+  Markdown panes now remember whether you were reading the raw or rendered view when
+  you pop them out into their own window.
+
+### Fixed
+- **A pane comes back on the conversation you switched it to** — Claude and Codex
+  can change conversations in place with `/resume`, but muxel only ever remembered
+  the one a pane started with. Restarting the app reopened the old conversation, or
+  a blank one. A pane now learns about a switch as it happens and restores the
+  conversation you were actually in, and it only accepts a new one after confirming
+  that conversation belongs to that pane's directory and isn't already open in a
+  sibling pane — so two panes on the same folder no longer steal each other's
+  history.
+- **Claude and Grok panes stop reporting Done while they are still working** — both
+  agents changed the shape of what they publish, and muxel was reading the older
+  form. Claude's newer spinner went unrecognized, a pane waiting on a permission
+  prompt looked idle rather than blocked, and both agents return to an idle title
+  while background shells and commands are still running. muxel now reads the
+  current spinners, marks a pane blocked when it is genuinely waiting on you, and
+  keeps a pane Working while it reports background work of its own — settling to
+  Done only once that work is really finished.
+- **A finished notification clears when the agent picks the work back up** — a
+  card saying an agent was done stayed in the feed after that pane started another
+  turn, so the sidebar said Working while the notification still said finished. A
+  pane's cards are now cleared when it goes back to work; other panes and general
+  app notifications are untouched.
+- **Task runners hand Codex the task instead of an empty prompt** — running Review,
+  Security Review, or any task of your own against Codex opened a pane and then sat
+  there at a blank prompt, because the task was being passed as a hidden instruction
+  the agent never acted on. The task is now typed and submitted as a normal first
+  turn, and the pane is still yours for follow-up once it finishes.
+- **Windows tools that take an empty argument start again** — Windows drops empty
+  values when passing them between processes, so an option written as `--tools ""`
+  arrived at the agent with its value missing and the agent exited before its
+  interface came up. Empty arguments now survive the trip intact, keeping every
+  later argument in the right position.
+
 ## [0.1.8] — 2026-08-20
 
 ### Added
