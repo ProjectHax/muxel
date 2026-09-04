@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -96,9 +96,11 @@ pub fn focus_changed(instance_id: Uuid, focused: bool) {
     if !focused {
         clear_pane_state(instance_id);
     }
-    emit_line(&format!(
-        "term-focus[v1] pane={instance_id} focused={focused}"
-    ));
+    defer(DeferredRecord::Focus {
+        instance_id,
+        focused,
+    });
+    touch();
 }
 
 pub(crate) fn pane_closed(instance_id: Uuid) {
@@ -110,6 +112,7 @@ pub(crate) fn pane_closed(instance_id: Uuid) {
 fn clear_pane_state(instance_id: Uuid) {
     if let Ok(mut panes) = pane_latency().lock() {
         panes.remove(&instance_id);
+        PANE_LATENCY_ACTIVE.store(!panes.is_empty(), Ordering::Release);
     }
     if let Ok(mut cursor) = LAST_CURSOR.lock()
         && cursor.is_some_and(|(pane, _, _)| pane == instance_id)
@@ -155,18 +158,46 @@ fn log_path() -> &'static PathBuf {
     })
 }
 
+fn rotated_log_path(path: &Path) -> PathBuf {
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    PathBuf::from(rotated)
+}
+
+/// Prepare a bounded live log before it is opened. If rotation cannot replace
+/// the backup, truncate the live file; if neither operation succeeds, stop
+/// logging rather than append without a bound.
+fn prepare_log_path(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    if meta.len() < PROFILE_LOG_MAX_BYTES {
+        return true;
+    }
+    let rotated = rotated_log_path(path);
+    match std::fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+    if std::fs::rename(path, &rotated).is_ok() {
+        return true;
+    }
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .is_ok()
+}
+
 fn open_log_file(path: &Path) -> Option<std::fs::File> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     // Append across restarts so a long session (or many short ones) builds a
     // corpus; rotate when large so a multi-day run cannot fill the disk.
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() >= PROFILE_LOG_MAX_BYTES
-    {
-        let mut rotated = path.as_os_str().to_owned();
-        rotated.push(".1");
-        let _ = std::fs::rename(path, PathBuf::from(rotated));
+    if !prepare_log_path(path) {
+        return None;
     }
     match OpenOptions::new().create(true).append(true).open(path) {
         Ok(f) => Some(f),
@@ -177,6 +208,13 @@ fn open_log_file(path: &Path) -> Option<std::fs::File> {
             None
         }
     }
+}
+
+fn reopen_log_file(slot: &mut Option<std::fs::File>, path: &Path) {
+    // The explicit first assignment matters on Windows: an assignment whose
+    // RHS opens/rotates first would retain the old handle until too late.
+    *slot = None;
+    *slot = open_log_file(path);
 }
 
 fn emit_line(line: &str) {
@@ -206,7 +244,7 @@ fn emit_line(line: &str) {
                 .unwrap_or(false)
         });
         if needs_reopen {
-            *g = open_log_file(path);
+            reopen_log_file(&mut g, path);
         }
         if let Some(f) = g.as_mut() {
             let _ = writeln!(f, "{line}");
@@ -293,10 +331,39 @@ struct StartupRecord {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct PointerRecord {
+    instance_id: Uuid,
+    event: &'static str,
+    mouse_reporting: bool,
+    shift: bool,
+}
+
+fn pointer_event_label(event: &str) -> &'static str {
+    match event {
+        "down" => "down",
+        "wheel" => "wheel",
+        _ => "other",
+    }
+}
+
+fn focus_line(instance_id: Uuid, focused: bool) -> String {
+    format!("term-focus[v1] pane={instance_id} focused={focused}")
+}
+
+fn pointer_line(pointer: PointerRecord) -> String {
+    format!(
+        "term-pointer[v1] pane={} event={} mouse_reporting={} shift={}",
+        pointer.instance_id, pointer.event, pointer.mouse_reporting, pointer.shift,
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
 enum DeferredRecord {
     Startup(StartupRecord),
     SlowWrite(SlowWrite),
     SlowLatency(SlowLatency),
+    Focus { instance_id: Uuid, focused: bool },
+    Pointer(PointerRecord),
 }
 
 const MAX_PENDING_RECORDS: usize = 128;
@@ -580,6 +647,7 @@ impl PaneLatency {
 }
 
 static PANE_LATENCY: OnceLock<std::sync::Mutex<HashMap<Uuid, PaneLatency>>> = OnceLock::new();
+static PANE_LATENCY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn pane_latency() -> &'static std::sync::Mutex<HashMap<Uuid, PaneLatency>> {
     PANE_LATENCY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
@@ -600,6 +668,19 @@ fn update_latency_pane<R>(
         panes.remove(&instance_id);
     }
     result
+}
+
+/// Drop unanswered keys after the same horizon used by [`PaneLatency::read`].
+/// Later stages stay alive: a long reader/UI delay is precisely what this
+/// profiler is meant to capture.
+fn prune_stale_pending_keys(panes: &mut HashMap<Uuid, PaneLatency>, now: u64) {
+    panes.retain(|_, pane| {
+        pane.pending_key_at == 0 || now.saturating_sub(pane.pending_key_at) < LATENCY_STALE_US
+    });
+}
+
+fn publish_latency_activity(panes: &HashMap<Uuid, PaneLatency>) {
+    PANE_LATENCY_ACTIVE.store(!panes.is_empty(), Ordering::Release);
 }
 
 /// Samples older than this are dropped as stale — the key had no echo (arrow
@@ -640,9 +721,13 @@ fn flusher_loop(rx: Receiver<DeferredRecord>) {
     let mut records = Vec::with_capacity(MAX_PENDING_RECORDS);
     let mut last_dump = Instant::now();
     loop {
+        if records.len() == MAX_PENDING_RECORDS {
+            dump("capacity", &mut records);
+            last_dump = Instant::now();
+        }
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(record) if records.len() < MAX_PENDING_RECORDS => records.push(record),
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(record) => records.push(record),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
         while records.len() < MAX_PENDING_RECORDS {
@@ -849,6 +934,11 @@ fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
                     sample.min_interval_us / 1000,
                 ));
             }
+            DeferredRecord::Focus {
+                instance_id,
+                focused,
+            } => emit_line(&focus_line(instance_id, focused)),
+            DeferredRecord::Pointer(pointer) => emit_line(&pointer_line(pointer)),
         }
     }
 }
@@ -864,6 +954,7 @@ pub fn key_started(instance_id: Uuid, started_at: Instant) {
             .entry(instance_id)
             .or_default()
             .key(instant_us(started_at));
+        publish_latency_activity(&panes);
     }
 }
 
@@ -939,11 +1030,19 @@ pub(crate) fn output_drained(instance_id: Uuid, timing: PtyReadTiming) {
     c.read_drain_us.fetch_add(elapsed, Ordering::Relaxed);
     c.read_drain_max_us.fetch_max(elapsed, Ordering::Relaxed);
     c.read_drain_n.fetch_add(1, Ordering::Relaxed);
+    // Background output has no per-key chain to correlate. Keep aggregate
+    // counters, but do not contend on the pane map for every PTY batch.
+    if !PANE_LATENCY_ACTIVE.load(Ordering::Acquire) {
+        touch();
+        return;
+    }
     if let Ok(mut panes) = pane_latency().lock() {
+        prune_stale_pending_keys(&mut panes, now);
         update_latency_pane(&mut panes, instance_id, |pane| {
             pane.read(timing.sequence, timing.read_at_us);
             pane.drained(timing, now);
         });
+        publish_latency_activity(&panes);
     }
     touch();
 }
@@ -958,6 +1057,7 @@ pub(crate) fn output_update_requested(instance_id: Uuid) {
         update_latency_pane(&mut panes, instance_id, |pane| {
             pane.update_requested(now_us())
         });
+        publish_latency_activity(&panes);
     }
     touch();
 }
@@ -970,6 +1070,7 @@ pub(crate) fn output_update_started(instance_id: Uuid) {
     }
     if let Ok(mut panes) = pane_latency().lock() {
         update_latency_pane(&mut panes, instance_id, |pane| pane.processed(now_us()));
+        publish_latency_activity(&panes);
     }
     touch();
 }
@@ -981,9 +1082,13 @@ pub fn pointer_routed(instance_id: Uuid, event: &str, mouse_reporting: bool, shi
     if !enabled() {
         return;
     }
-    emit_line(&format!(
-        "term-pointer[v1] pane={instance_id} event={event} mouse_reporting={mouse_reporting} shift={shift}"
-    ));
+    let event = pointer_event_label(event);
+    defer(DeferredRecord::Pointer(PointerRecord {
+        instance_id,
+        event,
+        mouse_reporting,
+        shift,
+    }));
     touch();
 }
 
@@ -996,6 +1101,7 @@ pub fn notify_scheduled(instance_id: Uuid, request: PaintRequest, min_interval: 
         update_latency_pane(&mut panes, instance_id, |pane| {
             pane.notified(now_us(), request, min_interval)
         });
+        publish_latency_activity(&panes);
     }
     touch();
 }
@@ -1047,7 +1153,11 @@ pub fn paint_with_phases(
     }
     if focused {
         let sample = pane_latency().lock().ok().and_then(|mut panes| {
-            update_latency_pane(&mut panes, instance_id, |pane| pane.painted(now_us())).flatten()
+            let sample =
+                update_latency_pane(&mut panes, instance_id, |pane| pane.painted(now_us()))
+                    .flatten();
+            publish_latency_activity(&panes);
+            sample
         });
         if let Some(sample) = sample {
             c.key_read_lat_us
@@ -1227,6 +1337,37 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_output_prunes_an_unanswered_stale_key() {
+        let stale = Uuid::new_v4();
+        let active = Uuid::new_v4();
+        let mut panes = HashMap::from([
+            (
+                stale,
+                PaneLatency {
+                    pending_key_at: 10,
+                    ..PaneLatency::default()
+                },
+            ),
+            (
+                active,
+                PaneLatency {
+                    key_at: 20,
+                    read_at: 30,
+                    ..PaneLatency::default()
+                },
+            ),
+        ]);
+
+        prune_stale_pending_keys(&mut panes, 10 + LATENCY_STALE_US);
+
+        assert!(!panes.contains_key(&stale));
+        assert!(
+            panes.contains_key(&active),
+            "later latency stages are evidence"
+        );
+    }
+
+    #[test]
     fn pane_close_removes_a_pending_no_output_key_and_cursor() {
         let instance_id = Uuid::new_v4();
         pane_latency().lock().unwrap().insert(
@@ -1281,6 +1422,56 @@ mod tests {
         assert!(try_defer_to(Some(&tx), record));
         assert!(!try_defer_to(Some(&tx), record));
         assert!(!try_defer_to(None, record));
+    }
+
+    #[test]
+    fn pointer_and_focus_records_are_fixed_content_free_schemas() {
+        let pane = Uuid::nil();
+        let secret = "wheel path=C:/secret prompt=do-not-log";
+        let pointer = pointer_line(PointerRecord {
+            instance_id: pane,
+            event: pointer_event_label(secret),
+            mouse_reporting: true,
+            shift: false,
+        });
+        assert_eq!(
+            pointer,
+            "term-pointer[v1] pane=00000000-0000-0000-0000-000000000000 event=other mouse_reporting=true shift=false"
+        );
+        assert!(!pointer.contains(secret));
+        assert_eq!(
+            focus_line(pane, true),
+            "term-focus[v1] pane=00000000-0000-0000-0000-000000000000 focused=true"
+        );
+    }
+
+    #[test]
+    fn rotation_drops_the_live_handle_and_replaces_an_existing_backup() {
+        let dir = std::env::temp_dir().join(format!("muxel-term-prof-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create rotation fixture");
+        let path = dir.join("term-prof.log");
+        let rotated = rotated_log_path(&path);
+        std::fs::write(&path, vec![b'x'; PROFILE_LOG_MAX_BYTES as usize + 1])
+            .expect("write oversized live log");
+        std::fs::write(&rotated, b"stale backup").expect("write stale backup");
+        let mut slot = Some(
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("hold live log open"),
+        );
+
+        reopen_log_file(&mut slot, &path);
+
+        assert_eq!(
+            std::fs::metadata(&rotated).expect("rotated log").len(),
+            PROFILE_LOG_MAX_BYTES + 1
+        );
+        assert_eq!(std::fs::metadata(&path).expect("new live log").len(), 0);
+        writeln!(slot.as_mut().expect("reopened live log"), "bounded").unwrap();
+        drop(slot);
+        assert!(std::fs::metadata(&path).unwrap().len() < PROFILE_LOG_MAX_BYTES);
+        std::fs::remove_dir_all(dir).expect("remove rotation fixture");
     }
 
     #[test]
