@@ -620,34 +620,24 @@ pub fn claude_session_path(home: &Path, cwd: &Path, session_id: &str) -> PathBuf
         .join(format!("{session_id}.jsonl"))
 }
 
-/// Whether any Codex rollout under `~/.codex/sessions` carries `session_id`.
-/// Used to decide if a stored id is still resumable before `codex resume <id>`.
+/// Whether a Codex rollout filename under `~/.codex/sessions` carries
+/// `session_id`. Used to decide if a stored id is still resumable before
+/// `codex resume <id>` without opening rollout contents on the activation path.
 pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
+    let Ok(session_id) = Uuid::parse_str(session_id) else {
+        return false;
+    };
     let root = home.join(".codex").join("sessions");
     if !root.is_dir() {
         return false;
     }
-    let mut found = false;
+    let plain_suffix = format!("-{}.jsonl", session_id.hyphenated());
+    let compressed_suffix = format!("-{}.jsonl.zst", session_id.hyphenated());
     walk_jsonl(&root, &mut |path| {
-        // The rollout filename embeds the session id, so a name match settles it
-        // without opening the file (and works for compressed `.jsonl.zst` too).
-        if path
-            .file_name()
+        path.file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.contains(session_id))
-        {
-            found = true;
-            return true; // stop the walk
-        }
-        if let Some((id, _)) = codex_session_meta(path)
-            && id == session_id
-        {
-            found = true;
-            return true;
-        }
-        false
-    });
-    found
+            .is_some_and(|name| name.ends_with(&plain_suffix) || name.ends_with(&compressed_suffix))
+    })
 }
 
 /// Whether Codex has an exact rollout whose session id and recorded cwd both
@@ -1423,8 +1413,6 @@ mod tests {
             codex_latest_session_id(&tmp, &cwd).as_deref(),
             Some("id-new")
         );
-        assert!(codex_session_exists(&tmp, "id-new"));
-        assert!(!codex_session_exists(&tmp, "missing"));
         assert!(codex_session_matches_cwd(&tmp, "id-new", &cwd));
         assert!(!codex_session_matches_cwd(
             &tmp,
@@ -1432,16 +1420,38 @@ mod tests {
             &tmp.join("other")
         ));
         assert!(!codex_session_matches_cwd(&tmp, "missing", &cwd));
-        let unindexed = day.join("rollout-without-session-id.jsonl");
-        let mut f = std::fs::File::create(&unindexed).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn codex_session_exists_uses_filename_only() {
+        use std::io::Write;
+
+        let tmp = std::env::temp_dir().join(format!("muxel-codex-exists-{}", Uuid::new_v4()));
+        let day = tmp.join(".codex/sessions/2026/09/04");
+        std::fs::create_dir_all(&day).unwrap();
+        let present_id = Uuid::new_v4().to_string();
+        let compressed_id = Uuid::new_v4().to_string();
+        let content_only_id = Uuid::new_v4().to_string();
+        let path = day.join(format!("rollout-2026-09-04T00-00-00-{present_id}.jsonl"));
+        let mut f = std::fs::File::create(path).unwrap();
         writeln!(
             f,
-            r#"{{"type":"session_meta","payload":{{"session_id":"hidden","cwd":"{}"}}}}"#,
-            cwd.display().to_string().replace('\\', "\\\\")
+            r#"{{"type":"session_meta","payload":{{"session_id":"{content_only_id}","cwd":"ignored"}}}}"#
         )
         .unwrap();
-        assert!(codex_session_exists(&tmp, "hidden"));
-        assert!(!codex_session_matches_cwd(&tmp, "hidden", &cwd));
+        std::fs::write(
+            day.join(format!(
+                "rollout-2026-09-04T00-00-01-{compressed_id}.jsonl.zst"
+            )),
+            "contents need not be readable as a rollout",
+        )
+        .unwrap();
+
+        assert!(codex_session_exists(&tmp, &present_id));
+        assert!(codex_session_exists(&tmp, &compressed_id.to_uppercase()));
+        assert!(!codex_session_exists(&tmp, &content_only_id));
+        assert!(!codex_session_exists(&tmp, "not-a-session-uuid"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
