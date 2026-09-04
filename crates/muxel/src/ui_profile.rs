@@ -42,8 +42,8 @@ mod focus;
 
 pub use focus::{
     FocusActionReason, ProfileWindowKind, clear_focus_panes, focus_action, focus_action_for_pane,
-    register_focus_pane, register_profile_window, terminal_focus_observer, unregister_focus_pane,
-    unregister_profile_window, window_activation,
+    native_focus_edge_for_pane, register_focus_pane, register_profile_window,
+    terminal_focus_observer, unregister_focus_pane, unregister_profile_window, window_activation,
 };
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -97,6 +97,10 @@ enum DeferredRecord {
     Focus {
         at: SystemTime,
         event: Box<focus::FocusEvent>,
+    },
+    FocusPathLost {
+        at: SystemTime,
+        event: GpuiFocusPathEvent,
     },
     BrowserVisibility {
         at: SystemTime,
@@ -167,6 +171,62 @@ struct BrowserVisibilityEvent {
     host_class: Option<String>,
     host_owner: Option<&'static str>,
     host_visible: Option<bool>,
+}
+
+/// Fixed semantic buckets for the GPUI handle retained when a rendered focus
+/// path disappears. Callers can only choose these labels; user text never
+/// enters the diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GpuiFocusOwnerKind {
+    None,
+    AppRoot,
+    Terminal,
+    Editor,
+    Browser,
+    BrowserAddress,
+    AppInput,
+    Unknown,
+}
+
+impl GpuiFocusOwnerKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::AppRoot => "app-root",
+            Self::Terminal => "terminal",
+            Self::Editor => "editor",
+            Self::Browser => "browser",
+            Self::BrowserAddress => "browser-address",
+            Self::AppInput => "app-input",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuiFocusOwner {
+    pub kind: GpuiFocusOwnerKind,
+    pub pane: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FocusRenderContext {
+    token: u64,
+    view: RenderView,
+    stage: RenderStage,
+    active_us: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GpuiFocusPathEvent {
+    current: GpuiFocusOwner,
+    active: GpuiFocusOwner,
+    current_tracked: bool,
+    active_tracked: bool,
+    window_active: bool,
+    overlay_open: bool,
+    render: Option<FocusRenderContext>,
+    terminal: Option<muxel_terminal::TerminalFocusProfile>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -746,6 +806,9 @@ fn deferred_writer(rx: Receiver<DeferredRecord>) {
                 &render_line("slow", token, view, stage, "elapsed", elapsed_us),
             ),
             DeferredRecord::Focus { at, event } => emit_at(at, &focus::focus_line(&event)),
+            DeferredRecord::FocusPathLost { at, event } => {
+                emit_at(at, &gpui_focus_path_line(&event))
+            }
             DeferredRecord::BrowserVisibility { at, event } => {
                 emit_at(at, &browser_visibility_line(&event))
             }
@@ -823,6 +886,115 @@ fn optional_hresult(value: Option<i32>) -> String {
         || "unavailable".to_string(),
         |value| format!("0x{:08x}", value as u32),
     )
+}
+
+fn optional_pane(pane: Option<Uuid>) -> String {
+    pane.map_or_else(|| "none".to_string(), |pane| pane.to_string())
+}
+
+fn terminal_paint_cause(cause: muxel_terminal::TerminalPaintCause) -> &'static str {
+    match cause {
+        muxel_terminal::TerminalPaintCause::Immediate => "immediate",
+        muxel_terminal::TerminalPaintCause::Timer => "timer",
+    }
+}
+
+fn gpui_focus_path_line(event: &GpuiFocusPathEvent) -> String {
+    let (render_token, render_view, render_stage, render_active) = event.render.map_or_else(
+        || (0, "none", "none", "none".to_string()),
+        |render| {
+            (
+                render.token,
+                render.view.label(),
+                render.stage.label(),
+                format!("{}µs", render.active_us),
+            )
+        },
+    );
+    let (content_generation, paint_generation, paint_age, paint_cause, paint_pending) =
+        event.terminal.map_or_else(
+            || (0, 0, "none".to_string(), "none", false),
+            |terminal| {
+                (
+                    terminal.content_generation,
+                    terminal.paint_generation,
+                    terminal.last_paint_age.map_or_else(
+                        || "none".to_string(),
+                        |age| format!("{}µs", age.as_micros()),
+                    ),
+                    terminal
+                        .last_paint_cause
+                        .map_or("none", terminal_paint_cause),
+                    terminal.paint_pending,
+                )
+            },
+        );
+    format!(
+        "ui-prof[focus path v1] current={} current_pane={} current_tracked={} active={} active_pane={} active_tracked={} window_active={} overlay_open={} render_token={} render_view={} render_stage={} render_active={} term_content_gen={} term_paint_gen={} term_paint_age={} term_paint_cause={} term_paint_pending={}",
+        event.current.kind.label(),
+        optional_pane(event.current.pane),
+        event.current_tracked,
+        event.active.kind.label(),
+        optional_pane(event.active.pane),
+        event.active_tracked,
+        event.window_active,
+        event.overlay_open,
+        render_token,
+        render_view,
+        render_stage,
+        render_active,
+        content_generation,
+        paint_generation,
+        paint_age,
+        paint_cause,
+        paint_pending,
+    )
+}
+
+fn current_focus_render_context() -> Option<FocusRenderContext> {
+    RENDER_STACK.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .copied()
+            .map(|render| FocusRenderContext {
+                token: render.token,
+                view: render.view,
+                stage: render.stage,
+                active_us: profiler_elapsed_us().saturating_sub(render.started_us),
+            })
+    })
+}
+
+/// Record GPUI's direct "nothing in the rendered tree has focus" callback.
+/// The main app supplies only fixed owner classes and optional pane UUIDs; the
+/// profiler adds the live render and terminal-paint correlation snapshots.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpui_focus_path_lost(
+    current: GpuiFocusOwner,
+    active: GpuiFocusOwner,
+    current_tracked: bool,
+    active_tracked: bool,
+    window_active: bool,
+    overlay_open: bool,
+    terminal: Option<muxel_terminal::TerminalFocusProfile>,
+) {
+    if !is_enabled() {
+        return;
+    }
+    defer_record(DeferredRecord::FocusPathLost {
+        at: SystemTime::now(),
+        event: GpuiFocusPathEvent {
+            current,
+            active,
+            current_tracked,
+            active_tracked,
+            window_active,
+            overlay_open,
+            render: current_focus_render_context(),
+            terminal,
+        },
+    });
 }
 
 fn browser_visibility_line(event: &BrowserVisibilityEvent) -> String {
@@ -1574,6 +1746,45 @@ mod tests {
             ),
             "ui-prof[lifecycle status v1] pane=00000000-0000-0000-0000-000000000000 previous=done next=working raw=idle pane_active=false window_active=true root_notify_reason=status-dirty root_notify_gen=19"
         );
+    }
+
+    #[test]
+    fn focus_path_record_names_internal_owner_and_paint_without_content() {
+        let event = GpuiFocusPathEvent {
+            current: GpuiFocusOwner {
+                kind: GpuiFocusOwnerKind::Terminal,
+                pane: Some(Uuid::nil()),
+            },
+            active: GpuiFocusOwner {
+                kind: GpuiFocusOwnerKind::Terminal,
+                pane: Some(Uuid::nil()),
+            },
+            current_tracked: false,
+            active_tracked: false,
+            window_active: true,
+            overlay_open: false,
+            render: Some(FocusRenderContext {
+                token: 41,
+                view: RenderView::Main,
+                stage: RenderStage::Prepaint,
+                active_us: 812,
+            }),
+            terminal: Some(muxel_terminal::TerminalFocusProfile {
+                content_generation: 93,
+                paint_generation: 17,
+                last_paint_age: Some(Duration::from_micros(240)),
+                last_paint_cause: Some(muxel_terminal::TerminalPaintCause::Timer),
+                paint_pending: false,
+            }),
+        };
+        let line = gpui_focus_path_line(&event);
+        assert_eq!(
+            line,
+            "ui-prof[focus path v1] current=terminal current_pane=00000000-0000-0000-0000-000000000000 current_tracked=false active=terminal active_pane=00000000-0000-0000-0000-000000000000 active_tracked=false window_active=true overlay_open=false render_token=41 render_view=main render_stage=prepaint render_active=812µs term_content_gen=93 term_paint_gen=17 term_paint_age=240µs term_paint_cause=timer term_paint_pending=false"
+        );
+        for forbidden in ["text=", "input=", "title=", "command=", "row="] {
+            assert!(!line.contains(forbidden));
+        }
     }
 
     #[test]

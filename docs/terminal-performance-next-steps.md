@@ -110,6 +110,46 @@ The current `term-prof[v5]` names two samples too strongly:
 Those samples remain useful as upper-level symptoms. They do not identify the
 slow stage.
 
+### Name focus-path loss before restoring focus
+
+Live dogfood on 2026-08-28 captured several terminal focus-out edges while the
+Muxel top-level window remained the Windows foreground, active, and focused
+window. At least one loss occurred without a project switch, lifecycle status
+transition, root notification, slow-render record, or UI-pump stall. Terminal
+output and paints continued. That proves an internal GPUI focus-path loss; it
+does not prove that a Working indicator, terminal paint, or presentation caused
+the loss.
+
+The opt-in UI profiler now subscribes to GPUI's direct `on_focus_lost` callback.
+Its `ui-prof[focus path v1]` record contains only fixed classes, UUIDs,
+generations, booleans, and durations:
+
+- the focus handle GPUI still retains (`terminal`, `editor`, `browser`, app
+  root/input, `none`, or `unknown`) and its pane UUID when applicable;
+- whether that handle and the active pane target occur in the newly rendered
+  main-window dispatch tree;
+- window-active and overlay-open state;
+- the current profiled render token/view/stage when one is still live;
+- the active terminal's content generation and most recent output-driven paint
+  generation, immediate/timer cause, age, and pending-timer state.
+
+This is one bounded record per path-loss edge. The owner scan is installed only
+when profiling is enabled; normal frames and keys do not run it. The terminal
+output path adds fixed-size per-pane correlation state and updates it only when
+the app-level focus observer is installed. No screen or input content is logged.
+
+Do not add automatic focus restoration yet. First distinguish these cases:
+
+1. retained owner is the active terminal but `active_tracked=false`: the frame
+   dropped the terminal from GPUI's dispatch tree;
+2. owner is another named GPUI control: trace the explicit focus transfer;
+3. owner is `none` or `unknown`: extend only that missing owner seam;
+4. the last terminal paint is old: terminal output is adjacent, not causal.
+
+If case 1 repeats, a recovery can be evaluated at GPUI's documented
+`on_focus_lost` seam. It must first focus a target present in the rendered tree
+and must not fight intentional app-input or native-browser focus.
+
 ### Add a v6 event path
 
 Give each processed output batch a sequence number and timestamps for:

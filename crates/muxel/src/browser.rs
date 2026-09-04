@@ -329,9 +329,10 @@ mod imp {
                             let got_tx = focus_tx.clone();
                             let got_focus =
                                 FocusChangedEventHandler::create(Box::new(move |_, _| {
-                                    crate::ui_profile::focus_action_for_pane(
+                                    crate::ui_profile::native_focus_edge_for_pane(
                                         crate::ui_profile::FocusActionReason::NativeBrowserGain,
                                         instance_id,
+                                        true,
                                     );
                                     let _ = got_tx.send(true);
                                     Ok(())
@@ -339,6 +340,11 @@ mod imp {
                             let lost_tx = focus_tx.clone();
                             let lost_focus =
                                 FocusChangedEventHandler::create(Box::new(move |_, _| {
+                                    crate::ui_profile::native_focus_edge_for_pane(
+                                        crate::ui_profile::FocusActionReason::NativeBrowserLoss,
+                                        instance_id,
+                                        false,
+                                    );
                                     let _ = lost_tx.send(false);
                                     Ok(())
                                 }));
@@ -374,33 +380,37 @@ mod imp {
                     let wv = cx.new(|cx2| gpui_wry::WebView::new(wv, window, cx2));
                     // Re-apply whatever the pane changed while the build ran.
                     let visible = this.native_visible;
-                    let bounds = wv.read(cx).bounds();
-                    let bounds_changed = this
-                        .last_profile_bounds
-                        .replace(bounds)
-                        .is_some_and(|previous| previous != bounds);
-                    let project_active = this.profile_project_active;
-                    let pane_active = this.profile_pane_active;
-                    wv.update(cx, |wv, _| {
-                        if visible {
-                            wv.show()
-                        } else {
-                            wv.hide()
-                        }
-                        #[cfg(target_os = "windows")]
-                        crate::ui_profile::profile_browser_native_visibility(
-                            crate::ui_profile::BrowserVisibilityContext {
-                                project: project_id,
-                                pane: instance_id,
-                                reason: crate::ui_profile::BrowserVisibilityReason::Initial,
-                                requested: visible,
-                                project_active,
-                                pane_active,
-                                bounds_changed,
-                            },
-                            wv.raw(),
-                        );
-                    });
+                    if crate::ui_profile::is_enabled() {
+                        let bounds = wv.read(cx).bounds();
+                        let bounds_changed = this
+                            .last_profile_bounds
+                            .replace(bounds)
+                            .is_some_and(|previous| previous != bounds);
+                        let project_active = this.profile_project_active;
+                        let pane_active = this.profile_pane_active;
+                        wv.update(cx, |wv, _| {
+                            if visible {
+                                wv.show()
+                            } else {
+                                wv.hide()
+                            }
+                            #[cfg(target_os = "windows")]
+                            crate::ui_profile::profile_browser_native_visibility(
+                                crate::ui_profile::BrowserVisibilityContext {
+                                    project: project_id,
+                                    pane: instance_id,
+                                    reason: crate::ui_profile::BrowserVisibilityReason::Initial,
+                                    requested: visible,
+                                    project_active,
+                                    pane_active,
+                                    bounds_changed,
+                                },
+                                wv.raw(),
+                            );
+                        });
+                    } else if !visible {
+                        wv.update(cx, |wv, _| wv.hide());
+                    }
                     if this.url != requested {
                         let current = this.url.clone();
                         wv.update(cx, |wv, _| wv.load_url(&current));
@@ -602,6 +612,17 @@ mod imp {
             overlay: bool,
             cx: &mut Context<Self>,
         ) {
+            let visibility_changed = self.native_visible != visible;
+            if !crate::ui_profile::is_enabled() {
+                if !visibility_changed {
+                    return;
+                }
+                self.native_visible = visible;
+                if let Some(wv) = &self.webview {
+                    wv.update(cx, |wv, _| if visible { wv.show() } else { wv.hide() });
+                }
+                return;
+            }
             let reason = if self.profile_overlay != overlay {
                 crate::ui_profile::BrowserVisibilityReason::Overlay
             } else if self.profile_project_active != project_active {
@@ -612,7 +633,6 @@ mod imp {
             self.profile_project_active = project_active;
             self.profile_pane_active = pane_active;
             self.profile_overlay = overlay;
-            let visibility_changed = self.native_visible != visible;
             if !should_sample_native_visibility(visibility_changed, reason) {
                 return;
             }

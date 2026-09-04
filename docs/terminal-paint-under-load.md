@@ -102,6 +102,13 @@ shape reuse, `key→echo` vs `echo→paint`, cursor-row probe.
 cursor starvation (term-prof cannot see non-terminal keys). Spikes:
 `pump >8ms/>30ms`, `probe >50ms/>200ms`, `timeout=`.
 
+When GPUI reports that nothing in the newly rendered dispatch tree owns focus,
+`ui-prof[focus path v1]` records fixed owner classes and pane UUIDs for the
+retained handle and active target, whether each handle was present in that
+frame, the active render token/stage, and the active terminal's last
+output-driven paint generation/cause/age. This record is emitted only at the
+loss edge. It stores no terminal text, input, titles, paths, or commands.
+
 Example (PowerShell):
 
 ```text

@@ -41,6 +41,7 @@ pub enum FocusActionReason {
     AppRootChrome,
     PanePointer,
     NativeBrowserGain,
+    NativeBrowserLoss,
     NativeBrowserAccepted,
     WindowActivated,
     WindowDeactivated,
@@ -54,6 +55,7 @@ impl FocusActionReason {
             Self::AppRootChrome => "app-root-chrome",
             Self::PanePointer => "pane-pointer",
             Self::NativeBrowserGain => "native-browser-gain",
+            Self::NativeBrowserLoss => "native-browser-loss",
             Self::NativeBrowserAccepted => "native-browser-accepted",
             Self::WindowActivated => "window-activated",
             Self::WindowDeactivated => "window-deactivated",
@@ -476,6 +478,57 @@ pub fn focus_action_for_pane(reason: FocusActionReason, pane: Uuid) {
     if let Ok(mut state) = registry().lock() {
         state.record_pane_action(pane, reason, Instant::now());
     }
+}
+
+/// Record a native child focus edge that GPUI cannot observe. Unlike a plain
+/// action marker, this immediately samples Win32 ownership and emits a bounded
+/// deferred record, so WebView focus theft does not depend on a later terminal
+/// edge to become visible in the trace.
+pub fn native_focus_edge_for_pane(reason: FocusActionReason, pane: Uuid, focused: bool) {
+    if !super::is_enabled() {
+        return;
+    }
+    super::ensure_flusher();
+    let now = Instant::now();
+    let at = SystemTime::now();
+    let (window_id, context) = if let Ok(mut state) = registry().lock() {
+        state.record_pane_action(pane, reason, now);
+        let window_id = state
+            .panes
+            .iter()
+            .find(|state| state.pane == pane)
+            .and_then(|state| state.window_id)
+            .unwrap_or(0);
+        (window_id, state.context(window_id, pane, now))
+    } else {
+        (
+            0,
+            FocusContext {
+                kind: ProfileWindowKind::Unknown,
+                host_hwnd: None,
+                action: None,
+                top_level_hwnds: Vec::new(),
+            },
+        )
+    };
+    let native = sample_native_focus(&context.top_level_hwnds);
+    let window_active = matches!(
+        (&native.foreground, context.host_hwnd),
+        (OwnerSnapshot::Present { hwnd, .. }, Some(host)) if *hwnd == host
+    );
+    super::defer_record(super::DeferredRecord::Focus {
+        at,
+        event: Box::new(FocusEvent {
+            pane,
+            focused,
+            window_active,
+            window_kind: context.kind,
+            window_id,
+            host_hwnd: context.host_hwnd,
+            action: context.action,
+            native,
+        }),
+    });
 }
 
 pub fn window_activation(kind: ProfileWindowKind, active: bool, window: &Window) {

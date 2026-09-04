@@ -2650,23 +2650,62 @@ struct PopoutView {
     view: PaneView,
     iid: Uuid,
     show_close_confirm: bool,
+    /// Profiler-only correlation state. Keeping it on the root that owns the
+    /// pane prevents a popped-out terminal from affecting main-app lifecycle
+    /// bookkeeping or suppressing the first transition after re-dock.
+    profile_status: Option<AgentStatus>,
+    profile_window_active: bool,
 }
 
 impl PopoutView {
     fn new(view: PaneView, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) -> Self {
         ui_profile::register_profile_window(ui_profile::ProfileWindowKind::Popout, window);
-        cx.observe_window_activation(window, |_this, window, cx| {
-            ui_profile::window_activation(
-                ui_profile::ProfileWindowKind::Popout,
-                window.is_window_active(),
-                window,
-            );
-            cx.notify();
-        })
-        .detach();
+        let profile_status = if ui_profile::is_enabled() {
+            match &view {
+                PaneView::Terminal(terminal) => Some(terminal.read(cx).status()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let profile_window_active = window.is_window_active();
+        if ui_profile::is_enabled() {
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.profile_window_active = window.is_window_active();
+                ui_profile::window_activation(
+                    ui_profile::ProfileWindowKind::Popout,
+                    window.is_window_active(),
+                    window,
+                );
+                cx.notify();
+            })
+            .detach();
+        }
         // Re-render (refresh the title) when the pane updates.
         match &view {
-            PaneView::Terminal(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
+            PaneView::Terminal(v) => cx
+                .observe(v, |this, terminal, cx| {
+                    if ui_profile::is_enabled() {
+                        let status = terminal.read(cx).status();
+                        if this.profile_status != Some(status) {
+                            let previous = this.profile_status.replace(status);
+                            if let Some(generation) = ui_profile::begin_status_dirty() {
+                                ui_profile::lifecycle_status_transition(
+                                    this.iid,
+                                    previous,
+                                    status,
+                                    status,
+                                    true,
+                                    this.profile_window_active,
+                                    generation,
+                                );
+                                ui_profile::status_dirty_root_notify(generation, 1);
+                            }
+                        }
+                    }
+                    cx.notify();
+                })
+                .detach(),
             PaneView::Editor(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
             PaneView::Browser(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
         }
@@ -2674,6 +2713,8 @@ impl PopoutView {
             view,
             iid,
             show_close_confirm: false,
+            profile_status,
+            profile_window_active,
         }
     }
 
@@ -3879,6 +3920,17 @@ impl MuxelApp {
         // Install the global handle so menu-dispatched actions can reach us.
         let weak = cx.weak_entity();
         cx.set_global(MuxelHandle(weak));
+
+        // GPUI calls this when its selected handle is absent from the newly
+        // rendered dispatch tree. That is the exact failure behind a terminal
+        // appearing active while key routing has stopped. Keep the observer and
+        // all owner scans entirely behind the opt-in profiler gate.
+        if ui_profile::is_enabled() {
+            cx.on_focus_lost(window, |this, window, cx| {
+                this.profile_focus_path_lost(window, cx);
+            })
+            .detach();
+        }
 
         // Persist the window geometry (debounced) on resize/move.
         cx.observe_window_bounds(window, |this, window, cx| {
@@ -9418,6 +9470,132 @@ impl MuxelApp {
         Some(iid)
     }
 
+    fn profiled_focus_owner(
+        &self,
+        current: Option<&FocusHandle>,
+        window: &Window,
+        cx: &App,
+    ) -> ui_profile::GpuiFocusOwner {
+        let Some(current) = current else {
+            return ui_profile::GpuiFocusOwner {
+                kind: ui_profile::GpuiFocusOwnerKind::None,
+                pane: None,
+            };
+        };
+        if current == &self.focus_handle {
+            return ui_profile::GpuiFocusOwner {
+                kind: ui_profile::GpuiFocusOwnerKind::AppRoot,
+                pane: None,
+            };
+        }
+        for (pane, terminal) in &self.terminals {
+            if current == &terminal.read(cx).focus_handle(cx) {
+                return ui_profile::GpuiFocusOwner {
+                    kind: ui_profile::GpuiFocusOwnerKind::Terminal,
+                    pane: Some(*pane),
+                };
+            }
+        }
+        for (pane, editor) in &self.editors {
+            if current == &editor.read(cx).focus_handle(cx) {
+                return ui_profile::GpuiFocusOwner {
+                    kind: ui_profile::GpuiFocusOwnerKind::Editor,
+                    pane: Some(*pane),
+                };
+            }
+        }
+        for (pane, browser) in &self.browsers {
+            let browser = browser.read(cx);
+            if browser.address_focused(window, cx) {
+                return ui_profile::GpuiFocusOwner {
+                    kind: ui_profile::GpuiFocusOwnerKind::BrowserAddress,
+                    pane: Some(*pane),
+                };
+            }
+            if current == &browser.focus_handle(cx) {
+                return ui_profile::GpuiFocusOwner {
+                    kind: ui_profile::GpuiFocusOwnerKind::Browser,
+                    pane: Some(*pane),
+                };
+            }
+        }
+        for input in [
+            &self.git_diff_commit_input,
+            &self.file_browser_input,
+            &self.memory_search,
+            &self.memory_title_input,
+            &self.memory_note_input,
+            &self.memory_tags_input,
+            &self.rename_input,
+            &self.workspace_name_input,
+            &self.term_search_input,
+            &self.broadcast_input,
+            &self.dispose_commit_input,
+            &self.git_action_input,
+            &self.nr_dir,
+            &self.nr_name,
+            &self.password_prompt_input,
+            &self.runner_input,
+            &self.search_input,
+            &self.find_input,
+        ] {
+            if current == &input.read(cx).focus_handle(cx) {
+                return ui_profile::GpuiFocusOwner {
+                    kind: ui_profile::GpuiFocusOwnerKind::AppInput,
+                    pane: None,
+                };
+            }
+        }
+        ui_profile::GpuiFocusOwner {
+            kind: ui_profile::GpuiFocusOwnerKind::Unknown,
+            pane: None,
+        }
+    }
+
+    fn profile_focus_path_lost(&self, window: &Window, cx: &App) {
+        let current_handle = window.focused(cx);
+        let current = self.profiled_focus_owner(current_handle.as_ref(), window, cx);
+        let current_tracked = current_handle
+            .as_ref()
+            .is_some_and(|handle| self.focus_handle.contains(handle, window));
+
+        let mut active = ui_profile::GpuiFocusOwner {
+            kind: ui_profile::GpuiFocusOwnerKind::None,
+            pane: self.active_instance,
+        };
+        let mut active_tracked = false;
+        let mut terminal = None;
+        if let Some(pane) = self.active_instance {
+            if let Some(view) = self.terminals.get(&pane) {
+                let view = view.read(cx);
+                let handle = view.focus_handle(cx);
+                active.kind = ui_profile::GpuiFocusOwnerKind::Terminal;
+                active_tracked = self.focus_handle.contains(&handle, window);
+                terminal = Some(view.focus_profile());
+            } else if let Some(view) = self.editors.get(&pane) {
+                let handle = view.read(cx).focus_handle(cx);
+                active.kind = ui_profile::GpuiFocusOwnerKind::Editor;
+                active_tracked = self.focus_handle.contains(&handle, window);
+            } else if let Some(view) = self.browsers.get(&pane) {
+                let handle = view.read(cx).focus_handle(cx);
+                active.kind = ui_profile::GpuiFocusOwnerKind::Browser;
+                active_tracked = self.focus_handle.contains(&handle, window);
+            } else {
+                active.kind = ui_profile::GpuiFocusOwnerKind::Unknown;
+            }
+        }
+
+        ui_profile::gpui_focus_path_lost(
+            current,
+            active,
+            current_tracked,
+            active_tracked,
+            window.is_window_active(),
+            self.any_overlay_open(cx),
+            terminal,
+        );
+    }
+
     /// Any overlay that draws above the pane area. The native browser webviews
     /// float above ALL gpui content, so they must hide beneath these.
     /// NOTE: every new modal/palette/menu flag MUST be added here (see CLAUDE.md).
@@ -9522,17 +9700,20 @@ impl MuxelApp {
         }
         let overlay = self.any_overlay_open(cx);
         let pane_active = self.visible_browser_ids();
-        let mut active_projects: HashSet<Uuid> =
-            self.workspace.active_project.into_iter().collect();
-        active_projects.extend(self.secondary_windows.iter().map(|window| window.pid));
+        let active_projects = ui_profile::is_enabled().then(|| {
+            let mut active: HashSet<Uuid> = self.workspace.active_project.into_iter().collect();
+            active.extend(self.secondary_windows.iter().map(|window| window.pid));
+            active
+        });
         let updates: Vec<_> = self
             .browsers
             .iter()
             .map(|(iid, view)| {
-                let project_active = self
-                    .workspace
-                    .instance(*iid)
-                    .is_some_and(|instance| active_projects.contains(&instance.project_id));
+                let project_active = active_projects.as_ref().is_some_and(|active| {
+                    self.workspace
+                        .instance(*iid)
+                        .is_some_and(|instance| active.contains(&instance.project_id))
+                });
                 let pane_active = pane_active.contains(iid);
                 (
                     view.clone(),

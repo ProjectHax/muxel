@@ -708,6 +708,11 @@ pub struct TerminalView {
     grok_screen_working_at: std::cell::Cell<Option<std::time::Instant>>,
     /// Last time we `cx.notify()`'d a paint from the drain loop (background throttle).
     last_paint_notify: std::cell::Cell<std::time::Instant>,
+    /// Profiler correlation only: advances once per output-driven `cx.notify()`.
+    /// State is fixed-size per pane and no terminal content is retained.
+    profile_paint_generation: std::cell::Cell<u64>,
+    profile_last_paint_cause: std::cell::Cell<Option<TerminalPaintCause>>,
+    profile_focus: bool,
     /// A throttled batch must still paint if output stops before the next batch.
     /// The generation invalidates an older, later timer when interactive output
     /// brings the deadline forward.
@@ -723,6 +728,24 @@ pub struct TerminalView {
 /// platform/window knowledge out of this crate without creating a dependency
 /// cycle.
 pub type TerminalFocusObserver = fn(Uuid, bool, &mut Window, &mut App);
+
+/// Why the drain loop most recently requested a terminal paint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalPaintCause {
+    Immediate,
+    Timer,
+}
+
+/// Content-free state sampled only when the app-level UI profiler observes a
+/// focus-path failure.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalFocusProfile {
+    pub content_generation: u64,
+    pub paint_generation: u64,
+    pub last_paint_age: Option<Duration>,
+    pub last_paint_cause: Option<TerminalPaintCause>,
+    pub paint_pending: bool,
+}
 
 /// A spawned terminal not yet wrapped in a view: the spec that actually ran
 /// (the requested one, or the fallback shell), the live session + its output
@@ -826,6 +849,12 @@ impl TerminalView {
                 self.paint_timer_generation
                     .set(self.paint_timer_generation.get().wrapping_add(1));
                 self.last_paint_notify.set(now);
+                if self.profile_focus {
+                    self.profile_paint_generation
+                        .set(self.profile_paint_generation.get().wrapping_add(1));
+                    self.profile_last_paint_cause
+                        .set(Some(TerminalPaintCause::Immediate));
+                }
                 cx.notify();
                 profile::notify_scheduled(
                     self.instance_id,
@@ -851,6 +880,12 @@ impl TerminalView {
                 }
                 view.pending_paint_deadline.set(None);
                 view.last_paint_notify.set(Instant::now());
+                if view.profile_focus {
+                    view.profile_paint_generation
+                        .set(view.profile_paint_generation.get().wrapping_add(1));
+                    view.profile_last_paint_cause
+                        .set(Some(TerminalPaintCause::Timer));
+                }
                 cx.notify();
                 profile::notify_scheduled(
                     view.instance_id,
@@ -1161,6 +1196,9 @@ impl TerminalView {
             grok_blocked_at: std::cell::Cell::new(None),
             grok_screen_working_at: std::cell::Cell::new(None),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
+            profile_paint_generation: std::cell::Cell::new(0),
+            profile_last_paint_cause: std::cell::Cell::new(None),
+            profile_focus: focus_observer.is_some(),
             pending_paint_deadline: std::cell::Cell::new(None),
             paint_timer_generation: std::cell::Cell::new(0),
             status_cache: std::cell::Cell::new(None),
@@ -1206,6 +1244,19 @@ impl TerminalView {
     /// console. `None` when the program launched (a fallback shell still ran).
     pub fn launch_error(&self) -> Option<&str> {
         self.launch_error.as_deref()
+    }
+
+    /// Snapshot fixed-size redraw correlation state for an app-level focus-path
+    /// loss. Callers keep this behind the opt-in profiler gate.
+    pub fn focus_profile(&self) -> TerminalFocusProfile {
+        let last_paint_cause = self.profile_last_paint_cause.get();
+        TerminalFocusProfile {
+            content_generation: self.session.content_generation(),
+            paint_generation: self.profile_paint_generation.get(),
+            last_paint_age: last_paint_cause.map(|_| self.last_paint_notify.get().elapsed()),
+            last_paint_cause,
+            paint_pending: self.pending_paint_deadline.get().is_some(),
+        }
     }
 
     /// The agent's lifecycle state, from its per-agent on-screen markers, the
