@@ -451,14 +451,44 @@ fn open_log(path: &Path) -> Option<std::fs::File> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() >= LOG_MAX_BYTES
-    {
-        let mut rotated = path.as_os_str().to_owned();
-        rotated.push(".1");
-        let _ = std::fs::rename(path, PathBuf::from(rotated));
+    if !prepare_log_path(path) {
+        return None;
     }
     OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+fn reopen_log(slot: &mut Option<std::fs::File>, path: &Path) {
+    *slot = None;
+    *slot = open_log(path);
+}
+
+fn rotated_log_path(path: &Path) -> PathBuf {
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    PathBuf::from(rotated)
+}
+
+fn prepare_log_path(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    if meta.len() < LOG_MAX_BYTES {
+        return true;
+    }
+    let rotated = rotated_log_path(path);
+    match std::fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+    if std::fs::rename(path, &rotated).is_ok() {
+        return true;
+    }
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .is_ok()
 }
 
 fn emit_at(at: SystemTime, line: &str) {
@@ -476,7 +506,7 @@ fn emit_at(at: SystemTime, line: &str) {
                 .unwrap_or(false)
         });
         if reopen {
-            *g = open_log(path);
+            reopen_log(&mut g, path);
         }
         if let Some(f) = g.as_mut() {
             let _ = writeln!(f, "{line}");
@@ -580,6 +610,10 @@ fn render_line(
     )
 }
 
+fn start_line(pid: u32) -> String {
+    format!("ui-prof[start] pid={pid}")
+}
+
 fn ensure_flusher() {
     if !is_enabled() {
         return;
@@ -597,11 +631,7 @@ fn ensure_flusher() {
     STARTED.get_or_init(Instant::now);
     defer_record(DeferredRecord::Line {
         at: SystemTime::now(),
-        line: format!(
-            "ui-prof[start] pid={} path={}",
-            std::process::id(),
-            log_path().display()
-        ),
+        line: start_line(std::process::id()),
     });
     std::thread::Builder::new()
         .name("muxel-ui-prof".into())
@@ -644,18 +674,6 @@ fn ensure_flusher() {
             }
         })
         .ok();
-}
-
-/// Record a low-volume, opt-in subsystem event beside the UI health counters.
-pub fn event(category: &str, event: &str) {
-    if !is_enabled() {
-        return;
-    }
-    ensure_flusher();
-    defer_record(DeferredRecord::Line {
-        at: SystemTime::now(),
-        line: format!("ui-prof[{category}] {event}"),
-    });
 }
 
 /// Begin one synchronous profiler phase. The returned guard writes its end
@@ -1052,12 +1070,48 @@ mod tests {
     }
 
     #[test]
+    fn ui_rotation_drops_the_live_handle_and_replaces_an_existing_backup() {
+        let dir = std::env::temp_dir().join(format!("muxel-ui-prof-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create rotation fixture");
+        let path = dir.join("ui-prof.log");
+        let rotated = rotated_log_path(&path);
+        std::fs::write(&path, vec![b'x'; LOG_MAX_BYTES as usize + 1])
+            .expect("write oversized live log");
+        std::fs::write(&rotated, b"stale backup").expect("write stale backup");
+        let mut slot = Some(
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("hold live log open"),
+        );
+
+        reopen_log(&mut slot, &path);
+
+        assert_eq!(
+            std::fs::metadata(&rotated).expect("rotated log").len(),
+            LOG_MAX_BYTES + 1
+        );
+        assert_eq!(std::fs::metadata(&path).expect("new live log").len(), 0);
+        writeln!(slot.as_mut().expect("reopened live log"), "bounded").unwrap();
+        drop(slot);
+        assert!(std::fs::metadata(&path).unwrap().len() < LOG_MAX_BYTES);
+        std::fs::remove_dir_all(dir).expect("remove rotation fixture");
+    }
+
+    #[test]
     fn phase_records_only_fixed_labels_and_pane_identity() {
         let pane = Uuid::nil();
         assert_eq!(
             phase_line("end", 7, "activation", "resume-scan", Some(pane), Some(42)),
             "ui-prof[phase end] span=7 category=activation phase=resume-scan pane=00000000-0000-0000-0000-000000000000 elapsed=42µs"
         );
+    }
+
+    #[test]
+    fn start_record_does_not_disclose_the_log_path() {
+        let line = start_line(42);
+        assert_eq!(line, "ui-prof[start] pid=42");
+        assert!(!line.contains("path="));
     }
 
     #[test]

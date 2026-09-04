@@ -11,7 +11,6 @@ use crate::integrations;
 use crate::settings_view::{self, RemoteTestState, SettingsSection, SettingsUi};
 use crate::theme;
 use crate::ui_profile;
-use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
