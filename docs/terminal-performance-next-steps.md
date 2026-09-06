@@ -121,7 +121,7 @@ does not prove that a Working indicator, terminal paint, or presentation caused
 the loss.
 
 The opt-in UI profiler now subscribes to GPUI's direct `on_focus_lost` callback.
-Its `ui-prof[focus path v1]` record contains only fixed classes, UUIDs,
+Its `ui-prof[focus path v2]` record contains only fixed classes, UUIDs,
 generations, booleans, and durations:
 
 - the focus handle GPUI still retains (`terminal`, `editor`, `browser`, app
@@ -129,9 +129,11 @@ generations, booleans, and durations:
 - whether that handle and the active pane target occur in the newly rendered
   main-window dispatch tree;
 - window-active and overlay-open state;
-- the current profiled render token/view/stage when one is still live;
-- the active terminal's content generation and most recent output-driven paint
-  generation, immediate/timer cause, age, and pending-timer state.
+- the profiled render token/view/stage, preferring a callback that has not
+  returned and explicitly labeling a retained frame when no callback is live;
+- the active terminal's content generation and most recent output-driven
+  notification generation, immediate/timer cause, age, and pending-timer state.
+  These measure redraw requests, not completed paints or presentations.
 
 This is one bounded record per path-loss edge. The owner scan is installed only
 when profiling is enabled; normal frames and keys do not run it. The terminal
@@ -144,7 +146,8 @@ Do not add automatic focus restoration yet. First distinguish these cases:
    dropped the terminal from GPUI's dispatch tree;
 2. owner is another named GPUI control: trace the explicit focus transfer;
 3. owner is `none` or `unknown`: extend only that missing owner seam;
-4. the last terminal paint is old: terminal output is adjacent, not causal.
+4. the last terminal redraw request is old: inspect the output/drain route;
+   this record does not establish whether the requested frame painted.
 
 If case 1 repeats, a recovery can be evaluated at GPUI's documented
 `on_focus_lost` seam. It must first focus a target present in the rendered tree

@@ -103,11 +103,22 @@ cursor starvation (term-prof cannot see non-terminal keys). Spikes:
 `pump >8ms/>30ms`, `probe >50ms/>200ms`, `timeout=`.
 
 When GPUI reports that nothing in the newly rendered dispatch tree owns focus,
-`ui-prof[focus path v1]` records fixed owner classes and pane UUIDs for the
+`ui-prof[focus path v2]` records fixed owner classes and pane UUIDs for the
 retained handle and active target, whether each handle was present in that
 frame, the active render token/stage, and the active terminal's last
-output-driven paint generation/cause/age. This record is emitted only at the
-loss edge. It stores no terminal text, input, titles, paths, or commands.
+output-driven notification generation/cause/age. These are redraw requests,
+not evidence that a paint or presentation completed. This record is emitted
+only at the loss edge. It stores no terminal text, input, titles, paths, or commands.
+The render context prefers a callback that has not returned over retained
+frame allocations and labels the observation as `callback` or `retained-frame`.
+
+Native focus records classify a WebView child as Muxel-owned only when its
+bounded ancestry includes both a WRY host and a registered Muxel top-level
+window. This includes browser subprocess children and excludes unrelated WRY
+applications. Window classes use fixed buckets; arbitrary OS class text is not
+stored. Browser visibility records compare controller and host visibility,
+plus a change flag for cached GPUI layout bounds, not a native rectangle.
+Pane and project UUIDs identify persisted workspace objects across runs.
 
 Example (PowerShell):
 

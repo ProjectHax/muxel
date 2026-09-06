@@ -9699,8 +9699,13 @@ impl MuxelApp {
             return;
         }
         let overlay = self.any_overlay_open(cx);
-        let pane_active = self.visible_browser_ids();
-        let active_projects = ui_profile::is_enabled().then(|| {
+        let profile_visibility = cfg!(target_os = "windows") && ui_profile::is_enabled();
+        let pane_active = if overlay && !profile_visibility {
+            Vec::new()
+        } else {
+            self.visible_browser_ids()
+        };
+        let active_projects = profile_visibility.then(|| {
             let mut active: HashSet<Uuid> = self.workspace.active_project.into_iter().collect();
             active.extend(self.secondary_windows.iter().map(|window| window.pid));
             active

@@ -40,11 +40,14 @@ use uuid::Uuid;
 
 mod focus;
 
+#[cfg(target_os = "windows")]
+pub use focus::native_focus_edge_for_pane;
 pub use focus::{
-    FocusActionReason, ProfileWindowKind, clear_focus_panes, focus_action, focus_action_for_pane,
-    native_focus_edge_for_pane, register_focus_pane, register_profile_window,
+    FocusActionReason, ProfileWindowKind, clear_focus_panes, focus_action, register_profile_window,
     terminal_focus_observer, unregister_focus_pane, unregister_profile_window, window_activation,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub use focus::{focus_action_for_pane, register_focus_pane};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -102,6 +105,7 @@ enum DeferredRecord {
         at: SystemTime,
         event: GpuiFocusPathEvent,
     },
+    #[cfg(target_os = "windows")]
     BrowserVisibility {
         at: SystemTime,
         event: BrowserVisibilityEvent,
@@ -125,16 +129,20 @@ enum DeferredRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "windows", test))]
 pub(crate) enum BrowserVisibilityReason {
+    #[cfg(target_os = "windows")]
     Initial,
     Project,
     Pane,
     Overlay,
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl BrowserVisibilityReason {
     fn label(self) -> &'static str {
         match self {
+            #[cfg(target_os = "windows")]
             Self::Initial => "initial",
             Self::Project => "project",
             Self::Pane => "pane",
@@ -144,6 +152,7 @@ impl BrowserVisibilityReason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "windows")]
 pub(crate) struct BrowserVisibilityContext {
     pub project: Uuid,
     pub pane: Uuid,
@@ -155,6 +164,7 @@ pub(crate) struct BrowserVisibilityContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "windows", test))]
 struct BrowserVisibilityEvent {
     project: Uuid,
     pane: Uuid,
@@ -168,7 +178,7 @@ struct BrowserVisibilityEvent {
     controller_hr: Option<i32>,
     host_parent_hr: Option<i32>,
     host_hwnd: Option<isize>,
-    host_class: Option<String>,
+    host_class: Option<&'static str>,
     host_owner: Option<&'static str>,
     host_visible: Option<bool>,
 }
@@ -809,6 +819,7 @@ fn deferred_writer(rx: Receiver<DeferredRecord>) {
             DeferredRecord::FocusPathLost { at, event } => {
                 emit_at(at, &gpui_focus_path_line(&event))
             }
+            #[cfg(target_os = "windows")]
             DeferredRecord::BrowserVisibility { at, event } => {
                 emit_at(at, &browser_visibility_line(&event))
             }
@@ -873,6 +884,7 @@ fn phase_line(
     )
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn optional_bool(value: Option<bool>) -> &'static str {
     match value {
         Some(true) => "true",
@@ -881,6 +893,7 @@ fn optional_bool(value: Option<bool>) -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn optional_hresult(value: Option<i32>) -> String {
     value.map_or_else(
         || "unavailable".to_string(),
@@ -892,45 +905,47 @@ fn optional_pane(pane: Option<Uuid>) -> String {
     pane.map_or_else(|| "none".to_string(), |pane| pane.to_string())
 }
 
-fn terminal_paint_cause(cause: muxel_terminal::TerminalPaintCause) -> &'static str {
+fn terminal_notify_cause(cause: muxel_terminal::TerminalNotifyCause) -> &'static str {
     match cause {
-        muxel_terminal::TerminalPaintCause::Immediate => "immediate",
-        muxel_terminal::TerminalPaintCause::Timer => "timer",
+        muxel_terminal::TerminalNotifyCause::Immediate => "immediate",
+        muxel_terminal::TerminalNotifyCause::Timer => "timer",
     }
 }
 
 fn gpui_focus_path_line(event: &GpuiFocusPathEvent) -> String {
-    let (render_token, render_view, render_stage, render_active) = event.render.map_or_else(
-        || (0, "none", "none", "none".to_string()),
-        |render| {
-            (
-                render.token,
-                render.view.label(),
-                render.stage.label(),
-                format!("{}µs", render.active_us),
-            )
-        },
-    );
-    let (content_generation, paint_generation, paint_age, paint_cause, paint_pending) =
+    let (render_token, render_view, render_stage, render_observation, render_active) =
+        event.render.map_or_else(
+            || (0, "none", "none", "none", "none".to_string()),
+            |render| {
+                (
+                    render.token,
+                    render.view.label(),
+                    render.stage.label(),
+                    render.stage.observation(),
+                    format!("{}µs", render.active_us),
+                )
+            },
+        );
+    let (content_generation, notify_generation, notify_age, notify_cause, notify_pending) =
         event.terminal.map_or_else(
             || (0, 0, "none".to_string(), "none", false),
             |terminal| {
                 (
                     terminal.content_generation,
-                    terminal.paint_generation,
-                    terminal.last_paint_age.map_or_else(
+                    terminal.notify_generation,
+                    terminal.last_notify_age.map_or_else(
                         || "none".to_string(),
                         |age| format!("{}µs", age.as_micros()),
                     ),
                     terminal
-                        .last_paint_cause
-                        .map_or("none", terminal_paint_cause),
-                    terminal.paint_pending,
+                        .last_notify_cause
+                        .map_or("none", terminal_notify_cause),
+                    terminal.notify_pending,
                 )
             },
         );
     format!(
-        "ui-prof[focus path v1] current={} current_pane={} current_tracked={} active={} active_pane={} active_tracked={} window_active={} overlay_open={} render_token={} render_view={} render_stage={} render_active={} term_content_gen={} term_paint_gen={} term_paint_age={} term_paint_cause={} term_paint_pending={}",
+        "ui-prof[focus path v2] current={} current_pane={} current_tracked={} active={} active_pane={} active_tracked={} window_active={} overlay_open={} render_token={} render_view={} render_stage={} render_observation={} render_active={} term_content_gen={} term_notify_gen={} term_notify_age={} term_notify_cause={} term_notify_pending={}",
         event.current.kind.label(),
         optional_pane(event.current.pane),
         event.current_tracked,
@@ -942,33 +957,30 @@ fn gpui_focus_path_line(event: &GpuiFocusPathEvent) -> String {
         render_token,
         render_view,
         render_stage,
+        render_observation,
         render_active,
         content_generation,
-        paint_generation,
-        paint_age,
-        paint_cause,
-        paint_pending,
+        notify_generation,
+        notify_age,
+        notify_cause,
+        notify_pending,
     )
 }
 
 fn current_focus_render_context() -> Option<FocusRenderContext> {
     RENDER_STACK.with(|stack| {
-        stack
-            .borrow()
-            .last()
-            .copied()
-            .map(|render| FocusRenderContext {
-                token: render.token,
-                view: render.view,
-                stage: render.stage,
-                active_us: profiler_elapsed_us().saturating_sub(render.started_us),
-            })
+        current_render_snapshot(&stack.borrow()).map(|render| FocusRenderContext {
+            token: render.token,
+            view: render.view,
+            stage: render.stage,
+            active_us: profiler_elapsed_us().saturating_sub(render.started_us),
+        })
     })
 }
 
 /// Record GPUI's direct "nothing in the rendered tree has focus" callback.
 /// The main app supplies only fixed owner classes and optional pane UUIDs; the
-/// profiler adds the live render and terminal-paint correlation snapshots.
+/// profiler adds the live render and terminal-notify correlation snapshots.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gpui_focus_path_lost(
     current: GpuiFocusOwner,
@@ -997,6 +1009,7 @@ pub(crate) fn gpui_focus_path_lost(
     });
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn browser_visibility_line(event: &BrowserVisibilityEvent) -> String {
     let host_hwnd = event.host_hwnd.map_or_else(
         || "none".to_string(),
@@ -1016,7 +1029,7 @@ fn browser_visibility_line(event: &BrowserVisibilityEvent) -> String {
         optional_hresult(event.controller_hr),
         optional_hresult(event.host_parent_hr),
         host_hwnd,
-        event.host_class.as_deref().unwrap_or("unavailable"),
+        event.host_class.unwrap_or("unavailable"),
         event.host_owner.unwrap_or("unavailable"),
         optional_bool(event.host_visible),
     )
@@ -1144,13 +1157,13 @@ pub(crate) fn profile_browser_native_visibility(
                     let hwnd = HWND(raw);
                     let mut buffer = [0u16; 128];
                     let len = unsafe { GetClassNameW(hwnd, &mut buffer) }.max(0) as usize;
-                    let class = focus::sanitize_class_name(&String::from_utf16_lossy(
+                    let class = focus::class_name_bucket(&String::from_utf16_lossy(
                         &buffer[..len.min(buffer.len())],
                     ));
                     let mut pid = 0;
                     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
                     let current_pid = unsafe { GetCurrentProcessId() };
-                    let owner = if pid == current_pid && class.eq_ignore_ascii_case("WRY_WEBVIEW") {
+                    let owner = if pid == current_pid && class == "wry-webview" {
                         "muxel-native-child"
                     } else if pid == current_pid {
                         "muxel-other"
@@ -1718,13 +1731,13 @@ mod tests {
             controller_hr: Some(0),
             host_parent_hr: Some(0),
             host_hwnd: Some(0x12),
-            host_class: Some(focus::sanitize_class_name("WRY WEBVIEW/path")),
+            host_class: Some(focus::class_name_bucket("WRY WEBVIEW/path")),
             host_owner: Some("muxel-native-child"),
             host_visible: Some(true),
         };
         assert_eq!(
             browser_visibility_line(&event),
-            "ui-prof[browser visibility v1] project=ffffffff-ffff-ffff-ffff-ffffffffffff pane=00000000-0000-0000-0000-000000000000 reason=project requested=false project_active=false pane_active=true bounds_changed=false present_gen=23 controller_visible=false controller_hr=0x00000000 host_parent_hr=0x00000000 host_hwnd=0x12 host_class=WRY_WEBVIEW_path host_owner=muxel-native-child host_visible=true"
+            "ui-prof[browser visibility v1] project=ffffffff-ffff-ffff-ffff-ffffffffffff pane=00000000-0000-0000-0000-000000000000 reason=project requested=false project_active=false pane_active=true bounds_changed=false present_gen=23 controller_visible=false controller_hr=0x00000000 host_parent_hr=0x00000000 host_hwnd=0x12 host_class=other host_owner=muxel-native-child host_visible=true"
         );
         let line = browser_visibility_line(&event);
         for forbidden in ["url=", "title=", "path=", "command=", "row="] {
@@ -1749,7 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_path_record_names_internal_owner_and_paint_without_content() {
+    fn focus_path_record_names_internal_owner_and_notify_without_content() {
         let event = GpuiFocusPathEvent {
             current: GpuiFocusOwner {
                 kind: GpuiFocusOwnerKind::Terminal,
@@ -1771,20 +1784,44 @@ mod tests {
             }),
             terminal: Some(muxel_terminal::TerminalFocusProfile {
                 content_generation: 93,
-                paint_generation: 17,
-                last_paint_age: Some(Duration::from_micros(240)),
-                last_paint_cause: Some(muxel_terminal::TerminalPaintCause::Timer),
-                paint_pending: false,
+                notify_generation: 17,
+                last_notify_age: Some(Duration::from_micros(240)),
+                last_notify_cause: Some(muxel_terminal::TerminalNotifyCause::Timer),
+                notify_pending: false,
             }),
         };
         let line = gpui_focus_path_line(&event);
         assert_eq!(
             line,
-            "ui-prof[focus path v1] current=terminal current_pane=00000000-0000-0000-0000-000000000000 current_tracked=false active=terminal active_pane=00000000-0000-0000-0000-000000000000 active_tracked=false window_active=true overlay_open=false render_token=41 render_view=main render_stage=prepaint render_active=812µs term_content_gen=93 term_paint_gen=17 term_paint_age=240µs term_paint_cause=timer term_paint_pending=false"
+            "ui-prof[focus path v2] current=terminal current_pane=00000000-0000-0000-0000-000000000000 current_tracked=false active=terminal active_pane=00000000-0000-0000-0000-000000000000 active_tracked=false window_active=true overlay_open=false render_token=41 render_view=main render_stage=prepaint render_observation=callback render_active=812µs term_content_gen=93 term_notify_gen=17 term_notify_age=240µs term_notify_cause=timer term_notify_pending=false"
         );
         for forbidden in ["text=", "input=", "title=", "command=", "row="] {
             assert!(!line.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn focus_context_uses_live_callback_before_nested_retained_frame() {
+        let previous = RENDER_STACK.with(|stack| {
+            stack.replace(vec![
+                RenderSnapshot {
+                    token: 10,
+                    started_us: 0,
+                    view: RenderView::Main,
+                    stage: RenderStage::Prepaint,
+                },
+                RenderSnapshot {
+                    token: 20,
+                    started_us: 0,
+                    view: RenderView::Workspace,
+                    stage: RenderStage::RootPaintOrPresent,
+                },
+            ])
+        });
+        let context = current_focus_render_context().expect("render context");
+        RENDER_STACK.with(|stack| stack.replace(previous));
+        assert_eq!(context.token, 10);
+        assert_eq!(context.stage.observation(), "callback");
     }
 
     #[test]

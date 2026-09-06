@@ -710,8 +710,8 @@ pub struct TerminalView {
     last_paint_notify: std::cell::Cell<std::time::Instant>,
     /// Profiler correlation only: advances once per output-driven `cx.notify()`.
     /// State is fixed-size per pane and no terminal content is retained.
-    profile_paint_generation: std::cell::Cell<u64>,
-    profile_last_paint_cause: std::cell::Cell<Option<TerminalPaintCause>>,
+    profile_notify_generation: std::cell::Cell<u64>,
+    profile_last_notify_cause: std::cell::Cell<Option<TerminalNotifyCause>>,
     profile_focus: bool,
     /// A throttled batch must still paint if output stops before the next batch.
     /// The generation invalidates an older, later timer when interactive output
@@ -729,22 +729,23 @@ pub struct TerminalView {
 /// cycle.
 pub type TerminalFocusObserver = fn(Uuid, bool, &mut Window, &mut App);
 
-/// Why the drain loop most recently requested a terminal paint.
+/// Why the drain loop most recently notified GPUI to request a redraw.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TerminalPaintCause {
+pub enum TerminalNotifyCause {
     Immediate,
     Timer,
 }
 
 /// Content-free state sampled only when the app-level UI profiler observes a
-/// focus-path failure.
+/// focus-path failure. These counters describe notification scheduling, not
+/// completion of a paint or native presentation.
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalFocusProfile {
     pub content_generation: u64,
-    pub paint_generation: u64,
-    pub last_paint_age: Option<Duration>,
-    pub last_paint_cause: Option<TerminalPaintCause>,
-    pub paint_pending: bool,
+    pub notify_generation: u64,
+    pub last_notify_age: Option<Duration>,
+    pub last_notify_cause: Option<TerminalNotifyCause>,
+    pub notify_pending: bool,
 }
 
 /// A spawned terminal not yet wrapped in a view: the spec that actually ran
@@ -850,10 +851,10 @@ impl TerminalView {
                     .set(self.paint_timer_generation.get().wrapping_add(1));
                 self.last_paint_notify.set(now);
                 if self.profile_focus {
-                    self.profile_paint_generation
-                        .set(self.profile_paint_generation.get().wrapping_add(1));
-                    self.profile_last_paint_cause
-                        .set(Some(TerminalPaintCause::Immediate));
+                    self.profile_notify_generation
+                        .set(self.profile_notify_generation.get().wrapping_add(1));
+                    self.profile_last_notify_cause
+                        .set(Some(TerminalNotifyCause::Immediate));
                 }
                 cx.notify();
                 profile::notify_scheduled(
@@ -881,10 +882,10 @@ impl TerminalView {
                 view.pending_paint_deadline.set(None);
                 view.last_paint_notify.set(Instant::now());
                 if view.profile_focus {
-                    view.profile_paint_generation
-                        .set(view.profile_paint_generation.get().wrapping_add(1));
-                    view.profile_last_paint_cause
-                        .set(Some(TerminalPaintCause::Timer));
+                    view.profile_notify_generation
+                        .set(view.profile_notify_generation.get().wrapping_add(1));
+                    view.profile_last_notify_cause
+                        .set(Some(TerminalNotifyCause::Timer));
                 }
                 cx.notify();
                 profile::notify_scheduled(
@@ -1196,8 +1197,8 @@ impl TerminalView {
             grok_blocked_at: std::cell::Cell::new(None),
             grok_screen_working_at: std::cell::Cell::new(None),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
-            profile_paint_generation: std::cell::Cell::new(0),
-            profile_last_paint_cause: std::cell::Cell::new(None),
+            profile_notify_generation: std::cell::Cell::new(0),
+            profile_last_notify_cause: std::cell::Cell::new(None),
             profile_focus: focus_observer.is_some(),
             pending_paint_deadline: std::cell::Cell::new(None),
             paint_timer_generation: std::cell::Cell::new(0),
@@ -1249,13 +1250,13 @@ impl TerminalView {
     /// Snapshot fixed-size redraw correlation state for an app-level focus-path
     /// loss. Callers keep this behind the opt-in profiler gate.
     pub fn focus_profile(&self) -> TerminalFocusProfile {
-        let last_paint_cause = self.profile_last_paint_cause.get();
+        let last_notify_cause = self.profile_last_notify_cause.get();
         TerminalFocusProfile {
             content_generation: self.session.content_generation(),
-            paint_generation: self.profile_paint_generation.get(),
-            last_paint_age: last_paint_cause.map(|_| self.last_paint_notify.get().elapsed()),
-            last_paint_cause,
-            paint_pending: self.pending_paint_deadline.get().is_some(),
+            notify_generation: self.profile_notify_generation.get(),
+            last_notify_age: last_notify_cause.map(|_| self.last_paint_notify.get().elapsed()),
+            last_notify_cause,
+            notify_pending: self.pending_paint_deadline.get().is_some(),
         }
     }
 

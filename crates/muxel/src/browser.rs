@@ -60,6 +60,7 @@ fn should_publish_url(changed: bool, navigation_committed: bool) -> bool {
     changed || navigation_committed
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn should_sample_native_visibility(
     visibility_changed: bool,
     reason: crate::ui_profile::BrowserVisibilityReason,
@@ -187,6 +188,7 @@ mod imp {
 
     pub struct BrowserView {
         instance_id: uuid::Uuid,
+        #[cfg(target_os = "windows")]
         project_id: uuid::Uuid,
         focus_handle: FocusHandle,
         webview: Option<Entity<gpui_wry::WebView>>,
@@ -200,9 +202,13 @@ mod imp {
         pending_navigation_from: Option<String>,
         /// What the app last asked of the native child (dedupes plaform calls).
         native_visible: bool,
+        #[cfg(target_os = "windows")]
         profile_project_active: bool,
+        #[cfg(target_os = "windows")]
         profile_pane_active: bool,
+        #[cfg(target_os = "windows")]
         profile_overlay: bool,
+        #[cfg(target_os = "windows")]
         last_profile_bounds: Option<Bounds<Pixels>>,
         /// Native page-focus events. WebView2 reports these from its controller;
         /// macOS uses guarded page IPC until WKWebView exposes the same seam.
@@ -220,6 +226,8 @@ mod imp {
             window: &mut Window,
             cx: &mut Context<Self>,
         ) -> Self {
+            #[cfg(not(target_os = "windows"))]
+            let _ = project_id;
             crate::ui_profile::register_focus_pane(instance_id, window);
             let address = cx.new(|cx| InputState::new(window, cx).default_value(url.clone()));
             cx.subscribe_in(
@@ -380,6 +388,10 @@ mod imp {
                     let wv = cx.new(|cx2| gpui_wry::WebView::new(wv, window, cx2));
                     // Re-apply whatever the pane changed while the build ran.
                     let visible = this.native_visible;
+                    if !visible {
+                        wv.update(cx, |wv, _| wv.hide());
+                    }
+                    #[cfg(target_os = "windows")]
                     if crate::ui_profile::is_enabled() {
                         let bounds = wv.read(cx).bounds();
                         let bounds_changed = this
@@ -388,28 +400,18 @@ mod imp {
                             .is_some_and(|previous| previous != bounds);
                         let project_active = this.profile_project_active;
                         let pane_active = this.profile_pane_active;
-                        wv.update(cx, |wv, _| {
-                            if visible {
-                                wv.show()
-                            } else {
-                                wv.hide()
-                            }
-                            #[cfg(target_os = "windows")]
-                            crate::ui_profile::profile_browser_native_visibility(
-                                crate::ui_profile::BrowserVisibilityContext {
-                                    project: project_id,
-                                    pane: instance_id,
-                                    reason: crate::ui_profile::BrowserVisibilityReason::Initial,
-                                    requested: visible,
-                                    project_active,
-                                    pane_active,
-                                    bounds_changed,
-                                },
-                                wv.raw(),
-                            );
-                        });
-                    } else if !visible {
-                        wv.update(cx, |wv, _| wv.hide());
+                        crate::ui_profile::profile_browser_native_visibility(
+                            crate::ui_profile::BrowserVisibilityContext {
+                                project: project_id,
+                                pane: instance_id,
+                                reason: crate::ui_profile::BrowserVisibilityReason::Initial,
+                                requested: visible,
+                                project_active,
+                                pane_active,
+                                bounds_changed,
+                            },
+                            wv.read(cx).raw(),
+                        );
                     }
                     if this.url != requested {
                         let current = this.url.clone();
@@ -423,6 +425,7 @@ mod imp {
 
             Self {
                 instance_id,
+                #[cfg(target_os = "windows")]
                 project_id,
                 focus_handle: cx.focus_handle(),
                 webview: None,
@@ -431,9 +434,13 @@ mod imp {
                 url,
                 pending_navigation_from: None,
                 native_visible: true,
+                #[cfg(target_os = "windows")]
                 profile_project_active: true,
+                #[cfg(target_os = "windows")]
                 profile_pane_active: true,
+                #[cfg(target_os = "windows")]
                 profile_overlay: false,
+                #[cfg(target_os = "windows")]
                 last_profile_bounds: None,
                 focus_events,
                 new_window_events,
@@ -613,14 +620,34 @@ mod imp {
             cx: &mut Context<Self>,
         ) {
             let visibility_changed = self.native_visible != visible;
-            if !crate::ui_profile::is_enabled() {
-                if !visibility_changed {
-                    return;
-                }
+            if visibility_changed {
                 self.native_visible = visible;
                 if let Some(wv) = &self.webview {
                     wv.update(cx, |wv, _| if visible { wv.show() } else { wv.hide() });
                 }
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = (project_active, pane_active, overlay);
+            #[cfg(target_os = "windows")]
+            self.profile_native_visibility(
+                visibility_changed,
+                project_active,
+                pane_active,
+                overlay,
+                cx,
+            );
+        }
+
+        #[cfg(target_os = "windows")]
+        fn profile_native_visibility(
+            &mut self,
+            visibility_changed: bool,
+            project_active: bool,
+            pane_active: bool,
+            overlay: bool,
+            cx: &Context<Self>,
+        ) {
+            if !crate::ui_profile::is_enabled() {
                 return;
             }
             let reason = if self.profile_overlay != overlay {
@@ -636,35 +663,24 @@ mod imp {
             if !should_sample_native_visibility(visibility_changed, reason) {
                 return;
             }
-            if visibility_changed {
-                self.native_visible = visible;
-            }
             if let Some(wv) = &self.webview {
-                let instance_id = self.instance_id;
-                let project_id = self.project_id;
                 let bounds = wv.read(cx).bounds();
                 let bounds_changed = self
                     .last_profile_bounds
                     .replace(bounds)
                     .is_some_and(|previous| previous != bounds);
-                wv.update(cx, |wv, _| {
-                    if visibility_changed {
-                        if visible { wv.show() } else { wv.hide() }
-                    }
-                    #[cfg(target_os = "windows")]
-                    crate::ui_profile::profile_browser_native_visibility(
-                        crate::ui_profile::BrowserVisibilityContext {
-                            project: project_id,
-                            pane: instance_id,
-                            reason,
-                            requested: visible,
-                            project_active,
-                            pane_active,
-                            bounds_changed,
-                        },
-                        wv.raw(),
-                    );
-                });
+                crate::ui_profile::profile_browser_native_visibility(
+                    crate::ui_profile::BrowserVisibilityContext {
+                        project: self.project_id,
+                        pane: self.instance_id,
+                        reason,
+                        requested: self.native_visible,
+                        project_active,
+                        pane_active,
+                        bounds_changed,
+                    },
+                    wv.read(cx).raw(),
+                );
             }
         }
     }
