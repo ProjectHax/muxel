@@ -178,6 +178,47 @@ impl PartialEq for LeafData {
     }
 }
 
+/// Borrowed synchronization representation: visual identity is local metadata,
+/// and older peers (including iOS) legitimately omit it when saving a layout.
+pub(crate) struct SemanticPane<'a>(pub &'a PaneNode);
+
+impl Serialize for SemanticPane<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeSeq, SerializeStruct};
+        struct Children<'a>(&'a [PaneNode]);
+        impl Serialize for Children<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+                for child in self.0 {
+                    seq.serialize_element(&SemanticPane(child))?;
+                }
+                seq.end()
+            }
+        }
+        match self.0 {
+            PaneNode::Leaf(leaf) => {
+                let mut node = serializer.serialize_struct("PaneNode", 3)?;
+                node.serialize_field("kind", "leaf")?;
+                node.serialize_field("tabs", &leaf.tabs)?;
+                node.serialize_field("active", &leaf.active)?;
+                node.end()
+            }
+            PaneNode::Split {
+                direction,
+                sizes,
+                children,
+            } => {
+                let mut node = serializer.serialize_struct("PaneNode", 4)?;
+                node.serialize_field("kind", "split")?;
+                node.serialize_field("direction", direction)?;
+                node.serialize_field("sizes", sizes)?;
+                node.serialize_field("children", &Children(children))?;
+                node.end()
+            }
+        }
+    }
+}
+
 impl LeafData {
     fn new(instance: Uuid) -> Self {
         Self {
@@ -363,6 +404,24 @@ impl PaneNode {
                 match direction {
                     SplitDirection::Horizontal => widths.sum(),
                     SplitDirection::Vertical => widths.fold(0.0, f32::max),
+                }
+            }
+        }
+    }
+
+    /// Minimum height, with the same recursive constraints as [`Self::min_width`].
+    pub fn min_height(&self, leaf_min: f32) -> f32 {
+        match self {
+            Self::Leaf(_) => leaf_min,
+            Self::Split {
+                direction,
+                children,
+                ..
+            } => {
+                let heights = children.iter().map(|child| child.min_height(leaf_min));
+                match direction {
+                    SplitDirection::Vertical => heights.sum(),
+                    SplitDirection::Horizontal => heights.fold(0.0, f32::max),
                 }
             }
         }

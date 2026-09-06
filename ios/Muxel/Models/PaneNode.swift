@@ -18,6 +18,9 @@ enum SplitDirection: String, Codable, Equatable {
 
 extension PaneNode: Codable {
     private enum CodingKeys: String, CodingKey {
+        // Desktop's optional `pane_id` is rendering identity, not shared layout
+        // content. It is deliberately omitted here; desktop's semantic sync key
+        // excludes it too, so an iOS save does not forge a layout change.
         case kind, tabs, active, instance, direction, sizes, children
     }
 
