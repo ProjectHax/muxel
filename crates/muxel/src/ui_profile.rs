@@ -16,6 +16,12 @@
 //! 4. `ui-prof.log` in cwd
 //!
 //! When disabled: single OnceLock check, no flusher, no probe work.
+//!
+//! Render records distinguish `observation=callback` (an instrumented callback
+//! has not returned; its duration includes re-entrant work) from
+//! `observation=retained-frame` (the last frame observed by a wrapper, retained
+//! until GPUI clears its arena). The latter cannot establish the currently
+//! executing window after arbitrary native re-entry or display presentation.
 
 use std::cell::RefCell;
 use std::fs::OpenOptions;
@@ -41,10 +47,7 @@ static DEFERRED: OnceLock<SyncSender<DeferredRecord>> = OnceLock::new();
 static DEFERRED_DROPPED: AtomicU64 = AtomicU64::new(0);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_RENDER_TOKEN: AtomicU64 = AtomicU64::new(0);
-static RENDER_TOKEN: AtomicU64 = AtomicU64::new(0);
-static RENDER_STARTED_US: AtomicU64 = AtomicU64::new(0);
-static RENDER_VIEW: AtomicU64 = AtomicU64::new(0);
-static RENDER_STAGE: AtomicU64 = AtomicU64::new(0);
+static RENDER_PUBLICATION: RenderPublication = RenderPublication::new();
 
 const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PENDING_RECORDS: usize = 4096;
@@ -128,6 +131,21 @@ enum RenderStage {
 }
 
 impl RenderStage {
+    fn is_callback(self) -> bool {
+        matches!(
+            self,
+            Self::Build | Self::RequestLayout | Self::Prepaint | Self::Paint
+        )
+    }
+
+    fn observation(self) -> &'static str {
+        if self.is_callback() {
+            "callback"
+        } else {
+            "retained-frame"
+        }
+    }
+
     fn from_code(code: u64) -> Option<Self> {
         match code {
             1 => Some(Self::Build),
@@ -198,6 +216,75 @@ struct RenderSnapshot {
     stage: RenderStage,
 }
 
+struct RenderPublication {
+    version: AtomicU64,
+    token: AtomicU64,
+    started_us: AtomicU64,
+    view: AtomicU64,
+    stage: AtomicU64,
+}
+
+impl RenderPublication {
+    const fn new() -> Self {
+        Self {
+            version: AtomicU64::new(0),
+            token: AtomicU64::new(0),
+            started_us: AtomicU64::new(0),
+            view: AtomicU64::new(0),
+            stage: AtomicU64::new(0),
+        }
+    }
+
+    fn publish(&self, snapshot: Option<RenderSnapshot>) {
+        // Single writer: GPUI's UI thread. Correlation tokens can return after
+        // a nested draw; publication versions cannot. Odd marks an incomplete
+        // publication. SeqCst keeps all fields inside this versioned interval.
+        self.version.fetch_add(1, Ordering::SeqCst);
+        self.token.store(0, Ordering::SeqCst);
+        if let Some(snapshot) = snapshot {
+            self.started_us.store(snapshot.started_us, Ordering::SeqCst);
+            self.view.store(snapshot.view as u64, Ordering::SeqCst);
+            self.stage.store(snapshot.stage as u64, Ordering::SeqCst);
+            self.token.store(snapshot.token, Ordering::SeqCst);
+        }
+        self.version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn read_version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
+    }
+
+    fn read_fields(&self) -> Option<RenderSnapshot> {
+        let token = self.token.load(Ordering::SeqCst);
+        if token == 0 {
+            return None;
+        }
+        Some(RenderSnapshot {
+            token,
+            started_us: self.started_us.load(Ordering::SeqCst),
+            view: RenderView::from_code(self.view.load(Ordering::SeqCst))?,
+            stage: RenderStage::from_code(self.stage.load(Ordering::SeqCst))?,
+        })
+    }
+
+    fn finish_read(
+        &self,
+        version: u64,
+        snapshot: Option<RenderSnapshot>,
+    ) -> Result<Option<RenderSnapshot>, ()> {
+        if version.is_multiple_of(2) && version == self.read_version() {
+            Ok(snapshot)
+        } else {
+            Err(())
+        }
+    }
+
+    fn load(&self) -> Result<Option<RenderSnapshot>, ()> {
+        let version = self.read_version();
+        self.finish_read(version, self.read_fields())
+    }
+}
+
 thread_local! {
     /// Render watches are created and dropped on GPUI's UI thread. A vector is
     /// required instead of saved previous values because re-entrant Windows
@@ -233,7 +320,7 @@ impl Drop for RenderWatch {
         RENDER_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
             remove_render_snapshot(&mut stack, self.token);
-            publish_render_snapshot(stack.last().copied());
+            publish_render_snapshot(current_render_snapshot(&stack));
         });
         if elapsed_us >= SLOW_RENDER_US {
             defer_record(DeferredRecord::SlowRender {
@@ -252,7 +339,7 @@ impl RenderWatch {
         RENDER_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
             if mark_render_stage(&mut stack, self.token, stage) {
-                publish_render_snapshot(stack.last().copied());
+                publish_render_snapshot(current_render_snapshot(&stack));
             }
         });
     }
@@ -266,25 +353,33 @@ fn remove_render_snapshot(stack: &mut Vec<RenderSnapshot>, token: u64) -> bool {
     true
 }
 
-/// Update one live watch. Returns true only when it is the published top.
-fn mark_render_stage(stack: &mut [RenderSnapshot], token: u64, stage: RenderStage) -> bool {
+fn current_render_snapshot(stack: &[RenderSnapshot]) -> Option<RenderSnapshot> {
+    // A nested draw's frame allocation can outlive its execution. A callback
+    // guard still on the stack is stronger evidence: it has not returned yet
+    // (and its measured interval includes any re-entrant work). Only fall back
+    // to the last observed retained frame outside instrumented callbacks.
+    stack
+        .iter()
+        .rev()
+        .find(|snapshot| snapshot.stage.is_callback())
+        .or_else(|| stack.last())
+        .copied()
+}
+
+/// The wrapper resumed after its child callback. Make that frame the latest
+/// observed one even if a nested draw's allocation remains in the arena.
+fn mark_render_stage(stack: &mut Vec<RenderSnapshot>, token: u64, stage: RenderStage) -> bool {
     let Some(index) = stack.iter().rposition(|snapshot| snapshot.token == token) else {
         return false;
     };
-    stack[index].stage = stage;
-    index + 1 == stack.len()
+    let mut snapshot = stack.remove(index);
+    snapshot.stage = stage;
+    stack.push(snapshot);
+    true
 }
 
 fn publish_render_snapshot(snapshot: Option<RenderSnapshot>) {
-    // Invalidate the previous snapshot first. Readers that caught its token
-    // will reject the record on their second token read.
-    RENDER_TOKEN.store(0, Ordering::Release);
-    if let Some(snapshot) = snapshot {
-        RENDER_STARTED_US.store(snapshot.started_us, Ordering::Relaxed);
-        RENDER_VIEW.store(snapshot.view as u64, Ordering::Relaxed);
-        RENDER_STAGE.store(snapshot.stage as u64, Ordering::Relaxed);
-        RENDER_TOKEN.store(snapshot.token, Ordering::Release);
-    }
+    RENDER_PUBLICATION.publish(snapshot);
 }
 
 impl IntoElement for ProfiledElement {
@@ -604,9 +699,10 @@ fn render_line(
     duration_us: u64,
 ) -> String {
     format!(
-        "ui-prof[render {event}] token={token} view={} stage={} {duration_label}={duration_us}µs",
+        "ui-prof[render {event}] token={token} view={} stage={} observation={} {duration_label}={duration_us}µs",
         view.label(),
         stage.label(),
+        stage.observation(),
     )
 }
 
@@ -729,7 +825,7 @@ fn watch_render(view: RenderView, stage: RenderStage) -> Option<RenderWatch> {
     RENDER_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.push(snapshot);
-        publish_render_snapshot(stack.last().copied());
+        publish_render_snapshot(current_render_snapshot(&stack));
     });
     Some(RenderWatch {
         token,
@@ -976,32 +1072,23 @@ pub fn probe_timeout() {
     }
     ensure_flusher();
     PROBE_TIMEOUT.fetch_add(1, Ordering::Relaxed);
-    let token = RENDER_TOKEN.load(Ordering::Acquire);
-    if token == 0 {
+    let Ok(snapshot) = RENDER_PUBLICATION.load() else {
+        return;
+    };
+    let Some(snapshot) = snapshot else {
         defer_record(DeferredRecord::StaticLine {
             at: SystemTime::now(),
             line: "ui-prof[probe timeout] no-render-active",
         });
         return;
-    }
-    let started_us = RENDER_STARTED_US.load(Ordering::Relaxed);
-    let view = RenderView::from_code(RENDER_VIEW.load(Ordering::Relaxed));
-    let stage = RenderStage::from_code(RENDER_STAGE.load(Ordering::Relaxed));
-    std::sync::atomic::fence(Ordering::Acquire);
-    // Re-read the token after the associated fields. A changed or cleared token
-    // means the render stage ended while the probe thread sampled it.
-    if token != RENDER_TOKEN.load(Ordering::Acquire) {
-        return;
-    }
-    if let (Some(view), Some(stage)) = (view, stage) {
-        defer_record(DeferredRecord::RenderBlocked {
-            at: SystemTime::now(),
-            token,
-            view,
-            stage,
-            active_us: profiler_elapsed_us().saturating_sub(started_us),
-        });
-    }
+    };
+    defer_record(DeferredRecord::RenderBlocked {
+        at: SystemTime::now(),
+        token: snapshot.token,
+        view: snapshot.view,
+        stage: snapshot.stage,
+        active_us: profiler_elapsed_us().saturating_sub(snapshot.started_us),
+    });
 }
 
 /// Record failure to enqueue the probe itself. This is transport evidence, not
@@ -1125,7 +1212,7 @@ mod tests {
                 "active",
                 15_281_000,
             ),
-            "ui-prof[render blocked] token=9 view=workspace stage=root-layout-or-compute active=15281000µs"
+            "ui-prof[render blocked] token=9 view=workspace stage=root-layout-or-compute observation=retained-frame active=15281000µs"
         );
         assert_eq!(RenderView::from_code(99), None);
         assert_eq!(RenderStage::from_code(99), None);
@@ -1148,13 +1235,16 @@ mod tests {
         // A nested draw survives while an outer stage guard is destroyed.
         assert!(remove_render_snapshot(&mut stack, 2));
         assert_eq!(stack.last().map(|watch| watch.token), Some(3));
-        // The hidden outer frame can progress without replacing the nested top.
-        assert!(!mark_render_stage(
+        // Once the outer wrapper resumes, its frame is the latest observed.
+        assert!(mark_render_stage(
             &mut stack,
             1,
             RenderStage::RootPaintOrPresent,
         ));
-        assert_eq!(stack.last().map(|watch| watch.token), Some(3));
+        assert_eq!(
+            current_render_snapshot(&stack).map(|watch| watch.token),
+            Some(1)
+        );
         // Once the nested draw dies, only the still-live outer frame resurfaces.
         assert!(remove_render_snapshot(&mut stack, 3));
         assert_eq!(
@@ -1164,5 +1254,55 @@ mod tests {
         assert!(remove_render_snapshot(&mut stack, 1));
         assert!(stack.is_empty());
         assert!(!remove_render_snapshot(&mut stack, 2));
+    }
+
+    #[test]
+    fn retained_nested_frame_does_not_hide_the_resumed_outer_callback() {
+        let snapshot = |token, view, stage| RenderSnapshot {
+            token,
+            started_us: token * 10,
+            view,
+            stage,
+        };
+        let mut stack = vec![
+            snapshot(1, RenderView::Main, RenderStage::Frame),
+            snapshot(2, RenderView::Main, RenderStage::RequestLayout),
+            snapshot(3, RenderView::Workspace, RenderStage::RootPaintOrPresent),
+            snapshot(4, RenderView::Workspace, RenderStage::Paint),
+        ];
+        assert_eq!(current_render_snapshot(&stack).unwrap().token, 4);
+        // Nested paint returned, but GPUI must retain its arena allocation
+        // until the enclosing draw finishes. The outer callback is still live.
+        remove_render_snapshot(&mut stack, 4);
+        assert_eq!(current_render_snapshot(&stack).unwrap().token, 2);
+        remove_render_snapshot(&mut stack, 2);
+        mark_render_stage(&mut stack, 1, RenderStage::RootLayoutOrCompute);
+        assert_eq!(current_render_snapshot(&stack).unwrap().token, 1);
+    }
+
+    #[test]
+    fn render_publication_rejects_a_nested_snapshot_after_the_outer_token_returns() {
+        let publication = RenderPublication::new();
+        let outer = RenderSnapshot {
+            token: 1,
+            started_us: 10,
+            view: RenderView::Main,
+            stage: RenderStage::Paint,
+        };
+        let nested = RenderSnapshot {
+            token: 2,
+            started_us: 20,
+            view: RenderView::Workspace,
+            stage: RenderStage::Build,
+        };
+        publication.publish(Some(outer));
+        let version = publication.read_version();
+        // Deterministic interleave of the same writer and reader operations
+        // used by publish/load: the outer correlation token returns unchanged.
+        publication.publish(Some(nested));
+        let fields = publication.read_fields();
+        publication.publish(Some(outer));
+        assert!(publication.finish_read(version, fields).is_err());
+        assert_eq!(publication.load(), Ok(Some(outer)));
     }
 }
