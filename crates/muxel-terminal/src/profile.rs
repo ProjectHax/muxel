@@ -560,7 +560,10 @@ impl PaneLatency {
         if self.read_at != 0 {
             return;
         }
-        if self.pending_key_at == 0 || now.saturating_sub(self.pending_key_at) >= LATENCY_STALE_US {
+        // A later key cannot tell whether the previous key's response is
+        // already queued behind a stalled UI drain. Only its read timestamp
+        // can decide expiry; keep one pending key until then or focus/close.
+        if self.pending_key_at == 0 {
             self.pending_key_at = now;
         }
     }
@@ -618,7 +621,7 @@ impl PaneLatency {
             return None;
         }
         let process_paint_us = now.saturating_sub(self.process_at);
-        let sample = (process_paint_us < LATENCY_STALE_US).then(|| LatencySample {
+        let sample = Some(LatencySample {
             key_read_us: self.read_at.saturating_sub(self.key_at),
             read_drain_us: (self.drain_at != 0).then(|| self.drain_at.saturating_sub(self.read_at)),
             drain_request_us: (self.drain_at != 0 && self.update_requested_at != 0)
@@ -670,12 +673,19 @@ fn update_latency_pane<R>(
     result
 }
 
-/// Drop unanswered keys after the same horizon used by [`PaneLatency::read`].
-/// Later stages stay alive: a long reader/UI delay is precisely what this
-/// profiler is meant to capture.
-fn prune_stale_pending_keys(panes: &mut HashMap<Uuid, PaneLatency>, now: u64) {
-    panes.retain(|_, pane| {
-        pane.pending_key_at == 0 || now.saturating_sub(pane.pending_key_at) < LATENCY_STALE_US
+/// Correlate in reader order, independent of UI delay. An unrelated pane or an
+/// older chunk cannot prove that this key went unanswered: its response may
+/// still be queued. State is limited to one chain per pane, removed on a stale
+/// post-key read, completed paint, focus loss, or pane close.
+fn correlate_drained_output(
+    panes: &mut HashMap<Uuid, PaneLatency>,
+    instance_id: Uuid,
+    timing: PtyReadTiming,
+    now: u64,
+) {
+    update_latency_pane(panes, instance_id, |pane| {
+        pane.read(timing.sequence, timing.read_at_us);
+        pane.drained(timing, now);
     });
 }
 
@@ -683,8 +693,8 @@ fn publish_latency_activity(panes: &HashMap<Uuid, PaneLatency>) {
     PANE_LATENCY_ACTIVE.store(!panes.is_empty(), Ordering::Release);
 }
 
-/// Samples older than this are dropped as stale — the key had no echo (arrow
-/// keys in some TUIs), or the echo was for something else entirely.
+/// Maximum key→read attribution window. Once a read is correlated, subsequent
+/// drain, process, and paint delays are evidence and must not expire the chain.
 const LATENCY_STALE_US: u64 = 500_000;
 
 /// Whether a terminal paint walked the grid or replayed a cached draw list.
@@ -1037,11 +1047,7 @@ pub(crate) fn output_drained(instance_id: Uuid, timing: PtyReadTiming) {
         return;
     }
     if let Ok(mut panes) = pane_latency().lock() {
-        prune_stale_pending_keys(&mut panes, now);
-        update_latency_pane(&mut panes, instance_id, |pane| {
-            pane.read(timing.sequence, timing.read_at_us);
-            pane.drained(timing, now);
-        });
+        correlate_drained_output(&mut panes, instance_id, timing, now);
         publish_latency_activity(&panes);
     }
     touch();
@@ -1283,6 +1289,73 @@ mod tests {
     }
 
     #[test]
+    fn delayed_drain_keeps_a_prompt_read_after_unrelated_and_pre_key_output() {
+        let focused = Uuid::new_v4();
+        let background = Uuid::new_v4();
+        let mut panes = HashMap::new();
+        panes
+            .entry(focused)
+            .or_insert_with(PaneLatency::default)
+            .key(10);
+        correlate_drained_output(
+            &mut panes,
+            background,
+            PtyReadTiming {
+                sequence: 1,
+                read_at_us: 600_000,
+            },
+            600_010,
+        );
+        correlate_drained_output(
+            &mut panes,
+            focused,
+            PtyReadTiming {
+                sequence: 1,
+                read_at_us: 5,
+            },
+            600_020,
+        );
+        correlate_drained_output(
+            &mut panes,
+            focused,
+            PtyReadTiming {
+                sequence: 2,
+                read_at_us: 20,
+            },
+            600_030,
+        );
+        let pane = panes
+            .get_mut(&focused)
+            .expect("queued response retains its pending key");
+        pane.update_requested(600_040);
+        pane.processed(600_050);
+        let sample = pane.painted(600_060).expect("delayed channel sample");
+        assert_eq!(sample.key_read_us, 10);
+        assert_eq!(sample.read_drain_us, Some(600_010));
+    }
+
+    #[test]
+    fn completed_chain_keeps_slow_process_to_paint_evidence() {
+        let mut pane = PaneLatency::default();
+        pane.key(10);
+        pane.read(1, 20);
+        pane.drained(
+            PtyReadTiming {
+                sequence: 1,
+                read_at_us: 20,
+            },
+            30,
+        );
+        pane.update_requested(40);
+        pane.processed(50);
+        pane.notified(60, PaintRequest::Now, Duration::ZERO);
+        let sample = pane.painted(600_050).expect("slow completed chain");
+        assert_eq!(sample.process_paint_us, 600_000);
+        assert_eq!(sample.notify_paint_us, Some(599_990));
+        assert_eq!(pane, PaneLatency::default());
+    }
+
+    #[test]
     fn key_during_an_active_chain_is_not_deferred_to_later_output() {
         let mut pane = PaneLatency::default();
         pane.key(10);
@@ -1337,34 +1410,26 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_output_prunes_an_unanswered_stale_key() {
-        let stale = Uuid::new_v4();
-        let active = Uuid::new_v4();
-        let mut panes = HashMap::from([
-            (
-                stale,
-                PaneLatency {
-                    pending_key_at: 10,
-                    ..PaneLatency::default()
-                },
-            ),
-            (
-                active,
-                PaneLatency {
-                    key_at: 20,
-                    read_at: 30,
-                    ..PaneLatency::default()
-                },
-            ),
-        ]);
-
-        prune_stale_pending_keys(&mut panes, 10 + LATENCY_STALE_US);
-
-        assert!(!panes.contains_key(&stale));
-        assert!(
-            panes.contains_key(&active),
-            "later latency stages are evidence"
+    fn stale_post_key_read_releases_the_single_pending_chain() {
+        let pane_id = Uuid::new_v4();
+        let mut panes = HashMap::new();
+        let pane = panes.entry(pane_id).or_insert_with(PaneLatency::default);
+        pane.key(10);
+        pane.key(600_000);
+        assert_eq!(
+            pane.pending_key_at, 10,
+            "later input cannot expire queued evidence"
         );
+        correlate_drained_output(
+            &mut panes,
+            pane_id,
+            PtyReadTiming {
+                sequence: 1,
+                read_at_us: 10 + LATENCY_STALE_US,
+            },
+            2 * LATENCY_STALE_US,
+        );
+        assert!(panes.is_empty());
     }
 
     #[test]

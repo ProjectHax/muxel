@@ -124,6 +124,11 @@ writer queue. The PTY reader only stamps the batch and updates relaxed counters;
 the UI drain pairs that batch with the pending key, so profiling does not put a
 shared lock in the reader path.
 
+The 500 ms attribution window applies only to key→read, using the reader's
+timestamp. Queued output and completed drain/process/paint stages survive
+longer UI stalls. Correlation retains at most one chain per pane until a
+post-key read expires it, paint completes, focus is lost, or the pane closes.
+
 Still future work: fixed-size latency histograms and byte-depth gauges for the
 two queues. Add them only when interval averages/maxima leave a real incident
 ambiguous.

@@ -639,11 +639,10 @@ impl TerminalSession {
                 // pipe breaks (child gone).
                 let mut prior_profiler_interval = None;
                 while let Ok(write) = write_rx.recv() {
-                    let dequeued_at = Instant::now();
                     let queue_delay = write.queued_at.map(|queued_at| {
                         queue_delay_excluding_profiler(
                             queued_at,
-                            dequeued_at,
+                            Instant::now(),
                             prior_profiler_interval,
                         )
                     });
