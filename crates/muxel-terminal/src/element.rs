@@ -1335,9 +1335,10 @@ impl InputHandler for TerminalInputHandler {
     ) {
         if !text.is_empty() {
             let t0 = Instant::now();
+            profile::key_started(self.instance_id, t0);
             self.session.write_input(text.as_bytes());
             // InputHandler has no is_held; key-repeat for letters often lands here.
-            profile::key_handled(self.instance_id, false, t0.elapsed());
+            profile::key_finished(false, t0.elapsed());
         }
     }
 

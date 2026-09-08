@@ -81,24 +81,33 @@ criteria are in the `present_pump.rs` module docs (zed#61469 in our gpui pin +
 
 ## Diagnostics (opt-in — **off by default**)
 
-Nothing profiles unless you set env vars. When off, call sites are a single
-OnceLock check.
+Nothing profiles unless you set env vars. When off, call sites take a cached
+boolean branch.
 
 | Env | Meaning |
 |-----|---------|
 | `MUXEL_PROFILE=1` | enable **both** terminal + UI profilers |
-| `MUXEL_PROFILE_TERMINAL=1` | terminal key→echo→paint only (`profile.rs`) |
+| `MUXEL_PROFILE_TERMINAL=1` | terminal key→next-read→process→paint only (`profile.rs`) |
 | `MUXEL_PROFILE_UI=1` | UI/present-pump/probe only (`ui_profile.rs`) |
 | `MUXEL_PROFILE_LOG` | terminal log path (append; rotates at 2 MB → `.1`) |
 | `MUXEL_PROFILE_UI_LOG` | UI log path (default: sibling `ui-prof*.log`) |
 | `MUXEL_PROFILE_STDERR=1` | also echo dump lines to stderr (default: file only) |
 
 **Terminal log** (`term-prof`): ~500 ms intervals while interesting work
-happens (keys, paint spikes, high felt latency). Fields: paint phase splits,
-shape reuse, `key→echo` vs `echo→paint`, cursor-row probe.
+happens (keys, paint spikes, high felt latency). Fields: PTY writer queue/write,
+PTY reader→drain, parse, paint phase splits, shape reuse, and focused cursor
+position metadata. Terminal and input contents are never logged.
+Startup and slow per-pane lines cross a bounded nonblocking handoff; the
+channel and worker each retain at most 128 records, and interval lines report
+any saturation as `deferred_dropped=`.
+`term-prof[v8]` splits typing latency into `key→next-read`,
+`read→process`, and `process→paint`; slow `term-lat[v8]` chains further split
+channel drain, intentional coalescing, UI-update queueing, notify, and paint. A
+`term-write[v1]` line names the pane when queueing or the ConPTY write itself
+exceeds 50 ms.
 
 **UI log** (`ui-prof`): present-pump cost, UI-queue probe RTT, coalesce rate,
-1m / 15m / hourly snapshots (working set). Use this for settings typing and
+and 1m / 15m / hourly snapshots (working set). Use this for settings typing and
 cursor starvation (term-prof cannot see non-terminal keys). Spikes:
 `pump >8ms/>30ms`, `probe >50ms/>200ms`, `timeout=`.
 
@@ -117,10 +126,11 @@ Attach-only PresentMon (optional external tool):
 presentmon --process_id <pid> --timed 20 --output_file pm.csv --terminate_after_timed
 ```
 
-Logged: key/notify/process/paint rates, paint phase splits (build/shape/submit)
-with shape-reuse %, felt-latency samples (`key→echo` = agent+ConPTY side,
-`echo→paint` = muxel side), sync-expiry count, and a focused-pane cursor-row
-probe that shows whether typed bytes reached the grid.
+Logged: key/writer/reader/notify/process/paint rates, writer queue and ConPTY
+write timing, reader→drain timing, paint phase splits (build/shape/submit) with
+shape-reuse %, split latency samples, sync-expiry count, and a focused-pane
+cursor position. `process→paint` ends at GPUI paint completion; only PresentMon
+can prove when that paint reached the screen.
 
 ## Ruled out on the way (kept for the next archaeologist)
 
