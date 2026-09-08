@@ -16,21 +16,452 @@
 //! 4. `ui-prof.log` in cwd
 //!
 //! When disabled: single OnceLock check, no flusher, no probe work.
+//!
+//! Render records distinguish `observation=callback` (an instrumented callback
+//! has not returned; its duration includes re-entrant work) from
+//! `observation=retained-frame` (the last frame observed by a wrapper, retained
+//! until GPUI clears its arena). The latter cannot establish the currently
+//! executing window after arbitrary native re-entry or display presentation.
 
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use gpui::{
+    AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, Pixels, Window,
+};
+use uuid::Uuid;
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 static STARTED: OnceLock<Instant> = OnceLock::new();
 static FLUSHER: AtomicBool = AtomicBool::new(false);
+static DEFERRED: OnceLock<SyncSender<DeferredRecord>> = OnceLock::new();
+static DEFERRED_DROPPED: AtomicU64 = AtomicU64::new(0);
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_RENDER_TOKEN: AtomicU64 = AtomicU64::new(0);
+static RENDER_PUBLICATION: RenderPublication = RenderPublication::new();
 
 const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PENDING_RECORDS: usize = 4096;
+const SLOW_RENDER_US: u64 = 50_000;
+
+enum DeferredRecord {
+    Line {
+        at: SystemTime,
+        line: String,
+    },
+    StaticLine {
+        at: SystemTime,
+        line: &'static str,
+    },
+    Phase {
+        at: SystemTime,
+        boundary: PhaseBoundary,
+        id: u64,
+        category: &'static str,
+        phase: &'static str,
+        pane: Option<Uuid>,
+        elapsed_us: Option<u64>,
+    },
+    RenderBlocked {
+        at: SystemTime,
+        token: u64,
+        view: RenderView,
+        stage: RenderStage,
+        active_us: u64,
+    },
+    SlowRender {
+        at: SystemTime,
+        token: u64,
+        view: RenderView,
+        stage: RenderStage,
+        elapsed_us: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderView {
+    Main = 1,
+    Workspace = 2,
+    Popout = 3,
+    DevConsole = 4,
+    FileDiff = 5,
+}
+
+impl RenderView {
+    fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::Main),
+            2 => Some(Self::Workspace),
+            3 => Some(Self::Popout),
+            4 => Some(Self::DevConsole),
+            5 => Some(Self::FileDiff),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Workspace => "workspace",
+            Self::Popout => "popout",
+            Self::DevConsole => "dev-console",
+            Self::FileDiff => "file-diff",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderStage {
+    Build = 1,
+    Frame = 2,
+    RequestLayout = 3,
+    RootLayoutOrCompute = 4,
+    Prepaint = 5,
+    Paint = 6,
+    RootPaintOrPresent = 7,
+}
+
+impl RenderStage {
+    fn is_callback(self) -> bool {
+        matches!(
+            self,
+            Self::Build | Self::RequestLayout | Self::Prepaint | Self::Paint
+        )
+    }
+
+    fn observation(self) -> &'static str {
+        if self.is_callback() {
+            "callback"
+        } else {
+            "retained-frame"
+        }
+    }
+
+    fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::Build),
+            2 => Some(Self::Frame),
+            3 => Some(Self::RequestLayout),
+            4 => Some(Self::RootLayoutOrCompute),
+            5 => Some(Self::Prepaint),
+            6 => Some(Self::Paint),
+            7 => Some(Self::RootPaintOrPresent),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Frame => "frame",
+            Self::RequestLayout => "request-layout",
+            Self::RootLayoutOrCompute => "root-layout-or-compute",
+            Self::Prepaint => "prepaint",
+            Self::Paint => "paint",
+            Self::RootPaintOrPresent => "root-paint-or-present",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PhaseBoundary {
+    Begin,
+    End,
+}
+
+impl PhaseBoundary {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::End => "end",
+        }
+    }
+}
+
+/// A content-free phase boundary around synchronous work that may occupy the UI
+/// thread. Records are timestamped at the call site and written by a bounded
+/// background worker, so profiling cannot add file I/O or lock waits to the
+/// measured path.
+pub struct PhaseSpan {
+    id: u64,
+    category: &'static str,
+    phase: &'static str,
+    pane: Option<Uuid>,
+    started: Instant,
+}
+
+/// High-frequency render watch. Normal frames only touch atomics and emit
+/// nothing; slow frames and probe timeouts enqueue one typed record.
+pub struct RenderWatch {
+    token: u64,
+    view: RenderView,
+    stage: RenderStage,
+    started: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderSnapshot {
+    token: u64,
+    started_us: u64,
+    view: RenderView,
+    stage: RenderStage,
+}
+
+struct RenderPublication {
+    version: AtomicU64,
+    token: AtomicU64,
+    started_us: AtomicU64,
+    view: AtomicU64,
+    stage: AtomicU64,
+}
+
+impl RenderPublication {
+    const fn new() -> Self {
+        Self {
+            version: AtomicU64::new(0),
+            token: AtomicU64::new(0),
+            started_us: AtomicU64::new(0),
+            view: AtomicU64::new(0),
+            stage: AtomicU64::new(0),
+        }
+    }
+
+    fn publish(&self, snapshot: Option<RenderSnapshot>) {
+        // Single writer: GPUI's UI thread. Correlation tokens can return after
+        // a nested draw; publication versions cannot. Odd marks an incomplete
+        // publication. SeqCst keeps all fields inside this versioned interval.
+        self.version.fetch_add(1, Ordering::SeqCst);
+        self.token.store(0, Ordering::SeqCst);
+        if let Some(snapshot) = snapshot {
+            self.started_us.store(snapshot.started_us, Ordering::SeqCst);
+            self.view.store(snapshot.view as u64, Ordering::SeqCst);
+            self.stage.store(snapshot.stage as u64, Ordering::SeqCst);
+            self.token.store(snapshot.token, Ordering::SeqCst);
+        }
+        self.version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn read_version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
+    }
+
+    fn read_fields(&self) -> Option<RenderSnapshot> {
+        let token = self.token.load(Ordering::SeqCst);
+        if token == 0 {
+            return None;
+        }
+        Some(RenderSnapshot {
+            token,
+            started_us: self.started_us.load(Ordering::SeqCst),
+            view: RenderView::from_code(self.view.load(Ordering::SeqCst))?,
+            stage: RenderStage::from_code(self.stage.load(Ordering::SeqCst))?,
+        })
+    }
+
+    fn finish_read(
+        &self,
+        version: u64,
+        snapshot: Option<RenderSnapshot>,
+    ) -> Result<Option<RenderSnapshot>, ()> {
+        if version.is_multiple_of(2) && version == self.read_version() {
+            Ok(snapshot)
+        } else {
+            Err(())
+        }
+    }
+
+    fn load(&self) -> Result<Option<RenderSnapshot>, ()> {
+        let version = self.read_version();
+        self.finish_read(version, self.read_fields())
+    }
+}
+
+thread_local! {
+    /// Render watches are created and dropped on GPUI's UI thread. A vector is
+    /// required instead of saved previous values because re-entrant Windows
+    /// draws can defer a nested arena clear and therefore destroy watches out
+    /// of LIFO order.
+    static RENDER_STACK: RefCell<Vec<RenderSnapshot>> = const { RefCell::new(Vec::new()) };
+}
+
+struct ProfiledElement {
+    inner: AnyElement,
+    view: RenderView,
+    frame: Option<RenderWatch>,
+}
+
+impl Drop for PhaseSpan {
+    fn drop(&mut self) {
+        let elapsed_us = self.started.elapsed().as_micros() as u64;
+        defer_record(DeferredRecord::Phase {
+            at: SystemTime::now(),
+            boundary: PhaseBoundary::End,
+            id: self.id,
+            category: self.category,
+            phase: self.phase,
+            pane: self.pane,
+            elapsed_us: Some(elapsed_us),
+        });
+    }
+}
+
+impl Drop for RenderWatch {
+    fn drop(&mut self) {
+        let elapsed_us = self.started.elapsed().as_micros() as u64;
+        RENDER_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            remove_render_snapshot(&mut stack, self.token);
+            publish_render_snapshot(current_render_snapshot(&stack));
+        });
+        if elapsed_us >= SLOW_RENDER_US {
+            defer_record(DeferredRecord::SlowRender {
+                at: SystemTime::now(),
+                token: self.token,
+                view: self.view,
+                stage: self.stage,
+                elapsed_us,
+            });
+        }
+    }
+}
+
+impl RenderWatch {
+    fn mark_stage(&self, stage: RenderStage) {
+        RENDER_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if mark_render_stage(&mut stack, self.token, stage) {
+                publish_render_snapshot(current_render_snapshot(&stack));
+            }
+        });
+    }
+}
+
+fn remove_render_snapshot(stack: &mut Vec<RenderSnapshot>, token: u64) -> bool {
+    let Some(index) = stack.iter().rposition(|snapshot| snapshot.token == token) else {
+        return false;
+    };
+    stack.remove(index);
+    true
+}
+
+fn current_render_snapshot(stack: &[RenderSnapshot]) -> Option<RenderSnapshot> {
+    // A nested draw's frame allocation can outlive its execution. A callback
+    // guard still on the stack is stronger evidence: it has not returned yet
+    // (and its measured interval includes any re-entrant work). Only fall back
+    // to the last observed retained frame outside instrumented callbacks.
+    stack
+        .iter()
+        .rev()
+        .find(|snapshot| snapshot.stage.is_callback())
+        .or_else(|| stack.last())
+        .copied()
+}
+
+/// The wrapper resumed after its child callback. Make that frame the latest
+/// observed one even if a nested draw's allocation remains in the arena.
+fn mark_render_stage(stack: &mut Vec<RenderSnapshot>, token: u64, stage: RenderStage) -> bool {
+    let Some(index) = stack.iter().rposition(|snapshot| snapshot.token == token) else {
+        return false;
+    };
+    let mut snapshot = stack.remove(index);
+    snapshot.stage = stage;
+    stack.push(snapshot);
+    true
+}
+
+fn publish_render_snapshot(snapshot: Option<RenderSnapshot>) {
+    RENDER_PUBLICATION.publish(snapshot);
+}
+
+impl IntoElement for ProfiledElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for ProfiledElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let layout = {
+            let _watch = watch_render(self.view, RenderStage::RequestLayout);
+            self.inner.request_layout(window, cx)
+        };
+        if let Some(frame) = &self.frame {
+            // gpui-component's thin Root still finishes its own request-layout
+            // callback before GPUI computes the window layout. This stage names
+            // that combined, otherwise hookless interval without overstating it.
+            frame.mark_stage(RenderStage::RootLayoutOrCompute);
+        }
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        {
+            let _watch = watch_render(self.view, RenderStage::Prepaint);
+            self.inner.prepaint(window, cx);
+        }
+        if let Some(frame) = &self.frame {
+            frame.mark_stage(RenderStage::Frame);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        {
+            let _watch = watch_render(self.view, RenderStage::Paint);
+            self.inner.paint(window, cx);
+        }
+        if let Some(frame) = &self.frame {
+            // gpui-component's Root may still paint after this child returns;
+            // GPUI then finalizes the scene and presents before clearing the
+            // arena. Keep the sentinel through that combined hookless interval.
+            frame.mark_stage(RenderStage::RootPaintOrPresent);
+        }
+    }
+}
 
 /// Present-pump ticks handled on the UI thread.
 static PUMP_N: AtomicU64 = AtomicU64::new(0);
@@ -54,6 +485,8 @@ static PROBE_SPIKE_50MS: AtomicU64 = AtomicU64::new(0);
 static PROBE_SPIKE_200MS: AtomicU64 = AtomicU64::new(0);
 /// Probes that never came back within the wait window.
 static PROBE_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+/// Probes that could not be posted at all (not evidence of a busy UI thread).
+static PROBE_POST_FAILURE: AtomicU64 = AtomicU64::new(0);
 /// Last probe send tick (GetTickCount64); 0 = none in flight / completed.
 #[allow(dead_code)] // present-pump telemetry: only `present_pump` (Windows) writes it
 static PROBE_SENT_TICK: AtomicU64 = AtomicU64::new(0);
@@ -113,23 +546,51 @@ fn open_log(path: &Path) -> Option<std::fs::File> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() >= LOG_MAX_BYTES
-    {
-        let mut rotated = path.as_os_str().to_owned();
-        rotated.push(".1");
-        let _ = std::fs::rename(path, PathBuf::from(rotated));
+    if !prepare_log_path(path) {
+        return None;
     }
     OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
-fn emit(line: &str) {
+fn reopen_log(slot: &mut Option<std::fs::File>, path: &Path) {
+    *slot = None;
+    *slot = open_log(path);
+}
+
+fn rotated_log_path(path: &Path) -> PathBuf {
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    PathBuf::from(rotated)
+}
+
+fn prepare_log_path(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    if meta.len() < LOG_MAX_BYTES {
+        return true;
+    }
+    let rotated = rotated_log_path(path);
+    match std::fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+    if std::fs::rename(path, &rotated).is_ok() {
+        return true;
+    }
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .is_ok()
+}
+
+fn emit_at(at: SystemTime, line: &str) {
     if !is_enabled() {
         return;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = at.duration_since(UNIX_EPOCH).unwrap_or_default();
     let line = format!("[{}.{:03}] {line}", now.as_secs(), now.subsec_millis());
     let path = log_path();
     let slot = LOG_FILE.get_or_init(|| Mutex::new(open_log(path)));
@@ -140,7 +601,7 @@ fn emit(line: &str) {
                 .unwrap_or(false)
         });
         if reopen {
-            *g = open_log(path);
+            reopen_log(&mut g, path);
         }
         if let Some(f) = g.as_mut() {
             let _ = writeln!(f, "{line}");
@@ -149,10 +610,114 @@ fn emit(line: &str) {
     }
 }
 
+fn emit(line: &str) {
+    emit_at(SystemTime::now(), line);
+}
+
+fn deferred_sender() -> &'static SyncSender<DeferredRecord> {
+    DEFERRED.get_or_init(|| {
+        let (tx, rx) = sync_channel(MAX_PENDING_RECORDS);
+        let _ = std::thread::Builder::new()
+            .name("muxel-ui-prof-records".into())
+            .spawn(move || deferred_writer(rx));
+        tx
+    })
+}
+
+fn deferred_writer(rx: Receiver<DeferredRecord>) {
+    while let Ok(record) = rx.recv() {
+        match record {
+            DeferredRecord::Line { at, line } => emit_at(at, &line),
+            DeferredRecord::StaticLine { at, line } => emit_at(at, line),
+            DeferredRecord::Phase {
+                at,
+                boundary,
+                id,
+                category,
+                phase,
+                pane,
+                elapsed_us,
+            } => emit_at(
+                at,
+                &phase_line(boundary.label(), id, category, phase, pane, elapsed_us),
+            ),
+            DeferredRecord::RenderBlocked {
+                at,
+                token,
+                view,
+                stage,
+                active_us,
+            } => emit_at(
+                at,
+                &render_line("blocked", token, view, stage, "active", active_us),
+            ),
+            DeferredRecord::SlowRender {
+                at,
+                token,
+                view,
+                stage,
+                elapsed_us,
+            } => emit_at(
+                at,
+                &render_line("slow", token, view, stage, "elapsed", elapsed_us),
+            ),
+        }
+    }
+}
+
+fn try_defer_to(tx: Option<&SyncSender<DeferredRecord>>, record: DeferredRecord) -> bool {
+    tx.is_some_and(|tx| tx.try_send(record).is_ok())
+}
+
+fn defer_record(record: DeferredRecord) {
+    if !try_defer_to(DEFERRED.get(), record) {
+        DEFERRED_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn phase_line(
+    boundary: &str,
+    id: u64,
+    category: &str,
+    phase: &str,
+    pane: Option<Uuid>,
+    elapsed_us: Option<u64>,
+) -> String {
+    let pane = pane.map_or_else(|| "none".to_string(), |pane| pane.to_string());
+    let elapsed = elapsed_us.map_or_else(String::new, |us| format!(" elapsed={us}µs"));
+    format!(
+        "ui-prof[phase {boundary}] span={id} category={category} phase={phase} pane={pane}{elapsed}"
+    )
+}
+
+fn render_line(
+    event: &str,
+    token: u64,
+    view: RenderView,
+    stage: RenderStage,
+    duration_label: &str,
+    duration_us: u64,
+) -> String {
+    format!(
+        "ui-prof[render {event}] token={token} view={} stage={} observation={} {duration_label}={duration_us}µs",
+        view.label(),
+        stage.label(),
+        stage.observation(),
+    )
+}
+
+fn start_line(pid: u32) -> String {
+    format!("ui-prof[start] pid={pid}")
+}
+
 fn ensure_flusher() {
     if !is_enabled() {
         return;
     }
+    // Every caller that can enqueue a record first observes an initialized
+    // sender. This closes the tiny race where a second thread saw `FLUSHER=true`
+    // before the winning thread had published `DEFERRED`.
+    let _ = deferred_sender();
     if FLUSHER
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -160,11 +725,10 @@ fn ensure_flusher() {
         return;
     }
     STARTED.get_or_init(Instant::now);
-    emit(&format!(
-        "ui-prof[start] pid={} path={}",
-        std::process::id(),
-        log_path().display()
-    ));
+    defer_record(DeferredRecord::Line {
+        at: SystemTime::now(),
+        line: start_line(std::process::id()),
+    });
     std::thread::Builder::new()
         .name("muxel-ui-prof".into())
         .spawn(|| {
@@ -206,6 +770,97 @@ fn ensure_flusher() {
             }
         })
         .ok();
+}
+
+/// Begin one synchronous profiler phase. The returned guard writes its end
+/// boundary on drop. `category` and `phase` must be fixed labels; `pane` is the
+/// only correlation value, keeping command lines, paths, and session ids out of
+/// the log.
+pub fn phase(category: &'static str, phase: &'static str, pane: Option<Uuid>) -> Option<PhaseSpan> {
+    if !is_enabled() {
+        return None;
+    }
+    ensure_flusher();
+    let id = NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let started = Instant::now();
+    defer_record(DeferredRecord::Phase {
+        at: SystemTime::now(),
+        boundary: PhaseBoundary::Begin,
+        id,
+        category,
+        phase,
+        pane,
+        elapsed_us: None,
+    });
+    Some(PhaseSpan {
+        id,
+        category,
+        phase,
+        pane,
+        started,
+    })
+}
+
+fn profiler_elapsed_us() -> u64 {
+    STARTED.get().map_or(0, |started| {
+        started.elapsed().as_micros().min(u64::MAX as u128) as u64
+    })
+}
+
+fn watch_render(view: RenderView, stage: RenderStage) -> Option<RenderWatch> {
+    if !is_enabled() {
+        return None;
+    }
+    ensure_flusher();
+    let token = NEXT_RENDER_TOKEN
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    let started = Instant::now();
+    let snapshot = RenderSnapshot {
+        token,
+        started_us: profiler_elapsed_us(),
+        view,
+        stage,
+    };
+    RENDER_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        stack.push(snapshot);
+        publish_render_snapshot(current_render_snapshot(&stack));
+    });
+    Some(RenderWatch {
+        token,
+        view,
+        stage,
+        started,
+    })
+}
+
+/// Mark root-view element construction as the current UI-thread render stage.
+/// Normal frames touch atomics only and produce no log record.
+pub fn watch_render_build(view: RenderView) -> Option<RenderWatch> {
+    watch_render(view, RenderStage::Build)
+}
+
+/// Wrap the application element beneath gpui-component's thin window Root so
+/// request-layout, the remaining root/layout interval, prepaint, paint, and the
+/// remaining root/present interval stay observable after `Render::render`.
+pub fn finish_render(
+    view: RenderView,
+    build: Option<RenderWatch>,
+    element: impl IntoElement,
+) -> AnyElement {
+    let inner = element.into_any_element();
+    drop(build);
+    if !is_enabled() {
+        inner
+    } else {
+        ProfiledElement {
+            inner,
+            view,
+            frame: watch_render(view, RenderStage::Frame),
+        }
+        .into_any_element()
+    }
 }
 
 fn working_set_bytes() -> Option<u64> {
@@ -253,8 +908,17 @@ fn dump_interval(tag: &str) {
     let p50 = PROBE_SPIKE_50MS.swap(0, Ordering::Relaxed);
     let p200 = PROBE_SPIKE_200MS.swap(0, Ordering::Relaxed);
     let pto = PROBE_TIMEOUT.swap(0, Ordering::Relaxed);
+    let post_fail = PROBE_POST_FAILURE.swap(0, Ordering::Relaxed);
+    let deferred_dropped = DEFERRED_DROPPED.swap(0, Ordering::Relaxed);
 
-    if n == 0 && pn == 0 && coal == 0 && posts == 0 && pto == 0 {
+    if n == 0
+        && pn == 0
+        && coal == 0
+        && posts == 0
+        && pto == 0
+        && post_fail == 0
+        && deferred_dropped == 0
+    {
         return;
     }
 
@@ -269,9 +933,11 @@ fn dump_interval(tag: &str) {
         || p50 > 0
         || p200 > 0
         || pto > 0
+        || post_fail > 0
         || pmax >= 50_000
         || max >= 8_000
-        || coal > posts.saturating_add(n).max(1); // heavy coalesce
+        || coal > posts.saturating_add(n).max(1)
+        || deferred_dropped > 0; // heavy coalesce / saturated record worker
 
     if !interesting && tag == "tick" {
         return;
@@ -280,7 +946,8 @@ fn dump_interval(tag: &str) {
     emit(&format!(
         "ui-prof[v1 {tag}] pump={n} avg={pump_avg}µs max={max}µs spikes(>8ms={s8} >30ms={s30}) \
          hwnds/tick≈{hwnd_avg} posts={posts} coalesce={coal} \
-         probe n={pn} avg={probe_avg}µs max={pmax}µs spikes(>50ms={p50} >200ms={p200}) timeout={pto}"
+         probe n={pn} avg={probe_avg}µs max={pmax}µs spikes(>50ms={p50} >200ms={p200}) timeout={pto} post_fail={post_fail} \
+         deferred_dropped={deferred_dropped}"
     ));
 }
 
@@ -299,6 +966,8 @@ fn dump_snapshot(tag: &str) {
     let p50 = PROBE_SPIKE_50MS.swap(0, Ordering::Relaxed);
     let p200 = PROBE_SPIKE_200MS.swap(0, Ordering::Relaxed);
     let pto = PROBE_TIMEOUT.swap(0, Ordering::Relaxed);
+    let post_fail = PROBE_POST_FAILURE.swap(0, Ordering::Relaxed);
+    let deferred_dropped = DEFERRED_DROPPED.swap(0, Ordering::Relaxed);
     let _ = PUMP_HWNDS.swap(0, Ordering::Relaxed);
 
     let up_s = STARTED.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
@@ -311,7 +980,8 @@ fn dump_snapshot(tag: &str) {
     emit(&format!(
         "ui-prof[v1 snapshot {tag}] up={up_s}s ws={ws} \
          pump={n} avg={pump_avg}µs max={max}µs spikes(>8ms={s8} >30ms={s30}) posts={posts} coalesce={coal} \
-         probe n={pn} avg={probe_avg}µs max={pmax}µs spikes(>50ms={p50} >200ms={p200}) timeout={pto}"
+         probe n={pn} avg={probe_avg}µs max={pmax}µs spikes(>50ms={p50} >200ms={p200}) timeout={pto} post_fail={post_fail} \
+         deferred_dropped={deferred_dropped}"
     ));
 }
 
@@ -364,10 +1034,13 @@ pub fn move_size_changed(active: bool) {
         return;
     }
     ensure_flusher();
-    emit(if active {
-        "ui-prof[move-size enter]"
-    } else {
-        "ui-prof[move-size exit]"
+    defer_record(DeferredRecord::StaticLine {
+        at: SystemTime::now(),
+        line: if active {
+            "ui-prof[move-size enter]"
+        } else {
+            "ui-prof[move-size exit]"
+        },
     });
 }
 
@@ -399,6 +1072,35 @@ pub fn probe_timeout() {
     }
     ensure_flusher();
     PROBE_TIMEOUT.fetch_add(1, Ordering::Relaxed);
+    let Ok(snapshot) = RENDER_PUBLICATION.load() else {
+        return;
+    };
+    let Some(snapshot) = snapshot else {
+        defer_record(DeferredRecord::StaticLine {
+            at: SystemTime::now(),
+            line: "ui-prof[probe timeout] no-render-active",
+        });
+        return;
+    };
+    defer_record(DeferredRecord::RenderBlocked {
+        at: SystemTime::now(),
+        token: snapshot.token,
+        view: snapshot.view,
+        stage: snapshot.stage,
+        active_us: profiler_elapsed_us().saturating_sub(snapshot.started_us),
+    });
+}
+
+/// Record failure to enqueue the probe itself. This is transport evidence, not
+/// proof that the UI thread failed to answer, so it must not sample render state.
+#[allow(dead_code)]
+pub fn probe_post_failed() {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    PROBE_SENT_TICK.store(0, Ordering::Relaxed);
+    PROBE_POST_FAILURE.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Force an immediate snapshot (future hotkey / debugger). Best-effort.
@@ -429,4 +1131,178 @@ pub fn probe_mark_sent(tick_ms: u64) {
 #[allow(dead_code)]
 pub fn probe_last_sent() -> u64 {
     PROBE_SENT_TICK.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_record_queue_is_bounded_and_nonblocking() {
+        let (tx, _rx) = sync_channel(1);
+        assert!(try_defer_to(
+            Some(&tx),
+            DeferredRecord::Line {
+                at: UNIX_EPOCH,
+                line: "first".into(),
+            }
+        ));
+        assert!(!try_defer_to(
+            Some(&tx),
+            DeferredRecord::Line {
+                at: UNIX_EPOCH,
+                line: "second".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn ui_rotation_drops_the_live_handle_and_replaces_an_existing_backup() {
+        let dir = std::env::temp_dir().join(format!("muxel-ui-prof-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create rotation fixture");
+        let path = dir.join("ui-prof.log");
+        let rotated = rotated_log_path(&path);
+        std::fs::write(&path, vec![b'x'; LOG_MAX_BYTES as usize + 1])
+            .expect("write oversized live log");
+        std::fs::write(&rotated, b"stale backup").expect("write stale backup");
+        let mut slot = Some(
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("hold live log open"),
+        );
+
+        reopen_log(&mut slot, &path);
+
+        assert_eq!(
+            std::fs::metadata(&rotated).expect("rotated log").len(),
+            LOG_MAX_BYTES + 1
+        );
+        assert_eq!(std::fs::metadata(&path).expect("new live log").len(), 0);
+        writeln!(slot.as_mut().expect("reopened live log"), "bounded").unwrap();
+        drop(slot);
+        assert!(std::fs::metadata(&path).unwrap().len() < LOG_MAX_BYTES);
+        std::fs::remove_dir_all(dir).expect("remove rotation fixture");
+    }
+
+    #[test]
+    fn phase_records_only_fixed_labels_and_pane_identity() {
+        let pane = Uuid::nil();
+        assert_eq!(
+            phase_line("end", 7, "activation", "resume-scan", Some(pane), Some(42)),
+            "ui-prof[phase end] span=7 category=activation phase=resume-scan pane=00000000-0000-0000-0000-000000000000 elapsed=42µs"
+        );
+    }
+
+    #[test]
+    fn start_record_does_not_disclose_the_log_path() {
+        let line = start_line(42);
+        assert_eq!(line, "ui-prof[start] pid=42");
+        assert!(!line.contains("path="));
+    }
+
+    #[test]
+    fn render_records_use_bounded_view_and_stage_labels() {
+        assert_eq!(
+            render_line(
+                "blocked",
+                9,
+                RenderView::Workspace,
+                RenderStage::RootLayoutOrCompute,
+                "active",
+                15_281_000,
+            ),
+            "ui-prof[render blocked] token=9 view=workspace stage=root-layout-or-compute observation=retained-frame active=15281000µs"
+        );
+        assert_eq!(RenderView::from_code(99), None);
+        assert_eq!(RenderStage::from_code(99), None);
+    }
+
+    #[test]
+    fn reentrant_render_drops_never_resurrect_a_dead_watch() {
+        let snapshot = |token, stage| RenderSnapshot {
+            token,
+            started_us: token * 10,
+            view: RenderView::Main,
+            stage,
+        };
+        let mut stack = vec![
+            snapshot(1, RenderStage::Frame),
+            snapshot(2, RenderStage::Paint),
+            snapshot(3, RenderStage::Frame),
+        ];
+
+        // A nested draw survives while an outer stage guard is destroyed.
+        assert!(remove_render_snapshot(&mut stack, 2));
+        assert_eq!(stack.last().map(|watch| watch.token), Some(3));
+        // Once the outer wrapper resumes, its frame is the latest observed.
+        assert!(mark_render_stage(
+            &mut stack,
+            1,
+            RenderStage::RootPaintOrPresent,
+        ));
+        assert_eq!(
+            current_render_snapshot(&stack).map(|watch| watch.token),
+            Some(1)
+        );
+        // Once the nested draw dies, only the still-live outer frame resurfaces.
+        assert!(remove_render_snapshot(&mut stack, 3));
+        assert_eq!(
+            stack.last(),
+            Some(&snapshot(1, RenderStage::RootPaintOrPresent))
+        );
+        assert!(remove_render_snapshot(&mut stack, 1));
+        assert!(stack.is_empty());
+        assert!(!remove_render_snapshot(&mut stack, 2));
+    }
+
+    #[test]
+    fn retained_nested_frame_does_not_hide_the_resumed_outer_callback() {
+        let snapshot = |token, view, stage| RenderSnapshot {
+            token,
+            started_us: token * 10,
+            view,
+            stage,
+        };
+        let mut stack = vec![
+            snapshot(1, RenderView::Main, RenderStage::Frame),
+            snapshot(2, RenderView::Main, RenderStage::RequestLayout),
+            snapshot(3, RenderView::Workspace, RenderStage::RootPaintOrPresent),
+            snapshot(4, RenderView::Workspace, RenderStage::Paint),
+        ];
+        assert_eq!(current_render_snapshot(&stack).unwrap().token, 4);
+        // Nested paint returned, but GPUI must retain its arena allocation
+        // until the enclosing draw finishes. The outer callback is still live.
+        remove_render_snapshot(&mut stack, 4);
+        assert_eq!(current_render_snapshot(&stack).unwrap().token, 2);
+        remove_render_snapshot(&mut stack, 2);
+        mark_render_stage(&mut stack, 1, RenderStage::RootLayoutOrCompute);
+        assert_eq!(current_render_snapshot(&stack).unwrap().token, 1);
+    }
+
+    #[test]
+    fn render_publication_rejects_a_nested_snapshot_after_the_outer_token_returns() {
+        let publication = RenderPublication::new();
+        let outer = RenderSnapshot {
+            token: 1,
+            started_us: 10,
+            view: RenderView::Main,
+            stage: RenderStage::Paint,
+        };
+        let nested = RenderSnapshot {
+            token: 2,
+            started_us: 20,
+            view: RenderView::Workspace,
+            stage: RenderStage::Build,
+        };
+        publication.publish(Some(outer));
+        let version = publication.read_version();
+        // Deterministic interleave of the same writer and reader operations
+        // used by publish/load: the outer correlation token returns unchanged.
+        publication.publish(Some(nested));
+        let fields = publication.read_fields();
+        publication.publish(Some(outer));
+        assert!(publication.finish_read(version, fields).is_err());
+        assert_eq!(publication.load(), Ok(Some(outer)));
+    }
 }
