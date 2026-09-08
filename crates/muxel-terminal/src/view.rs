@@ -915,6 +915,11 @@ pub struct TerminalView {
     grok_screen_working_at: std::cell::Cell<Option<std::time::Instant>>,
     /// Last time we `cx.notify()`'d a paint from the drain loop (background throttle).
     last_paint_notify: std::cell::Cell<std::time::Instant>,
+    /// Profiler correlation only: advances once per output-driven `cx.notify()`.
+    /// State is fixed-size per pane and no terminal content is retained.
+    profile_notify_generation: std::cell::Cell<u64>,
+    profile_last_notify_cause: std::cell::Cell<Option<TerminalNotifyCause>>,
+    profile_focus: bool,
     /// A throttled batch must still paint if output stops before the next batch.
     /// The generation invalidates an older, later timer when interactive output
     /// brings the deadline forward.
@@ -923,6 +928,31 @@ pub struct TerminalView {
     /// Cached agent status for the current grid and OSC-title generations.
     status_cache: std::cell::Cell<Option<(u64, u64, AgentStatus)>>,
     _drain: Task<()>,
+}
+
+/// Optional app-owned diagnostic invoked at the existing GPUI terminal focus
+/// edge. Muxel injects it only while the opt-in profiler is enabled, keeping
+/// platform/window knowledge out of this crate without creating a dependency
+/// cycle.
+pub type TerminalFocusObserver = fn(Uuid, bool, &mut Window, &mut App);
+
+/// Why the drain loop most recently notified GPUI to request a redraw.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalNotifyCause {
+    Immediate,
+    Timer,
+}
+
+/// Content-free state sampled only when the app-level UI profiler observes a
+/// focus-path failure. These counters describe notification scheduling, not
+/// completion of a paint or native presentation.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalFocusProfile {
+    pub content_generation: u64,
+    pub notify_generation: u64,
+    pub last_notify_age: Option<Duration>,
+    pub last_notify_cause: Option<TerminalNotifyCause>,
+    pub notify_pending: bool,
 }
 
 impl Drop for TerminalView {
@@ -1030,6 +1060,12 @@ impl TerminalView {
                 self.paint_timer_generation
                     .set(self.paint_timer_generation.get().wrapping_add(1));
                 self.last_paint_notify.set(now);
+                if self.profile_focus {
+                    self.profile_notify_generation
+                        .set(self.profile_notify_generation.get().wrapping_add(1));
+                    self.profile_last_notify_cause
+                        .set(Some(TerminalNotifyCause::Immediate));
+                }
                 cx.notify();
                 profile::notify_scheduled(
                     self.instance_id,
@@ -1055,6 +1091,12 @@ impl TerminalView {
                 }
                 view.pending_paint_deadline.set(None);
                 view.last_paint_notify.set(Instant::now());
+                if view.profile_focus {
+                    view.profile_notify_generation
+                        .set(view.profile_notify_generation.get().wrapping_add(1));
+                    view.profile_last_notify_cause
+                        .set(Some(TerminalNotifyCause::Timer));
+                }
                 cx.notify();
                 profile::notify_scheduled(
                     view.instance_id,
@@ -1072,6 +1114,20 @@ impl TerminalView {
         launch: TerminalLaunch,
         instance_id: Uuid,
         startup_started: Instant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_focus_observer(launch, instance_id, startup_started, None, window, cx)
+    }
+
+    /// [`Self::new`] with an optional app-owned diagnostic at the exact GPUI
+    /// focus edge. Kept separate so the normal public constructor remains
+    /// source-compatible for other workspace consumers.
+    pub fn new_with_focus_observer(
+        launch: TerminalLaunch,
+        instance_id: Uuid,
+        startup_started: Instant,
+        focus_observer: Option<TerminalFocusObserver>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1098,8 +1154,11 @@ impl TerminalView {
         {
             let s = session.clone();
             window
-                .on_focus_in(&focus_handle, cx, move |_w, _cx| {
+                .on_focus_in(&focus_handle, cx, move |w, cx| {
                     profile::focus_changed(instance_id, true);
+                    if let Some(observer) = focus_observer {
+                        observer(instance_id, true, w, cx);
+                    }
                     s.report_focus(true);
                 })
                 .detach();
@@ -1107,8 +1166,11 @@ impl TerminalView {
         {
             let s = session.clone();
             window
-                .on_focus_out(&focus_handle, cx, move |_ev, _w, _cx| {
+                .on_focus_out(&focus_handle, cx, move |_ev, w, cx| {
                     profile::focus_changed(instance_id, false);
+                    if let Some(observer) = focus_observer {
+                        observer(instance_id, false, w, cx);
+                    }
                     s.report_focus(false);
                 })
                 .detach();
@@ -1356,6 +1418,9 @@ impl TerminalView {
             grok_blocked_at: std::cell::Cell::new(None),
             grok_screen_working_at: std::cell::Cell::new(None),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
+            profile_notify_generation: std::cell::Cell::new(0),
+            profile_last_notify_cause: std::cell::Cell::new(None),
+            profile_focus: focus_observer.is_some(),
             pending_paint_deadline: std::cell::Cell::new(None),
             paint_timer_generation: std::cell::Cell::new(0),
             status_cache: std::cell::Cell::new(None),
@@ -1401,6 +1466,19 @@ impl TerminalView {
     /// console. `None` when the program launched (a fallback shell still ran).
     pub fn launch_error(&self) -> Option<&str> {
         self.launch_error.as_deref()
+    }
+
+    /// Snapshot fixed-size redraw correlation state for an app-level focus-path
+    /// loss. Callers keep this behind the opt-in profiler gate.
+    pub fn focus_profile(&self) -> TerminalFocusProfile {
+        let last_notify_cause = self.profile_last_notify_cause.get();
+        TerminalFocusProfile {
+            content_generation: self.session.content_generation(),
+            notify_generation: self.profile_notify_generation.get(),
+            last_notify_age: last_notify_cause.map(|_| self.last_paint_notify.get().elapsed()),
+            last_notify_cause,
+            notify_pending: self.pending_paint_deadline.get().is_some(),
+        }
     }
 
     /// The agent's lifecycle state, from its per-agent on-screen markers, the

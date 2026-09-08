@@ -25,6 +25,7 @@ pub use present_flag::{mark_present_needed, take_present_needed};
 pub use profile::startup_event;
 pub use session::{CommandSpec, PtyChunk, TerminalSession};
 pub use view::{
-    AgentStatus, OpenLink, OpenLinkBackground, TerminalLaunch, TerminalMouseMode, TerminalView,
-    clean_agent_title, paste_clipboard_into_session,
+    AgentStatus, OpenLink, OpenLinkBackground, TerminalFocusObserver, TerminalFocusProfile,
+    TerminalLaunch, TerminalMouseMode, TerminalNotifyCause, TerminalView, clean_agent_title,
+    paste_clipboard_into_session,
 };

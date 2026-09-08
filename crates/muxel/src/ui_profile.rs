@@ -38,6 +38,17 @@ use gpui::{
 };
 use uuid::Uuid;
 
+mod focus;
+
+#[cfg(target_os = "windows")]
+pub use focus::native_focus_edge_for_pane;
+pub use focus::{
+    FocusActionReason, ProfileWindowKind, clear_focus_panes, focus_action, register_profile_window,
+    terminal_focus_observer, unregister_focus_pane, unregister_profile_window, window_activation,
+};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub use focus::{focus_action_for_pane, register_focus_pane};
+
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
@@ -48,6 +59,7 @@ static DEFERRED_DROPPED: AtomicU64 = AtomicU64::new(0);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_RENDER_TOKEN: AtomicU64 = AtomicU64::new(0);
 static RENDER_PUBLICATION: RenderPublication = RenderPublication::new();
+static NEXT_STATUS_NOTIFY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PENDING_RECORDS: usize = 4096;
@@ -85,6 +97,146 @@ enum DeferredRecord {
         stage: RenderStage,
         elapsed_us: u64,
     },
+    Focus {
+        at: SystemTime,
+        event: Box<focus::FocusEvent>,
+    },
+    FocusPathLost {
+        at: SystemTime,
+        event: GpuiFocusPathEvent,
+    },
+    #[cfg(target_os = "windows")]
+    BrowserVisibility {
+        at: SystemTime,
+        event: BrowserVisibilityEvent,
+    },
+    LifecycleStatus {
+        at: SystemTime,
+        pane: Uuid,
+        previous: Option<muxel_terminal::AgentStatus>,
+        next: muxel_terminal::AgentStatus,
+        raw: Option<muxel_terminal::AgentStatus>,
+        pane_active: bool,
+        window_active: bool,
+        notify_generation: u64,
+    },
+    RootNotify {
+        at: SystemTime,
+        reason: &'static str,
+        generation: u64,
+        transitions: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "windows", test))]
+pub(crate) enum BrowserVisibilityReason {
+    #[cfg(target_os = "windows")]
+    Initial,
+    Project,
+    Pane,
+    Overlay,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl BrowserVisibilityReason {
+    fn label(self) -> &'static str {
+        match self {
+            #[cfg(target_os = "windows")]
+            Self::Initial => "initial",
+            Self::Project => "project",
+            Self::Pane => "pane",
+            Self::Overlay => "overlay",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "windows")]
+pub(crate) struct BrowserVisibilityContext {
+    pub project: Uuid,
+    pub pane: Uuid,
+    pub reason: BrowserVisibilityReason,
+    pub requested: bool,
+    pub project_active: bool,
+    pub pane_active: bool,
+    pub bounds_changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "windows", test))]
+struct BrowserVisibilityEvent {
+    project: Uuid,
+    pane: Uuid,
+    reason: BrowserVisibilityReason,
+    requested: bool,
+    project_active: bool,
+    pane_active: bool,
+    bounds_changed: bool,
+    present_generation: u64,
+    controller_visible: Option<bool>,
+    controller_hr: Option<i32>,
+    host_parent_hr: Option<i32>,
+    host_hwnd: Option<isize>,
+    host_class: Option<&'static str>,
+    host_owner: Option<&'static str>,
+    host_visible: Option<bool>,
+}
+
+/// Fixed semantic buckets for the GPUI handle retained when a rendered focus
+/// path disappears. Callers can only choose these labels; user text never
+/// enters the diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GpuiFocusOwnerKind {
+    None,
+    AppRoot,
+    Terminal,
+    Editor,
+    Browser,
+    BrowserAddress,
+    AppInput,
+    Unknown,
+}
+
+impl GpuiFocusOwnerKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::AppRoot => "app-root",
+            Self::Terminal => "terminal",
+            Self::Editor => "editor",
+            Self::Browser => "browser",
+            Self::BrowserAddress => "browser-address",
+            Self::AppInput => "app-input",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuiFocusOwner {
+    pub kind: GpuiFocusOwnerKind,
+    pub pane: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FocusRenderContext {
+    token: u64,
+    view: RenderView,
+    stage: RenderStage,
+    active_us: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GpuiFocusPathEvent {
+    current: GpuiFocusOwner,
+    active: GpuiFocusOwner,
+    current_tracked: bool,
+    active_tracked: bool,
+    window_active: bool,
+    overlay_open: bool,
+    render: Option<FocusRenderContext>,
+    terminal: Option<muxel_terminal::TerminalFocusProfile>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -476,6 +628,8 @@ static PUMP_HWNDS: AtomicU64 = AtomicU64::new(0);
 static PUMP_COALESCE: AtomicU64 = AtomicU64::new(0);
 /// Posts successfully queued.
 static PUMP_POSTS: AtomicU64 = AtomicU64::new(0);
+/// Monotonic count of profiler-observed present-pump handler completions.
+static PUMP_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// UI probe round-trips (PostMessage → wndproc): sum/max/n in µs.
 static PROBE_N: AtomicU64 = AtomicU64::new(0);
@@ -661,6 +815,46 @@ fn deferred_writer(rx: Receiver<DeferredRecord>) {
                 at,
                 &render_line("slow", token, view, stage, "elapsed", elapsed_us),
             ),
+            DeferredRecord::Focus { at, event } => emit_at(at, &focus::focus_line(&event)),
+            DeferredRecord::FocusPathLost { at, event } => {
+                emit_at(at, &gpui_focus_path_line(&event))
+            }
+            #[cfg(target_os = "windows")]
+            DeferredRecord::BrowserVisibility { at, event } => {
+                emit_at(at, &browser_visibility_line(&event))
+            }
+            DeferredRecord::LifecycleStatus {
+                at,
+                pane,
+                previous,
+                next,
+                raw,
+                pane_active,
+                window_active,
+                notify_generation,
+            } => emit_at(
+                at,
+                &lifecycle_status_line(
+                    pane,
+                    previous,
+                    next,
+                    raw,
+                    pane_active,
+                    window_active,
+                    notify_generation,
+                ),
+            ),
+            DeferredRecord::RootNotify {
+                at,
+                reason,
+                generation,
+                transitions,
+            } => emit_at(
+                at,
+                &format!(
+                    "ui-prof[root notify v1] reason={reason} generation={generation} transitions={transitions}"
+                ),
+            ),
         }
     }
 }
@@ -688,6 +882,326 @@ fn phase_line(
     format!(
         "ui-prof[phase {boundary}] span={id} category={category} phase={phase} pane={pane}{elapsed}"
     )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unavailable",
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn optional_hresult(value: Option<i32>) -> String {
+    value.map_or_else(
+        || "unavailable".to_string(),
+        |value| format!("0x{:08x}", value as u32),
+    )
+}
+
+fn optional_pane(pane: Option<Uuid>) -> String {
+    pane.map_or_else(|| "none".to_string(), |pane| pane.to_string())
+}
+
+fn terminal_notify_cause(cause: muxel_terminal::TerminalNotifyCause) -> &'static str {
+    match cause {
+        muxel_terminal::TerminalNotifyCause::Immediate => "immediate",
+        muxel_terminal::TerminalNotifyCause::Timer => "timer",
+    }
+}
+
+fn gpui_focus_path_line(event: &GpuiFocusPathEvent) -> String {
+    let (render_token, render_view, render_stage, render_observation, render_active) =
+        event.render.map_or_else(
+            || (0, "none", "none", "none", "none".to_string()),
+            |render| {
+                (
+                    render.token,
+                    render.view.label(),
+                    render.stage.label(),
+                    render.stage.observation(),
+                    format!("{}µs", render.active_us),
+                )
+            },
+        );
+    let (content_generation, notify_generation, notify_age, notify_cause, notify_pending) =
+        event.terminal.map_or_else(
+            || (0, 0, "none".to_string(), "none", false),
+            |terminal| {
+                (
+                    terminal.content_generation,
+                    terminal.notify_generation,
+                    terminal.last_notify_age.map_or_else(
+                        || "none".to_string(),
+                        |age| format!("{}µs", age.as_micros()),
+                    ),
+                    terminal
+                        .last_notify_cause
+                        .map_or("none", terminal_notify_cause),
+                    terminal.notify_pending,
+                )
+            },
+        );
+    format!(
+        "ui-prof[focus path v2] current={} current_pane={} current_tracked={} active={} active_pane={} active_tracked={} window_active={} overlay_open={} render_token={} render_view={} render_stage={} render_observation={} render_active={} term_content_gen={} term_notify_gen={} term_notify_age={} term_notify_cause={} term_notify_pending={}",
+        event.current.kind.label(),
+        optional_pane(event.current.pane),
+        event.current_tracked,
+        event.active.kind.label(),
+        optional_pane(event.active.pane),
+        event.active_tracked,
+        event.window_active,
+        event.overlay_open,
+        render_token,
+        render_view,
+        render_stage,
+        render_observation,
+        render_active,
+        content_generation,
+        notify_generation,
+        notify_age,
+        notify_cause,
+        notify_pending,
+    )
+}
+
+fn current_focus_render_context() -> Option<FocusRenderContext> {
+    RENDER_STACK.with(|stack| {
+        current_render_snapshot(&stack.borrow()).map(|render| FocusRenderContext {
+            token: render.token,
+            view: render.view,
+            stage: render.stage,
+            active_us: profiler_elapsed_us().saturating_sub(render.started_us),
+        })
+    })
+}
+
+/// Record GPUI's direct "nothing in the rendered tree has focus" callback.
+/// The main app supplies only fixed owner classes and optional pane UUIDs; the
+/// profiler adds the live render and terminal-notify correlation snapshots.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpui_focus_path_lost(
+    current: GpuiFocusOwner,
+    active: GpuiFocusOwner,
+    current_tracked: bool,
+    active_tracked: bool,
+    window_active: bool,
+    overlay_open: bool,
+    terminal: Option<muxel_terminal::TerminalFocusProfile>,
+) {
+    if !is_enabled() {
+        return;
+    }
+    defer_record(DeferredRecord::FocusPathLost {
+        at: SystemTime::now(),
+        event: GpuiFocusPathEvent {
+            current,
+            active,
+            current_tracked,
+            active_tracked,
+            window_active,
+            overlay_open,
+            render: current_focus_render_context(),
+            terminal,
+        },
+    });
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn browser_visibility_line(event: &BrowserVisibilityEvent) -> String {
+    let host_hwnd = event.host_hwnd.map_or_else(
+        || "none".to_string(),
+        |hwnd| format!("0x{:x}", hwnd as usize),
+    );
+    format!(
+        "ui-prof[browser visibility v1] project={} pane={} reason={} requested={} project_active={} pane_active={} bounds_changed={} present_gen={} controller_visible={} controller_hr={} host_parent_hr={} host_hwnd={} host_class={} host_owner={} host_visible={}",
+        event.project,
+        event.pane,
+        event.reason.label(),
+        event.requested,
+        event.project_active,
+        event.pane_active,
+        event.bounds_changed,
+        event.present_generation,
+        optional_bool(event.controller_visible),
+        optional_hresult(event.controller_hr),
+        optional_hresult(event.host_parent_hr),
+        host_hwnd,
+        event.host_class.unwrap_or("unavailable"),
+        event.host_owner.unwrap_or("unavailable"),
+        optional_bool(event.host_visible),
+    )
+}
+
+fn agent_status_label(status: muxel_terminal::AgentStatus) -> &'static str {
+    match status {
+        muxel_terminal::AgentStatus::Working => "working",
+        muxel_terminal::AgentStatus::Idle => "idle",
+        muxel_terminal::AgentStatus::Blocked => "blocked",
+        muxel_terminal::AgentStatus::Done => "done",
+    }
+}
+
+fn optional_agent_status(status: Option<muxel_terminal::AgentStatus>) -> &'static str {
+    status.map_or("none", agent_status_label)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lifecycle_status_line(
+    pane: Uuid,
+    previous: Option<muxel_terminal::AgentStatus>,
+    next: muxel_terminal::AgentStatus,
+    raw: Option<muxel_terminal::AgentStatus>,
+    pane_active: bool,
+    window_active: bool,
+    notify_generation: u64,
+) -> String {
+    format!(
+        "ui-prof[lifecycle status v1] pane={pane} previous={} next={} raw={} pane_active={pane_active} window_active={window_active} root_notify_reason=status-dirty root_notify_gen={notify_generation}",
+        optional_agent_status(previous),
+        agent_status_label(next),
+        optional_agent_status(raw),
+    )
+}
+
+/// Reserve one generation for all displayed lifecycle transitions that make a
+/// single app tick notify the root. Disabled profiling performs no atomic work.
+pub(crate) fn begin_status_dirty() -> Option<u64> {
+    if !is_enabled() {
+        return None;
+    }
+    ensure_flusher();
+    Some(
+        NEXT_STATUS_NOTIFY_GENERATION
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lifecycle_status_transition(
+    pane: Uuid,
+    previous: Option<muxel_terminal::AgentStatus>,
+    next: muxel_terminal::AgentStatus,
+    raw: muxel_terminal::AgentStatus,
+    pane_active: bool,
+    window_active: bool,
+    notify_generation: u64,
+) {
+    if !is_enabled() {
+        return;
+    }
+    defer_record(DeferredRecord::LifecycleStatus {
+        at: SystemTime::now(),
+        pane,
+        previous,
+        next,
+        raw: (raw != next).then_some(raw),
+        pane_active,
+        window_active,
+        notify_generation,
+    });
+}
+
+pub(crate) fn status_dirty_root_notify(generation: u64, transitions: usize) {
+    if !is_enabled() {
+        return;
+    }
+    defer_record(DeferredRecord::RootNotify {
+        at: SystemTime::now(),
+        reason: "status-dirty",
+        generation,
+        transitions,
+    });
+}
+
+/// Sample both native layers after WRY applies a Windows visibility change.
+/// WebView2's controller visibility and its containing HWND are independent;
+/// keeping both in one record distinguishes a failed hide from stale paint.
+#[cfg(target_os = "windows")]
+pub(crate) fn profile_browser_native_visibility(
+    context: BrowserVisibilityContext,
+    webview: &wry::WebView,
+) {
+    if !is_enabled() {
+        return;
+    }
+
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
+    };
+    use windows_webview::Win32::Foundation::HWND as WebViewHwnd;
+    use wry::WebViewExtWindows as _;
+
+    ensure_flusher();
+    let controller = webview.controller();
+    let mut controller_value = windows_webview::core::BOOL::default();
+    let (controller_visible, controller_hr) =
+        match unsafe { controller.IsVisible(&mut controller_value) } {
+            Ok(()) => (Some(controller_value.as_bool()), Some(0)),
+            Err(error) => (None, Some(error.code().0)),
+        };
+
+    let mut parent = WebViewHwnd::default();
+    let (host_parent_hr, host_hwnd, host_class, host_owner, host_visible) =
+        match unsafe { controller.ParentWindow(&mut parent) } {
+            Ok(()) => {
+                let raw = parent.0 as isize;
+                if raw == 0 {
+                    (Some(0), None, None, None, None)
+                } else {
+                    let hwnd = HWND(raw);
+                    let mut buffer = [0u16; 128];
+                    let len = unsafe { GetClassNameW(hwnd, &mut buffer) }.max(0) as usize;
+                    let class = focus::class_name_bucket(&String::from_utf16_lossy(
+                        &buffer[..len.min(buffer.len())],
+                    ));
+                    let mut pid = 0;
+                    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+                    let current_pid = unsafe { GetCurrentProcessId() };
+                    let owner = if pid == current_pid && class == "wry-webview" {
+                        "muxel-native-child"
+                    } else if pid == current_pid {
+                        "muxel-other"
+                    } else {
+                        "external"
+                    };
+                    (
+                        Some(0),
+                        Some(raw),
+                        Some(class),
+                        Some(owner),
+                        Some(unsafe { IsWindowVisible(hwnd) }.as_bool()),
+                    )
+                }
+            }
+            Err(error) => (Some(error.code().0), None, None, None, None),
+        };
+
+    defer_record(DeferredRecord::BrowserVisibility {
+        at: SystemTime::now(),
+        event: BrowserVisibilityEvent {
+            project: context.project,
+            pane: context.pane,
+            reason: context.reason,
+            requested: context.requested,
+            project_active: context.project_active,
+            pane_active: context.pane_active,
+            bounds_changed: context.bounds_changed,
+            present_generation: PUMP_GENERATION.load(Ordering::Acquire),
+            controller_visible,
+            controller_hr,
+            host_parent_hr,
+            host_hwnd,
+            host_class,
+            host_owner,
+            host_visible,
+        },
+    });
 }
 
 fn render_line(
@@ -996,6 +1510,7 @@ pub fn pump_handled(elapsed: Duration, hwnd_count: u32) {
         return;
     }
     ensure_flusher();
+    PUMP_GENERATION.fetch_add(1, Ordering::Release);
     let us = elapsed.as_micros() as u64;
     PUMP_N.fetch_add(1, Ordering::Relaxed);
     PUMP_US.fetch_add(us, Ordering::Relaxed);
@@ -1199,6 +1714,114 @@ mod tests {
         let line = start_line(42);
         assert_eq!(line, "ui-prof[start] pid=42");
         assert!(!line.contains("path="));
+    }
+
+    #[test]
+    fn browser_visibility_record_separates_controller_and_host_state() {
+        let event = BrowserVisibilityEvent {
+            project: Uuid::max(),
+            pane: Uuid::nil(),
+            reason: BrowserVisibilityReason::Project,
+            requested: false,
+            project_active: false,
+            pane_active: true,
+            bounds_changed: false,
+            present_generation: 23,
+            controller_visible: Some(false),
+            controller_hr: Some(0),
+            host_parent_hr: Some(0),
+            host_hwnd: Some(0x12),
+            host_class: Some(focus::class_name_bucket("WRY WEBVIEW/path")),
+            host_owner: Some("muxel-native-child"),
+            host_visible: Some(true),
+        };
+        assert_eq!(
+            browser_visibility_line(&event),
+            "ui-prof[browser visibility v1] project=ffffffff-ffff-ffff-ffff-ffffffffffff pane=00000000-0000-0000-0000-000000000000 reason=project requested=false project_active=false pane_active=true bounds_changed=false present_gen=23 controller_visible=false controller_hr=0x00000000 host_parent_hr=0x00000000 host_hwnd=0x12 host_class=other host_owner=muxel-native-child host_visible=true"
+        );
+        let line = browser_visibility_line(&event);
+        for forbidden in ["url=", "title=", "path=", "command=", "row="] {
+            assert!(!line.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn lifecycle_status_record_correlates_one_transition_to_its_root_notify() {
+        assert_eq!(
+            lifecycle_status_line(
+                Uuid::nil(),
+                Some(muxel_terminal::AgentStatus::Done),
+                muxel_terminal::AgentStatus::Working,
+                Some(muxel_terminal::AgentStatus::Idle),
+                false,
+                true,
+                19,
+            ),
+            "ui-prof[lifecycle status v1] pane=00000000-0000-0000-0000-000000000000 previous=done next=working raw=idle pane_active=false window_active=true root_notify_reason=status-dirty root_notify_gen=19"
+        );
+    }
+
+    #[test]
+    fn focus_path_record_names_internal_owner_and_notify_without_content() {
+        let event = GpuiFocusPathEvent {
+            current: GpuiFocusOwner {
+                kind: GpuiFocusOwnerKind::Terminal,
+                pane: Some(Uuid::nil()),
+            },
+            active: GpuiFocusOwner {
+                kind: GpuiFocusOwnerKind::Terminal,
+                pane: Some(Uuid::nil()),
+            },
+            current_tracked: false,
+            active_tracked: false,
+            window_active: true,
+            overlay_open: false,
+            render: Some(FocusRenderContext {
+                token: 41,
+                view: RenderView::Main,
+                stage: RenderStage::Prepaint,
+                active_us: 812,
+            }),
+            terminal: Some(muxel_terminal::TerminalFocusProfile {
+                content_generation: 93,
+                notify_generation: 17,
+                last_notify_age: Some(Duration::from_micros(240)),
+                last_notify_cause: Some(muxel_terminal::TerminalNotifyCause::Timer),
+                notify_pending: false,
+            }),
+        };
+        let line = gpui_focus_path_line(&event);
+        assert_eq!(
+            line,
+            "ui-prof[focus path v2] current=terminal current_pane=00000000-0000-0000-0000-000000000000 current_tracked=false active=terminal active_pane=00000000-0000-0000-0000-000000000000 active_tracked=false window_active=true overlay_open=false render_token=41 render_view=main render_stage=prepaint render_observation=callback render_active=812µs term_content_gen=93 term_notify_gen=17 term_notify_age=240µs term_notify_cause=timer term_notify_pending=false"
+        );
+        for forbidden in ["text=", "input=", "title=", "command=", "row="] {
+            assert!(!line.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn focus_context_uses_live_callback_before_nested_retained_frame() {
+        let previous = RENDER_STACK.with(|stack| {
+            stack.replace(vec![
+                RenderSnapshot {
+                    token: 10,
+                    started_us: 0,
+                    view: RenderView::Main,
+                    stage: RenderStage::Prepaint,
+                },
+                RenderSnapshot {
+                    token: 20,
+                    started_us: 0,
+                    view: RenderView::Workspace,
+                    stage: RenderStage::RootPaintOrPresent,
+                },
+            ])
+        });
+        let context = current_focus_render_context().expect("render context");
+        RENDER_STACK.with(|stack| stack.replace(previous));
+        assert_eq!(context.token, 10);
+        assert_eq!(context.stage.observation(), "callback");
     }
 
     #[test]

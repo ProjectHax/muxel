@@ -744,6 +744,11 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Platform & distribution
 
+- **Opt-in focus diagnostics** — the UI profiler correlates GPUI focus-path
+  loss with redraw requests and native Windows ownership. WebView children
+  must descend from a registered Muxel window; unrelated WRY apps remain
+  external. Records use fixed class buckets and opaque pane/project UUIDs,
+  with no terminal text, URLs, titles, or paths.
 - **Cross-platform** — Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and
   Windows (x86_64 + arm64).
 - **Desktop integration** — app icon and a `.desktop` launcher entry (also the

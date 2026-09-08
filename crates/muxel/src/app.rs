@@ -2647,13 +2647,62 @@ struct PopoutView {
     view: PaneView,
     iid: Uuid,
     show_close_confirm: bool,
+    /// Profiler-only correlation state. Keeping it on the root that owns the
+    /// pane prevents a popped-out terminal from affecting main-app lifecycle
+    /// bookkeeping or suppressing the first transition after re-dock.
+    profile_status: Option<AgentStatus>,
+    profile_window_active: bool,
 }
 
 impl PopoutView {
-    fn new(view: PaneView, iid: Uuid, cx: &mut Context<Self>) -> Self {
+    fn new(view: PaneView, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        ui_profile::register_profile_window(ui_profile::ProfileWindowKind::Popout, window);
+        let profile_status = if ui_profile::is_enabled() {
+            match &view {
+                PaneView::Terminal(terminal) => Some(terminal.read(cx).status()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let profile_window_active = window.is_window_active();
+        if ui_profile::is_enabled() {
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.profile_window_active = window.is_window_active();
+                ui_profile::window_activation(
+                    ui_profile::ProfileWindowKind::Popout,
+                    window.is_window_active(),
+                    window,
+                );
+                cx.notify();
+            })
+            .detach();
+        }
         // Re-render (refresh the title) when the pane updates.
         match &view {
-            PaneView::Terminal(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
+            PaneView::Terminal(v) => cx
+                .observe(v, |this, terminal, cx| {
+                    if ui_profile::is_enabled() {
+                        let status = terminal.read(cx).status();
+                        if this.profile_status != Some(status) {
+                            let previous = this.profile_status.replace(status);
+                            if let Some(generation) = ui_profile::begin_status_dirty() {
+                                ui_profile::lifecycle_status_transition(
+                                    this.iid,
+                                    previous,
+                                    status,
+                                    status,
+                                    true,
+                                    this.profile_window_active,
+                                    generation,
+                                );
+                                ui_profile::status_dirty_root_notify(generation, 1);
+                            }
+                        }
+                    }
+                    cx.notify();
+                })
+                .detach(),
             PaneView::Editor(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
             PaneView::Browser(v) => cx.observe(v, |_, _, cx| cx.notify()).detach(),
         }
@@ -2661,6 +2710,8 @@ impl PopoutView {
             view,
             iid,
             show_close_confirm: false,
+            profile_status,
+            profile_window_active,
         }
     }
 
@@ -2728,11 +2779,13 @@ impl WorkspaceWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        ui_profile::register_profile_window(ui_profile::ProfileWindowKind::Secondary, window);
         // Track this window's OS focus for notification gating + PTY focus
         // reporting (mirrors the main window's observer).
         cx.observe_window_activation(window, |this, window, cx| {
             let _phase = ui_profile::phase("window", "activation-callback", None);
             let active = window.is_window_active();
+            ui_profile::window_activation(ui_profile::ProfileWindowKind::Secondary, active, window);
             let pid = this.pid;
             if let Some(app) = this.app.upgrade() {
                 app.update(cx, |app, cx| app.set_secondary_active(pid, active, cx));
@@ -3092,7 +3145,10 @@ impl Render for PopoutView {
         // away while the close confirmation sits on top of it.
         if let PaneView::Browser(v) = &self.view {
             let (v, visible) = (v.clone(), !self.show_close_confirm);
-            v.update(cx, |b, cx| b.set_native_visible(visible, cx));
+            let overlay = self.show_close_confirm;
+            v.update(cx, |b, cx| {
+                b.set_native_visible(visible, true, true, overlay, cx)
+            });
         }
         let root = div()
             .size_full()
@@ -3722,6 +3778,7 @@ mod link_source_tests {
 
 impl MuxelApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        ui_profile::register_profile_window(ui_profile::ProfileWindowKind::Main, window);
         // `spawn_in` so the closure has a window: `tick` updates agent status, and
         // a clicked desktop notification (`handle_notification_click`) has to focus
         // a pane and raise the window.
@@ -3861,6 +3918,17 @@ impl MuxelApp {
         let weak = cx.weak_entity();
         cx.set_global(MuxelHandle(weak));
 
+        // GPUI calls this when its selected handle is absent from the newly
+        // rendered dispatch tree. That is the exact failure behind a terminal
+        // appearing active while key routing has stopped. Keep the observer and
+        // all owner scans entirely behind the opt-in profiler gate.
+        if ui_profile::is_enabled() {
+            cx.on_focus_lost(window, |this, window, cx| {
+                this.profile_focus_path_lost(window, cx);
+            })
+            .detach();
+        }
+
         // Persist the window geometry (debounced) on resize/move.
         cx.observe_window_bounds(window, |this, window, cx| {
             if this.bounds_save_task.is_some() {
@@ -3883,6 +3951,11 @@ impl MuxelApp {
         cx.observe_window_activation(window, |this, window, cx| {
             let _phase = ui_profile::phase("window", "activation-callback", None);
             this.window_active = window.is_window_active();
+            ui_profile::window_activation(
+                ui_profile::ProfileWindowKind::Main,
+                this.window_active,
+                window,
+            );
             if let Some(iid) = this.active_instance
                 && let Some(view) = this.terminals.get(&iid)
             {
@@ -4306,6 +4379,7 @@ impl MuxelApp {
         // Terminate a popped-out terminal when the user closes its window.
         let weak = cx.weak_entity();
         cx.on_window_closed(move |cx, window_id| {
+            ui_profile::unregister_profile_window(window_id.as_u64());
             if let Some(app) = weak.upgrade() {
                 app.update(cx, |this, cx| {
                     this.handle_secondary_closed(window_id, cx);
@@ -5166,7 +5240,14 @@ impl MuxelApp {
         let font_size = self.settings.font_size * self.settings.zoom;
         let mouse_mode = TerminalMouseMode::from_setting(&self.settings.terminal_mouse);
         let view = cx.new(move |cx| {
-            let mut view = TerminalView::new(launch, instance_id, started, window, cx);
+            let mut view = TerminalView::new_with_focus_observer(
+                launch,
+                instance_id,
+                started,
+                ui_profile::terminal_focus_observer(),
+                window,
+                cx,
+            );
             view.set_palette(palette);
             view.set_config(font_family, font_size);
             view.set_mouse_mode(mouse_mode);
@@ -5896,7 +5977,7 @@ impl MuxelApp {
         let _phase = ui_profile::phase("activation", "spawn-project-pane", Some(iid));
         // A workspace can change while a deferred activation task is yielding.
         // UUIDs from the old document must become no-ops, never fallback shells.
-        let Some(kind) = self.workspace.instance(iid).map(|i| i.kind) else {
+        let Some((kind, pid)) = self.workspace.instance(iid).map(|i| (i.kind, i.project_id)) else {
             return;
         };
         match kind {
@@ -5941,7 +6022,8 @@ impl MuxelApp {
                         .instance(iid)
                         .and_then(|i| i.browser_url.clone())
                         .unwrap_or_else(|| "about:blank".to_string());
-                    let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                    let view =
+                        cx.new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
                     self.browsers.insert(iid, view);
                 }
             }
@@ -6027,6 +6109,7 @@ impl MuxelApp {
         // the new document can be admitted.
         self.terminal_launching.clear();
         self.terminal_launches.clear();
+        ui_profile::clear_focus_panes();
         {
             let _phase = ui_profile::phase("workspace", "kill-terminals", None);
             let views: Vec<_> = self.terminals.drain().collect();
@@ -6522,7 +6605,39 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let reason = if attend {
+            ui_profile::FocusActionReason::FocusInstance
+        } else {
+            ui_profile::FocusActionReason::RestoreInstance
+        };
+        self.focus_instance_with_reason(iid, attend, reason, window, cx);
+    }
+
+    fn focus_instance_from_pointer(
+        &mut self,
+        iid: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_instance_with_reason(
+            iid,
+            true,
+            ui_profile::FocusActionReason::PanePointer,
+            window,
+            cx,
+        );
+    }
+
+    fn focus_instance_with_reason(
+        &mut self,
+        iid: Uuid,
+        attend: bool,
+        reason: ui_profile::FocusActionReason,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let _phase = ui_profile::phase("workspace", "focus-pane", Some(iid));
+        ui_profile::focus_action(reason, Some(iid), window);
         self.active_instance = Some(iid);
         if attend {
             // Deliberately selecting a pane clears its pending notification.
@@ -6592,6 +6707,7 @@ impl MuxelApp {
     /// context), so muxel shortcuts — including Ctrl+P → command palette — work
     /// instead of going to the focused terminal. Triggered by clicking app chrome.
     fn deselect_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        ui_profile::focus_action(ui_profile::FocusActionReason::AppRootChrome, None, window);
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -6819,6 +6935,10 @@ impl MuxelApp {
                 ..Default::default()
             },
             move |window, cx| {
+                ui_profile::register_profile_window(
+                    ui_profile::ProfileWindowKind::Auxiliary,
+                    window,
+                );
                 window.set_window_title(&title);
                 let content = integrations::git_diff_for(&loc, &path);
                 let view = cx.new(|cx| FileDiffView::new(title.clone(), content, split, cx));
@@ -6856,6 +6976,10 @@ impl MuxelApp {
                 ..Default::default()
             },
             move |window, cx| {
+                ui_profile::register_profile_window(
+                    ui_profile::ProfileWindowKind::Auxiliary,
+                    window,
+                );
                 window.set_window_title("muxel — dev console");
                 let view = cx.new(|cx| DevConsoleView::new(app.clone(), cx));
                 let fh = view.read(cx).focus_handle(cx);
@@ -7895,6 +8019,8 @@ impl MuxelApp {
         // (rather than a respawn that's about to fail again on a still-down host).
         const RECONNECT_SETTLE_SECS: u64 = 4;
         let mut dirty = false;
+        let mut status_notify_generation = None;
+        let mut status_transition_count = 0;
         let mut activity_changed = false;
         let now_epoch = chrono::Utc::now().timestamp_millis();
         for Snap {
@@ -7956,13 +8082,32 @@ impl MuxelApp {
             // A completion that happens in the pane the user is actively watching
             // is already attended. Record that at the same transition timestamp so
             // it cannot reappear as unseen after restart.
-            let attended = self.instance_window_active(iid) && Some(iid) == focused;
+            let pane_active = Some(iid) == focused;
+            let owning_window_active = self.instance_window_active(iid);
+            let attended = owning_window_active && pane_active;
             let restored_state = self
                 .workspace
                 .instance(iid)
                 .and_then(|instance| instance.activity.current_state());
             let previous = self.last_status.insert(iid, status);
             let changed = previous != Some(status);
+            if changed {
+                if status_notify_generation.is_none() {
+                    status_notify_generation = ui_profile::begin_status_dirty();
+                }
+                if let Some(generation) = status_notify_generation {
+                    ui_profile::lifecycle_status_transition(
+                        iid,
+                        previous,
+                        status,
+                        raw_status,
+                        pane_active,
+                        owning_window_active,
+                        generation,
+                    );
+                    status_transition_count += 1;
+                }
+            }
             let (preserve_restored, keep_restore_guard) =
                 restored_activity_sample(restoring, submitted_turn, raw_status);
             if !keep_restore_guard {
@@ -8248,6 +8393,9 @@ impl MuxelApp {
         // Sync remote projects' layouts to their hosts (change-detect + debounce).
         self.tick_remote_sync(cx);
         if dirty {
+            if let Some(generation) = status_notify_generation {
+                ui_profile::status_dirty_root_notify(generation, status_transition_count);
+            }
             cx.notify();
         }
     }
@@ -8933,7 +9081,7 @@ impl MuxelApp {
         match kind {
             InstanceKind::Browser => {
                 let url = browser_url.unwrap_or_else(|| "about:blank".to_string());
-                let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                let view = cx.new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
                 self.browsers.insert(iid, view);
             }
             _ => self.spawn_terminal_deferred(iid, window, cx),
@@ -9310,12 +9458,138 @@ impl MuxelApp {
         if !self.place_resource_instance(pid, instance, target, placement) {
             return None;
         }
-        let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+        let view = cx.new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
         self.browsers.insert(iid, view);
         self.focus_instance(iid, window, cx);
         self.persist();
         cx.notify();
         Some(iid)
+    }
+
+    fn profiled_focus_owner(
+        &self,
+        current: Option<&FocusHandle>,
+        window: &Window,
+        cx: &App,
+    ) -> ui_profile::GpuiFocusOwner {
+        let Some(current) = current else {
+            return ui_profile::GpuiFocusOwner {
+                kind: ui_profile::GpuiFocusOwnerKind::None,
+                pane: None,
+            };
+        };
+        if current == &self.focus_handle {
+            return ui_profile::GpuiFocusOwner {
+                kind: ui_profile::GpuiFocusOwnerKind::AppRoot,
+                pane: None,
+            };
+        }
+        for (pane, terminal) in &self.terminals {
+            if current == &terminal.read(cx).focus_handle(cx) {
+                return ui_profile::GpuiFocusOwner {
+                    kind: ui_profile::GpuiFocusOwnerKind::Terminal,
+                    pane: Some(*pane),
+                };
+            }
+        }
+        for (pane, editor) in &self.editors {
+            if current == &editor.read(cx).focus_handle(cx) {
+                return ui_profile::GpuiFocusOwner {
+                    kind: ui_profile::GpuiFocusOwnerKind::Editor,
+                    pane: Some(*pane),
+                };
+            }
+        }
+        for (pane, browser) in &self.browsers {
+            let browser = browser.read(cx);
+            if browser.address_focused(window, cx) {
+                return ui_profile::GpuiFocusOwner {
+                    kind: ui_profile::GpuiFocusOwnerKind::BrowserAddress,
+                    pane: Some(*pane),
+                };
+            }
+            if current == &browser.focus_handle(cx) {
+                return ui_profile::GpuiFocusOwner {
+                    kind: ui_profile::GpuiFocusOwnerKind::Browser,
+                    pane: Some(*pane),
+                };
+            }
+        }
+        for input in [
+            &self.git_diff_commit_input,
+            &self.file_browser_input,
+            &self.memory_search,
+            &self.memory_title_input,
+            &self.memory_note_input,
+            &self.memory_tags_input,
+            &self.rename_input,
+            &self.workspace_name_input,
+            &self.term_search_input,
+            &self.broadcast_input,
+            &self.dispose_commit_input,
+            &self.git_action_input,
+            &self.nr_dir,
+            &self.nr_name,
+            &self.password_prompt_input,
+            &self.runner_input,
+            &self.search_input,
+            &self.find_input,
+        ] {
+            if current == &input.read(cx).focus_handle(cx) {
+                return ui_profile::GpuiFocusOwner {
+                    kind: ui_profile::GpuiFocusOwnerKind::AppInput,
+                    pane: None,
+                };
+            }
+        }
+        ui_profile::GpuiFocusOwner {
+            kind: ui_profile::GpuiFocusOwnerKind::Unknown,
+            pane: None,
+        }
+    }
+
+    fn profile_focus_path_lost(&self, window: &Window, cx: &App) {
+        let current_handle = window.focused(cx);
+        let current = self.profiled_focus_owner(current_handle.as_ref(), window, cx);
+        let current_tracked = current_handle
+            .as_ref()
+            .is_some_and(|handle| self.focus_handle.contains(handle, window));
+
+        let mut active = ui_profile::GpuiFocusOwner {
+            kind: ui_profile::GpuiFocusOwnerKind::None,
+            pane: self.active_instance,
+        };
+        let mut active_tracked = false;
+        let mut terminal = None;
+        if let Some(pane) = self.active_instance {
+            if let Some(view) = self.terminals.get(&pane) {
+                let view = view.read(cx);
+                let handle = view.focus_handle(cx);
+                active.kind = ui_profile::GpuiFocusOwnerKind::Terminal;
+                active_tracked = self.focus_handle.contains(&handle, window);
+                terminal = Some(view.focus_profile());
+            } else if let Some(view) = self.editors.get(&pane) {
+                let handle = view.read(cx).focus_handle(cx);
+                active.kind = ui_profile::GpuiFocusOwnerKind::Editor;
+                active_tracked = self.focus_handle.contains(&handle, window);
+            } else if let Some(view) = self.browsers.get(&pane) {
+                let handle = view.read(cx).focus_handle(cx);
+                active.kind = ui_profile::GpuiFocusOwnerKind::Browser;
+                active_tracked = self.focus_handle.contains(&handle, window);
+            } else {
+                active.kind = ui_profile::GpuiFocusOwnerKind::Unknown;
+            }
+        }
+
+        ui_profile::gpui_focus_path_lost(
+            current,
+            active,
+            current_tracked,
+            active_tracked,
+            window.is_window_active(),
+            self.any_overlay_open(cx),
+            terminal,
+        );
     }
 
     /// Any overlay that draws above the pane area. The native browser webviews
@@ -9421,19 +9695,40 @@ impl MuxelApp {
             return;
         }
         let overlay = self.any_overlay_open(cx);
-        let visible = if overlay {
+        let profile_visibility = cfg!(target_os = "windows") && ui_profile::is_enabled();
+        let pane_active = if overlay && !profile_visibility {
             Vec::new()
         } else {
             self.visible_browser_ids()
         };
+        let active_projects = profile_visibility.then(|| {
+            let mut active: HashSet<Uuid> = self.workspace.active_project.into_iter().collect();
+            active.extend(self.secondary_windows.iter().map(|window| window.pid));
+            active
+        });
         let updates: Vec<_> = self
             .browsers
             .iter()
-            .map(|(iid, v)| (v.clone(), visible.contains(iid)))
+            .map(|(iid, view)| {
+                let project_active = active_projects.as_ref().is_some_and(|active| {
+                    self.workspace
+                        .instance(*iid)
+                        .is_some_and(|instance| active.contains(&instance.project_id))
+                });
+                let pane_active = pane_active.contains(iid);
+                (
+                    view.clone(),
+                    !overlay && pane_active,
+                    project_active,
+                    pane_active,
+                )
+            })
             .collect();
         cx.defer(move |cx| {
-            for (view, show) in updates {
-                view.update(cx, |v, cx| v.set_native_visible(show, cx));
+            for (view, show, project_active, pane_active) in updates {
+                view.update(cx, |v, cx| {
+                    v.set_native_visible(show, project_active, pane_active, overlay, cx)
+                });
             }
         });
     }
@@ -10416,6 +10711,7 @@ impl MuxelApp {
     /// Close an instance. `kill_remote_session` is false for auto-close-on-exit,
     /// so a dropped remote connection doesn't tear down a still-running session.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
+        ui_profile::unregister_focus_pane(iid);
         // Invalidate a PTY still being created. Its eventual result sees the
         // missing token, drops, and kills the child instead of becoming invisible.
         self.terminal_launching.remove(&iid);
@@ -12887,20 +13183,30 @@ impl MuxelApp {
                     PopoutContent::Browser(u) => PopoutContent::Browser(u.clone()),
                 };
                 move |window, cx| {
+                    ui_profile::register_profile_window(
+                        ui_profile::ProfileWindowKind::Popout,
+                        window,
+                    );
                     window.set_window_title(&title);
-                    let pane = match content {
-                        PopoutContent::Terminal(view) => PaneView::Terminal(view),
-                        PopoutContent::Editor(snap) => {
-                            PaneView::Editor(snap.build(config, window, cx))
-                        }
-                        PopoutContent::Browser(url) => PaneView::Browser(
-                            cx.new(|cx| crate::browser::BrowserView::new(url, window, cx)),
-                        ),
-                    };
+                    let pane =
+                        match content {
+                            PopoutContent::Terminal(view) => PaneView::Terminal(view),
+                            PopoutContent::Editor(snap) => {
+                                PaneView::Editor(snap.build(config, window, cx))
+                            }
+                            PopoutContent::Browser(url) => PaneView::Browser(cx.new(|cx| {
+                                crate::browser::BrowserView::new(iid, pid, url, window, cx)
+                            })),
+                        };
                     let fh = pane.focus_handle(cx);
+                    ui_profile::focus_action(
+                        ui_profile::FocusActionReason::FocusInstance,
+                        Some(iid),
+                        window,
+                    );
                     window.focus(&fh, cx);
                     *slot.borrow_mut() = Some(pane.clone());
-                    let popout = cx.new(|cx| PopoutView::new(pane, iid, cx));
+                    let popout = cx.new(|cx| PopoutView::new(pane, iid, window, cx));
                     cx.new(|cx| {
                         gpui_component::Root::new(popout, window, cx).bg(cx.theme().background)
                     })
@@ -12934,7 +13240,8 @@ impl MuxelApp {
                         self.editors.insert(iid, ed);
                     }
                     PopoutContent::Browser(url) => {
-                        let bv = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+                        let bv = cx
+                            .new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
                         self.browsers.insert(iid, bv);
                     }
                 }
@@ -13007,9 +13314,9 @@ impl MuxelApp {
             return;
         }
         for (iid, url, redock) in std::mem::take(&mut self.pending_browser_redock) {
-            let bv = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
-            self.browsers.insert(iid, bv);
             if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) {
+                let bv = cx.new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
+                self.browsers.insert(iid, bv);
                 self.redock_into_layout(iid, pid, redock, cx);
             }
         }
@@ -13029,6 +13336,7 @@ impl MuxelApp {
         let Some(popout) = self.popouts.remove(&iid) else {
             return;
         };
+        ui_profile::unregister_focus_pane(iid);
         self.clear_notifications_for(iid);
         // Terminals must be killed; editors just drop (unsaved changes lost — the
         // pop-out window already confirmed the close).
@@ -16122,7 +16430,7 @@ impl MuxelApp {
                             .cursor_pointer()
                             // Click switches to this tab.
                             .on_click(cx.listener(move |this, _e, window, cx| {
-                                this.focus_instance(tab, window, cx)
+                                this.focus_instance_from_pointer(tab, window, cx)
                             }))
                             // Middle-click closes the tab, like a browser.
                             .on_mouse_down(
@@ -16558,7 +16866,7 @@ impl MuxelApp {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _ev, window, cx| {
-                                    this.focus_instance(iid, window, cx);
+                                    this.focus_instance_from_pointer(iid, window, cx);
                                 }),
                             )
                             .on_drag_move::<DragInstance>(cx.listener(
