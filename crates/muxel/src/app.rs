@@ -9,13 +9,13 @@ use crate::editor::{
 use crate::i18n::{t, tf, tn};
 use crate::integrations;
 use crate::settings_view::{self, RemoteTestState, SettingsSection, SettingsUi};
+use crate::split::{h_resizable, resizable_panel, v_resizable};
 use crate::theme;
 use crate::ui_profile;
 use gpui::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
-use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis};
 use gpui_component::spinner::Spinner;
 use gpui_component::tag::Tag;
@@ -2230,9 +2230,6 @@ pub struct MuxelApp {
     /// failure (disk full, read-only config dir) notifies once per cause
     /// instead of on every autosave. Cleared when that target saves again.
     save_errors: HashMap<SaveTarget, String>,
-    /// Per-split id nonce, bumped to reset a split's resizable state when its
-    /// panes are evened out (double-click a divider).
-    split_even_nonce: HashMap<String, u32>,
     /// Trailing-edge repaint for cached terminals after a divider drag. During
     /// the drag terminal PTY resizes are intentionally suppressed; this wakes
     /// only the affected terminal views once the split stops changing.
@@ -4336,7 +4333,6 @@ impl MuxelApp {
             next_terminal_launch_token: 0,
             failed_launches: HashMap::new(),
             save_errors: HashMap::new(),
-            split_even_nonce: HashMap::new(),
             split_resize_notify_task: None,
             memory_ensured: HashSet::new(),
             remote_synced: HashSet::new(),
@@ -13061,11 +13057,19 @@ impl MuxelApp {
             h_resizable(key)
                 .child(
                     resizable_panel()
-                        .size(px(saved))
+                        .fixed_size(px(saved))
                         .size_range(px(160.0)..px(half))
                         .child(self.render_sidebar(cx)),
                 )
                 .child(resizable_panel().child(main_column))
+                .on_resize(|state, _window, cx| {
+                    if let Some(width) = state.read(cx).sizes().first().copied()
+                        && let Some(app) =
+                            cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade())
+                    {
+                        app.update(cx, |app, cx| app.set_sidebar_width(f32::from(width), cx));
+                    }
+                })
                 .into_any_element()
         };
 
@@ -15203,14 +15207,12 @@ impl MuxelApp {
     /// pane proportions restore on next launch. Called from `on_resize`.
     fn update_split_sizes(
         &mut self,
+        pid: Uuid,
         key: SharedString,
         sizes: Vec<f32>,
         terminal_ids: Vec<Uuid>,
         cx: &mut Context<Self>,
     ) {
-        let Some(pid) = self.workspace.active_project else {
-            return;
-        };
         let changed = self
             .workspace
             .project_mut(pid)
@@ -15243,20 +15245,16 @@ impl MuxelApp {
     }
 
     /// Even out a split's panes (double-click a divider): reset its sizes to
-    /// equal. Bumping the per-split nonce changes the resizable group's id so its
-    /// internal state restarts from the equal (flexing) layout.
-    fn even_split(&mut self, key: String, n: usize, cx: &mut Context<Self>) {
+    /// equal. Controlled layout reads these preferences on the next frame.
+    fn even_split(&mut self, pid: Uuid, key: String, n: usize, cx: &mut Context<Self>) {
         if n < 2 {
             return;
         }
         // `[1.0; n]` is the "equal" sentinel — panels then flex evenly.
         let equal = vec![1.0_f32; n];
-        if let Some(pid) = self.workspace.active_project
-            && let Some(p) = self.workspace.project_mut(pid)
-        {
+        if let Some(p) = self.workspace.project_mut(pid) {
             set_split_sizes(&mut p.layout, &key, &equal);
         }
-        *self.split_even_nonce.entry(key).or_insert(0) += 1;
         self.persist();
         cx.notify();
     }
@@ -16916,19 +16914,20 @@ impl MuxelApp {
                 sizes,
             } => {
                 let horizontal = *direction == SplitDirection::Horizontal;
-                // Stable id from the split's instance set: the resize state is
-                // keyed by it (persists across renders; resets only when the
-                // split's membership changes — i.e. a pane is added/removed).
+                // Stable id from persistent pane identities: tab membership/order
+                // changes keep the resize state; pane topology changes replace it.
                 let key = node.split_key();
-                // Bumped when the split is evened out, to restart its resizable
-                // state from the equal layout.
-                let nonce = self.split_even_nonce.get(&key).copied().unwrap_or(0);
-                let id = SharedString::from(format!("split-{key}-{nonce}"));
+                let Some(pid) = node
+                    .first_instance()
+                    .and_then(|iid| self.workspace.instance(iid))
+                    .map(|instance| instance.project_id)
+                else {
+                    return div().into_any_element();
+                };
+                let id = SharedString::from(format!("split-{key}"));
                 let n = children.len();
-                // Apply recorded pixel sizes (a [1.0; n] default means "equal" →
-                // let the panels flex). The last panel always flexes so the row
-                // fills the container (the sidebar pattern, which is what works).
-                let use_sizes = sizes.len() == n && sizes.iter().any(|s| *s > 2.0);
+                // Stored pixels are proportional preferences. Every child,
+                // including the last, participates in container redistribution.
                 let mut group = if horizontal {
                     h_resizable(id)
                 } else {
@@ -16938,19 +16937,19 @@ impl MuxelApp {
                 // can't shrink below a sane terminal width (the default 100px is
                 // ~12 columns, which makes wide TUIs like Claude overflow). The
                 // cross axis (height for a horizontal split) keeps the default.
-                let min_extent = if horizontal {
-                    MIN_PANE_WIDTH
-                } else {
-                    MIN_PANE_HEIGHT
-                };
                 for (i, child) in children.iter().enumerate() {
                     let pane = self.render_pane(child, cx);
-                    let panel = if use_sizes && i + 1 < n {
-                        resizable_panel().size(px(sizes[i]))
+                    let minimum = if horizontal {
+                        child.min_width(f32::from(MIN_PANE_WIDTH))
                     } else {
-                        resizable_panel()
+                        child.min_height(f32::from(MIN_PANE_HEIGHT))
                     };
-                    group = group.child(panel.size_range(min_extent..Pixels::MAX).child(pane));
+                    group = group.child(
+                        resizable_panel()
+                            .size(px(sizes.get(i).copied().unwrap_or(1.0)))
+                            .size_range(px(minimum)..Pixels::MAX)
+                            .child(pane),
+                    );
                 }
                 let resize_key = SharedString::from(key.clone());
                 let resize_terminal_ids =
@@ -16967,58 +16966,19 @@ impl MuxelApp {
                         let key = resize_key.clone();
                         let terminal_ids = resize_terminal_ids.clone();
                         app.update(cx, |app, cx| {
-                            app.update_split_sizes(key, sizes, terminal_ids, cx)
+                            app.update_split_sizes(pid, key, sizes, terminal_ids, cx)
                         });
                     }
                 });
 
-                // Double-click a divider to even out the split. The gpui resize
-                // handle occludes events, so we overlay thin double-click strips at
-                // the divider positions (from the recorded sizes), on top of the
-                // handles. They act only on a double-click and don't stop single
-                // events, so dragging the handle below still works. Only shown when
-                // the panes are uneven (recorded pixel sizes present).
-                if !use_sizes || n < 2 {
-                    return group.into_any_element();
-                }
-                let mut overlay = div().absolute().top_0().left_0().size_full();
-                let mut cumulative = 0.0_f32;
-                for (i, s) in sizes.iter().enumerate().take(n - 1) {
-                    cumulative += *s;
-                    let pos = cumulative;
-                    let ekey = key.clone();
-                    let base = div()
-                        .id(SharedString::from(format!("even-{key}-{i}")))
-                        .absolute();
-                    let strip = if horizontal {
-                        base.top_0()
-                            .h_full()
-                            .left(px(pos - 5.0))
-                            .w(px(10.0))
-                            .cursor_col_resize()
-                    } else {
-                        base.left_0()
-                            .w_full()
-                            .top(px(pos - 5.0))
-                            .h(px(10.0))
-                            .cursor_row_resize()
-                    }
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
-                            if ev.click_count >= 2 {
-                                this.even_split(ekey.clone(), n, cx);
-                                cx.stop_propagation();
-                            }
-                        }),
-                    );
-                    overlay = overlay.child(strip);
-                }
-                div()
-                    .relative()
-                    .size_full()
-                    .child(group.into_any_element())
-                    .child(overlay)
+                group
+                    .on_reset(move |_window, cx| {
+                        if let Some(app) =
+                            cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade())
+                        {
+                            app.update(cx, |app, cx| app.even_split(pid, key.clone(), n, cx));
+                        }
+                    })
                     .into_any_element()
             }
         }
@@ -25247,7 +25207,7 @@ impl Render for MuxelApp {
             h_resizable(fb_key)
                 .child(
                     resizable_panel()
-                        .size(px(fb_saved))
+                        .fixed_size(px(fb_saved))
                         .size_range(px(180.0)..px(fb_half))
                         .child(self.render_file_browser(cx)),
                 )
@@ -25278,7 +25238,7 @@ impl Render for MuxelApp {
             h_resizable(mem_key)
                 .child(
                     resizable_panel()
-                        .size(px(mem_saved))
+                        .fixed_size(px(mem_saved))
                         .size_range(px(200.0)..px(mem_half))
                         .child(self.render_memory_panel(cx)),
                 )
@@ -25296,6 +25256,15 @@ impl Render for MuxelApp {
         } else {
             main_column.into_any_element()
         };
+        let center_minimum = 100.0
+            + if self.show_file_browser {
+                180.0
+            } else if self.show_memory {
+                200.0
+            } else {
+                0.0
+            };
+        let body_minimum = center_minimum + if sidebar_hidden { 0.0 } else { 160.0 };
         let body: AnyElement = if sidebar_hidden {
             center
         } else {
@@ -25316,11 +25285,15 @@ impl Render for MuxelApp {
             h_resizable(key)
                 .child(
                     resizable_panel()
-                        .size(px(saved))
+                        .fixed_size(px(saved))
                         .size_range(px(160.0)..px(half))
                         .child(self.render_sidebar(cx)),
                 )
-                .child(resizable_panel().child(center))
+                .child(
+                    resizable_panel()
+                        .size_range(px(center_minimum)..Pixels::MAX)
+                        .child(center),
+                )
                 .on_resize(|state, _window, cx| {
                     let width = state.read(cx).sizes().first().map(|p| f32::from(*p));
                     if let Some(width) = width
@@ -25348,10 +25321,14 @@ impl Render for MuxelApp {
                     .unwrap_or_default()
             ));
             h_resizable(gd_key)
-                .child(resizable_panel().child(body))
                 .child(
                     resizable_panel()
-                        .size(px(gd_saved))
+                        .size_range(px(body_minimum)..Pixels::MAX)
+                        .child(body),
+                )
+                .child(
+                    resizable_panel()
+                        .fixed_size(px(gd_saved))
                         .size_range(px(200.0)..px(gd_half))
                         .child(self.render_git_diff_panel(cx)),
                 )
@@ -26068,6 +26045,7 @@ mod split_resize_tests {
         let outside = Uuid::new_v4();
         let children = vec![
             PaneNode::Leaf(LeafData {
+                pane_id: Uuid::new_v4(),
                 tabs: vec![terminal_a, editor],
                 active: 0,
             }),

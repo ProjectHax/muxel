@@ -89,6 +89,15 @@ fn check(tree: &Option<PaneNode>, step: usize, op: &str) {
             ld.tabs.len()
         );
     }
+    let pane_ids: Vec<_> = leaves.iter().map(|leaf| leaf.pane_id).collect();
+    let mut unique_pane_ids = pane_ids.clone();
+    unique_pane_ids.sort();
+    unique_pane_ids.dedup();
+    assert_eq!(
+        unique_pane_ids.len(),
+        pane_ids.len(),
+        "step {step} after {op}: two leaves share one pane identity"
+    );
     check_splits(root, step, op);
 
     let ids = all_ids(tree);
@@ -113,6 +122,7 @@ fn checker_detects_an_empty_leaf() {
         children: vec![
             PaneNode::leaf(Uuid::new_v4()),
             PaneNode::Leaf(LeafData {
+                pane_id: Uuid::new_v4(),
                 tabs: vec![],
                 active: 0,
             }),

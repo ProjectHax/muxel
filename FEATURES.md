@@ -215,7 +215,9 @@ feature is added or changed, update the matching entry here in the same change**
   title shape; existing marker, bell, and process-exit signals still apply.
   Provider-owned screen rows can add precise state that titles omit: Claude
   permission forms report **blocked**, while positive background counts displayed
-  by Claude and Grok remain **working** even when their titles look idle. Brief
+  by Claude and Grok remain **working** even when their titles look idle. Claude's
+  visible foreground progress row also preserves **working** when a narrow tmux
+  pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
   active work. Local Codex `/rename` values are read
   from its session index by the pane's captured session UUID, so child commands
@@ -486,7 +488,14 @@ feature is added or changed, update the matching entry here in the same change**
   main, secondary, and popped-out editor windows.
 - **Resource tab grouping** — files, diffs, and browser pages opened by default join
   the nearest pane of the same type; explicit New Tab and New Pane commands still
-  use the requested tab or split placement.
+  use the requested tab or split placement. Opening another resource as a tab
+  preserves the surrounding split geometry, including narrow resource columns.
+- **Resize preferences** — project, file/memory, and right-hand tool sidebars keep
+  their preferred logical-pixel widths as the window changes size. The center
+  splits redistribute proportionally at every level. Temporary minimum-size
+  clamps do not save over those widths or proportions; enlarging the window or
+  reopening a sidebar restores its preference. Divider dragging updates the
+  preference, and double-clicking a center divider makes its split equal.
 - **Git diff panel** — a toolbar button (far right) toggles a collapsible
   right-side panel with two tabs:
   - **Files** — the active project's changed files (added / modified / deleted /

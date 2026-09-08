@@ -6,7 +6,7 @@ use crate::colors::TerminalPalette;
 use crate::element::TerminalElement;
 use crate::keymap::{KeyModifiers, key_to_bytes};
 use crate::profile;
-use crate::session::{CommandSpec, PtyChunk, TerminalSession};
+use crate::session::{CommandSpec, ProfiledPtyChunk, TerminalSession};
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
 use gpui::*;
@@ -306,7 +306,7 @@ fn sticky_title_status(
 fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<AgentStatus> {
     match provider {
         TitleProvider::Claude if is_claude_blocked_prompt(screen) => Some(AgentStatus::Blocked),
-        TitleProvider::Claude if screen.lines().any(is_claude_live_background_row) => {
+        TitleProvider::Claude if claude_screen_has_current_work(screen) => {
             Some(AgentStatus::Working)
         }
         TitleProvider::Grok
@@ -323,6 +323,207 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
         }
         _ => None,
     }
+}
+
+fn claude_screen_has_current_work(screen: &str) -> bool {
+    let mut newer_rows = [None, None];
+    for line in screen.lines().rev() {
+        if is_claude_live_task_footer(line, newer_rows)
+            || is_claude_live_foreground_row(line)
+            || is_claude_live_background_row(line)
+        {
+            return true;
+        }
+        if is_claude_completed_foreground_row(line) {
+            return false;
+        }
+        newer_rows[1] = newer_rows[0];
+        newer_rows[0] = Some(line);
+    }
+    false
+}
+
+fn is_claude_live_task_footer(line: &str, newer_rows: [Option<&str>; 2]) -> bool {
+    if is_claude_live_task_footer_line(line) {
+        return true;
+    }
+    if !line.trim().starts_with("Auto mode") {
+        return false;
+    }
+
+    let mut footer = line.trim().to_string();
+    let mut previous = line;
+    for row in newer_rows.into_iter().flatten() {
+        if row.trim().is_empty() {
+            return false;
+        }
+        if previous.ends_with(char::is_whitespace) || row.starts_with(char::is_whitespace) {
+            footer.push(' ');
+        }
+        footer.push_str(row.trim());
+        if is_claude_live_task_footer_line(&footer) {
+            return true;
+        }
+        previous = row;
+    }
+    false
+}
+
+fn is_claude_live_task_footer_line(line: &str) -> bool {
+    let Some(summary) = line.trim().strip_prefix("Auto mode on · ") else {
+        return false;
+    };
+    let mut tasks = summary
+        .split(" · ")
+        .flat_map(|group| group.split(", "))
+        .peekable();
+    tasks.peek().is_some() && tasks.all(is_claude_live_task_count)
+}
+
+fn is_claude_live_task_count(task: &str) -> bool {
+    let Some((count, kind)) = task.split_once(' ') else {
+        return false;
+    };
+    let Ok(count) = count.parse::<usize>() else {
+        return false;
+    };
+    if count == 0 {
+        return false;
+    }
+    let base = if count == 1 {
+        kind
+    } else {
+        let Some(base) = kind.strip_suffix('s') else {
+            return false;
+        };
+        base
+    };
+    matches!(
+        base,
+        "shell"
+            | "monitor"
+            | "agent"
+            | "team"
+            | "local agent"
+            | "cloud session"
+            | "background task"
+            | "background dynamic workflow"
+            | "MCP task"
+            | "remote dynamic workflow"
+    )
+}
+
+fn is_claude_live_foreground_row(line: &str) -> bool {
+    let Some(status) = line.trim().strip_prefix("✻ ") else {
+        return false;
+    };
+    let Some((activity, metrics)) = status.rsplit_once(" (") else {
+        return false;
+    };
+    if activity
+        .trim_end()
+        .strip_suffix('…')
+        .is_none_or(|label| label.trim().is_empty())
+    {
+        return false;
+    }
+    let Some(metrics) = metrics.strip_suffix(')') else {
+        return false;
+    };
+    let Some((elapsed, tokens)) = metrics.split_once(" · ") else {
+        return false;
+    };
+    is_claude_elapsed(elapsed.trim())
+        && tokens
+            .trim()
+            .strip_suffix(" tokens")
+            .is_some_and(|count| is_claude_token_count(count.trim()))
+}
+
+fn is_claude_completed_foreground_row(line: &str) -> bool {
+    let Some(status) = line.trim().strip_prefix("✻ ") else {
+        return false;
+    };
+    let Some((summary, finished_at)) = status.rsplit_once(" · done ") else {
+        return false;
+    };
+    let Some((activity, elapsed)) = summary.rsplit_once(" for ") else {
+        return false;
+    };
+    !activity.trim().is_empty()
+        && is_claude_elapsed(elapsed.trim())
+        && is_claude_clock_time(finished_at.trim())
+}
+
+fn is_claude_clock_time(value: &str) -> bool {
+    let Some((clock, meridiem)) = value.rsplit_once(' ') else {
+        return false;
+    };
+    if !matches!(meridiem, "AM" | "PM") {
+        return false;
+    }
+    let Some((hour, minute)) = clock.split_once(':') else {
+        return false;
+    };
+    let Ok(hour) = hour.parse::<u8>() else {
+        return false;
+    };
+    hour != 0
+        && hour <= 12
+        && minute.len() == 2
+        && minute.bytes().all(|byte| byte.is_ascii_digit())
+        && minute.parse::<u8>().is_ok_and(|minute| minute < 60)
+}
+
+fn is_claude_token_count(value: &str) -> bool {
+    let Some(value) = value
+        .strip_prefix("↑ ")
+        .or_else(|| value.strip_prefix("↓ "))
+    else {
+        return false;
+    };
+    let (number, scaled) = value
+        .strip_suffix('k')
+        .or_else(|| value.strip_suffix('m'))
+        .map_or((value, false), |number| (number, true));
+    let mut parts = number.split('.');
+    let Some(whole) = parts.next() else {
+        return false;
+    };
+    let fraction = parts.next();
+    !whole.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|fraction| {
+            scaled && !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && parts.next().is_none()
+}
+
+fn is_claude_elapsed(value: &str) -> bool {
+    let mut previous_rank = 4;
+    for part in value.split_whitespace() {
+        let Some((unit, digits)) = part
+            .char_indices()
+            .next_back()
+            .map(|(index, unit)| (unit, &part[..index]))
+        else {
+            return false;
+        };
+        let rank = match unit {
+            'h' => 3,
+            'm' => 2,
+            's' => 1,
+            _ => return false,
+        };
+        if rank >= previous_rank
+            || digits.is_empty()
+            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return false;
+        }
+        previous_rank = rank;
+    }
+    previous_rank != 4
 }
 
 fn is_claude_live_background_row(line: &str) -> bool {
@@ -619,7 +820,7 @@ impl TerminalMouseMode {
     }
 }
 
-/// How a child ended, carried from `PtyChunk::Exit` to the view in one piece so
+/// How a child ended, carried from `ProfiledPtyChunk::Exit` to the view in one piece so
 /// the three same-typed optionals can't be transposed at a call site.
 struct ExitInfo {
     code: Option<i32>,
@@ -631,14 +832,20 @@ struct ExitInfo {
 /// at an Exit event or once [`MAX_BYTES_PER_TURN`] is buffered (the rest stays
 /// queued for the next drain turn).
 fn coalesce_pending(
-    rx: &async_channel::Receiver<PtyChunk>,
+    rx: &async_channel::Receiver<ProfiledPtyChunk>,
+    instance_id: Uuid,
     output: &mut Vec<u8>,
     exit: &mut Option<ExitInfo>,
 ) {
     while let Ok(more) = rx.try_recv() {
         match more {
-            PtyChunk::Output(b) => output.extend_from_slice(&b),
-            PtyChunk::Exit {
+            ProfiledPtyChunk::Output { bytes, timing } => {
+                if let Some(timing) = timing {
+                    profile::output_drained(instance_id, timing);
+                }
+                output.extend_from_slice(&bytes);
+            }
+            ProfiledPtyChunk::Exit {
                 code,
                 signal,
                 read_error,
@@ -670,10 +877,10 @@ pub struct TerminalView {
     /// code wasn't reported by the OS/PTY). `Some(1)` may mean a signal — see
     /// `exit_signal`.
     exit_code: Option<i32>,
-    /// The signal that killed the child, when one did (see `PtyChunk::Exit`).
+    /// The signal that killed the child, when one did (see `ProfiledPtyChunk::Exit`).
     exit_signal: Option<String>,
     /// Set when the session ended on a PTY read error rather than a clean EOF —
-    /// the child may still have been healthy (see `PtyChunk::Exit`).
+    /// the child may still have been healthy (see `ProfiledPtyChunk::Exit`).
     exit_read_error: Option<String>,
     /// Error from a failed launch (e.g. the agent program isn't on PATH), captured
     /// for the dev console. `None` when the program launched fine.
@@ -748,6 +955,12 @@ pub struct TerminalFocusProfile {
     pub notify_pending: bool,
 }
 
+impl Drop for TerminalView {
+    fn drop(&mut self) {
+        profile::pane_closed(self.instance_id);
+    }
+}
+
 /// A spawned terminal not yet wrapped in a view: the spec that actually ran
 /// (the requested one, or the fallback shell), the live session + its output
 /// receiver, and the launch error when the requested program failed to start.
@@ -756,7 +969,7 @@ pub struct TerminalFocusProfile {
 pub struct TerminalLaunch {
     spec: CommandSpec,
     session: Arc<TerminalSession>,
-    rx: async_channel::Receiver<PtyChunk>,
+    rx: async_channel::Receiver<ProfiledPtyChunk>,
     launch_error: Option<String>,
 }
 
@@ -789,10 +1002,7 @@ impl TerminalLaunch {
         (cols, rows): (u16, u16),
         instance_id: Option<Uuid>,
     ) -> anyhow::Result<Self> {
-        let spawn = |spec| match instance_id {
-            Some(instance_id) => TerminalSession::spawn_profiled(spec, cols, rows, instance_id),
-            None => TerminalSession::spawn(spec, cols, rows),
-        };
+        let spawn = |spec| TerminalSession::spawn_internal(spec, cols, rows, instance_id);
         match spawn(spec.clone()) {
             Ok((session, rx)) => Ok(Self {
                 spec,
@@ -945,6 +1155,7 @@ impl TerminalView {
             let s = session.clone();
             window
                 .on_focus_in(&focus_handle, cx, move |w, cx| {
+                    profile::focus_changed(instance_id, true);
                     if let Some(observer) = focus_observer {
                         observer(instance_id, true, w, cx);
                     }
@@ -956,6 +1167,7 @@ impl TerminalView {
             let s = session.clone();
             window
                 .on_focus_out(&focus_handle, cx, move |_ev, w, cx| {
+                    profile::focus_changed(instance_id, false);
                     if let Some(observer) = focus_observer {
                         observer(instance_id, false, w, cx);
                     }
@@ -1080,8 +1292,13 @@ impl TerminalView {
                 let mut output: Vec<u8> = Vec::new();
                 let mut exit: Option<ExitInfo> = None;
                 match chunk {
-                    PtyChunk::Output(b) => output.extend_from_slice(&b),
-                    PtyChunk::Exit {
+                    ProfiledPtyChunk::Output { bytes, timing } => {
+                        if let Some(timing) = timing {
+                            profile::output_drained(instance_id, timing);
+                        }
+                        output.extend_from_slice(&bytes);
+                    }
+                    ProfiledPtyChunk::Exit {
                         code,
                         signal,
                         read_error,
@@ -1093,7 +1310,7 @@ impl TerminalView {
                         });
                     }
                 }
-                coalesce_pending(&rx, &mut output, &mut exit);
+                coalesce_pending(&rx, instance_id, &mut output, &mut exit);
 
                 // Coalesce before taking the UI lock: bg agents always; focused
                 // stream bursts too (interaction priority is decided after parsing).
@@ -1108,7 +1325,7 @@ impl TerminalView {
                     };
                     if let Some(d) = wait {
                         cx.background_executor().timer(d).await;
-                        coalesce_pending(&rx, &mut output, &mut exit);
+                        coalesce_pending(&rx, instance_id, &mut output, &mut exit);
                     }
                 }
 
@@ -1123,10 +1340,14 @@ impl TerminalView {
                     );
                     first_output = false;
                 }
+                if batch_len > 0 {
+                    profile::output_update_requested(instance_id);
+                }
                 let stop = view
                     .update(cx, |view, cx| {
                         let focused = view.session.is_focused();
                         if !output.is_empty() {
+                            profile::output_update_started(instance_id);
                             let t0 = Instant::now();
                             view.session.process_output(&output);
                             if !view.has_visible_content
@@ -1143,8 +1364,8 @@ impl TerminalView {
                             }
                             profile::process_output(instance_id, batch_len, t0.elapsed(), focused);
                             if focused && profile::is_enabled() {
-                                let (col, row, text) = view.session.cursor_probe();
-                                profile::screen_probe_update(col, row, text);
+                                let (col, row) = view.session.cursor_position();
+                                profile::cursor_probe_update(instance_id, col, row);
                             }
                             for (ty, text) in view.session.take_clipboard_stores() {
                                 write_clipboard(ty, text, cx);
@@ -1543,6 +1764,7 @@ impl TerminalView {
             if event.keystroke.key.eq_ignore_ascii_case("enter") {
                 self.session.mark_turn_submitted();
             }
+            profile::key_started(self.instance_id, t0);
             self.session.write_input(&bytes);
             if cleared {
                 cx.notify();
@@ -1550,7 +1772,7 @@ impl TerminalView {
             // Key path: gpui may sync-draw without presenting — arm the pump.
             crate::present_flag::mark_present_needed();
             cx.stop_propagation();
-            profile::key_handled(self.instance_id, held, t0.elapsed());
+            profile::key_finished(held, t0.elapsed());
         }
     }
 }
@@ -1904,6 +2126,70 @@ mod tests {
     }
 
     #[test]
+    fn claude_live_foreground_row_overrides_idle_title() {
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "⎿  Running…\n\n✻ Unravelling… (3s · ↓ 117 tokens)\n\n  esc to in…"
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Chewing on it… (1m 20s · ↓ 2.6k tokens)"
+            ),
+            Some(AgentStatus::Working)
+        );
+        for idle_or_quoted in [
+            "✻ Brewed for 12s · done 11:22 AM",
+            "quoted: ✻ Chewing on it… (20s · ↓ 171 tokens)",
+            "> ✻ Chewing on it… (20s · ↓ 171 tokens)",
+            "✻ Chewing on it… (soon · ↓ 171 tokens)",
+            "✻ Chewing on it… (20s · tokens)",
+            "✻ … (20s · ↓ 171 tokens)",
+            "✻ Chewing on it… (3s 1h · ↓ 171 tokens)",
+            "✻ Chewing on it… (1m 2m · ↓ 171 tokens)",
+            "✻ Chewing on it… (1s 2m · ↓ 171 tokens)",
+            "✻ Chewing on it… (20s · ↑↓171 tokens)",
+            "✻ Chewing on it… (20s · ↓171 tokens)",
+            "✻ Chewing on it… (20s · 1e3 tokens)",
+            "✻ Chewing on it… (20s · +171 tokens)",
+            "✻ Chewing on it… (20s · ↓ 2.6 tokens)",
+            "✻ Chewing on it… (20s · .5k tokens)",
+            "✻ Chewing on it… (20s · 2..6k tokens)",
+        ] {
+            assert_eq!(
+                provider_screen_status(TitleProvider::Claude, idle_or_quoted),
+                None,
+                "accepted Claude foreground lookalike {idle_or_quoted:?}"
+            );
+        }
+
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Chewing on it… (20s · ↓ 171 tokens)\n\nThat was the exact row under discussion.\n\n✻ Brewed for 21s · done 11:22 AM"
+            ),
+            None,
+            "an earlier exact row must not override newer completion evidence"
+        );
+
+        let live_background_above_long_output = format!(
+            "· 1 command still running · send a message to interrupt\n{}",
+            (0..20)
+                .map(|line| format!("ordinary output {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(
+            provider_screen_status(TitleProvider::Claude, &live_background_above_long_output),
+            Some(AgentStatus::Working),
+            "live background work must not disappear beyond an arbitrary row window"
+        );
+    }
+
+    #[test]
     fn live_background_command_overrides_idle_title() {
         assert_eq!(
             provider_screen_status(
@@ -1951,11 +2237,59 @@ mod tests {
             ),
             Some(AgentStatus::Working)
         );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Brewed for 15s · done 11:22 AM\nAuto mode on · 1 shell ·   \n2 agents"
+            ),
+            Some(AgentStatus::Working),
+            "a footer wrapped at a word boundary must remain live"
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Brewed for 15s · done 11:22 AM\nAuto mode on · 1 shell · 2 ag\nents"
+            ),
+            Some(AgentStatus::Working),
+            "a footer wrapped inside a task kind must remain live"
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Brewed for 15s · done 11:22 AM\nAuto mode on · 1 shell · 2 agents"
+            ),
+            Some(AgentStatus::Working),
+            "Claude's current task footer must override the completed foreground row"
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "✻ Brewed for 15s · done 11:22 AM\nAuto mode on · 1 shell, 2 monitors · 1 local agent"
+            ),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            provider_screen_status(
+                TitleProvider::Claude,
+                "Auto mode on · 1 shell · 2 agents\n✻ Brewed for 15s · done 11:22 AM"
+            ),
+            None,
+            "a stale footer must not override a newer completion row"
+        );
         for false_positive in [
             "✻ Brewed for 15s · 0 shells still running",
             "✻ Brewed for 15s · 1 shells still running",
             "quoted: ✻ Brewed for 15s · 1 shell still running",
             "✻ Brewed for 15s · 1 shell still running later",
+            "Auto mode on",
+            "Auto mode on · 0 shells",
+            "Auto mode on · 1 shells",
+            "Auto mode on · 2 shell",
+            "Auto mode on · 1 worker",
+            "Auto mode on · 1 shell · 1 hook",
+            "Auto mode on · 1 shell ·",
+            "quoted: Auto mode on · 1 shell · 2 agents",
+            "Auto mode off · 1 shell · 2 agents",
         ] {
             assert_eq!(
                 provider_screen_status(TitleProvider::Claude, false_positive),
