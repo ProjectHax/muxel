@@ -13,6 +13,7 @@ use muxel_core::{Instance, LeafData, PaneNode, Project, Uuid, Workspace, dedupe_
 fn project_with(instances: &[Uuid]) -> Project {
     let mut p = Project::new("proj", "/tmp/proj");
     p.layout = Some(PaneNode::Leaf(LeafData {
+        pane_id: Uuid::new_v4(),
         tabs: instances.to_vec(),
         active: 0,
     }));
@@ -35,6 +36,7 @@ fn a_second_instance_on_the_same_session_is_dropped_from_both_the_list_and_the_l
     let dup = instance(pid, Some("muxel_sro_client_90f9def0"));
     let other = instance(pid, Some("muxel_sro_client_d0d464c4"));
     proj.layout = Some(PaneNode::Leaf(LeafData {
+        pane_id: Uuid::new_v4(),
         tabs: vec![first.id, dup.id, other.id],
         active: 1, // the duplicate is focused — removing it must not leave a hole
     }));

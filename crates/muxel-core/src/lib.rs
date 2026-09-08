@@ -7,6 +7,7 @@ mod appimage;
 pub mod audio;
 pub mod autopilot;
 pub mod diff;
+pub mod geometry;
 mod gui_path;
 pub mod locale;
 pub mod memory;
@@ -1215,7 +1216,7 @@ impl RemoteLayout {
             })
             .collect();
         serde_json::json!({
-            "layout": self.layout,
+            "layout": self.layout.as_ref().map(pane::SemanticPane),
             "instances": instances,
             "worktrees": self.worktrees,
             // In the key, so flipping the toggle counts as a change and is pushed to
@@ -1302,6 +1303,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
                 // An empty project: this instance seeds the layout.
                 None => {
                     project.layout = Some(PaneNode::Leaf(LeafData {
+                        pane_id: Uuid::new_v4(),
                         tabs: vec![id],
                         active: 0,
                     }))
@@ -2494,6 +2496,25 @@ mod settings_tests {
 mod remote_layout_tests {
     use super::*;
 
+    #[test]
+    fn content_key_is_stable_for_legacy_and_ios_layouts() {
+        let json = r#"{"version":1,"updated_at":10,"remote_root":"/srv/test","layout":{"kind":"split","direction":"horizontal","sizes":[900,300],"children":[{"kind":"leaf","tabs":["11111111-1111-4111-8111-111111111111"],"active":0},{"kind":"leaf","tabs":["22222222-2222-4222-8222-222222222222"],"active":0}]},"instances":[],"worktrees":[],"memory_enabled":false}"#;
+        let first = RemoteLayout::parse(json, "/srv/test").unwrap();
+        let second = RemoteLayout::parse(json, "/srv/test").unwrap();
+        assert_eq!(first.layout, second.layout);
+        assert_eq!(first.content_key(), second.content_key());
+
+        // Old/iOS peers preserve content but omit desktop-only leaf identity.
+        // Returning that same document must not schedule a push or a view teardown.
+        let persisted = RemoteLayout::parse(&first.to_json(), "/srv/test").unwrap();
+        assert_eq!(persisted.content_key(), second.content_key());
+        let mut renamed = second.clone();
+        if let Some(PaneNode::Split { sizes, .. }) = &mut renamed.layout {
+            sizes.swap(0, 1);
+        }
+        assert_ne!(persisted.content_key(), renamed.content_key());
+    }
+
     fn remote_project(root: &str) -> Project {
         let mut p = Project::new("proj", "/local/proj");
         p.remote = Some(RemoteRef {
@@ -2532,6 +2553,7 @@ mod remote_layout_tests {
         let wt2 = worktree(pid, "lone-reef", 1);
 
         proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
         }));
@@ -2584,6 +2606,7 @@ mod remote_layout_tests {
         let i1 = Instance::shell(proj.id);
         let id1 = i1.id;
         proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
             tabs: vec![id1],
             active: 0,
         }));
@@ -2597,6 +2620,7 @@ mod remote_layout_tests {
         let i2 = Instance::shell(proj.id);
         let id2 = i2.id;
         proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
             tabs: vec![id1, id2],
             active: 0,
         }));
@@ -2611,6 +2635,7 @@ mod remote_layout_tests {
         let mut proj = remote_project("/srv/app");
         let instance = Instance::shell(proj.id);
         proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
             tabs: vec![instance.id],
             active: 0,
         }));
@@ -2633,6 +2658,7 @@ mod remote_layout_tests {
         let mut proj = remote_project("/srv/app");
         let i1 = Instance::shell(proj.id);
         proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
             tabs: vec![i1.id],
             active: 0,
         }));

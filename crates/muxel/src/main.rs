@@ -20,6 +20,7 @@ mod present_pump;
 mod secrets;
 mod session_binding;
 mod settings_view;
+mod split;
 mod stt;
 mod theme;
 mod tts;

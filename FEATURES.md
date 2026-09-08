@@ -488,7 +488,14 @@ feature is added or changed, update the matching entry here in the same change**
   main, secondary, and popped-out editor windows.
 - **Resource tab grouping** — files, diffs, and browser pages opened by default join
   the nearest pane of the same type; explicit New Tab and New Pane commands still
-  use the requested tab or split placement.
+  use the requested tab or split placement. Opening another resource as a tab
+  preserves the surrounding split geometry, including narrow resource columns.
+- **Resize preferences** — project, file/memory, and right-hand tool sidebars keep
+  their preferred logical-pixel widths as the window changes size. The center
+  splits redistribute proportionally at every level. Temporary minimum-size
+  clamps do not save over those widths or proportions; enlarging the window or
+  reopening a sidebar restores its preference. Divider dragging updates the
+  preference, and double-clicking a center divider makes its split equal.
 - **Git diff panel** — a toolbar button (far right) toggles a collapsible
   right-side panel with two tabs:
   - **Files** — the active project's changed files (added / modified / deleted /
