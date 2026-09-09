@@ -1151,30 +1151,32 @@ impl TerminalView {
         // Forward focus in/out to the PTY (DECSET 1004) so agents like Claude
         // know when their pane is the one the user is looking at — and only
         // notify when it isn't.
-        {
-            let s = session.clone();
-            window
-                .on_focus_in(&focus_handle, cx, move |w, cx| {
-                    profile::focus_changed(instance_id, true);
-                    if let Some(observer) = focus_observer {
-                        observer(instance_id, true, w, cx);
-                    }
-                    s.report_focus(true);
-                })
-                .detach();
-        }
-        {
-            let s = session.clone();
-            window
-                .on_focus_out(&focus_handle, cx, move |_ev, w, cx| {
-                    profile::focus_changed(instance_id, false);
-                    if let Some(observer) = focus_observer {
-                        observer(instance_id, false, w, cx);
-                    }
-                    s.report_focus(false);
-                })
-                .detach();
-        }
+        //
+        // These MUST be the `Context` (entity-scoped) subscriptions, never
+        // `window.on_focus_in(…).detach()`. A window-scoped focus listener lives
+        // as long as the *window*, and a closure capturing `session.clone()`
+        // therefore pins the `TerminalSession` — and its PTY master fd, its
+        // writer-thread fd dup, and that parked thread — for the rest of the
+        // process. Remote panes respawn on every dropped SSH connection, so that
+        // leaked ~2 fds per reconnect until the whole app hit EMFILE ("Too many
+        // open files") and could no longer spawn anything. The entity-scoped
+        // form holds only a `WeakEntity` and prunes itself once the view is gone.
+        cx.on_focus_in(&focus_handle, window, move |view, window, cx| {
+            profile::focus_changed(instance_id, true);
+            if let Some(observer) = focus_observer {
+                observer(instance_id, true, window, cx);
+            }
+            view.session.report_focus(true);
+        })
+        .detach();
+        cx.on_focus_out(&focus_handle, window, move |view, _ev, window, cx| {
+            profile::focus_changed(instance_id, false);
+            if let Some(observer) = focus_observer {
+                observer(instance_id, false, window, cx);
+            }
+            view.session.report_focus(false);
+        })
+        .detach();
 
         // Startup automation (runners + type-in injection): once the agent is
         // ready, optionally send Shift+Tab a few times to reach auto-accept mode,

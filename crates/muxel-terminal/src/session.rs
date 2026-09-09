@@ -2190,6 +2190,68 @@ mod content_damage_tests {
         assert!(!session.is_interactive());
         session.kill();
     }
+
+    /// Open descriptors in this process. `/dev/fd` on macOS, `/proc/self/fd` on
+    /// Linux; both list one entry per open descriptor.
+    fn open_fds() -> usize {
+        let dir = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+    }
+
+    /// Poll until the process is holding at most `limit` descriptors, or
+    /// `budget` runs out; returns the last count seen.
+    fn settle_fds(limit: usize, budget: Duration) -> usize {
+        let deadline = Instant::now() + budget;
+        let mut open = open_fds();
+        while open > limit && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+            open = open_fds();
+        }
+        open
+    }
+
+    /// Descriptor use must not grow with the number of spawned-and-dropped
+    /// sessions.
+    ///
+    /// A live session costs three: the PTY master, the reader thread's dup, and
+    /// the writer thread's dup. The last two are only released when those
+    /// threads exit, which happens because dropping the session kills the child
+    /// (reader sees EOF) and drops the writer channel's `Sender`. Anything that
+    /// keeps an `Arc<TerminalSession>` alive past its pane therefore leaks
+    /// descriptors until the process hits EMFILE — which is exactly what a
+    /// window-lifetime focus subscription capturing the session used to do (see
+    /// `TerminalView::new_with_focus_observer`).
+    ///
+    /// Deliberately one session at a time, settling between rounds: PTYs are a
+    /// system-wide resource (`kern.tty.ptmx_max` is 511 on macOS) that the rest
+    /// of this parallel suite is also drawing on, so a batch of live PTYs would
+    /// starve its neighbours. `SLACK` absorbs their descriptors instead; a leak
+    /// holds 2 per round and so can never settle back under it. The per-round
+    /// budget is short (threads unwind in milliseconds) so a leaking build fails
+    /// promptly; the generous one is spent once, on the final reading.
+    #[test]
+    fn dropped_sessions_do_not_accumulate_descriptors() {
+        const ROUNDS: usize = 12;
+        const SLACK: usize = 12;
+        const PER_ROUND: Duration = Duration::from_secs(2);
+        const FINAL: Duration = Duration::from_secs(15);
+
+        let baseline = open_fds();
+        for _ in 0..ROUNDS {
+            drop(spawn_quiet());
+            settle_fds(baseline + SLACK, PER_ROUND);
+        }
+        let open = settle_fds(baseline + SLACK, FINAL);
+        assert!(
+            open <= baseline + SLACK,
+            "{ROUNDS} spawned-and-dropped sessions leaked descriptors: \
+             {baseline} open before, {open} after"
+        );
+    }
 }
 
 #[cfg(test)]

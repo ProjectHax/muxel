@@ -5,6 +5,18 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **A long-running window stops running out of file handles** — after a day of
+  use, panes could fail to start with "Too many open files", and once that
+  happened nothing new would launch at all: not an agent, not a shell, not even
+  the fallback shell muxel falls back to when a launch fails. Every terminal was
+  holding on to its file handles after its pane was gone, so each remote pane
+  that reconnected after a dropped SSH connection quietly consumed a few more —
+  a single day of flaky Wi-Fi was enough to exhaust the whole window. Terminals
+  now release everything when their pane closes. muxel also raises its own
+  open-file limit at startup, because macOS starts apps launched from Finder or
+  the Dock with a limit far below what a workspace full of panes needs.
+
 ## [0.1.9] — 2026-08-28
 
 ### Added
