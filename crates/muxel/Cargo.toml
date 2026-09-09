@@ -102,6 +102,10 @@ features = ["rt"]
 [target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
 whisper-rs = "0.16"
 
+# `setrlimit(RLIMIT_NOFILE)` at startup — see `raise_open_file_limit` in main.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Ask macOS (TCC) whether the microphone is *denied*. A denied app is handed
 # silent audio rather than an error, so nothing in cpal can tell us — see the
 # permission check in stt.rs. These are the objc2 versions gpui already pins, so

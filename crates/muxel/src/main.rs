@@ -99,6 +99,90 @@ fn spawn_present_pump() {
     present_pump::spawn();
 }
 
+/// The soft `RLIMIT_NOFILE` to move to, or `None` to leave it alone.
+///
+/// Only ever raises: a launcher that already handed us a generous soft limit
+/// must not be clamped down to the per-process cap. An *unlimited* hard limit is
+/// not actually settable — macOS caps NOFILE at `kern.maxfilesperproc` and Linux
+/// at `fs.nr_open`, and `setrlimit` past that fails outright — so the cap stands
+/// in for infinity.
+#[cfg(unix)]
+fn fd_limit_target(
+    soft: libc::rlim_t,
+    hard: libc::rlim_t,
+    cap: Option<libc::rlim_t>,
+) -> Option<libc::rlim_t> {
+    let target = if hard == libc::RLIM_INFINITY {
+        cap?
+    } else {
+        hard
+    };
+    (target > soft).then_some(target)
+}
+
+/// The kernel's per-process descriptor ceiling, when it can be read.
+#[cfg(unix)]
+fn per_process_fd_cap() -> Option<libc::rlim_t> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut max: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        // SAFETY: `kern.maxfilesperproc` is an int sysctl; both out-params are
+        // stack locals sized to match.
+        let ok = unsafe {
+            libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                (&raw mut max).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+        };
+        (ok && max > 0).then_some(max as libc::rlim_t)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::read_to_string("/proc/sys/fs/nr_open")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    }
+}
+
+/// Raise this process's open-file soft limit toward its hard limit (Unix).
+///
+/// Every pane costs three descriptors: the PTY master, the reader thread's dup,
+/// and the writer thread's dup — plus SSH control sockets, fonts, watched files,
+/// and whatever gpui holds for the window and GPU. macOS launches GUI apps with
+/// a soft `RLIMIT_NOFILE` of **256** (`launchctl limit maxfiles`), which a busy
+/// workspace can exhaust on panes alone; the process then hits EMFILE — "Too
+/// many open files (os error 24)" — and can no longer spawn *anything*, down to
+/// the fallback shell. Every terminal (Alacritty, WezTerm, Zed) raises this the
+/// same way at startup.
+///
+/// Best effort: any failure just leaves the inherited limit in place.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    // SAFETY: plain libc calls on a stack-local `rlimit`, before any thread that
+    // could be spawning children observes the limit.
+    unsafe {
+        let mut limit = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let Some(target) = fd_limit_target(limit.rlim_cur, limit.rlim_max, per_process_fd_cap())
+        else {
+            return;
+        };
+        limit.rlim_cur = target;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+            log::warn!(
+                "could not raise the open-file limit to {target}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 fn main() {
     match session_binding::hook_instance_from_args(
         std::env::args_os().skip(1),
@@ -127,6 +211,10 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     // Opt-in lag harness (no-op unless MUXEL_PROFILE / MUXEL_PROFILE_UI / TERMINAL).
     ui_profile::init();
+    // Before any pane spawns: GUI launchers hand us a soft limit far below what
+    // a multiplexer needs (256 on macOS).
+    #[cfg(unix)]
+    raise_open_file_limit();
 
     // Linux built-in browser: `muxel --browser <url>` relaunches this binary as
     // a standalone WebKitGTK window (gpui can't host one — see browser_helper).
@@ -277,4 +365,46 @@ fn main() {
             })
             .detach();
         });
+}
+
+#[cfg(all(test, unix))]
+mod fd_limit_tests {
+    use super::fd_limit_target;
+
+    const INFINITY: libc::rlim_t = libc::RLIM_INFINITY;
+
+    #[test]
+    fn raises_a_gui_launcher_soft_limit_to_the_hard_limit() {
+        // macOS hands GUI apps 256 against an unlimited hard limit.
+        assert_eq!(fd_limit_target(256, INFINITY, Some(92_160)), Some(92_160));
+        assert_eq!(fd_limit_target(1024, 524_288, None), Some(524_288));
+    }
+
+    #[test]
+    fn never_lowers_an_already_generous_limit() {
+        // The cap standing in for an unlimited hard limit must not clamp a shell
+        // that already raised the soft limit above it.
+        assert_eq!(fd_limit_target(1_048_576, INFINITY, Some(92_160)), None);
+        assert_eq!(fd_limit_target(524_288, 524_288, None), None);
+    }
+
+    #[test]
+    fn unreadable_cap_leaves_an_unlimited_hard_limit_alone() {
+        assert_eq!(fd_limit_target(256, INFINITY, None), None);
+    }
+
+    /// End-to-end on the real process: raising must never cost us descriptors,
+    /// whatever soft/hard/cap combination this machine happens to have.
+    #[test]
+    fn raising_the_real_limit_never_lowers_it() {
+        // SAFETY: `getrlimit` into a stack-local `rlimit`.
+        let soft = || unsafe {
+            let mut limit = std::mem::zeroed::<libc::rlimit>();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            limit.rlim_cur
+        };
+        let before = soft();
+        super::raise_open_file_limit();
+        assert!(soft() >= before);
+    }
 }
