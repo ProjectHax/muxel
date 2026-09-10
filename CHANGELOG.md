@@ -5,6 +5,8 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-10
+
 ### Fixed
 - **A long-running window stops running out of file handles** — after a day of
   use, panes could fail to start with "Too many open files", and once that
@@ -16,6 +18,45 @@ All notable changes to muxel are documented here. This project adheres to
   now release everything when their pane closes. muxel also raises its own
   open-file limit at startup, because macOS starts apps launched from Finder or
   the Dock with a limit far below what a workspace full of panes needs.
+- **Splits keep their proportions when tabs come and go** — adding, reordering, or
+  closing a tab could rebuild the pane it lived in, snapping a carefully sized split
+  back to its defaults — including a narrow column kept aside for files and diffs.
+  Resizing the window was no kinder: sidebars stretched and shrank along with the
+  panes, and making the window small for a moment could save the squeezed width as
+  if you had chosen it. Tab changes now leave the surrounding layout alone. The
+  project, file, and tool sidebars keep the width you gave them while the center
+  splits share out the remaining space in proportion, and a sidebar squeezed by a
+  small window returns to its own width once there is room again. Dragging a divider
+  is still how you change a size, and double-clicking a center divider still evens
+  out its split.
+- **Claude panes in narrow splits stop reporting Done while background work runs** —
+  newer versions of Claude keep working after the main line says it has finished,
+  listing the shells and helper agents still running in a footer at the bottom of
+  the screen. In a narrow pane, such as a tmux split, that footer wraps across lines
+  and muxel missed it: the pane dropped to Done while the work carried on, then
+  flipped back to Working with a second notification as soon as more output arrived.
+  muxel now reads the footer even when it wraps, and keeps the pane Working until it
+  no longer reports anything running. Claude's progress line is also recognized when
+  a narrow pane cuts off the end of it.
+- **Reopening a Codex pane no longer freezes muxel** — before resuming a saved Codex
+  conversation, muxel checks that it still exists. When it couldn't find the
+  conversation by name, it opened and read through every conversation Codex had ever
+  saved — on a history of around 900 conversations and 2 GB, the whole window
+  stopped responding for more than ten seconds while the pane started. The check now
+  looks at names only and finishes in a fraction of a second, so a missing or stale
+  conversation is no longer the slowest case.
+
+### Changed
+- **Freeze and typing-lag reports can show where the time went** — the opt-in
+  profiler (`MUXEL_PROFILE=1`) could say that a keystroke was slow to appear or that
+  the window stalled, but not why. It now breaks a slow keystroke into its stages —
+  the program answering, muxel reading and parsing the output, and the redraw — and
+  names what the app was busy with during a freeze: restoring the workspace,
+  switching projects, launching an agent, or drawing the window. On Windows it also
+  records which window held keyboard focus, embedded browser panes included, so a
+  report can show where your typing went when it seemed to vanish. The logs hold
+  timings and counts only — no keystrokes, terminal text, commands, URLs, titles, or
+  file paths — and nothing is recorded unless profiling is switched on.
 
 ## [0.1.9] — 2026-08-28
 
