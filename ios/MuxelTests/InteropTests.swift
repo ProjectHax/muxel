@@ -99,6 +99,22 @@ final class InteropTests: XCTestCase {
         }
     }
 
+    func testPaneIdsRemovedReportsOnlyPeerClosedPanes() {
+        var old = RemoteLayout(remoteRoot: "/srv/app")
+        for id in ["aaaa", "bbbb", "cccc"] {
+            old.addInstanceAsTab(Instance(id: id, projectId: "p", title: id, program: nil, args: []),
+                                 now: 1)
+        }
+        var fresh = old
+        fresh.removeInstance(id: "bbbb", now: 2) // closed on desktop
+        fresh.removeInstance(id: "cccc", now: 2) // launched here, write not landed yet
+        XCTAssertEqual(fresh.paneIdsRemoved(since: old, pending: ["cccc"]), ["bbbb"])
+        // Nothing dropped → nothing reported.
+        XCTAssertEqual(old.paneIdsRemoved(since: old), [])
+        // A different project's layout never disconnects this one's terminals.
+        XCTAssertEqual(RemoteLayout(remoteRoot: "/srv/other").paneIdsRemoved(since: old), [])
+    }
+
     func testAddInstanceAsTabSeedsAndAppends() {
         var layout = RemoteLayout(remoteRoot: "/srv/app")
         let a = Instance(id: "aaaa", projectId: "p", title: "A", program: "claude", args: [])

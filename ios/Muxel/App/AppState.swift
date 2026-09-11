@@ -8,7 +8,19 @@ import SwiftUI
 final class AppState: ObservableObject {
     @Published var doc: StoreDocument
     @Published var selectedProject: RemoteProject?
-    @Published var layout: RemoteLayout?
+    @Published var layout: RemoteLayout? {
+        didSet {
+            // A refresh that drops a pane (a peer closed it) drops its live terminal
+            // too, rather than leaving a dead entry behind. Same project only —
+            // `select`/`deselect` pass through nil, so switching projects never
+            // disconnects the terminals the store keeps across navigation.
+            guard let oldValue, let layout else { return }
+            for id in layout.paneIdsRemoved(since: oldValue, pending: pendingLaunches) {
+                terminals.disconnect(id)
+                deadPanes.remove(id)
+            }
+        }
+    }
     /// Load state of the selected project's shared layout — lets the detail view
     /// distinguish "can't reach the host" from a genuinely empty project.
     @Published var layoutLoad: LayoutLoadState = .idle
@@ -92,6 +104,9 @@ final class AppState: ObservableObject {
     /// interleave their read-modify-write pairs (the SSH command mutex serializes
     /// individual commands, not whole RMW sequences).
     private var layoutWriteChain: Task<Void, Never>?
+    /// Panes launched here whose layout write-back hasn't landed yet. They're shown
+    /// before the shared file has them, so a refresh must not read them as closed.
+    private var pendingLaunches: Set<String> = []
     /// Foreground poll counter — used to re-read the shared layout only every Nth poll.
     private var pollTick = 0
     /// Cache of each non-selected project's terminal instances (`project.id` →
@@ -532,12 +547,13 @@ final class AppState: ObservableObject {
     private func runPollOnce() async {
         guard let project = selectedProject, let host = host(for: project) else { return }
         let conn = connection(for: host)
-        // Every ~5th poll (~15s), re-read the shared layout so a peer's rename (and
-        // other edits) show up live while this project is open. Lightweight — a single
-        // file read; the same instance ids keep the selected tab + live terminals.
-        // (Selecting a project / returning to the app still refresh immediately.)
+        // Every 2nd poll (~6s — desktop's live-sync cadence is ~5s), re-read the shared
+        // layout so a peer's new panes, closed panes and renames show up live while this
+        // project is open. Lightweight — a single file read; the same instance ids keep
+        // the selected tab + live terminals. (Selecting a project / returning to the app
+        // still refresh immediately.)
         pollTick &+= 1
-        if pollTick % 5 == 0,
+        if pollTick % 2 == 0,
            let fresh = try? await RemoteLayoutStore.read(conn, root: project.remoteRoot) {
             layout = fresh
         }
@@ -728,6 +744,7 @@ final class AppState: ObservableObject {
         var next = layout ?? RemoteLayout(remoteRoot: project.remoteRoot)
         next.addInstanceAsTab(instance, now: unixNow(), targetLeafAnchor: targetLeafAnchor)
         if let worktreeRecord { next.worktrees.append(worktreeRecord) }
+        pendingLaunches.insert(instanceId)
         layout = next
         lastLaunched = instanceId
 
@@ -735,6 +752,7 @@ final class AppState: ObservableObject {
         // write over SSH) rather than blocking the UI on those round-trips; reassign the
         // authoritative layout when it returns (newer-wins also picks up peer changes).
         Task {
+            defer { self.pendingLaunches.remove(instanceId) }
             do {
                 let conn = self.connection(for: host)
                 try await conn.connect()

@@ -95,6 +95,17 @@ struct RemoteLayout: Codable, Equatable {
         return (layout?.allTabs ?? []).compactMap { byId[$0] }
     }
 
+    /// Panes in `old` that this layout no longer has — a peer closed them, so a
+    /// refresh must drop their live terminals too. Only compares the same project
+    /// (another root reports nothing). `pending` panes — launched here, write-back
+    /// still in flight — are never reported: a read that raced the write simply
+    /// hasn't seen them yet.
+    func paneIdsRemoved(since old: RemoteLayout, pending: Set<String> = []) -> [String] {
+        guard old.remoteRoot == remoteRoot else { return [] }
+        let current = Set(instances.map(\.id))
+        return old.instances.map(\.id).filter { !current.contains($0) && !pending.contains($0) }
+    }
+
     // MARK: Mutations (for launching/closing from the phone)
 
     /// Append `instance` and add it as a new active tab in the first leaf (or seed

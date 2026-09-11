@@ -2813,6 +2813,84 @@ mod remote_layout_tests {
         assert_eq!(a.tmux_session, added.tmux_session);
     }
 
+    /// Reduce a desktop pane subtree to what the iOS `PaneNode` encoder writes: only
+    /// its coding keys (no `pane_id`).
+    fn as_ios_pane(node: &mut serde_json::Value) {
+        const IOS_KEYS: [&str; 7] = [
+            "kind",
+            "tabs",
+            "active",
+            "instance",
+            "direction",
+            "sizes",
+            "children",
+        ];
+        if let Some(obj) = node.as_object_mut() {
+            obj.retain(|k, _| IOS_KEYS.contains(&k.as_str()));
+            if let Some(children) = obj.get_mut("children").and_then(|c| c.as_array_mut()) {
+                children.iter_mut().for_each(as_ios_pane);
+            }
+        }
+    }
+
+    #[test]
+    fn ios_write_back_is_not_a_layout_change() {
+        // The iOS app's models have no `grid`, `activity` or leaf `pane_id`, so every
+        // layout it writes back drops them. That must read as the same layout here —
+        // or each phone save would look like a peer change — and adopting it must
+        // keep this machine's own grid and activity.
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let mut a = Instance::shell(proj.id);
+        a.grid = Some((120, 40));
+        a.activity.last_state = Some(AgentActivityState::Working);
+        a.tmux_session = Some("muxel_studio_1a2b3c4d".into());
+        let b = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            sizes: vec![1.0, 1.0],
+            children: vec![
+                PaneNode::Leaf(LeafData {
+                    pane_id: Uuid::new_v4(),
+                    tabs: vec![a.id],
+                    active: 0,
+                }),
+                PaneNode::Leaf(LeafData {
+                    pane_id: Uuid::new_v4(),
+                    tabs: vec![b.id],
+                    active: 0,
+                }),
+            ],
+        });
+        ws.instances = vec![a.clone(), b];
+        ws.projects = vec![proj.clone()];
+        let desktop = RemoteLayout::capture(&proj, &ws, 10);
+
+        // The same document as the iOS encoder writes it.
+        let mut doc: serde_json::Value = serde_json::from_str(&desktop.to_json()).unwrap();
+        for inst in doc["instances"].as_array_mut().unwrap() {
+            let inst = inst.as_object_mut().unwrap();
+            inst.remove("grid");
+            inst.remove("activity");
+        }
+        as_ios_pane(&mut doc["layout"]);
+        doc["updated_at"] = 11.into();
+        let ios = RemoteLayout::parse(&doc.to_string(), "/local/proj").expect("iOS doc parses");
+
+        let key = desktop.content_key();
+        assert_eq!(ios.content_key(), key);
+        assert_eq!(
+            peer_layout_action(&ios.content_key(), 11, Some(key.as_str()), &key, 10),
+            PeerLayoutAction::InSync
+        );
+
+        let merged = merge_peer_instances(&ws.instances, ios.instances, proj.id);
+        let a2 = merged.iter().find(|i| i.id == a.id).unwrap();
+        assert_eq!(a2.grid, Some((120, 40)));
+        assert_eq!(a2.activity.last_state, Some(AgentActivityState::Working));
+        assert_eq!(a2.tmux_session, a.tmux_session);
+    }
+
     #[test]
     fn json_round_trips_and_parse_validates() {
         let mut ws = Workspace::default();
