@@ -1203,28 +1203,101 @@ impl RemoteLayout {
     /// ignores `version`/`updated_at`, for "did anything change" and "are these in
     /// sync" checks. Relies on [`capture`](Self::capture)'s canonical ordering and
     /// serde_json's deterministic (sorted-key) object encoding.
+    ///
+    /// Per-machine state is left out, so it never reads as a layout change: the
+    /// owning project's id (every machine has its own id for the same project) and
+    /// what this machine observes of a pane — its program-supplied title, terminal
+    /// grid and agent activity. Counting those pushed the layout on every resize
+    /// and agent turn, and made two peers look out of sync when nothing differed.
     pub fn content_key(&self) -> String {
-        // Program-supplied titles are local display state. Retitling an active
-        // agent must not schedule a remote layout push.
         let instances: Vec<Instance> = self
             .instances
             .iter()
             .cloned()
             .map(|mut instance| {
+                instance.project_id = Uuid::nil();
                 instance.auto_name = None;
+                instance.grid = None;
+                instance.activity = AgentActivity::default();
                 instance
+            })
+            .collect();
+        let worktrees: Vec<Worktree> = self
+            .worktrees
+            .iter()
+            .cloned()
+            .map(|mut worktree| {
+                worktree.project_id = Uuid::nil();
+                worktree
             })
             .collect();
         serde_json::json!({
             "layout": self.layout.as_ref().map(pane::SemanticPane),
             "instances": instances,
-            "worktrees": self.worktrees,
+            "worktrees": worktrees,
             // In the key, so flipping the toggle counts as a change and is pushed to
             // the host rather than sitting on one machine.
             "memory_enabled": self.memory_enabled,
         })
         .to_string()
     }
+}
+
+/// What a live poll should do with the shared `.muxel/workspace.json` it just read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerLayoutAction {
+    /// Nothing new: the file is what this machine last wrote or adopted.
+    Ignore,
+    /// The file already matches this machine's layout.
+    InSync,
+    /// A peer wrote a different layout; apply it.
+    Adopt,
+}
+
+/// Decide a live poll from content keys ([`RemoteLayout::content_key`]) and
+/// revisions (`updated_at`). `synced` is the key of the file as this machine last
+/// wrote or adopted it, so a file with any other key was written by a peer (the
+/// iOS app, or muxel on another machine). The peer's layout is adopted unless this
+/// machine also has a change it hasn't pushed yet (`local` differs from `synced`)
+/// that is at least as new — then that pending push wins, the same newer-wins rule
+/// as the connect-time sync.
+pub fn peer_layout_action(
+    remote_key: &str,
+    remote_rev: u64,
+    synced: Option<&str>,
+    local_key: &str,
+    local_rev: u64,
+) -> PeerLayoutAction {
+    if remote_key == local_key {
+        PeerLayoutAction::InSync
+    } else if synced == Some(remote_key) || (synced != Some(local_key) && remote_rev <= local_rev) {
+        PeerLayoutAction::Ignore
+    } else {
+        PeerLayoutAction::Adopt
+    }
+}
+
+/// A peer layout's instances as this machine should hold them: every one the peer
+/// lists (a pane it closed is simply absent), re-homed to `project_id`, and — for a
+/// pane this machine already has — keeping what this machine observed of it (its
+/// program-supplied title, terminal grid and agent activity), which is per-machine
+/// and never part of the shared content.
+pub fn merge_peer_instances(
+    local: &[Instance],
+    peer: Vec<Instance>,
+    project_id: Uuid,
+) -> Vec<Instance> {
+    peer.into_iter()
+        .map(|mut instance| {
+            instance.project_id = project_id;
+            if let Some(mine) = local.iter().find(|l| l.id == instance.id) {
+                instance.auto_name = mine.auto_name.clone();
+                instance.grid = mine.grid;
+                instance.activity = mine.activity.clone();
+            }
+            instance
+        })
+        .collect()
 }
 
 /// Drop instances that duplicate another one — the same id twice, or a second
@@ -2650,6 +2723,94 @@ mod remote_layout_tests {
         ws.instances[0].custom_name = Some("My title".into());
         let renamed = RemoteLayout::capture(&proj, &ws, 1);
         assert_ne!(original.content_key(), renamed.content_key());
+    }
+
+    #[test]
+    fn content_key_ignores_per_machine_state() {
+        let mut ws = Workspace::default();
+        let mut proj = remote_project("/srv/app");
+        let wt = worktree(proj.id, "swift-pine", 0);
+        let mut instance = Instance::shell(proj.id);
+        instance.worktree_id = Some(wt.id);
+        proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: vec![instance.id],
+            active: 0,
+        }));
+        ws.instances = vec![instance];
+        ws.worktrees = vec![wt];
+        ws.projects = vec![proj.clone()];
+        let original = RemoteLayout::capture(&proj, &ws, 1);
+
+        // A resize and an agent turn are this machine's observation, not layout.
+        ws.instances[0].grid = Some((120, 40));
+        ws.instances[0].activity.completed_at = Some(1_700_000_000);
+        ws.instances[0].activity.last_state = Some(AgentActivityState::Done);
+        let observed = RemoteLayout::capture(&proj, &ws, 1);
+        assert_eq!(original.content_key(), observed.content_key());
+
+        // The same project on another machine carries that machine's project id.
+        let mut peer = original.clone();
+        let other = Uuid::new_v4();
+        peer.instances.iter_mut().for_each(|i| i.project_id = other);
+        peer.worktrees.iter_mut().for_each(|w| w.project_id = other);
+        assert_eq!(original.content_key(), peer.content_key());
+    }
+
+    #[test]
+    fn peer_layout_action_adopts_only_peer_writes() {
+        use PeerLayoutAction::{Adopt, Ignore, InSync};
+        // Same content either way: nothing to apply, just record it.
+        assert_eq!(peer_layout_action("a", 5, Some("x"), "a", 9), InSync);
+        // Our own last write (or what we last adopted) is not news.
+        assert_eq!(peer_layout_action("a", 5, Some("a"), "b", 9), Ignore);
+        // A peer wrote while nothing is pending here: adopt, whatever its clock says.
+        assert_eq!(peer_layout_action("p", 1, Some("a"), "a", 9), Adopt);
+        // Both sides changed: the newer one wins.
+        assert_eq!(peer_layout_action("p", 10, Some("a"), "b", 9), Adopt);
+        assert_eq!(peer_layout_action("p", 9, Some("a"), "b", 9), Ignore);
+        // Nothing recorded yet: only a strictly newer peer layout is taken.
+        assert_eq!(peer_layout_action("p", 10, None, "b", 9), Adopt);
+        assert_eq!(peer_layout_action("p", 8, None, "b", 9), Ignore);
+    }
+
+    #[test]
+    fn merge_peer_instances_keeps_local_observation() {
+        let local_pid = Uuid::new_v4();
+        let mut kept = Instance::shell(local_pid);
+        kept.grid = Some((100, 30));
+        kept.auto_name = Some("Fixing tests".into());
+        kept.activity.last_state = Some(AgentActivityState::Working);
+        let closed = Instance::shell(local_pid);
+
+        let peer_pid = Uuid::new_v4();
+        let mut peer_kept = kept.clone();
+        peer_kept.project_id = peer_pid;
+        peer_kept.grid = Some((40, 20));
+        peer_kept.auto_name = None;
+        peer_kept.activity = AgentActivity::default();
+        peer_kept.custom_name = Some("Reviewer".into());
+        let mut added = Instance::shell(peer_pid);
+        added.tmux_session = Some("muxel_proj_12345678".into());
+
+        let merged = merge_peer_instances(
+            &[kept.clone(), closed.clone()],
+            vec![peer_kept, added.clone()],
+            local_pid,
+        );
+        // The pane the peer closed is gone; the rest belong to this project.
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|i| i.project_id == local_pid));
+        assert!(merged.iter().all(|i| i.id != closed.id));
+
+        let k = merged.iter().find(|i| i.id == kept.id).unwrap();
+        assert_eq!(k.custom_name.as_deref(), Some("Reviewer")); // shared: the peer's
+        assert_eq!(k.grid, Some((100, 30))); // per-machine: ours
+        assert_eq!(k.auto_name.as_deref(), Some("Fixing tests"));
+        assert_eq!(k.activity.last_state, Some(AgentActivityState::Working));
+
+        let a = merged.iter().find(|i| i.id == added.id).unwrap();
+        assert_eq!(a.tmux_session, added.tmux_session);
     }
 
     #[test]

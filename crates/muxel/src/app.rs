@@ -2248,6 +2248,16 @@ pub struct MuxelApp {
     layout_keys: HashMap<Uuid, String>,
     /// Pending debounced layout pushes: project id → earliest time to push.
     remote_push_due: HashMap<Uuid, Instant>,
+    /// Content key of each synced project's `.muxel/workspace.json` as this machine
+    /// last wrote or adopted it. A live poll that reads any other key is looking at
+    /// a peer's write (see `muxel_core::peer_layout_action`).
+    layout_synced_keys: HashMap<Uuid, String>,
+    /// Projects with a layout push in flight — one at a time each, so a slow host
+    /// never has two pushes racing over the same file.
+    remote_push_inflight: HashSet<Uuid>,
+    /// Projects whose last layout push failed. Reported once per failing streak,
+    /// not on every retry; cleared by the next successful push.
+    layout_push_failing: HashSet<Uuid>,
     /// Per-project generation for deferred pane fleets. Starting a newer restore
     /// cancels the older task before it can launch or focus another pane.
     deferred_activation_generation: HashMap<Uuid, u64>,
@@ -4339,6 +4349,9 @@ impl MuxelApp {
             remote_connecting: HashSet::new(),
             layout_keys: HashMap::new(),
             remote_push_due: HashMap::new(),
+            layout_synced_keys: HashMap::new(),
+            remote_push_inflight: HashSet::new(),
+            layout_push_failing: HashSet::new(),
             deferred_activation_generation: HashMap::new(),
             focus_handle: cx.focus_handle(),
             settings,
@@ -4692,8 +4705,11 @@ impl MuxelApp {
             }
             // Proactive resume: if we'd `--resume` an already-started session but its
             // transcript is gone from disk (deleted/expired), start a *fresh* session
-            // instead of a doomed resume that just hangs.
-            if inst.session_started
+            // instead of a doomed resume that just hangs. Local projects only: a
+            // remote agent's transcript is on its host, so its absence from this disk
+            // says nothing — checking here reset every remote pane's conversation.
+            if local
+                && inst.session_started
                 && let Some(sid) = inst.session_id.clone()
                 && {
                     let _phase =
@@ -7539,21 +7555,22 @@ impl MuxelApp {
     }
 
     /// Re-fetch the shared `.muxel/workspace.json` for each already-reconciled synced
-    /// project and adopt a peer's instance renames live (see `reconcile_remote_names`),
-    /// off the UI thread. Runs on the same ~5s throttle as branch polling. This is the
-    /// live counterpart to the connect-time `apply_remote_layout_sync`, but surgical:
-    /// it never tears panes down (structural changes still reconcile on next connect).
-    fn fetch_remote_layouts(&mut self, cx: &mut Context<Self>) {
+    /// project, off the UI thread, and apply a peer's changes live (see
+    /// `poll_peer_layout`). Runs on the same ~5s throttle as branch polling — the
+    /// live counterpart to the connect-time `apply_remote_layout_sync`.
+    fn fetch_remote_layouts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let synced: Vec<Uuid> = self.remote_synced.iter().copied().collect();
         let jobs: Vec<(Uuid, integrations::RepoLoc)> = synced
             .into_iter()
             .filter(|pid| self.project_syncs_layout(*pid))
+            // Mid-push, the file may be half written; the next poll reads it whole.
+            .filter(|pid| !self.remote_push_inflight.contains(pid))
             .filter_map(|pid| self.repo_loc(pid).map(|loc| (pid, loc)))
             .collect();
         if jobs.is_empty() {
             return;
         }
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let results = cx
                 .background_executor()
                 .spawn(async move {
@@ -7562,67 +7579,196 @@ impl MuxelApp {
                         .collect::<Vec<_>>()
                 })
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                let mut changed = false;
+            let _ = this.update_in(cx, |this, window, cx| {
                 for (pid, json) in results {
                     if let Some(json) = json {
-                        changed |= this.reconcile_remote_names(pid, &json);
+                        this.poll_peer_layout(pid, &json, window, cx);
                     }
-                }
-                if changed {
-                    cx.notify();
                 }
             });
         })
         .detach();
     }
 
-    /// Adopt just the peer-set instance names (`custom_name`) from a fetched remote
-    /// layout, in place — no teardown/respawn (unlike a full `pull_remote_layout`).
-    /// Only existing instances (matched by id) are touched; new/removed panes are left
-    /// to the connect-time reconcile. Returns whether anything changed. Guarded by the
-    /// top-level `updated_at` so a not-yet-pushed local rename isn't clobbered.
-    fn reconcile_remote_names(&mut self, pid: Uuid, json: &str) -> bool {
+    /// Act on one polled layout file: adopt a peer's write, or just note that the
+    /// file already matches this machine (see `muxel_core::peer_layout_action`).
+    fn poll_peer_layout(
+        &mut self,
+        pid: Uuid,
+        json: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(proj) = self.workspace.project(pid) else {
-            return false;
+            return;
         };
         let layout_root = match &proj.remote {
             Some(r) => r.remote_root.clone(),
             None => proj.root_path.display().to_string(),
         };
-        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        let local = RemoteLayout::capture(proj, &self.workspace, now_epoch);
-        let local_rev = proj.layout_updated_at.unwrap_or(0);
         let Some(remote) = RemoteLayout::parse(json, &layout_root) else {
-            return false;
+            return;
         };
-        // Only adopt a strictly-newer, actually-different remote, so a desktop rename
-        // we haven't pushed yet isn't overwritten by a stale read.
-        if remote.updated_at <= local_rev || remote.content_key() == local.content_key() {
-            return false;
+        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
+        let local_key = RemoteLayout::capture(proj, &self.workspace, now_epoch).content_key();
+        let local_rev = proj.layout_updated_at.unwrap_or(0);
+        let remote_key = remote.content_key();
+        match muxel_core::peer_layout_action(
+            &remote_key,
+            remote.updated_at,
+            self.layout_synced_keys.get(&pid).map(String::as_str),
+            &local_key,
+            local_rev,
+        ) {
+            muxel_core::PeerLayoutAction::Ignore => {}
+            muxel_core::PeerLayoutAction::InSync => {
+                self.layout_synced_keys.insert(pid, remote_key);
+            }
+            muxel_core::PeerLayoutAction::Adopt => self.adopt_peer_layout(pid, remote, window, cx),
         }
-        let mut changed = false;
-        for r in &remote.instances {
-            if let Some(inst) = self.workspace.instance_mut(r.id)
-                && inst.custom_name != r.custom_name
-            {
-                inst.custom_name = r.custom_name.clone();
-                changed = true;
+    }
+
+    /// Apply a peer's layout live, in place: panes it added appear (attached to their
+    /// running tmux sessions), panes it closed go away, and every pane both sides
+    /// share keeps its live terminal. Unlike the connect-time
+    /// [`Self::pull_remote_layout`] nothing is torn down and respawned, so a peer
+    /// starting one agent never interrupts the others.
+    fn adopt_peer_layout(
+        &mut self,
+        pid: Uuid,
+        remote: RemoteLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
+        let name = project.name.clone();
+        let before = project.instances();
+        let local: Vec<Instance> = before
+            .iter()
+            .filter_map(|id| self.workspace.instance(*id).cloned())
+            .collect();
+        let remote_key = remote.content_key();
+        let RemoteLayout {
+            layout,
+            instances,
+            worktrees,
+            updated_at,
+            memory_enabled,
+            ..
+        } = remote;
+        let mut instances = muxel_core::merge_peer_instances(&local, instances, pid);
+        self.bind_peer_sessions(pid, &mut instances);
+        let keep: HashSet<Uuid> = instances.iter().map(|i| i.id).collect();
+        let closed: Vec<Uuid> = before
+            .iter()
+            .copied()
+            .filter(|id| !keep.contains(id))
+            .collect();
+        let added = instances.iter().filter(|i| !before.contains(&i.id)).count();
+        // A pane the peer closed: drop only this side's view. Closing it on the peer
+        // already tore down its tmux session and worktree.
+        for &iid in &closed {
+            ui_profile::unregister_focus_pane(iid);
+            self.terminal_launching.remove(&iid);
+            self.clear_notifications_for(iid);
+            if let Some(view) = self.terminals.remove(&iid) {
+                view.read(cx).session().kill();
+            }
+            self.editors.remove(&iid);
+            self.browsers.remove(&iid);
+            self.last_status.remove(&iid);
+            self.failed_launches.remove(&iid);
+            self.workspace.remove_instance_meta(iid);
+            if self.maximized == Some(iid) {
+                self.maximized = None;
             }
         }
-        if !changed {
-            return false;
+        for instance in instances {
+            self.workspace.remove_instance_meta(instance.id);
+            self.workspace.add_instance(instance);
+        }
+        for mut wt in worktrees {
+            wt.project_id = pid;
+            self.workspace.remove_worktree_meta(wt.id);
+            self.workspace.add_worktree(wt);
         }
         if let Some(p) = self.workspace.project_mut(pid) {
-            p.layout_updated_at = Some(remote.updated_at);
+            p.layout = layout;
+            p.layout_updated_at = Some(updated_at);
+            if let Some(enabled) = memory_enabled {
+                p.memory_enabled = enabled;
+            }
         }
-        // Reseed change detection so we don't immediately push the adopted names back.
-        if let Some(p) = self.workspace.project(pid) {
-            let key = RemoteLayout::capture(p, &self.workspace, now_epoch).content_key();
-            self.layout_keys.insert(pid, key);
+        self.seed_adopted_layout(pid, remote_key);
+        if self.active_instance.is_some_and(|a| closed.contains(&a)) {
+            self.active_instance = self
+                .workspace
+                .project(pid)
+                .and_then(|p| p.preferred_instance());
         }
         self.persist();
-        true
+        muxel_store::append_event_log(&format!(
+            "layout: adopted peer layout for \"{name}\" (+{added} -{})",
+            closed.len()
+        ));
+        // The peer's new panes attach to their sessions (`tmux new-session -A`).
+        self.spawn_project_terminals_now(pid, window, cx);
+        cx.notify();
+    }
+
+    /// After adopting a peer's layout: re-seed change detection so the adoption
+    /// isn't pushed straight back, and remember the file as synced. Whatever this
+    /// machine had to add (a session binding the peer never recorded) makes the
+    /// content differ from the file; that is pushed, so the peer learns it too.
+    fn seed_adopted_layout(&mut self, pid: Uuid, remote_key: String) {
+        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
+        let Some(p) = self.workspace.project(pid) else {
+            return;
+        };
+        let key = RemoteLayout::capture(p, &self.workspace, now_epoch).content_key();
+        self.remote_push_due.remove(&pid);
+        if key != remote_key {
+            if let Some(p) = self.workspace.project_mut(pid) {
+                p.layout_updated_at = Some(now_epoch);
+            }
+            self.remote_push_due
+                .insert(pid, Instant::now() + Duration::from_secs(2));
+        }
+        self.layout_keys.insert(pid, key);
+        self.layout_synced_keys.insert(pid, remote_key);
+    }
+
+    /// Bind a local project's terminal panes that a peer created without recording
+    /// a tmux session (another desktop relying on its host's tmux default) to the
+    /// session they actually run in, found by pane id — so this machine attaches to
+    /// that agent instead of launching a second one beside it. With no such session
+    /// running, the pane gets this project's canonical name and starts there.
+    fn bind_peer_sessions(&self, pid: Uuid, instances: &mut [Instance]) {
+        if !self.tmux_available {
+            return;
+        }
+        let Some(project) = self.workspace.project(pid).filter(|p| p.remote.is_none()) else {
+            return;
+        };
+        let unbound = |i: &Instance| {
+            i.kind == InstanceKind::Terminal
+                && i.tmux_session
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+        };
+        if !instances.iter().any(unbound) {
+            return;
+        }
+        let sessions = integrations::list_local_tmux_sessions().unwrap_or_default();
+        for instance in instances.iter_mut().filter(|i| unbound(i)) {
+            let session = muxel_core::tmux::session_by_suffix(&sessions, instance.id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| muxel_core::tmux::session_name(&project.name, instance.id));
+            instance.tmux_session = Some(session);
+            instance.use_tmux = true;
+        }
     }
 
     /// Adopt the exact Claude conversation selected by an in-process `/resume`.
@@ -7909,7 +8055,7 @@ impl MuxelApp {
         // Throttle remote (ssh) branch polling + layout re-fetch to every ~5s.
         if self.remote_poll_count == 0 {
             self.poll_remote_branches(cx);
-            self.fetch_remote_layouts(cx);
+            self.fetch_remote_layouts(window, cx);
         }
         self.remote_poll_count = (self.remote_poll_count + 1) % 5;
         // Session switches happen inside Grok without replacing the PTY child.
@@ -11372,6 +11518,12 @@ impl MuxelApp {
         if !self.project_syncs_layout(pid) {
             return;
         }
+        // One push per project at a time: go again once the one in flight lands.
+        if self.remote_push_inflight.contains(&pid) {
+            self.remote_push_due
+                .insert(pid, Instant::now() + Duration::from_secs(1));
+            return;
+        }
         let Some(loc) = self.repo_loc(pid) else {
             return;
         };
@@ -11379,21 +11531,45 @@ impl MuxelApp {
         let Some(proj) = self.workspace.project(pid) else {
             return;
         };
-        let json = RemoteLayout::capture(proj, &self.workspace, now_epoch).to_json();
+        let name = proj.name.clone();
+        let doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
+        let key = doc.content_key();
+        let json = doc.to_json();
+        self.remote_push_inflight.insert(pid);
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move { integrations::push_remote_layout(&loc, &json) })
                 .await;
-            if let Err(e) = res {
-                let _ = this.update(cx, |this, cx| {
-                    let msg = format!("{e}");
-                    if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
-                        this.add_event(NotifKind::Error, t("Layout sync"), msg);
+            let _ = this.update(cx, |this, cx| {
+                this.remote_push_inflight.remove(&pid);
+                match res {
+                    Ok(()) => {
+                        this.layout_synced_keys.insert(pid, key);
+                        this.layout_push_failing.remove(&pid);
                     }
-                    cx.notify();
-                });
-            }
+                    Err(e) => {
+                        // Retry quietly: a peer must eventually see this layout even
+                        // if nothing else changes here.
+                        this.remote_push_due
+                            .entry(pid)
+                            .or_insert_with(|| Instant::now() + Duration::from_secs(30));
+                        let msg = format!("{e}");
+                        // Report a failing host once per streak — each retry, and every
+                        // later layout change, would otherwise raise it again.
+                        if !this.handle_ssh_error(&msg, None, SshRetry::None, cx)
+                            && this.layout_push_failing.insert(pid)
+                        {
+                            this.add_event(
+                                NotifKind::Error,
+                                t("Layout sync"),
+                                format!("{name}: {msg}"),
+                            );
+                            cx.notify();
+                        }
+                    }
+                }
+            });
         })
         .detach();
     }
@@ -11441,7 +11617,8 @@ impl MuxelApp {
             }
             // Already in sync → just arm change detection.
             Some(r) if r.content_key() == local_key => {
-                self.layout_keys.insert(pid, local_key);
+                self.layout_keys.insert(pid, local_key.clone());
+                self.layout_synced_keys.insert(pid, local_key);
             }
             // Local is newer, or there's no usable remote doc → push local up.
             _ => {
@@ -11480,12 +11657,8 @@ impl MuxelApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let local_auto_names: HashMap<Uuid, String> = local
-            .instances
-            .iter()
-            .filter_map(|instance| instance.auto_name.clone().map(|name| (instance.id, name)))
-            .collect();
         self.backup_local_layout(pid, &local, remote.updated_at);
+        let remote_key = remote.content_key();
 
         // Light teardown: drop the local views (kill the ssh client / local PTY),
         // but don't mutate the layout or dispose worktrees — we replace wholesale.
@@ -11506,7 +11679,7 @@ impl MuxelApp {
 
         let RemoteLayout {
             layout,
-            mut instances,
+            instances,
             mut worktrees,
             updated_at,
             memory_enabled,
@@ -11520,15 +11693,10 @@ impl MuxelApp {
         {
             project.memory_enabled = enabled;
         }
-        for inst in &mut instances {
-            inst.project_id = pid;
-            // auto_name is local observation state and is excluded from layout
-            // conflict detection. A structural pull must not replace a newer
-            // local observation with stale peer JSON.
-            if let Some(name) = local_auto_names.get(&inst.id) {
-                inst.auto_name = Some(name.clone());
-            }
-        }
+        // What this machine observed of each pane (program title, grid, activity) is
+        // its own; a structural pull must not replace it with the peer's.
+        let mut instances = muxel_core::merge_peer_instances(&local.instances, instances, pid);
+        self.bind_peer_sessions(pid, &mut instances);
         for wt in &mut worktrees {
             wt.project_id = pid;
         }
@@ -11544,12 +11712,7 @@ impl MuxelApp {
             p.layout = layout;
             p.layout_updated_at = Some(updated_at);
         }
-        // Re-seed change detection so the adoption itself isn't seen as a change.
-        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        if let Some(p) = self.workspace.project(pid) {
-            let key = RemoteLayout::capture(p, &self.workspace, now_epoch).content_key();
-            self.layout_keys.insert(pid, key);
-        }
+        self.seed_adopted_layout(pid, remote_key);
         self.active_instance = self
             .workspace
             .project(pid)

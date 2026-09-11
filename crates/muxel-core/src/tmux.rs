@@ -125,6 +125,19 @@ pub fn session_for(recorded: Option<&str>, slug: &str, instance: Uuid) -> String
     }
 }
 
+/// The muxel session running `instance`, found by the `_<uuid8>` suffix every muxel
+/// session name ends with, whichever slug the peer that created it used (its
+/// project name, or its own name for this host). This is how a pane a peer created
+/// without recording a session name gets attached to, rather than launched a
+/// second time beside it. The iOS app resolves panes by the same suffix.
+pub fn session_by_suffix(sessions: &[RemoteSession], instance: Uuid) -> Option<&RemoteSession> {
+    let id = instance.simple().to_string();
+    let suffix = format!("_{}", &id[..8]);
+    sessions
+        .iter()
+        .find(|s| s.name.starts_with(SESSION_PREFIX) && s.name.ends_with(&suffix))
+}
+
 /// Arguments for `tmux …` that start the server *before* any session exists, from a
 /// command line that names no project. Run this once per host before creating the
 /// first session — locally, and on every remote host muxel or the iOS app touches.
@@ -426,5 +439,27 @@ mod tests {
         // client flag has to come before the first command.
         let args = launch_session_args("s", None, Some("claude"), &[]);
         assert_eq!(args.first().map(String::as_str), Some("-u"));
+    }
+
+    #[test]
+    fn session_by_suffix_finds_a_peer_session_whatever_its_slug() {
+        let id = Uuid::parse_str("1a2b3c4d-0000-4000-8000-000000000000").unwrap();
+        let session = |name: &str| RemoteSession {
+            name: name.into(),
+            path: "/work".into(),
+            command: "claude".into(),
+        };
+        // A remote desktop names the session after its host, not the project.
+        let sessions = vec![
+            session("muxel_proj_99999999"),
+            session("muxel_studio_1a2b3c4d"),
+        ];
+        assert_eq!(
+            session_by_suffix(&sessions, id).map(|s| s.name.as_str()),
+            Some("muxel_studio_1a2b3c4d")
+        );
+        // Only muxel's own sessions, and only a whole-id suffix, count.
+        let others = vec![session("work_1a2b3c4d"), session("muxel_p_x1a2b3c4d")];
+        assert!(session_by_suffix(&others, id).is_none());
     }
 }

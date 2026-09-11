@@ -245,6 +245,26 @@ pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::
     )))
 }
 
+/// Every tmux session on this machine, as [`list_remote_tmux_sessions`] reports a
+/// host's. An empty list when no tmux server is running; `None` when tmux couldn't
+/// be run at all.
+pub fn list_local_tmux_sessions() -> Option<Vec<muxel_core::tmux::RemoteSession>> {
+    let out = command("tmux")
+        .args(muxel_core::tmux::list_sessions_args())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        // No server (or no socket yet) is a perfectly good answer: nothing running.
+        let err = String::from_utf8_lossy(&out.stderr);
+        return (err.contains("no server running") || err.contains("error connecting to"))
+            .then(Vec::new);
+    }
+    Some(muxel_core::tmux::parse_sessions(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
 /// Write `content` to a remote file (overwriting), piping it over SSH stdin.
 pub fn write_remote_file(loc: &RepoLoc, abs_path: &str, content: &str) -> Result<()> {
     let RepoLoc::Remote(c) = loc else {

@@ -654,16 +654,23 @@ feature is added or changed, update the matching entry here in the same change**
   still-running agents). muxel pushes the layout as you rearrange panes and, on
   connect, loads whichever copy — local or remote — is newer; the replaced copy is
   kept as a one-level backup on each side. Automatic for every remote project; no
-  setup required. **Renaming a pane** also syncs live between peers: while connected,
-  each side re-reads the shared file every few seconds and adopts a peer's renamed
-  pane label in place (no teardown), so a rename on desktop or iOS shows up on both.
-  (Structural changes — adding/removing panes — still reconcile on the next connect.)
+  setup required. **Changes sync live**: while connected, each side re-reads the
+  shared file every few seconds and applies a peer's changes in place — panes a peer
+  adds appear, attached to their running tmux sessions; panes it closes go away;
+  renames carry over — without restarting any pane both sides share. Only real
+  layout changes are pushed: a pane's size and agent status are per-machine and never
+  trigger one. A failing push is reported once (not on every retry) and retried in
+  the background.
 - **Shareable local projects** — a *local* project also mirrors its layout to
   `<root>/.muxel/workspace.json` (and git-ignores `.muxel/`) when tmux mode is on,
   so its panes are tmux sessions a peer can attach to. The iOS companion app can
   then SSH into the machine, read that file, and bring up / drive the same panes —
   the desktop didn't need to be opened as a "remote" project. The shared
   `tmux_session` name keeps a pane addressing the same session from either side.
+  Panes a peer creates over SSH — the iOS app, or muxel on another machine that
+  opened this one as a remote project — show up in the local window within a few
+  seconds, attached to the peer's tmux session (found by the pane id at the end of
+  the session name when the peer didn't record one).
 - **Reconnect on failure** — when a remote project's SSH connection fails (or
   drops), the pane area shows the error with **Reconnect** (re-runs the connect
   pre-flight, re-syncs the layout, respawns panes) and **Scan for projects**
