@@ -5022,8 +5022,9 @@ impl MuxelApp {
         self.install_terminal_spawn(meta, result, window, cx);
     }
 
-    fn mark_terminal_session_started(&mut self, instance_id: Uuid) -> bool {
-        let resume_capable = self.workspace.instance(instance_id).is_some_and(|inst| {
+    /// Whether `iid` runs a preset that can reopen its conversation (`resume_flag`).
+    fn resume_capable(&self, iid: Uuid) -> bool {
+        self.workspace.instance(iid).is_some_and(|inst| {
             inst.preset_id
                 .and_then(|id| self.presets.iter().find(|preset| preset.id == id))
                 .or_else(|| {
@@ -5032,8 +5033,11 @@ impl MuxelApp {
                         .find(|preset| preset.name == inst.preset)
                 })
                 .is_some_and(|preset| preset.resume_flag.is_some())
-        });
-        if resume_capable
+        })
+    }
+
+    fn mark_terminal_session_started(&mut self, instance_id: Uuid) -> bool {
+        if self.resume_capable(instance_id)
             && let Some(inst) = self.workspace.instance_mut(instance_id)
             && !inst.session_started
         {
@@ -13819,28 +13823,91 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Whether the active pane is a code editor (not an agent/terminal). Uses
-    /// the persisted instance kind (authoritative), not the live `editors` map.
-    fn active_is_editor(&self) -> bool {
+    /// Whether the active pane runs a process (an agent/terminal, not an editor,
+    /// diff or browser). Uses the persisted instance kind (authoritative), not the
+    /// live `terminals` map — a tombstoned or failed pane still counts.
+    fn active_is_terminal(&self) -> bool {
         self.active_instance
             .and_then(|iid| self.workspace.instance(iid))
-            .map(|i| i.kind == InstanceKind::Editor)
-            .unwrap_or(false)
+            .is_some_and(|i| i.kind == InstanceKind::Terminal)
     }
 
     fn restart_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active) = self.active_instance else {
+        if let Some(active) = self.active_instance {
+            self.restart_agent(active, window, cx);
+        }
+    }
+
+    /// Restart a terminal pane (toolbar Restart, palette, tab menu): stop its
+    /// process *and* its tmux session — a plain respawn would just reattach to the
+    /// old process — then relaunch, so `new-session -A` starts a fresh session and
+    /// a resume-capable agent comes back on its saved conversation (e.g. to pick
+    /// up an updated harness binary). Other programs (shells, …) start over.
+    fn restart_agent(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(inst) = self.workspace.instance(iid) else {
             return;
         };
-        // Editors have no process to restart (restarting would spawn a shell).
-        if self.workspace.instance(active).map(|i| i.kind) == Some(InstanceKind::Editor) {
+        // Editors, diffs and browsers have no process (respawning would put a
+        // shell over them).
+        if inst.kind != InstanceKind::Terminal {
             return;
         }
-        if let Some(view) = self.terminals.remove(&active) {
+        let recorded_session = inst.tmux_session.clone();
+        let use_tmux = inst.use_tmux;
+        muxel_store::append_event_log(&format!("restart: \"{}\" [{iid}]", inst.display_name()));
+        self.terminal_launching.remove(&iid);
+        self.failed_launches.remove(&iid);
+        if let Some(view) = self.terminals.remove(&iid) {
             view.read(cx).session().kill();
         }
-        self.spawn_terminal(active, window, cx);
-        self.focus_instance(active, window, cx);
+        // Same session resolution as closing a pane (`teardown_closed_instance`).
+        let remote_host = self
+            .remote_host_for_instance(iid)
+            .filter(|host| host.default_use_tmux || use_tmux);
+        let Some(host) = remote_host else {
+            if let Some(session) = recorded_session {
+                integrations::kill_tmux_session(&session);
+            }
+            self.spawn_terminal(iid, window, cx);
+            self.focus_instance(iid, window, cx);
+            cx.notify();
+            return;
+        };
+        // The session lives on the host: respawn only once it is gone, or
+        // `new-session -A` would reattach the old agent.
+        let session = muxel_core::tmux::session_for(recorded_session.as_deref(), &host.name, iid);
+        let control_path = Self::control_path_for(host.id);
+        let password = (host.auth == SshAuth::Password)
+            .then(|| self.remote_password(&host))
+            .flatten();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .spawn(async move {
+                    integrations::kill_remote_tmux(
+                        &host,
+                        &control_path,
+                        password.as_deref(),
+                        &session,
+                    );
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.workspace.instance(iid).is_none() {
+                    return; // closed while the kill was in flight
+                }
+                // A project restore may have reattached the old session meanwhile.
+                if let Some(view) = this.terminals.remove(&iid) {
+                    view.read(cx).session().kill();
+                }
+                this.spawn_terminal(iid, window, cx);
+                if this.active_instance == Some(iid) {
+                    this.focus_instance(iid, window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        self.focus_instance(iid, window, cx);
         cx.notify();
     }
 
@@ -16357,6 +16424,7 @@ impl MuxelApp {
                         let tab_wt_id = self.workspace.instance(tab).and_then(|i| i.worktree_id);
                         let tab_is_terminal = self.workspace.instance(tab).map(|i| i.kind)
                             == Some(InstanceKind::Terminal);
+                        let tab_resumable = tab_is_terminal && self.resume_capable(tab);
                         let tab_pinned = self
                             .workspace
                             .instance(tab)
@@ -16507,6 +16575,22 @@ impl MuxelApp {
                                                     move |this, _, _w, cx| this.toggle_pin(tab, cx),
                                                 )),
                                         );
+                                    // Relaunch on the saved conversation (resume-capable
+                                    // agents only), e.g. after the harness updates.
+                                    let menu = if tab_resumable {
+                                        menu.item(
+                                            PopupMenuItem::new(t("Restart agent"))
+                                                .icon(IconName::Play)
+                                                .on_click(window.listener_for(
+                                                    &entity,
+                                                    move |this, _, window, cx| {
+                                                        this.restart_agent(tab, window, cx)
+                                                    },
+                                                )),
+                                        )
+                                    } else {
+                                        menu
+                                    };
                                     // Clear scrollback (terminals only).
                                     let menu = if tab_is_terminal {
                                         menu.item(
@@ -19159,7 +19243,7 @@ impl MuxelApp {
                 Button::new("restart")
                     .ghost()
                     .icon(IconName::Play)
-                    .disabled(self.active_is_editor())
+                    .disabled(!self.active_is_terminal())
                     .tooltip(t("Restart agent"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.restart_active(window, cx))),
             )

@@ -51,10 +51,16 @@ feature is added or changed, update the matching entry here in the same change**
   panes, or drop at a precise insertion point.
 - **Pinned tabs** — pin a tab to the leftmost block; pins behave fluidly when
   dragged past unpinned tabs.
-- **Tab context menu** — right-click a tab to Rename, Duplicate, Pin/Unpin, Close
-  tabs to the left / right, Close others, or Close. Duplicate clears copied
-  conversation state so a harness can mint a new session instead of deliberately
-  resuming the source.
+- **Tab context menu** — right-click a tab to Rename, Duplicate, Pin/Unpin, Restart
+  agent, Close tabs to the left / right, Close others, or Close. Duplicate clears
+  copied conversation state so a harness can mint a new session instead of
+  deliberately resuming the source. **Restart agent** (resume-capable agents only)
+  does what the toolbar Restart does for that tab.
+- **Restart** — the toolbar Restart (also the tab menu's *Restart agent* and the
+  palette's *Restart agent*) stops the pane's process *and* its tmux session,
+  local or remote, then relaunches in place in a fresh session. A resume-capable
+  agent comes back on its saved conversation, so an updated harness binary takes
+  effect without losing it; a shell or other program starts over.
 - **Tab cycling** — keyboard shortcuts cycle to the next/previous tab.
 
 ## Pop-out windows
@@ -430,7 +436,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Crash tombstones** — a pane whose process dies abnormally (non-zero exit, or
   the PTY failing outright) is never auto-closed: it keeps its final screen under
   a "process exited — code N" banner, fires an error in the NOTIFICATIONS feed
-  (plus a desktop notification when unattended), and Restart relaunches in place.
+  (plus a desktop notification when unattended), and Restart relaunches in place
+  (resuming a resume-capable agent's conversation).
   Only a clean exit (code 0) qualifies for auto-close. A process that was *killed*
   is named as such — "process killed — signal Hangup/Killed/Terminated" — instead
   of being reported as a crash, since the OS gives a signalled child no exit code
