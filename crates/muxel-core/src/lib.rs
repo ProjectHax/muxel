@@ -12,12 +12,14 @@ mod gui_path;
 pub mod locale;
 pub mod memory;
 mod pane;
+pub mod remote_ops;
 mod shell;
 pub mod ssh;
 pub mod stt;
 pub mod tmux;
 pub mod tts;
 pub mod url;
+pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
@@ -712,6 +714,31 @@ pub enum SshAuth {
     Password,
 }
 
+/// The operating system on the far side of an SSH connection.
+///
+/// muxel builds every remote command as a shell line, and the two families share
+/// no vocabulary: `test -f` against `Test-Path`, `mkdir -p` against `New-Item`,
+/// POSIX single-quoting against PowerShell's. A host therefore has to say which
+/// it is — there is no probe cheap or reliable enough to do it per command, and
+/// guessing wrong produces confusing half-failures rather than a clean error.
+///
+/// `Unix` is the default and the serde fallback, so every host saved before this
+/// existed keeps its exact current behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteOs {
+    /// Linux, macOS, BSD — anything with a POSIX shell.
+    #[default]
+    Unix,
+    /// Windows reached through its OpenSSH server.
+    Windows,
+}
+
+impl RemoteOs {
+    pub fn is_windows(self) -> bool {
+        self == RemoteOs::Windows
+    }
+}
+
 /// A saved SSH remote host: connection settings for remote development. The
 /// password (when `auth == Password`) is stored in the OS keychain keyed by `id`,
 /// never in this struct.
@@ -756,9 +783,18 @@ pub struct RemoteHost {
     /// Extra raw `-o KEY=VALUE` ssh options.
     #[serde(default)]
     pub extra_options: Vec<String>,
-    /// Default new remote panes here to a persistent tmux session.
+    /// Default new remote panes here to a persistent tmux session. Ignored for
+    /// [`RemoteOs::Windows`] hosts, which have no tmux — see [`Self::use_tmux`].
     #[serde(default = "default_true")]
     pub default_use_tmux: bool,
+    /// Which OS is on the far side. Decides the entire remote command vocabulary.
+    #[serde(default)]
+    pub os: RemoteOs,
+    /// Shell an interactive pane runs on a Windows host. Unused when `os` is Unix
+    /// (that side asks the host for `$SHELL`), and never used for muxel's own
+    /// commands, which always go through `powershell.exe`.
+    #[serde(default)]
+    pub windows_shell: crate::winshell::WindowsShell,
 }
 
 impl RemoteHost {
@@ -777,6 +813,8 @@ impl RemoteHost {
             strict_host_key: String::new(),
             keepalive_secs: None,
             compression: false,
+            os: RemoteOs::default(),
+            windows_shell: crate::winshell::WindowsShell::default(),
             extra_options: Vec::new(),
             default_use_tmux: true,
         }
@@ -788,6 +826,18 @@ impl RemoteHost {
     /// fields are used unchanged. `id`, `identity_id`, and every transport field
     /// (port, jump, keepalive, extra options, …) are preserved — so the argv builders
     /// in [`crate::ssh`] and the per-host ControlMaster socket keep working verbatim.
+    /// Whether a pane on this host should run inside tmux, given the instance's
+    /// own preference.
+    ///
+    /// The single gate for the decision, because Windows has no tmux and a stray
+    /// `true` there produces a pane that dies on `tmux: command not found`. A
+    /// host saved as Unix with tmux on and later switched to Windows keeps that
+    /// stale `true` on disk, and an `Instance` carries its own flag as well — so
+    /// this answers for both rather than trusting either.
+    pub fn use_tmux(&self, instance_prefers: bool) -> bool {
+        !self.os.is_windows() && (self.default_use_tmux || instance_prefers)
+    }
+
     pub fn effective(&self, identities: &[Identity]) -> RemoteHost {
         let mut h = self.clone();
         if let Some(iid) = self.identity_id
@@ -3071,7 +3121,7 @@ mod project_order_tests {
 
 #[cfg(test)]
 mod identity_tests {
-    use super::{Identity, RemoteHost, SshAuth};
+    use super::{Identity, RemoteHost, RemoteOs, SshAuth};
     use std::path::PathBuf;
 
     fn host_referencing(id: uuid::Uuid) -> RemoteHost {
@@ -3090,6 +3140,45 @@ mod identity_tests {
         i.auth = SshAuth::Key;
         i.identity_file = Some(PathBuf::from("/keys/id_ed25519"));
         i
+    }
+
+    /// A host saved before Windows support existed must load as Unix and keep
+    /// its exact behavior — the back-compat rule for every persisted struct.
+    #[test]
+    fn host_saved_without_an_os_field_loads_as_unix() {
+        let json = r#"{
+            "id": "11111111-1111-4111-8111-111111111111",
+            "name": "dev",
+            "hostname": "example.com",
+            "user": "ryan",
+            "auth": "Agent",
+            "default_use_tmux": true
+        }"#;
+        let h: RemoteHost = serde_json::from_str(json).unwrap();
+        assert_eq!(h.os, RemoteOs::Unix);
+        assert_eq!(h.windows_shell, crate::winshell::WindowsShell::PowerShell);
+        // And the tmux decision it had before is untouched.
+        assert!(h.use_tmux(false));
+    }
+
+    #[test]
+    fn host_os_round_trips() {
+        let mut h = RemoteHost::new("win", "win.example.com");
+        h.os = RemoteOs::Windows;
+        h.windows_shell = crate::winshell::WindowsShell::Pwsh;
+        let back: RemoteHost = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        assert_eq!(back.os, RemoteOs::Windows);
+        assert_eq!(back.windows_shell, crate::winshell::WindowsShell::Pwsh);
+    }
+
+    /// Switching a host to Windows must not have to also clear `default_use_tmux`
+    /// — the gate answers for the stale value.
+    #[test]
+    fn windows_host_ignores_a_stale_saved_tmux_preference() {
+        let mut h = RemoteHost::new("win", "w");
+        h.default_use_tmux = true;
+        h.os = RemoteOs::Windows;
+        assert!(!h.use_tmux(true));
     }
 
     #[test]

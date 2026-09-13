@@ -5046,6 +5046,7 @@ dependencies = [
 name = "muxel-core"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "uuid",

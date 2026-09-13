@@ -4,7 +4,9 @@
 use crate::i18n::{t, tf};
 use anyhow::{Context, Result, bail};
 use muxel_core::memory::{self, MemoryEntry};
-use muxel_core::{MEMORY_DIR, MEMORY_FILE, RemoteHost, SshAuth, memory_header, ssh};
+use muxel_core::{
+    MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth, memory_header, remote_ops, ssh,
+};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -158,11 +160,7 @@ fn git_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Out
     match loc {
         RepoLoc::Local(path) => command("git").arg("-C").arg(path).args(args).output(),
         RepoLoc::Remote(c) => {
-            let mut remote = format!("git -C {}", ssh::sh_quote(&c.remote_path));
-            for a in args {
-                remote.push(' ');
-                remote.push_str(&ssh::sh_quote(a));
-            }
+            let remote = remote_ops::git(c.host.os, &c.remote_path, args);
             remote_ssh_command(c, remote).output()
         }
     }
@@ -179,14 +177,10 @@ pub fn list_remote_files(loc: &RepoLoc) -> Vec<String> {
         return Vec::new();
     };
     let root = c.remote_path.trim_end_matches('/');
-    let q = ssh::sh_quote(root);
     // Same cap as the local walk: the old 10k quietly cut large trees off, and a
     // folder whose files all fell past the cut just vanished from the browser.
     let cap = crate::app::MAX_PROJECT_FILES;
-    let cmd = format!(
-        "cd {q} && (git ls-files --cached --others --exclude-standard 2>/dev/null \
-         || find . -type f -not -path '*/.git/*') | head -n {cap}"
-    );
+    let cmd = remote_ops::list_files(c.host.os, root, cap);
     let Ok(out) = remote_ssh_command(c, cmd).output() else {
         return Vec::new();
     };
@@ -207,10 +201,8 @@ pub fn read_remote_file(loc: &RepoLoc, abs_path: &str) -> Option<String> {
     let RepoLoc::Remote(c) = loc else {
         return None;
     };
-    let p = ssh::sh_quote(abs_path);
-    // Only cat when it's a regular file within the size cap.
-    let cmd =
-        format!("if [ -f {p} ] && [ \"$(wc -c < {p})\" -le {MAX_REMOTE_BYTES} ]; then cat {p}; fi");
+    // Only read when it's a regular file within the size cap.
+    let cmd = remote_ops::read_file(c.host.os, abs_path, MAX_REMOTE_BYTES);
     let out = remote_ssh_command(c, cmd).output().ok()?;
     out.status
         .success()
@@ -225,6 +217,12 @@ pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::
     let RepoLoc::Remote(c) = loc else {
         return None;
     };
+    if c.host.os.is_windows() {
+        // No tmux on Windows, so there is nothing to adopt. `Some(empty)` rather
+        // than `None`: the host is reachable and genuinely has no sessions, and
+        // `None` would read as "couldn't reach it" and strand the UI in a retry.
+        return Some(Vec::new());
+    }
     let args = muxel_core::tmux::list_sessions_args();
     // `tmux` is not on sshd's bare default PATH when it came from Homebrew — see
     // `ssh::tmux_path_prelude`. Unresolved, this reads as "no sessions on the host"
@@ -271,7 +269,7 @@ pub fn write_remote_file(loc: &RepoLoc, abs_path: &str, content: &str) -> Result
         bail!("not a remote file");
     };
     use std::io::Write;
-    let cmd = format!("cat > {}", ssh::sh_quote(abs_path));
+    let cmd = remote_ops::write_file(c.host.os, abs_path);
     let mut command = remote_ssh_command(c, cmd);
     command
         .stdin(std::process::Stdio::piped())
@@ -335,14 +333,13 @@ pub fn ensure_memory_file(loc: &RepoLoc) -> Result<()> {
         RepoLoc::Remote(c) => {
             let root = c.remote_path.trim_end_matches('/');
             let file = format!("{MEMORY_DIR}/{MEMORY_FILE}");
-            let cmd = format!(
-                "cd {root} && mkdir -p {dir} && {{ test -f {file} || printf '%s' {hdr} > {file}; }} \
-                 && {{ grep -qxF {ign} .gitignore 2>/dev/null || printf '%s\\n' {ign} >> .gitignore; }}",
-                root = ssh::sh_quote(root),
-                dir = ssh::sh_quote(MEMORY_DIR),
-                file = ssh::sh_quote(&file),
-                hdr = ssh::sh_quote(memory_header()),
-                ign = ssh::sh_quote(&ignore_line),
+            let cmd = remote_ops::ensure_seeded_file(
+                c.host.os,
+                root,
+                MEMORY_DIR,
+                &file,
+                memory_header(),
+                &ignore_line,
             );
             let out = remote_ssh_command(c, cmd)
                 .output()
@@ -403,7 +400,7 @@ pub fn memory_file_exists(loc: &RepoLoc) -> bool {
     match loc {
         RepoLoc::Local(root) => root.join(MEMORY_DIR).join(MEMORY_FILE).is_file(),
         RepoLoc::Remote(c) => {
-            let cmd = format!("test -f {}", ssh::sh_quote(&memory_abs(loc)));
+            let cmd = remote_ops::test_file(c.host.os, &memory_abs(loc));
             remote_ssh_command(c, cmd)
                 .output()
                 .is_ok_and(|o| o.status.success())
@@ -462,19 +459,11 @@ fn push_local_layout(root: &Path, json: &str) -> Result<()> {
 /// `<root>/.muxel/` exists, back up any current `workspace.json` to
 /// `workspace.bak.json`, and git-ignore `.muxel/`. Pure (no I/O) so its shape is
 /// unit-testable; mirrors `ensure_memory_file`'s remote branch.
-fn remote_push_prep_cmd(root: &str) -> String {
+fn remote_push_prep_cmd(os: RemoteOs, root: &str) -> String {
     let rel = format!("{MEMORY_DIR}/{REMOTE_LAYOUT_FILE}");
     let bak = format!("{MEMORY_DIR}/{REMOTE_LAYOUT_BAK}");
     let ignore_line = format!("{MEMORY_DIR}/");
-    format!(
-        "cd {root} && mkdir -p {dir} && {{ test -f {rel} && cp -f {rel} {bak} || true; }} \
-         && {{ grep -qxF {ign} .gitignore 2>/dev/null || printf '%s\\n' {ign} >> .gitignore; }}",
-        root = ssh::sh_quote(root.trim_end_matches('/')),
-        dir = ssh::sh_quote(MEMORY_DIR),
-        rel = ssh::sh_quote(&rel),
-        bak = ssh::sh_quote(&bak),
-        ign = ssh::sh_quote(&ignore_line),
-    )
+    remote_ops::push_prep(os, root, MEMORY_DIR, &rel, &bak, &ignore_line)
 }
 
 /// Read a project's synced layout JSON (`<root>/.muxel/workspace.json`) — over SSH
@@ -503,7 +492,7 @@ pub fn push_remote_layout(loc: &RepoLoc, json: &str) -> Result<()> {
         RepoLoc::Local(root) => return push_local_layout(root, json),
     };
     let root = c.remote_path.trim_end_matches('/');
-    let out = remote_ssh_command(c, remote_push_prep_cmd(root))
+    let out = remote_ssh_command(c, remote_push_prep_cmd(c.host.os, root))
         .output()
         .map_err(|e| ssh_spawn_error(c.host.auth, e))?;
     if !out.status.success() {
@@ -637,11 +626,21 @@ pub fn scan_remote_projects(
     password: Option<&str>,
 ) -> Result<Vec<String>> {
     const MARKER: &str = "/.muxel/workspace.json";
-    let cmd = format!(
-        "find \"$HOME\" -maxdepth 7 \\( -name node_modules -o -name .git -o -name .cache \
-         -o -name .cargo -o -name .rustup -o -name .npm -o -name target -o -name vendor \
-         -o -name Library -o -name .Trash \\) -prune -o -type f -path '*{MARKER}' -print 2>/dev/null"
-    );
+    /// Directories never worth descending into, on either OS: big, and never a
+    /// project root muxel put a marker in.
+    const PRUNE: &[&str] = &[
+        "node_modules",
+        ".git",
+        ".cache",
+        ".cargo",
+        ".rustup",
+        ".npm",
+        "target",
+        "vendor",
+        "Library",
+        ".Trash",
+    ];
+    let cmd = remote_ops::scan_projects(host.os, MARKER, 7, PRUNE);
     let out = ssh_run(host, control_path, password, &cmd)?;
     if !out.status.success() && is_ssh_transport_failure(host.auth, out.status.code()) {
         bail!("{}", ssh_error_message(&out));
@@ -743,7 +742,7 @@ pub fn ssh_test_dir(
         host,
         control_path,
         password,
-        &format!("test -d {}", ssh::sh_quote(dir)),
+        &remote_ops::test_dir(host.os, dir),
     )?;
     if out.status.success() {
         return Ok(());
@@ -1707,7 +1706,7 @@ mod tests {
     #[test]
     fn remote_push_prep_cmd_backs_up_and_gitignores() {
         // `sh_quote` leaves quote-safe tokens (paths, `.muxel/`) bare.
-        let cmd = remote_push_prep_cmd("/srv/app/");
+        let cmd = remote_push_prep_cmd(RemoteOs::Unix, "/srv/app/");
         // cd into the (trailing-slash-trimmed) root and create the dir.
         assert!(cmd.contains("cd /srv/app "), "cd into root: {cmd}");
         assert!(cmd.contains("mkdir -p .muxel "), "make .muxel: {cmd}");
@@ -1722,6 +1721,24 @@ mod tests {
             "gitignore: {cmd}"
         );
         assert!(cmd.contains(">> .gitignore"), "appends ignore: {cmd}");
+    }
+
+    /// The same preparation on a Windows host goes out as one opaque encoded
+    /// command, so the far side's `DefaultShell` cannot reinterpret any of it.
+    #[test]
+    fn remote_push_prep_cmd_is_encoded_for_windows() {
+        let cmd = remote_push_prep_cmd(RemoteOs::Windows, "C:/src/app/");
+        assert!(
+            cmd.starts_with("powershell.exe -NoProfile -NonInteractive -EncodedCommand "),
+            "{cmd}"
+        );
+        let payload = cmd.rsplit(' ').next().unwrap();
+        assert!(
+            payload
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+            "payload is not bare base64: {payload}"
+        );
     }
 
     #[test]

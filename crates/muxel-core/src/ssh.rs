@@ -9,7 +9,8 @@
 //! ControlMaster socket so repeated connections (the pane plus every git call)
 //! reuse one authenticated connection.
 
-use crate::{RemoteHost, SshAuth};
+use crate::winshell::{self, WindowsShell};
+use crate::{RemoteHost, RemoteOs, SshAuth};
 
 /// POSIX single-quote `s` for safe embedding in a remote shell command. Tokens
 /// made only of safe characters are left bare (readability + test clarity).
@@ -414,8 +415,98 @@ fn login_shell_command(program: &str, args: &[String]) -> String {
     format!("\"${{SHELL:-/bin/sh}}\" -ilc {}", sh_quote(&inner))
 }
 
+/// The remote command a pane runs on a **Windows** host.
+///
+/// No tmux branch: Windows has none, so a pane here is exactly as durable as its
+/// SSH connection. The caller has already decided that — see
+/// [`RemoteHost::use_tmux`] — but this ignores `spec.use_tmux` outright rather
+/// than trusting it, because a stale `true` would otherwise produce a pane that
+/// dies on `tmux: command not found`.
+///
+/// Unlike muxel's own commands (see [`crate::winshell`]), this deliberately does
+/// **not** pass `-NoProfile`: an interactive pane needs the user's real `PATH`,
+/// or an agent installed by npm/winget is not on it. That is the same reason
+/// [`login_shell_command`] uses `-ilc` on Unix.
+///
+/// A shell pane keeps the session open (`-NoExit` / `cmd /K`). A program pane
+/// does not, so the pane ends when the agent ends — matching the Unix `exec`.
+fn windows_remote_command(spec: &SshSpec) -> String {
+    let shell = spec.host.windows_shell;
+    if shell == WindowsShell::Cmd {
+        return cmd_remote_command(spec);
+    }
+
+    // PowerShell. The whole script is base64'd below, so nothing here has to
+    // survive the outer shell's parsing — see `crate::winshell`.
+    let mut script = String::new();
+    if let Some(cwd) = spec.remote_cwd {
+        // -LiteralPath, because a project directory containing `[` or `]` is a
+        // wildcard to -Path and would not be found.
+        script.push_str(&format!(
+            "Set-Location -LiteralPath {}",
+            winshell::ps_quote(cwd)
+        ));
+    }
+    if let Some(program) = spec.program {
+        if !script.is_empty() {
+            script.push_str("; ");
+        }
+        // `&` is the call operator: it runs the command a string names, where a
+        // bare `'claude'` would just echo the word.
+        script.push_str(&format!("& {}", winshell::ps_quote(program)));
+        for a in spec.args {
+            script.push(' ');
+            script.push_str(&winshell::ps_quote(a));
+        }
+    }
+
+    let mut argv = vec![shell.exe().to_string(), "-NoLogo".to_string()];
+    if spec.program.is_none() {
+        // No program: the interactive prompt *is* the pane, so keep it alive
+        // after the Set-Location runs.
+        argv.push("-NoExit".to_string());
+    }
+    if !script.is_empty() {
+        argv.push("-EncodedCommand".to_string());
+        argv.push(winshell::encoded_command(&script));
+    }
+    argv.join(" ")
+}
+
+/// The `cmd.exe` form of [`windows_remote_command`].
+///
+/// cmd has no scripting worth the trouble and no way to quote that survives
+/// nesting, so muxel keeps this minimal and offers PowerShell as the default.
+/// `cd /d` rather than a bare `cd`, which silently does nothing across drives.
+fn cmd_remote_command(spec: &SshSpec) -> String {
+    let mut inner = String::new();
+    if let Some(cwd) = spec.remote_cwd {
+        inner.push_str(&format!("cd /d {cwd}"));
+    }
+    if let Some(program) = spec.program {
+        if !inner.is_empty() {
+            inner.push_str(" && ");
+        }
+        inner.push_str(program);
+        for a in spec.args {
+            inner.push(' ');
+            inner.push_str(a);
+        }
+    }
+    if inner.is_empty() {
+        return "cmd.exe".to_string();
+    }
+    // /K keeps an interactive session open; /C ends with the program, matching
+    // the Unix `exec`.
+    let flag = if spec.program.is_some() { "/C" } else { "/K" };
+    format!("cmd.exe {flag} {inner}")
+}
+
 /// The remote command string a pane runs (the single argument after `--`).
 fn remote_command(spec: &SshSpec) -> String {
+    if spec.host.os == RemoteOs::Windows {
+        return windows_remote_command(spec);
+    }
     if spec.use_tmux {
         // `tmux new-session -A` attaches if the session exists, so a reconnect
         // resumes the running agent. Reuse the local tmux arg builder, run remote.
@@ -482,11 +573,169 @@ pub fn ssh_args(spec: &SshSpec) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RemoteHost;
+    use crate::winshell::WindowsShell;
+    use crate::{RemoteHost, RemoteOs};
     use std::path::PathBuf;
 
     fn host() -> RemoteHost {
         RemoteHost::new("dev", "example.com")
+    }
+
+    fn win_host() -> RemoteHost {
+        let mut h = RemoteHost::new("win", "win.example.com");
+        h.os = RemoteOs::Windows;
+        h
+    }
+
+    fn decode_encoded(cmd: &str) -> String {
+        use base64::Engine as _;
+        let b64 = cmd.rsplit(' ').next().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16(&units).unwrap()
+    }
+
+    /// The regression that matters most: a host flipped to Windows still carries
+    /// whatever `use_tmux` it was saved with, and an `Instance` carries its own.
+    /// Neither may put `tmux` on a Windows command line — the pane would die on
+    /// `tmux: command not found`.
+    #[test]
+    fn windows_pane_never_uses_tmux_even_when_asked() {
+        let h = win_host();
+        for (use_tmux, session) in [(true, Some("muxel-proj-1")), (false, None)] {
+            let cmd = remote_command(&SshSpec {
+                host: &h,
+                control_path: "/s",
+                remote_cwd: Some("C:/src/app"),
+                program: Some("claude"),
+                args: &[],
+                use_tmux,
+                tmux_session: session,
+            });
+            assert!(
+                !cmd.contains("tmux"),
+                "tmux leaked into a Windows pane: {cmd}"
+            );
+        }
+    }
+
+    /// And the host-level gate agrees, whatever the instance wants.
+    #[test]
+    fn use_tmux_gate_is_false_for_windows_and_unchanged_for_unix() {
+        let mut w = win_host();
+        w.default_use_tmux = true;
+        assert!(!w.use_tmux(true));
+        assert!(!w.use_tmux(false));
+
+        let mut u = host();
+        u.default_use_tmux = false;
+        assert!(u.use_tmux(true), "instance preference still counts on Unix");
+        assert!(!u.use_tmux(false));
+        u.default_use_tmux = true;
+        assert!(u.use_tmux(false), "host default still counts on Unix");
+    }
+
+    #[test]
+    fn windows_shell_pane_sets_cwd_and_stays_open() {
+        let cmd = remote_command(&SshSpec {
+            host: &win_host(),
+            control_path: "/s",
+            remote_cwd: Some(r"C:\src\my app"),
+            program: None,
+            args: &[],
+            use_tmux: false,
+            tmux_session: None,
+        });
+        assert!(cmd.starts_with("powershell.exe -NoLogo -NoExit -EncodedCommand "));
+        let script = decode_encoded(&cmd);
+        assert_eq!(script, r"Set-Location -LiteralPath 'C:\src\my app'");
+    }
+
+    /// A program pane must end with its program, the way the Unix `exec` does —
+    /// so no `-NoExit`.
+    #[test]
+    fn windows_program_pane_ends_with_the_program() {
+        let cmd = remote_command(&SshSpec {
+            host: &win_host(),
+            control_path: "/s",
+            remote_cwd: Some("C:/src/app"),
+            program: Some("claude"),
+            args: &["--model".to_string(), "be terse".to_string()],
+            use_tmux: false,
+            tmux_session: None,
+        });
+        assert!(!cmd.contains("-NoExit"), "{cmd}");
+        let script = decode_encoded(&cmd);
+        assert_eq!(
+            script,
+            "Set-Location -LiteralPath 'C:/src/app'; & 'claude' '--model' 'be terse'"
+        );
+    }
+
+    /// An interactive pane must load the user's profile, or an agent installed by
+    /// npm/winget is not on PATH — the Windows twin of `login_shell_command`'s
+    /// `-ilc`. muxel's *own* commands are the opposite and pass `-NoProfile`.
+    #[test]
+    fn windows_pane_loads_the_user_profile() {
+        let cmd = remote_command(&SshSpec {
+            host: &win_host(),
+            control_path: "/s",
+            remote_cwd: None,
+            program: Some("claude"),
+            args: &[],
+            use_tmux: false,
+            tmux_session: None,
+        });
+        assert!(!cmd.contains("-NoProfile"), "{cmd}");
+    }
+
+    #[test]
+    fn windows_cmd_shell_uses_cd_slash_d() {
+        let mut h = win_host();
+        h.windows_shell = WindowsShell::Cmd;
+        let shell = remote_command(&SshSpec {
+            host: &h,
+            control_path: "/s",
+            remote_cwd: Some(r"D:\work"),
+            program: None,
+            args: &[],
+            use_tmux: false,
+            tmux_session: None,
+        });
+        // A bare `cd` does not change drive on Windows.
+        assert_eq!(shell, r"cmd.exe /K cd /d D:\work");
+
+        let prog = remote_command(&SshSpec {
+            host: &h,
+            control_path: "/s",
+            remote_cwd: Some(r"D:\work"),
+            program: Some("claude"),
+            args: &[],
+            use_tmux: false,
+            tmux_session: None,
+        });
+        assert!(prog.starts_with("cmd.exe /C "), "{prog}");
+    }
+
+    #[test]
+    fn unix_pane_command_is_unchanged_by_the_windows_branch() {
+        // The existing Unix shape, asserted verbatim: adding Windows must not
+        // have moved anything on the side every current host uses.
+        let cmd = remote_command(&SshSpec {
+            host: &host(),
+            control_path: "/s",
+            remote_cwd: Some("/srv/app"),
+            program: None,
+            args: &[],
+            use_tmux: false,
+            tmux_session: None,
+        });
+        assert_eq!(cmd, "cd /srv/app && exec ${SHELL:-/bin/sh} -l");
     }
 
     #[test]

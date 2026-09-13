@@ -184,6 +184,11 @@ pub struct SettingsUi {
     pub s_forward_agent: bool,
     pub s_compression: bool,
     pub s_use_tmux: bool,
+    /// Which OS the selected host runs — decides the whole remote command
+    /// vocabulary, and whether the tmux row is offered at all.
+    pub s_remote_os: muxel_core::RemoteOs,
+    /// Shell an interactive pane runs on a Windows host.
+    pub s_windows_shell: muxel_core::winshell::WindowsShell,
     pub s_name: Entity<InputState>,
     pub s_host: Entity<InputState>,
     pub s_port: Entity<InputState>,
@@ -312,6 +317,8 @@ impl SettingsUi {
             s_forward_agent: false,
             s_compression: false,
             s_use_tmux: true,
+            s_remote_os: muxel_core::RemoteOs::default(),
+            s_windows_shell: muxel_core::winshell::WindowsShell::default(),
             s_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
             s_host: cx.new(|cx| {
                 InputState::new(window, cx)

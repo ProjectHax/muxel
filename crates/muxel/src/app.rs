@@ -23,17 +23,18 @@ use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
 use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
 use muxel_core::memory::{self, MemoryEntry};
+use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity, InjectionMode, Instance,
     InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project,
-    RemoteHost, RemoteLayout, RemoteRef, ResolvedLaunch, Runner, Snippet, SplitDirection, SshAuth,
-    StartupAgent, Workspace, WorkspaceMeta, WorkspacesIndex, Worktree, add_tab, add_tab_at,
-    agent_activity_label, append_agent_instruction, codex_developer_instructions_override,
-    file_link_instruction, focus_in_direction, memory_instruction, memory_reference,
-    migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove,
-    resolve_launch_for_session, set_active_tab, set_split_sizes, set_tab_order, split,
-    split_beside, ssh, swap_instances, swap_panes, sync_agent_injection_modes,
-    sync_codex_approval_args,
+    RemoteHost, RemoteLayout, RemoteOs, RemoteRef, ResolvedLaunch, Runner, Snippet, SplitDirection,
+    SshAuth, StartupAgent, Workspace, WorkspaceMeta, WorkspacesIndex, Worktree, add_tab,
+    add_tab_at, agent_activity_label, append_agent_instruction,
+    codex_developer_instructions_override, file_link_instruction, focus_in_direction,
+    memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
+    move_pane_beside, move_tab_to, remove, resolve_launch_for_session, set_active_tab,
+    set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
+    sync_agent_injection_modes, sync_codex_approval_args,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
@@ -4566,7 +4567,9 @@ impl MuxelApp {
         resolved: &ResolvedLaunch,
     ) -> (String, Vec<String>, Vec<(String, String)>) {
         let control_path = Self::control_path_for(host.id);
-        let use_tmux = host.default_use_tmux || inst.is_some_and(|i| i.use_tmux);
+        // `RemoteHost::use_tmux` is the single gate: it also answers "never" for a
+        // Windows host, which has no tmux to attach to.
+        let use_tmux = host.use_tmux(inst.is_some_and(|i| i.use_tmux));
         // The session recorded on the instance wins — it is what the iOS app
         // launches from, and what a previous run left running on the host. See
         // `tmux::session_for`.
@@ -21131,6 +21134,8 @@ impl MuxelApp {
         self.settings_ui.s_forward_agent = h.forward_agent;
         self.settings_ui.s_compression = h.compression;
         self.settings_ui.s_use_tmux = h.default_use_tmux;
+        self.settings_ui.s_remote_os = h.os;
+        self.settings_ui.s_windows_shell = h.windows_shell;
         let set =
             |inp: &Entity<InputState>, v: String, cx: &mut Context<Self>, window: &mut Window| {
                 inp.update(cx, |s, cx| s.set_value(v, window, cx));
@@ -21242,6 +21247,8 @@ impl MuxelApp {
         let forward_agent = ui.s_forward_agent;
         let compression = ui.s_compression;
         let use_tmux = ui.s_use_tmux;
+        let remote_os = ui.s_remote_os;
+        let windows_shell = ui.s_windows_shell;
         let identity_id = ui.s_identity_id;
         let host_id = self.remotes.get(idx).map(|h| h.id);
         if let Some(h) = self.remotes.get_mut(idx) {
@@ -21260,6 +21267,8 @@ impl MuxelApp {
             h.keepalive_secs = keepalive;
             h.extra_options = extra;
             h.default_use_tmux = use_tmux;
+            h.os = remote_os;
+            h.windows_shell = windows_shell;
             h.identity_id = identity_id;
         }
         if let Some(id) = host_id {
@@ -24581,7 +24590,41 @@ impl MuxelApp {
         let forward = ui.s_forward_agent;
         let compression = ui.s_compression;
         let use_tmux = ui.s_use_tmux;
+        let remote_os = ui.s_remote_os;
+        let win_shell = ui.s_windows_shell;
+        let os_btn = |label: &'static str, val: RemoteOs, id: &'static str| {
+            Button::new(id)
+                .ghost()
+                .selected(remote_os == val)
+                .label(label)
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    this.settings_ui.s_remote_os = val;
+                    cx.notify();
+                }))
+        };
+        let shell_btn = |label: &'static str, val: WindowsShell, id: &'static str| {
+            Button::new(id)
+                .ghost()
+                .selected(win_shell == val)
+                .label(label)
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    this.settings_ui.s_windows_shell = val;
+                    cx.notify();
+                }))
+        };
         form = form
+            .child(self.settings_label(&t("Remote operating system"), cx))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(os_btn(
+                        "Unix (Linux/macOS)",
+                        RemoteOs::Unix,
+                        "remote-os-unix",
+                    ))
+                    .child(os_btn("Windows", RemoteOs::Windows, "remote-os-windows")),
+            )
             .child(self.settings_label(&t("Jump host (ProxyJump, optional)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_jump)))
             .child(
@@ -24605,8 +24648,37 @@ impl MuxelApp {
                         })),
                     &t("Enable compression (-C) — helps on slow or high-latency links"),
                 ),
-            )
-            .child(
+            );
+
+        // Persistence and the pane shell are the two places the families really
+        // differ, so the form asks a different question for each.
+        if remote_os == RemoteOs::Windows {
+            form = form
+                .child(self.settings_label(&t("Pane shell"), cx))
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(shell_btn(
+                            "PowerShell",
+                            WindowsShell::PowerShell,
+                            "win-shell-ps",
+                        ))
+                        .child(shell_btn("pwsh 7+", WindowsShell::Pwsh, "win-shell-pwsh"))
+                        .child(shell_btn("cmd.exe", WindowsShell::Cmd, "win-shell-cmd")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t(
+                            "Windows has no tmux, so a pane here lasts as long as its SSH \
+                     connection. On reconnect muxel relaunches the pane and the agent \
+                     resumes its saved conversation.",
+                        )),
+                );
+        } else {
+            form = form.child(
                 self.check_row(
                     Checkbox::new("remote-tmux")
                         .checked(use_tmux)
@@ -24616,7 +24688,10 @@ impl MuxelApp {
                         })),
                     &t("Run remote panes in a persistent tmux session (survives disconnects)"),
                 ),
-            )
+            );
+        }
+
+        form = form
             .child(self.settings_label(&t("StrictHostKeyChecking (blank = accept-new)"), cx))
             .child(Self::wide_input(Input::new(&ui.s_strict)))
             .child(self.settings_label(

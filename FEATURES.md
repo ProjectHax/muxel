@@ -594,6 +594,20 @@ feature is added or changed, update the matching entry here in the same change**
   rather than starting a second one beside it. It adopts only muxel's own sessions,
   only within the project, and never one a pane already owns — your own tmux is left
   alone.
+- **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
+  speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
+  layout sync, the memory file, project scan, remote git, and the connection test
+  all work the same as on a Linux host. Every command muxel sends is encoded so it
+  reads identically whether the host's OpenSSH `DefaultShell` is `cmd.exe` (the
+  Windows default) or PowerShell — there is nothing to configure on the far side
+  beyond enabling the SSH server. Interactive panes run PowerShell, pwsh 7+, or
+  `cmd.exe`, chosen per host, and load your profile so agents installed by npm or
+  winget are on `PATH`.
+  The one real difference: Windows has no tmux, so a pane there lasts as long as
+  its SSH connection rather than outliving it. On reconnect muxel relaunches the
+  pane and the agent resumes its saved conversation, so the thread survives even
+  though the process does not — and the tmux options are hidden for Windows hosts
+  rather than offered and quietly ignored.
 - **Scan for remote projects** — in the new-remote-project wizard, "Scan for
   projects" searches the host for existing muxel projects (`.muxel/workspace.json`
   markers, heavy dirs pruned) and lists the found roots; clicking one fills in the
