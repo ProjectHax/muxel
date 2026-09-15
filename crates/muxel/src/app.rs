@@ -72,6 +72,57 @@ fn same_browser_resource(existing: &str, requested: &str) -> bool {
     }
 }
 
+/// Where the maximize goes when the user selects `target`. While a maximized
+/// pane is on screen it follows the selection, so picking another agent shows
+/// that agent full-size instead of focusing a pane hidden behind the maximized
+/// one. A maximize parked in a project that isn't shown stays put, as does one
+/// when the target has no place in a layout (popped out). Pure.
+fn maximize_after_select(
+    maximized: Option<Uuid>,
+    on_screen: bool,
+    target: Uuid,
+    target_in_layout: bool,
+) -> Option<Uuid> {
+    match maximized {
+        Some(max) if max != target && on_screen && target_in_layout => Some(target),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod maximize_follow_tests {
+    use super::maximize_after_select;
+    use uuid::Uuid;
+
+    #[test]
+    fn follows_the_selection_while_on_screen() {
+        let (max, other) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(
+            maximize_after_select(Some(max), true, other, true),
+            Some(other)
+        );
+    }
+
+    #[test]
+    fn stays_put_otherwise() {
+        let (max, other) = (Uuid::new_v4(), Uuid::new_v4());
+        // Nothing maximized: selecting never maximizes.
+        assert_eq!(maximize_after_select(None, false, other, true), None);
+        // Maximized pane not on screen (another project is shown).
+        assert_eq!(
+            maximize_after_select(Some(max), false, other, true),
+            Some(max)
+        );
+        // Target is popped out, so it can't fill the pane area.
+        assert_eq!(
+            maximize_after_select(Some(max), true, other, false),
+            Some(max)
+        );
+        // Re-selecting the maximized pane keeps it maximized.
+        assert_eq!(maximize_after_select(Some(max), true, max, true), Some(max));
+    }
+}
+
 const RESTORE_LAUNCH_CONCURRENCY: usize = 4;
 const RESTORE_FIRST_WAVE_DEBOUNCE_MS: u64 = 250;
 const RESTORE_WAVE_YIELD_MS: u64 = 1;
@@ -12694,6 +12745,24 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Whether the maximized pane, if any, is what a window shows right now: its
+    /// project is the main window's (dashboard closed) or a secondary window's.
+    fn maximize_on_screen(&self) -> bool {
+        let Some(max) = self.maximized else {
+            return false;
+        };
+        let Some(pid) = self.workspace.instance(max).map(|i| i.project_id) else {
+            return false;
+        };
+        let shown = (self.workspace.active_project == Some(pid) && !self.show_dashboard)
+            || self.secondary_windows.iter().any(|s| s.pid == pid);
+        shown
+            && self
+                .workspace
+                .project(pid)
+                .is_some_and(|p| p.instances().contains(&max))
+    }
+
     /// Whether `window` is the main muxel window.
     fn is_main_window(&self, window: &Window) -> bool {
         self.main_window
@@ -15058,9 +15127,20 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Focus an instance, switching to its project first if needed.
+    /// Focus an instance, switching to its project first if needed. A maximize on
+    /// screen moves to it (see [`maximize_after_select`]).
     fn select_instance(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id)
+        let target_pid = self.workspace.instance(iid).map(|i| i.project_id);
+        let target_in_layout = target_pid
+            .and_then(|pid| self.workspace.project(pid))
+            .is_some_and(|p| p.instances().contains(&iid));
+        self.maximized = maximize_after_select(
+            self.maximized,
+            self.maximize_on_screen(),
+            iid,
+            target_in_layout,
+        );
+        if let Some(pid) = target_pid
             && self.workspace.active_project != Some(pid)
         {
             // The target pane is attended below. Do not consume the first pane's
