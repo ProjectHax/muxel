@@ -45,7 +45,7 @@ pub use url::{normalize_url, same_resource_url};
 pub use worktree::Worktree;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 pub use uuid::Uuid;
 
 /// What a pane holds. Defaults to `Terminal` so instances persisted before
@@ -900,6 +900,19 @@ pub struct RemoteRef {
     pub remote_root: String,
 }
 
+/// A remote root in comparable form: no trailing separator, and on Windows hosts
+/// `\`-separated and lowercased (their paths are case- and separator-blind).
+fn normalize_remote_root(root: &str, os: RemoteOs) -> String {
+    let root = root.trim();
+    match os {
+        RemoteOs::Unix => root.trim_end_matches('/').to_string(),
+        RemoteOs::Windows => root
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase(),
+    }
+}
+
 /// A project: a named workspace rooted at a directory, with a pane layout.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
@@ -1088,6 +1101,30 @@ impl Workspace {
             self.active_project = Some(id);
         }
         id
+    }
+
+    /// The local project already rooted at `root`, if any, so opening the same
+    /// folder twice can be refused. Symlinked / trailing-separator spellings match.
+    pub fn local_project_at(&self, root: &Path) -> Option<&Project> {
+        self.projects
+            .iter()
+            .find(|p| !p.is_remote() && agent::paths_loosely_equal(&p.root_path, root))
+    }
+
+    /// The remote project already open at `remote_root` on `host_id`, if any,
+    /// compared per the host's path rules (see [`normalize_remote_root`]).
+    pub fn remote_project_at(
+        &self,
+        host_id: Uuid,
+        remote_root: &str,
+        os: RemoteOs,
+    ) -> Option<&Project> {
+        let want = normalize_remote_root(remote_root, os);
+        self.projects.iter().find(|p| {
+            p.remote.as_ref().is_some_and(|r| {
+                r.host_id == host_id && normalize_remote_root(&r.remote_root, os) == want
+            })
+        })
     }
 
     /// Move project `id` one slot toward the front (`up`) or back of the sidebar
@@ -3116,6 +3153,72 @@ mod project_order_tests {
         // Unknown id never moves anything.
         assert!(!ws.move_project(super::Uuid::new_v4(), true));
         assert_eq!(order(&ws), ["a", "b", "c"]);
+    }
+}
+
+#[cfg(test)]
+mod open_project_tests {
+    use super::{Project, RemoteOs, RemoteRef, Uuid, Workspace};
+    use std::path::Path;
+
+    fn remote(host_id: Uuid, root: &str) -> Project {
+        let mut p = Project::new("r", root);
+        p.remote = Some(RemoteRef {
+            host_id,
+            remote_root: root.to_string(),
+        });
+        p
+    }
+
+    #[test]
+    fn local_project_at_matches_the_same_folder() {
+        let dir = std::env::temp_dir();
+        let mut ws = Workspace::default();
+        let id = ws.add_project(Project::new("tmp", &dir));
+        assert_eq!(ws.local_project_at(&dir).map(|p| p.id), Some(id));
+        // Missing-on-disk paths fall back to a trailing-separator-blind compare.
+        let gone = ws.add_project(Project::new("gone", "/muxel-nope/proj"));
+        assert_eq!(
+            ws.local_project_at(Path::new("/muxel-nope/proj/"))
+                .map(|p| p.id),
+            Some(gone)
+        );
+        assert!(
+            ws.local_project_at(Path::new("/muxel-nope/other"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_project_at_ignores_remote_projects() {
+        // A remote project's root_path is cosmetic; it must not block a local open.
+        let mut ws = Workspace::default();
+        ws.add_project(remote(Uuid::new_v4(), "/muxel-nope/srv"));
+        assert!(ws.local_project_at(Path::new("/muxel-nope/srv")).is_none());
+    }
+
+    #[test]
+    fn remote_project_at_matches_host_and_root() {
+        let host = Uuid::new_v4();
+        let mut ws = Workspace::default();
+        let id = ws.add_project(remote(host, "/home/me/app"));
+        let found = |h, root: &str| ws.remote_project_at(h, root, RemoteOs::Unix).map(|p| p.id);
+        assert_eq!(found(host, "/home/me/app"), Some(id));
+        assert_eq!(found(host, "/home/me/app/"), Some(id));
+        // Unix paths are case-sensitive; other hosts are other projects.
+        assert_eq!(found(host, "/home/me/App"), None);
+        assert_eq!(found(Uuid::new_v4(), "/home/me/app"), None);
+    }
+
+    #[test]
+    fn remote_project_at_is_case_and_separator_blind_on_windows() {
+        let host = Uuid::new_v4();
+        let mut ws = Workspace::default();
+        let id = ws.add_project(remote(host, r"C:\Users\me\app"));
+        let found = ws
+            .remote_project_at(host, "c:/users/ME/app/", RemoteOs::Windows)
+            .map(|p| p.id);
+        assert_eq!(found, Some(id));
     }
 }
 

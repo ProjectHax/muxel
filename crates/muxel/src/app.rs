@@ -6515,6 +6515,21 @@ impl MuxelApp {
         if dir.is_empty() {
             return;
         }
+        // Refuse a second copy of an open project; keep the wizard up to say why.
+        let os = self
+            .remotes
+            .iter()
+            .find(|h| h.id == host_id)
+            .map(|h| h.os)
+            .unwrap_or_default();
+        if let Some(open) = self.workspace.remote_project_at(host_id, &dir, os) {
+            self.nr_verify = RemoteTestState::Failed(tf(
+                "“{name}” is already open in this workspace.",
+                &[("name", &open.name)],
+            ));
+            cx.notify();
+            return;
+        }
         let mut name = self.nr_name.read(cx).value().trim().to_string();
         if name.is_empty() {
             // Default to the remote directory's last component.
@@ -6544,6 +6559,15 @@ impl MuxelApp {
             {
                 let name = Self::project_name_from(&dir);
                 let _ = this.update_in(cx, |this, window, cx| {
+                    if let Some(open) = this.workspace.local_project_at(&dir) {
+                        let msg = tf(
+                            "“{name}” is already open in this workspace.",
+                            &[("name", &open.name)],
+                        );
+                        this.add_event(NotifKind::Error, t("Project already open"), msg);
+                        cx.notify();
+                        return;
+                    }
                     this.create_project_at(dir, name, window, cx);
                 });
             }

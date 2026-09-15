@@ -847,7 +847,7 @@ fn codex_session_meta(path: &Path) -> Option<(String, String)> {
     None
 }
 
-fn paths_loosely_equal(a: &Path, b: &Path) -> bool {
+pub(crate) fn paths_loosely_equal(a: &Path, b: &Path) -> bool {
     if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
         return ca == cb;
     }

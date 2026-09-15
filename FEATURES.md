@@ -576,6 +576,12 @@ feature is added or changed, update the matching entry here in the same change**
   ("Close terminal?", "Close other tabs?") opens in the window showing that
   pane, and raises it, so the prompt is never stranded on another monitor.
 - **No auto-created project** — start empty; add projects via a folder picker.
+- **No duplicate projects** — opening a folder that's already a project in this
+  workspace is refused with an “already open” error instead of adding a second
+  copy. The same goes for remote projects (same host + directory): the
+  new-remote-project wizard stays open and says so inline. Symlinked or
+  trailing-slash spellings of the same path count as the same project, and on
+  Windows hosts so do differences in case or separator.
 - **Startup agents** — save the project's open agents as a startup set (preset +
   worktree flag) and relaunch them in one click from the project menu.
 
