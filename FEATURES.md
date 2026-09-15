@@ -33,9 +33,12 @@ feature is added or changed, update the matching entry here in the same change**
   positions.
 - **Per-project focus** — switching away from a project and back restores the
   pane that was last focused there, falling back safely if that pane was removed.
-- **Maximize** — temporarily expand one pane to fill the work area. While a pane
-  is maximized, selecting another agent (sidebar, notification, tray) moves the
-  maximize to it, so that agent comes up full-size instead of hiding behind.
+- **Maximize** — temporarily expand one pane to fill the work area. The whole tab
+  group comes along: every tab stays in the tab bar and switching tabs keeps the
+  pane maximized, as does closing or popping out the tab being shown while others
+  remain. While a pane is maximized, selecting another agent (sidebar,
+  notification, tray) moves the maximize to it, so that agent comes up full-size
+  instead of hiding behind.
 - **Pane cards** — rounded "card" panes with an accent ring + glow on the active
   pane, hover highlight, and a configurable border style.
 

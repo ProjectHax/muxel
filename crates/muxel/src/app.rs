@@ -89,10 +89,40 @@ fn maximize_after_select(
     }
 }
 
+/// The maximize anchor once the `leaving` tabs go (closed, popped out, dropped by
+/// a peer). The maximize covers the anchor's whole tab group (`group`), so when
+/// the anchor leaves but a groupmate stays, it re-anchors there and the group
+/// stays maximized; with the whole group gone nothing is maximized. Pure.
+fn maximize_anchor_after_leave(
+    maximized: Option<Uuid>,
+    group: &[Uuid],
+    leaving: &[Uuid],
+) -> Option<Uuid> {
+    let max = maximized?;
+    if !leaving.contains(&max) {
+        return Some(max);
+    }
+    group.iter().copied().find(|t| !leaving.contains(t))
+}
+
 #[cfg(test)]
 mod maximize_follow_tests {
-    use super::maximize_after_select;
+    use super::{maximize_after_select, maximize_anchor_after_leave};
     use uuid::Uuid;
+
+    #[test]
+    fn a_leaving_anchor_hands_the_maximize_to_its_group() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        // The anchor leaves but a groupmate stays: the group stays maximized.
+        assert_eq!(maximize_anchor_after_leave(Some(a), &[a, b], &[a]), Some(b));
+        // Another tab leaving doesn't move the anchor.
+        assert_eq!(maximize_anchor_after_leave(Some(a), &[a, b], &[b]), Some(a));
+        // The whole group leaves (or it was a lone tab): nothing is maximized.
+        assert_eq!(maximize_anchor_after_leave(Some(a), &[a, b], &[a, b]), None);
+        assert_eq!(maximize_anchor_after_leave(Some(a), &[a], &[a]), None);
+        // Nothing maximized stays that way.
+        assert_eq!(maximize_anchor_after_leave(None, &[a, b], &[c]), None);
+    }
 
     #[test]
     fn follows_the_selection_while_on_screen() {
@@ -6748,6 +6778,11 @@ impl MuxelApp {
             set_active_tab(&mut p.layout, iid);
             p.last_focused_instance = Some(iid);
         }
+        // Keep the maximize anchored on the tab its group is showing, so dragging
+        // a background tab out of the group leaves the maximize where it is.
+        if self.maximized.is_some_and(|m| m != iid) && self.maximized_group().contains(&iid) {
+            self.maximized = Some(iid);
+        }
         let runtime_completion = self
             .terminals
             .get(&iid)
@@ -7747,6 +7782,7 @@ impl MuxelApp {
         let added = instances.iter().filter(|i| !before.contains(&i.id)).count();
         // A pane the peer closed: drop only this side's view. Closing it on the peer
         // already tore down its tmux session and worktree.
+        self.release_maximize(&closed);
         for &iid in &closed {
             ui_profile::unregister_focus_pane(iid);
             self.terminal_launching.remove(&iid);
@@ -7759,9 +7795,6 @@ impl MuxelApp {
             self.last_status.remove(&iid);
             self.failed_launches.remove(&iid);
             self.workspace.remove_instance_meta(iid);
-            if self.maximized == Some(iid) {
-                self.maximized = None;
-            }
         }
         for instance in instances {
             self.workspace.remove_instance_meta(instance.id);
@@ -9857,13 +9890,6 @@ impl MuxelApp {
         let Some(project) = self.workspace.active() else {
             return Vec::new();
         };
-        if let Some(max) = self.maximized {
-            return if self.browsers.contains_key(&max) {
-                vec![max]
-            } else {
-                Vec::new()
-            };
-        }
         fn walk(
             node: &PaneNode,
             active_instance: Option<Uuid>,
@@ -9901,7 +9927,12 @@ impl MuxelApp {
         }
         let mut out = Vec::new();
         if let Some(layout) = &project.layout {
-            walk(layout, self.active_instance, &self.browsers, &mut out);
+            // A maximized pane's window shows only its tab group, as render does.
+            let root = self
+                .maximized
+                .and_then(|m| layout.leaf_containing(m))
+                .unwrap_or(layout);
+            walk(root, self.active_instance, &self.browsers, &mut out);
         }
         // Projects shown in secondary (per-monitor) windows render there.
         for sec in &self.secondary_windows {
@@ -9910,7 +9941,11 @@ impl MuxelApp {
                 .project(sec.pid)
                 .and_then(|p| p.layout.as_ref())
             {
-                walk(layout, self.active_instance, &self.browsers, &mut out);
+                let root = self
+                    .maximized
+                    .and_then(|m| layout.leaf_containing(m))
+                    .unwrap_or(layout);
+                walk(root, self.active_instance, &self.browsers, &mut out);
             }
         }
         out
@@ -10961,6 +10996,8 @@ impl MuxelApp {
                 .and_then(|p| p.layout.as_ref())
                 .and_then(|l| l.surviving_active_after_remove(iid))
         });
+        // Before the layout changes: a groupmate inherits the maximize.
+        self.release_maximize(&[iid]);
         if let Some(pid) = pid
             && let Some(project) = self.workspace.project_mut(pid)
         {
@@ -10998,9 +11035,6 @@ impl MuxelApp {
         }
         self.last_status.remove(&iid);
         self.failed_launches.remove(&iid);
-        if self.maximized == Some(iid) {
-            self.maximized = None;
-        }
 
         // If the closed tab was active, retarget to its pane's surviving tab if
         // the pane lives on, else the active project's first instance.
@@ -12739,10 +12773,35 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Toggle a terminal filling the pane area (transient; not persisted).
+    /// Toggle the pane holding `iid` filling the pane area, its whole tab group
+    /// included (transient; not persisted).
     fn toggle_maximize(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        self.maximized = (self.maximized != Some(iid)).then_some(iid);
+        let unmaximize = self.maximized_group().contains(&iid);
+        self.maximized = (!unmaximize).then_some(iid);
         cx.notify();
+    }
+
+    /// The tabs sharing a pane with the maximized instance: the tab group the
+    /// maximize covers. Empty when nothing is maximized or it left the layout.
+    fn maximized_group(&self) -> Vec<Uuid> {
+        let Some(max) = self.maximized else {
+            return Vec::new();
+        };
+        self.workspace
+            .instance(max)
+            .and_then(|i| self.workspace.project(i.project_id))
+            .and_then(|p| p.layout.as_ref())
+            .and_then(|l| l.tab_group(max))
+            .map(<[Uuid]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// `leaving` tabs are about to leave their panes (closed, dropped by a peer).
+    /// Call before the layout changes, so the maximize can re-anchor on a tab
+    /// that stays (see [`maximize_anchor_after_leave`]).
+    fn release_maximize(&mut self, leaving: &[Uuid]) {
+        let group = self.maximized_group();
+        self.maximized = maximize_anchor_after_leave(self.maximized, &group, leaving);
     }
 
     /// Whether the maximized pane, if any, is what a window shows right now: its
@@ -13270,11 +13329,12 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let layout = self.workspace.project(pid).and_then(|p| p.layout.clone());
-        let maximized_here = self.maximized.filter(|id| {
+        let maximized_here = self.maximized.and_then(|max| {
             self.workspace
                 .project(pid)
-                .map(|p| p.instances().contains(id))
-                .unwrap_or(false)
+                .and_then(|p| p.layout.as_ref())
+                .and_then(|l| l.leaf_containing(max))
+                .cloned()
         });
         let failed_remote = self
             .remote_connect_failed
@@ -13283,8 +13343,8 @@ impl MuxelApp {
             .cloned();
         let main_content: AnyElement = if let Some(msg) = failed_remote {
             self.render_remote_connect_failed(pid, &msg, cx)
-        } else if let Some(iid) = maximized_here {
-            self.render_pane(&PaneNode::leaf(iid), cx)
+        } else if let Some(leaf) = maximized_here {
+            self.render_pane(&leaf, cx)
         } else {
             match layout {
                 Some(root) => self.render_pane_root(pid, &root, cx),
@@ -13397,6 +13457,8 @@ impl MuxelApp {
             iid,
         );
         // Remove from the pane tree but KEEP the instance metadata + the view.
+        // The maximize's tab group is read first: a groupmate may inherit it.
+        let max_group = self.maximized_group();
         if let Some(project) = self.workspace.project_mut(pid) {
             remove(&mut project.layout, iid);
         }
@@ -13411,9 +13473,7 @@ impl MuxelApp {
             self.redock_into_layout(iid, pid, redock, cx);
             return;
         };
-        if self.maximized == Some(iid) {
-            self.maximized = None;
-        }
+        self.maximized = maximize_anchor_after_leave(self.maximized, &max_group, &[iid]);
         if self.active_instance == Some(iid) {
             self.active_instance = self.workspace.active().and_then(|p| p.first_instance());
         }
@@ -16490,7 +16550,7 @@ impl MuxelApp {
                 // tab drag or focus change.
                 let sid = iid.simple();
                 let kind = inst.map(|i| i.kind).unwrap_or_default();
-                let max_icon = if self.maximized == Some(iid) {
+                let max_icon = if self.maximized.is_some_and(|m| tabs.contains(&m)) {
                     IconName::Minimize
                 } else {
                     IconName::Maximize
@@ -25566,12 +25626,14 @@ impl Render for MuxelApp {
             .unwrap_or_default();
         let active_layout = self.workspace.active().and_then(|p| p.layout.clone());
 
-        // A maximized terminal (in the active project) fills the pane area.
-        let maximized_here = self.maximized.filter(|id| {
+        // A maximized pane (in the active project) fills the pane area, its whole
+        // tab group included so the other tabs stay one click away.
+        let maximized_here = self.maximized.and_then(|max| {
             self.workspace
                 .active()
-                .map(|p| p.instances().contains(id))
-                .unwrap_or(false)
+                .and_then(|p| p.layout.as_ref())
+                .and_then(|l| l.leaf_containing(max))
+                .cloned()
         });
         let failed_remote = self.workspace.active_project.and_then(|pid| {
             self.remote_connect_failed
@@ -25583,8 +25645,8 @@ impl Render for MuxelApp {
             self.render_dashboard(cx)
         } else if let Some((fpid, msg)) = failed_remote {
             self.render_remote_connect_failed(fpid, &msg, cx)
-        } else if let Some(iid) = maximized_here {
-            self.render_pane(&PaneNode::leaf(iid), cx)
+        } else if let Some(leaf) = maximized_here {
+            self.render_pane(&leaf, cx)
         } else {
             match (active_layout, self.workspace.active_project) {
                 (Some(root), Some(pid)) => self.render_pane_root(pid, &root, cx),

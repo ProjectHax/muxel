@@ -321,6 +321,17 @@ impl PaneNode {
         }
     }
 
+    /// The leaf (tab group) holding `instance`, or `None` if it isn't in this
+    /// subtree. A maximized pane renders this node, so it keeps all its tabs.
+    pub fn leaf_containing(&self, instance: Uuid) -> Option<&PaneNode> {
+        match self {
+            PaneNode::Leaf(ld) => ld.tabs.contains(&instance).then_some(self),
+            PaneNode::Split { children, .. } => {
+                children.iter().find_map(|c| c.leaf_containing(instance))
+            }
+        }
+    }
+
     /// All instance ids in this subtree, in reading order (every tab of every
     /// leaf). Drives terminal spawning and the FocusNext/Prev cycle.
     pub fn collect_instances(&self) -> Vec<Uuid> {
@@ -1179,6 +1190,25 @@ pub fn set_split_sizes(tree: &mut Option<PaneNode>, key: &str, sizes: &[f32]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leaf_containing_returns_the_whole_tab_group() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut tree = Some(PaneNode::leaf(a));
+        assert!(add_tab(&mut tree, a, b));
+        assert!(split(&mut tree, a, SplitDirection::Horizontal, c));
+        let root = tree.as_ref().unwrap();
+        let tabs_of = |iid| {
+            root.leaf_containing(iid)
+                .and_then(|l| l.tabs())
+                .map(|(t, _)| t.to_vec())
+        };
+        // Either tab of a group finds the same leaf, with every tab in it.
+        assert_eq!(tabs_of(a), Some(vec![a, b]));
+        assert_eq!(root.leaf_containing(b), root.leaf_containing(a));
+        assert_eq!(tabs_of(c), Some(vec![c]));
+        assert_eq!(tabs_of(Uuid::new_v4()), None);
+    }
 
     fn id() -> Uuid {
         Uuid::new_v4()
