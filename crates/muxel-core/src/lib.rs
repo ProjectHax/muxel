@@ -913,6 +913,9 @@ fn normalize_remote_root(root: &str, os: RemoteOs) -> String {
     }
 }
 
+/// How many unconfirmed closes a project keeps. See [`Project::remember_closed_session`].
+const MAX_CLOSED_SESSIONS: usize = 64;
+
 /// A project: a named workspace rooted at a directory, with a pane layout.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
@@ -944,6 +947,12 @@ pub struct Project {
     /// to/from `<remote_root>/.muxel/workspace.json`. `None` until first change/sync.
     #[serde(default)]
     pub layout_updated_at: Option<u64>,
+    /// Panes closed on this project's host whose tmux session muxel has not yet
+    /// confirmed dead. Persisted because the confirmation may have to wait for the
+    /// next connect — see [`tmux::ClosedSession`]. Local bookkeeping, never part of
+    /// the synced layout doc.
+    #[serde(default)]
+    pub closed_sessions: Vec<tmux::ClosedSession>,
 }
 
 /// One agent in a project's saved startup set.
@@ -970,12 +979,40 @@ impl Project {
             remote: None,
             memory_enabled: false,
             layout_updated_at: None,
+            closed_sessions: Vec::new(),
         }
     }
 
     /// Whether this project runs on a remote host over SSH.
     pub fn is_remote(&self) -> bool {
         self.remote.is_some()
+    }
+
+    /// Remember that `session` was closed and must not come back as a pane until
+    /// the host confirms it is gone. Idempotent per instance: closing, failing to
+    /// confirm, and closing again leaves one entry.
+    ///
+    /// Capped, oldest first: a host that is never reachable again would otherwise
+    /// grow the ledger without bound, and an entry that old has long stopped
+    /// protecting anything — its instance is gone from the workspace.
+    pub fn remember_closed_session(&mut self, session: String, instance: Uuid) {
+        self.closed_sessions.retain(|c| c.instance != instance);
+        self.closed_sessions.push(tmux::ClosedSession {
+            name: session,
+            instance,
+        });
+        let over = self
+            .closed_sessions
+            .len()
+            .saturating_sub(MAX_CLOSED_SESSIONS);
+        self.closed_sessions.drain(..over);
+    }
+
+    /// Forget a close whose session the host has confirmed gone.
+    pub fn forget_closed_session(&mut self, instance: Uuid) -> bool {
+        let before = self.closed_sessions.len();
+        self.closed_sessions.retain(|c| c.instance != instance);
+        self.closed_sessions.len() != before
     }
 
     /// All instance ids referenced by this project's layout.
@@ -2649,6 +2686,53 @@ mod settings_tests {
                 .terminal_mouse,
             "copy_on_select"
         );
+    }
+}
+
+#[cfg(test)]
+mod closed_session_tests {
+    use super::{MAX_CLOSED_SESSIONS, Project};
+    use uuid::Uuid;
+
+    #[test]
+    fn closing_the_same_pane_twice_leaves_one_entry() {
+        let mut p = Project::new("app", "/srv/app");
+        let iid = Uuid::new_v4();
+        p.remember_closed_session("muxel_app_1".into(), iid);
+        p.remember_closed_session("muxel_app_1".into(), iid);
+        assert_eq!(p.closed_sessions.len(), 1);
+        assert!(p.forget_closed_session(iid), "a confirmed kill clears it");
+        assert!(p.closed_sessions.is_empty());
+        assert!(
+            !p.forget_closed_session(iid),
+            "and clearing twice is a no-op"
+        );
+    }
+
+    /// A host that never comes back must not grow the ledger without bound; the
+    /// newest closes — the ones whose panes could still be adopted back — survive.
+    #[test]
+    fn the_ledger_is_capped_oldest_first() {
+        let mut p = Project::new("app", "/srv/app");
+        let ids: Vec<Uuid> = (0..MAX_CLOSED_SESSIONS + 10)
+            .map(|n| {
+                let iid = Uuid::new_v4();
+                p.remember_closed_session(format!("muxel_app_{n}"), iid);
+                iid
+            })
+            .collect();
+        let last = *ids.last().unwrap();
+        assert_eq!(p.closed_sessions.len(), MAX_CLOSED_SESSIONS);
+        assert_eq!(p.closed_sessions.last().unwrap().instance, last);
+    }
+
+    /// Old `workspace.json` files predate the ledger and must still load.
+    #[test]
+    fn a_project_without_the_field_still_loads() {
+        let mut v = serde_json::to_value(Project::new("app", "/srv/app")).unwrap();
+        v.as_object_mut().unwrap().remove("closed_sessions");
+        let p: Project = serde_json::from_value(v).unwrap();
+        assert!(p.closed_sessions.is_empty());
     }
 }
 

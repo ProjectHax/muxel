@@ -369,6 +369,37 @@ pub fn tmux_path_prelude() -> String {
     format!("export PATH=\"$PATH:{}\"", REMOTE_TMUX_PATH_DIRS.join(":"))
 }
 
+/// Exit codes for [`kill_and_confirm_command`], chosen above the range a shell
+/// hands out for a command that merely failed.
+pub const TMUX_STILL_ALIVE: i32 = 91;
+pub const TMUX_MISSING: i32 = 92;
+
+/// A remote command line that kills tmux session `session` and then **says whether
+/// it worked**: exit `0` when the host no longer has the session,
+/// [`TMUX_STILL_ALIVE`] when it does, [`TMUX_MISSING`] when there is no `tmux` to
+/// ask.
+///
+/// The confirmation is the whole point. `kill-session` alone exits non-zero both
+/// when the session was never there (fine) and when nothing ran at all (not fine),
+/// so a caller that only looks at the kill cannot tell a finished teardown from a
+/// silently dropped one — and a dropped one leaves the agent running on the host.
+/// `has-session` is the question actually being asked.
+///
+/// `tmux` is separately checked with `command -v`, because an unfindable `tmux`
+/// makes `has-session` fail too, which would otherwise read as "the session is
+/// gone". The `=` target is exact-match, as in [`crate::tmux::kill_session_args`].
+pub fn kill_and_confirm_command(session: &str) -> String {
+    let target = sh_quote(&format!("={session}"));
+    [
+        tmux_path_prelude(),
+        format!("command -v tmux >/dev/null 2>&1 || exit {TMUX_MISSING}"),
+        format!("tmux kill-session -t {target} >/dev/null 2>&1"),
+        format!("tmux has-session -t {target} >/dev/null 2>&1 && exit {TMUX_STILL_ALIVE}"),
+        "exit 0".to_string(),
+    ]
+    .join("; ")
+}
+
 /// Parameters for a remote interactive pane command.
 pub struct SshSpec<'a> {
     pub host: &'a RemoteHost,
@@ -750,6 +781,50 @@ mod tests {
         assert_eq!(sh_quote("/my work"), "'/my work'");
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
         assert_eq!(sh_quote(""), "''");
+    }
+
+    /// The teardown command must answer "is it gone?", not "did a kill run?" —
+    /// the difference between a closed remote agent and one still burning tokens.
+    #[test]
+    fn kill_and_confirm_asks_has_session_after_killing() {
+        let cmd = kill_and_confirm_command("muxel_app_1a2b3c4d");
+        assert!(
+            cmd.starts_with(&tmux_path_prelude()),
+            "tmux must be findable first: {cmd}"
+        );
+        let kill = cmd.find("kill-session").expect("kills the session");
+        let has = cmd.find("has-session").expect("then confirms it is gone");
+        assert!(kill < has, "confirmation comes after the kill: {cmd}");
+        assert!(
+            cmd.contains(&format!("exit {TMUX_STILL_ALIVE}")) && cmd.ends_with("exit 0"),
+            "a surviving session is distinguishable from a clean teardown: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!(
+                "command -v tmux >/dev/null 2>&1 || exit {TMUX_MISSING}"
+            )),
+            "a missing tmux is its own answer, not a silent success: {cmd}"
+        );
+    }
+
+    /// Exact-match, so killing `muxel_p_1` never takes down `muxel_p_12`, and a
+    /// session name is never able to run anything of its own.
+    #[test]
+    fn kill_and_confirm_targets_one_session_exactly() {
+        let cmd = kill_and_confirm_command("muxel_p_1");
+        assert_eq!(
+            cmd.matches("-t =muxel_p_1 ").count(),
+            2,
+            "both the kill and the confirmation name the same exact target: {cmd}"
+        );
+        // A session name is data, never a second command: it arrives single-quoted,
+        // with its own quotes escaped, so the shell reads it as one word.
+        let hostile = kill_and_confirm_command("x'; rm -rf ~; '");
+        assert_eq!(
+            hostile.matches(r"-t '=x'\''; rm -rf ~; '\''' ").count(),
+            2,
+            "hostile name is quoted whole: {hostile}"
+        );
     }
 
     #[test]

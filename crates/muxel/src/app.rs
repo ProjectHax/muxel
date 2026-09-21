@@ -153,6 +153,12 @@ mod maximize_follow_tests {
     }
 }
 
+/// How long to wait before each attempt at killing a closed pane's remote tmux
+/// session (the first is immediate). Short enough that a blip or a control socket
+/// that died with the pane's own ssh is ridden out within the minute; anything
+/// longer-lived is left to the next connect — see `MuxelApp::reap_remote_session`.
+const RETRY_REMOTE_KILL_SECS: [u64; 4] = [0, 3, 10, 30];
+
 const RESTORE_LAUNCH_CONCURRENCY: usize = 4;
 const RESTORE_FIRST_WAVE_DEBOUNCE_MS: u64 = 250;
 const RESTORE_WAVE_YIELD_MS: u64 = 1;
@@ -5554,6 +5560,10 @@ impl MuxelApp {
                             // After the sync, so a session the layout accounts for is
                             // not adopted a second time.
                             if let Some(sessions) = sessions {
+                                // Finish any close whose kill never landed *first*,
+                                // so a session the user closed is reaped rather than
+                                // adopted back as a pane.
+                                this.reap_closed_sessions(pid, &sessions, cx);
                                 this.adopt_remote_sessions(pid, &sessions, window, cx);
                             }
                         }
@@ -5668,8 +5678,11 @@ impl MuxelApp {
             .filter(|i| i.project_id == pid)
             .map(|i| muxel_core::tmux::session_for(i.tmux_session.as_deref(), &host_name, i.id))
             .collect();
+        // A pane the user closed whose kill is still unconfirmed must not come back
+        // as a pane — `reap_closed_sessions` is still working on it.
+        let closed = project.closed_sessions.clone();
 
-        let orphans = muxel_core::tmux::orphan_sessions(sessions, &root, &owned);
+        let orphans = muxel_core::tmux::orphan_sessions(sessions, &root, &owned, &closed);
         if orphans.is_empty() {
             return;
         }
@@ -10898,23 +10911,30 @@ impl MuxelApp {
     /// Tear down a just-closed instance's tmux session (local **or** remote) and
     /// dispose its worktree. Call after `remove_instance_meta`, with the captured
     /// fields (the project meta must still exist).
-    #[allow(clippy::too_many_arguments)]
     fn teardown_closed_instance(
         &mut self,
         iid: Uuid,
         project_id: Uuid,
-        use_tmux: bool,
         // The session name recorded on the instance, if it had one (`tmux_session`).
         recorded_session: Option<String>,
         worktree_path: Option<PathBuf>,
         worktree_id: Option<Uuid>,
         cx: &mut Context<Self>,
     ) {
+        let is_remote = self
+            .workspace
+            .project(project_id)
+            .is_some_and(|p| p.is_remote());
         // Remote tmux session: closing a pane always tears its session down —
         // a *dropped* SSH connection never reaches here (an abnormal exit leaves
         // a tombstone pane instead of auto-closing), so reconnectability is
         // preserved where it matters. Killed over ssh in the background
         // (reuses the host's still-warm ControlMaster).
+        //
+        // Gated on the host having tmux *at all*, not on tmux being its current
+        // default: a host whose default was switched off since the pane launched
+        // still has that pane's session running, and skipping it here would both
+        // strand the agent and aim the local kill below at a remote session name.
         let remote_host = self
             .workspace
             .project(project_id)
@@ -10925,33 +10945,25 @@ impl MuxelApp {
                     .find(|h| h.id == r.host_id)
                     .map(|h| h.effective(&self.identities))
             })
-            .filter(|host| host.default_use_tmux || use_tmux);
-        // A remote instance's session lives on the host, not here; killing the
-        // recorded name locally would be a no-op at best.
-        if remote_host.is_none()
-            && let Some(session) = recorded_session.clone()
-        {
-            integrations::kill_tmux_session(&session);
-        }
-        if let Some(host) = remote_host {
+            .filter(|host| !host.os.is_windows());
+        match remote_host {
             // The same name the pane was launched with — a recomputed one would
             // leave the session it was actually running alive on the host forever.
-            let session =
-                muxel_core::tmux::session_for(recorded_session.as_deref(), &host.name, iid);
-            let control_path = Self::control_path_for(host.id);
-            let password = (host.auth == SshAuth::Password)
-                .then(|| self.remote_password(&host))
-                .flatten();
-            cx.background_executor()
-                .spawn(async move {
-                    integrations::kill_remote_tmux(
-                        &host,
-                        &control_path,
-                        password.as_deref(),
-                        &session,
-                    );
-                })
-                .detach();
+            // A pane that never had a session confirms as already gone, so aiming
+            // at one costs a single round trip and nothing else.
+            Some(host) => {
+                let session =
+                    muxel_core::tmux::session_for(recorded_session.as_deref(), &host.name, iid);
+                self.reap_remote_session(project_id, iid, host, session, cx);
+            }
+            // A remote instance's session lives on the host, not here; killing the
+            // recorded name locally would be a no-op at best.
+            None if !is_remote => {
+                if let Some(session) = recorded_session {
+                    integrations::kill_tmux_session(&session);
+                }
+            }
+            None => {}
         }
         // Worktree disposed only when its last instance is gone.
         let root = self
@@ -10966,13 +10978,158 @@ impl MuxelApp {
         }
     }
 
+    /// Kill the tmux session a closed pane left on a remote host, and keep at it
+    /// until the host confirms the session is gone.
+    ///
+    /// One ssh round trip is not a guarantee: it can lose a race with the control
+    /// socket the pane's own ssh just took down, hit a blip, or reach a host that is
+    /// busy. Unconfirmed, that failure used to be invisible *and* self-reversing —
+    /// the agent kept running and the next connect adopted it back into a pane, so
+    /// closing a remote agent looked like it had worked until muxel restarted.
+    ///
+    /// So the close is written down first ([`Project::remember_closed_session`]),
+    /// retried a few times with a widening gap, and only forgotten once a kill comes
+    /// back confirmed. Anything the retries don't finish is finished at the next
+    /// connect by [`Self::reap_closed_sessions`], which has the host's real session
+    /// list to work from; until then the entry keeps the pane from being adopted
+    /// back.
+    fn reap_remote_session(
+        &mut self,
+        project_id: Uuid,
+        iid: Uuid,
+        host: RemoteHost,
+        session: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(p) = self.workspace.project_mut(project_id) {
+            p.remember_closed_session(session.clone(), iid);
+        }
+        let control_path = Self::control_path_for(host.id);
+        let password = (host.auth == SshAuth::Password)
+            .then(|| self.remote_password(&host))
+            .flatten();
+        cx.spawn(async move |this, cx| {
+            // Immediately, then backing off — a control socket that went down with
+            // the pane, or a momentary network stall, is usually over in seconds.
+            let mut err = None;
+            for (attempt, wait) in RETRY_REMOTE_KILL_SECS.iter().enumerate() {
+                if attempt > 0 {
+                    cx.background_executor()
+                        .timer(Duration::from_secs(*wait))
+                        .await;
+                }
+                let (host, control_path, session, password) = (
+                    host.clone(),
+                    control_path.clone(),
+                    session.clone(),
+                    password.clone(),
+                );
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        integrations::kill_remote_tmux(
+                            &host,
+                            &control_path,
+                            password.as_deref(),
+                            &session,
+                        )
+                    })
+                    .await;
+                match res {
+                    Ok(()) => {
+                        err = None;
+                        break;
+                    }
+                    Err(e) => err = Some(format!("{e}")),
+                }
+            }
+            let _ = this.update(cx, |this, cx| match err {
+                None => this.finish_closed_session(project_id, iid),
+                Some(msg) => {
+                    // Not an error dialog: the session is remembered, the pane stays
+                    // closed, and the next connect to the host finishes the job.
+                    muxel_store::append_event_log(&format!(
+                        "close: “{session}” not confirmed dead on “{}” — {msg}",
+                        host.name
+                    ));
+                    this.dev_log.push(DevLogEntry {
+                        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                        kind: NotifKind::Error,
+                        title: t("Remote session").to_string(),
+                        detail: format!("{session}: {msg}"),
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A confirmed kill: drop the ledger entry so the session can be adopted again
+    /// if the host ever hands out that name once more.
+    fn finish_closed_session(&mut self, project_id: Uuid, iid: Uuid) {
+        if let Some(p) = self.workspace.project_mut(project_id)
+            && p.forget_closed_session(iid)
+        {
+            self.persist();
+        }
+    }
+
+    /// Connect-time half of [`Self::reap_remote_session`]: reconcile a project's
+    /// remembered closes against what is actually running on its host.
+    ///
+    /// The host's session list is the authority muxel lacked at close time. A close
+    /// with nothing left running is finished, whatever became of its kill. One with a
+    /// session still there gets another kill — aimed at the name the session actually
+    /// has, which a derived name may no longer match (a renamed host, a session a
+    /// peer created under its own slug).
+    ///
+    /// Runs before adoption, so a close that finished here doesn't keep a pane away.
+    fn reap_closed_sessions(
+        &mut self,
+        pid: Uuid,
+        sessions: &[muxel_core::tmux::RemoteSession],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
+        if project.closed_sessions.is_empty() {
+            return;
+        }
+        let pending: Vec<(Uuid, Option<String>)> = project
+            .closed_sessions
+            .iter()
+            .map(|c| {
+                (
+                    c.instance,
+                    muxel_core::tmux::live_closed_session(sessions, c).map(|s| s.name.clone()),
+                )
+            })
+            .collect();
+        let Some(host) = self.remote_host_for_project(pid) else {
+            return;
+        };
+        for (iid, live) in pending {
+            match live {
+                Some(session) => self.reap_remote_session(pid, iid, host.clone(), session, cx),
+                None => self.finish_closed_session(pid, iid),
+            }
+        }
+    }
+
     /// Manually close an instance (kills its tmux session, local or remote).
     fn close_instance(&mut self, iid: Uuid, cx: &mut Context<Self>) {
         self.close_instance_inner(iid, "close", cx);
     }
 
-    /// Close an instance. `kill_remote_session` is false for auto-close-on-exit,
-    /// so a dropped remote connection doesn't tear down a still-running session.
+    /// Close an instance: drop its pane, kill the process, and tear down its tmux
+    /// session — local, or remote via [`Self::reap_remote_session`]. `reason` is the
+    /// word that lands in the event log.
+    ///
+    /// Reached only by a deliberate close and by auto-close on a *clean* exit; a
+    /// dropped remote connection exits abnormally and tombstones the pane instead,
+    /// so a still-running session stays reconnectable.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
         ui_profile::unregister_focus_pane(iid);
         // Invalidate a PTY still being created. Its eventual result sees the
@@ -11018,15 +11175,13 @@ impl MuxelApp {
                 i.worktree_path.clone(),
                 i.worktree_id,
                 i.project_id,
-                i.use_tmux,
             )
         });
         self.workspace.remove_instance_meta(iid);
-        if let Some((local_session, worktree_path, worktree_id, project_id, use_tmux)) = info {
+        if let Some((local_session, worktree_path, worktree_id, project_id)) = info {
             self.teardown_closed_instance(
                 iid,
                 project_id,
-                use_tmux,
                 local_session,
                 worktree_path,
                 worktree_id,
@@ -13673,16 +13828,14 @@ impl MuxelApp {
                 i.worktree_path.clone(),
                 i.worktree_id,
                 i.project_id,
-                i.use_tmux,
             )
         });
         self.workspace.remove_instance_meta(iid);
-        if let Some((local_session, worktree_path, worktree_id, project_id, use_tmux)) = info {
+        if let Some((local_session, worktree_path, worktree_id, project_id)) = info {
             // Popout window closed deliberately → kill the remote session too.
             self.teardown_closed_instance(
                 iid,
                 project_id,
-                use_tmux,
                 local_session,
                 worktree_path,
                 worktree_id,
@@ -14172,17 +14325,19 @@ impl MuxelApp {
             return;
         }
         let recorded_session = inst.tmux_session.clone();
-        let use_tmux = inst.use_tmux;
         muxel_store::append_event_log(&format!("restart: \"{}\" [{iid}]", inst.display_name()));
         self.terminal_launching.remove(&iid);
         self.failed_launches.remove(&iid);
         if let Some(view) = self.terminals.remove(&iid) {
             view.read(cx).session().kill();
         }
-        // Same session resolution as closing a pane (`teardown_closed_instance`).
+        // Same session resolution and same gate as closing a pane
+        // (`teardown_closed_instance`): the host having tmux, not tmux being its
+        // current default — a default switched off since the pane launched must not
+        // leave the old session running for `new-session -A` to reattach.
         let remote_host = self
             .remote_host_for_instance(iid)
-            .filter(|host| host.default_use_tmux || use_tmux);
+            .filter(|host| !host.os.is_windows());
         let Some(host) = remote_host else {
             if let Some(session) = recorded_session {
                 integrations::kill_tmux_session(&session);
@@ -14199,20 +14354,39 @@ impl MuxelApp {
         let password = (host.auth == SshAuth::Password)
             .then(|| self.remote_password(&host))
             .flatten();
+        let host_name = host.name.clone();
+        let label = session.clone();
         cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
+            let killed = cx
+                .background_executor()
                 .spawn(async move {
                     integrations::kill_remote_tmux(
                         &host,
                         &control_path,
                         password.as_deref(),
                         &session,
-                    );
+                    )
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if this.workspace.instance(iid).is_none() {
                     return; // closed while the kill was in flight
+                }
+                // Say so rather than letting it pass as a restart: the respawn below
+                // is `new-session -A`, so a session that survived is *reattached* —
+                // the same agent, looking like a restart that did nothing.
+                if let Err(e) = killed {
+                    this.add_event(
+                        NotifKind::Error,
+                        tf(
+                            "Couldn't restart on “{host}”",
+                            &[("host", &host_name.to_string())],
+                        ),
+                        tf(
+                            "{session} is still running, so the pane reattached to it: {err}",
+                            &[("session", &label), ("err", &format!("{e}"))],
+                        ),
+                    );
                 }
                 // A project restore may have reattached the old session meanwhile.
                 if let Some(view) = this.terminals.remove(&iid) {

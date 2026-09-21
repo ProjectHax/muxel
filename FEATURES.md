@@ -599,12 +599,22 @@ feature is added or changed, update the matching entry here in the same change**
   settings.
 - **Running agents are picked back up** — opening a remote project looks for muxel
   tmux sessions still alive on the host in that project's tree, and re-attaches a
-  pane to any the workspace no longer has an instance for. An agent whose pane was
-  closed (or whose workspace was lost) keeps running on the host with nothing
-  pointing at it; this brings it back mid-conversation, exactly where it was,
-  rather than starting a second one beside it. It adopts only muxel's own sessions,
-  only within the project, and never one a pane already owns — your own tmux is left
+  pane to any the workspace no longer has an instance for. An agent whose workspace
+  was lost keeps running on the host with nothing pointing at it; this brings it
+  back mid-conversation, exactly where it was, rather than starting a second one
+  beside it. It adopts only muxel's own sessions, only within the project, and never
+  one a pane already owns or one you deliberately closed — your own tmux is left
   alone.
+- **Closing a remote agent really stops it** — closing a remote pane kills its tmux
+  session on the host, and muxel *confirms* the session is gone rather than assuming
+  the kill landed. A kill that fails (a blip, a control socket that went down with
+  the pane's own ssh, a host that is briefly unreachable) is retried over the
+  following half-minute, and anything still unfinished is finished on the next
+  connect to that host — aimed at the session's real name, even if the host has been
+  renamed since. Until it is confirmed dead, the close is remembered, so a session
+  whose kill is still in flight is never adopted back into a pane: a closed agent
+  stays closed across a muxel restart. Unconfirmed closes are listed in the
+  developer log.
 - **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
   speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
   layout sync, the memory file, project scan, remote git, and the connection test

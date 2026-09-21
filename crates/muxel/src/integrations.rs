@@ -1305,23 +1305,35 @@ pub fn kill_tmux_session(session: &str) {
         .output();
 }
 
-/// Kill a tmux session on a remote host over SSH (best-effort; reuses the host's
-/// ControlMaster, which is still alive right after the pane's ssh closed).
+/// Kill a tmux session on a remote host over SSH, and **confirm it is gone**
+/// (reuses the host's ControlMaster, which is still alive right after the pane's
+/// ssh closed).
+///
+/// `Ok(())` means the host answered and no longer has the session. An `Err` says
+/// "could not confirm" — the session may well still be running — and the caller is
+/// expected to try again rather than treat the teardown as finished. See
+/// [`ssh::kill_and_confirm_command`] for why a bare `kill-session` can't answer
+/// that question.
 pub fn kill_remote_tmux(
     host: &RemoteHost,
     control_path: &str,
     password: Option<&str>,
     session: &str,
-) {
-    let target = format!("={session}"); // exact-match target, as in kill_session_args
-    // Unresolved tmux (Homebrew's isn't on sshd's PATH) would leak the session — see
-    // `ssh::tmux_path_prelude`.
-    let cmd = format!(
-        "{}; tmux kill-session -t {}",
-        ssh::tmux_path_prelude(),
-        ssh::sh_quote(&target)
-    );
-    let _ = ssh_exec(host, control_path, password, &cmd);
+) -> Result<()> {
+    let out = ssh_run(
+        host,
+        control_path,
+        password,
+        &ssh::kill_and_confirm_command(session),
+    )?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        Some(ssh::TMUX_STILL_ALIVE) => {
+            bail!("tmux session “{session}” is still running on {}", host.name)
+        }
+        Some(ssh::TMUX_MISSING) => bail!("no tmux on {}", host.name),
+        _ => bail!("{}", ssh_error_message(&out)),
+    }
 }
 
 /// Fire-and-forget kill of a remote tmux session, for quit-time cleanup: the
