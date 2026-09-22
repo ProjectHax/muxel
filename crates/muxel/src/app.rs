@@ -522,6 +522,8 @@ struct TerminalActivitySample {
     raw_status: AgentStatus,
     submitted_turn: bool,
     restoring: bool,
+    runtime: muxel_terminal::TerminalRuntimeSnapshot,
+    binding_rev: u64,
 }
 
 #[derive(Default)]
@@ -910,6 +912,464 @@ fn is_restored_transition(
     preserve_restored
         || (status == AgentStatus::Done && restored_state == Some(AgentActivityState::Done))
         || (status == AgentStatus::Blocked && restored_state == Some(AgentActivityState::Blocked))
+}
+
+/// The provider binding a status was seen in: the PTY launch, and the
+/// binding revision within it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatusBinding {
+    launch: Uuid,
+    rev: u64,
+}
+
+/// The last attributable status recorded for a pane, and its binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SeenStatus {
+    status: AgentStatus,
+    binding: StatusBinding,
+}
+
+/// What one status sample does on the app's attention path: the last status
+/// recorded for the pane, its unread activity, and notifications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusAttention {
+    /// Not attributable: the record, unread state and notifications stay.
+    Skip,
+    /// The status recorded already.
+    Unchanged,
+    /// A transition to record. Entering Blocked or Done notifies when the
+    /// pane isn't being watched. `new_binding`: the launch has switched
+    /// conversations since the record, so the recorded and durable states
+    /// are the old conversation's, not this status's previous state.
+    Changed {
+        notify: Option<NotifKind>,
+        new_binding: bool,
+    },
+}
+
+/// Decide one status sample's attention. A status the terminal marks
+/// non-attributable (level state while a provider binding switched out of band
+/// settles, which may be the old conversation's) moves nothing, so the record
+/// keeps the last attributable status and a Blocked or Done that fresh evidence
+/// confirms is still a transition, and still notifies.
+fn status_attention(
+    previous: Option<SeenStatus>,
+    binding: StatusBinding,
+    status: AgentStatus,
+    attributable: bool,
+) -> StatusAttention {
+    if !attributable {
+        return StatusAttention::Skip;
+    }
+    let notify = match status {
+        AgentStatus::Blocked => Some(NotifKind::Blocked),
+        AgentStatus::Done => Some(NotifKind::Done),
+        AgentStatus::Working | AgentStatus::Idle => None,
+    };
+    match previous {
+        // The launch switched conversations since the record: its first
+        // attributable status is a transition whatever the old one's was. A
+        // relaunch usually resumes the conversation the pane is bound to, and
+        // compares as before, so a relaunch into a different conversation can
+        // miss an event in the state last recorded for the pane.
+        Some(seen) if seen.binding.launch == binding.launch && seen.binding.rev != binding.rev => {
+            StatusAttention::Changed {
+                notify,
+                new_binding: true,
+            }
+        }
+        Some(seen) if seen.status == status => StatusAttention::Unchanged,
+        _ => StatusAttention::Changed {
+            notify,
+            new_binding: false,
+        },
+    }
+}
+
+/// One status sample, as the tick applies it to a pane's attention.
+#[derive(Clone, Copy, Debug)]
+struct StatusSample {
+    status: AgentStatus,
+    binding: StatusBinding,
+    attributable: bool,
+    /// The pane is focused in its active window.
+    attended: bool,
+    /// The restore guard holds the pane's durable state through this sample.
+    preserve_restored: bool,
+}
+
+impl StatusSample {
+    fn from_runtime(
+        runtime: muxel_terminal::TerminalRuntimeSnapshot,
+        binding_rev: u64,
+        status: AgentStatus,
+        attended: bool,
+        preserve_restored: bool,
+    ) -> Self {
+        Self {
+            status,
+            binding: StatusBinding {
+                launch: runtime.launch_id,
+                rev: runtime.binding_rev,
+            },
+            attributable: runtime.is_attributable_to(binding_rev),
+            attended,
+            preserve_restored,
+        }
+    }
+}
+
+/// What applying one status sample did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SampleEffect {
+    /// A transition was recorded.
+    changed: bool,
+    /// The durable activity changed.
+    activity_changed: bool,
+    /// The notification to raise: an unattended transition into Blocked or
+    /// Done that isn't restored state.
+    notify: Option<NotifKind>,
+    /// A new completion, for auto-read.
+    completed: bool,
+}
+
+/// Apply one status sample to a pane's attention: the status recorded for it,
+/// its durable activity (completion and unread state), and the notification.
+fn apply_status_sample(
+    record: &mut Option<SeenStatus>,
+    activity: Option<&mut AgentActivity>,
+    sample: StatusSample,
+    now: i64,
+) -> SampleEffect {
+    let StatusSample {
+        status,
+        binding,
+        attributable,
+        attended,
+        preserve_restored,
+    } = sample;
+    let (changed, notify, new_binding) =
+        match status_attention(*record, binding, status, attributable) {
+            StatusAttention::Skip => return SampleEffect::default(),
+            StatusAttention::Unchanged => (false, None, false),
+            StatusAttention::Changed {
+                notify,
+                new_binding,
+            } => (true, notify, new_binding),
+        };
+    let previous = record.filter(|_| !new_binding).map(|seen| seen.status);
+    *record = Some(SeenStatus { status, binding });
+    let mut effect = SampleEffect {
+        changed,
+        ..SampleEffect::default()
+    };
+    let restored_state = activity.as_deref().and_then(AgentActivity::current_state);
+    if !preserve_restored
+        && let Some(activity) = activity
+        && (new_binding || activity_needs_observation(previous, status, activity))
+    {
+        // A new binding's first status is a new event. Its previous state is
+        // none of the old conversation's: a durable Done there would swallow
+        // this conversation's completion.
+        let previous_activity = if new_binding {
+            Some(AgentActivityState::Idle)
+        } else {
+            activity
+                .current_state()
+                .or_else(|| previous.map(activity_state))
+        };
+        effect.activity_changed |= activity.observe(previous_activity, activity_state(status), now);
+        if attended && status == AgentStatus::Done {
+            effect.activity_changed |= activity.attend(now);
+        }
+    }
+    // The first live sample after restore describes durable state, not a new
+    // event; a new binding's never does.
+    let restored =
+        !new_binding && is_restored_transition(preserve_restored, status, restored_state);
+    effect.completed = changed && status == AgentStatus::Done && !restored;
+    effect.notify = notify.filter(|_| !attended && !restored);
+    effect
+}
+
+fn apply_popout_status_sample(
+    record: &mut Option<SeenStatus>,
+    mut activity: Option<&mut AgentActivity>,
+    sample: StatusSample,
+    now: i64,
+) -> SampleEffect {
+    let mut effect = apply_status_sample(record, activity.as_deref_mut(), sample, now);
+    if sample.attributable
+        && !sample.preserve_restored
+        && let Some(activity) = activity
+    {
+        effect.activity_changed |= observe_popout_activity(
+            activity,
+            Some(sample.status),
+            sample.status,
+            sample.attended,
+            now,
+        );
+    }
+    // Popout sampling records activity and attendance; alert/audio delivery
+    // remains with the docked pipeline.
+    effect.notify = None;
+    effect.completed = false;
+    effect
+}
+
+#[cfg(test)]
+mod status_attention_tests {
+    use super::{
+        AgentActivity, AgentStatus, NotifKind, SampleEffect, SeenStatus, StatusAttention,
+        StatusBinding, StatusSample, apply_status_sample, status_attention,
+    };
+    use uuid::Uuid;
+
+    fn seen(status: AgentStatus, binding: StatusBinding) -> Option<SeenStatus> {
+        Some(SeenStatus { status, binding })
+    }
+
+    #[test]
+    fn adoption_rejects_cached_completion_before_the_runtime_refresh() {
+        use muxel_terminal::{
+            CommandSpec, TerminalRuntimeSnapshot, TerminalSession, TerminalStatusCoverage,
+            TerminalStatusReason,
+        };
+        use std::time::SystemTime;
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        let old = StatusBinding {
+            launch: session.id,
+            rev: session.binding_revision(),
+        };
+        let cached = TerminalRuntimeSnapshot {
+            status: AgentStatus::Done,
+            attributable: true,
+            reason: TerminalStatusReason::Quiet,
+            coverage: TerminalStatusCoverage::ProviderVisible,
+            launch_id: session.id,
+            binding_rev: old.rev,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: true,
+        };
+        let mut record = seen(AgentStatus::Working, old);
+        let mut activity = AgentActivity::default();
+        // Hook adoption calls this exact session path before taking the tick's
+        // snapshot; the queued runtime event deliberately remains unread.
+        let now = SystemTime::now();
+        session.provider_switched(now, now);
+        let sample = StatusSample::from_runtime(
+            cached,
+            session.binding_revision(),
+            cached.status,
+            false,
+            false,
+        );
+        let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 200);
+        assert_eq!(effect, SampleEffect::default());
+        assert_eq!(record, seen(AgentStatus::Working, old));
+        assert_eq!(activity.completed_at, None);
+        assert!(!activity.has_unattended_completion());
+
+        let fresh = TerminalRuntimeSnapshot {
+            binding_rev: session.binding_revision(),
+            ..cached
+        };
+        let sample = StatusSample::from_runtime(
+            fresh,
+            session.binding_revision(),
+            fresh.status,
+            false,
+            false,
+        );
+        let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 300);
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+        assert!(effect.completed);
+        assert_eq!(activity.completed_at, Some(300));
+        assert!(activity.has_unattended_completion());
+    }
+
+    #[test]
+    fn an_unattributable_status_neither_notifies_nor_becomes_the_record() {
+        use AgentStatus::*;
+        let b = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 0,
+        };
+        // Working, then an old conversation's Blocked while the switch settles.
+        assert_eq!(
+            status_attention(seen(Working, b), b, Blocked, false),
+            StatusAttention::Skip
+        );
+        // The record is still Working, so the same Blocked from fresh evidence
+        // is a transition and notifies.
+        assert_eq!(
+            status_attention(seen(Working, b), b, Blocked, true),
+            StatusAttention::Changed {
+                notify: Some(NotifKind::Blocked),
+                new_binding: false
+            }
+        );
+        assert_eq!(
+            status_attention(seen(Idle, b), b, Done, false),
+            StatusAttention::Skip
+        );
+        assert_eq!(
+            status_attention(None, b, Blocked, false),
+            StatusAttention::Skip
+        );
+        assert_eq!(
+            status_attention(seen(Blocked, b), b, Idle, false),
+            StatusAttention::Skip
+        );
+        assert_eq!(
+            status_attention(seen(Blocked, b), b, Blocked, true),
+            StatusAttention::Unchanged
+        );
+        assert_eq!(
+            status_attention(seen(Blocked, b), b, Working, true),
+            StatusAttention::Changed {
+                notify: None,
+                new_binding: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_new_bindings_first_attributable_status_is_a_transition() {
+        use AgentStatus::*;
+        let launch = Uuid::new_v4();
+        let old = StatusBinding { launch, rev: 0 };
+        let new = StatusBinding { launch, rev: 1 };
+        // The old conversation ended Done, or Blocked; the new one's first
+        // Done or Blocked is its own.
+        assert_eq!(
+            status_attention(seen(Done, old), new, Done, true),
+            StatusAttention::Changed {
+                notify: Some(NotifKind::Done),
+                new_binding: true
+            }
+        );
+        assert_eq!(
+            status_attention(seen(Blocked, old), new, Blocked, true),
+            StatusAttention::Changed {
+                notify: Some(NotifKind::Blocked),
+                new_binding: true
+            }
+        );
+        // A relaunch resumes the conversation the pane is bound to.
+        let relaunch = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 0,
+        };
+        assert_eq!(
+            status_attention(seen(Done, new), relaunch, Done, true),
+            StatusAttention::Unchanged
+        );
+    }
+
+    /// Runs samples through `apply_status_sample` as the tick does, one pane.
+    struct Pane {
+        record: Option<SeenStatus>,
+        activity: AgentActivity,
+    }
+
+    impl Pane {
+        fn sample(
+            &mut self,
+            status: AgentStatus,
+            binding: StatusBinding,
+            attributable: bool,
+            attended: bool,
+            now: i64,
+        ) -> SampleEffect {
+            apply_status_sample(
+                &mut self.record,
+                Some(&mut self.activity),
+                StatusSample {
+                    status,
+                    binding,
+                    attributable,
+                    attended,
+                    preserve_restored: false,
+                },
+                now,
+            )
+        }
+    }
+
+    #[test]
+    fn a_fresh_done_after_a_switch_from_an_old_done_notifies_and_records() {
+        use AgentStatus::*;
+        let launch = Uuid::new_v4();
+        let old = StatusBinding { launch, rev: 0 };
+        let new = StatusBinding { launch, rev: 1 };
+        let mut pane = Pane {
+            record: None,
+            activity: AgentActivity::default(),
+        };
+        // The old conversation works and finishes while the user watches.
+        pane.sample(Working, old, true, true, 100);
+        pane.sample(Done, old, true, true, 200);
+        assert_eq!(pane.activity.completed_at, Some(200));
+        assert!(!pane.activity.has_unattended_completion());
+
+        // The user looks away and Claude switches. While it settles, Idle
+        // isn't attributable and changes nothing.
+        assert_eq!(
+            pane.sample(Idle, new, false, false, 300),
+            SampleEffect::default()
+        );
+        // A quick turn, all its Working samples unattributable, ends with a
+        // fresh bell.
+        let effect = pane.sample(Done, new, true, false, 400);
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+        assert!(effect.completed, "auto-read may speak it");
+        assert_eq!(pane.activity.completed_at, Some(400));
+        assert!(pane.activity.has_unattended_completion());
+    }
+
+    #[test]
+    fn an_old_prompt_held_through_a_switch_notifies_only_when_redrawn() {
+        use AgentStatus::*;
+        let launch = Uuid::new_v4();
+        let old = StatusBinding { launch, rev: 0 };
+        let new = StatusBinding { launch, rev: 1 };
+        let mut pane = Pane {
+            record: None,
+            activity: AgentActivity::default(),
+        };
+        let mut notified = Vec::new();
+        // As the terminal reports them: the old prompt, held through the
+        // window and through harmless fresh output, then gone, then redrawn.
+        for (at, (status, binding, attributable)) in [
+            (Working, old, true),
+            (Blocked, new, false),
+            (Blocked, new, false),
+            (Idle, new, true),
+            (Blocked, new, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let effect = pane.sample(status, binding, attributable, false, at as i64 * 100);
+            notified.push(effect.notify);
+        }
+        assert_eq!(
+            notified,
+            vec![None, None, None, None, Some(NotifKind::Blocked)]
+        );
+        assert_eq!(pane.activity.blocked_at, Some(400));
+    }
 }
 
 /// The minimum age a dropped tmux pane's last launch must reach before the next
@@ -2245,11 +2705,11 @@ fn process_parent_map() -> HashMap<u32, u32> {
 }
 
 #[cfg(any(windows, test))]
-fn active_grok_session_for_process(
+fn active_grok_session_for_process<'a>(
     root_pid: u32,
-    active: &[GrokActiveSession],
+    active: &'a [GrokActiveSession],
     parents: &HashMap<u32, u32>,
-) -> Option<String> {
+) -> Option<&'a GrokActiveSession> {
     active
         .iter()
         // Grok keeps the starter registration when `/resume` loads another
@@ -2257,7 +2717,47 @@ fn active_grok_session_for_process(
         // the selected session later, so newest is the current binding.
         .filter(|session| process_descends_from(parents, session.pid, root_pid))
         .max_by_key(|session| session.opened_at)
-        .map(|session| session.session_id.clone())
+}
+
+/// One read of Grok's session registry. The rows it returned were current at
+/// some instant between when it began and when it returned.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug)]
+struct GrokRegistryRead {
+    started: SystemTime,
+    finished: SystemTime,
+}
+
+/// When Grok switched to a registered session, as `[from, to]`: its
+/// registration time through the last instant that time can stand for, or for
+/// an older row without one, any time after the previous registry read began
+/// (none yet: unknown) and before this one returned.
+#[cfg(any(windows, test))]
+fn grok_switch_interval(
+    session: &GrokActiveSession,
+    previous: Option<GrokRegistryRead>,
+    read: GrokRegistryRead,
+) -> (SystemTime, SystemTime) {
+    if session.opened_at == chrono::DateTime::UNIX_EPOCH {
+        (
+            previous.map_or(SystemTime::UNIX_EPOCH, |previous| previous.started),
+            read.finished,
+        )
+    } else {
+        (session.opened_at.into(), latest_instant(session.opened_at))
+    }
+}
+
+/// The latest instant a timestamp can stand for at the precision it was
+/// written to: a whole-second time may have been truncated by up to a second.
+#[cfg(any(windows, test))]
+fn latest_instant(at: chrono::DateTime<chrono::Utc>) -> SystemTime {
+    let nanos = at.timestamp_subsec_nanos();
+    let unit: u32 = [1_000_000_000, 1_000_000, 1_000]
+        .into_iter()
+        .find(|&unit| nanos.is_multiple_of(unit))
+        .unwrap_or(1);
+    SystemTime::from(at) + Duration::from_nanos(unit.into())
 }
 
 fn is_grok_program(program: Option<&str>) -> bool {
@@ -3167,6 +3667,12 @@ pub struct MuxelApp {
     remote_layout_poll_inflight: bool,
     /// Coalescing/backoff and stale-result guards for background provider scans.
     session_discoveries: muxel_core::session_discovery::SessionDiscoveries,
+    /// The last Grok refresh's registry read: a switch it didn't see, to a row
+    /// with no registration time of its own, happened after it began.
+    #[cfg(windows)]
+    grok_registry_read: Option<GrokRegistryRead>,
+    /// Per pane, the PTY launch and nonce of the last Claude hook record read.
+    claude_hook_seen: HashMap<Uuid, (Uuid, Uuid)>,
     /// Full persisted settings (source of truth for config not mirrored above).
     settings: muxel_core::Settings,
     /// Active theme name + mode override (persisted).
@@ -3256,8 +3762,9 @@ pub struct MuxelApp {
     dev_log: Vec<DevLogEntry>,
     /// The popped-out dev-console window, when open (toggled by F12).
     dev_console_window: Option<WindowHandle<gpui_component::Root>>,
-    /// Last seen status per instance, to fire notifications on transitions.
-    last_status: HashMap<Uuid, AgentStatus>,
+    /// Last attributable status per instance and the provider binding it was
+    /// seen in, to fire notifications on transitions.
+    last_status: HashMap<Uuid, SeenStatus>,
     /// Last rendered lifecycle copy per instance. Age labels change at coarse
     /// minute/hour/day boundaries without changing the underlying status.
     last_activity_labels: HashMap<Uuid, String>,
@@ -4246,7 +4753,7 @@ struct WorktreeDispose {
 /// What an in-app notification is about (drives its color/label). `Blocked`/`Done`
 /// are per-agent status notifications; `Success`/`Error`/`Info` are generic events
 /// (git results, connections, save errors, …) that used to be pop-up toasts.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NotifKind {
     Blocked,
     Done,
@@ -4335,10 +4842,10 @@ fn redock_terminal_resource<T>(
     notifications: &mut Vec<Notification>,
     instance: Uuid,
     terminal: T,
-    status: AgentStatus,
+    status: Option<AgentStatus>,
 ) -> bool {
     terminals.insert(instance, terminal);
-    clear_stale_agent_notification(notifications, instance, status)
+    status.is_some_and(|status| clear_stale_agent_notification(notifications, instance, status))
 }
 
 /// One line in the developer console — a timestamped error/event with details
@@ -5473,6 +5980,9 @@ impl MuxelApp {
             remote_branch_poll_inflight: false,
             remote_layout_poll_inflight: false,
             session_discoveries: Default::default(),
+            #[cfg(windows)]
+            grok_registry_read: None,
+            claude_hook_seen: HashMap::new(),
             theme: settings.theme.clone(),
             theme_mode: settings.theme_mode.clone(),
             use_tmux: settings.default_use_tmux,
@@ -6178,7 +6688,7 @@ impl MuxelApp {
         // this launch's `--resume` id so even an immediate app restart is correct.
         if local && is_claude_program(preset.program.as_deref()) {
             let _phase = ui_profile::phase("activation", "claude-binding", Some(iid));
-            self.adopt_claude_session_binding(iid);
+            self.adopt_claude_session_binding(iid, None);
         }
         let sibling_session_ids: HashSet<String> = self
             .workspace
@@ -8887,10 +9397,10 @@ impl MuxelApp {
         if self.maximized.is_some_and(|m| m != iid) && self.maximized_group().contains(&iid) {
             self.maximized = Some(iid);
         }
-        let runtime_completion = self
-            .terminals
-            .get(&iid)
-            .is_some_and(|view| view.read(cx).status() == AgentStatus::Done);
+        let runtime_completion = self.terminals.get(&iid).is_some_and(|view| {
+            let view = view.read(cx);
+            view.status() == AgentStatus::Done && view.status_attributable()
+        });
         let can_attend = self
             .workspace
             .instance(iid)
@@ -8906,7 +9416,7 @@ impl MuxelApp {
             let now = chrono::Utc::now().timestamp_millis();
             if attend_agent_activity(
                 &mut instance.activity,
-                self.last_status.get(&iid).copied(),
+                self.last_status.get(&iid).map(|seen| seen.status),
                 runtime_completion,
                 now,
             ) {
@@ -10045,48 +10555,71 @@ impl MuxelApp {
     /// transcript path identify a direct child of Claude's own store. Resume
     /// records require a real transcript; clear/fork records may precede their
     /// first write. The cwd may differ after `/cd` or an all-project `/resume`.
-    fn adopt_claude_session_binding(&mut self, iid: Uuid) -> bool {
+    /// `launch` is the pane's live PTY launch, if it has one; the nonce of the
+    /// last record read is remembered per launch. Returns when the hook ran if
+    /// the record reports a switch and the binding was adopted.
+    fn adopt_claude_session_binding(
+        &mut self,
+        iid: Uuid,
+        launch: Option<Uuid>,
+    ) -> Option<SystemTime> {
+        use crate::session_binding::acknowledge_claude_binding;
         let (Some(data_dir), Some(home)) = (muxel_store::data_dir(), home_dir()) else {
-            return false;
+            return None;
         };
-        let binding_path = crate::session_binding::claude_binding_path(&data_dir, iid);
-        if !binding_path.is_file() {
-            return false;
-        }
-        let Some(session_id) =
-            crate::session_binding::claude_session_id_from_binding(&data_dir, iid, &home)
+        // One claimed record, read once: the session id and the hook's stamp
+        // come from the same bytes, and a record the hook writes meanwhile
+        // waits for the next claim instead of being deleted unread.
+        let record = crate::session_binding::claim_claude_binding(&data_dir, iid)?;
+        let Some(binding) =
+            crate::session_binding::claude_binding_from_record(&record.bytes, &home)
         else {
-            crate::session_binding::clear_claude_binding(&data_dir, iid);
-            return false;
+            acknowledge_claude_binding(record);
+            return None;
         };
-        if session_id_bound_elsewhere(&self.workspace.instances, iid, &session_id) {
-            crate::session_binding::clear_claude_binding(&data_dir, iid);
-            return false;
+        // The hook stamps when it ran. An older muxel's hook didn't; its
+        // record's write time stands in, and an unreadable one falls back to now.
+        let switched_at = binding
+            .stamp
+            .map(|stamp| stamp.recorded_at)
+            .or(record.modified)
+            .unwrap_or_else(SystemTime::now);
+        if session_id_bound_elsewhere(&self.workspace.instances, iid, &binding.session_id) {
+            acknowledge_claude_binding(record);
+            return None;
         }
-        if self
+        let seen = self
+            .claude_hook_seen
+            .get(&iid)
+            .filter(|(seen_launch, _)| Some(*seen_launch) == launch)
+            .map(|(_, nonce)| *nonce);
+        let bound = self
             .workspace
             .instance(iid)
-            .and_then(|instance| instance.session_id.as_deref())
-            == Some(session_id.as_str())
-        {
-            crate::session_binding::clear_claude_binding(&data_dir, iid);
-            return false;
+            .and_then(|instance| instance.session_id.as_deref());
+        if !crate::session_binding::claude_record_switches(&binding, seen, bound) {
+            self.remember_claude_hook(iid, launch, binding.stamp);
+            acknowledge_claude_binding(record);
+            return None;
         }
         let Some(instance) = self.workspace.instance_mut(iid) else {
-            crate::session_binding::clear_claude_binding(&data_dir, iid);
-            return false;
+            acknowledge_claude_binding(record);
+            return None;
         };
         let previous_session_id = instance.session_id.clone();
         let previous_session_started = instance.session_started;
         let previous_auto_name = instance.auto_name.clone();
-        instance.session_id = Some(session_id);
+        instance.session_id = Some(binding.session_id);
         instance.session_started = true;
         instance.auto_name = None;
         self.bump_session_binding_generation(iid);
         if self.try_persist() {
-            crate::session_binding::clear_claude_binding(&data_dir, iid);
-            true
+            self.remember_claude_hook(iid, launch, binding.stamp);
+            acknowledge_claude_binding(record);
+            Some(switched_at)
         } else {
+            // The claimed record stays; the next claim retries it before any
+            // record the hook has written since.
             let instance = self
                 .workspace
                 .instance_mut(iid)
@@ -10095,7 +10628,20 @@ impl MuxelApp {
             instance.session_started = previous_session_started;
             instance.auto_name = previous_auto_name;
             self.bump_session_binding_generation(iid);
-            false
+            None
+        }
+    }
+
+    /// Remember the nonce of a hook record this launch has handled, so the same
+    /// record read again (deleting it failed) isn't another switch.
+    fn remember_claude_hook(
+        &mut self,
+        iid: Uuid,
+        launch: Option<Uuid>,
+        stamp: Option<crate::session_binding::ClaudeHookStamp>,
+    ) {
+        if let (Some(launch), Some(stamp)) = (launch, stamp) {
+            self.claude_hook_seen.insert(iid, (launch, stamp.nonce));
         }
     }
 
@@ -10245,6 +10791,8 @@ impl MuxelApp {
             resume_error: bool,
             submitted_turn: bool,
             restoring: bool,
+            runtime: muxel_terminal::TerminalRuntimeSnapshot,
+            binding_rev: u64,
         }
         let snapshot: Vec<Snap> = self
             .terminals
@@ -10256,6 +10804,8 @@ impl MuxelApp {
                     raw_status,
                     submitted_turn,
                     restoring,
+                    runtime,
+                    binding_rev,
                 } = self.terminal_activity_sample(*iid, v);
                 let exited = v.exited();
                 let exit_code = v.exit_code();
@@ -10293,6 +10843,8 @@ impl MuxelApp {
                     resume_error,
                     submitted_turn,
                     restoring,
+                    runtime,
+                    binding_rev,
                 }
             })
             .collect();
@@ -10328,6 +10880,8 @@ impl MuxelApp {
             resume_error,
             submitted_turn,
             restoring,
+            runtime,
+            binding_rev,
         } in snapshot
         {
             // A completion that happens in the pane the user is actively watching
@@ -10336,12 +10890,32 @@ impl MuxelApp {
             let pane_active = Some(iid) == focused;
             let owning_window_active = self.instance_window_active(iid);
             let attended = owning_window_active && pane_active;
-            let restored_state = self
-                .workspace
-                .instance(iid)
-                .and_then(|instance| instance.activity.current_state());
-            let previous = self.last_status.insert(iid, status);
-            let changed = previous != Some(status);
+            let (preserve_restored, keep_restore_guard) =
+                restored_activity_sample(restoring, submitted_turn, raw_status);
+            if !keep_restore_guard {
+                self.restoring_activity.remove(&iid);
+            }
+            let mut record = self.last_status.get(&iid).copied();
+            let previous = record.map(|seen| seen.status);
+            let effect = apply_status_sample(
+                &mut record,
+                self.workspace
+                    .instance_mut(iid)
+                    .map(|instance| &mut instance.activity),
+                StatusSample::from_runtime(
+                    runtime,
+                    binding_rev,
+                    status,
+                    attended,
+                    preserve_restored,
+                ),
+                now_epoch,
+            );
+            if let Some(record) = record {
+                self.last_status.insert(iid, record);
+            }
+            activity_changed |= effect.activity_changed;
+            let changed = effect.changed;
             if changed {
                 if status_notify_generation.is_none() {
                     status_notify_generation = ui_profile::begin_status_dirty();
@@ -10358,20 +10932,6 @@ impl MuxelApp {
                     );
                     status_transition_count += 1;
                 }
-            }
-            let (preserve_restored, keep_restore_guard) =
-                restored_activity_sample(restoring, submitted_turn, raw_status);
-            if !keep_restore_guard {
-                self.restoring_activity.remove(&iid);
-            }
-            if !preserve_restored && let Some(instance) = self.workspace.instance_mut(iid) {
-                activity_changed |= observe_terminal_activity(
-                    &mut instance.activity,
-                    previous,
-                    status,
-                    attended,
-                    now_epoch,
-                );
             }
             if let Some(instance) = self.workspace.instance(iid) {
                 let label =
@@ -10422,37 +10982,22 @@ impl MuxelApp {
                 }
                 muxel_store::append_event_log(&line);
             }
-            // The first live sample after restore describes durable state, not a
-            // new event. Do not notify again for a saved completion/block.
-            let restored_transition =
-                is_restored_transition(preserve_restored, status, restored_state);
-            if changed
-                && status == AgentStatus::Done
-                && !restored_transition
-                && self.auto_read_wanted(iid, pane_active)
-            {
+            if effect.completed && self.auto_read_wanted(iid, pane_active) {
                 to_read_aloud.push(iid);
             }
-            if changed && !attended && !restored_transition {
-                let kind = match status {
-                    AgentStatus::Blocked => Some(NotifKind::Blocked),
-                    AgentStatus::Done => Some(NotifKind::Done),
-                    _ => None,
-                };
-                if let Some(kind) = kind {
-                    // Collect the in-app entry regardless of the desktop toggle;
-                    // only the OS popup respects `notifications_enabled`.
-                    self.add_notification(iid, kind, &title, &project);
-                    // Skip the OS popup while the window is focused — no point
-                    // raising a desktop toast over the app you're already looking
-                    // at; the in-app feed already records it.
-                    if self.notifications_enabled && !self.window_active {
-                        notify(
-                            format!("{title} {}", kind.label()),
-                            project.clone(),
-                            Some(iid),
-                        );
-                    }
+            if let Some(kind) = effect.notify {
+                // Collect the in-app entry regardless of the desktop toggle;
+                // only the OS popup respects `notifications_enabled`.
+                self.add_notification(iid, kind, &title, &project);
+                // Skip the OS popup while the window is focused — no point
+                // raising a desktop toast over the app you're already looking
+                // at; the in-app feed already records it.
+                if self.notifications_enabled && !self.window_active {
+                    notify(
+                        format!("{title} {}", kind.label()),
+                        project.clone(),
+                        Some(iid),
+                    );
                 }
             }
             let tmux_session = self
@@ -10755,6 +11300,7 @@ impl MuxelApp {
             .map(|v| v.read(cx).session().clone())
         {
             session.write_input(self.continue_message_for(iid).as_bytes());
+            session.mark_turn_submitted();
             session.write_input(b"\r");
         }
     }
@@ -10989,7 +11535,7 @@ impl MuxelApp {
             &self.terminals,
             &self.popouts,
             PopOut::terminal_view,
-            |iid, _| self.last_status.get(&iid).copied(),
+            |iid, _| self.last_status.get(&iid).map(|seen| seen.status),
         );
         for iid in close {
             self.close_instance_inner(iid, "loop post-run", cx);
@@ -16153,7 +16699,11 @@ impl MuxelApp {
         };
         match popout.view {
             PaneView::Terminal(view) => {
-                let status = self.terminal_activity_sample(iid, view.read(cx)).status;
+                let sample = self.terminal_activity_sample(iid, view.read(cx));
+                let status = sample
+                    .runtime
+                    .is_attributable_to(sample.binding_rev)
+                    .then_some(sample.status);
                 if redock_terminal_resource(
                     &mut self.terminals,
                     &mut self.notifications,
@@ -17178,7 +17728,9 @@ impl MuxelApp {
         let payload = format!("{line}\r");
         for iid in self.broadcast_targets() {
             if let Some(view) = self.terminals.get(&iid) {
-                view.read(cx).session().write_input(payload.as_bytes());
+                let session = view.read(cx).session();
+                session.mark_turn_submitted();
+                session.write_input(payload.as_bytes());
             }
         }
         self.broadcast_input
@@ -17223,7 +17775,12 @@ impl MuxelApp {
         for step in steps {
             match step {
                 SnippetStep::Paste(text) => session.paste(text),
-                SnippetStep::Write(bytes) => session.write_input(bytes),
+                SnippetStep::Write(bytes) => {
+                    if bytes.ends_with(b"\r") {
+                        session.mark_turn_submitted();
+                    }
+                    session.write_input(bytes);
+                }
             }
         }
         self.focus_instance(iid, window, cx);
@@ -17538,7 +18095,9 @@ impl MuxelApp {
         iid: Uuid,
         terminal: &TerminalView,
     ) -> TerminalActivitySample {
-        let raw_status = terminal.status();
+        let runtime = terminal.runtime_snapshot();
+        let binding_rev = terminal.session().binding_revision();
+        let raw_status = runtime.status;
         let submitted_turn = terminal.session().has_submitted_turn();
         let instance = self.workspace.instance(iid);
         let startup_delay_ms = instance
@@ -17567,6 +18126,8 @@ impl MuxelApp {
             raw_status,
             submitted_turn,
             restoring,
+            runtime,
+            binding_rev,
         }
     }
 
@@ -17588,7 +18149,7 @@ impl MuxelApp {
             let attended = window
                 .update(cx, |_, window, _| window.is_window_active())
                 .unwrap_or(false);
-            let previous = self.last_status.insert(iid, sample.status);
+            let mut record = self.last_status.get(&iid).copied();
             let (preserve, keep_guard) = restored_activity_sample(
                 sample.restoring,
                 sample.submitted_turn,
@@ -17597,22 +18158,31 @@ impl MuxelApp {
             if !keep_guard {
                 self.restoring_activity.remove(&iid);
             }
-            if !preserve && let Some(instance) = self.workspace.instance_mut(iid) {
-                updates.persist |= observe_popout_activity(
-                    &mut instance.activity,
-                    previous,
+            let effect = apply_popout_status_sample(
+                &mut record,
+                self.workspace
+                    .instance_mut(iid)
+                    .map(|instance| &mut instance.activity),
+                StatusSample::from_runtime(
+                    sample.runtime,
+                    sample.binding_rev,
                     sample.status,
                     attended,
-                    now,
-                );
+                    preserve,
+                ),
+                now,
+            );
+            if let Some(record) = record {
+                self.last_status.insert(iid, record);
             }
+            updates.persist |= effect.activity_changed;
             if let Some(instance) = self.workspace.instance(iid) {
                 let label =
                     agent_activity_label(activity_state(sample.status), &instance.activity, now);
                 let previous_label = self.last_activity_labels.insert(iid, label.clone());
                 updates.redraw |= previous_label.as_ref() != Some(&label);
             }
-            updates.redraw |= previous != Some(sample.status);
+            updates.redraw |= effect.changed;
         }
         updates.redraw |= updates.persist;
         updates
@@ -17931,6 +18501,7 @@ impl MuxelApp {
         };
         session.paste(text);
         if submit {
+            session.mark_turn_submitted();
             session.write_input(b"\r");
         }
         self.focus_instance(iid, window, cx);
@@ -18310,8 +18881,7 @@ impl MuxelApp {
                 let status = self
                     .last_status
                     .get(iid)
-                    .copied()
-                    .unwrap_or(AgentStatus::Idle);
+                    .map_or(AgentStatus::Idle, |seen| seen.status);
                 // Show the status so you can spot at a glance which agents are
                 // waiting on you ("needs input") or done.
                 let status_word = match status {
@@ -29938,8 +30508,8 @@ mod toolbar_menu_tests {
 #[cfg(test)]
 mod grok_session_tests {
     use super::{
-        GrokActiveSession, active_grok_session_for_process, is_grok_program,
-        parse_grok_active_sessions,
+        GrokActiveSession, GrokRegistryRead, active_grok_session_for_process, grok_switch_interval,
+        is_grok_program, parse_grok_active_sessions,
     };
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
@@ -29954,12 +30524,63 @@ mod grok_session_tests {
         let parents = HashMap::from([(300, 200), (200, 100)]);
 
         assert_eq!(
-            active_grok_session_for_process(100, &active, &parents).as_deref(),
+            active_grok_session_for_process(100, &active, &parents)
+                .map(|session| session.session_id.as_str()),
             Some("559929ad-a189-4107-9acf-bf63458be632")
         );
         assert_eq!(
             active_grok_session_for_process(999, &active, &parents),
             None
+        );
+    }
+
+    #[test]
+    fn a_grok_switch_interval_never_ends_before_the_switch() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let at = |ms: u64| UNIX_EPOCH + Duration::from_millis(ms);
+        let second = 1_800_000_000_000;
+        let previous = GrokRegistryRead {
+            started: at(second - 1_000),
+            finished: at(second - 990),
+        };
+        let read = GrokRegistryRead {
+            started: at(second + 2_000),
+            finished: at(second + 2_040),
+        };
+        // Grok switched at .700 into a second and registered the row with
+        // that whole second. The old conversation's Enter came at .300.
+        let mut session = GrokActiveSession {
+            session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            pid: 300,
+            opened_at: Utc.timestamp_millis_opt(second as i64).unwrap(),
+        };
+        let (switched, enter) = (at(second + 700), at(second + 300));
+        let (from, to) = grok_switch_interval(&session, Some(previous), read);
+        assert!(from <= switched && switched <= to);
+        // Input counts in the new binding only after `to`.
+        assert!(enter <= to, "the Enter stays the old conversation's");
+        assert_eq!(to, at(second + 1_000), "to the second's last instant");
+        // A time written to the millisecond is good to the millisecond.
+        session.opened_at = Utc.timestamp_millis_opt(second as i64 + 700).unwrap();
+        assert_eq!(
+            grok_switch_interval(&session, Some(previous), read),
+            (at(second + 700), at(second + 701))
+        );
+
+        // An older row has no registration time. Grok switched after the
+        // previous read began and before this one returned, perhaps while
+        // this one ran; the old conversation's Enter just before that is
+        // still the old conversation's.
+        session.opened_at = chrono::DateTime::UNIX_EPOCH;
+        let (switched, enter) = (at(second + 2_020), at(second + 2_010));
+        let (from, to) = grok_switch_interval(&session, Some(previous), read);
+        assert_eq!((from, to), (previous.started, read.finished));
+        assert!(from <= switched && switched <= to);
+        assert!(enter <= to, "the Enter stays the old conversation's");
+        // With no earlier read, it could have been any time.
+        assert_eq!(
+            grok_switch_interval(&session, None, read),
+            (UNIX_EPOCH, read.finished)
         );
     }
 
@@ -29979,7 +30600,8 @@ mod grok_session_tests {
         ];
 
         assert_eq!(
-            active_grok_session_for_process(300, &active, &HashMap::new()).as_deref(),
+            active_grok_session_for_process(300, &active, &HashMap::new())
+                .map(|session| session.session_id.as_str()),
             Some("22222222-2222-4222-8222-222222222222")
         );
     }
@@ -31051,7 +31673,7 @@ mod agent_notification_tests {
             let view = popouts.remove(&pane).unwrap().unwrap();
             let status = *view;
             let changed =
-                redock_terminal_resource(&mut docked, &mut notifications, pane, view, status);
+                redock_terminal_resource(&mut docked, &mut notifications, pane, view, Some(status));
 
             assert_eq!(
                 notifications.iter().map(|card| card.id).collect::<Vec<_>>(),
@@ -31063,6 +31685,25 @@ mod agent_notification_tests {
             assert!(popouts.is_empty());
             assert_eq!(last_status, cached, "redock must preserve the status cache");
         }
+    }
+
+    #[test]
+    fn redock_preserves_attention_when_the_new_binding_is_uncertain() {
+        let pane = Uuid::new_v4();
+        let terminal = Arc::new(AgentStatus::Working);
+        let mut docked = HashMap::new();
+        let mut notifications = vec![notification(Some(pane), NotifKind::Done)];
+        let card = notifications[0].id;
+        assert!(!redock_terminal_resource(
+            &mut docked,
+            &mut notifications,
+            pane,
+            terminal.clone(),
+            None,
+        ));
+        assert!(Arc::ptr_eq(docked.get(&pane).unwrap(), &terminal));
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].id, card);
     }
 
     #[test]
@@ -31080,7 +31721,7 @@ mod agent_notification_tests {
                 &mut notifications,
                 pane,
                 status,
-                status,
+                Some(status),
             ));
             assert_eq!(docked.get(&pane), Some(&status));
             assert_eq!(notifications.len(), 1);
@@ -31260,7 +31901,10 @@ mod terminal_lookup_tests {
 
 #[cfg(test)]
 mod popout_activity_tests {
-    use super::{observe_popout_activity, popout_terminal_views, terminal_view_in};
+    use super::{
+        SeenStatus, StatusBinding, StatusSample, apply_popout_status_sample,
+        observe_popout_activity, popout_terminal_views, terminal_view_in,
+    };
     use muxel_core::control::{
         AgentState, REPLY_GRACE_MS, WaitOutcome, awaiting_reply, wait_outcome,
     };
@@ -31268,6 +31912,91 @@ mod popout_activity_tests {
     use muxel_terminal::AgentStatus;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[test]
+    fn uncertain_popout_sample_preserves_record_activity_and_unread_completion() {
+        let binding = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 1,
+        };
+        let mut record = Some(SeenStatus {
+            status: AgentStatus::Done,
+            binding,
+        });
+        let before_record = record;
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            200,
+        );
+        let before_activity = activity.clone();
+        let effect = apply_popout_status_sample(
+            &mut record,
+            Some(&mut activity),
+            StatusSample {
+                status: AgentStatus::Done,
+                binding: StatusBinding { rev: 2, ..binding },
+                attributable: false,
+                attended: true,
+                preserve_restored: false,
+            },
+            300,
+        );
+        assert!(!effect.changed && !effect.activity_changed);
+        assert_eq!(record, before_record);
+        assert_eq!(activity, before_activity);
+        assert!(activity.has_unattended_completion());
+    }
+
+    #[test]
+    fn new_popout_binding_records_completion_and_later_attendance_without_alerts() {
+        let binding = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 1,
+        };
+        let mut record = Some(SeenStatus {
+            status: AgentStatus::Done,
+            binding,
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(None, AgentActivityState::Working, 100);
+        activity.observe(
+            Some(AgentActivityState::Working),
+            AgentActivityState::Done,
+            200,
+        );
+        let sample = StatusSample {
+            status: AgentStatus::Done,
+            binding: StatusBinding { rev: 2, ..binding },
+            attributable: true,
+            attended: false,
+            preserve_restored: false,
+        };
+        let completed = apply_popout_status_sample(&mut record, Some(&mut activity), sample, 300);
+        assert!(completed.changed && completed.activity_changed);
+        assert!(completed.notify.is_none() && !completed.completed);
+        assert_eq!(activity.completed_at, Some(300));
+        assert!(
+            !apply_popout_status_sample(&mut record, Some(&mut activity), sample, 400)
+                .activity_changed
+        );
+        let attended = StatusSample {
+            attended: true,
+            ..sample
+        };
+        assert!(
+            apply_popout_status_sample(&mut record, Some(&mut activity), attended, 500)
+                .activity_changed
+        );
+        assert_eq!(activity.completed_at, Some(300));
+        assert_eq!(activity.last_attended_at, Some(500));
+        assert!(
+            !apply_popout_status_sample(&mut record, Some(&mut activity), attended, 600)
+                .activity_changed
+        );
+    }
 
     #[test]
     fn popout_activity_finishes_ctl_wait_before_grace_for_done_and_blocked() {

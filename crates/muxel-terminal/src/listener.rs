@@ -7,21 +7,325 @@ use crate::replies::Replies;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::term::ClipboardType;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Shared, thread-safe handle to the PTY's input side.
 pub(crate) type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
-/// Forwards terminal events to shared state. Lives inside the `Term`, so its
+const MAX_TITLE_EVENTS: usize = 64;
+const MAX_TITLE_EVENT_BYTES: usize = 16 * 1024;
+
+/// Attribution allowance around a provider switch reported out of band.
+/// The reporter's time trails the switch:
+/// Claude's hook stamps its record once Claude has spawned the hook process and
+/// it has started, and Grok's registry time may be whole seconds. PTY output
+/// carries when the reader received it, which trails the provider's write by
+/// the ConPTY or tmux relay, the reader's scheduling, and up to the 150 ms vte
+/// holds a synchronized update. Two seconds is an allowance, not a bound on
+/// either delay; older output read beyond the window can appear fresh. A turn
+/// starting and finishing inside the window shows no Done.
+pub(crate) const SWITCH_SLACK: Duration = Duration::from_secs(2);
+
+/// Where one piece of lifecycle evidence (an OSC title, a bell, a submitted
+/// turn) falls in this PTY's evidence order. The sequence orders evidence
+/// exactly; the wall-clock time places it against a provider switch that is
+/// reported out of band, such as a hook's record read on a later tick. For PTY
+/// output, the time is when the reader received the bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvidenceMark {
+    seq: u64,
+    at: SystemTime,
+}
+
+struct TitleEvent {
+    mark: EvidenceMark,
+    title: Option<String>,
+}
+
+/// Recent OSC title edges, oldest first, bounded by count and bytes. Reading
+/// does not consume them: the reader keeps a cursor, so it can read a new
+/// binding's edges from its start.
+#[derive(Default)]
+struct TitleEventBuffer {
+    events: VecDeque<TitleEvent>,
+    bytes: usize,
+    /// The newest edge dropped to stay within bounds. A reader whose cursor is
+    /// behind it has missed an edge.
+    evicted: Option<EvidenceMark>,
+}
+
+impl TitleEventBuffer {
+    fn push(&mut self, mark: EvidenceMark, title: Option<String>) {
+        let bytes = title.as_ref().map_or(0, String::len);
+        if bytes > MAX_TITLE_EVENT_BYTES {
+            self.events.clear();
+            self.bytes = 0;
+            self.evicted = Some(mark);
+            return;
+        }
+        while self.events.len() >= MAX_TITLE_EVENTS
+            || self.bytes.saturating_add(bytes) > MAX_TITLE_EVENT_BYTES
+        {
+            let Some(dropped) = self.events.pop_front() else {
+                break;
+            };
+            self.bytes -= dropped.title.as_ref().map_or(0, String::len);
+            self.evicted = Some(dropped.mark);
+        }
+        self.bytes += bytes;
+        self.events.push_back(TitleEvent { mark, title });
+    }
+
+    /// The edges after `cursor` that were read after `fresh_after` (every one,
+    /// when `None`), the cursor past all edges after `cursor`, and whether an
+    /// edge after `cursor` was evicted.
+    fn after(
+        &self,
+        cursor: u64,
+        fresh_after: Option<SystemTime>,
+    ) -> (Vec<Option<String>>, u64, bool) {
+        let titles = self
+            .events
+            .iter()
+            .filter(|event| event.mark.seq > cursor)
+            .filter(|event| fresh_after.is_none_or(|after| event.mark.at > after))
+            .map(|event| event.title.clone())
+            .collect();
+        let evicted = self.evicted.map_or(0, |mark| mark.seq);
+        let last = self.events.back().map_or(0, |event| event.mark.seq);
+        (titles, cursor.max(last).max(evicted), evicted > cursor)
+    }
+}
+
+/// One read of the evidence for the runtime reducer.
+pub(crate) struct EvidenceRead {
+    /// Title edges after the reader's cursor, in order, except those read
+    /// inside a switch window: those can't form a completion edge.
+    pub titles: Vec<Option<String>>,
+    /// The cursor for the next read.
+    pub cursor: u64,
+    /// An edge after the cursor was evicted unread.
+    pub overflowed: bool,
+    /// A turn was submitted in the current binding: after the title that began
+    /// it, or after the latest instant a switch reported out of band can have
+    /// happened.
+    pub submitted: bool,
+    /// The binding began at a switch reported out of band and has no fresh
+    /// evidence yet, so the level state may still be the old conversation's.
+    pub settling: bool,
+    /// The binding began at a switch reported out of band.
+    pub windowed: bool,
+}
+
+/// Which current evidence a binding switch retired.
+pub(crate) struct BindingSwitch {
+    pub title: bool,
+    pub bell: bool,
+}
+
+/// Where a switch reported out of band stops being ambiguous. Output read
+/// before the switch could have happened, less [`SWITCH_SLACK`], is the old
+/// conversation's. Evidence after these points is the new one's. Evidence in
+/// between could be either: it shows as level state and decides nothing.
+#[derive(Clone, Copy, Debug)]
+struct SwitchWindow {
+    /// The latest the switch can have happened. Input written after it went to
+    /// the new conversation; input has no read lag.
+    input_after: SystemTime,
+    /// When muxel learned of the switch, or `input_after` plus the slack if
+    /// that is later. Output read after it is the new conversation's.
+    output_after: SystemTime,
+}
+
+/// A PTY launch's lifecycle evidence, in one order, and the provider binding
+/// (conversation) it belongs to. A binding begins at a sequence number;
+/// evidence recorded before it belongs to the conversation it replaced. A
+/// binding begun by a switch reported out of band also has a window: evidence
+/// inside it is ambiguous.
+#[derive(Default)]
+pub(crate) struct LifecycleEvidence {
+    seq: u64,
+    titles: TitleEventBuffer,
+    /// The edge that set (or reset) the current title.
+    title: Option<EvidenceMark>,
+    /// The latest bell. Acknowledging it clears the session's flag, not this.
+    bell: Option<EvidenceMark>,
+    submitted: Option<EvidenceMark>,
+    binding_rev: u64,
+    binding_since: u64,
+    /// The window of the switch reported out of band that began the current
+    /// binding, if one did.
+    window: Option<SwitchWindow>,
+    /// When the reader received the output being parsed.
+    reading_at: Option<SystemTime>,
+    /// Output read after the window has been parsed.
+    fresh_output: bool,
+}
+
+impl LifecycleEvidence {
+    /// The parser is about to apply output the reader received at `at`.
+    pub(crate) fn begin_read(&mut self, at: SystemTime) {
+        self.reading_at = Some(at);
+        self.fresh_output |= self.output_is_fresh(at);
+    }
+
+    pub(crate) fn end_read(&mut self) {
+        self.reading_at = None;
+    }
+
+    /// When the output raising an event was read: the chunk being parsed, or
+    /// now for an event raised outside one.
+    pub(crate) fn output_time(&self) -> SystemTime {
+        self.reading_at.unwrap_or_else(SystemTime::now)
+    }
+
+    fn output_is_fresh(&self, at: SystemTime) -> bool {
+        self.window.is_none_or(|window| at > window.output_after)
+    }
+
+    fn mark(&mut self, at: SystemTime) -> EvidenceMark {
+        self.seq += 1;
+        EvidenceMark { seq: self.seq, at }
+    }
+
+    /// Record an OSC title (or its reset); returns its sequence number.
+    pub(crate) fn record_title(&mut self, title: Option<String>, at: SystemTime) -> u64 {
+        let mark = self.mark(at);
+        self.titles.push(mark, title);
+        self.title = Some(mark);
+        mark.seq
+    }
+
+    /// Record a bell; returns whether it rings for the current binding. One
+    /// read inside a switch window may be the old conversation's last turn.
+    pub(crate) fn record_bell(&mut self, at: SystemTime) -> bool {
+        self.bell = Some(self.mark(at));
+        self.output_is_fresh(at)
+    }
+
+    pub(crate) fn record_submission(&mut self, at: SystemTime) {
+        self.submitted = Some(self.mark(at));
+    }
+
+    pub(crate) fn binding_rev(&self) -> u64 {
+        self.binding_rev
+    }
+
+    /// Begin a new binding at sequence `since`, a provider title in the output
+    /// itself. The order is exact: evidence before it belongs to the retired
+    /// conversation, evidence from `since` on is the new one's, and no window
+    /// is needed.
+    pub(crate) fn begin_binding(&mut self, since: u64) -> BindingSwitch {
+        self.window = None;
+        self.advance_binding(since)
+    }
+
+    fn advance_binding(&mut self, since: u64) -> BindingSwitch {
+        let since = since.max(self.binding_since);
+        self.binding_rev += 1;
+        self.binding_since = since;
+        let retired = |mark: Option<EvidenceMark>| mark.is_some_and(|mark| mark.seq < since);
+        let switch = BindingSwitch {
+            title: retired(self.title),
+            bell: retired(self.bell),
+        };
+        if switch.bell {
+            self.bell = None;
+        }
+        switch
+    }
+
+    /// Begin a new binding for a switch reported out of band: the provider
+    /// switched at some instant in `[from, to]`, and muxel learned of it at
+    /// `learned_at`. The current title is retired if it was read before `from`
+    /// less the slack, and any bell is. Everything else recorded so far, and
+    /// output read until the window closes, is ambiguous.
+    pub(crate) fn switch_binding(
+        &mut self,
+        from: SystemTime,
+        to: SystemTime,
+        learned_at: SystemTime,
+    ) -> BindingSwitch {
+        let window = SwitchWindow {
+            input_after: to,
+            output_after: learned_at.max(to.checked_add(SWITCH_SLACK).unwrap_or(to)),
+        };
+        // A later report never shortens an earlier window.
+        self.window = Some(match self.window {
+            Some(open) => SwitchWindow {
+                input_after: open.input_after.max(window.input_after),
+                output_after: open.output_after.max(window.output_after),
+            },
+            None => window,
+        });
+        self.fresh_output = false;
+        let old_before = from
+            .checked_sub(SWITCH_SLACK)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let old_title = self.title.is_some_and(|mark| mark.at < old_before);
+        let mut switch = self.advance_binding(self.seq + 1);
+        switch.title = old_title;
+        if old_title {
+            self.title = None;
+        }
+        switch
+    }
+
+    /// Read for the reducer. `cursor: None` reads the current binding's title
+    /// edges from its start; a cursor never reaches back into a retired
+    /// binding.
+    pub(crate) fn read(&self, cursor: Option<u64>) -> EvidenceRead {
+        let start = self.binding_since.saturating_sub(1);
+        let cursor = cursor.map_or(start, |cursor| cursor.max(start));
+        let window = self.window;
+        let (titles, cursor, overflowed) = self
+            .titles
+            .after(cursor, window.map(|window| window.output_after));
+        EvidenceRead {
+            titles,
+            cursor,
+            overflowed,
+            submitted: self.submitted.is_some_and(|mark| match window {
+                // Input written after the switch went to the new conversation,
+                // even before muxel learned of the switch.
+                Some(window) => mark.at > window.input_after,
+                None => mark.seq >= self.binding_since,
+            }),
+            settling: self.settling(),
+            windowed: window.is_some(),
+        }
+    }
+
+    /// After a switch reported out of band, until fresh evidence sets the
+    /// level state: the current title was read inside the window, or there is
+    /// none and no output read after the window has been parsed.
+    fn settling(&self) -> bool {
+        let Some(window) = self.window else {
+            return false;
+        };
+        match self.title {
+            Some(mark) => mark.at <= window.output_after,
+            None => !self.fresh_output,
+        }
+    }
+}
+
+// Forwards terminal events to shared state. Lives inside the `Term`, so its
 /// `send_event` runs wherever the VTE processor is advanced (the GPUI thread) —
 /// and while the `Term` mutex is held, so it must never call back into the
 /// session; it only touches its own shared state and the PTY writer.
 pub(crate) struct MuxelListener {
     pub replies: Arc<Replies>,
     pub title: Arc<Mutex<Option<String>>>,
+    /// Title edges, bells and submissions in one order, and the provider
+    /// binding they belong to. The binding advances only when a provider
+    /// publishes a different UUID-shaped thread (or the app reports a switch);
+    /// ordinary spinner/title frames for the same conversation do not churn it.
+    pub evidence: Arc<Mutex<LifecycleEvidence>>,
     /// Monotonic sequence for OSC title changes, including ResetTitle. Consumers
     /// use it to distinguish a repeated title event from an unchanged snapshot.
     pub title_generation: Arc<AtomicU64>,
@@ -58,19 +362,44 @@ impl EventListener for MuxelListener {
         match event {
             Event::Title(title) => {
                 let mut hint = self.session_id_hint.lock();
-                if session_thread_field(&title).is_some() {
+                let mut evidence = self.evidence.lock();
+                let at = evidence.output_time();
+                let seq = evidence.record_title(Some(title.clone()), at);
+                if let Some(next) = session_thread_field(&title) {
+                    let changed = hint.as_deref().and_then(session_thread_field) != Some(next);
                     *hint = Some(title.clone());
+                    if changed {
+                        // This title opens the new provider binding. Frames
+                        // before it belong to the retired conversation and
+                        // cannot seed the new reducer. So does a bell that
+                        // rang before it; one after it (same batch included)
+                        // belongs to the new binding and survives.
+                        if evidence.begin_binding(seq).bell {
+                            self.bell.store(false, Ordering::Relaxed);
+                        }
+                    }
                 }
                 *self.title.lock() = Some(title);
                 *self.title_changed_at.lock() = Some(Instant::now());
                 self.title_generation.fetch_add(1, Ordering::Relaxed);
             }
             Event::ResetTitle => {
+                {
+                    let mut evidence = self.evidence.lock();
+                    let at = evidence.output_time();
+                    evidence.record_title(None, at);
+                }
                 *self.title.lock() = None;
                 *self.title_changed_at.lock() = Some(Instant::now());
                 self.title_generation.fetch_add(1, Ordering::Relaxed);
             }
-            Event::Bell => self.bell.store(true, Ordering::Relaxed),
+            Event::Bell => {
+                let mut evidence = self.evidence.lock();
+                let at = evidence.output_time();
+                if evidence.record_bell(at) {
+                    self.bell.store(true, Ordering::Relaxed);
+                }
+            }
             // Apps query the terminal (cursor position, device attributes, …);
             // the reply must go back to the PTY's stdin. Those the reader thread
             // already answered are dropped here, the rest kept in query order.
@@ -105,6 +434,7 @@ mod tests {
                 Vec::<u8>::new(),
             ))))),
             title: Arc::new(Mutex::new(None)),
+            evidence: Arc::new(Mutex::new(LifecycleEvidence::default())),
             title_generation: Arc::new(AtomicU64::new(0)),
             title_changed_at: Arc::new(Mutex::new(None)),
             session_id_hint: hint.clone(),
@@ -117,18 +447,191 @@ mod tests {
         let first_frame = format!("{}... | Starting ⠹", &first[..29]);
         listener.send_event(Event::Title(first_frame.clone()));
         assert_eq!(listener.title_generation.load(Ordering::Relaxed), 1);
+        assert_eq!(listener.evidence.lock().binding_rev(), 1);
         assert_eq!(hint.lock().as_deref(), Some(first_frame.as_str()));
         listener.send_event(Event::Title("Renamed conversation | Ready".to_string()));
         assert_eq!(listener.title_generation.load(Ordering::Relaxed), 2);
+        assert_eq!(listener.evidence.lock().binding_rev(), 1);
         assert_eq!(hint.lock().as_deref(), Some(first_frame.as_str()));
 
         listener.send_event(Event::Title(format!("Review {resumed} | Ready ·")));
         assert_eq!(hint.lock().as_deref(), Some(first_frame.as_str()));
+        assert_eq!(listener.evidence.lock().binding_rev(), 1);
 
+        // The retired conversation's bell dies with its binding; a bell after
+        // the new title, even in the same drained batch, is the new one's.
+        listener.send_event(Event::Bell);
         listener.send_event(Event::Title(resumed.to_string()));
+        assert!(!listener.bell.load(Ordering::Relaxed));
+        listener.send_event(Event::Bell);
+        assert!(listener.bell.load(Ordering::Relaxed));
         assert_eq!(hint.lock().as_deref(), Some(resumed));
+        assert_eq!(listener.evidence.lock().binding_rev(), 2);
+        // A reader that never saw the switch reads only the new binding's edges.
+        let read = listener.evidence.lock().read(Some(0));
+        assert!(!read.overflowed);
+        assert_eq!(read.titles, vec![Some(resumed.to_string())]);
         listener.send_event(Event::ResetTitle);
         assert_eq!(listener.title_generation.load(Ordering::Relaxed), 5);
         assert_eq!(*listener.title.lock(), None);
+    }
+
+    #[test]
+    fn title_edges_are_bounded_and_report_overflow() {
+        let at = SystemTime::now();
+        let mut evidence = LifecycleEvidence::default();
+        for index in 0..=MAX_TITLE_EVENTS {
+            evidence.record_title(Some(format!("title-{index}")), at);
+        }
+        let read = evidence.read(None);
+        assert_eq!(read.titles.len(), MAX_TITLE_EVENTS);
+        assert!(read.overflowed);
+        assert_eq!(
+            read.titles.last().and_then(Option::as_deref),
+            Some("title-64")
+        );
+        // Reading doesn't consume; the cursor moves past what was read.
+        let read = evidence.read(Some(read.cursor));
+        assert!(read.titles.is_empty());
+        assert!(!read.overflowed);
+
+        let cursor = read.cursor;
+        evidence.record_title(Some("x".repeat(MAX_TITLE_EVENT_BYTES + 1)), at);
+        let read = evidence.read(Some(cursor));
+        assert!(read.titles.is_empty());
+        assert!(read.overflowed);
+    }
+
+    #[test]
+    fn a_switch_window_retires_old_evidence_and_holds_ambiguous_evidence() {
+        let t0 = SystemTime::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let slack = SWITCH_SLACK.as_millis() as u64;
+        let mut evidence = LifecycleEvidence::default();
+        // Long before the hook ran at 10 s: the old conversation's.
+        evidence.record_submission(at(1_000));
+        evidence.record_title(Some("old idle".into()), at(1_000));
+        assert!(evidence.record_bell(at(1_000)));
+        // Inside the window: Claude switches before its hook runs.
+        evidence.record_title(Some("working".into()), at(9_500));
+        evidence.record_title(Some("idle".into()), at(9_900));
+        // Input after the hook ran went to the new conversation, even before
+        // muxel's tick read the record.
+        evidence.record_submission(at(10_100));
+
+        let switch = evidence.switch_binding(at(10_000), at(10_000), at(10_400));
+        assert!(
+            !switch.title,
+            "the current title was read inside the window"
+        );
+        assert!(switch.bell);
+        assert_eq!(evidence.binding_rev(), 1);
+        let read = evidence.read(None);
+        assert!(
+            read.titles.is_empty(),
+            "nothing recorded so far forms an edge"
+        );
+        assert!(read.submitted);
+        assert!(read.settling);
+
+        // Output read until the window closes is still ambiguous.
+        evidence.record_title(Some("late working".into()), at(10_000 + slack));
+        assert!(
+            !evidence.record_bell(at(10_000 + slack)),
+            "a bell in the window rings for no binding"
+        );
+        let read = evidence.read(None);
+        assert!(read.titles.is_empty());
+        assert!(read.settling);
+
+        // Output read after it is the new conversation's.
+        evidence.record_title(Some("fresh".into()), at(10_001 + slack));
+        assert!(evidence.record_bell(at(10_001 + slack)));
+        let read = evidence.read(None);
+        assert_eq!(read.titles, vec![Some("fresh".into())]);
+        assert!(!read.settling);
+    }
+
+    #[test]
+    fn a_switch_retires_a_title_read_before_it_could_have_happened() {
+        let t0 = SystemTime::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let slack = SWITCH_SLACK.as_millis() as u64;
+        let mut evidence = LifecycleEvidence::default();
+        evidence.record_submission(at(9_000));
+        evidence.record_title(Some("old idle".into()), at(9_999 - slack));
+        let switch = evidence.switch_binding(at(10_000), at(10_000), at(10_400));
+        assert!(switch.title);
+        assert!(!evidence.read(None).submitted, "the Enter that picked it");
+        // With no title, output read after the window ends the wait.
+        assert!(evidence.read(None).settling);
+        evidence.begin_read(at(10_000 + slack));
+        evidence.end_read();
+        assert!(evidence.read(None).settling);
+        evidence.begin_read(at(10_001 + slack));
+        evidence.end_read();
+        assert!(!evidence.read(None).settling);
+    }
+
+    #[test]
+    fn a_window_lasts_until_muxel_learns_of_the_switch() {
+        let t0 = SystemTime::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut evidence = LifecycleEvidence::default();
+        // A registry row with no time of its own: Grok switched somewhere
+        // between two reads, the second at 1 s. Muxel applies it at 5 s.
+        evidence.record_title(Some("new idle".into()), at(500));
+        let switch = evidence.switch_binding(at(0), at(1_000), at(5_000));
+        assert!(!switch.title, "it may be the new conversation's");
+        evidence.record_title(Some("working".into()), at(4_000));
+        assert!(evidence.read(None).titles.is_empty());
+        evidence.record_title(Some("working".into()), at(5_001));
+        assert_eq!(evidence.read(None).titles.len(), 1);
+    }
+
+    #[test]
+    fn a_later_switch_never_shortens_an_earlier_window() {
+        let t0 = SystemTime::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut evidence = LifecycleEvidence::default();
+        evidence.switch_binding(at(10_000), at(10_000), at(20_000));
+        // A second report whose times fall before the first was learned.
+        evidence.switch_binding(at(1_000), at(1_000), at(1_500));
+        assert_eq!(evidence.binding_rev(), 2);
+        evidence.record_title(Some("queued".into()), at(15_000));
+        evidence.record_submission(at(5_000));
+        let read = evidence.read(None);
+        assert!(read.titles.is_empty());
+        assert!(!read.submitted);
+    }
+
+    #[test]
+    fn a_switch_inside_lost_title_edges_reports_the_loss() {
+        let t0 = SystemTime::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let slack = SWITCH_SLACK.as_millis() as u64;
+        let mut evidence = LifecycleEvidence::default();
+        evidence.record_title(Some("old".into()), at(1));
+        evidence.switch_binding(at(5), at(5), at(10));
+        // More of the new conversation's frames than the buffer holds.
+        for index in 0..MAX_TITLE_EVENTS + 4 {
+            evidence.record_title(Some(format!("new-{index}")), at(10 + slack + index as u64));
+        }
+        let read = evidence.read(None);
+        assert!(read.overflowed, "edges of the new binding were evicted");
+    }
+
+    #[test]
+    fn a_submission_counts_only_in_the_binding_it_was_made_in() {
+        let at = SystemTime::now();
+        let mut evidence = LifecycleEvidence::default();
+        evidence.record_submission(at);
+        assert!(evidence.read(None).submitted);
+        // A provider title opens a new binding after the Enter that chose it.
+        let seq = evidence.record_title(Some("resumed".into()), at);
+        evidence.begin_binding(seq);
+        assert!(!evidence.read(None).submitted);
+        evidence.record_submission(at);
+        assert!(evidence.read(None).submitted);
     }
 }
