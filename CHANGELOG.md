@@ -5,6 +5,34 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-09-22
+
+### Fixed
+- **A remote agent you close stays closed** — closing a remote pane told the host to
+  kill the pane's tmux session and never checked the result, and that one instruction
+  cannot answer the question on its own: it fails the same way whether the session was
+  already gone or the request never landed at all. A kill that lost a race with the
+  connection the pane was tearing down, or hit a brief network blip, left the agent
+  running on the host with nothing pointing at it — and the next time muxel connected
+  to that host it found a muxel session no pane owned and adopted it straight back into
+  a pane. The close looked like it had worked right up until muxel restarted and undid
+  it. muxel now confirms with the host that the session is really gone. A close it
+  cannot confirm is remembered and retried over the following half-minute, and anything
+  still unfinished is finished on the next connect to that host, aimed at the session's
+  real name even if you renamed the host in between. Until a close is confirmed, muxel
+  refuses to adopt that session back into a pane, so an agent you closed stays closed
+  across a restart even if the host never becomes reachable again. Unconfirmed closes
+  are listed in the developer log.
+- **Restarting a remote agent no longer reattaches the one already running** — closing
+  and restarting both decided whether to stop the agent on the host by looking at
+  whether that host was *currently* set to run its panes in tmux. Turning that setting
+  off after a pane had already launched skipped the remote stop entirely and aimed the
+  local one at a session name that only ever existed on the host, so nothing was
+  stopped anywhere. muxel now decides from whether the host has tmux at all, which
+  cannot change out from under a running pane. Restart also says when it could not stop
+  the agent, rather than reattaching to the agent that was still running and presenting
+  it as a fresh start.
+
 ## [0.2.1] — 2026-09-15
 
 ### Added
