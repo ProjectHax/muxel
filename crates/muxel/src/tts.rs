@@ -1,22 +1,22 @@
-//! Text-to-speech I/O: the voice muxel can answer in.
+//! Text-to-speech I/O: the voice muxel reads agents' replies aloud in.
 //!
-//! **Nothing calls this today.** It was built for the spoken wake command, which
-//! was cut; it is kept — whole, working and documented — because the next feature
-//! that wants to say something out loud should not have to rediscover any of it.
-//! To wire it up: build a [`VoiceConfig`] from `Settings` (the `tts_*` fields are
-//! still persisted) and call [`speak`]. Hence the `dead_code` allowance below:
-//! this module is deliberately parked, not accidentally orphaned.
+//! Read-aloud (the toolbar speaker, the `ReadAloud` shortcut, and auto-read when
+//! an agent finishes) builds a [`VoiceConfig`] from `Settings` and calls
+//! [`speak`]; the [`Speech`] it gets back stops the voice mid-sentence and says
+//! when it has finished. Everything that decides *what* is said — finding the
+//! reply, dropping the code — is pure and lives in `muxel_core::readaloud`.
 //!
 //! The Kokoro (Local) engine is behind the off-by-default `voice-local` cargo
-//! feature, because onnxruntime links statically and costs ~63 MB of binary — too
-//! much to carry for a feature nothing calls yet. System and Provider need no
-//! feature: cpal is already here for the microphone, and ureq for HTTP.
+//! feature, because onnxruntime links statically and costs ~63 MB of binary.
+//! System and Provider need no feature: cpal is already here for the microphone,
+//! and ureq for HTTP.
 //!
 //! Three engines, mirroring the speech-to-text side:
 //!
 //! - **System** — the synthesizer the OS already ships (`say`, SAPI, `spd-say` /
 //!   `espeak`). Needs no model, no key and no network, so it is the default and
-//!   the floor everything else falls back to. It also sounds like 1998.
+//!   the floor everything else falls back to. Its voice and pace are the OS's, so
+//!   they follow the user's system voice and the rate setting.
 //! - **Local** — Kokoro-82M on onnxruntime, in-process and fully offline, with the
 //!   weights downloaded once into the data dir exactly like the whisper model.
 //! - **Provider** — a cloud OpenAI-compatible `/audio/speech` endpoint, reusing
@@ -29,21 +29,22 @@
 //!
 //! Synthesis and playback are separate threads joined by a channel, so sound
 //! starts on the first chunk rather than the last. That is not a nicety: Kokoro
-//! renders at ~1.4× real time, so rendering a whole greeting before playing it
-//! would open with four seconds of silence.
+//! renders at ~1.4× real time, so rendering a whole reply before playing it would
+//! open with seconds of silence.
 //!
-//! Speech should never be the only channel — whatever speaks next should still
-//! report on screen. So every failure here degrades rather than raises: a provider
-//! that 500s, a model that won't download, a machine with no voice at all — it
-//! falls back to the system voice, and failing that, stays quiet.
+//! Speech is never the only channel — the reply is still on screen. So every
+//! failure here degrades rather than raises: a provider that 500s, a model that
+//! won't download, a machine with no voice at all — it falls back to the system
+//! voice, and failing that, stays quiet.
 
-// Parked, not orphaned — see the module docs. Remove this the moment something
-// speaks again.
-#![allow(dead_code)]
-
-use std::path::{Path, PathBuf};
+#[cfg(feature = "voice-local")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -55,8 +56,16 @@ use muxel_core::TtsEngine;
 #[derive(Clone)]
 pub struct VoiceConfig {
     pub engine: TtsEngine,
-    /// Kokoro voice + weights (Local).
+    /// Speaking pace as a multiple of normal (`muxel_core::tts::clamp_rate`
+    /// range). Honored by the System and Provider voices; Kokoro speaks at its
+    /// own pace.
+    pub rate: f32,
+    /// The OS voice to use by name (System); empty = the OS default.
+    pub system_voice: String,
+    /// Kokoro voice + weights (Local). Only read when Kokoro is compiled in.
+    #[cfg_attr(not(feature = "voice-local"), allow(dead_code))]
     pub local_voice: String,
+    #[cfg_attr(not(feature = "voice-local"), allow(dead_code))]
     pub local_model: String,
     /// Endpoint, key, model and voice (Provider). The URL and key are the ones
     /// the Speech section already stores — one provider serves both directions.
@@ -65,66 +74,97 @@ pub struct VoiceConfig {
     pub provider_voice: String,
     pub api_key: String,
     /// Where downloaded models live (`None` if there is no data dir).
+    #[cfg_attr(not(feature = "voice-local"), allow(dead_code))]
     pub models_dir: Option<PathBuf>,
 }
 
-/// Speak `text` aloud, off the UI thread. Returns immediately.
-///
-/// The returned channel fires once, when audio actually starts — or when the
-/// attempt is abandoned. A caller pacing something around the voice can wait on it
-/// *with a timeout* and carry on regardless; it must never be treated as a promise
-/// that sound happened.
-pub fn speak(text: &str, cfg: VoiceConfig) -> Receiver<()> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+/// One utterance in progress. Every clone controls the same utterance.
+#[derive(Clone)]
+pub struct Speech {
+    stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+}
+
+impl Speech {
+    /// Silence it now: the OS voice is killed, queued audio is thrown away, and
+    /// a synthesizer still rendering stops at its next chunk.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether it has finished — spoken to the end, stopped, or given up.
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Relaxed)
+    }
+}
+
+/// Speak `text` aloud, off the UI thread. Returns immediately with a handle to
+/// stop it or ask whether it has finished.
+pub fn speak(text: &str, cfg: VoiceConfig) -> Speech {
+    let speech = Speech {
+        stop: Arc::default(),
+        done: Arc::default(),
+    };
     let text = text.trim().to_string();
     if text.is_empty() {
-        let _ = tx.try_send(());
-        return rx;
+        speech.done.store(true, Ordering::Relaxed);
+        return speech;
     }
+    let handle = speech.clone();
     std::thread::spawn(move || {
-        if cfg.engine == TtsEngine::System {
-            system_voice(&text, &tx);
-            let _ = tx.try_send(());
-            return;
-        }
-
-        // Synthesis runs on its own thread and pushes finished chunks down the
-        // channel, so playback can begin on the FIRST chunk instead of waiting for
-        // the last. That is what makes the local voice usable: Kokoro takes ~4s to
-        // render four sentences whole, but under a second to render the first — and
-        // it renders faster than the device plays, so once the first sentence is
-        // out, the rest stays ahead of the needle.
-        let (chunk_tx, chunks) = std::sync::mpsc::channel::<Vec<f32>>();
-        let synth_cfg = cfg.clone();
-        let synth_text = text.clone();
-        let producer = std::thread::spawn(move || produce(&synth_text, &synth_cfg, &chunk_tx));
-
-        let played = match play_stream(&chunks, muxel_core::tts::SPEECH_RATE, &tx) {
-            Ok(n) => n,
-            Err(e) => {
-                log::warn!("speech playback failed: {e:#}");
-                0
-            }
-        };
-        let synth = producer
-            .join()
-            .unwrap_or_else(|_| bail!("speech thread panicked"));
-
-        // Nothing came out — a dead provider, a model that won't download, no audio
-        // device. Fall back to the OS voice, which needs none of those things.
-        if played == 0 {
-            if let Err(e) = synth {
-                log::warn!("speech failed, falling back to the system voice: {e:#}");
-            }
-            system_voice(&text, &tx);
-        } else if let Err(e) = synth {
-            // It spoke, then broke: say what happened but don't repeat the line.
-            log::warn!("speech ended early: {e:#}");
-        }
-        // Whatever happened, unblock anyone pacing around us.
-        let _ = tx.try_send(());
+        say_it(&text, &cfg, &handle.stop);
+        handle.done.store(true, Ordering::Relaxed);
     });
-    rx
+    speech
+}
+
+/// The body of [`speak`]'s thread: synthesize and play, falling back to the OS
+/// voice when nothing came out.
+fn say_it(text: &str, cfg: &VoiceConfig, stop: &AtomicBool) {
+    if cfg.engine == TtsEngine::System {
+        system_voice(text, cfg, stop);
+        return;
+    }
+
+    // Synthesis runs on its own thread and pushes finished chunks down the
+    // channel, so playback can begin on the FIRST chunk instead of waiting for
+    // the last. That is what makes the local voice usable: Kokoro takes seconds to
+    // render a reply whole, but under a second to render its first sentence — and
+    // it renders faster than the device plays, so the rest stays ahead.
+    let (chunk_tx, chunks) = std::sync::mpsc::channel::<Vec<f32>>();
+    let synth_cfg = cfg.clone();
+    let synth_text = text.to_string();
+    let producer = std::thread::spawn(move || produce(&synth_text, &synth_cfg, &chunk_tx));
+
+    let played = match play_stream(&chunks, muxel_core::tts::SPEECH_RATE, stop) {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("speech playback failed: {e:#}");
+            0
+        }
+    };
+    // Hang up, so a synthesizer still rendering stops at its next chunk.
+    drop(chunks);
+    if stop.load(Ordering::Relaxed) {
+        // Stopped: leave the producer to notice on its own rather than wait out
+        // a slow provider request just to throw its answer away.
+        return;
+    }
+    let synth = producer
+        .join()
+        .unwrap_or_else(|_| bail!("speech thread panicked"));
+
+    // Nothing came out — a dead provider, a model that won't download, no audio
+    // device. Fall back to the OS voice, which needs none of those things.
+    if played == 0 {
+        if let Err(e) = synth {
+            log::warn!("speech failed, falling back to the system voice: {e:#}");
+        }
+        system_voice(text, cfg, stop);
+    } else if let Err(e) = synth {
+        // It spoke, then broke: say what happened but don't repeat the reply.
+        log::warn!("speech ended early: {e:#}");
+    }
 }
 
 /// Synthesize `text` into the channel, a chunk at a time.
@@ -144,14 +184,27 @@ fn produce(text: &str, cfg: &VoiceConfig, out: &std::sync::mpsc::Sender<Vec<f32>
 // --- Playback ---------------------------------------------------------------
 
 /// Play mono chunks (at `rate`) on the default output device as they arrive,
-/// blocking until the producer is done and the buffer has drained. Returns how
-/// many samples were played; signals `started` when the first sound goes out.
+/// blocking until the producer is done and the buffer has drained — or until
+/// `stop` is raised, which silences it at once. Returns how many samples were
+/// queued for playback.
 ///
 /// Building the device stream waits for the first chunk, so a synthesizer that
 /// fails outright never opens (and never has to close) an audio device.
-fn play_stream(chunks: &Receiver<Vec<f32>>, rate: u32, started: &SyncSender<()>) -> Result<usize> {
-    let Ok(first) = chunks.recv() else {
-        return Ok(0); // producer failed before it made a sound
+fn play_stream(chunks: &Receiver<Vec<f32>>, rate: u32, stop: &AtomicBool) -> Result<usize> {
+    // Short enough that Stop feels immediate, long enough to cost nothing.
+    const POLL: Duration = Duration::from_millis(50);
+    let stopped = || stop.load(Ordering::Relaxed);
+
+    // A provider can take seconds to answer; keep an eye on Stop meanwhile.
+    let first = loop {
+        if stopped() {
+            return Ok(0);
+        }
+        match chunks.recv_timeout(POLL) {
+            Ok(chunk) => break chunk,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(0), // failed before a sound
+        }
     };
 
     let device = cpal::default_host()
@@ -183,18 +236,28 @@ fn play_stream(chunks: &Receiver<Vec<f32>>, rate: u32, started: &SyncSender<()>)
         other => bail!("unsupported output sample format: {other:?}"),
     };
     stream.play().context("start output stream")?;
-    let _ = started.try_send(());
 
     // Feed the queue until the producer hangs up.
-    while let Ok(chunk) = chunks.recv() {
-        played += push(&queue, &chunk, rate, dev_rate)?;
+    while !stopped() {
+        match chunks.recv_timeout(POLL) {
+            Ok(chunk) => played += push(&queue, &chunk, rate, dev_rate)?,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
 
     // Producer is done; wait for the device to drain what is left, with a ceiling
     // well past the audio's own length so a stalled device can't wedge the thread.
     let secs = played as f32 / dev_rate.max(1) as f32;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f32(secs + 5.0);
+    let deadline = std::time::Instant::now() + Duration::from_secs_f32(secs + 5.0);
     loop {
+        if stopped() {
+            // Silence now, rather than letting the queued audio play out.
+            if let Ok(mut q) = queue.lock() {
+                q.clear();
+            }
+            return Ok(played);
+        }
         let empty = queue.lock().map(|q| q.is_empty()).unwrap_or(true);
         if empty && starving.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -203,11 +266,11 @@ fn play_stream(chunks: &Receiver<Vec<f32>>, rate: u32, started: &SyncSender<()>)
             log::warn!("speech playback timed out waiting for the device");
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(20));
     }
     // The last buffer is queued, not yet audible: let the device flush it before
     // the stream drops, or the final word is clipped.
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    std::thread::sleep(Duration::from_millis(150));
     Ok(played)
 }
 
@@ -269,10 +332,17 @@ fn synth_provider(text: &str, cfg: &VoiceConfig) -> Result<Vec<f32>> {
     if cfg.api_key.is_empty() {
         bail!("set a provider API key in Settings → Speech");
     }
-    let body =
-        muxel_core::tts::build_speech_request(&cfg.provider_model, &cfg.provider_voice, text);
+    let body = muxel_core::tts::build_speech_request(
+        &cfg.provider_model,
+        &cfg.provider_voice,
+        text,
+        cfg.rate,
+    );
     let url = muxel_core::tts::speech_endpoint(&cfg.provider_url);
+    // Bounded, so a stalled endpoint ends in the system-voice fallback rather than
+    // a speaker button stuck on "reading" forever.
     let resp = ureq::post(&url)
+        .timeout(Duration::from_secs(90))
         .set("Authorization", &format!("Bearer {}", cfg.api_key))
         .set("Content-Type", "application/json")
         .send_string(&body);
@@ -299,6 +369,7 @@ fn synth_provider(text: &str, cfg: &VoiceConfig) -> Result<Vec<f32>> {
 
 /// Fetch `url` to `dest` via a `.part` file, so an interrupted download never
 /// leaves a truncated model that later loads as garbage. Mirrors `stt::ensure_model`.
+#[cfg(feature = "voice-local")]
 fn download_once(url: &str, dest: &Path) -> Result<()> {
     if dest.is_file() {
         return Ok(());
@@ -411,42 +482,93 @@ pub const fn local_voice_supported() -> bool {
 
 // --- System (the OS voice) --------------------------------------------------
 
-/// Speak through the synthesizer the OS ships. Blocks until it finishes.
-fn system_voice(text: &str, started: &SyncSender<()>) {
-    let _ = started.try_send(());
-    for mut cmd in system_voices(text) {
-        let spoken = cmd
+/// Speak through the synthesizer the OS ships. Blocks until it finishes or
+/// `stop` is raised.
+fn system_voice(text: &str, cfg: &VoiceConfig, stop: &AtomicBool) {
+    for mut cmd in system_voices(text, cfg) {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut child) = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if spoken {
-            return;
+            .spawn()
+        else {
+            continue; // not installed; try the next
+        };
+        // Waited on, never left to the scheduler: an unreaped synthesizer would
+        // linger as a zombie for the life of the app, and muxel has been bitten
+        // by leaked children before.
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return,
+                Ok(Some(_)) => break, // it couldn't speak; try the next
+                Ok(None) if stop.load(Ordering::Relaxed) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    cancel_system_voice();
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
         }
     }
     log::debug!("no speech synthesizer available; muxel stays quiet");
 }
 
-/// The OS synthesizers to try, best first. A box with none of them installed just
-/// runs out of candidates and stays quiet.
-///
-/// Each child is waited on (in [`system_voice`]) rather than left to the
-/// scheduler: an unreaped synthesizer would linger as a zombie for the life of
-/// the app, and muxel has been bitten by leaked children before.
-fn system_voices(text: &str) -> Vec<Command> {
+/// Silence a synthesizer that outlives the process that asked it to speak.
+/// speech-dispatcher is one: `spd-say` hands the text to a daemon, so killing
+/// `spd-say` would leave the daemon reading on. The others speak in-process.
+fn cancel_system_voice() {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = Command::new("spd-say")
+            .arg("--cancel")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// The OS synthesizers to try, best first, set to the chosen voice and pace. A
+/// box with none of them installed just runs out of candidates and stays quiet.
+fn system_voices(text: &str, cfg: &VoiceConfig) -> Vec<Command> {
+    let voice = cfg.system_voice.trim();
     #[cfg(target_os = "macos")]
     {
+        // `say` falls back to the default voice itself when `-v` names one that
+        // isn't installed. `--` so text that opens with a dash is spoken, not parsed.
+        let wpm = muxel_core::tts::say_words_per_minute(cfg.rate).to_string();
         let mut say = Command::new("say");
-        say.arg(text);
+        if !voice.is_empty() {
+            say.args(["-v", voice]);
+        }
+        say.args(["-r", &wpm, "--", text]);
         vec![say]
     }
     #[cfg(target_os = "windows")]
     {
-        // Single quotes delimit the PowerShell string, so an apostrophe in the
-        // text ("daddy's") has to be doubled or it closes the string early.
+        use std::os::windows::process::CommandExt;
+        // Single quotes delimit the PowerShell strings, so an apostrophe in the
+        // text ("don't") has to be doubled or it closes the string early.
         let escaped = text.replace('\'', "''");
+        let select = if voice.is_empty() {
+            String::new()
+        } else {
+            // A voice that isn't installed throws; keep the default instead.
+            format!(
+                "try {{ $s.SelectVoice('{}') }} catch {{}}; ",
+                voice.replace('\'', "''")
+            )
+        };
+        let rate = muxel_core::tts::rate_step(cfg.rate, 10);
         let mut ps = Command::new("powershell");
         ps.args([
             "-NoProfile",
@@ -454,9 +576,12 @@ fn system_voices(text: &str) -> Vec<Command> {
             "-Command",
             &format!(
                 "Add-Type -AssemblyName System.Speech; \
-                 (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{escaped}')"
+                 $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
+                 {select}$s.Rate = {rate}; $s.Speak('{escaped}')"
             ),
         ]);
+        // CREATE_NO_WINDOW: a GUI app must not flash a console per utterance.
+        ps.creation_flags(0x0800_0000);
         vec![ps]
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -464,12 +589,63 @@ fn system_voices(text: &str) -> Vec<Command> {
         // `--` so a line that happens to start with a dash is spoken, not parsed
         // as a flag. spd-say routes through speech-dispatcher where it is set up;
         // espeak is the fallback for boxes without it.
+        let step = muxel_core::tts::rate_step(cfg.rate, 100).to_string();
+        let wpm = muxel_core::tts::espeak_words_per_minute(cfg.rate).to_string();
         let mut spd = Command::new("spd-say");
-        spd.args(["--wait", "--", text]);
-        let mut espeak_ng = Command::new("espeak-ng");
-        espeak_ng.args(["--", text]);
-        let mut espeak = Command::new("espeak");
-        espeak.args(["--", text]);
-        vec![spd, espeak_ng, espeak]
+        spd.args(["--wait", "-r", &step]);
+        if !voice.is_empty() {
+            spd.args(["-y", voice]);
+        }
+        spd.args(["--", text]);
+        let espeak = |program: &str| {
+            let mut cmd = Command::new(program);
+            cmd.args(["-s", &wpm]);
+            if !voice.is_empty() {
+                cmd.args(["-v", voice]);
+            }
+            cmd.args(["--", text]);
+            cmd
+        };
+        vec![spd, espeak("espeak-ng"), espeak("espeak")]
+    }
+}
+
+/// The voices the OS synthesizer offers, as `(name, locale)`, for the settings
+/// picker. Blocking (it runs the OS's own listing), so call it off the UI thread.
+/// Empty where there's no reliable way to ask — Linux, whose voice names depend on
+/// which speech-dispatcher module is configured; there the name is typed instead.
+pub fn system_voice_list() -> Vec<(String, String)> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("say")
+            .args(["-v", "?"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|out| muxel_core::tts::parse_say_voices(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or_default()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Add-Type -AssemblyName System.Speech; \
+                 (New-Object System.Speech.Synthesis.SpeechSynthesizer).GetInstalledVoices() \
+                 | ForEach-Object { $_.VoiceInfo.Name + '|' + $_.VoiceInfo.Culture.Name }",
+            ])
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|out| muxel_core::tts::parse_voice_lines(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or_default()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Vec::new()
     }
 }

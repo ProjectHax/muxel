@@ -12,6 +12,7 @@ mod gui_path;
 pub mod locale;
 pub mod memory;
 mod pane;
+pub mod readaloud;
 pub mod remote_ops;
 mod shell;
 pub mod ssh;
@@ -38,6 +39,7 @@ pub use pane::{
     move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove, set_active_tab,
     set_split_sizes, set_tab_order, split, split_beside, swap_instances, swap_panes,
 };
+pub use readaloud::{ReadAloudAuto, ReadAloudScope};
 pub use shell::{join_words, split_words};
 pub use stt::SttEngine;
 pub use tts::TtsEngine;
@@ -2096,14 +2098,18 @@ pub struct Settings {
     /// The spoken phrase that triggers the wake command.
     #[serde(default = "default_stt_wake_phrase")]
     pub stt_wake_phrase: String,
-    // --- Text-to-speech (the voice muxel *can* answer in) ---
-    // Nothing speaks today — the spoken wake command was cut — but `muxel::tts` is
-    // kept working behind these, so a future spoken feature inherits a configured
-    // voice rather than starting from nothing. See crates/muxel/src/tts.rs.
+    // --- Text-to-speech (the voice read-aloud speaks in; see crates/muxel/src/tts.rs) ---
     /// Which synthesizer speaks. Defaults to the OS voice: it needs no model and
     /// no key, so speech works on a fresh install with nothing configured.
     #[serde(default)]
     pub tts_engine: TtsEngine,
+    /// The OS voice by name (System engine: `say -v`, SAPI `SelectVoice`,
+    /// `spd-say -y`); empty = the OS default voice.
+    #[serde(default)]
+    pub tts_system_voice: String,
+    /// Speaking pace as a multiple of normal ([`tts::MIN_TTS_RATE`]–[`tts::MAX_TTS_RATE`]).
+    #[serde(default = "default_tts_rate")]
+    pub tts_rate: f32,
     /// Kokoro voice for the local engine (`bm_george`, `am_michael`, …).
     #[serde(default = "default_kokoro_voice")]
     pub tts_local_voice: String,
@@ -2117,6 +2123,32 @@ pub struct Settings {
     /// API key are the Speech section's — one provider, both directions.
     #[serde(default = "default_tts_provider_model")]
     pub tts_provider_model: String,
+    // --- Read aloud (accessibility: speak an agent's last reply; see `readaloud`) ---
+    /// Show the read-aloud speaker button in the toolbar. The shortcut and the
+    /// palette command work either way.
+    #[serde(default = "default_true")]
+    pub read_aloud_button: bool,
+    /// How much of the last reply to read: the final message, or the whole turn.
+    #[serde(default)]
+    pub read_aloud_scope: ReadAloudScope,
+    /// Read replies automatically when an agent finishes.
+    #[serde(default)]
+    pub read_aloud_auto: ReadAloudAuto,
+    /// Say which agent is speaking before its reply ("Claude says: …").
+    #[serde(default)]
+    pub read_aloud_announce: bool,
+    /// Say "link" instead of reading a URL out character by character.
+    #[serde(default = "default_true")]
+    pub read_aloud_skip_urls: bool,
+    /// Say only a path's file name (`src/app.rs:120` → "app.rs").
+    #[serde(default = "default_true")]
+    pub read_aloud_short_paths: bool,
+    /// Read tables row by row; off skips them.
+    #[serde(default)]
+    pub read_aloud_tables: bool,
+    /// Stop after about this many characters, at a sentence (0 = read it all).
+    #[serde(default)]
+    pub read_aloud_max_chars: u32,
 }
 
 fn default_stt_model() -> String {
@@ -2142,6 +2174,9 @@ fn default_tts_voice() -> String {
 }
 fn default_tts_provider_model() -> String {
     tts::DEFAULT_TTS_PROVIDER_MODEL.to_string()
+}
+fn default_tts_rate() -> f32 {
+    1.0
 }
 
 fn default_editor_font_size() -> f32 {
@@ -2381,10 +2416,20 @@ impl Default for Settings {
             stt_wake_command: false,
             stt_wake_phrase: default_stt_wake_phrase(),
             tts_engine: TtsEngine::default(),
+            tts_system_voice: String::new(),
+            tts_rate: default_tts_rate(),
             tts_local_voice: default_kokoro_voice(),
             tts_local_model: default_kokoro_model(),
             tts_provider_voice: default_tts_voice(),
             tts_provider_model: default_tts_provider_model(),
+            read_aloud_button: true,
+            read_aloud_scope: ReadAloudScope::default(),
+            read_aloud_auto: ReadAloudAuto::default(),
+            read_aloud_announce: false,
+            read_aloud_skip_urls: true,
+            read_aloud_short_paths: true,
+            read_aloud_tables: false,
+            read_aloud_max_chars: 0,
         }
     }
 }
@@ -2410,6 +2455,16 @@ pub const PRESET_SEED_VERSION: u32 = 16;
 pub const CURRENT_TERMS_VERSION: u32 = 1;
 
 impl Settings {
+    /// What read-aloud keeps and drops when it turns a reply into speech.
+    pub fn speak_options(&self) -> readaloud::SpeakOptions {
+        readaloud::SpeakOptions {
+            skip_urls: self.read_aloud_skip_urls,
+            shorten_paths: self.read_aloud_short_paths,
+            read_tables: self.read_aloud_tables,
+            max_chars: self.read_aloud_max_chars as usize,
+        }
+    }
+
     /// Merge in any built-in presets + runners the user is missing (matched by
     /// name), once per seed version, so new built-ins reach existing configs
     /// without resurrecting ones the user deleted. Returns whether the settings
@@ -2536,6 +2591,28 @@ mod settings_tests {
         // fills an *absent* field, not an explicitly empty one).
         let s2: Settings = serde_json::from_str(r#"{"snippets": []}"#).expect("parse");
         assert!(s2.snippets.is_empty());
+    }
+
+    #[test]
+    fn read_aloud_settings_default_for_old_configs() {
+        // A config from before read-aloud: the button shows, nothing auto-reads,
+        // URLs and paths are shortened, and the voice keeps its normal pace.
+        let s: Settings = serde_json::from_str("{}").expect("parse");
+        assert!(s.read_aloud_button);
+        assert_eq!(s.read_aloud_scope, ReadAloudScope::FinalMessage);
+        assert_eq!(s.read_aloud_auto, ReadAloudAuto::Off);
+        assert!(!s.read_aloud_announce);
+        assert_eq!(s.tts_rate, 1.0);
+        assert!(s.tts_system_voice.is_empty());
+        assert_eq!(s.speak_options(), readaloud::SpeakOptions::default());
+        // Saved choices come back.
+        let s: Settings = serde_json::from_str(
+            r#"{"read_aloud_scope": "WholeTurn", "read_aloud_auto": "All", "read_aloud_max_chars": 1000}"#,
+        )
+        .expect("parse");
+        assert_eq!(s.read_aloud_scope, ReadAloudScope::WholeTurn);
+        assert_eq!(s.read_aloud_auto, ReadAloudAuto::All);
+        assert_eq!(s.speak_options().max_chars, 1000);
     }
 
     #[test]

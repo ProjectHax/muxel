@@ -1220,6 +1220,11 @@ struct SetPreset(Uuid);
 #[action(namespace = muxel, no_json)]
 struct SetDefaultPreset(Uuid);
 
+/// Pick the OS voice read-aloud speaks with (by name; empty = the OS default).
+#[derive(Action, Clone, PartialEq)]
+#[action(namespace = muxel, no_json)]
+struct SetSystemVoice(String);
+
 /// Register global action handlers that route to the running app. Called once
 /// at startup (the app installs [`MuxelHandle`] when it is created).
 pub fn register_actions(cx: &mut App) {
@@ -1247,6 +1252,15 @@ pub fn register_actions(cx: &mut App) {
         };
         if let Some(app) = weak.upgrade() {
             app.update(cx, |this, cx| this.set_theme(a.0.clone(), cx));
+        }
+    });
+    // Voice picks come from the Read Aloud settings dropdown, same routing.
+    cx.on_action(|a: &SetSystemVoice, cx| {
+        let Some(weak) = cx.try_global::<MuxelHandle>().map(|h| h.0.clone()) else {
+            return;
+        };
+        if let Some(app) = weak.upgrade() {
+            app.update(cx, |this, cx| this.set_system_voice(a.0.clone(), cx));
         }
     });
     // Language picks come from the settings dropdown (overlay menu → global
@@ -1332,6 +1346,8 @@ actions!(
         ToggleSpeechToText,
         // Push-to-hold dictation: records while the chord is held.
         HoldSpeechToText,
+        // Read the focused agent's last reply aloud, or stop reading.
+        ReadAloud,
         // Toggle the "new agents get a git worktree" toolbar switch.
         ToggleWorktree,
         // OS fullscreen with the sidebar hidden (a floating pill reveals it).
@@ -1396,6 +1412,7 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
         "ToggleBroadcast" => KeyBinding::new(keystroke, ToggleBroadcast, context),
         "ToggleSpeechToText" => KeyBinding::new(keystroke, ToggleSpeechToText, context),
         "HoldSpeechToText" => KeyBinding::new(keystroke, HoldSpeechToText, context),
+        "ReadAloud" => KeyBinding::new(keystroke, ReadAloud, context),
         "ToggleWorktree" => KeyBinding::new(keystroke, ToggleWorktree, context),
         "ToggleFullScreen" => KeyBinding::new(keystroke, ToggleFullScreen, context),
         "ToggleDevConsole" => KeyBinding::new(keystroke, ToggleDevConsole, context),
@@ -2095,6 +2112,82 @@ impl SttState {
     }
 }
 
+/// A reading in progress, and its utterance once the reply has been gathered and
+/// handed to the voice.
+struct ReadAloudJob {
+    generation: u64,
+    speech: Option<crate::tts::Speech>,
+}
+
+/// How many lines of a pane's buffer read-aloud searches for the last reply.
+const READ_ALOUD_LINES: usize = 2000;
+/// How much of a Claude transcript's tail read-aloud parses — plenty for any one
+/// turn, without reading a session's whole history to find its last reply.
+const READ_ALOUD_TRANSCRIPT_BYTES: u64 = 4 << 20;
+
+/// Everything needed to find a pane's last reply, gathered on the UI thread so
+/// the slow part — reading a transcript, asking tmux for its scrollback — runs
+/// off it.
+struct ReplySource {
+    /// The pane's buffer as muxel's own terminal holds it.
+    screen: String,
+    /// The local tmux session behind the pane, which holds the real scrollback.
+    tmux_session: Option<String>,
+    /// Claude's transcript for the pane's session, when it is on this machine.
+    transcript: Option<PathBuf>,
+    /// Said before the reply when announcing is on ("Claude says:").
+    announce: Option<String>,
+}
+
+impl ReplySource {
+    /// The words to say for the pane's last reply, or `None` if it has none that
+    /// aren't code. Blocking — call it off the UI thread.
+    fn utterance(
+        self,
+        scope: muxel_core::ReadAloudScope,
+        opts: &muxel_core::readaloud::SpeakOptions,
+    ) -> Option<String> {
+        use muxel_core::readaloud;
+        let screen = self
+            .tmux_session
+            .as_deref()
+            .and_then(|session| integrations::tmux_capture(session, READ_ALOUD_LINES))
+            .unwrap_or(self.screen);
+        // The transcript is exact — the model's own markdown, with every tool call
+        // a separate entry — but only while it is the conversation on screen: a
+        // stale session binding must never read out some other conversation.
+        let reply = self
+            .transcript
+            .as_deref()
+            .and_then(|path| read_file_tail(path, READ_ALOUD_TRANSCRIPT_BYTES))
+            .and_then(|jsonl| readaloud::reply_from_claude_transcript(&jsonl, scope))
+            .filter(|reply| readaloud::reply_on_screen(reply, &screen))
+            .or_else(|| readaloud::reply_from_screen(&screen, scope))?;
+        let spoken = readaloud::speakable(&reply, opts);
+        if spoken.is_empty() {
+            return None;
+        }
+        Some(match self.announce {
+            // Pane names carry agents' title glyphs (`✳ Fix the pager`); clean
+            // them like the reply, so the voice doesn't read a spinner's name.
+            Some(intro) => format!("{}\n{spoken}", readaloud::speakable(&intro, opts)),
+            None => spoken,
+        })
+    }
+}
+
+/// The last `max` bytes of a file, lossily decoded (a torn first line is the
+/// caller's to skip).
+fn read_file_tail(path: &std::path::Path, max: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(max))).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// The small label shown under the cursor while dragging a project row.
 struct DragGhost {
     label: SharedString,
@@ -2454,6 +2547,14 @@ pub struct MuxelApp {
     /// True while a push-to-hold dictation is active (started on the hold chord's
     /// key-down, stopped on the next key-up).
     stt_hold: bool,
+    /// The reply being read aloud, if any (drives the toolbar speaker's state).
+    read_aloud: Option<ReadAloudJob>,
+    /// Panes whose replies are waiting their turn to be read — auto-read of
+    /// several agents finishing together — oldest first.
+    read_aloud_queue: std::collections::VecDeque<Uuid>,
+    /// Counts readings, so a background task can tell its reading was stopped or
+    /// replaced while it worked.
+    read_aloud_generation: u64,
     /// True while the wake command's sweep is walking the workspace — the guard
     /// against a second sweep stacking on top of the running one.
     waking: bool,
@@ -2588,6 +2689,7 @@ enum PaletteCommand {
     ToggleDashboard,
     OpenSettings,
     OpenMemory,
+    ReadAloud,
     RunRunner(usize),
     SendSnippet(usize),
 }
@@ -4374,6 +4476,9 @@ impl MuxelApp {
             stt_state: SttState::Idle,
             stt_recording: None,
             stt_hold: false,
+            read_aloud: None,
+            read_aloud_queue: std::collections::VecDeque::new(),
+            read_aloud_generation: 0,
             waking: false,
             confirm_quit: false,
             place_menu: None,
@@ -8283,6 +8388,8 @@ impl MuxelApp {
 
         let mut to_close = Vec::new();
         let mut to_recover: Vec<(Uuid, String)> = Vec::new();
+        // Agents that just finished, whose replies auto-read should speak.
+        let mut to_read_aloud: Vec<Uuid> = Vec::new();
         // (instance, title, signal name) — panes to reattach to a live tmux session.
         let mut to_reattach: Vec<(Uuid, String, String)> = Vec::new();
         // Only re-render when something visible actually changed. Re-rendering
@@ -8453,6 +8560,13 @@ impl MuxelApp {
             // new event. Do not notify again for a saved completion/block.
             let restored_transition =
                 is_restored_transition(preserve_restored, status, restored_state);
+            if changed
+                && status == AgentStatus::Done
+                && !restored_transition
+                && self.auto_read_wanted(iid, pane_active)
+            {
+                to_read_aloud.push(iid);
+            }
             if changed && !attended && !restored_transition {
                 let kind = match status {
                     AgentStatus::Blocked => Some(NotifKind::Blocked),
@@ -8649,6 +8763,10 @@ impl MuxelApp {
             // connection exits abnormally and tombstones instead, staying
             // reconnectable).
             self.close_instance_inner(iid, "auto-close (exit)", cx); // re-renders on its own
+        }
+
+        for iid in to_read_aloud {
+            self.enqueue_read_aloud(iid, cx);
         }
 
         if activity_changed {
@@ -10373,6 +10491,7 @@ impl MuxelApp {
             ToggleSidebar,
             ToggleDashboard,
             OpenSettings,
+            ReadAloud,
         ];
         // Only meaningful with an active project to open the memory for.
         if self.workspace.active_project.is_some() {
@@ -10404,6 +10523,10 @@ impl MuxelApp {
             PaletteCommand::ToggleDashboard => t("Toggle dashboard (all agents)").into(),
             PaletteCommand::OpenSettings => t("Open settings").into(),
             PaletteCommand::OpenMemory => t("Open project memory (.muxel/MEMORY.md)").into(),
+            PaletteCommand::ReadAloud if self.read_aloud.is_some() => {
+                t("Stop reading aloud").into()
+            }
+            PaletteCommand::ReadAloud => t("Read the last reply aloud").into(),
             PaletteCommand::RunRunner(i) => self
                 .runners
                 .get(i)
@@ -10440,6 +10563,7 @@ impl MuxelApp {
                     self.open_memory_panel(pid, window, cx);
                 }
             }
+            PaletteCommand::ReadAloud => self.toggle_read_aloud(cx),
             PaletteCommand::RunRunner(i) => self.run_runner(i, String::new(), window, cx),
             PaletteCommand::SendSnippet(i) => self.send_snippet_to_active(i, window, cx),
         }
@@ -13417,6 +13541,7 @@ impl MuxelApp {
                 this.activate_main_window(window, cx);
                 this.start_hold(cx)
             }))
+            .on_action(cx.listener(|this, _: &ReadAloud, _window, cx| this.toggle_read_aloud(cx)))
             // Push-to-hold: releasing any key while a hold dictation is active
             // stops recording and transcribes. Key-ups bubble up the focus tree
             // to this root, so this fires even while a terminal pane is focused.
@@ -14925,25 +15050,207 @@ impl MuxelApp {
         .detach();
     }
 
-    /// Snapshot the speech settings for one utterance. The provider URL and key
+    /// Snapshot the voice settings for one utterance. The provider URL and key
     /// are the Speech section's — one provider serves both transcription and
-    /// speech, so there is no second endpoint to configure.
-    ///
-    /// Unused while nothing speaks (see `tts.rs`), but kept as the settings → voice
-    /// bridge so the next feature that wants a voice only has to call
-    /// `crate::tts::speak(text, self.voice_config())`.
-    #[allow(dead_code)]
+    /// speech, so there is no second endpoint to configure. The key is left empty
+    /// here: a keychain read can block, so [`Self::begin_read_aloud`] fetches it off
+    /// the UI thread, and only for the Provider voice that needs it.
     fn voice_config(&self) -> crate::tts::VoiceConfig {
         crate::tts::VoiceConfig {
             engine: self.settings.tts_engine,
+            rate: self.settings.tts_rate,
+            system_voice: self.settings.tts_system_voice.clone(),
             local_voice: self.settings.tts_local_voice.clone(),
             local_model: self.settings.tts_local_model.clone(),
             provider_url: self.settings.stt_provider_url.clone(),
             provider_model: self.settings.tts_provider_model.clone(),
             provider_voice: self.settings.tts_provider_voice.clone(),
-            api_key: crate::secrets::get_stt_api_key().unwrap_or_default(),
+            api_key: String::new(),
             models_dir: muxel_store::models_dir(),
         }
+    }
+
+    // --- Read aloud: speak the focused agent's last reply ---------------------
+
+    /// The speaker button / `ReadAloud`: read the focused agent's last reply —
+    /// or, while something is being read, stop (and drop any queued auto-reads).
+    fn toggle_read_aloud(&mut self, cx: &mut Context<Self>) {
+        if self.read_aloud.is_some() {
+            self.stop_read_aloud(cx);
+            return;
+        }
+        let target = self
+            .active_instance
+            .filter(|iid| self.terminals.contains_key(iid));
+        if !target.is_some_and(|iid| self.read_aloud_pane(iid, cx)) {
+            // Said, not only shown: whoever pressed this may not see the screen.
+            self.say_read_aloud_notice(t("Focus an agent pane first."), cx);
+        }
+    }
+
+    /// Read `iid`'s last reply. `false` if the pane has nothing to read from.
+    fn read_aloud_pane(&mut self, iid: Uuid, cx: &mut Context<Self>) -> bool {
+        let Some(source) = self.reply_source(iid, cx) else {
+            return false;
+        };
+        let scope = self.settings.read_aloud_scope;
+        let opts = self.settings.speak_options();
+        self.begin_read_aloud(cx, move || {
+            source
+                .utterance(scope, &opts)
+                .unwrap_or_else(|| t("There's no reply to read in this pane yet.").to_string())
+        });
+        true
+    }
+
+    /// Say something short about read-aloud itself, through the same voice.
+    fn say_read_aloud_notice(&mut self, notice: SharedString, cx: &mut Context<Self>) {
+        let notice = notice.to_string();
+        self.begin_read_aloud(cx, move || notice);
+    }
+
+    /// What `iid`'s last reply can be found in: the terminal's buffer, the tmux
+    /// session behind it, and — for a local Claude pane — its session transcript.
+    fn reply_source(&self, iid: Uuid, cx: &App) -> Option<ReplySource> {
+        let view = self.terminals.get(&iid)?;
+        let inst = self.workspace.instance(iid)?;
+        let project = self.workspace.project(inst.project_id)?;
+        let local = project.remote.is_none();
+        let transcript = if local && is_claude_program(inst.program.as_deref()) {
+            let cwd = inst
+                .worktree_path
+                .as_deref()
+                .unwrap_or(project.root_path.as_path());
+            home_dir()
+                .zip(inst.session_id.as_deref())
+                .map(|(home, id)| muxel_core::claude_session_path(&home, cwd, id))
+        } else {
+            None
+        };
+        Some(ReplySource {
+            screen: view.read(cx).recent_text(READ_ALOUD_LINES),
+            tmux_session: inst.tmux_session.clone().filter(|_| local),
+            transcript,
+            announce: self
+                .settings
+                .read_aloud_announce
+                .then(|| tf("{name} says:", &[("name", inst.display_name())])),
+        })
+    }
+
+    /// Start a reading, replacing any in progress: work out what to say off the
+    /// UI thread (`text`), then speak it, keeping the toolbar speaker lit until
+    /// the voice is done — at which point the next queued reply starts.
+    fn begin_read_aloud(
+        &mut self,
+        cx: &mut Context<Self>,
+        text: impl FnOnce() -> String + Send + 'static,
+    ) {
+        if let Some(job) = self.read_aloud.take()
+            && let Some(speech) = job.speech
+        {
+            speech.stop();
+        }
+        self.read_aloud_generation += 1;
+        let generation = self.read_aloud_generation;
+        self.read_aloud = Some(ReadAloudJob {
+            generation,
+            speech: None,
+        });
+        let mut voice = self.voice_config();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let (text, voice) = cx
+                .background_executor()
+                .spawn(async move {
+                    if voice.engine == muxel_core::TtsEngine::Provider {
+                        voice.api_key = crate::secrets::get_stt_api_key().unwrap_or_default();
+                    }
+                    (text(), voice)
+                })
+                .await;
+            let speech = this
+                .update(cx, |this, _cx| {
+                    // Stopped or replaced while the reply was being gathered.
+                    let job = this
+                        .read_aloud
+                        .as_mut()
+                        .filter(|job| job.generation == generation)?;
+                    let speech = crate::tts::speak(&text, voice);
+                    job.speech = Some(speech.clone());
+                    Some(speech)
+                })
+                .ok()
+                .flatten();
+            if let Some(speech) = speech {
+                while !speech.is_done() {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                }
+            }
+            let _ = this.update(cx, |this, cx| this.finish_read_aloud(generation, cx));
+        })
+        .detach();
+    }
+
+    /// A reading ended on its own: clear it (unless a newer one has already
+    /// replaced it) and start the next queued reply.
+    fn finish_read_aloud(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if self
+            .read_aloud
+            .as_ref()
+            .is_some_and(|job| job.generation == generation)
+        {
+            self.read_aloud = None;
+            self.next_read_aloud(cx);
+            cx.notify();
+        }
+    }
+
+    /// Stop reading now, and forget the replies queued behind it.
+    fn stop_read_aloud(&mut self, cx: &mut Context<Self>) {
+        self.read_aloud_queue.clear();
+        if let Some(job) = self.read_aloud.take()
+            && let Some(speech) = job.speech
+        {
+            speech.stop();
+        }
+        cx.notify();
+    }
+
+    /// Auto-read: read `iid`'s reply now if nothing is being read, otherwise once
+    /// what's ahead of it is done.
+    fn enqueue_read_aloud(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        if self.read_aloud.is_none() {
+            self.read_aloud_pane(iid, cx);
+        } else if !self.read_aloud_queue.contains(&iid) {
+            self.read_aloud_queue.push_back(iid);
+        }
+    }
+
+    /// Start the next queued reply whose pane is still open.
+    fn next_read_aloud(&mut self, cx: &mut Context<Self>) {
+        while let Some(iid) = self.read_aloud_queue.pop_front() {
+            if self.terminals.contains_key(&iid) && self.read_aloud_pane(iid, cx) {
+                return;
+            }
+        }
+    }
+
+    /// Whether an agent that just finished in `iid` should be read out, per the
+    /// auto-read setting. Shells never are: every command they run "finishes".
+    fn auto_read_wanted(&self, iid: Uuid, focused: bool) -> bool {
+        let agent = self
+            .workspace
+            .instance(iid)
+            .is_some_and(|inst| muxel_core::readaloud::is_agent_program(inst.program.as_deref()));
+        agent
+            && match self.settings.read_aloud_auto {
+                muxel_core::ReadAloudAuto::Off => false,
+                muxel_core::ReadAloudAuto::Focused => focused,
+                muxel_core::ReadAloudAuto::All => true,
+            }
     }
 
     /// Whether `iid`'s process is up: a live view whose child hasn't exited.
@@ -19767,6 +20074,23 @@ impl MuxelApp {
                     .tooltip(t("Dictate to the focused agent"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.toggle_speech(window, cx))),
             )
+            .children(self.settings.read_aloud_button.then(|| {
+                let reading = self.read_aloud.is_some();
+                Button::new("read-aloud")
+                    .ghost()
+                    .icon(Icon::empty().path(if reading {
+                        "icons/circle-stop.svg"
+                    } else {
+                        "icons/volume-2.svg"
+                    }))
+                    .selected(reading)
+                    .tooltip(if reading {
+                        t("Stop reading aloud")
+                    } else {
+                        t("Read the agent's last reply aloud")
+                    })
+                    .on_click(cx.listener(|this, _ev, _window, cx| this.toggle_read_aloud(cx)))
+            }))
             // Spacer pushes the git-diff toggle to the far right of the toolbar.
             .child(div().flex_1())
             .child(
@@ -20323,6 +20647,8 @@ impl MuxelApp {
             });
             self.load_appearance_inputs(window, cx);
             self.load_speech_inputs(window, cx);
+            self.load_read_aloud_inputs(window, cx);
+            self.load_system_voices(cx);
             self.load_keybinding_inputs(window, cx);
         }
         cx.notify();
@@ -20741,6 +21067,512 @@ impl MuxelApp {
                 )),
         )
         .into_any_element()
+    }
+
+    // ===== Read-aloud settings =====
+
+    /// Seed the Read Aloud section's text inputs from the current settings.
+    fn load_read_aloud_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let voice = self.settings.tts_system_voice.clone();
+        self.settings_ui
+            .tts_system_voice
+            .update(cx, |s, cx| s.set_value(voice, window, cx));
+        let voice = self.settings.tts_provider_voice.clone();
+        self.settings_ui
+            .tts_provider_voice
+            .update(cx, |s, cx| s.set_value(voice, window, cx));
+        let model = self.settings.tts_provider_model.clone();
+        self.settings_ui
+            .tts_provider_model
+            .update(cx, |s, cx| s.set_value(model, window, cx));
+    }
+
+    /// List the OS voices once, in the background, for the voice picker.
+    fn load_system_voices(&mut self, cx: &mut Context<Self>) {
+        if self.settings_ui.tts_system_voices.is_some() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let voices = cx
+                .background_executor()
+                .spawn(async { crate::tts::system_voice_list() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.settings_ui.tts_system_voices = Some(voices);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The voice picker's choice (empty = the OS default voice).
+    fn set_system_voice(&mut self, name: String, cx: &mut Context<Self>) {
+        self.settings.tts_system_voice = name;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Read the typed OS voice name (where the OS can't list its voices).
+    fn apply_tts_system_voice(&mut self, cx: &mut Context<Self>) {
+        let voice = self
+            .settings_ui
+            .tts_system_voice
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        self.set_system_voice(voice, cx);
+    }
+
+    /// Read the provider voice + model inputs; a blank one restores its default.
+    fn apply_tts_provider(&mut self, cx: &mut Context<Self>) {
+        let voice = self
+            .settings_ui
+            .tts_provider_voice
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        self.settings.tts_provider_voice = if voice.is_empty() {
+            muxel_core::tts::DEFAULT_TTS_VOICE.to_string()
+        } else {
+            voice
+        };
+        let model = self
+            .settings_ui
+            .tts_provider_model
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        self.settings.tts_provider_model = if model.is_empty() {
+            muxel_core::tts::DEFAULT_TTS_PROVIDER_MODEL.to_string()
+        } else {
+            model
+        };
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn adjust_tts_rate(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let rate = ((self.settings.tts_rate + delta) * 10.0).round() / 10.0;
+        self.settings.tts_rate = muxel_core::tts::clamp_rate(rate);
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// One choice in a row of mutually exclusive setting buttons: `pick` applies
+    /// it to the settings, which are then saved.
+    fn option_btn(
+        &self,
+        id: impl Into<ElementId>,
+        label: SharedString,
+        selected: bool,
+        cx: &mut Context<Self>,
+        pick: impl Fn(&mut muxel_core::Settings) + 'static,
+    ) -> Button {
+        Button::new(id)
+            .ghost()
+            .selected(selected)
+            .label(label)
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                pick(&mut this.settings);
+                this.persist_settings();
+                cx.notify();
+            }))
+    }
+
+    /// A settings checkbox bound to one boolean setting.
+    fn setting_check(
+        &self,
+        id: &'static str,
+        checked: bool,
+        label: &str,
+        cx: &mut Context<Self>,
+        set: impl Fn(&mut muxel_core::Settings, bool) + 'static,
+    ) -> impl IntoElement {
+        self.check_row(
+            Checkbox::new(id).checked(checked).on_click(cx.listener(
+                move |this, c: &bool, _w, cx| {
+                    set(&mut this.settings, *c);
+                    this.persist_settings();
+                    cx.notify();
+                },
+            )),
+            label,
+        )
+    }
+
+    fn render_settings_read_aloud(&self, cx: &mut Context<Self>) -> AnyElement {
+        use muxel_core::{ReadAloudAuto, ReadAloudScope, TtsEngine};
+        let settings = &self.settings;
+        let muted = cx.theme().muted_foreground;
+        let note = |text: SharedString| div().text_xs().text_color(muted).child(text);
+
+        // The shortcut as the user has it bound.
+        let chord = settings
+            .keybindings
+            .iter()
+            .find(|k| k.action == "ReadAloud")
+            .map(|k| k.keystroke.clone())
+            .or_else(|| {
+                settings_view::DEFAULT_KEYBINDINGS
+                    .iter()
+                    .find(|(name, _, _)| *name == "ReadAloud")
+                    .map(|(_, default, _)| default.to_string())
+            })
+            .map(|ks| prettify_keys(&ks))
+            .unwrap_or_default();
+
+        let scope = settings.read_aloud_scope;
+        let auto = settings.read_aloud_auto;
+        let max = settings.read_aloud_max_chars;
+        let engine = settings.tts_engine;
+
+        let mut col = v_flex()
+            .gap_3()
+            .max_w(px(560.0))
+            .child(note(
+                tf(
+                    "Press {keys}, or the speaker in the toolbar, to hear the focused agent's last reply. Press it again to stop.",
+                    &[("keys", &chord)],
+                )
+                .into(),
+            ))
+            .child(self.setting_check(
+                "ra-button",
+                settings.read_aloud_button,
+                &t("Show the read-aloud button in the toolbar"),
+                cx,
+                |s, on| s.read_aloud_button = on,
+            ))
+            // --- What is read ---
+            .child(self.settings_label(&t("What to read"), cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(self.option_btn(
+                        "ra-scope-final",
+                        t("Final message"),
+                        scope == ReadAloudScope::FinalMessage,
+                        cx,
+                        |s| s.read_aloud_scope = ReadAloudScope::FinalMessage,
+                    ))
+                    .child(self.option_btn(
+                        "ra-scope-turn",
+                        t("Whole last turn"),
+                        scope == ReadAloudScope::WholeTurn,
+                        cx,
+                        |s| s.read_aloud_scope = ReadAloudScope::WholeTurn,
+                    )),
+            )
+            .child(note(t(
+                "The final message is what the agent wrote after its last tool call — usually its summary. Code, diffs, commands and tool output are never read, only the agent's own words.",
+            )))
+            .child(self.settings_label(&t("Read automatically when an agent finishes"), cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(self.option_btn(
+                        "ra-auto-off",
+                        t("Off"),
+                        auto == ReadAloudAuto::Off,
+                        cx,
+                        |s| s.read_aloud_auto = ReadAloudAuto::Off,
+                    ))
+                    .child(self.option_btn(
+                        "ra-auto-focused",
+                        t("Focused pane"),
+                        auto == ReadAloudAuto::Focused,
+                        cx,
+                        |s| s.read_aloud_auto = ReadAloudAuto::Focused,
+                    ))
+                    .child(self.option_btn(
+                        "ra-auto-all",
+                        t("Any agent"),
+                        auto == ReadAloudAuto::All,
+                        cx,
+                        |s| s.read_aloud_auto = ReadAloudAuto::All,
+                    )),
+            )
+            .child(self.setting_check(
+                "ra-announce",
+                settings.read_aloud_announce,
+                &t("Say the agent's name before its reply"),
+                cx,
+                |s, on| s.read_aloud_announce = on,
+            ))
+            .child(self.settings_label(&t("Length limit"), cx));
+
+        let mut limits = div().flex().flex_wrap().gap_1();
+        for (chars, label) in [
+            (0, t("No limit")),
+            (500, t("About 30 s")),
+            (1000, t("About 1 min")),
+            (3000, t("About 3 min")),
+        ] {
+            limits = limits.child(self.option_btn(
+                SharedString::from(format!("ra-max-{chars}")),
+                label,
+                max == chars,
+                cx,
+                move |s| s.read_aloud_max_chars = chars,
+            ));
+        }
+        col =
+            col.child(limits)
+                .child(note(t(
+                    "A long reply stops at the end of a sentence once the limit is reached.",
+                )))
+                // --- How it's cleaned up ---
+                .child(self.settings_label(&t("Clean-up"), cx))
+                .child(self.setting_check(
+                    "ra-urls",
+                    settings.read_aloud_skip_urls,
+                    &t("Say \u{201c}link\u{201d} instead of reading web addresses"),
+                    cx,
+                    |s, on| s.read_aloud_skip_urls = on,
+                ))
+                .child(self.setting_check(
+                    "ra-paths",
+                    settings.read_aloud_short_paths,
+                    &t("Say only the file name of a path (src/app.rs:120 \u{2192} app.rs)"),
+                    cx,
+                    |s, on| s.read_aloud_short_paths = on,
+                ))
+                .child(self.setting_check(
+                    "ra-tables",
+                    settings.read_aloud_tables,
+                    &t("Read tables row by row (off skips them)"),
+                    cx,
+                    |s, on| s.read_aloud_tables = on,
+                ))
+                // --- The voice ---
+                .child(self.settings_label(&t("Voice"), cx))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .child(self.option_btn(
+                            "ra-engine-system",
+                            t("System"),
+                            engine == TtsEngine::System,
+                            cx,
+                            |s| s.tts_engine = TtsEngine::System,
+                        ))
+                        .children(
+                            (crate::tts::local_voice_supported() || engine == TtsEngine::Local)
+                                .then(|| {
+                                    self.option_btn(
+                                        "ra-engine-local",
+                                        t("Local (Kokoro)"),
+                                        engine == TtsEngine::Local,
+                                        cx,
+                                        |s| s.tts_engine = TtsEngine::Local,
+                                    )
+                                }),
+                        )
+                        .child(self.option_btn(
+                            "ra-engine-provider",
+                            t("Provider"),
+                            engine == TtsEngine::Provider,
+                            cx,
+                            |s| s.tts_engine = TtsEngine::Provider,
+                        )),
+                );
+
+        col = match engine {
+            TtsEngine::System => {
+                let listed = self
+                    .settings_ui
+                    .tts_system_voices
+                    .as_ref()
+                    .filter(|voices| !voices.is_empty());
+                match listed {
+                    Some(voices) => {
+                        let current = if settings.tts_system_voice.is_empty() {
+                            t("OS default voice")
+                        } else {
+                            SharedString::from(settings.tts_system_voice.clone())
+                        };
+                        let choices: Vec<(String, String)> = muxel_core::tts::voices_for_language(
+                            voices,
+                            &crate::i18n::current_language(),
+                        )
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                        col.child(self.settings_label(&t("System voice"), cx)).child(
+                            DropdownButton::new("ra-system-voice")
+                                .button(
+                                    Button::new("ra-system-voice-btn")
+                                        .ghost()
+                                        .icon(Icon::empty().path("icons/volume-2.svg"))
+                                        .label(current),
+                                )
+                                .dropdown_menu(move |mut menu, _window, _cx| {
+                                    menu = menu.menu(
+                                        t("OS default voice"),
+                                        Box::new(SetSystemVoice(String::new())),
+                                    );
+                                    for (name, locale) in &choices {
+                                        menu = menu.menu(
+                                            format!("{name} ({locale})"),
+                                            Box::new(SetSystemVoice(name.clone())),
+                                        );
+                                    }
+                                    menu.scrollable(true)
+                                }),
+                        )
+                    }
+                    None => col
+                        .child(self.settings_label(
+                            &t("System voice name (blank = the OS default voice)"),
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .child(Input::new(&self.settings_ui.tts_system_voice)),
+                                )
+                                .child(
+                                    Button::new("ra-apply-system-voice")
+                                        .primary()
+                                        .label(t("Apply"))
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.apply_tts_system_voice(cx)
+                                        })),
+                                ),
+                        ),
+                }
+            }
+            TtsEngine::Local => {
+                let mut voices = div().flex().flex_wrap().gap_1();
+                for voice in muxel_core::tts::KOKORO_VOICES {
+                    voices = voices.child(self.option_btn(
+                        SharedString::from(format!("ra-kokoro-{voice}")),
+                        SharedString::from(*voice),
+                        settings.tts_local_voice == *voice,
+                        cx,
+                        move |s| s.tts_local_voice = voice.to_string(),
+                    ));
+                }
+                col.child(self.settings_label(&t("Kokoro voice"), cx))
+                    .child(voices)
+                    .child(note(t(
+                        "Runs offline on this machine. The model (about 90 MB) downloads the first time it speaks. Speaks at its own pace.",
+                    )))
+            }
+            TtsEngine::Provider => col
+                .child(self.settings_label(&t("Provider voice (alloy, echo, nova, onyx, shimmer, …)"), cx))
+                .child(Self::wide_input(Input::new(&self.settings_ui.tts_provider_voice)))
+                .child(self.settings_label(&t("Provider model"), cx))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .child(Input::new(&self.settings_ui.tts_provider_model)),
+                        )
+                        .child(
+                            Button::new("ra-apply-provider")
+                                .primary()
+                                .label(t("Apply"))
+                                .on_click(
+                                    cx.listener(|this, _e, _w, cx| this.apply_tts_provider(cx)),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(note(t(
+                            "Uses the provider URL and API key from Speech. The reply's text is sent to that endpoint.",
+                        )))
+                        .child(
+                            Button::new("ra-open-speech")
+                                .ghost()
+                                .xsmall()
+                                .label(t("Speech settings"))
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.set_section(SettingsSection::Speech, cx)
+                                })),
+                        ),
+                ),
+        };
+
+        let rate_note = if engine == TtsEngine::Local {
+            t("Speaking rate (System and Provider voices)")
+        } else {
+            t("Speaking rate")
+        };
+        col.child(self.settings_label(&rate_note, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("ra-rate-dec").ghost().label("−").on_click(
+                            cx.listener(|this, _e, _w, cx| this.adjust_tts_rate(-0.1, cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .w(rems(4.0))
+                            .text_center()
+                            .child(format!("{:.1}×", settings.tts_rate)),
+                    )
+                    .child(
+                        Button::new("ra-rate-inc").ghost().label("+").on_click(
+                            cx.listener(|this, _e, _w, cx| this.adjust_tts_rate(0.1, cx)),
+                        ),
+                    )
+                    .child(
+                        Button::new("ra-rate-reset")
+                            .ghost()
+                            .small()
+                            .label(t("Normal"))
+                            .disabled((settings.tts_rate - 1.0).abs() < 0.05)
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.settings.tts_rate = 1.0;
+                                this.persist_settings();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div().child(
+                    Button::new("ra-test-voice")
+                        .ghost()
+                        .small()
+                        .icon(Icon::empty().path("icons/volume-2.svg"))
+                        .label(t("Test voice"))
+                        .tooltip(t("Hear a sample with these settings"))
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.say_read_aloud_notice(
+                                t("This is how muxel reads an agent's reply aloud."),
+                                cx,
+                            )
+                        })),
+                ),
+            )
+            .into_any_element()
     }
 
     // ===== Editor settings handlers =====
@@ -23661,54 +24493,33 @@ impl MuxelApp {
                 .selected(section == current)
                 .label(label)
         };
-        let nav = v_flex()
+        let sections = [
+            (t("Appearance"), SettingsSection::Appearance),
+            (t("Editor"), SettingsSection::Editor),
+            (t("Behavior"), SettingsSection::Behavior),
+            (t("Speech"), SettingsSection::Speech),
+            (t("Read Aloud"), SettingsSection::ReadAloud),
+            (t("Agents"), SettingsSection::Agents),
+            (t("Runners"), SettingsSection::Runners),
+            (t("Snippets"), SettingsSection::Snippets),
+            (t("Loops"), SettingsSection::Loops),
+            (t("Remotes"), SettingsSection::Remotes),
+            (t("Identities"), SettingsSection::Identities),
+            (t("Projects"), SettingsSection::Projects),
+            (t("Keybindings"), SettingsSection::Keybindings),
+        ];
+        let mut nav = v_flex()
             .w(rems(10.0))
             .flex_none()
             .p_2()
             .gap_1()
-            .bg(cx.theme().sidebar)
-            .child(
-                nav_item(t("Appearance"), SettingsSection::Appearance).on_click(cx.listener(
-                    |this, _e, _w, cx| this.set_section(SettingsSection::Appearance, cx),
-                )),
-            )
-            .child(nav_item(t("Editor"), SettingsSection::Editor).on_click(
-                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Editor, cx)),
-            ))
-            .child(nav_item(t("Behavior"), SettingsSection::Behavior).on_click(
-                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Behavior, cx)),
-            ))
-            .child(nav_item(t("Speech"), SettingsSection::Speech).on_click(
-                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Speech, cx)),
-            ))
-            .child(nav_item(t("Agents"), SettingsSection::Agents).on_click(
-                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Agents, cx)),
-            ))
-            .child(nav_item(t("Runners"), SettingsSection::Runners).on_click(
-                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Runners, cx)),
-            ))
-            .child(nav_item(t("Snippets"), SettingsSection::Snippets).on_click(
-                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Snippets, cx)),
-            ))
-            .child(nav_item(t("Loops"), SettingsSection::Loops).on_click(
-                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Loops, cx)),
-            ))
-            .child(nav_item(t("Remotes"), SettingsSection::Remotes).on_click(
-                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Remotes, cx)),
-            ))
-            .child(
-                nav_item(t("Identities"), SettingsSection::Identities).on_click(cx.listener(
-                    |this, _e, _w, cx| this.set_section(SettingsSection::Identities, cx),
-                )),
-            )
-            .child(nav_item(t("Projects"), SettingsSection::Projects).on_click(
-                cx.listener(|this, _e, _w, cx| this.set_section(SettingsSection::Projects, cx)),
-            ))
-            .child(
-                nav_item(t("Keybindings"), SettingsSection::Keybindings).on_click(cx.listener(
-                    |this, _e, _w, cx| this.set_section(SettingsSection::Keybindings, cx),
-                )),
+            .bg(cx.theme().sidebar);
+        for (label, section) in sections {
+            nav = nav.child(
+                nav_item(label, section)
+                    .on_click(cx.listener(move |this, _e, _w, cx| this.set_section(section, cx))),
             );
+        }
 
         let content_w = self.settings_content_w(window);
         let content = match current {
@@ -23716,6 +24527,7 @@ impl MuxelApp {
             SettingsSection::Editor => self.render_settings_editor(cx),
             SettingsSection::Behavior => self.render_settings_behavior(cx),
             SettingsSection::Speech => self.render_settings_speech(cx),
+            SettingsSection::ReadAloud => self.render_settings_read_aloud(cx),
             SettingsSection::Agents => self.render_settings_agents(cx),
             SettingsSection::Runners => self.render_settings_runners(cx),
             SettingsSection::Snippets => self.render_settings_snippets(cx),

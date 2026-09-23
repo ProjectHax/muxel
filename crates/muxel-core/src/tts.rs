@@ -46,19 +46,112 @@ pub const KOKORO_VOICES: &[&str] = &[
     "bf_emma",
 ];
 
+/// Slowest speaking rate offered, as a multiple of the voice's normal pace.
+pub const MIN_TTS_RATE: f32 = 0.5;
+/// Fastest speaking rate offered.
+pub const MAX_TTS_RATE: f32 = 2.0;
+
+/// A speaking rate from settings, made safe to use: finite and within range.
+pub fn clamp_rate(rate: f32) -> f32 {
+    if rate.is_finite() {
+        rate.clamp(MIN_TTS_RATE, MAX_TTS_RATE)
+    } else {
+        1.0
+    }
+}
+
+/// macOS `say -r`: words per minute, around `say`'s own pace of about 180.
+pub fn say_words_per_minute(rate: f32) -> u32 {
+    (180.0 * clamp_rate(rate)).round() as u32
+}
+
+/// `espeak`/`espeak-ng -s`: words per minute, around their default of 175.
+pub fn espeak_words_per_minute(rate: f32) -> u32 {
+    (175.0 * clamp_rate(rate)).round() as u32
+}
+
+/// A rate as a step on a symmetric scale whose ends are about 3× faster and 3×
+/// slower than normal — the shape of both SAPI's `Rate` (−10…10) and
+/// speech-dispatcher's `-r` (−100…100); `max_step` is the scale's end.
+pub fn rate_step(rate: f32, max_step: i32) -> i32 {
+    let step = (clamp_rate(rate).ln() / 3f32.ln() * max_step as f32).round() as i32;
+    step.clamp(-max_step, max_step)
+}
+
 /// Build the JSON body for an OpenAI-compatible `POST /audio/speech`.
 ///
 /// `response_format: "pcm"` asks for raw 24 kHz 16-bit mono little-endian samples
 /// rather than MP3 — the whole point being that raw PCM needs no audio decoder,
 /// so muxel can play the reply without taking on a codec dependency.
-pub fn build_speech_request(model: &str, voice: &str, text: &str) -> String {
-    let body = serde_json::json!({
+///
+/// `speed` is sent only when it isn't the normal pace, so an OpenAI-compatible
+/// server that doesn't know the field is never handed it by default.
+pub fn build_speech_request(model: &str, voice: &str, text: &str, speed: f32) -> String {
+    let mut body = serde_json::json!({
         "model": model,
         "voice": voice,
         "input": text,
         "response_format": "pcm",
     });
+    let speed = clamp_rate(speed);
+    if (speed - 1.0).abs() > 0.01 {
+        body["speed"] = serde_json::json!(speed);
+    }
     body.to_string()
+}
+
+/// The OS voices `say -v '?'` lists (macOS), as `(name, locale)`:
+/// `Eddy (English (US)) en_US    # Hello! …` → `("Eddy (English (US))", "en_US")`.
+pub fn parse_say_voices(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|line| {
+            let described = line.split(" # ").next()?.trim_end();
+            let (name, locale) = described.rsplit_once(char::is_whitespace)?;
+            let name = name.trim();
+            (!name.is_empty() && locale.contains('_'))
+                .then(|| (name.to_string(), locale.to_string()))
+        })
+        .collect()
+}
+
+/// `name|locale` lines, as muxel's Windows voice query prints them
+/// (`Microsoft Zira Desktop|en-US`).
+pub fn parse_voice_lines(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|line| {
+            let (name, locale) = line.trim().split_once('|')?;
+            let name = name.trim();
+            (!name.is_empty()).then(|| (name.to_string(), locale.trim().to_string()))
+        })
+        .collect()
+}
+
+/// The voices that speak `language` (a BCP-47 tag such as `en` or `pt-BR`,
+/// matched on its base), or every voice if none does — a picker should never be
+/// empty just because the OS has no voice in the UI's language.
+pub fn voices_for_language<'v>(
+    voices: &'v [(String, String)],
+    language: &str,
+) -> Vec<&'v (String, String)> {
+    let base = language
+        .split(['-', '_'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let matching: Vec<_> = voices
+        .iter()
+        .filter(|(_, locale)| {
+            locale
+                .split(['-', '_'])
+                .next()
+                .is_some_and(|l| l.eq_ignore_ascii_case(&base))
+        })
+        .collect();
+    if matching.is_empty() {
+        voices.iter().collect()
+    } else {
+        matching
+    }
 }
 
 /// Decode raw 16-bit signed little-endian PCM into f32 samples in `-1.0..=1.0`.
@@ -146,25 +239,83 @@ pub fn kokoro_voice_url(voice: &str) -> String {
 mod tests {
     use super::{
         DEFAULT_KOKORO_MODEL, DEFAULT_KOKORO_VOICE, KOKORO_VOICES, build_speech_request,
-        decode_pcm_s16le, kokoro_model_filename, kokoro_model_url, kokoro_voice_filename,
-        kokoro_voice_url, speech_endpoint,
+        clamp_rate, decode_pcm_s16le, espeak_words_per_minute, kokoro_model_filename,
+        kokoro_model_url, kokoro_voice_filename, kokoro_voice_url, parse_say_voices,
+        parse_voice_lines, rate_step, say_words_per_minute, speech_endpoint, voices_for_language,
     };
 
     #[test]
     fn speech_request_asks_for_raw_pcm() {
-        let body = build_speech_request("tts-1", "onyx", "All systems online.");
+        let body = build_speech_request("tts-1", "onyx", "All systems online.", 1.0);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["model"], "tts-1");
         assert_eq!(v["voice"], "onyx");
         assert_eq!(v["input"], "All systems online.");
         // Raw PCM is what lets us play the reply with no audio decoder.
         assert_eq!(v["response_format"], "pcm");
+        // The normal pace sends no `speed` at all.
+        assert!(v.get("speed").is_none());
+    }
+
+    #[test]
+    fn speech_request_carries_a_changed_speed() {
+        let body = build_speech_request("tts-1", "onyx", "Hi.", 1.5);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["speed"], 1.5);
+        // Out-of-range settings are clamped, never sent as-is.
+        let body = build_speech_request("tts-1", "onyx", "Hi.", 9.0);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["speed"], 2.0);
+    }
+
+    #[test]
+    fn rates_map_onto_each_synthesizer() {
+        assert_eq!(clamp_rate(f32::NAN), 1.0);
+        assert_eq!(clamp_rate(0.1), 0.5);
+        assert_eq!(say_words_per_minute(1.0), 180);
+        assert_eq!(say_words_per_minute(2.0), 360);
+        assert_eq!(espeak_words_per_minute(0.5), 88);
+        // Symmetric steps: normal is 0, faster positive, slower negative.
+        assert_eq!(rate_step(1.0, 10), 0);
+        assert_eq!(rate_step(2.0, 10), 6);
+        assert_eq!(rate_step(0.5, 10), -6);
+        assert_eq!(rate_step(2.0, 100), 63);
+    }
+
+    #[test]
+    fn os_voice_lists_parse() {
+        let say = "Albert              en_US    # Hello! My name is Albert.\n\
+                   Eddy (English (UK)) en_GB    # Hello! My name is Eddy.\n\
+                   Alice               it_IT    # Ciao! Mi chiamo Alice.\n\
+                   \n";
+        let voices = parse_say_voices(say);
+        assert_eq!(
+            voices,
+            vec![
+                ("Albert".to_string(), "en_US".to_string()),
+                ("Eddy (English (UK))".to_string(), "en_GB".to_string()),
+                ("Alice".to_string(), "it_IT".to_string()),
+            ]
+        );
+        assert_eq!(
+            parse_voice_lines("Microsoft Zira Desktop|en-US\r\n\r\nbroken line\n"),
+            vec![("Microsoft Zira Desktop".to_string(), "en-US".to_string())]
+        );
+
+        let english: Vec<&str> = voices_for_language(&voices, "en")
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(english, ["Albert", "Eddy (English (UK))"]);
+        assert_eq!(voices_for_language(&voices, "it-IT").len(), 1);
+        // No voice in the UI's language: offer them all rather than none.
+        assert_eq!(voices_for_language(&voices, "ja").len(), 3);
     }
 
     #[test]
     fn speech_request_escapes_rather_than_breaks() {
         // The greeting has an apostrophe in it; quotes/newlines must not corrupt JSON.
-        let body = build_speech_request("m", "v", "\"Daddy's\" home.\nOnline.");
+        let body = build_speech_request("m", "v", "\"Daddy's\" home.\nOnline.", 1.0);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["input"], "\"Daddy's\" home.\nOnline.");
     }

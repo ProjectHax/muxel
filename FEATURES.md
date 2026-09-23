@@ -168,26 +168,45 @@ feature is added or changed, update the matching entry here in the same change**
   them back online.") and sign off when the sweep finishes ("All systems online.
   Standing by."). The greeting is timed to land before the panes start moving. Turn
   it off and the wake command runs silently.
-- **The voice muxel answers in** — Settings → Speech picks the synthesizer, in the
-  same three flavours as dictation:
+- **Read aloud (accessibility)** — a speaker button in the toolbar (or
+  `Ctrl+Shift+R`, or *Read the last reply aloud* in the `Ctrl+P` palette) reads the
+  **focused** agent's last reply out loud; press it again to stop. It reads only the
+  model's own words — its final message (usually the summary of what it did) by
+  default, or the whole last turn — and **never code**: fenced blocks, diffs,
+  commands, tool calls and their output are skipped, and markdown, emoji and
+  symbols are flattened so nothing is read out as punctuation. For a local Claude
+  pane the reply comes from Claude's own session transcript, so it's exact even
+  after it has scrolled off screen; for other agents (Codex, Gemini, …) muxel finds
+  it in the terminal's scrollback, or in tmux's history for a tmux pane. When
+  there's nothing to read, it says so out loud, so the button is usable without
+  looking at the screen.
+- **Read Aloud settings** — Settings → Read Aloud: show or hide the toolbar button;
+  final message vs. whole turn; **auto-read** when the focused pane's agent (or any
+  agent) finishes, queued one reply at a time (shells are never auto-read); say the
+  agent's name first; a length limit (about 30 s / 1 min / 3 min) that stops at the
+  end of a sentence; say "link" instead of spelling out URLs; say only a path's file
+  name; read tables row by row or skip them; and the voice itself (below).
+- **The voice** — Settings → Read Aloud picks the synthesizer, in the same three
+  flavours as dictation:
   - **System** (default) — the voice the OS already ships (`say` on macOS, SAPI on
     Windows, `spd-say`/`espeak` on Linux). No model, no key, no network, works on a
-    fresh install — and sounds like 1998.
-  - **Local** — **Kokoro-82M**, a real neural voice run on your machine, with six
-    English reads to pick from (the default `bm_george` is a British male). The
-    model downloads once (~89 MB) the first time it speaks and nothing leaves the
-    machine after that. Speech is streamed a sentence at a time, so it starts
-    talking in about a second rather than after rendering the whole line.
+    fresh install. Pick any installed voice from a list of those in your UI language
+    (macOS and Windows; on Linux, type its name).
+  - **Local** — **Kokoro-82M**, a neural voice run on your machine, with six
+    English reads to pick from. The model downloads once (~89 MB) the first time it
+    speaks and nothing leaves the machine after that. Speech is streamed a sentence
+    at a time, so it starts talking in about a second. Only in builds made with the
+    `voice-local` cargo feature.
   - **Provider** — any OpenAI-compatible `/audio/speech` endpoint, reusing the base
     URL and keychain API key the Speech section already stores; the voice and model
-    (e.g. `onyx` / `tts-1`) are yours to set. What it says is sent to that endpoint.
+    (e.g. `onyx` / `tts-1`) are yours to set. What it reads is sent to that endpoint.
 
-  A **Test voice** button speaks a sample line so you can hear the setting without
-  triggering a wake. Every engine degrades rather than fails: a provider that
-  errors, a model that won't download, or a machine with no audio device at all
-  falls back to the system voice, and failing even that, stays quiet — the sweep
-  still runs and still reports. (The local voice, like local whisper, is
-  unavailable on Windows-on-ARM; use a Provider there.)
+  A **speaking rate** control (0.5×–2×) applies to the System and Provider voices,
+  and a **Test voice** button speaks a sample line. Every engine degrades rather than
+  fails: a provider that errors, a model that won't download, or a machine with no
+  audio device at all falls back to the system voice, and failing even that, stays
+  quiet. (The local voice, like local whisper, is unavailable on Windows-on-ARM; use a
+  Provider there.)
 - **Shared project memory** — opt-in per project: agents are told (via their system
   prompt) to `grep` and add durable lessons to a `.muxel/MEMORY.md` file shared
   across every agent and run in that project. muxel creates the file, git-ignores
@@ -735,8 +754,9 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Settings & theming
 
-- **Settings modal** — sections for Appearance, Editor, Behavior, Agents, Runners,
-  Snippets, Loops, Remotes, Projects, and Keybindings.
+- **Settings modal** — sections for Appearance, Editor, Behavior, Speech, Read
+  Aloud, Agents, Runners, Snippets, Loops, Remotes, Identities, Projects, and
+  Keybindings.
 - **Themes** — ~22 bundled themes with a switcher (Catppuccin, Gruvbox, Tokyo
   Night, Solarized, Ayu, Everforest, and more).
 - **Sizing** — whole-app zoom plus independent UI, terminal, and code/diff font

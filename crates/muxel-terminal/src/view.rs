@@ -1619,6 +1619,12 @@ impl TerminalView {
         self.session.visible_text()
     }
 
+    /// The last `max_lines` lines of scrollback + screen as text, soft wraps
+    /// rejoined. Used by read-aloud to find an agent's last reply.
+    pub fn recent_text(&self, max_lines: usize) -> String {
+        self.session.recent_text(max_lines)
+    }
+
     pub fn title(&self) -> Option<String> {
         self.session.title()
     }

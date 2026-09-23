@@ -1286,6 +1286,47 @@ impl TerminalSession {
         })
     }
 
+    /// The last `max_lines` rows of the buffer — scrollback as well as screen — as
+    /// text, with soft-wrapped rows rejoined into the lines they were written as.
+    /// Used by read-aloud, whose reply has often scrolled off the top of the screen.
+    pub(crate) fn recent_text(&self, max_lines: usize) -> String {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        self.with_term(|term| {
+            let grid = term.grid();
+            let cols = grid.columns();
+            let screen = grid.screen_lines() as i32;
+            let first = (screen - max_lines as i32).max(-(grid.history_size() as i32));
+            let mut out = String::new();
+            for line in first..screen {
+                let row = &grid[Line(line)];
+                let mut text = String::with_capacity(cols);
+                for col in 0..cols {
+                    let cell = &row[Column(col)];
+                    // The second half of a wide glyph is a placeholder, not a space.
+                    if cell
+                        .flags
+                        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                    {
+                        continue;
+                    }
+                    text.push(cell.c);
+                    if let Some(combining) = cell.zerowidth() {
+                        text.extend(combining);
+                    }
+                }
+                let wrapped = cols > 0 && row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+                if wrapped {
+                    out.push_str(&text);
+                } else {
+                    out.push_str(text.trim_end());
+                    out.push('\n');
+                }
+            }
+            out
+        })
+    }
+
     /// Mutate the terminal (e.g. to update the text selection).
     pub(crate) fn with_term_mut<R>(&self, f: impl FnOnce(&mut Term<MuxelListener>) -> R) -> R {
         let mut term = self.term.lock();
@@ -2818,6 +2859,36 @@ mod tests {
             session.take_clipboard_stores().is_empty(),
             "drained on take"
         );
+        session.kill();
+    }
+
+    /// `recent_text()` reaches into scrollback, rejoins soft-wrapped rows and skips
+    /// the placeholder cell behind each wide glyph — read-aloud needs a reply that
+    /// scrolled off the screen, as the lines the agent actually wrote.
+    #[test]
+    fn recent_text_reads_scrollback_and_rejoins_wraps() {
+        let (session, _rx) =
+            TerminalSession::spawn(CommandSpec::program("/bin/cat", vec![]), 20, 5).expect("spawn");
+        session.process_output("0123456789ABCDEFGHIJKLMNOP\r\n".as_bytes());
+        for i in 1..=8 {
+            session.process_output(format!("line {i}\r\n").as_bytes());
+        }
+        session.process_output("日本 done\r\n".as_bytes());
+
+        let all = session.recent_text(1000);
+        assert!(
+            all.contains("0123456789ABCDEFGHIJKLMNOP\n"),
+            "wrapped row not rejoined / history not read: {all:?}"
+        );
+        assert!(all.contains("line 1\nline 2\n"), "{all:?}");
+        assert!(
+            all.contains("日本 done\n"),
+            "wide-glyph spacer leaked: {all:?}"
+        );
+        // A small window is the bottom of the buffer, not the top.
+        let tail = session.recent_text(3);
+        assert!(!tail.contains("line 1"), "{tail:?}");
+        assert!(tail.contains("日本 done"), "{tail:?}");
         session.kill();
     }
 
