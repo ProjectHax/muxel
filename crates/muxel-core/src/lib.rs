@@ -1336,6 +1336,23 @@ impl RemoteLayout {
     /// grid and agent activity. Counting those pushed the layout on every resize
     /// and agent turn, and made two peers look out of sync when nothing differed.
     pub fn content_key(&self) -> String {
+        self.key(false)
+    }
+
+    /// [`content_key`](Self::content_key), also blind to the session bookkeeping a
+    /// machine fills in by itself as it runs a pane: the tmux session it bound, the
+    /// conversation id it minted or captured, whether that session has started, a
+    /// runner's spent auto-submit.
+    ///
+    /// A change only this key misses is a machine catching up, not someone editing
+    /// the layout. It is still pushed, so peers learn it, but it must not be stamped
+    /// as a newer revision: then it would outrank — and overwrite — a real edit a
+    /// peer made meanwhile, such as moving the pane that was just bound.
+    pub fn edit_key(&self) -> String {
+        self.key(true)
+    }
+
+    fn key(&self, edits_only: bool) -> String {
         let instances: Vec<Instance> = self
             .instances
             .iter()
@@ -1345,6 +1362,12 @@ impl RemoteLayout {
                 instance.auto_name = None;
                 instance.grid = None;
                 instance.activity = AgentActivity::default();
+                if edits_only {
+                    instance.tmux_session = None;
+                    instance.session_id = None;
+                    instance.session_started = false;
+                    instance.auto_submit = false;
+                }
                 instance
             })
             .collect();
@@ -1401,6 +1424,26 @@ pub fn peer_layout_action(
     } else {
         PeerLayoutAction::Adopt
     }
+}
+
+/// Whether writing this machine's layout over the shared file as it stands now
+/// would undo a peer: the file holds a write this machine hasn't seen, and under
+/// [`peer_layout_action`]'s rule that write wins. The push must then adopt it and
+/// push again on top, rather than overwrite it — a blind write here is how a pane
+/// a peer moved snapped back to where it was created.
+pub fn push_overwrites_peer(
+    file: &RemoteLayout,
+    synced: Option<&str>,
+    local_key: &str,
+    local_rev: u64,
+) -> bool {
+    peer_layout_action(
+        &file.content_key(),
+        file.updated_at,
+        synced,
+        local_key,
+        local_rev,
+    ) == PeerLayoutAction::Adopt
 }
 
 /// A peer layout's instances as this machine should hold them: every one the peer
@@ -3020,6 +3063,100 @@ mod remote_layout_tests {
         // Nothing recorded yet: only a strictly newer peer layout is taken.
         assert_eq!(peer_layout_action("p", 10, None, "b", 9), Adopt);
         assert_eq!(peer_layout_action("p", 8, None, "b", 9), Ignore);
+    }
+
+    #[test]
+    fn session_bookkeeping_is_not_an_edit() {
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let a = Instance::shell(proj.id);
+        let x = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: vec![a.id, x.id],
+            active: 0,
+        }));
+        ws.instances = vec![a.clone(), x.clone()];
+        ws.projects = vec![proj.clone()];
+        let before = RemoteLayout::capture(&proj, &ws, 1);
+
+        // A machine binding the pane's tmux session and conversation: content, not edit.
+        ws.instances[1].tmux_session = Some("muxel_proj_1a2b3c4d".into());
+        ws.instances[1].session_id = Some(Uuid::new_v4().to_string());
+        ws.instances[1].session_started = true;
+        let bound = RemoteLayout::capture(&proj, &ws, 1);
+        assert_ne!(bound.content_key(), before.content_key());
+        assert_eq!(bound.edit_key(), before.edit_key());
+
+        // Moving the pane, or renaming it, is an edit.
+        assert!(pane::move_into_split(
+            &mut proj.layout,
+            x.id,
+            a.id,
+            SplitDirection::Horizontal,
+            false
+        ));
+        let moved = RemoteLayout::capture(&proj, &ws, 1);
+        assert_ne!(moved.edit_key(), bound.edit_key());
+        ws.instances[0].custom_name = Some("Reviewer".into());
+        let renamed = RemoteLayout::capture(&proj, &ws, 1);
+        assert_ne!(renamed.edit_key(), moved.edit_key());
+    }
+
+    #[test]
+    fn a_push_never_overwrites_a_peer_move_made_meanwhile() {
+        // A peer creates pane X (rev 100) and this machine adopts it, binding X's
+        // tmux session. The binding keeps rev 100 — bookkeeping, not an edit.
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let a = Instance::shell(proj.id);
+        let x = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: vec![a.id, x.id],
+            active: 0,
+        }));
+        ws.instances = vec![a.clone(), x.clone()];
+        ws.projects = vec![proj.clone()];
+        let created = RemoteLayout::capture(&proj, &ws, 100);
+        ws.instances[1].tmux_session = Some("muxel_proj_1a2b3c4d".into());
+        let ours = RemoteLayout::capture(&proj, &ws, 100);
+
+        // Before this machine's push lands, the peer moves X into its own split and
+        // writes that. Its revision is on the peer's own clock, past its create: the
+        // iOS app stamps every write `max(now, previous + 1)`, and a desktop's move
+        // can only race a push if it came after this machine read the create.
+        let mut peer = created.clone();
+        assert!(pane::move_into_split(
+            &mut peer.layout,
+            x.id,
+            a.id,
+            SplitDirection::Horizontal,
+            false
+        ));
+        peer.updated_at = 101;
+        let synced = created.content_key();
+        assert!(push_overwrites_peer(
+            &peer,
+            Some(&synced),
+            &ours.content_key(),
+            ours.updated_at,
+        ));
+
+        // The file holding only what this machine already knows: push away.
+        assert!(!push_overwrites_peer(
+            &created,
+            Some(&synced),
+            &ours.content_key(),
+            ours.updated_at,
+        ));
+        // A real local edit newer than the peer's still wins, as before.
+        assert!(!push_overwrites_peer(
+            &peer,
+            Some(&synced),
+            &ours.content_key(),
+            102
+        ));
     }
 
     #[test]

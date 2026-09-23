@@ -2427,6 +2427,10 @@ pub struct MuxelApp {
     /// Last-seen layout `content_key` per remote project, to detect real changes
     /// (vs. timestamp-only churn) for the debounced push.
     layout_keys: HashMap<Uuid, String>,
+    /// Last-seen layout `edit_key` per project, telling a real edit (which gets a new
+    /// revision) from session bookkeeping this machine filled in by itself (which
+    /// keeps the one it had — see `RemoteLayout::edit_key`).
+    layout_edit_keys: HashMap<Uuid, String>,
     /// Pending debounced layout pushes: project id → earliest time to push.
     remote_push_due: HashMap<Uuid, Instant>,
     /// Content key of each synced project's `.muxel/workspace.json` as this machine
@@ -4541,6 +4545,7 @@ impl MuxelApp {
             remote_synced: HashSet::new(),
             remote_connecting: HashSet::new(),
             layout_keys: HashMap::new(),
+            layout_edit_keys: HashMap::new(),
             remote_push_due: HashMap::new(),
             layout_synced_keys: HashMap::new(),
             remote_push_inflight: HashSet::new(),
@@ -6812,7 +6817,7 @@ impl MuxelApp {
             && prev != pid
             && self.remote_push_due.remove(&prev).is_some()
         {
-            self.push_remote_layout_now(prev, cx);
+            self.push_remote_layout_now(prev, window, cx);
         }
         self.workspace.active_project = Some(pid);
         // Adopt the project's default preset as the current selection.
@@ -7950,22 +7955,24 @@ impl MuxelApp {
     /// After adopting a peer's layout: re-seed change detection so the adoption
     /// isn't pushed straight back, and remember the file as synced. Whatever this
     /// machine had to add (a session binding the peer never recorded) makes the
-    /// content differ from the file; that is pushed, so the peer learns it too.
+    /// content differ from the file; that is pushed, so the peer learns it too —
+    /// under the adopted revision, not a new one. It is bookkeeping, not an edit:
+    /// stamped as newer, it would beat a change the peer made meanwhile (moving the
+    /// very pane that was just bound), and the push would snap that pane back.
     fn seed_adopted_layout(&mut self, pid: Uuid, remote_key: String) {
         let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
         let Some(p) = self.workspace.project(pid) else {
             return;
         };
-        let key = RemoteLayout::capture(p, &self.workspace, now_epoch).content_key();
+        let doc = RemoteLayout::capture(p, &self.workspace, now_epoch);
+        let key = doc.content_key();
         self.remote_push_due.remove(&pid);
         if key != remote_key {
-            if let Some(p) = self.workspace.project_mut(pid) {
-                p.layout_updated_at = Some(now_epoch);
-            }
             self.remote_push_due
                 .insert(pid, Instant::now() + Duration::from_secs(2));
         }
         self.layout_keys.insert(pid, key);
+        self.layout_edit_keys.insert(pid, doc.edit_key());
         self.layout_synced_keys.insert(pid, remote_key);
     }
 
@@ -8783,7 +8790,7 @@ impl MuxelApp {
         // Auto-continue: nudge armed panes whose agent has stalled with work left.
         self.tick_auto_continue(cx);
         // Sync remote projects' layouts to their hosts (change-detect + debounce).
-        self.tick_remote_sync(cx);
+        self.tick_remote_sync(window, cx);
         if dirty {
             if let Some(generation) = status_notify_generation {
                 ui_profile::status_dirty_root_notify(generation, status_transition_count);
@@ -11858,9 +11865,9 @@ impl MuxelApp {
 
     /// Remote-layout sync heartbeat, driven from `tick()`. For every remote project
     /// already reconciled this session, detect a real layout change (by content,
-    /// ignoring timestamps), stamp a new version, and schedule a debounced push;
-    /// then fire any push whose debounce window has elapsed.
-    fn tick_remote_sync(&mut self, cx: &mut Context<Self>) {
+    /// ignoring timestamps), stamp a new version if it is an edit, and schedule a
+    /// debounced push; then fire any push whose debounce window has elapsed.
+    fn tick_remote_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.remote_synced.is_empty() {
             return;
         }
@@ -11875,11 +11882,20 @@ impl MuxelApp {
             let Some(proj) = self.workspace.project(pid) else {
                 continue;
             };
-            let key = RemoteLayout::capture(proj, &self.workspace, now_epoch).content_key();
+            let doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
+            let key = doc.content_key();
             if self.layout_keys.get(&pid) != Some(&key) {
                 self.layout_keys.insert(pid, key);
-                if let Some(p) = self.workspace.project_mut(pid) {
-                    p.layout_updated_at = Some(now_epoch);
+                // An edit gets a new revision. Session bookkeeping this machine filled
+                // in by itself (a tmux binding, a conversation id) keeps the one it
+                // had: pushed so peers learn it, it must not outrank a peer's edit
+                // made meanwhile (see `RemoteLayout::edit_key`).
+                let edit = doc.edit_key();
+                if self.layout_edit_keys.get(&pid) != Some(&edit) {
+                    self.layout_edit_keys.insert(pid, edit);
+                    if let Some(p) = self.workspace.project_mut(pid) {
+                        p.layout_updated_at = Some(now_epoch);
+                    }
                 }
                 // Debounce: each fresh change pushes the deadline ~2s out.
                 self.remote_push_due
@@ -11898,14 +11914,25 @@ impl MuxelApp {
             .collect();
         for pid in due {
             self.remote_push_due.remove(&pid);
-            self.push_remote_layout_now(pid, cx);
+            self.push_remote_layout_now(pid, window, cx);
         }
     }
 
     /// Push a layout-synced project's current pane layout to
     /// `<root>/.muxel/workspace.json` off the UI thread (backs up the previous copy
     /// first) — over SSH for a remote project, on the local filesystem for a local one.
-    fn push_remote_layout_now(&mut self, pid: Uuid, cx: &mut Context<Self>) {
+    ///
+    /// The file is re-read just before the write. If a peer has written something
+    /// this machine hasn't seen, and under the live-poll rule it wins, the peer's
+    /// layout is adopted instead and this machine pushes again on top of it: writing
+    /// over it would silently undo the peer's change — a pane it had just moved
+    /// snapping back to where it was created.
+    fn push_remote_layout_now(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        enum Pushed {
+            Written,
+            /// The file holds a peer's newer layout (its JSON), left in place.
+            PeerAhead(String),
+        }
         if !self.project_syncs_layout(pid) {
             return;
         }
@@ -11923,21 +11950,50 @@ impl MuxelApp {
             return;
         };
         let name = proj.name.clone();
+        let local_rev = proj.layout_updated_at.unwrap_or(0);
         let doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
         let key = doc.content_key();
+        let synced = self.layout_synced_keys.get(&pid).cloned();
+        // The file already holds this layout, as far as this machine knows.
+        if synced.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let root = doc.remote_root.clone();
         let json = doc.to_json();
+        let local_key = key.clone();
         self.remote_push_inflight.insert(pid);
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
-                .spawn(async move { integrations::push_remote_layout(&loc, &json) })
+                .spawn(async move {
+                    if let Some(current) = integrations::fetch_remote_layout(&loc)
+                        && let Some(file) = RemoteLayout::parse(&current, &root)
+                        && muxel_core::push_overwrites_peer(
+                            &file,
+                            synced.as_deref(),
+                            &local_key,
+                            local_rev,
+                        )
+                    {
+                        return Ok(Pushed::PeerAhead(current));
+                    }
+                    integrations::push_remote_layout(&loc, &json).map(|()| Pushed::Written)
+                })
                 .await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.remote_push_inflight.remove(&pid);
                 match res {
-                    Ok(()) => {
+                    Ok(Pushed::Written) => {
                         this.layout_synced_keys.insert(pid, key);
                         this.layout_push_failing.remove(&pid);
+                    }
+                    Ok(Pushed::PeerAhead(current)) => {
+                        this.poll_peer_layout(pid, &current, window, cx);
+                        // What this machine still has to add goes out next, on top of
+                        // the peer's layout rather than instead of it.
+                        this.remote_push_due
+                            .entry(pid)
+                            .or_insert_with(|| Instant::now() + Duration::from_secs(1));
                     }
                     Err(e) => {
                         // Retry quietly: a peer must eventually see this layout even
@@ -11992,6 +12048,7 @@ impl MuxelApp {
         };
         let local = RemoteLayout::capture(proj, &self.workspace, now_epoch);
         let local_key = local.content_key();
+        let local_edit = local.edit_key();
         let local_rev = proj.layout_updated_at.unwrap_or(0);
         let remote = fetched
             .as_deref()
@@ -12009,11 +12066,13 @@ impl MuxelApp {
             // Already in sync → just arm change detection.
             Some(r) if r.content_key() == local_key => {
                 self.layout_keys.insert(pid, local_key.clone());
+                self.layout_edit_keys.insert(pid, local_edit);
                 self.layout_synced_keys.insert(pid, local_key);
             }
             // Local is newer, or there's no usable remote doc → push local up.
             _ => {
                 self.layout_keys.insert(pid, local_key);
+                self.layout_edit_keys.insert(pid, local_edit);
                 self.remote_push_due.insert(pid, Instant::now());
             }
         }
