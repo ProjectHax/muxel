@@ -84,17 +84,31 @@ cargo build -p muxel                                     # the GUI binary
 Unit tests can't see the UI, so for anything visual:
 
 - **Smoke test** (does it launch without panicking?) — run the binary against an
-  isolated workspace with a timeout; exit code `124` means it stayed up (good):
+  isolated workspace for a few seconds; "ok" means it stayed up:
 
   ```sh
-  s=$(mktemp -d); XDG_CONFIG_HOME="$s/config" XDG_DATA_HOME="$s/data" \
-    timeout 5s ./target/debug/muxel >/dev/null 2>&1; echo "exit $? (124=ok)"; rm -rf "$s"
+  s=$(mktemp -d)
+  HOME="$s" XDG_CONFIG_HOME="$s/config" XDG_DATA_HOME="$s/data" \
+    ./target/debug/muxel >/dev/null 2>&1 & pid=$!
+  sleep 5
+  if kill -0 $pid 2>/dev/null; then echo ok; kill $pid; else wait $pid; echo "exited early: $?"; fi
+  rm -rf "$s"
   ```
+
+  **Isolation must override `HOME`, not just the `XDG_*` vars.** The `directories`
+  crate honours `XDG_*` only on Linux; on macOS it ignores them and uses
+  `~/Library/Application Support/dev.muxel.muxel` — the real workspace, possibly
+  with the user's own muxel running on it. It does follow `$HOME`, so setting both
+  covers Linux and macOS. The script backgrounds and kills the process rather than
+  using `timeout`, which macOS doesn't ship.
 
 - **Interactive** — `scripts/dev.sh` runs muxel against an isolated sandbox
   (`.muxel-dev/`) so testing never touches the real workspace. A fresh workspace shows
   the first-run welcome dialog; accepted-terms / window geometry / layout live
-  under the sandbox's data dir.
+  under the sandbox's data dir. Args go to cargo (`--release`); anything after `--`
+  goes to muxel. On Linux it isolates with `XDG_*`; on macOS (where those are
+  ignored) it builds first, then runs only the binary with `HOME` set to
+  `.muxel-dev/home` — so agents in its panes start without your login/config.
 - State each visual behavior that needs a human's eyes — the harness can build and
   smoke-test, but can't see colors/layout.
 
