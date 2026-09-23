@@ -5,6 +5,52 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-09-22
+
+### Added
+- **muxel can read an agent's last reply aloud** — a speaker button in the toolbar
+  (or `Ctrl+Shift+R`, or *Read the last reply aloud* in the `Ctrl+P` palette) reads
+  the focused agent's last reply out loud; press it again to stop. It reads only the
+  model's own words — by default its final message, which is usually the summary of
+  what it just did, or the whole last turn if you prefer — and never code: fenced
+  blocks, diffs, commands, tool calls and their output are skipped, and markdown,
+  emoji and symbols are flattened so nothing is read out as punctuation. A local
+  Claude pane is read from Claude's own record of the conversation, so the reply is
+  exact even after it has scrolled off screen; other agents are read from the
+  terminal's scrollback, or from tmux's history for a tmux pane. When there is
+  nothing to read it says so out loud, so the button works without looking at the
+  screen.
+- **Replies can be read automatically as agents finish** — a new Settings → Read
+  Aloud page can read each reply the moment the focused pane's agent finishes, or
+  any agent's, queued one at a time so they never talk over each other; a plain shell
+  is never read. The same page shows or hides the toolbar button, chooses between the
+  final message and the whole turn, can say the agent's name first, and caps a
+  reading at about 30 seconds, a minute or three minutes, stopping at the end of a
+  sentence. It can also say "link" instead of spelling out a URL, say only a file's
+  name instead of its whole path, and read a table row by row or skip it.
+
+### Changed
+- **The voice settings live under Read Aloud, with a speaking rate and a voice
+  picker** — the choice of synthesizer that used to sit under Speech has moved to the
+  Read Aloud page beside everything else about how muxel talks. A speaking rate from
+  0.5× to 2× now applies to the system and provider voices, and the system voice no
+  longer has to be the OS default: on macOS and Windows you pick any installed voice
+  from a list of those in your interface language, and on Linux you type its name.
+
+### Fixed
+- **A pane you move on a shared project stays where you put it** — on a project
+  whose layout is shared with another machine or the iOS app, a pane added on one
+  device and then moved snapped back to where it was first created. When muxel
+  picked up the other device's layout it filled in a few details of its own for the
+  new pane and wrote the layout back a couple of seconds later, without checking
+  whether it had changed in the meantime. A move made in that window was overwritten
+  by the older layout — which then looked newer than the move, so the other device
+  took the older layout too. muxel now re-reads the shared layout before writing and
+  takes a newer change from the other device instead of overwriting it. The details
+  a machine fills in by itself, such as which tmux session a pane runs in, are still
+  shared but no longer count as an edit, so they can never outrank a real move,
+  split, rename or new pane.
+
 ## [0.2.2] — 2026-09-22
 
 ### Fixed
