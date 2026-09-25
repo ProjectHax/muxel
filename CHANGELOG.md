@@ -5,6 +5,63 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-09-24
+
+### Added
+- **Another agent can drive the agents running in muxel** — turn on "Allow outside
+  tools to control muxel" and a program on the same computer — xAI's Grok Bot, a
+  script, or another coding agent — can work your agents through the new `muxel ctl`
+  command. It can list your projects, the pane layout and every agent with its
+  status, read an agent's last prompt and reply and the question it is stuck on, send
+  it a prompt, answer that question, press keys, and wait for its turn to end. Every
+  command answers in JSON. It is off by default and only listens on this computer,
+  behind a fresh token kept in a file only you can read. It won't type into an agent
+  that is busy or waiting on a question, only picks an answer the question actually
+  offers, and leaves shell panes alone unless you separately allow them, since typing
+  into a shell is running commands.
+- **A Grok Bot page in Settings walks through the setup** — four steps: turn
+  outside control on, with a live status showing whether it is listening; allow Grok
+  Bot to run commands on this computer; copy the skill that teaches it the commands
+  and the rules; and **Test**, which runs the same `muxel ctl` command Grok Bot will
+  and shows what muxel answered, or why it couldn't. One copied skill works on every
+  computer you use: it says how to find muxel on each, and every answer names the
+  computer that gave it. On Linux it works from the .deb, the .rpm and the AppImage
+  alike.
+- **Agents shared between computers take turns** — a remote project opened on two
+  computers, or a local tmux project another computer has attached to, can be
+  reached by more than one muxel. Before typing into such an agent, muxel checks
+  whether another muxel is partway through a turn with it and refuses if so, naming
+  the computer that has it, so two machines never type into the same agent at once.
+- **Pause, resume and start over reading aloud, pane by pane** — every agent pane
+  now has its own read-aloud controls in its header: the speaker starts reading,
+  then becomes pause and resume, with start over and stop beside it. Each pane keeps
+  its own place, so reading another pane pauses the one that was speaking, and coming
+  back to it picks up at the start of the sentence it stopped in. A tab that is being
+  read shows a badge that pauses or resumes it without switching to it.
+  `Ctrl+Shift+R` reads, pauses and resumes the focused pane, `Ctrl+Alt+R` starts it
+  over, and `Ctrl+Alt+S` stops whatever is speaking; all three are in the `Ctrl+P`
+  palette.
+
+### Changed
+- **Projects on the same host share one connection from the start** — opening
+  several remote projects on one host together, as a workspace does at launch, used
+  to open a separate SSH connection for each and announce "Connected to …" once per
+  project. The first project now connects and the rest wait for it and share its
+  connection, and the notice appears once per host.
+
+### Fixed
+- **Closing a remote pane on a Mac ends the agent running there** — on a host whose
+  login shell is zsh, which every Mac uses by default, the command muxel sends to end
+  a closed pane's tmux session failed before it could run. The agent kept running on
+  the host after you closed its pane or quit muxel. The session name is now quoted so
+  zsh leaves it alone, and the session really ends.
+- **muxel no longer mistakes another app's AppImage for its own** — on Linux, a
+  muxel installed from the .deb or .rpm but started from inside another AppImage
+  app, such as a shell in a terminal emulator shipped as an AppImage, picked up that
+  app's AppImage details and believed it was that file. Updating muxel then
+  overwrote the other app with muxel. muxel now treats itself as an AppImage only
+  when it is actually running from one.
+
 ## [0.2.3] — 2026-09-22
 
 ### Added
