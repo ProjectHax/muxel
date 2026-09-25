@@ -1,10 +1,12 @@
 //! Text-to-speech I/O: the voice muxel reads agents' replies aloud in.
 //!
-//! Read-aloud (the toolbar speaker, the `ReadAloud` shortcut, and auto-read when
-//! an agent finishes) builds a [`VoiceConfig`] from `Settings` and calls
-//! [`speak`]; the [`Speech`] it gets back stops the voice mid-sentence and says
-//! when it has finished. Everything that decides *what* is said — finding the
-//! reply, dropping the code — is pure and lives in `muxel_core::readaloud`.
+//! Read-aloud (the toolbar and pane speakers, the `ReadAloud` shortcuts, and
+//! auto-read when an agent finishes) builds a [`VoiceConfig`] from `Settings` and
+//! calls [`speak`] with the reply's pieces (`muxel_core::readaloud::chunks`). The
+//! [`Speech`] it gets back stops the voice mid-sentence, says which piece it was
+//! on — where a paused reading resumes — and when it has finished. Everything that
+//! decides *what* is said — finding the reply, dropping the code — is pure and
+//! lives in `muxel_core::readaloud`.
 //!
 //! The Kokoro (Local) engine is behind the off-by-default `voice-local` cargo
 //! feature, because onnxruntime links statically and costs ~63 MB of binary.
@@ -42,8 +44,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -83,11 +85,13 @@ pub struct VoiceConfig {
 pub struct Speech {
     stop: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+    /// The piece being spoken — or, once finished, the number of pieces.
+    position: Arc<AtomicUsize>,
 }
 
 impl Speech {
     /// Silence it now: the OS voice is killed, queued audio is thrown away, and
-    /// a synthesizer still rendering stops at its next chunk.
+    /// a synthesizer still rendering stops at its next piece.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -96,55 +100,68 @@ impl Speech {
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::Relaxed)
     }
+
+    /// The piece being spoken: where a reading stopped now would resume. Past
+    /// the last piece once it has all been spoken.
+    pub fn position(&self) -> usize {
+        self.position.load(Ordering::Relaxed)
+    }
 }
 
-/// Speak `text` aloud, off the UI thread. Returns immediately with a handle to
-/// stop it or ask whether it has finished.
-pub fn speak(text: &str, cfg: VoiceConfig) -> Speech {
+/// Speak `pieces` in order, from `from`, off the UI thread. Returns immediately
+/// with a handle to stop it, see how far it got, or ask whether it has finished.
+pub fn speak(pieces: Vec<String>, from: usize, cfg: VoiceConfig) -> Speech {
     let speech = Speech {
         stop: Arc::default(),
         done: Arc::default(),
+        position: Arc::new(AtomicUsize::new(from)),
     };
-    let text = text.trim().to_string();
-    if text.is_empty() {
+    if from >= pieces.len() {
+        speech.position.store(pieces.len(), Ordering::Relaxed);
         speech.done.store(true, Ordering::Relaxed);
         return speech;
     }
     let handle = speech.clone();
     std::thread::spawn(move || {
-        say_it(&text, &cfg, &handle.stop);
+        say_it(&pieces, from, &cfg, &handle.stop, &handle.position);
         handle.done.store(true, Ordering::Relaxed);
     });
     speech
 }
 
 /// The body of [`speak`]'s thread: synthesize and play, falling back to the OS
-/// voice when nothing came out.
-fn say_it(text: &str, cfg: &VoiceConfig, stop: &AtomicBool) {
+/// voice for whatever the chosen one couldn't say.
+fn say_it(
+    pieces: &[String],
+    from: usize,
+    cfg: &VoiceConfig,
+    stop: &AtomicBool,
+    position: &AtomicUsize,
+) {
     if cfg.engine == TtsEngine::System {
-        system_voice(text, cfg, stop);
+        system_pieces(pieces, from, cfg, stop, position);
         return;
     }
 
-    // Synthesis runs on its own thread and pushes finished chunks down the
-    // channel, so playback can begin on the FIRST chunk instead of waiting for
-    // the last. That is what makes the local voice usable: Kokoro takes seconds to
-    // render a reply whole, but under a second to render its first sentence — and
-    // it renders faster than the device plays, so the rest stays ahead.
-    let (chunk_tx, chunks) = std::sync::mpsc::channel::<Vec<f32>>();
+    // Synthesis runs on its own thread and pushes finished audio down the
+    // channel, so playback can begin on the FIRST piece instead of waiting for
+    // the last — and the next piece is rendered while this one plays. That is
+    // what makes the local voice usable: Kokoro takes seconds to render a reply
+    // whole, but under a second to render its first sentence.
+    let (audio_tx, audio) = std::sync::mpsc::channel::<(usize, Vec<f32>)>();
     let synth_cfg = cfg.clone();
-    let synth_text = text.to_string();
-    let producer = std::thread::spawn(move || produce(&synth_text, &synth_cfg, &chunk_tx));
+    let synth_pieces = pieces.to_vec();
+    let producer = std::thread::spawn(move || produce(&synth_pieces, from, &synth_cfg, &audio_tx));
 
-    let played = match play_stream(&chunks, muxel_core::tts::SPEECH_RATE, stop) {
+    let played = match play_stream(&audio, muxel_core::tts::SPEECH_RATE, stop, position) {
         Ok(n) => n,
         Err(e) => {
             log::warn!("speech playback failed: {e:#}");
             0
         }
     };
-    // Hang up, so a synthesizer still rendering stops at its next chunk.
-    drop(chunks);
+    // Hang up, so a synthesizer still rendering stops at its next piece.
+    drop(audio);
     if stop.load(Ordering::Relaxed) {
         // Stopped: leave the producer to notice on its own rather than wait out
         // a slow provider request just to throw its answer away.
@@ -154,54 +171,101 @@ fn say_it(text: &str, cfg: &VoiceConfig, stop: &AtomicBool) {
         .join()
         .unwrap_or_else(|_| bail!("speech thread panicked"));
 
-    // Nothing came out — a dead provider, a model that won't download, no audio
-    // device. Fall back to the OS voice, which needs none of those things.
     if played == 0 {
+        // Nothing came out — a dead provider, a model that won't download, no
+        // audio device. The OS voice needs none of those things.
         if let Err(e) = synth {
             log::warn!("speech failed, falling back to the system voice: {e:#}");
         }
-        system_voice(text, cfg, stop);
-    } else if let Err(e) = synth {
-        // It spoke, then broke: say what happened but don't repeat the reply.
-        log::warn!("speech ended early: {e:#}");
+        system_pieces(
+            pieces,
+            position.load(Ordering::Relaxed),
+            cfg,
+            stop,
+            position,
+        );
+        return;
+    }
+    match synth {
+        Ok(()) => position.store(pieces.len(), Ordering::Relaxed),
+        // It spoke, then broke: the OS voice carries on after the last piece that
+        // was heard, rather than repeating any of it.
+        Err(e) => {
+            log::warn!("speech ended early, the system voice finishes it: {e:#}");
+            let next = position.load(Ordering::Relaxed) + 1;
+            system_pieces(pieces, next, cfg, stop, position);
+        }
     }
 }
 
-/// Synthesize `text` into the channel, a chunk at a time.
-fn produce(text: &str, cfg: &VoiceConfig, out: &std::sync::mpsc::Sender<Vec<f32>>) -> Result<()> {
-    match cfg.engine {
-        // One request, one chunk: the whole reply arrives as a single PCM body.
-        TtsEngine::Provider => {
-            let _ = out.send(synth_provider(text, cfg)?);
-            Ok(())
+/// Synthesize `pieces` from `from` into the channel, each tagged with its index.
+/// Returns early (and fine) once the player hangs up.
+fn produce(
+    pieces: &[String],
+    from: usize,
+    cfg: &VoiceConfig,
+    out: &Sender<(usize, Vec<f32>)>,
+) -> Result<()> {
+    for (i, piece) in pieces.iter().enumerate().skip(from) {
+        if piece.trim().is_empty() {
+            continue;
         }
-        // Sentence by sentence, so the first word lands fast.
-        TtsEngine::Local => synth_local_streaming(text, cfg, out),
-        TtsEngine::System => Ok(()),
+        match cfg.engine {
+            // One request per piece; this loop runs ahead of playback, so the next
+            // piece is fetched while the current one plays.
+            TtsEngine::Provider => {
+                if out.send((i, synth_provider(piece, cfg)?)).is_err() {
+                    return Ok(());
+                }
+            }
+            // Kokoro streams a piece a sentence at a time; tag each part with the
+            // piece it belongs to on its way to the player.
+            TtsEngine::Local => {
+                let (part_tx, parts) = std::sync::mpsc::channel::<Vec<f32>>();
+                let tagged = out.clone();
+                let forward = std::thread::spawn(move || {
+                    parts.iter().all(|part| tagged.send((i, part)).is_ok())
+                });
+                let rendered = synth_local_streaming(piece, cfg, &part_tx);
+                drop(part_tx);
+                let heard = forward.join().unwrap_or(false);
+                rendered?;
+                if !heard {
+                    return Ok(());
+                }
+            }
+            TtsEngine::System => return Ok(()),
+        }
     }
+    Ok(())
 }
 
 // --- Playback ---------------------------------------------------------------
 
-/// Play mono chunks (at `rate`) on the default output device as they arrive,
+/// Play mono audio (at `rate`) on the default output device as it arrives,
 /// blocking until the producer is done and the buffer has drained — or until
-/// `stop` is raised, which silences it at once. Returns how many samples were
-/// queued for playback.
+/// `stop` is raised, which silences it at once. Keeps `position` on the piece
+/// that is audible now. Returns how many samples were queued for playback.
 ///
-/// Building the device stream waits for the first chunk, so a synthesizer that
+/// Building the device stream waits for the first audio, so a synthesizer that
 /// fails outright never opens (and never has to close) an audio device.
-fn play_stream(chunks: &Receiver<Vec<f32>>, rate: u32, stop: &AtomicBool) -> Result<usize> {
+fn play_stream(
+    audio: &Receiver<(usize, Vec<f32>)>,
+    rate: u32,
+    stop: &AtomicBool,
+    position: &AtomicUsize,
+) -> Result<usize> {
     // Short enough that Stop feels immediate, long enough to cost nothing.
     const POLL: Duration = Duration::from_millis(50);
     let stopped = || stop.load(Ordering::Relaxed);
 
     // A provider can take seconds to answer; keep an eye on Stop meanwhile.
-    let first = loop {
+    let (first_piece, first) = loop {
         if stopped() {
             return Ok(0);
         }
-        match chunks.recv_timeout(POLL) {
-            Ok(chunk) => break chunk,
+        match audio.recv_timeout(POLL) {
+            Ok(tagged) => break tagged,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Ok(0), // failed before a sound
         }
@@ -216,22 +280,33 @@ fn play_stream(chunks: &Receiver<Vec<f32>>, rate: u32, stop: &AtomicBool) -> Res
     let dev_rate = config.sample_rate.0;
     let channels = config.channels.max(1) as usize;
 
-    // The device rarely wants 24 kHz mono: resample each chunk to its rate, and
-    // fan the mono signal out across however many channels it has.
+    // The device rarely wants 24 kHz mono: resample to its rate, and fan the mono
+    // signal out across however many channels it has.
     let queue: Shared =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     let mut played = push(&queue, &first, rate, dev_rate)?;
+    // Where each piece starts in the stream, against how much the device has
+    // played (`consumed`), says which piece is audible.
+    let mut starts: Vec<(usize, usize)> = vec![(0, first_piece)];
+    position.store(first_piece, Ordering::Relaxed);
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let audible = |starts: &[(usize, usize)]| {
+        let at = consumed.load(Ordering::Relaxed);
+        if let Some(&(_, piece)) = starts.iter().rev().find(|(offset, _)| *offset <= at) {
+            position.store(piece, Ordering::Relaxed);
+        }
+    };
 
     let starving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stream = match format {
         cpal::SampleFormat::F32 => {
-            out_stream::<f32>(&device, &config, &queue, channels, &starving)?
+            out_stream::<f32>(&device, &config, &queue, channels, &starving, &consumed)?
         }
         cpal::SampleFormat::I16 => {
-            out_stream::<i16>(&device, &config, &queue, channels, &starving)?
+            out_stream::<i16>(&device, &config, &queue, channels, &starving, &consumed)?
         }
         cpal::SampleFormat::U16 => {
-            out_stream::<u16>(&device, &config, &queue, channels, &starving)?
+            out_stream::<u16>(&device, &config, &queue, channels, &starving, &consumed)?
         }
         other => bail!("unsupported output sample format: {other:?}"),
     };
@@ -239,11 +314,17 @@ fn play_stream(chunks: &Receiver<Vec<f32>>, rate: u32, stop: &AtomicBool) -> Res
 
     // Feed the queue until the producer hangs up.
     while !stopped() {
-        match chunks.recv_timeout(POLL) {
-            Ok(chunk) => played += push(&queue, &chunk, rate, dev_rate)?,
+        match audio.recv_timeout(POLL) {
+            Ok((piece, samples)) => {
+                if starts.last().is_some_and(|&(_, last)| last != piece) {
+                    starts.push((played, piece));
+                }
+                played += push(&queue, &samples, rate, dev_rate)?;
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        audible(&starts);
     }
 
     // Producer is done; wait for the device to drain what is left, with a ceiling
@@ -258,6 +339,7 @@ fn play_stream(chunks: &Receiver<Vec<f32>>, rate: u32, stop: &AtomicBool) -> Res
             }
             return Ok(played);
         }
+        audible(&starts);
         let empty = queue.lock().map(|q| q.is_empty()).unwrap_or(true);
         if empty && starving.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -293,12 +375,14 @@ fn out_stream<T>(
     queue: &Shared,
     channels: usize,
     starving: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    consumed: &Arc<AtomicUsize>,
 ) -> Result<cpal::Stream>
 where
     T: SizedSample + FromSample<f32>,
 {
     let queue = queue.clone();
     let starving = starving.clone();
+    let consumed = consumed.clone();
     device
         .build_output_stream(
             config,
@@ -307,15 +391,23 @@ where
                     Ok(q) => q,
                     Err(_) => return,
                 };
+                let mut heard = 0;
                 for frame in out.chunks_mut(channels) {
                     // An empty queue mid-utterance is an underrun: write silence
                     // rather than stopping, so a slow chunk costs a gap, not the
                     // rest of the sentence.
-                    let s = q.pop_front().unwrap_or(0.0);
+                    let s = match q.pop_front() {
+                        Some(s) => {
+                            heard += 1;
+                            s
+                        }
+                        None => 0.0,
+                    };
                     for slot in frame.iter_mut() {
                         *slot = T::from_sample(s);
                     }
                 }
+                consumed.fetch_add(heard, Ordering::Relaxed);
                 starving.store(q.is_empty(), std::sync::atomic::Ordering::Relaxed);
             },
             |e| log::warn!("speech stream error: {e}"),
@@ -482,12 +574,58 @@ pub const fn local_voice_supported() -> bool {
 
 // --- System (the OS voice) --------------------------------------------------
 
-/// Speak through the synthesizer the OS ships. Blocks until it finishes or
-/// `stop` is raised.
-fn system_voice(text: &str, cfg: &VoiceConfig, stop: &AtomicBool) {
-    for mut cmd in system_voices(text, cfg) {
+/// How one attempt at the OS voice went.
+enum Voiced {
+    Spoken,
+    Stopped,
+    /// No synthesizer on this machine would speak.
+    Unavailable,
+}
+
+/// Speak `pieces` from `from` through the OS voice, one at a time, keeping
+/// `position` on the piece being spoken.
+fn system_pieces(
+    pieces: &[String],
+    from: usize,
+    cfg: &VoiceConfig,
+    stop: &AtomicBool,
+    position: &AtomicUsize,
+) {
+    speak_pieces_with(pieces, from, stop, position, &|text| {
+        system_voices(text, cfg)
+    });
+}
+
+/// [`system_pieces`] with the synthesizer commands supplied by `voices` (which
+/// the tests swap for silent stand-ins).
+fn speak_pieces_with(
+    pieces: &[String],
+    from: usize,
+    stop: &AtomicBool,
+    position: &AtomicUsize,
+    voices: &dyn Fn(&str) -> Vec<Command>,
+) {
+    for (i, piece) in pieces.iter().enumerate().skip(from) {
+        position.store(i, Ordering::Relaxed);
+        if piece.trim().is_empty() {
+            continue;
+        }
+        match system_voice(voices(piece), stop) {
+            Voiced::Spoken => {}
+            Voiced::Stopped => return,
+            // Nothing to speak with: trying every other piece would fail the same.
+            Voiced::Unavailable => break,
+        }
+    }
+    position.store(pieces.len(), Ordering::Relaxed);
+}
+
+/// Speak through the first of `candidates` (the OS's synthesizers, best first)
+/// that works. Blocks until it finishes or `stop` is raised.
+fn system_voice(candidates: Vec<Command>, stop: &AtomicBool) -> Voiced {
+    for mut cmd in candidates {
         if stop.load(Ordering::Relaxed) {
-            return;
+            return Voiced::Stopped;
         }
         let Ok(mut child) = cmd
             .stdin(Stdio::null())
@@ -502,13 +640,13 @@ fn system_voice(text: &str, cfg: &VoiceConfig, stop: &AtomicBool) {
         // by leaked children before.
         loop {
             match child.try_wait() {
-                Ok(Some(status)) if status.success() => return,
+                Ok(Some(status)) if status.success() => return Voiced::Spoken,
                 Ok(Some(_)) => break, // it couldn't speak; try the next
                 Ok(None) if stop.load(Ordering::Relaxed) => {
                     let _ = child.kill();
                     let _ = child.wait();
                     cancel_system_voice();
-                    return;
+                    return Voiced::Stopped;
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                 Err(_) => {
@@ -520,6 +658,7 @@ fn system_voice(text: &str, cfg: &VoiceConfig, stop: &AtomicBool) {
         }
     }
     log::debug!("no speech synthesizer available; muxel stays quiet");
+    Voiced::Unavailable
 }
 
 /// Silence a synthesizer that outlives the process that asked it to speak.
@@ -647,5 +786,88 @@ pub fn system_voice_list() -> Vec<(String, String)> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         Vec::new()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::speak_pieces_with;
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A silent stand-in for the OS voice: logs the piece, then takes `secs` to
+    /// "say" it.
+    fn voice(log: &std::path::Path, secs: f32) -> impl Fn(&str) -> Vec<Command> {
+        let log = log.to_path_buf();
+        move |text| {
+            let mut cmd = Command::new("sh");
+            cmd.args([
+                "-c",
+                "printf '%s\\n' \"$1\" >> \"$2\"; sleep \"$3\"",
+                "sh",
+                text,
+                &log.display().to_string(),
+                &secs.to_string(),
+            ]);
+            vec![cmd]
+        }
+    }
+
+    fn heard(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn pieces() -> Vec<String> {
+        vec!["one.".into(), "two.".into(), "three.".into()]
+    }
+
+    #[test]
+    fn pieces_are_spoken_in_order_to_the_end() {
+        let dir = tempdir("in-order");
+        let log = dir.join("heard");
+        let (stop, position) = (AtomicBool::new(false), AtomicUsize::new(0));
+        speak_pieces_with(&pieces(), 0, &stop, &position, &voice(&log, 0.0));
+        assert_eq!(heard(&log), pieces());
+        assert_eq!(position.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn a_pause_stops_mid_piece_and_resumes_from_that_piece() {
+        let dir = tempdir("pause-resume");
+        let log = dir.join("heard");
+        let stop = Arc::new(AtomicBool::new(false));
+        let position = Arc::new(AtomicUsize::new(0));
+        let reader = {
+            let (stop, position, log) = (stop.clone(), position.clone(), log.clone());
+            std::thread::spawn(move || {
+                speak_pieces_with(&pieces(), 0, &stop, &position, &voice(&log, 0.6))
+            })
+        };
+        // Pause part-way through the second piece.
+        std::thread::sleep(Duration::from_millis(900));
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        let paused_at = position.load(Ordering::Relaxed);
+        assert_eq!(paused_at, 1, "paused on the piece that was being spoken");
+        assert_eq!(heard(&log), ["one.", "two."]);
+
+        // Resume: that piece again from its start, then on to the end.
+        let (stop, position) = (AtomicBool::new(false), AtomicUsize::new(paused_at));
+        speak_pieces_with(&pieces(), paused_at, &stop, &position, &voice(&log, 0.0));
+        assert_eq!(heard(&log), ["one.", "two.", "two.", "three."]);
+        assert_eq!(position.load(Ordering::Relaxed), 3);
+    }
+
+    fn tempdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("muxel-tts-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

@@ -1346,8 +1346,12 @@ actions!(
         ToggleSpeechToText,
         // Push-to-hold dictation: records while the chord is held.
         HoldSpeechToText,
-        // Read the focused agent's last reply aloud, or stop reading.
+        // Read the focused agent's last reply aloud; again pauses, again resumes.
         ReadAloud,
+        // Start the focused pane's reading over from the beginning.
+        ReadAloudRestart,
+        // Stop reading aloud (and forget where it was).
+        ReadAloudStop,
         // Toggle the "new agents get a git worktree" toolbar switch.
         ToggleWorktree,
         // OS fullscreen with the sidebar hidden (a floating pill reveals it).
@@ -1413,6 +1417,8 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
         "ToggleSpeechToText" => KeyBinding::new(keystroke, ToggleSpeechToText, context),
         "HoldSpeechToText" => KeyBinding::new(keystroke, HoldSpeechToText, context),
         "ReadAloud" => KeyBinding::new(keystroke, ReadAloud, context),
+        "ReadAloudRestart" => KeyBinding::new(keystroke, ReadAloudRestart, context),
+        "ReadAloudStop" => KeyBinding::new(keystroke, ReadAloudStop, context),
         "ToggleWorktree" => KeyBinding::new(keystroke, ToggleWorktree, context),
         "ToggleFullScreen" => KeyBinding::new(keystroke, ToggleFullScreen, context),
         "ToggleDevConsole" => KeyBinding::new(keystroke, ToggleDevConsole, context),
@@ -2112,11 +2118,161 @@ impl SttState {
     }
 }
 
-/// A reading in progress, and its utterance once the reply has been gathered and
-/// handed to the voice.
-struct ReadAloudJob {
+/// Where a pane's read-aloud stands, for its controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadState {
+    /// No reading: its speaker reads the agent's last reply.
+    Idle,
+    /// The voice is on this pane (or gathering its reply to start).
+    Playing,
+    /// A reading stopped part-way, waiting to resume where it left off.
+    Paused,
+}
+
+/// One pane's reading: its reply as the pieces it is spoken in
+/// (`readaloud::chunks`), and the piece to speak next — where a pause left off.
+struct PaneReading {
+    pieces: Vec<String>,
+    next: usize,
+}
+
+/// What a reading will say, once its reply has been gathered.
+enum Utterance {
+    /// A pane's reply: its pieces and the one to start at. Kept as the pane's
+    /// reading, so it can be paused, resumed and started over.
+    Reading(Vec<String>, usize),
+    /// A word about read-aloud itself ("nothing to read"), said once, not kept.
+    Notice(String),
+}
+
+/// Read-aloud's bookkeeping: every pane's reading, which one the voice is on, and
+/// the auto-reads waiting their turn. The voice itself (`tts::Speech`) is held by
+/// the app beside it.
+///
+/// One voice at a time: starting or resuming a pane pauses whichever is speaking,
+/// and that pane keeps its place — so each pane can be paused, resumed and started
+/// over on its own.
+#[derive(Default)]
+struct Readings {
+    panes: HashMap<Uuid, PaneReading>,
+    /// What the voice is on — a pane, or `None` for a notice — and that reading's
+    /// generation, from the moment its reply starts being gathered.
+    current: Option<(Option<Uuid>, u64)>,
     generation: u64,
-    speech: Option<crate::tts::Speech>,
+    /// Panes whose new replies auto-read reads next, oldest first.
+    queue: std::collections::VecDeque<Uuid>,
+}
+
+impl Readings {
+    fn state(&self, iid: Uuid) -> ReadState {
+        if self.current.is_some_and(|(pane, _)| pane == Some(iid)) {
+            ReadState::Playing
+        } else if self.panes.contains_key(&iid) {
+            ReadState::Paused
+        } else {
+            ReadState::Idle
+        }
+    }
+
+    /// The pane the voice is on, if it is on one.
+    fn speaking_pane(&self) -> Option<Uuid> {
+        self.current.and_then(|(pane, _)| pane)
+    }
+
+    /// The voice stops where it is — `at`, the piece it was on, if it had started —
+    /// and the pane it was reading keeps that place.
+    fn hush(&mut self, at: Option<usize>) {
+        if let Some((Some(iid), _)) = self.current.take()
+            && let Some(at) = at
+            && let Some(reading) = self.panes.get_mut(&iid)
+        {
+            reading.next = at;
+            if at >= reading.pieces.len() {
+                self.panes.remove(&iid);
+            }
+        }
+    }
+
+    /// Start a reading of `pane` (or a notice), once the previous one is hushed.
+    /// Returns its generation.
+    fn begin(&mut self, pane: Option<Uuid>) -> u64 {
+        self.generation += 1;
+        self.current = Some((pane, self.generation));
+        self.generation
+    }
+
+    /// The reading's reply is gathered: keep `reading` (pieces, first piece) as the
+    /// pane's. `None` — nothing to read, a notice says so — leaves the pane idle.
+    /// `false` if the reading was stopped or replaced while it was gathered.
+    fn loaded(&mut self, generation: u64, reading: Option<(Vec<String>, usize)>) -> bool {
+        let Some((pane, at)) = self.current else {
+            return false;
+        };
+        if at != generation {
+            return false;
+        }
+        match (pane, reading) {
+            (Some(iid), Some((pieces, next))) => {
+                self.panes.insert(iid, PaneReading { pieces, next });
+            }
+            (Some(_), None) => self.current = Some((None, generation)),
+            (None, _) => {}
+        }
+        true
+    }
+
+    /// The voice reached the end of a reading on its own: the reading is done.
+    /// `false` if it had already been stopped or replaced.
+    fn finished(&mut self, generation: u64) -> bool {
+        if self.current.is_none_or(|(_, at)| at != generation) {
+            return false;
+        }
+        if let Some((Some(iid), _)) = self.current.take() {
+            self.panes.remove(&iid);
+        }
+        true
+    }
+
+    /// `iid`'s reading as it stands: its pieces, and where it resumes.
+    fn resume_point(&self, iid: Uuid) -> Option<(Vec<String>, usize)> {
+        self.panes.get(&iid).map(|r| (r.pieces.clone(), r.next))
+    }
+
+    /// Wind `iid`'s reading back to its first piece. `false` if it has none.
+    fn rewind(&mut self, iid: Uuid) -> bool {
+        self.panes.get_mut(&iid).map(|r| r.next = 0).is_some()
+    }
+
+    /// Forget `iid`'s reading. `true` if the voice was on it — the caller silences
+    /// it, and the queued auto-reads go too: stopping means quiet.
+    fn stop(&mut self, iid: Uuid) -> bool {
+        self.panes.remove(&iid);
+        if self.speaking_pane() == Some(iid) {
+            self.current = None;
+            self.queue.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Auto-read `iid`'s new reply: `true` to read it now (the voice is free), or
+    /// it waits its turn behind what is being read.
+    fn enqueue(&mut self, iid: Uuid) -> bool {
+        if self.current.is_none() {
+            return true;
+        }
+        if !self.queue.contains(&iid) {
+            self.queue.push_back(iid);
+        }
+        false
+    }
+
+    /// Drop what belongs to panes that are gone.
+    fn retain(&mut self, live: &HashSet<Uuid>) {
+        self.panes.retain(|iid, _| live.contains(iid));
+        self.queue.retain(|iid| live.contains(iid));
+    }
 }
 
 /// How many lines of a pane's buffer read-aloud searches for the last reply.
@@ -2424,6 +2580,8 @@ pub struct MuxelApp {
     /// it isn't set until the ssh check *returns*, so two connects could otherwise
     /// overlap — each carrying the layout it fetched before the other landed.
     remote_connecting: HashSet<Uuid>,
+    /// One connect per remote host at a time, and one "Connected" per host.
+    host_connects: HostConnects,
     /// Last-seen layout `content_key` per remote project, to detect real changes
     /// (vs. timestamp-only churn) for the debounced push.
     layout_keys: HashMap<Uuid, String>,
@@ -2551,14 +2709,10 @@ pub struct MuxelApp {
     /// True while a push-to-hold dictation is active (started on the hold chord's
     /// key-down, stopped on the next key-up).
     stt_hold: bool,
-    /// The reply being read aloud, if any (drives the toolbar speaker's state).
-    read_aloud: Option<ReadAloudJob>,
-    /// Panes whose replies are waiting their turn to be read — auto-read of
-    /// several agents finishing together — oldest first.
-    read_aloud_queue: std::collections::VecDeque<Uuid>,
-    /// Counts readings, so a background task can tell its reading was stopped or
-    /// replaced while it worked.
-    read_aloud_generation: u64,
+    /// Every pane's read-aloud, and which one the voice is on.
+    readings: Readings,
+    /// The voice for `readings`' current reading, once it has started speaking.
+    read_aloud_speech: Option<crate::tts::Speech>,
     /// True while the wake command's sweep is walking the workspace — the guard
     /// against a second sweep stacking on top of the running one.
     waking: bool,
@@ -2694,6 +2848,8 @@ enum PaletteCommand {
     OpenSettings,
     OpenMemory,
     ReadAloud,
+    ReadAloudRestart,
+    ReadAloudStop,
     RunRunner(usize),
     SendSnippet(usize),
 }
@@ -3144,6 +3300,86 @@ impl ConfirmAction {
 }
 
 /// What to retry after the user trusts a changed host key.
+/// Who opens each remote host's ssh connection, and who waits for it.
+///
+/// Several of a host's projects connect together — a workspace opening, the
+/// startup reattach — and until one of them has the host's ControlMaster up, each
+/// opens an ssh connection of its own (`ControlMaster=auto` only shares a master
+/// that already exists). So one project per host leads the connect and the rest
+/// wait, then connect over the shared master. The host is announced once, too:
+/// "Connected to …" for every project on it was the same news said N times.
+#[derive(Default)]
+struct HostConnects {
+    /// Hosts a project is connecting to right now → the projects waiting on that
+    /// connect, each with its `defer_spawns`.
+    opening: HashMap<Uuid, Vec<(Uuid, bool)>>,
+    /// When each host last connected. Its master outlives that by at least
+    /// `ControlPersist`, so for a while a connect can simply ride it.
+    warm: HashMap<Uuid, Instant>,
+    /// Hosts already announced as connected. A failed connect forgets its host, so
+    /// the host coming back is announced again.
+    announced: HashSet<Uuid>,
+}
+
+/// How one project's connect proceeds (see [`HostConnects::begin`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostTurn {
+    /// Open the host's connection; the host's other projects wait on this one.
+    Lead,
+    /// The host just connected: go straight over its still-warm master.
+    Ride,
+    /// Another project is opening the connection; connect once it is up.
+    Wait,
+}
+
+impl HostConnects {
+    /// How long after a connect its host counts as warm — well inside ssh's
+    /// `ControlPersist=60`, which keeps the master that long past its last client.
+    const WARM: Duration = Duration::from_secs(30);
+
+    /// Begin `pid`'s connect to `host`. A waiting project is queued (once).
+    fn begin(&mut self, host: Uuid, pid: Uuid, defer_spawns: bool, now: Instant) -> HostTurn {
+        if let Some(waiting) = self.opening.get_mut(&host) {
+            if !waiting.iter().any(|(p, _)| *p == pid) {
+                waiting.push((pid, defer_spawns));
+            }
+            return HostTurn::Wait;
+        }
+        if self
+            .warm
+            .get(&host)
+            .is_some_and(|at| now.saturating_duration_since(*at) < Self::WARM)
+        {
+            return HostTurn::Ride;
+        }
+        self.opening.insert(host, Vec::new());
+        HostTurn::Lead
+    }
+
+    /// A connect to `host` finished (`ok` or not). A leading one hands back the
+    /// projects that were waiting on it. A failure cools the host and forgets its
+    /// announcement, so the next connect leads again and its success is news.
+    fn finish(&mut self, host: Uuid, turn: HostTurn, ok: bool, now: Instant) -> Vec<(Uuid, bool)> {
+        if ok {
+            self.warm.insert(host, now);
+        } else {
+            self.warm.remove(&host);
+            self.announced.remove(&host);
+        }
+        if turn == HostTurn::Lead {
+            self.opening.remove(&host).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Whether to say "Connected to …" for `host` now: the first time it
+    /// connects, and again after a connect to it has failed.
+    fn announce(&mut self, host: Uuid) -> bool {
+        self.announced.insert(host)
+    }
+}
+
 #[derive(Clone)]
 enum SshRetry {
     /// Nothing automatic — the success toast says to retry the operation.
@@ -4480,9 +4716,8 @@ impl MuxelApp {
             stt_state: SttState::Idle,
             stt_recording: None,
             stt_hold: false,
-            read_aloud: None,
-            read_aloud_queue: std::collections::VecDeque::new(),
-            read_aloud_generation: 0,
+            readings: Readings::default(),
+            read_aloud_speech: None,
             waking: false,
             confirm_quit: false,
             place_menu: None,
@@ -4544,6 +4779,7 @@ impl MuxelApp {
             memory_ensured: HashSet::new(),
             remote_synced: HashSet::new(),
             remote_connecting: HashSet::new(),
+            host_connects: HostConnects::default(),
             layout_keys: HashMap::new(),
             layout_edit_keys: HashMap::new(),
             remote_push_due: HashMap::new(),
@@ -5626,6 +5862,15 @@ impl MuxelApp {
             }
             // A fresh attempt hides the failure state until it fails again.
             self.remote_connect_failed.remove(&pid);
+            // Another of this host's projects is already opening its connection:
+            // wait for that, then connect over the shared master (see `HostConnects`).
+            let turn = self
+                .host_connects
+                .begin(host.id, pid, defer_spawns, Instant::now());
+            if turn == HostTurn::Wait {
+                return;
+            }
+            let host_id = host.id;
             // Pre-flight: verify login (and warm the ControlMaster) before opening.
             let control_path = Self::control_path_for(host.id);
             let password = self.remote_password(&host);
@@ -5660,11 +5905,17 @@ impl MuxelApp {
                     Ok(()) => {
                         this.remote_connecting.remove(&pid);
                         this.remote_connect_failed.remove(&pid);
-                        this.add_event(
-                            NotifKind::Success,
-                            tf("Connected to “{name}”", &[("name", &name.to_string())]),
-                            String::new(),
-                        );
+                        let waiting =
+                            this.host_connects
+                                .finish(host_id, turn, true, Instant::now());
+                        // Once per host, however many of its projects connect.
+                        if this.host_connects.announce(host_id) {
+                            this.add_event(
+                                NotifKind::Success,
+                                tf("Connected to “{name}”", &[("name", &name.to_string())]),
+                                String::new(),
+                            );
+                        }
                         if first_sync {
                             this.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
                             // After the sync, so a session the layout accounts for is
@@ -5691,12 +5942,22 @@ impl MuxelApp {
                         {
                             this.focus_instance_with_attendance(iid, false, window, cx);
                         }
+                        this.connect_host_projects(host_id, waiting, window, cx);
                         cx.notify();
                     }
                     Err(e) => {
                         this.remote_connecting.remove(&pid);
                         let msg = format!("{e}");
                         this.remote_connect_failed.insert(pid, msg.clone());
+                        // The projects waiting on this host fail with it — reported
+                        // once, below, not once per project.
+                        for (waiter, _) in
+                            this.host_connects
+                                .finish(host_id, turn, false, Instant::now())
+                        {
+                            this.remote_connecting.remove(&waiter);
+                            this.remote_connect_failed.insert(waiter, msg.clone());
+                        }
                         let retry = SshRetry::ConnectProject(pid);
                         if !this.handle_ssh_error(&msg, Some(&host_for_err), retry, cx) {
                             // Drop a possibly-wrong session password so a retry
@@ -5732,6 +5993,35 @@ impl MuxelApp {
             self.spawn_project_terminals_deferred(pid, window, cx);
         } else {
             self.spawn_project_terminals_now(pid, window, cx);
+        }
+    }
+
+    /// A host's connection just came up: connect the projects that were waiting on
+    /// it, and retry the host's projects whose connect failed earlier — a connect
+    /// only fails when the host can't be reached, and now it can. All of them go
+    /// over the master the leading connect left warm.
+    fn connect_host_projects(
+        &mut self,
+        host_id: Uuid,
+        waiting: Vec<(Uuid, bool)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let failed: Vec<Uuid> = self
+            .remote_connect_failed
+            .keys()
+            .copied()
+            .filter(|pid| {
+                self.remote_host_for_project(*pid)
+                    .is_some_and(|host| host.id == host_id)
+            })
+            .collect();
+        for (pid, defer_spawns) in waiting {
+            self.remote_connecting.remove(&pid);
+            self.ensure_project_terminals_with(pid, defer_spawns, window, cx);
+        }
+        for pid in failed {
+            self.reconnect_project(pid, window, cx);
         }
     }
 
@@ -8787,6 +9077,7 @@ impl MuxelApp {
         self.exit_logged.retain(|iid| live.contains(iid));
         self.reconnecting.retain(|iid, _| live.contains(iid));
         self.auto.retain(|iid, _| live.contains(iid));
+        self.readings.retain(&live);
         // Auto-continue: nudge armed panes whose agent has stalled with work left.
         self.tick_auto_continue(cx);
         // Sync remote projects' layouts to their hosts (change-detect + debounce).
@@ -10500,6 +10791,15 @@ impl MuxelApp {
             OpenSettings,
             ReadAloud,
         ];
+        // Start over / stop only mean something once there is a reading.
+        let has_reading = self.readings.current.is_some()
+            || self
+                .read_aloud_target()
+                .is_some_and(|iid| self.readings.state(iid) != ReadState::Idle);
+        if has_reading {
+            cmds.push(ReadAloudRestart);
+            cmds.push(ReadAloudStop);
+        }
         // Only meaningful with an active project to open the memory for.
         if self.workspace.active_project.is_some() {
             cmds.push(OpenMemory);
@@ -10530,10 +10830,16 @@ impl MuxelApp {
             PaletteCommand::ToggleDashboard => t("Toggle dashboard (all agents)").into(),
             PaletteCommand::OpenSettings => t("Open settings").into(),
             PaletteCommand::OpenMemory => t("Open project memory (.muxel/MEMORY.md)").into(),
-            PaletteCommand::ReadAloud if self.read_aloud.is_some() => {
-                t("Stop reading aloud").into()
-            }
-            PaletteCommand::ReadAloud => t("Read the last reply aloud").into(),
+            PaletteCommand::ReadAloud => match self
+                .read_aloud_target()
+                .map_or(ReadState::Idle, |iid| self.readings.state(iid))
+            {
+                ReadState::Idle => t("Read the last reply aloud").into(),
+                ReadState::Playing => t("Pause reading aloud").into(),
+                ReadState::Paused => t("Resume reading aloud").into(),
+            },
+            PaletteCommand::ReadAloudRestart => t("Start reading aloud over").into(),
+            PaletteCommand::ReadAloudStop => t("Stop reading aloud").into(),
             PaletteCommand::RunRunner(i) => self
                 .runners
                 .get(i)
@@ -10571,6 +10877,11 @@ impl MuxelApp {
                 }
             }
             PaletteCommand::ReadAloud => self.toggle_read_aloud(cx),
+            PaletteCommand::ReadAloudRestart => match self.read_aloud_target() {
+                Some(iid) => self.restart_reading(iid, cx),
+                None => self.say_read_aloud_notice(t("Focus an agent pane first."), cx),
+            },
+            PaletteCommand::ReadAloudStop => self.stop_read_aloud_now(cx),
             PaletteCommand::RunRunner(i) => self.run_runner(i, String::new(), window, cx),
             PaletteCommand::SendSnippet(i) => self.send_snippet_to_active(i, window, cx),
         }
@@ -13601,6 +13912,15 @@ impl MuxelApp {
                 this.start_hold(cx)
             }))
             .on_action(cx.listener(|this, _: &ReadAloud, _window, cx| this.toggle_read_aloud(cx)))
+            .on_action(cx.listener(|this, _: &ReadAloudRestart, _window, cx| {
+                match this.read_aloud_target() {
+                    Some(iid) => this.restart_reading(iid, cx),
+                    None => this.say_read_aloud_notice(t("Focus an agent pane first."), cx),
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &ReadAloudStop, _window, cx| this.stop_read_aloud_now(cx)),
+            )
             // Push-to-hold: releasing any key while a hold dictation is active
             // stops recording and transcribes. Key-ups bubble up the focus tree
             // to this root, so this fires even while a terminal pane is focused.
@@ -15129,43 +15449,123 @@ impl MuxelApp {
         }
     }
 
-    // --- Read aloud: speak the focused agent's last reply ---------------------
+    // --- Read aloud: speak an agent's last reply, per pane ---------------------
 
-    /// The speaker button / `ReadAloud`: read the focused agent's last reply —
-    /// or, while something is being read, stop (and drop any queued auto-reads).
+    /// The pane the toolbar's read-aloud controls and shortcuts act on: the
+    /// focused one, when it is a live terminal.
+    fn read_aloud_target(&self) -> Option<Uuid> {
+        self.active_instance
+            .filter(|iid| self.terminals.contains_key(iid))
+    }
+
+    /// The toolbar speaker / `ReadAloud`: read the focused pane's last reply, or
+    /// pause or resume its reading.
     fn toggle_read_aloud(&mut self, cx: &mut Context<Self>) {
-        if self.read_aloud.is_some() {
-            self.stop_read_aloud(cx);
-            return;
-        }
-        let target = self
-            .active_instance
-            .filter(|iid| self.terminals.contains_key(iid));
-        if !target.is_some_and(|iid| self.read_aloud_pane(iid, cx)) {
+        match self.read_aloud_target() {
+            Some(iid) => self.toggle_pane_reading(iid, cx),
             // Said, not only shown: whoever pressed this may not see the screen.
-            self.say_read_aloud_notice(t("Focus an agent pane first."), cx);
+            None => self.say_read_aloud_notice(t("Focus an agent pane first."), cx),
         }
     }
 
-    /// Read `iid`'s last reply. `false` if the pane has nothing to read from.
+    /// A pane's speaker: read its last reply, pause its reading, or resume it.
+    fn toggle_pane_reading(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        match self.readings.state(iid) {
+            ReadState::Playing => {
+                self.hush_read_aloud();
+                cx.notify();
+            }
+            ReadState::Paused => self.play_reading(iid, cx),
+            ReadState::Idle => {
+                if !self.read_aloud_pane(iid, cx) {
+                    self.say_read_aloud_notice(t("There's no reply to read in this pane yet."), cx);
+                }
+            }
+        }
+    }
+
+    /// Start `iid`'s reading over from its first piece — or, with no reading yet,
+    /// read its last reply.
+    fn restart_reading(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        // Hushed first: it stores the place this pane was at, which the rewind
+        // then replaces.
+        self.hush_read_aloud();
+        if self.readings.rewind(iid) {
+            self.play_reading(iid, cx);
+        } else if !self.read_aloud_pane(iid, cx) {
+            self.say_read_aloud_notice(t("There's no reply to read in this pane yet."), cx);
+        }
+    }
+
+    /// Stop `iid`'s reading and forget where it was.
+    fn stop_reading(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        if self.readings.stop(iid)
+            && let Some(speech) = self.read_aloud_speech.take()
+        {
+            speech.stop();
+        }
+        cx.notify();
+    }
+
+    /// `ReadAloudStop`: quiet, now — whatever is speaking, wherever it is — or,
+    /// with nothing speaking, drop the focused pane's paused reading.
+    fn stop_read_aloud_now(&mut self, cx: &mut Context<Self>) {
+        match self.readings.current {
+            Some((Some(iid), _)) => self.stop_reading(iid, cx),
+            Some((None, _)) => {
+                self.readings.current = None;
+                if let Some(speech) = self.read_aloud_speech.take() {
+                    speech.stop();
+                }
+                cx.notify();
+            }
+            None => {
+                if let Some(iid) = self.read_aloud_target() {
+                    self.stop_reading(iid, cx);
+                }
+            }
+        }
+    }
+
+    /// Silence the voice, keeping the place of the pane it was reading.
+    fn hush_read_aloud(&mut self) {
+        let at = self.read_aloud_speech.take().map(|speech| {
+            speech.stop();
+            speech.position()
+        });
+        self.readings.hush(at);
+    }
+
+    /// Read `iid`'s last reply from the top, as a new reading. `false` if the pane
+    /// has nothing to read from.
     fn read_aloud_pane(&mut self, iid: Uuid, cx: &mut Context<Self>) -> bool {
         let Some(source) = self.reply_source(iid, cx) else {
             return false;
         };
         let scope = self.settings.read_aloud_scope;
         let opts = self.settings.speak_options();
-        self.begin_read_aloud(cx, move || {
-            source
-                .utterance(scope, &opts)
-                .unwrap_or_else(|| t("There's no reply to read in this pane yet.").to_string())
+        self.begin_read_aloud(Some(iid), cx, move || {
+            match source.utterance(scope, &opts) {
+                Some(text) => Utterance::Reading(muxel_core::readaloud::chunks(&text), 0),
+                None => {
+                    Utterance::Notice(t("There's no reply to read in this pane yet.").to_string())
+                }
+            }
         });
         true
+    }
+
+    /// Resume `iid`'s reading where it left off.
+    fn play_reading(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        if let Some((pieces, next)) = self.readings.resume_point(iid) {
+            self.begin_read_aloud(Some(iid), cx, move || Utterance::Reading(pieces, next));
+        }
     }
 
     /// Say something short about read-aloud itself, through the same voice.
     fn say_read_aloud_notice(&mut self, notice: SharedString, cx: &mut Context<Self>) {
         let notice = notice.to_string();
-        self.begin_read_aloud(cx, move || notice);
+        self.begin_read_aloud(None, cx, move || Utterance::Notice(notice));
     }
 
     /// What `iid`'s last reply can be found in: the terminal's buffer, the tmux
@@ -15197,46 +15597,44 @@ impl MuxelApp {
         })
     }
 
-    /// Start a reading, replacing any in progress: work out what to say off the
-    /// UI thread (`text`), then speak it, keeping the toolbar speaker lit until
-    /// the voice is done — at which point the next queued reply starts.
+    /// Start a reading of `pane` (or a notice), pausing whatever was speaking:
+    /// work out what to say off the UI thread (`gather`), then speak it, keeping
+    /// the pane's controls in step until the voice is done — at which point the
+    /// next queued auto-read starts.
     fn begin_read_aloud(
         &mut self,
+        pane: Option<Uuid>,
         cx: &mut Context<Self>,
-        text: impl FnOnce() -> String + Send + 'static,
+        gather: impl FnOnce() -> Utterance + Send + 'static,
     ) {
-        if let Some(job) = self.read_aloud.take()
-            && let Some(speech) = job.speech
-        {
-            speech.stop();
-        }
-        self.read_aloud_generation += 1;
-        let generation = self.read_aloud_generation;
-        self.read_aloud = Some(ReadAloudJob {
-            generation,
-            speech: None,
-        });
+        self.hush_read_aloud();
+        let generation = self.readings.begin(pane);
         let mut voice = self.voice_config();
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let (text, voice) = cx
+            let (utterance, voice) = cx
                 .background_executor()
                 .spawn(async move {
                     if voice.engine == muxel_core::TtsEngine::Provider {
                         voice.api_key = crate::secrets::get_stt_api_key().unwrap_or_default();
                     }
-                    (text(), voice)
+                    (gather(), voice)
                 })
                 .await;
             let speech = this
-                .update(cx, |this, _cx| {
+                .update(cx, |this, cx| {
+                    let (pieces, from, kept) = match utterance {
+                        Utterance::Reading(pieces, from) => (pieces, from, true),
+                        Utterance::Notice(notice) => (vec![notice], 0, false),
+                    };
+                    let reading = kept.then(|| (pieces.clone(), from));
                     // Stopped or replaced while the reply was being gathered.
-                    let job = this
-                        .read_aloud
-                        .as_mut()
-                        .filter(|job| job.generation == generation)?;
-                    let speech = crate::tts::speak(&text, voice);
-                    job.speech = Some(speech.clone());
+                    if !this.readings.loaded(generation, reading) {
+                        return None;
+                    }
+                    let speech = crate::tts::speak(pieces, from, voice);
+                    this.read_aloud_speech = Some(speech.clone());
+                    cx.notify();
                     Some(speech)
                 })
                 .ok()
@@ -15253,48 +15651,78 @@ impl MuxelApp {
         .detach();
     }
 
-    /// A reading ended on its own: clear it (unless a newer one has already
-    /// replaced it) and start the next queued reply.
+    /// A reading ended on its own: it is done (unless it was paused, stopped or
+    /// replaced first), and the next queued auto-read starts.
     fn finish_read_aloud(&mut self, generation: u64, cx: &mut Context<Self>) {
-        if self
-            .read_aloud
-            .as_ref()
-            .is_some_and(|job| job.generation == generation)
-        {
-            self.read_aloud = None;
-            self.next_read_aloud(cx);
+        if self.readings.finished(generation) {
+            self.read_aloud_speech = None;
+            while let Some(iid) = self.readings.queue.pop_front() {
+                if self.terminals.contains_key(&iid) && self.read_aloud_pane(iid, cx) {
+                    break;
+                }
+            }
             cx.notify();
         }
     }
 
-    /// Stop reading now, and forget the replies queued behind it.
-    fn stop_read_aloud(&mut self, cx: &mut Context<Self>) {
-        self.read_aloud_queue.clear();
-        if let Some(job) = self.read_aloud.take()
-            && let Some(speech) = job.speech
-        {
-            speech.stop();
-        }
-        cx.notify();
-    }
-
-    /// Auto-read: read `iid`'s reply now if nothing is being read, otherwise once
+    /// Auto-read: read `iid`'s new reply now if the voice is free, otherwise once
     /// what's ahead of it is done.
     fn enqueue_read_aloud(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        if self.read_aloud.is_none() {
+        if self.readings.enqueue(iid) {
             self.read_aloud_pane(iid, cx);
-        } else if !self.read_aloud_queue.contains(&iid) {
-            self.read_aloud_queue.push_back(iid);
         }
     }
 
-    /// Start the next queued reply whose pane is still open.
-    fn next_read_aloud(&mut self, cx: &mut Context<Self>) {
-        while let Some(iid) = self.read_aloud_queue.pop_front() {
-            if self.terminals.contains_key(&iid) && self.read_aloud_pane(iid, cx) {
-                return;
-            }
+    /// Read-aloud controls for pane `iid` — the toolbar's for the focused pane
+    /// (`None` when there is none), or one pane's own in its header. A speaker
+    /// while the pane has no reading; then pause (or resume), start over and stop.
+    /// `place` keeps the element ids apart; `compact` sizes them for a pane header.
+    fn read_aloud_controls(
+        &self,
+        iid: Option<Uuid>,
+        place: &str,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<Button> {
+        let state = iid.map_or(ReadState::Idle, |iid| self.readings.state(iid));
+        let key = iid.map(|iid| iid.simple().to_string()).unwrap_or_default();
+        let button = |what: &str| {
+            let b = Button::new(SharedString::from(format!("{place}-ra-{what}-{key}"))).ghost();
+            if compact { b.xsmall() } else { b }
+        };
+        let (icon, tip): (Icon, SharedString) = match state {
+            ReadState::Idle => (
+                Icon::empty().path("icons/volume-2.svg"),
+                t("Read the agent's last reply aloud"),
+            ),
+            ReadState::Playing => (Icon::empty().path("icons/pause.svg"), t("Pause reading")),
+            ReadState::Paused => (Icon::new(IconName::Play), t("Resume reading")),
+        };
+        let mut controls = vec![
+            button("toggle")
+                .icon(icon)
+                .selected(state == ReadState::Playing)
+                .tooltip(tip)
+                .on_click(cx.listener(move |this, _e, _w, cx| match iid {
+                    Some(iid) => this.toggle_pane_reading(iid, cx),
+                    None => this.toggle_read_aloud(cx),
+                })),
+        ];
+        if let Some(iid) = iid.filter(|_| state != ReadState::Idle) {
+            controls.push(
+                button("restart")
+                    .icon(Icon::empty().path("icons/rotate-ccw.svg"))
+                    .tooltip(t("Start reading over"))
+                    .on_click(cx.listener(move |this, _e, _w, cx| this.restart_reading(iid, cx))),
+            );
+            controls.push(
+                button("stop")
+                    .icon(Icon::empty().path("icons/circle-stop.svg"))
+                    .tooltip(t("Stop reading"))
+                    .on_click(cx.listener(move |this, _e, _w, cx| this.stop_reading(iid, cx))),
+            );
         }
+        controls
     }
 
     /// Whether an agent that just finished in `iid` should be read out, per the
@@ -17183,6 +17611,14 @@ impl MuxelApp {
                                 this.open_diff_for(iid, window, cx)
                             }))
                     }))
+                    // This pane's own read-aloud: read, pause/resume, start over, stop.
+                    .children(
+                        if kind == InstanceKind::Terminal && self.settings.read_aloud_button {
+                            self.read_aloud_controls(Some(iid), "pane", true, cx)
+                        } else {
+                            Vec::new()
+                        },
+                    )
                     .children((kind == InstanceKind::Diff).then(|| {
                         Button::new(SharedString::from(format!("refresh-{sid}")))
                             .ghost()
@@ -17598,6 +18034,39 @@ impl MuxelApp {
                                     .text_ellipsis()
                                     .child(tab_title),
                             )
+                            // A tab being read aloud says so — even when another tab
+                            // of its pane is showing — and pauses or resumes on click.
+                            .children({
+                                let reading = self.readings.state(tab);
+                                (reading != ReadState::Idle).then(|| {
+                                    let playing = reading == ReadState::Playing;
+                                    div()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "tabra-{}",
+                                                tab.simple()
+                                            )))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(Icon::empty().path(if playing {
+                                                "icons/volume-2.svg"
+                                            } else {
+                                                "icons/pause.svg"
+                                            }))
+                                            .tooltip(if playing {
+                                                t("Reading aloud — click to pause")
+                                            } else {
+                                                t("Reading paused — click to resume")
+                                            })
+                                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                                this.toggle_pane_reading(tab, cx)
+                                            })),
+                                        )
+                                })
+                            })
                             .child(
                                 // stop_propagation so closing a tab isn't a focus/drag.
                                 div()
@@ -20133,23 +20602,13 @@ impl MuxelApp {
                     .tooltip(t("Dictate to the focused agent"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.toggle_speech(window, cx))),
             )
-            .children(self.settings.read_aloud_button.then(|| {
-                let reading = self.read_aloud.is_some();
-                Button::new("read-aloud")
-                    .ghost()
-                    .icon(Icon::empty().path(if reading {
-                        "icons/circle-stop.svg"
-                    } else {
-                        "icons/volume-2.svg"
-                    }))
-                    .selected(reading)
-                    .tooltip(if reading {
-                        t("Stop reading aloud")
-                    } else {
-                        t("Read the agent's last reply aloud")
-                    })
-                    .on_click(cx.listener(|this, _ev, _window, cx| this.toggle_read_aloud(cx)))
-            }))
+            // Read-aloud for the focused pane: its speaker, then pause / resume,
+            // start over and stop once it has a reading.
+            .children(if self.settings.read_aloud_button {
+                self.read_aloud_controls(self.read_aloud_target(), "tb", false, cx)
+            } else {
+                Vec::new()
+            })
             // Spacer pushes the git-diff toggle to the far right of the toolbar.
             .child(div().flex_1())
             .child(
@@ -21268,20 +21727,22 @@ impl MuxelApp {
         let muted = cx.theme().muted_foreground;
         let note = |text: SharedString| div().text_xs().text_color(muted).child(text);
 
-        // The shortcut as the user has it bound.
-        let chord = settings
-            .keybindings
-            .iter()
-            .find(|k| k.action == "ReadAloud")
-            .map(|k| k.keystroke.clone())
-            .or_else(|| {
-                settings_view::DEFAULT_KEYBINDINGS
-                    .iter()
-                    .find(|(name, _, _)| *name == "ReadAloud")
-                    .map(|(_, default, _)| default.to_string())
-            })
-            .map(|ks| prettify_keys(&ks))
-            .unwrap_or_default();
+        // A shortcut as the user has it bound.
+        let chord = |action: &str| {
+            settings
+                .keybindings
+                .iter()
+                .find(|k| k.action == action)
+                .map(|k| k.keystroke.clone())
+                .or_else(|| {
+                    settings_view::DEFAULT_KEYBINDINGS
+                        .iter()
+                        .find(|(name, _, _)| *name == action)
+                        .map(|(_, default, _)| default.to_string())
+                })
+                .map(|ks| prettify_keys(&ks))
+                .unwrap_or_default()
+        };
 
         let scope = settings.read_aloud_scope;
         let auto = settings.read_aloud_auto;
@@ -21293,15 +21754,19 @@ impl MuxelApp {
             .max_w(px(560.0))
             .child(note(
                 tf(
-                    "Press {keys}, or the speaker in the toolbar, to hear the focused agent's last reply. Press it again to stop.",
-                    &[("keys", &chord)],
+                    "Press {keys}, or a speaker (in the toolbar for the focused pane, or on any pane), to hear the agent's last reply. Press it again to pause, and again to resume — each pane keeps its own place, picking up at the start of the sentence it paused in. {restart} starts over; {stop} stops.",
+                    &[
+                        ("keys", &chord("ReadAloud")),
+                        ("restart", &chord("ReadAloudRestart")),
+                        ("stop", &chord("ReadAloudStop")),
+                    ],
                 )
                 .into(),
             ))
             .child(self.setting_check(
                 "ra-button",
                 settings.read_aloud_button,
-                &t("Show the read-aloud button in the toolbar"),
+                &t("Show read-aloud buttons in the toolbar and on each pane"),
                 cx,
                 |s, on| s.read_aloud_button = on,
             ))
@@ -27343,6 +27808,181 @@ mod restore_wave_policy_tests {
             restore_wave_decision(4, 6, true, true, false),
             RestoreWaveDecision::Launch { wave_end: 6 }
         );
+    }
+}
+
+#[cfg(test)]
+mod host_connects_tests {
+    use super::{HostConnects, HostTurn};
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    #[test]
+    fn one_project_per_host_opens_the_connection() {
+        let mut hosts = HostConnects::default();
+        let t0 = Instant::now();
+        let (rhel, mac) = (Uuid::new_v4(), Uuid::new_v4());
+        let (a, b, c, d) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+
+        assert_eq!(hosts.begin(rhel, a, false, t0), HostTurn::Lead);
+        // The host's other projects wait on it (once each)...
+        assert_eq!(hosts.begin(rhel, b, true, t0), HostTurn::Wait);
+        assert_eq!(hosts.begin(rhel, c, false, t0), HostTurn::Wait);
+        assert_eq!(hosts.begin(rhel, b, true, t0), HostTurn::Wait);
+        // ...while another host connects independently.
+        assert_eq!(hosts.begin(mac, d, false, t0), HostTurn::Lead);
+
+        let waiting = hosts.finish(rhel, HostTurn::Lead, true, t0);
+        assert_eq!(waiting, vec![(b, true), (c, false)]);
+        // Released, they all ride the warm master together — no second leader
+        // queueing the rest behind it one round trip at a time.
+        for (pid, defer) in waiting {
+            assert_eq!(hosts.begin(rhel, pid, defer, t0), HostTurn::Ride);
+            assert!(hosts.finish(rhel, HostTurn::Ride, true, t0).is_empty());
+        }
+        // Long after, the master may have gone: the next connect leads again.
+        let later = t0 + HostConnects::WARM + Duration::from_secs(1);
+        assert_eq!(hosts.begin(rhel, a, false, later), HostTurn::Lead);
+    }
+
+    #[test]
+    fn a_failed_connect_cools_its_host() {
+        let mut hosts = HostConnects::default();
+        let t0 = Instant::now();
+        let rhel = Uuid::new_v4();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(hosts.begin(rhel, a, false, t0), HostTurn::Lead);
+        assert_eq!(hosts.begin(rhel, b, false, t0), HostTurn::Wait);
+        // Its waiters share the failure rather than each trying on their own.
+        assert_eq!(
+            hosts.finish(rhel, HostTurn::Lead, false, t0),
+            vec![(b, false)]
+        );
+        assert_eq!(hosts.begin(rhel, b, false, t0), HostTurn::Lead);
+    }
+
+    #[test]
+    fn a_host_is_announced_once_and_again_after_it_failed() {
+        let mut hosts = HostConnects::default();
+        let t0 = Instant::now();
+        let rhel = Uuid::new_v4();
+        hosts.finish(rhel, HostTurn::Lead, true, t0);
+        assert!(hosts.announce(rhel));
+        // Its other projects connecting later say nothing new.
+        assert!(!hosts.announce(rhel));
+        assert!(!hosts.announce(rhel));
+        // A failed connect forgets it, so its return is news again.
+        hosts.finish(rhel, HostTurn::Ride, false, t0);
+        assert!(hosts.announce(rhel));
+    }
+}
+
+#[cfg(test)]
+mod readings_tests {
+    use super::{ReadState, Readings};
+    use uuid::Uuid;
+
+    fn pieces(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("Sentence {i}.")).collect()
+    }
+
+    /// Read `pane` from the top, as the app does: hush, begin, load.
+    fn read(r: &mut Readings, pane: Uuid, at: Option<usize>, n: usize) -> u64 {
+        r.hush(at);
+        let generation = r.begin(Some(pane));
+        assert!(r.loaded(generation, Some((pieces(n), 0))));
+        generation
+    }
+
+    #[test]
+    fn a_reading_pauses_resumes_and_finishes() {
+        let mut r = Readings::default();
+        let a = Uuid::new_v4();
+        assert_eq!(r.state(a), ReadState::Idle);
+        let first = read(&mut r, a, None, 5);
+        assert_eq!(r.state(a), ReadState::Playing);
+
+        // Paused on piece 2: that is where it resumes.
+        r.hush(Some(2));
+        assert_eq!(r.state(a), ReadState::Paused);
+        assert_eq!(r.resume_point(a), Some((pieces(5), 2)));
+        // The old voice ending now is not the reading finishing.
+        assert!(!r.finished(first));
+
+        let resumed = r.begin(Some(a));
+        assert!(r.loaded(resumed, r.resume_point(a)));
+        assert_eq!(r.state(a), ReadState::Playing);
+        assert!(r.finished(resumed));
+        assert_eq!(r.state(a), ReadState::Idle);
+    }
+
+    #[test]
+    fn reading_another_pane_pauses_the_first_in_place() {
+        let mut r = Readings::default();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        read(&mut r, a, None, 5);
+        // B starts while A is on piece 3.
+        read(&mut r, b, Some(3), 4);
+        assert_eq!(r.state(a), ReadState::Paused);
+        assert_eq!(r.state(b), ReadState::Playing);
+        assert_eq!(r.resume_point(a).map(|(_, next)| next), Some(3));
+        // Starting A over: B keeps its place, A goes back to the top.
+        r.hush(Some(1));
+        assert!(r.rewind(a));
+        assert_eq!(r.resume_point(a).map(|(_, next)| next), Some(0));
+        assert_eq!(r.resume_point(b).map(|(_, next)| next), Some(1));
+    }
+
+    #[test]
+    fn stopping_forgets_and_quiets_the_queue() {
+        let mut r = Readings::default();
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        read(&mut r, a, None, 3);
+        // Auto-reads wait their turn while A speaks.
+        assert!(!r.enqueue(b));
+        assert!(!r.enqueue(b));
+        assert_eq!(r.queue.len(), 1);
+        // Stopping a paused pane leaves the voice and queue alone...
+        read(&mut r, c, Some(1), 2);
+        assert!(!r.stop(a));
+        assert_eq!(r.state(a), ReadState::Idle);
+        assert_eq!(r.queue.len(), 1);
+        // ...stopping the one speaking silences it and drops the queue.
+        assert!(r.stop(c));
+        assert_eq!(r.state(c), ReadState::Idle);
+        assert!(r.queue.is_empty());
+        assert!(r.enqueue(b), "the voice is free again");
+    }
+
+    #[test]
+    fn a_reading_stopped_while_gathering_leaves_nothing_behind() {
+        let mut r = Readings::default();
+        let a = Uuid::new_v4();
+        let generation = r.begin(Some(a));
+        assert_eq!(r.state(a), ReadState::Playing);
+        r.hush(None); // paused before a word was said
+        assert!(!r.loaded(generation, Some((pieces(3), 0))));
+        assert_eq!(r.state(a), ReadState::Idle);
+
+        // Nothing to read: the notice that says so is not the pane's reading.
+        let generation = r.begin(Some(a));
+        assert!(r.loaded(generation, None));
+        assert_eq!(r.state(a), ReadState::Idle);
+        assert!(r.finished(generation));
+    }
+
+    #[test]
+    fn a_pause_at_the_very_end_is_a_finished_reading() {
+        let mut r = Readings::default();
+        let a = Uuid::new_v4();
+        read(&mut r, a, None, 2);
+        r.hush(Some(2));
+        assert_eq!(r.state(a), ReadState::Idle);
     }
 }
 

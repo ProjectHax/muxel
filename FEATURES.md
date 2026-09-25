@@ -170,8 +170,7 @@ feature is added or changed, update the matching entry here in the same change**
   it off and the wake command runs silently.
 - **Read aloud (accessibility)** — a speaker button in the toolbar (or
   `Ctrl+Shift+R`, or *Read the last reply aloud* in the `Ctrl+P` palette) reads the
-  **focused** agent's last reply out loud; press it again to stop. It reads only the
-  model's own words — its final message (usually the summary of what it did) by
+  **focused** agent's last reply out loud. It reads only the model's own words — its final message (usually the summary of what it did) by
   default, or the whole last turn — and **never code**: fenced blocks, diffs,
   commands, tool calls and their output are skipped, and markdown, emoji and
   symbols are flattened so nothing is read out as punctuation. For a local Claude
@@ -180,7 +179,16 @@ feature is added or changed, update the matching entry here in the same change**
   it in the terminal's scrollback, or in tmux's history for a tmux pane. When
   there's nothing to read, it says so out loud, so the button is usable without
   looking at the screen.
-- **Read Aloud settings** — Settings → Read Aloud: show or hide the toolbar button;
+- **Pause, resume and start over, per pane** — every agent pane has its own
+  read-aloud controls in its header (and the toolbar's act on the focused pane):
+  the speaker reads, then becomes **pause** / **resume**, with **start over** and
+  **stop** beside it. Each pane keeps its own place: reading another pane pauses the
+  one speaking, which resumes where it left off — at the start of the sentence it
+  paused in — whenever you come back to it. A tab being read shows a speaker (or
+  pause) badge that pauses or resumes it without switching to it. `Ctrl+Shift+R`
+  reads / pauses / resumes the focused pane, `Ctrl+Alt+R` starts it over, and
+  `Ctrl+Alt+S` stops whatever is speaking; all three are in the `Ctrl+P` palette.
+- **Read Aloud settings** — Settings → Read Aloud: show or hide the read-aloud buttons;
   final message vs. whole turn; **auto-read** when the focused pane's agent (or any
   agent) finishes, queued one reply at a time (shells are never auto-read); say the
   agent's name first; a length limit (about 30 s / 1 min / 3 min) that stops at the
@@ -684,10 +692,13 @@ feature is added or changed, update the matching entry here in the same change**
   which work everywhere.
 - **Resilient sessions** — remote panes default to a persistent tmux session on
   the host, so a dropped connection is survivable: reconnecting re-attaches the
-  still-running agent. One multiplexed SSH connection per host is shared by the
-  pane and all git calls. Launching a tmux session (remote, or a local tmux-mode
-  project) enables tmux `mouse on`, so the pane's scroll wheel scrolls tmux's own
-  copy-mode history instead of just the visible screen.
+  still-running agent. One multiplexed SSH connection per host is shared by all of
+  that host's projects, their panes and git calls: projects opening together (a
+  workspace, launch) wait for the first to connect instead of each opening its own,
+  and "Connected to …" is shown once per host rather than once per project.
+  Launching a tmux session (remote, or a local tmux-mode project) enables tmux
+  `mouse on`, so the pane's scroll wheel scrolls tmux's own copy-mode history
+  instead of just the visible screen.
 - **Survives a dropped connection** — every SSH connection keeps itself alive with
   periodic probes (`ServerAliveInterval`), so a drop (Wi-Fi blip, laptop sleep, host
   reboot) is *detected* — roughly a minute of silence — instead of the pane freezing

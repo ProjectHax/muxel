@@ -1006,6 +1006,76 @@ fn end_sentence(item: String) -> String {
     }
 }
 
+/// Longest piece read-aloud speaks in one go. A paused reading resumes from the
+/// start of the piece it stopped in, so this bounds how much a resume repeats —
+/// while short sentences grouped together spare the voice a restart for each.
+/// A sentence is never split, so one longer than this is a piece of its own.
+pub const CHUNK_CHARS: usize = 160;
+
+/// [`speakable`] text as the pieces it is spoken in, so a reading can be paused
+/// and resumed (and a pane can say how far it got): whole sentences, with short
+/// neighbours grouped up to [`CHUNK_CHARS`]. Pieces of one item are joined by a
+/// space, different items by a line break, which the voice pauses on.
+pub fn chunks(spoken: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for line in spoken.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        for (k, sentence) in split_sentences(line).into_iter().enumerate() {
+            let mut sep = if k == 0 { "\n" } else { " " };
+            if current.is_empty() {
+                sep = "";
+            } else if current.chars().count() + 1 + sentence.chars().count() > CHUNK_CHARS {
+                out.push(std::mem::take(&mut current));
+                sep = "";
+            }
+            current.push_str(sep);
+            current.push_str(&sentence);
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// One line's sentences: it breaks after a run of `.` `!` `?` `…` (and any closing
+/// quote or bracket) that is followed by a space — so `app.rs`, `v1.2` and `3.14`
+/// stay whole, which a split at every full stop would read as two halves.
+fn split_sentences(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        if matches!(chars[i], '.' | '!' | '?' | '…') {
+            let mut end = i + 1;
+            while end < chars.len()
+                && matches!(
+                    chars[end],
+                    '.' | '!' | '?' | '…' | '"' | '\'' | '”' | '’' | ')' | ']'
+                )
+            {
+                end += 1;
+            }
+            if end == chars.len() || chars[end].is_whitespace() {
+                let sentence: String = chars[start..end].iter().collect();
+                if !sentence.trim().is_empty() {
+                    out.push(sentence.trim().to_string());
+                }
+                start = end;
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    let tail: String = chars[start..].iter().collect();
+    if !tail.trim().is_empty() {
+        out.push(tail.trim().to_string());
+    }
+    out
+}
+
 /// Keep whole items while they fit in `max` characters; of the item that crosses
 /// the line, keep the sentences that fit. The very first item is cut at a word if
 /// it has to be, so a limit never leaves nothing to say.
@@ -1071,8 +1141,9 @@ fn cut_at_word(item: &str, room: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReadAloudScope, SpeakOptions, is_agent_program, looks_like_code,
+        CHUNK_CHARS, ReadAloudScope, SpeakOptions, chunks, is_agent_program, looks_like_code,
         reply_from_claude_transcript, reply_from_screen, reply_on_screen, speakable,
+        split_sentences,
     };
     use serde_json::json;
 
@@ -1155,6 +1226,42 @@ mod tests {
 
     fn final_msg(screen: &str) -> Option<String> {
         reply_from_screen(screen, ReadAloudScope::FinalMessage)
+    }
+
+    #[test]
+    fn sentences_break_between_sentences_not_inside_words() {
+        assert_eq!(
+            split_sentences("Fixed app.rs in v1.2 today. Tests pass! Really? \"Yes.\" Done…"),
+            vec![
+                "Fixed app.rs in v1.2 today.",
+                "Tests pass!",
+                "Really?",
+                "\"Yes.\"",
+                "Done…"
+            ]
+        );
+        assert_eq!(split_sentences("No terminator"), vec!["No terminator"]);
+        assert!(split_sentences("   ").is_empty());
+    }
+
+    #[test]
+    fn a_reply_is_spoken_in_sentence_sized_pieces() {
+        // Short sentences share a piece; items stay on their own lines within it.
+        assert_eq!(
+            chunks("Fixed the pager. Tests pass.\nDocs updated."),
+            vec!["Fixed the pager. Tests pass.\nDocs updated."]
+        );
+        // A long reply breaks between sentences, never inside one, and no piece
+        // outgrows the limit unless a single sentence does.
+        let long = "This sentence is long enough to matter here. ".repeat(12);
+        let pieces = chunks(long.trim());
+        assert!(pieces.len() > 1);
+        assert!(pieces.iter().all(|p| p.chars().count() <= CHUNK_CHARS));
+        assert!(pieces.iter().all(|p| p.ends_with("matter here.")));
+        assert_eq!(pieces.join(" "), long.trim());
+        let huge = format!("{}.", "word ".repeat(60).trim());
+        assert_eq!(chunks(&huge), vec![huge.clone()]);
+        assert!(chunks("").is_empty());
     }
 
     #[test]

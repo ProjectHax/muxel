@@ -59,8 +59,10 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("ToggleBroadcast", "ctrl-shift-i", None),
     ("ToggleSpeechToText", "ctrl-shift-m", None),
     ("HoldSpeechToText", "ctrl-shift-h", None),
-    // Read the focused agent's last reply aloud (again to stop).
+    // Read the focused agent's last reply aloud; again pauses, again resumes.
     ("ReadAloud", "ctrl-shift-r", None),
+    ("ReadAloudRestart", "ctrl-alt-r", None),
+    ("ReadAloudStop", "ctrl-alt-s", None),
     // Toggle the toolbar's "new agents get a git worktree" switch.
     ("ToggleWorktree", "ctrl-shift-g", None),
     // OS fullscreen; the sidebar hides until revealed or fullscreen exits.
