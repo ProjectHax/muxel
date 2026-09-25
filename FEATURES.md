@@ -176,7 +176,7 @@ feature is added or changed, update the matching entry here in the same change**
   symbols are flattened so nothing is read out as punctuation. For a local Claude
   pane the reply comes from Claude's own session transcript, so it's exact even
   after it has scrolled off screen; for other agents (Codex, Gemini, …) muxel finds
-  it in the terminal's scrollback, or in tmux's history for a tmux pane. When
+  it in the terminal's scrollback, which muxel keeps 10,000 lines of per pane. When
   there's nothing to read, it says so out loud, so the button is usable without
   looking at the screen.
 - **Pause, resume and start over, per pane** — every agent pane has its own
@@ -426,7 +426,7 @@ feature is added or changed, update the matching entry here in the same change**
   Every command prints JSON.
 - **Reads what the agent actually said** — `show` returns the last prompt and the
   model's last reply the way read-aloud finds them (a local Claude pane's session
-  transcript, otherwise the pane's scrollback or tmux history), and for a blocked
+  transcript, otherwise the pane's scrollback), and for a blocked
   agent the question with its numbered options read off the screen. `wait` blocks
   until the agent's turn ends — it finishes, asks something, or exits — then
   returns the same, so a caller can `send` then `wait` without polling. An answer
@@ -436,6 +436,15 @@ feature is added or changed, update the matching entry here in the same change**
   the prompt actually offers, and a pane that isn't running says so rather than
   swallowing the input. Shell panes are off limits unless "Also allow typing into
   shell panes" is on too, since typing into a shell is running commands.
+- **Never touches your sessions to read them** — every read (`screen`, `show`,
+  `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
+  10,000 lines per pane — five times the most any of these commands will return. It
+  never shells out to `tmux capture-pane`, which costs a subprocess on every poll
+  and, on tmux builds that abort on it (RHEL 10's stock tmux among them), takes the
+  whole tmux server down and every local agent with it. An agent can therefore be
+  polled as fast as its driver likes without being disturbed. The one thing tmux
+  alone knew — a pane's history from before muxel attached to an adopted session —
+  fills back in as the pane produces output.
 - **Local and owner-only** — the running app listens on a random loopback port and
   writes it, with a fresh random token, to `control.json` in muxel's data directory,
   readable only by the user; nothing is reachable from the network, and a request

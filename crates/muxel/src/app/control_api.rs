@@ -888,11 +888,7 @@ impl MuxelApp {
         };
         let id = ctl::short_id(iid);
         Answer::Later(Box::new(move || {
-            let text = source
-                .tmux_session
-                .as_deref()
-                .and_then(|session| integrations::tmux_capture(session, lines))
-                .unwrap_or(source.screen);
+            let text = source.screen;
             let kept: Vec<&str> = text.trim_end().lines().collect();
             let tail = kept[kept.len().saturating_sub(lines)..].join("\n");
             Ok(json!({ "agent": id, "text": tail }))
@@ -1268,11 +1264,7 @@ fn show_value(
     sent: Option<String>,
     scope: ReadAloudScope,
 ) -> Value {
-    let screen = source
-        .tmux_session
-        .as_deref()
-        .and_then(|session| integrations::tmux_capture(session, READ_ALOUD_LINES))
-        .unwrap_or(source.screen);
+    let screen = source.screen;
     let transcript = source
         .transcript
         .as_deref()

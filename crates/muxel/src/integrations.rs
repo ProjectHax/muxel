@@ -1298,20 +1298,6 @@ pub fn tmux_session_exists(session: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// The last `lines` lines of a local tmux session's pane, scrollback included
-/// (see [`muxel_core::tmux::capture_pane_args`]). `None` when tmux can't say.
-pub fn tmux_capture(session: &str, lines: usize) -> Option<String> {
-    let out = command("tmux")
-        .args(muxel_core::tmux::capture_pane_args(session, lines))
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// Run `tmux <args>` where a project's sessions live: on this machine, or on its
 /// SSH host (reusing the host's ControlMaster). `None` for a Windows host, which
 /// has no tmux.

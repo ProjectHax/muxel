@@ -289,22 +289,6 @@ pub fn launch_session_args(
     v
 }
 
-/// Arguments for `tmux …` to print the last `lines` lines of a session's pane —
-/// its scrollback as well as its screen, which the terminal attached to it never
-/// sees (tmux keeps the history). `-J` rejoins soft-wrapped lines. Read-aloud uses
-/// it to find an agent's last reply.
-pub fn capture_pane_args(session: &str, lines: usize) -> Vec<String> {
-    vec![
-        "capture-pane".to_string(),
-        "-p".to_string(),
-        "-J".to_string(),
-        "-t".to_string(),
-        format!("={session}:"),
-        "-S".to_string(),
-        format!("-{lines}"),
-    ]
-}
-
 /// Arguments for `tmux …` to read a session's user option (`@name`), printing its
 /// value alone — or nothing when it is unset or the session is gone (`-q`).
 /// Options take a pane target, so the exact-match session is `=name:`.
@@ -377,22 +361,6 @@ mod tests {
             name,
             session_name("My Project!", id),
             "stable for same inputs"
-        );
-    }
-
-    #[test]
-    fn capture_pane_targets_the_exact_session_with_history() {
-        assert_eq!(
-            capture_pane_args("muxel_p_1", 500),
-            vec![
-                "capture-pane",
-                "-p",
-                "-J",
-                "-t",
-                "=muxel_p_1:",
-                "-S",
-                "-500"
-            ]
         );
     }
 
