@@ -62,6 +62,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
       - run: cargo test --workspace
+      # `muxel ctl` (outside agents such as Grok Bot driving muxel) runs from
+      # contexts with no display: it must start, print its usage, and report —
+      # as JSON, exit 1 — that no muxel is running, without touching the GUI.
+      - name: muxel ctl starts without a display
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eux
+          unset DISPLAY WAYLAND_DISPLAY
+          target/debug/muxel ctl help | grep -q '^usage: muxel ctl'
+          set +e; out="$(target/debug/muxel ctl projects)"; code=$?; set -e
+          test "$code" -eq 1
+          echo "$out" | grep -q "muxel isn't running"
       - name: Clippy (Windows-only code)
         if: runner.os == 'Windows'
         run: cargo clippy --workspace --all-targets -- -D warnings

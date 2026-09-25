@@ -14,8 +14,13 @@ use crate::{RemoteHost, RemoteOs, SshAuth};
 
 /// POSIX single-quote `s` for safe embedding in a remote shell command. Tokens
 /// made only of safe characters are left bare (readability + test clarity).
+///
+/// A leading `=` is never bare: zsh — the login shell ssh runs the command in on
+/// a macOS host — expands `=word` to the path of command `word` and fails when
+/// there is none, which is every tmux exact-match target (`=muxel_…`).
 pub fn sh_quote(s: &str) -> String {
     let safe = !s.is_empty()
+        && !s.starts_with('=')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-+/:=@,%".contains(c));
     if safe {
@@ -781,6 +786,9 @@ mod tests {
         assert_eq!(sh_quote("/my work"), "'/my work'");
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
         assert_eq!(sh_quote(""), "''");
+        // zsh would expand a bare `=word` (a tmux exact-match target).
+        assert_eq!(sh_quote("=muxel_p_1a2b3c4d"), "'=muxel_p_1a2b3c4d'");
+        assert_eq!(sh_quote("a=b"), "a=b");
     }
 
     /// The teardown command must answer "is it gone?", not "did a kill run?" —
@@ -813,7 +821,7 @@ mod tests {
     fn kill_and_confirm_targets_one_session_exactly() {
         let cmd = kill_and_confirm_command("muxel_p_1");
         assert_eq!(
-            cmd.matches("-t =muxel_p_1 ").count(),
+            cmd.matches("-t '=muxel_p_1' ").count(),
             2,
             "both the kill and the confirmation name the same exact target: {cmd}"
         );

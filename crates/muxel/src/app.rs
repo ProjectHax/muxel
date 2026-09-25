@@ -46,6 +46,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod control_api;
+
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
 /// TUIs (Claude/opencode/…) don't get squished narrow enough to overflow.
 const MIN_PANE_WIDTH: Pixels = px(340.0);
@@ -2802,6 +2804,15 @@ pub struct MuxelApp {
     /// Active project's file contents, read once when the panel opens, so typing
     /// re-searches in memory without re-reading from disk.
     find_contents: Vec<(PathBuf, String)>,
+    /// The `muxel ctl` server, while outside control is on (see `control_api`).
+    control: Option<crate::control::Server>,
+    /// Answers the control server's requests on the UI thread.
+    control_task: Option<Task<()>>,
+    /// The control server couldn't start; not retried each tick until the
+    /// setting is toggled again.
+    control_failed: bool,
+    /// Prompts typed through `muxel ctl`, per pane, for `show` and `wait`.
+    control_turns: HashMap<Uuid, control_api::ControlTurn>,
 }
 
 /// One content-search match (file + 0-based line + the matched line text).
@@ -4232,6 +4243,7 @@ impl MuxelApp {
                         this.tick(window, cx);
                         this.handle_notification_click(window, cx);
                         this.pump_tray(window, cx);
+                        this.sync_control(cx);
                     })
                     .is_err()
                 {
@@ -4810,12 +4822,18 @@ impl MuxelApp {
             find_selected: 0,
             find_results: Vec::new(),
             find_contents: Vec::new(),
+            control: None,
+            control_task: None,
+            control_failed: false,
+            control_turns: HashMap::new(),
         };
 
         // Flush any coalesced auto-title before shutdown. On Unix, muxel also
         // hands tmux's exit policy back so it exits with its last session.
         cx.on_app_quit(|this, _cx| {
             this.persist();
+            // Stop serving `muxel ctl` and withdraw its endpoint file.
+            this.control = None;
             if cfg!(unix) {
                 integrations::restore_tmux_exit_empty();
             }
@@ -25024,6 +25042,7 @@ impl MuxelApp {
             (t("Speech"), SettingsSection::Speech),
             (t("Read Aloud"), SettingsSection::ReadAloud),
             (t("Agents"), SettingsSection::Agents),
+            (t("Grok Bot"), SettingsSection::GrokBot),
             (t("Runners"), SettingsSection::Runners),
             (t("Snippets"), SettingsSection::Snippets),
             (t("Loops"), SettingsSection::Loops),
@@ -25053,6 +25072,7 @@ impl MuxelApp {
             SettingsSection::Speech => self.render_settings_speech(cx),
             SettingsSection::ReadAloud => self.render_settings_read_aloud(cx),
             SettingsSection::Agents => self.render_settings_agents(cx),
+            SettingsSection::GrokBot => self.render_settings_grok_bot(cx),
             SettingsSection::Runners => self.render_settings_runners(cx),
             SettingsSection::Snippets => self.render_settings_snippets(cx),
             SettingsSection::Loops => self.render_settings_loops(cx),

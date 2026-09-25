@@ -305,6 +305,31 @@ pub fn capture_pane_args(session: &str, lines: usize) -> Vec<String> {
     ]
 }
 
+/// Arguments for `tmux …` to read a session's user option (`@name`), printing its
+/// value alone — or nothing when it is unset or the session is gone (`-q`).
+/// Options take a pane target, so the exact-match session is `=name:`.
+pub fn show_option_args(session: &str, option: &str) -> Vec<String> {
+    vec![
+        "show-options".to_string(),
+        "-qv".to_string(),
+        "-t".to_string(),
+        format!("={session}:"),
+        option.to_string(),
+    ]
+}
+
+/// Arguments for `tmux …` to set a session's user option (`@name`).
+pub fn set_option_args(session: &str, option: &str, value: &str) -> Vec<String> {
+    vec![
+        "set-option".to_string(),
+        "-q".to_string(),
+        "-t".to_string(),
+        format!("={session}:"),
+        option.to_string(),
+        value.to_string(),
+    ]
+}
+
 /// Arguments for `tmux …` to kill a session (exact-match `=` target).
 pub fn kill_session_args(session: &str) -> Vec<String> {
     vec![
@@ -317,6 +342,31 @@ pub fn kill_session_args(session: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn option_args_target_exactly_one_session() {
+        assert_eq!(
+            show_option_args("muxel_p_1a2b3c4d", "@muxel-ctl"),
+            [
+                "show-options",
+                "-qv",
+                "-t",
+                "=muxel_p_1a2b3c4d:",
+                "@muxel-ctl"
+            ]
+        );
+        assert_eq!(
+            set_option_args("muxel_p_1a2b3c4d", "@muxel-ctl", "v1|x"),
+            [
+                "set-option",
+                "-q",
+                "-t",
+                "=muxel_p_1a2b3c4d:",
+                "@muxel-ctl",
+                "v1|x"
+            ]
+        );
+    }
 
     #[test]
     fn session_name_is_sanitized_and_stable() {

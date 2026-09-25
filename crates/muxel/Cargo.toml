@@ -25,6 +25,9 @@ anyhow.workspace = true
 log.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
+# `muxel ctl` requests reach the UI thread over this (already in the tree via
+# muxel-terminal).
+async-channel = "2.3"
 notify-rust = "4"
 # debug-embed: always bake files into the binary, even in debug builds.
 # Without this, rust-embed reads icons from disk under CARGO_MANIFEST_DIR

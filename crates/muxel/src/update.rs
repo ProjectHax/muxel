@@ -36,10 +36,25 @@ pub enum InstallKind {
     LinuxPortable,
 }
 
+/// The `.AppImage` file this muxel is running from, if it is — `$APPIMAGE`, but
+/// only while this executable is inside that AppImage's mount. The variable alone
+/// is inherited from any AppImage up the process tree (see
+/// `muxel_core::own_appimage`).
+pub fn running_appimage() -> Option<PathBuf> {
+    let appimage = std::env::var("APPIMAGE").ok();
+    let appdir = std::env::var("APPDIR").ok();
+    let exe = std::env::current_exe().ok()?;
+    muxel_core::own_appimage(appimage.as_deref(), appdir.as_deref(), &exe).or_else(|| {
+        // `current_exe` is fully resolved; the runtime's `$APPDIR` may not be.
+        let real = std::fs::canonicalize(appdir.as_deref()?).ok()?;
+        muxel_core::own_appimage(appimage.as_deref(), real.to_str(), &exe)
+    })
+}
+
 impl InstallKind {
     /// Detect the install format from environment + the executable path.
     pub fn detect() -> InstallKind {
-        if std::env::var_os("APPIMAGE").is_some() {
+        if running_appimage().is_some() {
             return InstallKind::AppImage;
         }
         let exe = std::env::current_exe().unwrap_or_default();
@@ -233,7 +248,7 @@ fn apply_linux(url: &str, work: &Path) -> Result<RelaunchPlan> {
     make_executable(&dl)?;
     // AppImage: replace the .AppImage file itself (current_exe is inside the
     // read-only FUSE mount). Portable: replace the running binary directly.
-    if let Some(appimage) = std::env::var_os("APPIMAGE").map(PathBuf::from) {
+    if let Some(appimage) = running_appimage() {
         overwrite_in_place(&dl, &appimage)?;
         Ok(RelaunchPlan {
             program: appimage,

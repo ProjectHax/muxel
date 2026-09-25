@@ -1312,6 +1312,65 @@ pub fn tmux_capture(session: &str, lines: usize) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run `tmux <args>` where a project's sessions live: on this machine, or on its
+/// SSH host (reusing the host's ControlMaster). `None` for a Windows host, which
+/// has no tmux.
+fn tmux_at(loc: &RepoLoc, args: &[String]) -> Option<std::process::Output> {
+    match loc {
+        RepoLoc::Local(_) => command("tmux")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok(),
+        RepoLoc::Remote(c) => {
+            if c.host.os.is_windows() {
+                return None;
+            }
+            let cmd = std::iter::once("tmux".to_string())
+                .chain(args.iter().map(|a| ssh::sh_quote(a)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            remote_ssh_command(c, format!("{}; {cmd}", ssh::tmux_path_prelude()))
+                .stdin(std::process::Stdio::null())
+                .output()
+                .ok()
+        }
+    }
+}
+
+/// Run this muxel's own `ctl` command (`exe ctl <args>`), the way an outside
+/// agent does — Settings → Grok Bot's Test.
+pub fn run_muxel_ctl(exe: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    command(exe)
+        .arg("ctl")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+}
+
+/// A tmux session's user option (`@name`), wherever the session lives. `None`
+/// when it is unset, the session is gone, or tmux couldn't be reached.
+pub fn tmux_option(loc: &RepoLoc, session: &str, option: &str) -> Option<String> {
+    let out = tmux_at(loc, &muxel_core::tmux::show_option_args(session, option))?;
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// Set a tmux session's user option (`@name`), wherever the session lives.
+pub fn set_tmux_option(loc: &RepoLoc, session: &str, option: &str, value: &str) -> Result<()> {
+    let args = muxel_core::tmux::set_option_args(session, option, value);
+    let Some(out) = tmux_at(loc, &args) else {
+        bail!("tmux isn't reachable for session “{session}”");
+    };
+    if !out.status.success() {
+        bail!(
+            "tmux set-option failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Kill a tmux session. Best-effort.
 pub fn kill_tmux_session(session: &str) {
     let _ = command("tmux")

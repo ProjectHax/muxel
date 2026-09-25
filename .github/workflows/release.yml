@@ -193,6 +193,40 @@ jobs:
           mv muxel*-"${arch}".AppImage "muxel-linux-${arch}.AppImage" 2>/dev/null \
             || mv muxel*.AppImage "muxel-linux-${arch}.AppImage"
 
+      # `muxel ctl` is how outside agents (Grok Bot, …) drive muxel, and it has to
+      # work however muxel was installed. From the .deb's and the .rpm's
+      # /usr/bin/muxel, and through the AppImage (arguments passed through its
+      # AppRun), with no display: print its usage, report as JSON (exit 1) that no
+      # muxel is running, and print a skill naming the binary that ran it.
+      - name: Smoke-test muxel ctl from each package
+        run: |
+          set -eux
+          arch="${{ matrix.arch }}"
+          export APPIMAGE_EXTRACT_AND_RUN=1  # no FUSE on the runners
+          unset DISPLAY WAYLAND_DISPLAY
+          sudo apt-get install -y rpm2cpio cpio
+          check() {
+            "$@" ctl help | grep -q '^usage: muxel ctl'
+            set +e; out="$("$@" ctl projects)"; code=$?; set -e
+            test "$code" -eq 1
+            echo "$out" | grep -q "muxel isn't running"
+            "$@" ctl skill > skill.txt
+            grep -q '^## Find muxel on this computer' skill.txt
+          }
+          dpkg-deb -x target/debian/*.deb deb-root
+          check deb-root/usr/bin/muxel
+          grep -qF "$PWD/deb-root/usr/bin/muxel" skill.txt
+
+          mkdir rpm-root
+          (cd rpm-root && rpm2cpio ../target/generate-rpm/*.rpm | cpio -idm --quiet)
+          check rpm-root/usr/bin/muxel
+          grep -qF "$PWD/rpm-root/usr/bin/muxel" skill.txt
+
+          check "./muxel-linux-${arch}.AppImage"
+          # The .AppImage file itself, not its contents: the runtime exports
+          # $APPIMAGE whether it mounts the image or (as here) extracts it.
+          grep -qF "$PWD/muxel-linux-${arch}.AppImage" skill.txt
+
       - uses: actions/upload-artifact@v7
         with:
           name: muxel-linux-packages-${{ matrix.arch }}

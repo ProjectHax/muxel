@@ -337,10 +337,56 @@ fn dedent(line: &str, n: usize) -> &str {
     rest
 }
 
+/// The last prompt sent in an agent pane's text — the one that opened the turn on
+/// screen — without its glyph, with the lines it wrapped onto. `None` when it has
+/// scrolled out of the buffer, or the agent draws no prompt glyphs to go by. The
+/// prompt still being typed in the composer is not one that was sent.
+pub fn prompt_from_screen(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    let end = composer_start(&lines);
+    let at = lines[..end].iter().rposition(|line| prompt_line(line))?;
+    let first = lines[at]
+        .trim_start_matches(['│', '┃'])
+        .trim_start()
+        .trim_start_matches(PROMPT_GLYPHS)
+        .trim_end_matches(['│', '┃'])
+        .trim();
+    let mut text = vec![first];
+    for line in &lines[at + 1..end] {
+        if line.trim().is_empty() || !line.starts_with(char::is_whitespace) {
+            break;
+        }
+        text.push(line.trim());
+    }
+    let text = text.join("\n").trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 /// The lines of the last turn: after the last prompt that was sent, up to the
 /// composer. Either end may be missing — no composer in view, or a turn so long its
 /// prompt scrolled out of the buffer — and then the turn runs to that edge.
 fn last_turn<'l, 'a>(lines: &'l [&'a str]) -> &'l [&'a str] {
+    let end = composer_start(lines);
+    // The prompt that opened the turn, and the lines it wrapped onto.
+    let start = match lines[..end].iter().rposition(|line| prompt_line(line)) {
+        Some(prompt) => {
+            let mut start = prompt + 1;
+            while start < end
+                && !lines[start].trim().is_empty()
+                && lines[start].starts_with(char::is_whitespace)
+            {
+                start += 1;
+            }
+            start
+        }
+        None => 0,
+    };
+    &lines[start..end]
+}
+
+/// Where the composer begins — the rules framing it included — or the end of the
+/// buffer when no composer is in view.
+fn composer_start(lines: &[&str]) -> usize {
     let mut end = lines.len();
     let mut seen = 0;
     for (i, line) in lines.iter().enumerate().rev() {
@@ -362,21 +408,7 @@ fn last_turn<'l, 'a>(lines: &'l [&'a str]) -> &'l [&'a str] {
             break;
         }
     }
-    // The prompt that opened the turn, and the lines it wrapped onto.
-    let start = match lines[..end].iter().rposition(|line| prompt_line(line)) {
-        Some(prompt) => {
-            let mut start = prompt + 1;
-            while start < end
-                && !lines[start].trim().is_empty()
-                && lines[start].starts_with(char::is_whitespace)
-            {
-                start += 1;
-            }
-            start
-        }
-        None => 0,
-    };
-    &lines[start..end]
+    end
 }
 
 /// Whether the prompt line at `i` is the composer rather than a prompt already
@@ -1142,8 +1174,8 @@ fn cut_at_word(item: &str, room: usize) -> Option<String> {
 mod tests {
     use super::{
         CHUNK_CHARS, ReadAloudScope, SpeakOptions, chunks, is_agent_program, looks_like_code,
-        reply_from_claude_transcript, reply_from_screen, reply_on_screen, speakable,
-        split_sentences,
+        prompt_from_screen, reply_from_claude_transcript, reply_from_screen, reply_on_screen,
+        speakable, split_sentences,
     };
     use serde_json::json;
 
@@ -1382,6 +1414,33 @@ mod tests {
 ⏺ Both done.
 ";
         assert_eq!(final_msg(screen).as_deref(), Some("Both done."));
+    }
+
+    #[test]
+    fn the_sent_prompt_is_found_but_not_the_one_being_typed() {
+        assert_eq!(
+            prompt_from_screen(CLAUDE_SCREEN).as_deref(),
+            Some("fix the off-by-one in the pager")
+        );
+        let screen = "\
+❯ please fix the pager and then
+  also update the changelog
+
+⏺ Both done.
+
+────────
+❯ a half-typed second
+────────
+  ? for shortcuts
+";
+        assert_eq!(
+            prompt_from_screen(screen).as_deref(),
+            Some("please fix the pager and then\nalso update the changelog")
+        );
+        // Only the composer on screen: nothing has been sent yet.
+        assert_eq!(prompt_from_screen("────────\n❯ draft\n────────\n"), None);
+        // No prompt glyphs at all.
+        assert_eq!(prompt_from_screen("plain output\nmore output\n"), None);
     }
 
     #[test]

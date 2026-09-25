@@ -1366,7 +1366,7 @@ impl TerminalSession {
     }
 
     /// Whether the app has enabled DECCKM (application cursor keys).
-    pub(crate) fn is_app_cursor_mode(&self) -> bool {
+    pub fn is_app_cursor_mode(&self) -> bool {
         self.term.lock().mode().contains(TermMode::APP_CURSOR)
     }
 

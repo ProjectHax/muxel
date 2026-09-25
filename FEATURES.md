@@ -414,6 +414,73 @@ feature is added or changed, update the matching entry here in the same change**
   and SSH errors land here too. Timestamped, newest first, selectable/copyable, with a
   Clear button. F12 is a no-op until the setting is enabled.
 
+## Outside control (`muxel ctl`)
+
+- **Let another agent drive muxel** — Settings → Grok Bot → "Allow outside tools
+  to control muxel" (off by default) lets a program on the same computer — an
+  orchestrating agent such as xAI's Grok Bot, a script, another coding agent — work
+  the agents running in muxel through the `muxel ctl` command: list projects, the
+  pane layout and every agent (program, model, worktree, focus), see each one's
+  status (working / blocked / done / idle / exited), read its last prompt and last
+  reply, send it a prompt, answer the question it is blocked on, and press keys.
+  Every command prints JSON.
+- **Reads what the agent actually said** — `show` returns the last prompt and the
+  model's last reply the way read-aloud finds them (a local Claude pane's session
+  transcript, otherwise the pane's scrollback or tmux history), and for a blocked
+  agent the question with its numbered options read off the screen. `wait` blocks
+  until the agent's turn ends — it finishes, asks something, or exits — then
+  returns the same, so a caller can `send` then `wait` without polling. An answer
+  to a question counts as a turn too, so `answer` then `wait` works the same way.
+- **Refuses what would go wrong** — `send` won't type into an agent that is
+  working or waiting on a question (unless forced), `answer` only picks an option
+  the prompt actually offers, and a pane that isn't running says so rather than
+  swallowing the input. Shell panes are off limits unless "Also allow typing into
+  shell panes" is on too, since typing into a shell is running commands.
+- **Local and owner-only** — the running app listens on a random loopback port and
+  writes it, with a fresh random token, to `control.json` in muxel's data directory,
+  readable only by the user; nothing is reachable from the network, and a request
+  without the token is refused. Turning the setting off (or quitting) closes it.
+- **Settings → Grok Bot** — a setup page that walks through connecting Grok Bot
+  in four steps: turn on outside control (with a live status: on and listening,
+  starting, or off), allow command execution on this computer in Grok Bot's own
+  settings (where to find it), copy the skill (with a preview of exactly what gets
+  pasted), and **Test**, which runs the same `muxel ctl` command Grok Bot will and
+  shows what muxel answered — or why it couldn't. It also shows this computer's
+  muxel command, with a copy button, and links to Grok Bot's documentation.
+- **Instructions for the other agent** — `muxel ctl skill` (or Settings → Grok Bot
+  → "Copy skill") produces a ready-made skill: the commands, what each status
+  means, and the rules — one prompt at a time, `wait` after `send`, and permission
+  prompts left to the user unless they've said otherwise. Paste it into Grok Bot
+  (whose "Execution on Local Computer" setting must allow it to run commands here)
+  or any agent that can run shell commands.
+- **Works across several computers** — one skill serves every computer the agent
+  works on: it names the muxel binary it was copied from, and otherwise says how to
+  find muxel there (the running app records its own path in `control.json`, whose
+  location it gives for macOS, Linux and Windows, then the usual install places and
+  the `PATH`). Every reply carries `host`, the computer whose muxel answered, so an
+  agent working with several computers can tell which one it reached.
+- **However muxel was installed on Linux** — `muxel ctl` works from the .deb or
+  .rpm (`/usr/bin/muxel`), the tarball or install script, and the AppImage, which
+  is run with `ctl` like any command (`muxel-linux-x86_64.AppImage ctl panes`); a
+  running AppImage records the `.AppImage` file, not its temporary mount, as its
+  path. It needs no display, so it runs from an agent's background shell. The skill
+  covers the usual snags: an AppImage without FUSE (`APPIMAGE_EXTRACT_AND_RUN=1`), a
+  caller's `LD_LIBRARY_PATH` that doesn't suit muxel (`env -u LD_LIBRARY_PATH`),
+  and a caller whose home or `XDG_DATA_HOME` differs from muxel's (`MUXEL_CONTROL=`
+  pointing at its `control.json`). CI checks that `muxel ctl` starts from each
+  release package.
+- **Shared agents take turns** — an agent can be reached from more than one muxel:
+  a remote project opened on several computers, or a local tmux project another
+  computer attached to. Before typing, muxel checks a marker on the agent's tmux
+  session — which every muxel attached to it reads — and refuses while another
+  muxel's turn with it is still open ("muxel on *host* is using this agent"),
+  then marks it as its own. Two muxels that reach an idle agent at the same moment
+  settle it between them: only one types. A marker left by a muxel that quit or
+  crashed lapses once the agent is seen to finish, or when its grace period runs
+  out. `show` reports it as `controller`: which computer last typed into the agent
+  this way, whether that was this muxel, and whether its turn is still open.
+  `send --force` overrides it.
+
 ## Terminal
 
 - **alacritty-based emulator** — full VTE terminal with truecolor support.

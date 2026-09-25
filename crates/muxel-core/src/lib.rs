@@ -6,6 +6,7 @@ mod agent;
 mod appimage;
 pub mod audio;
 pub mod autopilot;
+pub mod control;
 pub mod diff;
 pub mod geometry;
 mod gui_path;
@@ -31,7 +32,7 @@ pub use agent::{
     file_link_instruction, memory_header, memory_instruction, memory_reference, resolve_launch,
     resolve_launch_for_session, session_resume_args,
 };
-pub use appimage::foreign_muxel_appimage_mounts;
+pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
 pub use pane::{
@@ -2192,6 +2193,15 @@ pub struct Settings {
     /// Stop after about this many characters, at a sentence (0 = read it all).
     #[serde(default)]
     pub read_aloud_max_chars: u32,
+    // --- Outside control (`muxel ctl`; see `control`) ---
+    /// Let other programs on this computer (an orchestrating agent such as Grok
+    /// Bot) list and drive the agents through `muxel ctl`. Off by default.
+    #[serde(default)]
+    pub control_enabled: bool,
+    /// …including typing into shell panes, which is running commands. Off by
+    /// default: outside control reaches coding agents only.
+    #[serde(default)]
+    pub control_allow_shells: bool,
 }
 
 fn default_stt_model() -> String {
@@ -2473,6 +2483,8 @@ impl Default for Settings {
             read_aloud_short_paths: true,
             read_aloud_tables: false,
             read_aloud_max_chars: 0,
+            control_enabled: false,
+            control_allow_shells: false,
         }
     }
 }
@@ -2656,6 +2668,18 @@ mod settings_tests {
         assert_eq!(s.read_aloud_scope, ReadAloudScope::WholeTurn);
         assert_eq!(s.read_aloud_auto, ReadAloudAuto::All);
         assert_eq!(s.speak_options().max_chars, 1000);
+    }
+
+    #[test]
+    fn outside_control_is_off_for_old_and_new_configs() {
+        // Nothing outside muxel can drive its agents until the user says so.
+        let s: Settings = serde_json::from_str("{}").expect("parse");
+        assert!(!s.control_enabled);
+        assert!(!s.control_allow_shells);
+        assert!(!Settings::default().control_enabled);
+        let s: Settings = serde_json::from_str(r#"{"control_enabled": true}"#).expect("parse");
+        assert!(s.control_enabled);
+        assert!(!s.control_allow_shells);
     }
 
     #[test]

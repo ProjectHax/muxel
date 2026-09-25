@@ -14,6 +14,26 @@
 //! is the pure selection half — which mounts are muxel's and not our own; the
 //! app crate does the liveness probe and the actual lazy-unmount.
 
+/// The `.AppImage` file this process is running from: `$APPIMAGE`, but only when
+/// the executable (`exe`) really lives inside that AppImage's mount (`$APPDIR`).
+///
+/// The AppImage runtime exports both variables to everything the app starts, so
+/// they also arrive in programs that merely descend from *another* AppImage — a
+/// shell in an AppImage terminal emulator, a command an Electron AppImage (such as
+/// an agent app) runs. A muxel installed from a .deb or .rpm and started that way
+/// must not take the other app's AppImage for its own: the updater would overwrite
+/// it, and `muxel ctl` would tell agents to run it.
+pub fn own_appimage(
+    appimage: Option<&str>,
+    appdir: Option<&str>,
+    exe: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let appimage = appimage.filter(|a| !a.is_empty())?;
+    let appdir = appdir.filter(|d| !d.is_empty())?;
+    exe.starts_with(appdir)
+        .then(|| std::path::PathBuf::from(appimage))
+}
+
 /// Given the contents of `/proc/self/mounts` and this process's own AppImage
 /// mount directory (`$APPDIR`; `None` when muxel wasn't launched from an
 /// AppImage), return the mountpoints of *other* muxel AppImage squashfuse mounts
@@ -93,7 +113,55 @@ fn unescape_mount_field(field: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::foreign_muxel_appimage_mounts;
+    use super::{foreign_muxel_appimage_mounts, own_appimage};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn own_appimage_only_when_running_inside_it() {
+        let image = Some("/home/me/Applications/muxel-linux-x86_64.AppImage");
+        // Launched from the AppImage (mounted, or extracted-and-run).
+        assert_eq!(
+            own_appimage(
+                image,
+                Some("/tmp/.mount_muxel-AbC123"),
+                Path::new("/tmp/.mount_muxel-AbC123/usr/bin/muxel")
+            ),
+            Some(PathBuf::from(
+                "/home/me/Applications/muxel-linux-x86_64.AppImage"
+            ))
+        );
+        assert!(
+            own_appimage(
+                image,
+                Some("/tmp/appimage_extracted_0f1e"),
+                Path::new("/tmp/appimage_extracted_0f1e/usr/bin/muxel")
+            )
+            .is_some()
+        );
+        // A .deb/.rpm muxel started by another AppImage inherits its variables.
+        assert_eq!(
+            own_appimage(
+                Some("/opt/Grok-Bot.AppImage"),
+                Some("/tmp/.mount_Grok-xYz"),
+                Path::new("/usr/bin/muxel")
+            ),
+            None
+        );
+        // Path components, not string prefixes.
+        assert_eq!(
+            own_appimage(
+                image,
+                Some("/tmp/.mount_mux"),
+                Path::new("/tmp/.mount_muxel-AbC123/usr/bin/muxel")
+            ),
+            None
+        );
+        assert_eq!(own_appimage(None, None, Path::new("/usr/bin/muxel")), None);
+        assert_eq!(
+            own_appimage(image, Some(""), Path::new("/usr/bin/muxel")),
+            None
+        );
+    }
 
     // A realistic /proc/self/mounts slice: unrelated FUSE mounts, our own muxel
     // mount, and a leftover muxel mount from a prior instance.

@@ -5004,6 +5004,7 @@ name = "muxel"
 version = "0.2.3"
 dependencies = [
  "anyhow",
+ "async-channel",
  "chrono",
  "cpal",
  "env_logger",
