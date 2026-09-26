@@ -169,14 +169,21 @@ mod maximize_follow_tests {
 const RETRY_REMOTE_KILL_SECS: [u64; 4] = [0, 3, 10, 30];
 
 const RESTORE_LAUNCH_CONCURRENCY: usize = 4;
+const RESTORE_WINDOWS_LAUNCH_CONCURRENCY: usize = 2;
 const RESTORE_FIRST_WAVE_DEBOUNCE_MS: u64 = 250;
 const RESTORE_WAVE_YIELD_MS: u64 = 1;
 const RESTORE_MOVE_SIZE_POLL_MS: u64 = 50;
+const RESTORE_STARTUP_POLL_MS: u64 = 50;
+const RESTORE_STARTUP_SETTLE_MS: u64 = 1_000;
+const RESTORE_STARTUP_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RestoreWaveDecision {
     Cancel,
     Pause,
+    // A launch is still running or a terminal still starting: hold the next
+    // terminal wave.
+    Settle,
     Launch { wave_end: usize },
 }
 
@@ -188,22 +195,212 @@ fn restore_wave_delay(wave_start: usize, target_is_windows: bool) -> Duration {
     })
 }
 
+fn restore_launch_concurrency(target_is_windows: bool) -> usize {
+    if target_is_windows {
+        RESTORE_WINDOWS_LAUNCH_CONCURRENCY
+    } else {
+        RESTORE_LAUNCH_CONCURRENCY
+    }
+}
+
 fn restore_wave_decision(
     wave_start: usize,
     instance_count: usize,
+    launch_concurrency: usize,
     activation_is_current: bool,
     project_is_visible: bool,
     move_size_active: bool,
+    startup_pending: bool,
 ) -> RestoreWaveDecision {
     if !activation_is_current || !project_is_visible {
         RestoreWaveDecision::Cancel
     } else if move_size_active {
         RestoreWaveDecision::Pause
+    } else if startup_pending {
+        RestoreWaveDecision::Settle
     } else {
         RestoreWaveDecision::Launch {
-            wave_end: (wave_start + RESTORE_LAUNCH_CONCURRENCY).min(instance_count),
+            wave_end: (wave_start + launch_concurrency).min(instance_count),
         }
     }
+}
+
+/// Split a project's panes into the restore's two queues, each in pane order
+/// with the selected pane swapped to the front: terminals, whose launches are
+/// admitted in waves, and every other pane. Editors, diffs and browsers do not
+/// launch a terminal, so they never wait for a terminal's startup.
+fn restore_queues(
+    mut instances: Vec<Uuid>,
+    selected: Option<Uuid>,
+    is_terminal: impl Fn(Uuid) -> bool,
+) -> (Vec<Uuid>, Vec<Uuid>) {
+    if let Some(selected) = selected
+        && let Some(index) = instances.iter().position(|iid| *iid == selected)
+    {
+        instances.swap(0, index);
+    }
+    instances.into_iter().partition(|iid| is_terminal(*iid))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RestoreStartupState {
+    provider_ready: bool,
+    has_visible_content: bool,
+    idle_for: Duration,
+    /// Since the view was installed: the PTY spawn has returned and the child
+    /// is running, so its output can be observed.
+    running_for: Duration,
+}
+
+/// Whether a live terminal is still inside provider startup: it has neither
+/// published readiness (or exited) nor drawn a visible screen and gone quiet. A
+/// silent or custom command stops counting five seconds after its view was
+/// installed, so it can delay the rest of the restore but never strand it.
+fn restore_terminal_still_starting(state: RestoreStartupState) -> bool {
+    state.running_for < Duration::from_millis(RESTORE_STARTUP_TIMEOUT_MS)
+        && !state.provider_ready
+        && !(state.has_visible_content
+            && state.idle_for >= Duration::from_millis(RESTORE_STARTUP_SETTLE_MS))
+}
+
+/// Whether admission holds the next terminal wave, decided from the app's own
+/// state: `queue` is the rest of this activation's terminal queue, `project`
+/// every terminal pane in the project, `live` the startup evidence of a pane's
+/// view (from the terminals map; `None` without one), `launching` the launches
+/// still running on a worker, as of `now`, and `failed` the launches that
+/// failed.
+///
+/// On every platform, a queued pane whose launch is already running (started by
+/// a superseded activation or an interactive spawn) holds the wave until that
+/// launch lands or passes [`TERMINAL_LAUNCH_DEADLINE`]: starting it again would
+/// put a second process beside the worker, and skipping it would strand the
+/// pane if that launch is discarded.
+/// With `settle_startups` (Windows), the wave also holds while a queued pane
+/// still needs a launch and any terminal in the project is still launching or
+/// starting, wherever pane order put it and whichever activation launched it.
+fn restore_startup_holds_admission(
+    queue: &[Uuid],
+    project: &HashSet<Uuid>,
+    live: impl Fn(Uuid) -> Option<RestoreStartupState>,
+    launching: &HashMap<Uuid, LaunchTicket>,
+    now: Instant,
+    failed: &HashMap<Uuid, String>,
+    settle_startups: bool,
+) -> bool {
+    let queued = || queue.iter().copied().filter(|iid| project.contains(iid));
+    let holding = |iid: Uuid| {
+        launching
+            .get(&iid)
+            .is_some_and(|&launch| launch_holds_admission(launch, now))
+    };
+    if queued().any(holding) {
+        return true;
+    }
+    let needs_launch = |iid: Uuid| !failed.contains_key(&iid) && live(iid).is_none();
+    let starting =
+        |iid: Uuid| holding(iid) || live(iid).is_some_and(restore_terminal_still_starting);
+    settle_startups && queued().any(needs_launch) && project.iter().copied().any(starting)
+}
+
+/// How long a running launch holds restore admission for the other panes. The
+/// deadline only stops one slow launch from holding back the others: past it
+/// the launch keeps running, its pane keeps showing that it is starting, and
+/// its result is installed when it lands. Only Restart, closing the pane or
+/// leaving the project supersedes it.
+const TERMINAL_LAUNCH_DEADLINE: Duration = Duration::from_secs(20);
+
+/// A pane's launch in flight: the token that owns it, and when its worker was
+/// dispatched (when it was reserved, until then).
+#[derive(Clone, Copy, Debug)]
+struct LaunchTicket {
+    token: u64,
+    since: Instant,
+}
+
+/// Whether a running launch still holds restore admission at `now`.
+fn launch_holds_admission(launch: LaunchTicket, now: Instant) -> bool {
+    now.saturating_duration_since(launch.since) < TERMINAL_LAUNCH_DEADLINE
+}
+
+/// Whether `token` still owns the pane's launch, however long it has run. A
+/// result whose token no longer does (the pane closed or restarted, or the
+/// project was left) is dropped, which kills the child.
+fn launch_token_current(launching: &HashMap<Uuid, LaunchTicket>, iid: Uuid, token: u64) -> bool {
+    launching
+        .get(&iid)
+        .is_some_and(|launch| launch.token == token)
+}
+
+/// Release a launch `token` still owns, so restore admission stops waiting on
+/// it. Returns whether it did.
+fn release_launch_token(
+    launching: &mut HashMap<Uuid, LaunchTicket>,
+    iid: Uuid,
+    token: u64,
+) -> bool {
+    launch_token_current(launching, iid, token) && launching.remove(&iid).is_some()
+}
+
+/// Whether a sweep that starts missing terminals (switching to a project, an
+/// adopted peer layout, a wake) should start this pane now. A pane with a live
+/// view is not missing, and neither is one whose launch is in flight: starting
+/// it again would drop that launch's result and kill the child it started.
+/// Explicit Restart supersedes a running launch on purpose and does not ask.
+fn needs_immediate_spawn(live: bool, launching: bool) -> bool {
+    !live && !launching
+}
+
+/// The window showing project `pid`: the pop-out window it was moved to, else
+/// the main window while that has it selected, else none.
+fn window_showing_project<W: Copy>(
+    pid: Uuid,
+    secondaries: impl IntoIterator<Item = (Uuid, W)>,
+    main: Option<W>,
+    main_project: Option<Uuid>,
+) -> Option<W> {
+    secondaries
+        .into_iter()
+        .find_map(|(shown, window)| (shown == pid).then_some(window))
+        .or(main.filter(|_| main_project == Some(pid)))
+}
+
+/// Where one step of a project's activation runs: a wave decision, a pane's
+/// preparation, a launch result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectRoute<W> {
+    /// Run it in `W`, the window showing the project now.
+    Run(W),
+    /// Running it there failed: release what it held and run the project's
+    /// activation again in `W`, the window showing the project now, so the
+    /// panes it would have started get another try.
+    Reactivate(W),
+    /// No window shows the project: the restore stops, and a launch result is
+    /// dropped, which kills the child. The next activation starts the rest.
+    Cancel,
+}
+
+/// Route a step of a project's activation by the window showing the project
+/// now (`shown_in`), never by the window the activation started in or the one
+/// the app rendered last: the project may have moved to another window since.
+/// `failed` once running the step in that window failed.
+fn project_route<W>(shown_in: Option<W>, failed: bool) -> ProjectRoute<W> {
+    match shown_in {
+        None => ProjectRoute::Cancel,
+        Some(window) if failed => ProjectRoute::Reactivate(window),
+        Some(window) => ProjectRoute::Run(window),
+    }
+}
+
+/// The windows to try, in order, for work on a project that happens whether or
+/// not it is on screen (an interactive launch result, a remote connect): the
+/// window showing it, then the main window.
+fn project_work_windows<W: Copy + Eq>(
+    shown_in: Option<W>,
+    main: Option<W>,
+) -> impl Iterator<Item = W> {
+    shown_in
+        .into_iter()
+        .chain(main.filter(move |main| Some(*main) != shown_in))
 }
 
 fn restore_move_size_active() -> bool {
@@ -2896,7 +3093,7 @@ pub struct MuxelApp {
     /// PTY/process creation currently running on the launch worker. This closes
     /// the gap where the pane has no view yet and another ensure pass could
     /// start the same agent twice.
-    terminal_launching: HashMap<Uuid, u64>,
+    terminal_launching: HashMap<Uuid, LaunchTicket>,
     next_terminal_launch_token: u64,
     /// Instances whose launch failed *completely* (even the fallback shell
     /// couldn't spawn), with the error. The pane shows it in place; Restart
@@ -6119,7 +6316,13 @@ impl MuxelApp {
         }
         self.next_terminal_launch_token = self.next_terminal_launch_token.wrapping_add(1);
         let token = self.next_terminal_launch_token;
-        self.terminal_launching.insert(instance_id, token);
+        self.terminal_launching.insert(
+            instance_id,
+            LaunchTicket {
+                token,
+                since: Instant::now(),
+            },
+        );
         self.reset_terminal_runtime(instance_id);
         if let Some(host) = self.remote_host_for_instance(instance_id)
             && host.auth == SshAuth::Password
@@ -6143,7 +6346,7 @@ impl MuxelApp {
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
         let _phase =
             ui_profile::phase("activation", "prepare-reserved-terminal", Some(instance_id));
-        if self.terminal_launching.get(&instance_id) != Some(&token)
+        if !launch_token_current(&self.terminal_launching, instance_id, token)
             || self.workspace.instance(instance_id).is_none()
         {
             return None;
@@ -6161,6 +6364,11 @@ impl MuxelApp {
             was_resume,
             started: Instant::now(),
         };
+        // Both callers hand the command to its worker as soon as this returns,
+        // so the launch's admission deadline counts from here.
+        if let Some(launch) = self.terminal_launching.get_mut(&instance_id) {
+            launch.since = meta.started;
+        }
         let size = self
             .workspace
             .instance(instance_id)
@@ -6181,13 +6389,12 @@ impl MuxelApp {
         let _phase = ui_profile::phase("activation", "finish-terminal-spawn", Some(instance_id));
         let token = meta.token;
         // The pane may have closed/restarted or a newer launch may own this iid
-        // while ConPTY was being created. Dropping the stale result kills it.
-        if self.terminal_launching.get(&instance_id) != Some(&token)
+        // while ConPTY was being created. Dropping the stale result kills it. A
+        // launch past its admission deadline still owns its pane and installs.
+        if !launch_token_current(&self.terminal_launching, instance_id, token)
             || self.workspace.instance(instance_id).is_none()
         {
-            if self.terminal_launching.get(&instance_id) == Some(&token) {
-                self.terminal_launching.remove(&instance_id);
-            }
+            release_launch_token(&mut self.terminal_launching, instance_id, token);
             return;
         }
         self.terminal_launching.remove(&instance_id);
@@ -6206,7 +6413,7 @@ impl MuxelApp {
         let Some(token) = self.reserve_terminal_spawn(instance_id, window, cx) else {
             return;
         };
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             // Give GPUI a frame to paint the selected pane's loading state before
             // the worker begins process discovery and ConPTY construction.
             cx.background_executor()
@@ -6225,13 +6432,27 @@ impl MuxelApp {
                 .background_executor()
                 .spawn(async move { TerminalLaunch::spawn_for_instance(spec, size, instance_id) })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            // Install in the window showing the pane's project: the terminal view
+            // listens for focus in the window it is created in. A launch for a
+            // project no window shows still installs, in the main window.
+            let pid = this
+                .read_with(cx, |this, _| {
+                    this.workspace.instance(instance_id).map(|i| i.project_id)
+                })
+                .ok()
+                .flatten();
+            let finished = Self::in_project_or_main(&this, pid, cx, |this, window, cx| {
                 this.finish_terminal_spawn(meta, result, window, cx);
                 if this.active_instance == Some(instance_id) && this.focus_handle.is_focused(window)
                 {
                     this.focus_instance_with_attendance(instance_id, false, window, cx);
                 }
             });
+            if finished.is_none() {
+                // No window took the result: the dropped result kills the child.
+                // Release the launch so restore admission does not wait on it.
+                Self::release_unlanded_launch(&this, instance_id, token, cx);
+            }
         })
         .detach();
     }
@@ -6477,7 +6698,7 @@ impl MuxelApp {
             // callback can resolve newer-wins before spawning panes.
             let loc = if first_sync { self.repo_loc(pid) } else { None };
             let host_for_err = host.clone();
-            cx.spawn_in(window, async move |this, cx| {
+            cx.spawn(async move |this, cx| {
                 let (res, fetched, sessions, has_memory) = cx
                     .background_executor()
                     .spawn(async move {
@@ -6512,7 +6733,9 @@ impl MuxelApp {
                         (res, fetched, sessions, has_memory)
                     })
                     .await;
-                let _ = this.update_in(cx, |this, window, cx| match res {
+                // In the window showing the project, else the main window: the
+                // connect bookkeeping runs whether or not the project is on screen.
+                Self::in_project_or_main(&this, Some(pid), cx, |this, window, cx| match res {
                     Ok(()) => {
                         this.remote_connecting.remove(&pid);
                         this.remote_connect_failed.remove(&pid);
@@ -6540,7 +6763,7 @@ impl MuxelApp {
                             }
                         }
                         if defer_spawns {
-                            this.spawn_project_terminals_deferred(pid, window, cx);
+                            this.spawn_project_terminals_deferred(pid, cx);
                         } else {
                             this.spawn_project_terminals_now(pid, window, cx);
                         }
@@ -6601,7 +6824,7 @@ impl MuxelApp {
             self.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
         }
         if defer_spawns {
-            self.spawn_project_terminals_deferred(pid, window, cx);
+            self.spawn_project_terminals_deferred(pid, cx);
         } else {
             self.spawn_project_terminals_now(pid, window, cx);
         }
@@ -7086,37 +7309,89 @@ impl MuxelApp {
         }
     }
 
-    fn spawn_project_terminals_deferred(
-        &mut self,
-        pid: Uuid,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let mut instances = self
-            .workspace
-            .project(pid)
-            .map(|p| p.instances())
-            .unwrap_or_default();
+    fn spawn_project_terminals_deferred(&mut self, pid: Uuid, cx: &mut Context<Self>) {
         // Start the pane the user can see first. Admit terminal processes in
         // bounded waves: enough parallelism to avoid a long fleet tail without
-        // firing the entire workspace at Windows in one burst.
-        if let Some(active) = self.active_instance
-            && let Some(index) = instances.iter().position(|iid| *iid == active)
-        {
-            instances.swap(0, index);
-        }
-        // A new activation owns this project's pending panes. Invalidate an
-        // older wave now so this run can launch them immediately; old results
-        // fail their token check and are killed on drop.
-        for iid in &instances {
-            self.terminal_launching.remove(iid);
-        }
+        // firing the entire workspace at Windows in one burst. Windows provider
+        // startups are especially expensive, so each wave must also settle before
+        // the next one starts. Other panes take their own queue, so no terminal
+        // startup holds them.
+        //
+        // Both queues run without a window. Each step that needs one runs in the
+        // window showing the project at that moment (`restore_step`), so a
+        // project moved to or from a pop-out mid-restore carries on there.
+        let (instances, panes) = restore_queues(
+            self.workspace
+                .project(pid)
+                .map(|p| p.instances())
+                .unwrap_or_default(),
+            self.active_instance,
+            |iid| self.workspace.instance(iid).map(|i| i.kind) == Some(InstanceKind::Terminal),
+        );
+        // A launch an older activation already started keeps its token, and
+        // that activation still installs the result while the project is shown.
+        // This one waits for it to land instead of starting the pane a second
+        // time beside the running worker, and launches the pane itself only if
+        // that result is discarded.
         let generation = {
             let generation = self.deferred_activation_generation.entry(pid).or_default();
             *generation = generation.wrapping_add(1);
             *generation
         };
-        cx.spawn_in(window, async move |this, cx| {
+        if !panes.is_empty() {
+            // Same debounce, move/size pause and cancellation as the terminal
+            // waves, one pane per turn, but never a startup hold.
+            cx.spawn(async move |this, cx| {
+                for (index, iid) in panes.iter().copied().enumerate() {
+                    cx.background_executor()
+                        .timer(restore_wave_delay(index, cfg!(target_os = "windows")))
+                        .await;
+                    loop {
+                        let decision = this
+                            .read_with(cx, |this, _| {
+                                restore_wave_decision(
+                                    index,
+                                    panes.len(),
+                                    1,
+                                    this.deferred_activation_generation.get(&pid)
+                                        == Some(&generation),
+                                    this.window_showing(pid).is_some(),
+                                    restore_move_size_active(),
+                                    false,
+                                )
+                            })
+                            .unwrap_or(RestoreWaveDecision::Cancel);
+                        match decision {
+                            RestoreWaveDecision::Cancel => return,
+                            RestoreWaveDecision::Pause | RestoreWaveDecision::Settle => {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(RESTORE_MOVE_SIZE_POLL_MS))
+                                    .await;
+                            }
+                            RestoreWaveDecision::Launch { .. } => {
+                                // Editors and browsers belong to the window they
+                                // are created in: the one showing the project.
+                                let created =
+                                    Self::restore_step(&this, pid, cx, |this, window, cx| {
+                                        let _phase = ui_profile::phase(
+                                            "activation",
+                                            "create-pane",
+                                            Some(iid),
+                                        );
+                                        this.spawn_project_pane(iid, window, cx);
+                                    });
+                                if created.is_none() {
+                                    return;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
+        cx.spawn(async move |this, cx| {
             let mut owned_tokens = Vec::new();
             let mut wave_start = 0;
             while wave_start < instances.len() {
@@ -7128,14 +7403,31 @@ impl MuxelApp {
                     .await;
                 let wave_end = loop {
                     let decision = this
-                        .update_in(cx, |this, window, _| {
+                        .read_with(cx, |this, cx| {
                             let _phase = ui_profile::phase("activation", "wave-decision", None);
+                            // PTY creation finishing is not provider startup
+                            // finishing: a Claude/Codex/Grok process can keep
+                            // loading and repainting for seconds afterward. On
+                            // Windows, hold the next wave until every terminal in
+                            // the project has landed and published provider
+                            // readiness or gone quiet after its first visible
+                            // screen. Everywhere, a queued pane another launch
+                            // owns waits for that launch, up to its deadline.
+                            let startup_pending = this.restore_startup_holds(
+                                pid,
+                                &instances[wave_start..],
+                                cfg!(target_os = "windows"),
+                                cx,
+                            );
                             restore_wave_decision(
                                 wave_start,
                                 instances.len(),
+                                restore_launch_concurrency(cfg!(target_os = "windows")),
                                 this.deferred_activation_generation.get(&pid) == Some(&generation),
-                                this.project_is_shown_in_window(pid, window),
+                                // Shown in any window: each step runs in that one.
+                                this.window_showing(pid).is_some(),
                                 restore_move_size_active(),
+                                startup_pending,
                             )
                         })
                         .unwrap_or(RestoreWaveDecision::Cancel);
@@ -7144,6 +7436,11 @@ impl MuxelApp {
                         RestoreWaveDecision::Pause => {
                             cx.background_executor()
                                 .timer(Duration::from_millis(RESTORE_MOVE_SIZE_POLL_MS))
+                                .await;
+                        }
+                        RestoreWaveDecision::Settle => {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(RESTORE_STARTUP_POLL_MS))
                                 .await;
                         }
                         RestoreWaveDecision::Launch { wave_end } => break Some(wave_end),
@@ -7160,24 +7457,21 @@ impl MuxelApp {
                     .enumerate()
                     .map(|(offset, iid)| (wave_start + offset, iid))
                 {
-                    let prepared = this
-                        .update_in(cx, |this, window, cx| {
-                            let _phase = ui_profile::phase("activation", "prepare-pane", Some(iid));
-                            if this.deferred_activation_generation.get(&pid) != Some(&generation)
-                                || !this.project_is_shown_in_window(pid, window)
-                            {
-                                return Err(());
-                            }
-                            if this.workspace.instance(iid).map(|i| i.kind)
-                                == Some(InstanceKind::Terminal)
-                            {
-                                Ok(this.prepare_terminal_spawn(iid, window, cx))
-                            } else {
-                                this.spawn_project_pane(iid, window, cx);
-                                Ok(None)
-                            }
-                        })
-                        .unwrap_or(Err(()));
+                    let prepared = Self::restore_step(&this, pid, cx, |this, window, cx| {
+                        let _phase = ui_profile::phase("activation", "prepare-pane", Some(iid));
+                        if this.deferred_activation_generation.get(&pid) != Some(&generation) {
+                            return Err(());
+                        }
+                        if this.workspace.instance(iid).map(|i| i.kind)
+                            == Some(InstanceKind::Terminal)
+                        {
+                            Ok(this.prepare_terminal_spawn(iid, window, cx))
+                        } else {
+                            this.spawn_project_pane(iid, window, cx);
+                            Ok(None)
+                        }
+                    })
+                    .unwrap_or(Err(()));
                     let Ok(prepared) = prepared else {
                         cancelled = true;
                         break;
@@ -7190,44 +7484,42 @@ impl MuxelApp {
                         launches.push((index, iid, meta, task));
                     }
                 }
-                if cancelled {
-                    break;
-                }
-                // All four workers are already running. Awaiting their handles in
-                // pane order controls admission/focus order, not concurrency.
+                // The wave's workers are already running. Await every one, even
+                // after a cancel or a re-activation: dropping a handle does not
+                // stop ConPTY creation, it only frees the pane to be started a
+                // second time beside it. Awaiting in pane order controls
+                // admission/focus order, not concurrency.
                 for (index, iid, meta, task) in launches {
-                    let result = task.await;
-                    let keep_going = this
-                        .update_in(cx, |this, window, cx| {
-                            let _phase =
-                                ui_profile::phase("activation", "complete-pane", Some(iid));
-                            if this.deferred_activation_generation.get(&pid) != Some(&generation)
-                                || !this.project_is_shown_in_window(pid, window)
-                            {
-                                if this.terminal_launching.get(&iid) == Some(&meta.token) {
-                                    this.terminal_launching.remove(&iid);
-                                }
-                                return false;
-                            }
-                            this.finish_terminal_spawn(meta, result, window, cx);
-                            // `focus_instance` puts a not-yet-created pane on the
-                            // app root. Focus the first visible pane only if that
-                            // neutral focus is still present; a modal/input wins.
-                            if index == 0
-                                && this.active_instance == Some(iid)
-                                && this.focus_handle.is_focused(window)
-                            {
-                                // Restoring keyboard focus is not user attendance.
-                                // Keep an unseen completion and its age latched.
-                                this.focus_instance_with_attendance(iid, false, window, cx);
-                            }
-                            true
+                    let remaining = TERMINAL_LAUNCH_DEADLINE.saturating_sub(meta.started.elapsed());
+                    // Boxed so the handle can move to a task of its own if the
+                    // deadline passes first.
+                    let mut task = Box::pin(task);
+                    let Ok(result) = task
+                        .as_mut()
+                        .with_timeout(remaining, cx.background_executor())
+                        .await
+                    else {
+                        // Past its deadline the launch stops holding admission,
+                        // so the restore goes on without it. It keeps running: a
+                        // task of its own lands it when the worker returns.
+                        owned_tokens.retain(|&owned| owned != (iid, meta.token));
+                        let this = this.clone();
+                        cx.spawn(async move |cx| {
+                            let result = task.await;
+                            Self::land_restored_launch(&this, pid, index == 0, meta, result, cx);
                         })
-                        .unwrap_or(false);
-                    if !keep_going {
-                        cancelled = true;
-                        break;
-                    }
+                        .detach();
+                        continue;
+                    };
+                    let current =
+                        Self::land_restored_launch(&this, pid, index == 0, meta, result, cx)
+                            && this
+                                .read_with(cx, |this, _| {
+                                    this.deferred_activation_generation.get(&pid)
+                                        == Some(&generation)
+                                })
+                                .unwrap_or(false);
+                    cancelled |= !current;
                 }
                 if cancelled {
                     break;
@@ -7236,9 +7528,7 @@ impl MuxelApp {
             }
             let _ = this.update(cx, |this, _| {
                 for (iid, token) in owned_tokens {
-                    if this.terminal_launching.get(&iid) == Some(&token) {
-                        this.terminal_launching.remove(&iid);
-                    }
+                    release_launch_token(&mut this.terminal_launching, iid, token);
                 }
                 // Keep the counter entry: generation numbers must never be reused
                 // while an older worker can still return.
@@ -7247,17 +7537,234 @@ impl MuxelApp {
         .detach();
     }
 
-    fn project_is_shown_in_window(&self, pid: Uuid, window: &Window) -> bool {
-        match self.secondary_pid_for(window) {
-            Some(shown) => shown == pid,
-            None => {
-                self.workspace.active_project == Some(pid)
-                    && !self
-                        .secondary_windows
-                        .iter()
-                        .any(|secondary| secondary.pid == pid)
+    /// The window showing project `pid` now, if any.
+    fn window_showing(&self, pid: Uuid) -> Option<AnyWindowHandle> {
+        window_showing_project(
+            pid,
+            self.secondary_windows.iter().map(|s| (s.pid, s.handle)),
+            self.main_window,
+            self.workspace.active_project,
+        )
+    }
+
+    /// The window showing project `pid` now, read without a window.
+    fn shown_window(
+        this: &WeakEntity<Self>,
+        pid: Uuid,
+        cx: &mut impl AppContext,
+    ) -> Option<AnyWindowHandle> {
+        this.read_with(cx, |this, _| this.window_showing(pid))
+            .ok()
+            .flatten()
+    }
+
+    /// Run `f` with this app in the given window. Activation and restore go
+    /// through here, never through `update_in`, which runs in whichever window
+    /// rendered the app last. `None` when the window refused the update (it
+    /// closed) or the app is gone.
+    fn update_in_window<R>(
+        this: &WeakEntity<Self>,
+        window: AnyWindowHandle,
+        cx: &mut impl AppContext,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> R,
+    ) -> Option<R> {
+        window
+            .update(cx, |_, window, cx| {
+                this.update(cx, |this, cx| f(this, window, cx))
+            })
+            .ok()?
+            .ok()
+    }
+
+    /// Run one step of project `pid`'s activation in the window showing the
+    /// project now ([`project_route`]). `None` when the step did not run, which
+    /// stops the restore: no window shows the project, or the one that does
+    /// refused the update, in which case the activation runs again wherever the
+    /// project is shown.
+    fn restore_step<R>(
+        this: &WeakEntity<Self>,
+        pid: Uuid,
+        cx: &mut impl AppContext,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> R,
+    ) -> Option<R> {
+        let ProjectRoute::Run(window) = project_route(Self::shown_window(this, pid, cx), false)
+        else {
+            return None;
+        };
+        let ran = Self::update_in_window(this, window, cx, f);
+        if ran.is_none() {
+            Self::reactivate_project(this, pid, cx);
+        }
+        ran
+    }
+
+    /// Run project `pid`'s activation again in the window showing it now, if
+    /// any ([`project_route`]), so the panes a failed step or an uninstalled
+    /// launch left get another try.
+    fn reactivate_project(this: &WeakEntity<Self>, pid: Uuid, cx: &mut impl AppContext) {
+        if let ProjectRoute::Reactivate(window) =
+            project_route(Self::shown_window(this, pid, cx), true)
+        {
+            Self::update_in_window(this, window, cx, |this, window, cx| {
+                this.ensure_project_terminals_deferred(pid, window, cx)
+            });
+        }
+    }
+
+    /// Run `f` for project `pid` whether or not it is on screen: in the window
+    /// showing it, else in the main window ([`project_work_windows`]). `None`
+    /// when no window took the update.
+    fn in_project_or_main<R>(
+        this: &WeakEntity<Self>,
+        pid: Option<Uuid>,
+        cx: &mut impl AppContext,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> R,
+    ) -> Option<R> {
+        let (shown_in, main) = this
+            .read_with(cx, |this, _| {
+                (
+                    pid.and_then(|pid| this.window_showing(pid)),
+                    this.main_window,
+                )
+            })
+            .ok()?;
+        let mut f = Some(f);
+        for window in project_work_windows(shown_in, main) {
+            // A window that refuses the update never calls this, so `f` is
+            // still there for the next one.
+            let ran = Self::update_in_window(this, window, cx, |this, window, cx| {
+                f.take().map(|f| f(this, window, cx))
+            });
+            if let Some(Some(ran)) = ran {
+                return Some(ran);
             }
         }
+        None
+    }
+
+    /// Land a restored pane's launch result, on time or late, in the window
+    /// showing project `pid` now ([`project_route`]): not necessarily the window
+    /// its activation started in, since the project may have moved. Returns
+    /// whether the window accepted the update; the launch token still decides
+    /// whether to install or discard the result.
+    fn land_restored_launch(
+        this: &WeakEntity<Self>,
+        pid: Uuid,
+        first: bool,
+        meta: TerminalSpawnMeta,
+        result: anyhow::Result<TerminalLaunch>,
+        cx: &mut impl AppContext,
+    ) -> bool {
+        let (iid, token) = (meta.instance_id, meta.token);
+        if let ProjectRoute::Run(window) = project_route(Self::shown_window(this, pid, cx), false)
+            && Self::update_in_window(this, window, cx, |this, window, cx| {
+                this.install_restored_launch(first, meta, result, window, cx)
+            })
+            .is_some()
+        {
+            return true;
+        }
+        // No window shows the project, or the one that does refused the update:
+        // the dropped result kills the child.
+        Self::release_unlanded_launch(this, iid, token, cx);
+        false
+    }
+
+    /// Release a launch whose result was not installed. While a window shows
+    /// the pane's project, its activation runs again there, so the pane is
+    /// relaunched rather than stranded ([`project_route`]).
+    fn release_unlanded_launch(
+        this: &WeakEntity<Self>,
+        iid: Uuid,
+        token: u64,
+        cx: &mut impl AppContext,
+    ) {
+        let released = this
+            .update(cx, |this, _| {
+                if !release_launch_token(&mut this.terminal_launching, iid, token) {
+                    return None;
+                }
+                this.workspace.instance(iid).map(|i| i.project_id)
+            })
+            .ok()
+            .flatten();
+        if let Some(pid) = released {
+            Self::reactivate_project(this, pid, cx);
+        }
+    }
+
+    /// Install one restored pane's launch result through `window`, the window
+    /// showing its project.
+    fn install_restored_launch(
+        &mut self,
+        first: bool,
+        meta: TerminalSpawnMeta,
+        result: anyhow::Result<TerminalLaunch>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let iid = meta.instance_id;
+        let _phase = ui_profile::phase("activation", "complete-pane", Some(iid));
+        // A re-activation of the shown project adopts the result. The token
+        // check inside still drops one a restart or a closed pane superseded.
+        self.finish_terminal_spawn(meta, result, window, cx);
+        // `focus_instance` puts a not-yet-created pane on the app root. Focus
+        // the first visible pane only if that neutral focus is still present; a
+        // modal/input wins.
+        if first && self.active_instance == Some(iid) && self.focus_handle.is_focused(window) {
+            // Restoring keyboard focus is not user attendance. Keep an unseen
+            // completion and its age latched.
+            self.focus_instance_with_attendance(iid, false, window, cx);
+        }
+    }
+
+    /// Restore admission for project `pid`, given the rest of an activation's
+    /// terminal queue. One pass over the workspace collects the project's
+    /// terminal panes; [`restore_startup_holds_admission`] decides.
+    fn restore_startup_holds(
+        &self,
+        pid: Uuid,
+        queue: &[Uuid],
+        settle_startups: bool,
+        cx: &App,
+    ) -> bool {
+        let project: HashSet<Uuid> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|i| i.project_id == pid && i.kind == InstanceKind::Terminal)
+            .map(|i| i.id)
+            .collect();
+        restore_startup_holds_admission(
+            queue,
+            &project,
+            |iid| self.restore_startup_state(iid, cx),
+            &self.terminal_launching,
+            Instant::now(),
+            &self.failed_launches,
+            settle_startups,
+        )
+    }
+
+    /// Startup evidence of a pane's live terminal view, or `None` without one
+    /// (not launched yet, superseded, or a failed launch).
+    fn restore_startup_state(&self, iid: Uuid, cx: &App) -> Option<RestoreStartupState> {
+        let view = self.terminals.get(&iid)?.read(cx);
+        // Refresh the provider-owned title signal. The cached readiness bit is
+        // otherwise advanced only by ordinary status consumers, which can lag
+        // this 50 ms admission poll by a full root tick.
+        let _ = view.status();
+        Some(RestoreStartupState {
+            provider_ready: view.completion_ready() || view.exited(),
+            has_visible_content: view.has_visible_content(),
+            idle_for: view.session().idle_for(),
+            // Set when the view was installed. Without a record nothing bounds
+            // a wait on it, so it never holds.
+            running_for: self
+                .terminal_launches
+                .get(&iid)
+                .map_or(Duration::MAX, |&(at, _)| at.elapsed()),
+        })
     }
 
     fn spawn_project_pane(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -7272,7 +7779,11 @@ impl MuxelApp {
                 // A totally-failed launch (fallback shell included) shows an
                 // error pane; don't respawn/re-notify on every project
                 // switch — the toolbar Restart is the retry path.
-                if !self.terminals.contains_key(&iid) && !self.failed_launches.contains_key(&iid) {
+                if needs_immediate_spawn(
+                    self.terminals.contains_key(&iid),
+                    self.terminal_launching.contains_key(&iid),
+                ) && !self.failed_launches.contains_key(&iid)
+                {
                     self.spawn_terminal(iid, window, cx);
                 }
             }
@@ -14701,7 +15212,7 @@ impl MuxelApp {
         pid: Uuid,
         display_id: DisplayId,
         display_uuid: Uuid,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let _phase = ui_profile::phase("workspace", "open-project-window", None);
@@ -14734,7 +15245,7 @@ impl MuxelApp {
                 .find(|id| *id != pid);
             self.active_instance = self.workspace.active().and_then(|p| p.preferred_instance());
             if let Some(next) = self.workspace.active_project {
-                self.spawn_project_terminals_deferred(next, window, cx);
+                self.spawn_project_terminals_deferred(next, cx);
             }
         }
 
@@ -16956,8 +17467,12 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // A pane whose launch is still in flight is starting, not dead.
         if self.workspace.instance(iid).map(|i| i.kind) != Some(InstanceKind::Terminal)
-            || self.is_running(iid, cx)
+            || !needs_immediate_spawn(
+                self.is_running(iid, cx),
+                self.terminal_launching.contains_key(&iid),
+            )
         {
             return false;
         }
@@ -29389,20 +29904,53 @@ mod shell_title_tests {
 
 #[cfg(test)]
 mod restore_wave_policy_tests {
-    use super::{RestoreWaveDecision, restore_wave_decision, restore_wave_delay};
-    use std::time::Duration;
+    use super::{
+        LaunchTicket, ProjectRoute, RestoreStartupState, RestoreWaveDecision, launch_token_current,
+        needs_immediate_spawn, project_route, project_work_windows, release_launch_token,
+        restore_launch_concurrency, restore_queues, restore_startup_holds_admission,
+        restore_terminal_still_starting, restore_wave_decision, restore_wave_delay,
+        window_showing_project,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    fn launches(tokens: &[(Uuid, u64)], since: Instant) -> HashMap<Uuid, LaunchTicket> {
+        tokens
+            .iter()
+            .map(|&(iid, token)| (iid, LaunchTicket { token, since }))
+            .collect()
+    }
+
+    fn startup(
+        provider_ready: bool,
+        has_visible_content: bool,
+        idle_ms: u64,
+        running_ms: u64,
+    ) -> RestoreStartupState {
+        RestoreStartupState {
+            provider_ready,
+            has_visible_content,
+            idle_for: Duration::from_millis(idle_ms),
+            running_for: Duration::from_millis(running_ms),
+        }
+    }
 
     #[test]
     fn only_the_first_windows_wave_gets_the_resize_debounce() {
         assert_eq!(restore_wave_delay(0, true), Duration::from_millis(250));
-        assert_eq!(restore_wave_delay(4, true), Duration::from_millis(1));
+        assert_eq!(restore_wave_delay(2, true), Duration::from_millis(1));
         assert_eq!(restore_wave_delay(0, false), Duration::from_millis(1));
     }
 
     #[test]
     fn an_active_move_size_loop_pauses_before_admission() {
         assert_eq!(
-            restore_wave_decision(0, 8, true, true, true),
+            restore_wave_decision(0, 8, 2, true, true, true, false),
+            RestoreWaveDecision::Pause
+        );
+        assert_eq!(
+            restore_wave_decision(2, 8, 2, true, true, true, true),
             RestoreWaveDecision::Pause
         );
     }
@@ -29410,25 +29958,401 @@ mod restore_wave_policy_tests {
     #[test]
     fn stale_or_hidden_activations_cancel_even_while_paused() {
         assert_eq!(
-            restore_wave_decision(0, 8, false, true, true),
+            restore_wave_decision(0, 8, 2, false, true, true, true),
             RestoreWaveDecision::Cancel
         );
         assert_eq!(
-            restore_wave_decision(0, 8, true, false, true),
+            restore_wave_decision(0, 8, 2, true, false, true, true),
             RestoreWaveDecision::Cancel
         );
     }
 
     #[test]
-    fn launch_admission_stays_four_wide_and_caps_the_final_wave() {
+    fn windows_launches_two_wide_while_other_platforms_stay_four_wide() {
+        assert_eq!(restore_launch_concurrency(true), 2);
+        assert_eq!(restore_launch_concurrency(false), 4);
         assert_eq!(
-            restore_wave_decision(0, 6, true, true, false),
+            restore_wave_decision(0, 6, 2, true, true, false, false),
+            RestoreWaveDecision::Launch { wave_end: 2 }
+        );
+        assert_eq!(
+            restore_wave_decision(0, 6, 4, true, true, false, false),
             RestoreWaveDecision::Launch { wave_end: 4 }
         );
         assert_eq!(
-            restore_wave_decision(4, 6, true, true, false),
+            restore_wave_decision(4, 6, 4, true, true, false, false),
             RestoreWaveDecision::Launch { wave_end: 6 }
         );
+    }
+
+    #[test]
+    fn a_starting_terminal_holds_the_next_wave_only_while_a_launch_remains() {
+        let (a, b, gone) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let project = HashSet::from([a, b]);
+        let live = HashMap::from([(a, startup(false, true, 0, 1_000))]);
+        let no_failures = HashMap::new();
+        let no_launches = HashMap::new();
+        // B still needs a launch while A is loading.
+        assert!(restore_startup_holds_admission(
+            &[b],
+            &project,
+            |iid| live.get(&iid).copied(),
+            &no_launches,
+            Instant::now(),
+            &no_failures,
+            true
+        ));
+        assert_eq!(
+            restore_wave_decision(2, 8, 2, true, true, false, true),
+            RestoreWaveDecision::Settle
+        );
+        // Other platforms do not wait for startups.
+        assert!(!restore_startup_holds_admission(
+            &[b],
+            &project,
+            |iid| live.get(&iid).copied(),
+            &no_launches,
+            Instant::now(),
+            &no_failures,
+            false
+        ));
+        // Nothing left to launch: B failed, or the queued pane left the project.
+        let failed = HashMap::from([(b, "not found".to_string())]);
+        assert!(!restore_startup_holds_admission(
+            &[b],
+            &project,
+            |iid| live.get(&iid).copied(),
+            &no_launches,
+            Instant::now(),
+            &failed,
+            true
+        ));
+        assert!(!restore_startup_holds_admission(
+            &[gone],
+            &project,
+            |iid| live.get(&iid).copied(),
+            &no_launches,
+            Instant::now(),
+            &no_failures,
+            true
+        ));
+    }
+
+    #[test]
+    fn a_terminal_starts_until_ready_or_quiet_with_a_five_second_escape() {
+        // Provider readiness (or exit) ends startup at once.
+        assert!(!restore_terminal_still_starting(startup(
+            true, true, 0, 100
+        )));
+        // A visible screen ends it after a second of quiet, not before.
+        assert!(!restore_terminal_still_starting(startup(
+            false, true, 1_000, 1_500
+        )));
+        assert!(restore_terminal_still_starting(startup(
+            false, true, 999, 1_500
+        )));
+        // A silent command counts until five seconds after its view appeared.
+        assert!(restore_terminal_still_starting(startup(
+            false, false, 4_999, 4_999
+        )));
+        assert!(!restore_terminal_still_starting(startup(
+            false, false, 5_000, 5_000
+        )));
+    }
+
+    #[test]
+    fn a_missing_view_cannot_strand_remaining_waves() {
+        // A removed, superseded or failed pane has no view and so no state.
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(!restore_startup_holds_admission(
+            &[b],
+            &HashSet::from([a, b]),
+            |_| None,
+            &HashMap::new(),
+            Instant::now(),
+            &HashMap::new(),
+            true
+        ));
+    }
+
+    #[test]
+    fn editors_and_browsers_never_queue_behind_terminal_admission() {
+        let (t1, t2, editor, t4) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let layout = vec![t1, t2, editor, t4];
+        let is_terminal = |iid| iid != editor;
+        // Terminal, terminal, editor, terminal: the editor is not in the queue
+        // whose second wave waits for the first pair to settle.
+        let (terminals, panes) = restore_queues(layout.clone(), Some(t1), is_terminal);
+        assert_eq!(terminals, vec![t1, t2, t4]);
+        assert_eq!(panes, vec![editor]);
+        // A selected pane leads its own queue.
+        let (terminals, panes) = restore_queues(layout.clone(), Some(t4), is_terminal);
+        assert_eq!(terminals, vec![t4, t2, t1]);
+        assert_eq!(panes, vec![editor]);
+        let (terminals, panes) = restore_queues(layout, Some(editor), is_terminal);
+        assert_eq!(terminals, vec![t2, t1, t4]);
+        assert_eq!(panes, vec![editor]);
+    }
+
+    #[test]
+    fn a_reactivation_waits_for_inherited_startups_wherever_the_selected_pane_moved() {
+        let (a, b, c, d) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let layout = vec![a, b, c, d];
+        let project: HashSet<Uuid> = layout.iter().copied().collect();
+        let no_failures = HashMap::new();
+        let no_launches = HashMap::new();
+        // The first activation selected A and launched the pair A, B.
+        let (first, _) = restore_queues(layout.clone(), Some(a), |_| true);
+        assert_eq!(first[..2], [a, b]);
+        // The user selects C and re-activates while A still loads. C swaps to
+        // the front, so the new first pair is C, B and A falls outside it.
+        let (second, _) = restore_queues(layout, Some(c), |_| true);
+        assert_eq!(second, vec![c, b, a, d]);
+        let loading = startup(false, true, 0, 1_500);
+        let settled = startup(true, true, 0, 1_500);
+        let mut live = HashMap::from([(a, loading), (b, settled)]);
+        // A holds C although it is outside the pair.
+        assert!(restore_startup_holds_admission(
+            &second,
+            &project,
+            |iid| live.get(&iid).copied(),
+            &no_launches,
+            Instant::now(),
+            &no_failures,
+            true
+        ));
+        live.insert(a, settled);
+        assert!(!restore_startup_holds_admission(
+            &second,
+            &project,
+            |iid| live.get(&iid).copied(),
+            &no_launches,
+            Instant::now(),
+            &no_failures,
+            true
+        ));
+        // C launched and is loading. It has left the rest of the queue, A and D,
+        // and still holds D.
+        live.insert(c, loading);
+        assert!(restore_startup_holds_admission(
+            &second[2..],
+            &project,
+            |iid| live.get(&iid).copied(),
+            &no_launches,
+            Instant::now(),
+            &no_failures,
+            true
+        ));
+    }
+
+    #[test]
+    fn a_reactivation_waits_for_launches_still_running_instead_of_starting_them_again() {
+        let (a, b, c, d) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let layout = vec![a, b, c, d];
+        let project: HashSet<Uuid> = layout.iter().copied().collect();
+        let no_failures = HashMap::new();
+        let (second, _) = restore_queues(layout, Some(c), |_| true);
+        assert_eq!(second, vec![c, b, a, d]);
+        // The superseded activation's workers are still creating A's and B's
+        // PTYs: their launch tokens remain and neither has a view yet.
+        let now = Instant::now();
+        let mut launching = launches(&[(a, 1), (b, 2)], now);
+        let mut live = HashMap::new();
+        for settle_startups in [true, false] {
+            // C does not start beside them, and B and A, still queued, are not
+            // started a second time: the wave holds until their launches land.
+            assert!(restore_startup_holds_admission(
+                &second,
+                &project,
+                |iid| live.get(&iid).copied(),
+                &launching,
+                now,
+                &no_failures,
+                settle_startups
+            ));
+            assert!(restore_startup_holds_admission(
+                &second[1..],
+                &project,
+                |iid| live.get(&iid).copied(),
+                &launching,
+                now,
+                &no_failures,
+                settle_startups
+            ));
+        }
+        // B lands and settles; A's result is discarded, so A needs a launch
+        // again and the queue still has it.
+        launching.clear();
+        live.insert(b, startup(true, true, 0, 100));
+        assert!(!restore_startup_holds_admission(
+            &second[1..],
+            &project,
+            |iid| live.get(&iid).copied(),
+            &launching,
+            now,
+            &no_failures,
+            true
+        ));
+    }
+
+    #[test]
+    fn a_launch_past_the_deadline_stops_holding_admission_but_keeps_its_pane() {
+        let (a, c) = (Uuid::new_v4(), Uuid::new_v4());
+        let project = HashSet::from([a, c]);
+        let no_failures = HashMap::new();
+        let dispatched = Instant::now();
+        let mut launching = launches(&[(a, 7)], dispatched);
+        let before = dispatched + Duration::from_millis(19_999);
+        let deadline = dispatched + Duration::from_secs(20);
+        let holds = |queue: &[Uuid], launching: &HashMap<Uuid, LaunchTicket>, now, settle| {
+            restore_startup_holds_admission(
+                queue,
+                &project,
+                |_| None,
+                launching,
+                now,
+                &no_failures,
+                settle,
+            )
+        };
+        // A's worker has not returned. Until the deadline, A queued holds the
+        // wave on every platform, and on Windows A still launching holds C.
+        assert!(holds(&[c, a], &launching, before, false));
+        assert!(holds(&[c, a], &launching, before, true));
+        assert!(holds(&[c], &launching, before, true));
+        // From the deadline on, A holds nothing back and C goes ahead.
+        assert!(!holds(&[c, a], &launching, deadline, false));
+        assert!(!holds(&[c, a], &launching, deadline, true));
+        assert!(!holds(&[c], &launching, deadline, true));
+        // A still owns its pane: its late result passes the token check and is
+        // installed.
+        assert!(launch_token_current(&launching, a, 7));
+        // A restart supersedes it. A result from the superseded launch is still
+        // dropped, and the new launch holds from its own dispatch.
+        launching.insert(
+            a,
+            LaunchTicket {
+                token: 8,
+                since: deadline,
+            },
+        );
+        assert!(!launch_token_current(&launching, a, 7));
+        assert!(!release_launch_token(&mut launching, a, 7));
+        assert!(launch_token_current(&launching, a, 8));
+        assert!(holds(&[c, a], &launching, deadline, false));
+    }
+
+    #[test]
+    fn a_late_launch_lands_in_the_window_showing_its_project_now() {
+        let (p, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let (main, popout) = ("main", "pop-out");
+        // P's restore ran in the main window, which still shows P.
+        let shown_in = window_showing_project(p, [], Some(main), Some(p));
+        assert_eq!(project_route(shown_in, false), ProjectRoute::Run(main));
+        // P moved to a pop-out while its launch ran, and the main window went on
+        // to another project. The result lands in the pop-out, not in the
+        // window the restore ran in.
+        let shown_in = window_showing_project(p, [(p, popout)], Some(main), Some(other));
+        assert_eq!(project_route(shown_in, false), ProjectRoute::Run(popout));
+        // Installing through it failed: release, and the pop-out's activation
+        // runs again to relaunch the pane.
+        assert_eq!(
+            project_route(shown_in, true),
+            ProjectRoute::Reactivate(popout)
+        );
+        // The pop-out closed and P came home: the main window relaunches it.
+        let shown_in = window_showing_project(p, [], Some(main), Some(p));
+        assert_eq!(
+            project_route(shown_in, true),
+            ProjectRoute::Reactivate(main)
+        );
+        // No window shows P: release and drop, whatever happened.
+        let shown_in = window_showing_project(p, [(other, popout)], Some(main), Some(other));
+        assert_eq!(shown_in, None);
+        assert_eq!(project_route(shown_in, false), ProjectRoute::Cancel);
+        assert_eq!(project_route(shown_in, true), ProjectRoute::Cancel);
+    }
+
+    #[test]
+    fn a_pop_out_restore_goes_on_in_its_own_window_whichever_window_rendered_last() {
+        let (p, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let (main, popout) = ("main", "pop-out");
+        // P is popped out. The main window shows another project and was the
+        // last to render, which is the window `update_in` would have picked.
+        let shown_in = window_showing_project(p, [(p, popout)], Some(main), Some(other));
+        // Each step of P's restore decides from the window showing P. The wave
+        // decision sees P on screen and admits the next pair, and the panes
+        // queue admits its next pane, instead of cancelling.
+        assert_eq!(
+            restore_wave_decision(2, 6, 2, true, shown_in.is_some(), false, false),
+            RestoreWaveDecision::Launch { wave_end: 4 }
+        );
+        assert_eq!(
+            restore_wave_decision(1, 3, 1, true, shown_in.is_some(), false, false),
+            RestoreWaveDecision::Launch { wave_end: 2 }
+        );
+        // Preparing the pair and creating editors or browsers run in the pop-out.
+        assert_eq!(project_route(shown_in, false), ProjectRoute::Run(popout));
+        // If the pop-out refuses the update, P's activation runs again there:
+        // a step never cancels while P is shown somewhere.
+        assert_eq!(
+            project_route(shown_in, true),
+            ProjectRoute::Reactivate(popout)
+        );
+        // Only a project no window shows cancels its restore, as before.
+        let hidden = window_showing_project(p, [], Some(main), Some(other));
+        assert_eq!(
+            restore_wave_decision(2, 6, 2, true, hidden.is_some(), false, false),
+            RestoreWaveDecision::Cancel
+        );
+        assert_eq!(project_route(hidden, false), ProjectRoute::Cancel);
+    }
+
+    #[test]
+    fn work_for_a_project_off_screen_still_finds_a_window() {
+        let (main, popout) = ("main", "pop-out");
+        // The window showing the project first, then the main window.
+        assert_eq!(
+            project_work_windows(Some(popout), Some(main)).collect::<Vec<_>>(),
+            vec![popout, main]
+        );
+        // Shown in the main window: tried once.
+        assert_eq!(
+            project_work_windows(Some(main), Some(main)).collect::<Vec<_>>(),
+            vec![main]
+        );
+        // Shown nowhere: the main window.
+        assert_eq!(
+            project_work_windows(None, Some(main)).collect::<Vec<_>>(),
+            vec![main]
+        );
+    }
+
+    #[test]
+    fn a_sweep_for_missing_terminals_leaves_a_launch_in_flight_alone() {
+        // A peer layout adopted during a startup hold, or a wake, walks the
+        // project's panes. A pane whose launch is still running has no view yet,
+        // but it is not missing: starting it again would kill that child.
+        assert!(!needs_immediate_spawn(false, true));
+        // A pane with neither a view nor a launch is started.
+        assert!(needs_immediate_spawn(false, false));
+        // A pane with a live view is left as it is.
+        assert!(!needs_immediate_spawn(true, false));
     }
 }
 
