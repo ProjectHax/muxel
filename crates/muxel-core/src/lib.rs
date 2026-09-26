@@ -30,8 +30,8 @@ pub use agent::{
     append_agent_instruction, claude_session_path, codex_developer_instructions_override,
     codex_latest_session_id, codex_session_exists, codex_session_id_from_title,
     codex_session_matches_cwd, codex_session_names, codex_terminal_title_override,
-    file_link_instruction, memory_header, memory_instruction, memory_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args,
+    file_link_instruction, find_claude_session_path, memory_header, memory_instruction,
+    memory_reference, resolve_launch, resolve_launch_for_session, session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
