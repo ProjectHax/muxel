@@ -63,6 +63,18 @@ Or grab a package from the [Releases](https://github.com/projecthax/muxel/releas
 - **Windows** (x64 + arm64): a signed **installer** (`.exe`, per-user, no admin,
   with in-app auto-updates) or a portable `.zip`
 
+**Nix / NixOS:**
+
+```sh
+nix run github:ProjectHax/muxel          # try it
+nix profile install github:ProjectHax/muxel
+```
+
+The flake exposes `packages.default` (and an `overlays.default` that adds `muxel`
+to a pkgs set, for use in a NixOS or home-manager configuration). Linux only —
+x86_64 and aarch64 — since GPUI's macOS backend needs a bundling step the flake
+doesn't do.
+
 ## Build from source
 
 Requires a recent stable Rust toolchain (pinned in `rust-toolchain.toml`).
@@ -89,6 +101,9 @@ sudo apt-get install -y \
 ```
 
 (See `.github/workflows/ci.yml` for the exact set used in CI.)
+
+On NixOS, `nix develop` gives you a shell with all of the above plus the runtime
+libraries GPUI `dlopen`s, which is what makes `cargo run -p muxel` work there.
 
 ## Releases & CI
 

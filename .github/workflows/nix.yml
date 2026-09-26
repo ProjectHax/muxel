@@ -1,0 +1,54 @@
+name: nix
+
+# The flake is the one build nobody can check locally unless they already run Nix,
+# so CI owns it. Kept out of `ci.yml` and gated on paths: a Nix build of muxel
+# compiles GPUI from source with no shared cache, which is far too slow to put in
+# front of every pull request.
+on:
+  push:
+    branches: [master]
+    paths:
+      - flake.nix
+      - flake.lock
+      - nix/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/nix.yml
+  pull_request:
+    paths:
+      - flake.nix
+      - flake.lock
+      - nix/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/nix.yml
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    # GPUI from source under Nix, single runner, cold cache.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      # Evaluation first, and on its own: a typo or a renamed nixpkgs attribute
+      # fails here in seconds instead of an hour into compiling GPUI.
+      - name: Evaluate the flake
+        run: nix flake check --no-build --all-systems --print-build-logs
+      - name: Build the package
+        run: nix build .#muxel --print-build-logs
+      # Proves the wrapper and its library paths actually work. `muxel --version`
+      # is not a thing — bare `muxel` opens a window — so use the same headless
+      # entry point `ci.yml` checks: `ctl help` prints usage and exits 0.
+      - name: The built binary runs without a display
+        shell: bash
+        run: |
+          set -eux
+          unset DISPLAY WAYLAND_DISPLAY
+          ./result/bin/muxel ctl help | grep -q '^usage: muxel ctl'
+      - name: The dev shell resolves
+        run: nix develop --command cargo --version
