@@ -977,7 +977,29 @@ fn scan_importable(
     let Some(sessions) = sessions else {
         return Err(t("Couldn't list tmux sessions there.").to_string());
     };
-    out.extend(import::tmux_candidates(&sessions, owned, root, presets));
+    let mut tmux_rows = import::tmux_candidates(&sessions, owned, root, presets);
+    for row in &mut tmux_rows {
+        // A pane's title is the agent's own statement of what it is doing
+        // (`✳ Review changes`). `clean_agent_title` drops the lifecycle
+        // decoration and returns None for a title that is only state, so a pane
+        // that has not started anything says nothing rather than "Claude Code".
+        if let import::ImportSource::TmuxSession { session } = &row.source
+            && let Some(found) = sessions.iter().find(|s| &s.name == session)
+            && !found.title.is_empty()
+        {
+            row.summary = row
+                .program
+                .as_deref()
+                .and_then(|program| clean_agent_title(program, &found.title))
+                .and_then(|title| {
+                    // `clean_agent_title` strips the lifecycle glyph but happily
+                    // returns "Claude Code" — the agent naming itself, which most
+                    // idle panes publish and which says nothing about the work.
+                    import::informative_title(&title, row.program.as_deref(), &row.preset_name)
+                });
+        }
+    }
+    out.extend(tmux_rows);
 
     // 2. Agents running outside tmux. Their own PTY can't be taken over, so this
     //    offers to resume the conversation instead — and says so in the row.
@@ -1035,6 +1057,28 @@ fn scan_importable(
             root,
             claude,
         ));
+    }
+
+    // Whatever a row resumes, its summary comes from that conversation's own
+    // transcript — readable only for a local project, as above.
+    if let Some(home) = home.filter(|_| is_local) {
+        for row in &mut out {
+            if row.summary.is_some() {
+                continue;
+            }
+            let session_id = match &row.source {
+                import::ImportSource::Conversation { session_id, .. } => Some(session_id.clone()),
+                import::ImportSource::Running { session_id, .. } => session_id.clone(),
+                import::ImportSource::TmuxSession { .. } => None,
+            };
+            if let Some(id) = session_id
+                && row.program.as_deref().map(basename_of) == Some("claude")
+            {
+                let path =
+                    muxel_core::claude_session_path(home, std::path::Path::new(&row.cwd), &id);
+                row.summary = integrations::claude_conversation_summary(&path);
+            }
+        }
     }
 
     import::sort_candidates(&mut out);
@@ -20119,6 +20163,17 @@ impl MuxelApp {
                                             },
                                         )),
                                 )
+                                // Take over an agent the user started outside muxel.
+                                .item(
+                                    PopupMenuItem::new(t("Import…"))
+                                        .icon(IconName::Plus)
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, window, cx| {
+                                                this.open_import(pid, window, cx)
+                                            },
+                                        )),
+                                )
                                 .separator()
                                 // Reorder the project in the sidebar (the explicit
                                 // alternative to dragging the row). Disabled at the ends.
@@ -20282,17 +20337,6 @@ impl MuxelApp {
                                         )),
                                 );
                             }
-                            // Take over an agent the user started outside muxel.
-                            menu = menu.item(
-                                PopupMenuItem::new(t("Import…"))
-                                    .icon(IconName::Plus)
-                                    .on_click(window.listener_for(
-                                        &entity,
-                                        move |this, _, window, cx| {
-                                            this.open_import(pid, window, cx)
-                                        },
-                                    )),
-                            );
                             // Git actions (only when the project is a repo).
                             if is_repo {
                                 menu = menu.separator();
@@ -24297,7 +24341,7 @@ impl MuxelApp {
                     .into_any_element()
             }
             Some(found) => {
-                let mut list = v_flex().gap_1();
+                let mut list = v_flex().w_full().gap_1();
                 for (ix, c) in found.iter().enumerate() {
                     let (what, note, tint) = match &c.source {
                         ImportSource::TmuxSession { session } => (
@@ -24341,12 +24385,20 @@ impl MuxelApp {
                             .border_1()
                             .border_color(border)
                             .child(
+                                // `min_w_0` is what lets this column shrink below
+                                // its text. Without it a long working directory
+                                // sets the row's width and shoves the Import
+                                // button off the side of the window.
                                 v_flex()
                                     .flex_1()
+                                    .min_w_0()
                                     .gap_1()
                                     .child(
                                         h_flex()
+                                            .w_full()
+                                            .min_w_0()
                                             .gap_2()
+                                            .flex_wrap()
                                             .items_center()
                                             .child(
                                                 div()
@@ -24359,23 +24411,54 @@ impl MuxelApp {
                                                 Tag::new().small().child(t("outside this project"))
                                             })),
                                     )
-                                    .child(div().text_xs().text_color(muted).child(c.cwd.clone()))
-                                    .child(div().text_xs().text_color(muted).child(note)),
+                                    .children(c.summary.clone().map(|summary| {
+                                        // What the agent was working on — the row's
+                                        // most useful line when several sessions
+                                        // share a directory.
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .text_xs()
+                                            .child(summary)
+                                    }))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(c.cwd.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(note),
+                                    ),
                             )
                             .child(
-                                Button::new(SharedString::from(format!("import-{ix}")))
-                                    .primary()
-                                    .small()
-                                    .disabled(!can)
-                                    .label(t("Import"))
-                                    .on_click(cx.listener(move |this, _e, window, cx| {
-                                        this.import_candidate(ix, window, cx)
-                                    })),
+                                div().flex_none().child(
+                                    Button::new(SharedString::from(format!("import-{ix}")))
+                                        .primary()
+                                        .small()
+                                        .disabled(!can)
+                                        .label(t("Import"))
+                                        .on_click(cx.listener(move |this, _e, window, cx| {
+                                            this.import_candidate(ix, window, cx)
+                                        })),
+                                ),
                             ),
                     );
                 }
                 div()
                     .id("import-list")
+                    .w_full()
                     .max_h(px(420.0))
                     .overflow_y_scroll()
                     .child(list)
@@ -24391,9 +24474,15 @@ impl MuxelApp {
                     cx.notify();
                 }),
             )
+            .p_4()
             .child(
+                // A fixed width overflows a window narrower than it, taking the
+                // Import buttons off-screen with it. Fill the space instead, up to
+                // a comfortable maximum; the backdrop's padding keeps the card off
+                // the window edges.
                 v_flex()
-                    .w(px(640.0))
+                    .w_full()
+                    .max_w(px(640.0))
                     .gap_3()
                     .p_5()
                     .bg(theme.background)

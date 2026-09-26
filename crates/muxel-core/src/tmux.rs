@@ -34,18 +34,27 @@ pub struct RemoteSession {
     /// What is running in it now (`claude`, `zsh`, …) — enough to re-adopt the
     /// session as the right kind of pane.
     pub command: String,
+    /// The pane's terminal title. Agents publish what they are working on here
+    /// (`✳ Review changes`), which is the only way to say what a session is *for*
+    /// without reading its screen — and reading the screen means `capture-pane`,
+    /// which muxel does not do. Empty when tmux reported no title.
+    pub title: String,
 }
 
-/// `tmux …` args listing one line per pane: session, start dir, running command.
+/// `tmux …` args listing one line per pane: session, start dir, running command
+/// and title.
 ///
 /// `list-panes -a` rather than `list-sessions`, because only a pane knows the
 /// command running in it; [`parse_sessions`] keeps the first pane of each session.
+///
+/// The title is last on the line on purpose: it is the one field whose contents
+/// are the agent's to choose, so it is the one that can contain the separator.
 pub fn list_sessions_args() -> Vec<String> {
     vec![
         "list-panes".to_string(),
         "-a".to_string(),
         "-F".to_string(),
-        "#{session_name}|#{session_path}|#{pane_current_command}".to_string(),
+        "#{session_name}|#{session_path}|#{pane_current_command}|#{pane_title}".to_string(),
     ]
 }
 
@@ -55,7 +64,7 @@ pub fn list_sessions_args() -> Vec<String> {
 pub fn parse_sessions(out: &str) -> Vec<RemoteSession> {
     let mut sessions: Vec<RemoteSession> = Vec::new();
     for line in out.lines() {
-        let mut fields = line.splitn(3, '|');
+        let mut fields = line.splitn(4, '|');
         let (Some(name), Some(path), Some(command)) = (fields.next(), fields.next(), fields.next())
         else {
             continue;
@@ -67,6 +76,10 @@ pub fn parse_sessions(out: &str) -> Vec<RemoteSession> {
             name: name.to_string(),
             path: path.to_string(),
             command: command.to_string(),
+            // Absent from a line written before the title joined the format, and
+            // from any host whose tmux reports no title. Not worth dropping a
+            // session over: every other field is still good.
+            title: fields.next().unwrap_or_default().to_string(),
         });
     }
     sessions
@@ -599,12 +612,34 @@ mod tests {
     }
 
     #[test]
+    fn a_panes_title_is_parsed_and_may_contain_the_separator() {
+        let out = "\
+s1|/work|claude|✳ Review changes
+s2|/work|claude|a|title|with|pipes
+s3|/work|zsh
+";
+        let got = parse_sessions(out);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].title, "✳ Review changes");
+        assert_eq!(
+            got[1].title, "a|title|with|pipes",
+            "the title is last precisely so it may contain the separator"
+        );
+        assert_eq!(
+            got[2].title, "",
+            "a line without a title is still a session"
+        );
+        assert_eq!(got[2].command, "zsh");
+    }
+
+    #[test]
     fn session_by_suffix_finds_a_peer_session_whatever_its_slug() {
         let id = Uuid::parse_str("1a2b3c4d-0000-4000-8000-000000000000").unwrap();
         let session = |name: &str| RemoteSession {
             name: name.into(),
             path: "/work".into(),
             command: "claude".into(),
+            title: String::new(),
         };
         // A remote desktop names the session after its host, not the project.
         let sessions = vec![

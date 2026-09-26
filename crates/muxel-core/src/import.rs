@@ -81,6 +81,10 @@ pub struct ImportCandidate {
     pub cwd: String,
     /// Whether `cwd` is the project root or beneath it.
     pub in_tree: bool,
+    /// What the agent was working on, when that can be told: a live pane's title,
+    /// or a conversation's own summary. `None` when there is nothing honest to
+    /// show — the caller fills this in, since reading it is I/O.
+    pub summary: Option<String>,
 }
 
 /// Whether `path` is `root` or sits beneath it (a worktree, say). Mirrors the
@@ -141,6 +145,7 @@ pub fn tmux_candidates(
                 preset_name: preset.map_or_else(|| s.command.clone(), |p| p.name.clone()),
                 cwd: s.path.clone(),
                 in_tree: in_tree(&s.path, root),
+                summary: None,
             }
         })
         .collect()
@@ -270,6 +275,7 @@ pub fn process_candidates(
                 preset_name: preset.name.clone(),
                 cwd: r.cwd.clone(),
                 in_tree: in_tree(&r.cwd, root),
+                summary: None,
             })
         })
         .collect()
@@ -317,8 +323,160 @@ pub fn conversation_candidates(
             preset_name: preset.name.clone(),
             cwd: cwd.to_string(),
             in_tree: in_tree(cwd, root),
+            summary: None,
         })
         .collect()
+}
+
+/// How much of a conversation to read looking for a summary. Claude writes its
+/// title early and repeats it, and the opening prompt is near the top, so the head
+/// of the file is enough — these transcripts run to megabytes.
+pub const SUMMARY_SCAN_BYTES: u64 = 256 * 1024;
+
+/// What a Claude conversation was about, read from the head of its transcript.
+///
+/// Claude records its own one-line title as an `ai-title`, which is exactly the
+/// summary wanted here. Older conversations have none, so the opening user message
+/// stands in — unwrapped from the `<command-name>`/`<command-args>` envelope a
+/// slash command arrives in, because "release-muxel /release-muxel" says nothing
+/// while the arguments to it usually say everything.
+pub fn conversation_summary(head: &str) -> Option<String> {
+    let mut first_prompt: Option<String> = None;
+    for line in head.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            // A truncated last line is expected: the read stops mid-file.
+            continue;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("ai-title") => {
+                if let Some(title) = value
+                    .get("aiTitle")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                {
+                    // The agent's own summary always wins; stop at the first.
+                    return Some(tidy(title));
+                }
+            }
+            Some("user") if first_prompt.is_none() => {
+                if let Some(text) = user_text(&value) {
+                    first_prompt = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    first_prompt
+}
+
+/// The plain text of a `user` record, whether its content is a bare string or a
+/// list of blocks.
+fn user_text(value: &serde_json::Value) -> Option<String> {
+    let content = value.get("message")?.get("content")?;
+    let raw = match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
+    let unwrapped = command_args(&raw).unwrap_or(&raw);
+    let cleaned = strip_tags(unwrapped);
+    (!cleaned.trim().is_empty()).then(|| tidy(&cleaned))
+}
+
+/// The text inside `<command-args>…</command-args>`, when the prompt is a slash
+/// command that carried arguments.
+fn command_args(raw: &str) -> Option<&str> {
+    let start = raw.find("<command-args>")? + "<command-args>".len();
+    let end = raw[start..].find("</command-args>")? + start;
+    let args = raw[start..end].trim();
+    (!args.is_empty()).then_some(args)
+}
+
+/// Drop any `<tag>` wrappers, keeping what is between them.
+fn strip_tags(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut depth = 0usize;
+    for ch in raw.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Collapse whitespace and cut to one readable line.
+fn tidy(text: &str) -> String {
+    const MAX: usize = 120;
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(MAX) {
+        None => flat,
+        Some((cut, _)) => format!("{}…", flat[..cut].trim_end()),
+    }
+}
+
+/// Whether a pane title actually says what the agent is *working on*, rather than
+/// just naming the agent or echoing a shell prompt.
+///
+/// Claude publishes `✳ Claude Code` until it has a task, and a shell's title is the
+/// prompt it draws (`you@host:~/work`). Showing either as a summary is worse than
+/// showing nothing: it fills the row with something the user already knows, and
+/// hides the fact that this session has nothing to say for itself.
+pub fn informative_title(title: &str, program: Option<&str>, preset_name: &str) -> Option<String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // The agent naming itself is not a summary.
+    if program
+        .map(basename)
+        .is_some_and(|p| p.eq_ignore_ascii_case(trimmed))
+        || preset_name.eq_ignore_ascii_case(trimmed)
+        || GENERIC_TITLES
+            .iter()
+            .any(|generic| generic.eq_ignore_ascii_case(trimmed))
+    {
+        return None;
+    }
+    if looks_like_shell_prompt(trimmed) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Titles an agent shows before it has been given anything to do.
+const GENERIC_TITLES: &[&str] = &[
+    "Claude Code",
+    "Claude",
+    "Codex",
+    "opencode",
+    "Amp",
+    "Grok",
+    "Shell",
+    "bash",
+    "zsh",
+    "fish",
+];
+
+/// Whether a title is a shell's own prompt rather than a description of work:
+/// `user@host:/path`, which is what a shell sets its terminal title to.
+fn looks_like_shell_prompt(title: &str) -> bool {
+    let Some((user_host, path)) = title.split_once(':') else {
+        return false;
+    };
+    // `user@host` before the colon and a path after it, with no spaces in either —
+    // a real summary containing a colon ("Fix: the pager") has spaces around it.
+    user_host.contains('@')
+        && !user_host.contains(char::is_whitespace)
+        && !path.contains(char::is_whitespace)
+        && (path.starts_with('/') || path.starts_with('~'))
 }
 
 /// Order the window's rows: the project's own first, then the ones muxel can truly
@@ -358,8 +516,8 @@ fn key(source: &ImportSource) -> String {
 mod tests {
     use super::{
         ImportCandidate, ImportSource, ProcessRow, claude_project_dir, conversation_candidates,
-        has_ancestor, in_tree, parse_processes, preset_for_command, process_candidates,
-        process_probe_command, sort_candidates,
+        conversation_summary, has_ancestor, in_tree, informative_title, parse_processes,
+        preset_for_command, process_candidates, process_probe_command, sort_candidates,
     };
     use crate::agent::AgentPreset;
     use crate::tmux::RemoteSession;
@@ -378,6 +536,7 @@ mod tests {
             name: name.to_string(),
             path: path.to_string(),
             command: command.to_string(),
+            title: String::new(),
         }
     }
 
@@ -573,6 +732,130 @@ nonsense
     }
 
     #[test]
+    fn a_conversations_own_title_is_the_summary() {
+        let head = concat!(
+            r#"{"type":"mode","mode":"x"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"do a thing"}}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Grok bot muxel sessions flap error 137"}"#,
+            "\n",
+        );
+        assert_eq!(
+            conversation_summary(head).as_deref(),
+            Some("Grok bot muxel sessions flap error 137"),
+            "the agent's own title beats the opening prompt"
+        );
+    }
+
+    #[test]
+    fn without_a_title_the_opening_prompt_stands_in() {
+        let head = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"  build   a framework  "}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"and then another thing"}}"#,
+            "\n",
+        );
+        assert_eq!(
+            conversation_summary(head).as_deref(),
+            Some("build a framework"),
+            "the first prompt, with its whitespace collapsed"
+        );
+    }
+
+    #[test]
+    fn a_slash_command_is_unwrapped_to_its_arguments() {
+        // "/plan" is not a summary of anything; what was asked for is in the args.
+        let head = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"#,
+            r#""<command-name>/plan</command-name><command-args>add a nix flake</command-args>"}}"#,
+            "\n",
+        );
+        assert_eq!(
+            conversation_summary(head).as_deref(),
+            Some("add a nix flake")
+        );
+    }
+
+    #[test]
+    fn block_content_and_a_truncated_tail_are_both_survivable() {
+        let head = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"fix the pager"}]}}"#,
+            "\n",
+            r#"{"type":"ai-ti"#,
+        );
+        assert_eq!(
+            conversation_summary(head).as_deref(),
+            Some("fix the pager"),
+            "a half-written last line is expected — the read stops mid-file"
+        );
+    }
+
+    #[test]
+    fn a_long_prompt_is_cut_to_one_readable_line() {
+        let long = "word ".repeat(80);
+        let head = format!(r#"{{"type":"user","message":{{"role":"user","content":"{long}"}}}}"#);
+        let got = conversation_summary(&head).expect("a summary");
+        assert!(got.ends_with('…'), "cut, not run on: {got:?}");
+        assert!(got.chars().count() <= 121, "{} chars", got.chars().count());
+    }
+
+    #[test]
+    fn nothing_to_say_is_none() {
+        assert_eq!(conversation_summary(""), None);
+        assert_eq!(conversation_summary("not json at all\n"), None);
+        assert_eq!(
+            conversation_summary(r#"{"type":"user","message":{"role":"user","content":"   "}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn an_agent_naming_itself_is_not_a_summary() {
+        // 6 of 8 live panes on a busy machine say exactly this.
+        assert_eq!(
+            informative_title("Claude Code", Some("claude"), "Claude"),
+            None
+        );
+        assert_eq!(informative_title("claude", Some("claude"), "Claude"), None);
+        assert_eq!(informative_title("Claude", Some("claude"), "Claude"), None);
+        assert_eq!(informative_title("  ", Some("claude"), "Claude"), None);
+    }
+
+    #[test]
+    fn a_real_task_title_is_kept() {
+        assert_eq!(
+            informative_title("Quest changes review", Some("claude"), "Claude").as_deref(),
+            Some("Quest changes review")
+        );
+        assert_eq!(
+            informative_title("websocket-game-client-relay", Some("claude"), "Claude").as_deref(),
+            Some("websocket-game-client-relay")
+        );
+    }
+
+    #[test]
+    fn a_shells_prompt_is_not_a_summary_but_a_colon_in_real_work_is() {
+        assert_eq!(
+            informative_title(
+                "ryan@zen-rhel:~/Projects/Bot/cloud-app",
+                Some("zsh"),
+                "Shell"
+            ),
+            None
+        );
+        assert_eq!(
+            informative_title("deploy@prod:/srv/app", Some("bash"), "Shell"),
+            None
+        );
+        // A summary that merely contains a colon must survive.
+        assert_eq!(
+            informative_title("Fix: the pager scrolls twice", Some("claude"), "Claude").as_deref(),
+            Some("Fix: the pager scrolls twice")
+        );
+    }
+
+    #[test]
     fn rows_are_ordered_by_project_then_attachability_then_recency() {
         let claude = AgentPreset::claude();
         let mk = |source: ImportSource, in_tree: bool, cwd: &str| ImportCandidate {
@@ -582,6 +865,7 @@ nonsense
             preset_name: claude.name.clone(),
             cwd: cwd.to_string(),
             in_tree,
+            summary: None,
         };
         let mut rows = vec![
             mk(

@@ -719,7 +719,13 @@ feature is added or changed, update the matching entry here in the same change**
   case: muxel starts the agent and resumes where it left off. Rows are ordered with
   the project's own first, then the ones muxel can genuinely attach to, then the
   most recently used; sessions elsewhere on the machine are still listed, tagged
-  "outside this project", so you can pull one in deliberately. Anything a pane
+  "outside this project", so you can pull one in deliberately. Each row says what
+  that agent was working on, which is what tells two sessions in the same directory
+  apart: a live pane's own title (`Quest changes review`), or, for a conversation,
+  the summary the agent wrote for it — falling back to the prompt it opened with,
+  unwrapped from the slash command that carried it. A pane that hasn't been given
+  anything to do yet says nothing, rather than filling the row with the agent's own
+  name. Anything a pane
   already holds — a session or a conversation — is left out, so importing can never
   put two panes on one agent. Works for remote projects over their existing SSH
   connection; Windows hosts have no tmux and no conversations to find.

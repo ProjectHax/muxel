@@ -1368,6 +1368,23 @@ pub fn claude_conversations(home: &Path, cwd: &Path) -> Vec<(String, i64)> {
     out
 }
 
+/// What a Claude conversation was about, read from the head of its transcript.
+///
+/// Only the head: these files reach megabytes, the title is written early and
+/// repeated, and the opening prompt is near the top — so there is nothing to gain
+/// from reading the rest, and a lot of time to lose doing it for every row.
+pub fn claude_conversation_summary(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::new();
+    file.take(muxel_core::import::SUMMARY_SCAN_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    // Lossy on purpose: the cut lands mid-file and can split a multi-byte
+    // character, which is not a reason to give up on the whole summary.
+    muxel_core::import::conversation_summary(&String::from_utf8_lossy(&head))
+}
+
 /// Run `tmux <args>` where a project's sessions live: on this machine, or on its
 /// SSH host (reusing the host's ControlMaster). `None` for a Windows host, which
 /// has no tmux.
