@@ -4,6 +4,7 @@
 # This list mirrors the `apt-get install` in `.github/workflows/ci.yml`, which is
 # the authoritative set — if you add a system library there, add it here too.
 {
+  rustPlatform,
   pkg-config,
   cmake,
   fontconfig,
@@ -13,7 +14,11 @@
   wayland-scanner,
   libxkbcommon,
   libGL,
-  xorg,
+  libx11,
+  libxcb,
+  libxcursor,
+  libxrandr,
+  libxi,
   alsa-lib,
   vulkan-loader,
   dbus,
@@ -30,6 +35,12 @@
     cmake
     # `wayland-sys`/`wayland-scanner` generate protocol bindings at build time.
     wayland-scanner
+    # `whisper-rs-sys` generates its FFI bindings with bindgen, which needs
+    # libclang at *build* time and finds it through `LIBCLANG_PATH`. This hook sets
+    # that and the clang include paths; without it the build dies with "Unable to
+    # find libclang". This is what the `clang` in CI's apt list is really for —
+    # nothing here is compiled with clang, it is bindgen that needs the library.
+    rustPlatform.bindgenHook
   ];
 
   buildInputs = [
@@ -39,13 +50,13 @@
     wayland-protocols
     libxkbcommon
     libGL
-    xorg.libX11
-    xorg.libxcb
+    libx11
+    libxcb
     # Not in CI's apt list — CI never opens a window — but an X11 session needs
     # them the moment muxel actually draws one.
-    xorg.libXcursor
-    xorg.libXrandr
-    xorg.libXi
+    libxcursor
+    libxrandr
+    libxi
     alsa-lib
     vulkan-loader
     dbus
@@ -65,10 +76,10 @@
     wayland
     libGL
     libxkbcommon
-    xorg.libX11
-    xorg.libxcb
-    xorg.libXcursor
-    xorg.libXrandr
-    xorg.libXi
+    libx11
+    libxcb
+    libxcursor
+    libxrandr
+    libxi
   ];
 }

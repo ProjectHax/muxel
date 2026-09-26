@@ -29,6 +29,13 @@
         muxel = {
           type = "app";
           program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.muxel}/bin/muxel";
+          # `nix flake check` warns about an app with no `meta`.
+          meta = {
+            inherit (self.packages.${pkgs.stdenv.hostPlatform.system}.muxel.meta)
+              description
+              license
+              ;
+          };
         };
         default = muxel;
       });
@@ -51,6 +58,6 @@
         muxel = final.callPackage ./nix/package.nix { };
       };
 
-      formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
+      formatter = forAllSystems (pkgs: pkgs.nixfmt);
     };
 }
