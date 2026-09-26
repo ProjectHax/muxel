@@ -1694,10 +1694,11 @@ fn is_claude_program(program: Option<&str>) -> bool {
     )
 }
 
-/// Whether a Claude agent's saved session transcript is missing from disk (so a
-/// `--resume` would just hang on "No conversation found"). Only Claude's session
-/// path is known, so other agents — or an undeterminable home/cwd — return `false`
-/// and keep their resume, leaving any failure to the runtime recovery.
+/// Whether a Claude agent's saved session transcript is confirmed missing from
+/// disk (so a `--resume` would just hang on "No conversation found"). Claude's
+/// `/cd` and worktree flows can move a conversation away from the pane's launch
+/// cwd, so search all Claude project directories by durable UUID. An I/O failure
+/// is not evidence of deletion and preserves the saved resume id.
 fn claude_session_gone(
     preset: &muxel_core::AgentPreset,
     cwd: Option<&std::path::Path>,
@@ -1706,10 +1707,16 @@ fn claude_session_gone(
     if !is_claude_program(preset.program.as_deref()) {
         return false;
     }
-    let (Some(home), Some(cwd)) = (home_dir(), cwd) else {
+    let Some(home) = home_dir() else {
         return false;
     };
-    !muxel_core::claude_session_path(&home, cwd, session_id).exists()
+    match muxel_core::find_claude_session_path(&home, cwd, session_id) {
+        Ok(path) => path.is_none(),
+        Err(error) => {
+            log::warn!("could not scan Claude sessions before resume: {error}");
+            false
+        }
+    }
 }
 
 /// Whether an agent-minted session id is no longer on disk (Codex today).
@@ -5144,12 +5151,9 @@ impl MuxelApp {
         // Claude can replace its conversation inside the same PTY. A process-local
         // SessionStart hook leaves an exact binding file; consume it before choosing
         // this launch's `--resume` id so even an immediate app restart is correct.
-        if local
-            && is_claude_program(preset.program.as_deref())
-            && let Some(cwd) = cwd.as_deref()
-        {
+        if local && is_claude_program(preset.program.as_deref()) {
             let _phase = ui_profile::phase("activation", "claude-binding", Some(iid));
-            self.adopt_claude_session_binding(iid, cwd);
+            self.adopt_claude_session_binding(iid);
         }
         let inst = self.workspace.instance_mut(iid)?;
         let host_minted = preset.session_id_flag.is_some();
@@ -8316,9 +8320,11 @@ impl MuxelApp {
     }
 
     /// Adopt the exact Claude conversation selected by an in-process `/resume`.
-    /// The hook record is keyed by pane id and accepted only when its UUID,
-    /// transcript path, and cwd all agree with Claude's own on-disk transcript.
-    fn adopt_claude_session_binding(&mut self, iid: Uuid, cwd: &std::path::Path) -> bool {
+    /// The hook record is keyed by pane id and accepted only when its UUID and
+    /// transcript path identify a direct child of Claude's own store. Resume
+    /// records require a real transcript; clear/fork records may precede their
+    /// first write. The cwd may differ after `/cd` or an all-project `/resume`.
+    fn adopt_claude_session_binding(&mut self, iid: Uuid) -> bool {
         let (Some(data_dir), Some(home)) = (muxel_store::data_dir(), home_dir()) else {
             return false;
         };
@@ -8327,7 +8333,7 @@ impl MuxelApp {
             return false;
         }
         let Some(session_id) =
-            crate::session_binding::claude_session_id_from_binding(&data_dir, iid, &home, cwd)
+            crate::session_binding::claude_session_id_from_binding(&data_dir, iid, &home)
         else {
             crate::session_binding::clear_claude_binding(&data_dir, iid);
             return false;
@@ -8374,7 +8380,7 @@ impl MuxelApp {
     /// while Muxel is still open; `session_resume_for` repeats this read before a
     /// later launch to close the quit-before-next-tick race.
     fn sync_claude_session_ids(&mut self, cx: &mut Context<Self>) {
-        let candidates: Vec<(Uuid, PathBuf)> = self
+        let candidates: Vec<Uuid> = self
             .workspace
             .instances
             .iter()
@@ -8383,16 +8389,12 @@ impl MuxelApp {
                 if project.remote.is_some() || !is_claude_program(instance.program.as_deref()) {
                     return None;
                 }
-                let cwd = instance
-                    .worktree_path
-                    .clone()
-                    .unwrap_or_else(|| project.root_path.clone());
-                Some((instance.id, cwd))
+                Some(instance.id)
             })
             .collect();
         let mut changed = false;
-        for (iid, cwd) in candidates {
-            changed |= self.adopt_claude_session_binding(iid, &cwd);
+        for iid in candidates {
+            changed |= self.adopt_claude_session_binding(iid);
         }
         if changed {
             cx.notify();
@@ -15600,7 +15602,11 @@ impl MuxelApp {
                 .unwrap_or(project.root_path.as_path());
             home_dir()
                 .zip(inst.session_id.as_deref())
-                .map(|(home, id)| muxel_core::claude_session_path(&home, cwd, id))
+                .and_then(|(home, id)| {
+                    muxel_core::find_claude_session_path(&home, Some(cwd), id)
+                        .ok()
+                        .flatten()
+                })
         } else {
             None
         };
