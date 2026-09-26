@@ -20,6 +20,7 @@ mod shell;
 pub mod ssh;
 pub mod stt;
 pub mod tmux;
+pub mod tmux_install;
 pub mod tts;
 pub mod url;
 pub mod winshell;
@@ -2024,6 +2025,10 @@ pub struct Settings {
     /// screen.
     #[serde(default)]
     pub accepted_terms_version: u32,
+    /// muxel has offered to install a missing tmux (macOS/Linux) — the offer is
+    /// made once, on the first launch without it; Settings can reopen it.
+    #[serde(default)]
+    pub tmux_install_offered: bool,
     /// Version of the built-in preset set already merged in (so new built-ins
     /// like Hermes/Ollama reach existing users once, without resurrecting ones
     /// they deleted).
@@ -2433,6 +2438,7 @@ impl Default for Settings {
             confirm_close_editor: false,
             confirm_close_diff: false,
             accepted_terms_version: 0,
+            tmux_install_offered: false,
             preset_seed_version: PRESET_SEED_VERSION,
             default_preset: String::new(),
             presets: AgentPreset::defaults(),

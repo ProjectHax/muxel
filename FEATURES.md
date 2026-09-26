@@ -895,6 +895,17 @@ feature is added or changed, update the matching entry here in the same change**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't
   found. tmux is unix-only, so this never applies on Windows.
+- **Installs tmux for you** — on the first launch without tmux (macOS/Linux) muxel
+  offers to install it, showing the exact commands first. On Linux it picks the
+  distro's package manager from `/etc/os-release` (apt, dnf/yum, zypper, pacman,
+  apk, xbps, emerge, eopkg) and elevates only the install: none when already root
+  or with passwordless sudo, else the desktop's own polkit password prompt, else a
+  sudo password muxel asks for once and doesn't keep. On macOS it runs
+  `brew install tmux` as you (Homebrew refuses root). NixOS, rpm-ostree systems,
+  and a Mac without Homebrew get instructions and a *Check again* button instead.
+  The output streams into the dialog, which can be hidden while it runs; a failure
+  offers the command to paste into a terminal. Offered once — *Install tmux…*
+  under Settings' tmux toggle opens it again.
 - **Agents survive a stray `pkill`** — muxel starts the tmux server itself, from a
   command line naming no project, so an agent running `pkill -f <project>` (to clear
   its own dev server) can't match the *shared* server and kill every session with it.

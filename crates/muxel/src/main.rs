@@ -24,6 +24,7 @@ mod settings_view;
 mod split;
 mod stt;
 mod theme;
+mod tmux_install;
 mod tts;
 mod ui_profile;
 mod update;

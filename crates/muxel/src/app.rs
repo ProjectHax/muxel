@@ -47,6 +47,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod control_api;
+mod tmux_install_modal;
 
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
 /// TUIs (Claude/opencode/…) don't get squished narrow enough to overflow.
@@ -2616,6 +2617,9 @@ pub struct MuxelApp {
     /// Whether `tmux` is installed on a unix host (gates the local-tmux default;
     /// refreshed each tick). Always false on Windows — muxel's tmux path is unix.
     tmux_available: bool,
+    /// The offer to install a missing tmux, and its install — made on the first
+    /// launch without it, or from Settings (`app/tmux_install_modal.rs`).
+    tmux_install: Option<tmux_install_modal::TmuxInstall>,
     /// Tick counter throttling remote branch-label polling (every 5th tick).
     remote_poll_count: u32,
     /// A background Grok PID→session-id refresh is already in flight.
@@ -4822,6 +4826,12 @@ impl MuxelApp {
         }
         let show_terms = settings.accepted_terms_version < muxel_core::CURRENT_TERMS_VERSION;
         let install_kind = crate::update::InstallKind::detect();
+        let tmux_available = cfg!(unix) && program_on_path("tmux");
+        // Offered once: shown when the first-run screens are done, since they
+        // replace the main view it's rendered in.
+        let tmux_install = (!tmux_available && !settings.tmux_install_offered)
+            .then(|| Self::new_tmux_install(window, cx))
+            .flatten();
 
         // Ensure a workspaces index exists (migrating a legacy workspace once).
         let workspaces = muxel_store::migrate_to_workspaces();
@@ -4842,7 +4852,8 @@ impl MuxelApp {
             worktree_changes: HashMap::new(),
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
-            tmux_available: cfg!(unix) && program_on_path("tmux"),
+            tmux_available,
+            tmux_install,
             remote_connect_failed: HashMap::new(),
             remote_poll_count: 0,
             #[cfg(windows)]
@@ -10650,6 +10661,7 @@ impl MuxelApp {
             || self.show_keys
             || self.show_terms
             || self.show_workspace_selector
+            || self.tmux_install_shown()
             || self.show_new_remote
             || self.import.is_some()
             || self.show_run_dialog
@@ -26050,6 +26062,19 @@ impl MuxelApp {
                     },
                 ),
             )
+            .children(
+                (!self.tmux_available && cfg!(any(target_os = "linux", target_os = "macos")))
+                    .then(|| {
+                        div().pl(px(24.0)).child(
+                            Button::new("b-tmux-install")
+                                .small()
+                                .label(t("Install tmux…"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.open_tmux_install(window, cx)
+                                })),
+                        )
+                    }),
+            )
             .child(
                 self.check_row(
                     Checkbox::new("b-worktree")
@@ -27979,6 +28004,10 @@ impl Render for MuxelApp {
             )
             .children(self.show_find_panel.then(|| self.render_find_panel(cx)))
             .children(self.show_update_modal.then(|| self.render_update_modal(cx)))
+            .children(
+                self.tmux_install_shown()
+                    .then(|| self.render_tmux_install(window, cx)),
+            )
             .children(self.show_quit_confirm.then(|| self.render_quit_modal(cx)))
             .children(self.git_modal.is_some().then(|| self.render_git_modal(cx)))
             .children(
