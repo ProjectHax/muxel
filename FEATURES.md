@@ -130,10 +130,17 @@ feature is added or changed, update the matching entry here in the same change**
   pane to what's actually on screen instead of the conversation it launched. Local
   Claude panes learn the switch from a process-local `SessionStart` hook keyed to the
   pane; Codex panes learn it from a later OSC title. Both are accepted only after the
-  new UUID's own on-disk session proves it belongs to this pane's directory and that no
-  sibling pane already owns it — terminal titles carry no sender identity, so an
-  unverified one cannot rebind a pane. Remote Claude panes keep their starter binding.
-  If the saved session is gone, the pane quietly starts fresh.
+  new UUID's own on-disk session proves it real and no sibling pane already owns it —
+  terminal titles carry no sender identity, so an unverified one cannot rebind a pane.
+  A Claude conversation is matched by UUID across Claude's whole store rather than only
+  the pane's own directory, so one moved by `/cd`, a worktree change, or a `/resume`
+  that reached into another project is still found and still resumes; it has to sit
+  directly inside that store, which is what stops a stray path from rebinding a pane,
+  and `/clear` or a fork may announce its new UUID before Claude has written the first
+  record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
+  starter binding. A saved conversation is abandoned only once muxel has confirmed it
+  is really gone — a session store it couldn't read leaves the pane's resume id alone —
+  and the pane then quietly starts fresh.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to
