@@ -1298,6 +1298,76 @@ pub fn tmux_session_exists(session: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+// --- import discovery ----------------------------------------------------------
+
+/// Every process of this user where a project lives, for the Import window.
+///
+/// `ps` has no cwd column, so this runs `import::process_probe_command` — a shell
+/// snippet, because it has to work the same over `ssh` as it does locally. `None`
+/// means the listing couldn't be run at all (an unreachable host, a Windows one);
+/// an empty list means it ran and found nothing.
+pub fn list_processes(loc: &RepoLoc) -> Option<Vec<muxel_core::import::ProcessRow>> {
+    let probe = muxel_core::import::process_probe_command();
+    let out = match loc {
+        RepoLoc::Local(_) => command("sh")
+            .arg("-c")
+            .arg(&probe)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?,
+        RepoLoc::Remote(c) => {
+            if c.host.os.is_windows() {
+                // No `/proc`, no `ps` of this shape. Nothing to find, and `None`
+                // would read as "couldn't reach the host".
+                return Some(Vec::new());
+            }
+            remote_ssh_command(c, probe)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .ok()?
+        }
+    };
+    // A non-zero exit still carries usable lines: the loop's last `readlink` can
+    // fail on a process that exited mid-probe without invalidating the rest.
+    Some(muxel_core::import::parse_processes(
+        &String::from_utf8_lossy(&out.stdout),
+    ))
+}
+
+/// Claude conversations recorded for `cwd`, as `(session_id, modified)` — its
+/// project directory's `*.jsonl` transcripts, newest first.
+///
+/// Local projects only: the transcripts live on whichever machine ran the agent,
+/// and a remote project's are on the host, where muxel would have to read them over
+/// ssh. Missing directory or unreadable entries yield an empty list, not an error —
+/// "no past conversations here" is the ordinary case.
+pub fn claude_conversations(home: &Path, cwd: &Path) -> Vec<(String, i64)> {
+    let dir = muxel_core::import::claude_project_dir(home, cwd);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, i64)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension()? != "jsonl" {
+                return None;
+            }
+            let id = path.file_stem()?.to_str()?.to_string();
+            let modified = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs() as i64);
+            Some((id, modified))
+        })
+        .collect();
+    // Newest conversation first.
+    out.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    out
+}
+
 /// Run `tmux <args>` where a project's sessions live: on this machine, or on its
 /// SSH host (reusing the host's ControlMaster). `None` for a Windows host, which
 /// has no tmux.

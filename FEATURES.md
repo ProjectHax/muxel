@@ -700,6 +700,23 @@ feature is added or changed, update the matching entry here in the same change**
   optionally verify it). Shells and agents then run on the remote, in a pane that
   behaves exactly like a local one. Local muxel still owns the UI, layout, and
   settings.
+- **Import an agent you started outside muxel** — a project's right-click menu has
+  **Import…**, which scans for agents running, or last run, outside muxel and lists
+  what this project can take over. A **tmux session** is the best case: muxel
+  attaches a pane to it, the agent keeps running exactly as it is, and the pane
+  survives a restart — this works for any program, including opencode and Amp,
+  which can't resume a conversation. An agent **running outside tmux** can't have
+  its terminal taken over at all, so muxel offers to resume its conversation in a
+  new pane instead and says plainly in the row that the one you started keeps
+  running on it too. A **past conversation** with nothing running on it is the clean
+  case: muxel starts the agent and resumes where it left off. Rows are ordered with
+  the project's own first, then the ones muxel can genuinely attach to, then the
+  most recently used; sessions elsewhere on the machine are still listed, tagged
+  "outside this project", so you can pull one in deliberately. Anything a pane
+  already holds — a session or a conversation — is left out, so importing can never
+  put two panes on one agent. Works for remote projects over their existing SSH
+  connection; Windows hosts have no tmux and no conversations to find.
+
 - **Running agents are picked back up** — opening a remote project looks for muxel
   tmux sessions still alive on the host in that project's tree, and re-attaches a
   pane to any the workspace no longer has an instance for. An agent whose workspace

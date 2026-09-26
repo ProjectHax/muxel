@@ -10,6 +10,7 @@ pub mod control;
 pub mod diff;
 pub mod geometry;
 mod gui_path;
+pub mod import;
 pub mod locale;
 pub mod memory;
 mod pane;

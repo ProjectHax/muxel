@@ -943,6 +943,123 @@ fn git_notify_detail(out: &str) -> String {
 /// Full-window backdrop for centered modal dialogs: dims the workspace and
 /// occludes it, so clicks/scroll/hover can't fall through to the terminals and
 /// sidebar painted behind the modal.
+/// Everything importable for a project: live tmux sessions, agents running outside
+/// tmux, and conversations on disk with nothing running. Blocking — call it off the
+/// UI thread.
+///
+/// `Err` is reserved for "the scan couldn't run at all" (an unreachable host), which
+/// the window says out loud; finding nothing is `Ok(empty)`.
+#[allow(clippy::too_many_arguments)]
+fn scan_importable(
+    loc: Option<&integrations::RepoLoc>,
+    root: &str,
+    presets: &[AgentPreset],
+    owned: &[String],
+    live: &[String],
+    own_pid: u32,
+    home: Option<&std::path::Path>,
+    local_root: Option<&std::path::Path>,
+) -> Result<Vec<muxel_core::import::ImportCandidate>, String> {
+    use muxel_core::import;
+    let Some(loc) = loc else {
+        return Err(t("This project has no host to look on.").to_string());
+    };
+    let is_local = matches!(loc, integrations::RepoLoc::Local(_));
+    let mut out: Vec<import::ImportCandidate> = Vec::new();
+
+    // 1. Live tmux sessions — the only import that actually attaches, and the only
+    //    one that works for an agent with no resume support.
+    let sessions = if is_local {
+        integrations::list_local_tmux_sessions()
+    } else {
+        integrations::list_remote_tmux_sessions(loc)
+    };
+    let Some(sessions) = sessions else {
+        return Err(t("Couldn't list tmux sessions there.").to_string());
+    };
+    out.extend(import::tmux_candidates(&sessions, owned, root, presets));
+
+    // 2. Agents running outside tmux. Their own PTY can't be taken over, so this
+    //    offers to resume the conversation instead — and says so in the row.
+    let rows = integrations::list_processes(loc).unwrap_or_default();
+    let tmux_pids: Vec<u32> = rows
+        .iter()
+        .filter(|r| r.comm.contains("tmux"))
+        .map(|r| r.pid)
+        .collect();
+    let mut muxel_pids: Vec<u32> = rows
+        .iter()
+        .filter(|r| r.comm.contains("muxel"))
+        .map(|r| r.pid)
+        .collect();
+    muxel_pids.push(own_pid);
+    let newest_conversation = |cwd: &std::path::Path, program: Option<&str>| -> Option<String> {
+        // Only readable for a local project; a host's conversations are its own.
+        let home = home.filter(|_| is_local)?;
+        match program.map(basename_of) {
+            Some("claude") => integrations::claude_conversations(home, cwd)
+                .first()
+                .map(|(id, _)| id.clone()),
+            Some("codex") => muxel_core::codex_latest_session_id(home, cwd),
+            _ => None,
+        }
+    };
+    out.extend(import::process_candidates(
+        &rows,
+        &tmux_pids,
+        &muxel_pids,
+        root,
+        presets,
+        |row, preset| {
+            newest_conversation(std::path::Path::new(&row.cwd), preset.program.as_deref())
+        },
+    ));
+
+    // 3. Conversations on disk with nothing running. A conversation a row above is
+    //    already on must not appear twice, so those ids join the live set.
+    let mut taken: Vec<String> = live.to_vec();
+    taken.extend(out.iter().filter_map(|c| match &c.source {
+        import::ImportSource::Running { session_id, .. } => session_id.clone(),
+        _ => None,
+    }));
+    if let (Some(home), Some(cwd)) = (home.filter(|_| is_local), local_root)
+        && let Some(claude) = presets
+            .iter()
+            .find(|p| p.program.as_deref().map(basename_of) == Some("claude"))
+    {
+        let convs = integrations::claude_conversations(home, cwd);
+        out.extend(import::conversation_candidates(
+            &convs,
+            &taken,
+            &cwd.to_string_lossy(),
+            root,
+            claude,
+        ));
+    }
+
+    import::sort_candidates(&mut out);
+    Ok(out)
+}
+
+/// The last path component, so `/usr/local/bin/claude` reads as `claude`.
+fn basename_of(command: &str) -> &str {
+    command.rsplit('/').next().unwrap_or(command)
+}
+
+/// A rough "how long ago", for an imported conversation's last use.
+fn ago_label(secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let delta = (now - secs).max(0);
+    match delta {
+        d if d < 90 => t("just now").to_string(),
+        d if d < 3600 => tf("{n}m ago", &[("n", &(d / 60).to_string())]),
+        d if d < 86_400 => tf("{n}h ago", &[("n", &(d / 3600).to_string())]),
+        d => tf("{n}d ago", &[("n", &(d / 86_400).to_string())]),
+    }
+}
+
 fn modal_backdrop() -> Div {
     div()
         .absolute()
@@ -1864,6 +1981,19 @@ const MAX_LOOP_RUNTIME: Duration = Duration::from_secs(30 * 60);
 
 /// Drag payload for moving a single tab (tabifies into the pane it's dropped on).
 #[derive(Clone)]
+/// The Import window's state: which project is importing, and what the scan found.
+///
+/// The scan runs off the UI thread (it shells out to `tmux`, to `ps`, and reads a
+/// conversation directory), so `found` is `None` until it lands and the window
+/// shows a spinner until then.
+struct ImportState {
+    project: Uuid,
+    /// `None` while the scan is still running.
+    found: Option<Vec<muxel_core::import::ImportCandidate>>,
+    /// Why the scan found nothing, when that is worth saying (an unreachable host).
+    error: Option<String>,
+}
+
 struct DragInstance {
     iid: Uuid,
 }
@@ -2739,6 +2869,9 @@ pub struct MuxelApp {
     git_action_input: Entity<InputState>,
     /// New-remote-project wizard: visible flag, chosen host, and its inputs.
     show_new_remote: bool,
+    /// The Import window: agents found running, or recorded, outside muxel that
+    /// the project can take over. `None` when it is closed.
+    import: Option<ImportState>,
     nr_host: Option<Uuid>,
     nr_dir: Entity<InputState>,
     nr_name: Entity<InputState>,
@@ -4750,6 +4883,7 @@ impl MuxelApp {
             git_diff_commit_input,
             diff_file_windows: HashMap::new(),
             show_new_remote: false,
+            import: None,
             nr_host: None,
             nr_dir,
             nr_name,
@@ -6150,6 +6284,164 @@ impl MuxelApp {
             ),
             t("Agents were still running on the host with no pane — they're back.").to_string(),
         );
+    }
+
+    /// Open the Import window for a project and start scanning for agents that
+    /// are running, or were run, outside muxel.
+    fn open_import(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.import = Some(ImportState {
+            project: pid,
+            found: None,
+            error: None,
+        });
+        self.scan_for_import(pid, window, cx);
+        cx.notify();
+    }
+
+    /// Gather everything importable for a project, off the UI thread.
+    ///
+    /// Three sources, in descending order of how good the import is: live tmux
+    /// sessions (a true attach), agents running outside tmux (their conversation
+    /// can be resumed, but the process keeps running), and conversations on disk
+    /// with nothing running. Everything the scan needs is copied out here, on the
+    /// UI thread, because the scan itself shells out and must not touch `self`.
+    fn scan_for_import(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
+        let is_local = project.remote.is_none();
+        let root = match &project.remote {
+            Some(r) => r.remote_root.clone(),
+            None => project.root_path.to_string_lossy().into_owned(),
+        };
+        // Conversations live on whichever machine ran the agent, so they are only
+        // readable for a local project.
+        let local_root = is_local.then(|| project.root_path.clone());
+        let loc = self.repo_loc(pid);
+        let presets = self.presets.clone();
+        // Sessions a pane already holds, across every project — importing one would
+        // put two panes on a single session, each fighting the other's redraws.
+        let owned: Vec<String> = self
+            .tmux_sessions()
+            .into_iter()
+            .map(|(_, s, _)| s)
+            .collect();
+        // Conversations a pane is already on, for the same reason.
+        let live: Vec<String> = self
+            .workspace
+            .instances
+            .iter()
+            .filter_map(|i| i.session_id.clone())
+            .collect();
+        let home = home_dir();
+        let own_pid = std::process::id();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    scan_importable(
+                        loc.as_ref(),
+                        &root,
+                        &presets,
+                        &owned,
+                        &live,
+                        own_pid,
+                        home.as_deref(),
+                        local_root.as_deref(),
+                    )
+                })
+                .await;
+            let _ = this.update_in(cx, |this, _window, cx| {
+                // The window may have been closed, or reopened on another project,
+                // while the scan was out.
+                if let Some(state) = this.import.as_mut().filter(|s| s.project == pid) {
+                    match found {
+                        Ok(list) => state.found = Some(list),
+                        Err(error) => {
+                            state.found = Some(Vec::new());
+                            state.error = Some(error);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Take over one of the Import window's rows.
+    ///
+    /// A tmux session becomes a pane bound to that session, exactly as
+    /// [`Self::adopt_remote_sessions`] binds an abandoned one: the launch resolves
+    /// to the recorded name and `tmux new-session -A` attaches instead of creating.
+    /// A conversation becomes a pane that resumes it. The row is dropped either
+    /// way, because it is in muxel now.
+    fn import_candidate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        use muxel_core::import::ImportSource;
+        let Some(state) = self.import.as_ref() else {
+            return;
+        };
+        let pid = state.project;
+        let Some(candidate) = state.found.as_ref().and_then(|f| f.get(index)).cloned() else {
+            return;
+        };
+        if !candidate.source.is_importable() {
+            return;
+        }
+        let preset = candidate
+            .preset_id
+            .and_then(|id| self.presets.iter().find(|p| p.id == id).cloned())
+            .unwrap_or_else(AgentPreset::shell);
+        let mut instance = Instance::from_preset(pid, &preset);
+        let detail = match &candidate.source {
+            ImportSource::TmuxSession { session } => {
+                // The binding that makes this an attach rather than a launch.
+                instance.tmux_session = Some(session.clone());
+                t("Attached to the running session — the agent was never interrupted.").to_string()
+            }
+            ImportSource::Running {
+                session_id: Some(id),
+                ..
+            } => {
+                instance.session_id = Some(id.clone());
+                instance.session_started = true;
+                t("Resumed its conversation. The agent you started is still running on it too.")
+                    .to_string()
+            }
+            ImportSource::Conversation { session_id, .. } => {
+                instance.session_id = Some(session_id.clone());
+                instance.session_started = true;
+                t("Resumed the conversation where it left off.").to_string()
+            }
+            ImportSource::Running {
+                session_id: None, ..
+            } => return,
+        };
+        let title = candidate.preset_name.clone();
+        // Its worktree is the session's business, not ours — the pane attaches to
+        // something already running in a directory of its own.
+        let anchor = self.workspace.project(pid).and_then(|p| p.first_instance());
+        self.place_and_spawn(
+            pid,
+            instance,
+            PlacementMode::Tab,
+            anchor,
+            Some(WorktreeChoice::None),
+            window,
+            cx,
+        );
+        if let Some(found) = self.import.as_mut().and_then(|s| s.found.as_mut())
+            && index < found.len()
+        {
+            found.remove(index);
+        }
+        self.add_event(
+            NotifKind::Success,
+            tf("Imported {name}", &[("name", &title)]),
+            detail,
+        );
+        cx.notify();
     }
 
     /// Every tmux session muxel has launched, `(project, session, is_remote)` —
@@ -10313,6 +10605,7 @@ impl MuxelApp {
             || self.show_terms
             || self.show_workspace_selector
             || self.show_new_remote
+            || self.import.is_some()
             || self.show_run_dialog
             || self.broadcasting
             || self.stt_state != SttState::Idle
@@ -19983,6 +20276,17 @@ impl MuxelApp {
                                         )),
                                 );
                             }
+                            // Take over an agent the user started outside muxel.
+                            menu = menu.item(
+                                PopupMenuItem::new(t("Import…"))
+                                    .icon(IconName::Plus)
+                                    .on_click(window.listener_for(
+                                        &entity,
+                                        move |this, _, window, cx| {
+                                            this.open_import(pid, window, cx)
+                                        },
+                                    )),
+                            );
                             // Git actions (only when the project is a repo).
                             if is_repo {
                                 menu = menu.separator();
@@ -23943,6 +24247,198 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    /// The Import window: everything running (or recorded) outside muxel that this
+    /// project can take over, best import first.
+    fn render_import_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        use muxel_core::import::ImportSource;
+        let Some(state) = self.import.as_ref() else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme();
+        let (muted, border, radius) = (theme.muted_foreground, theme.border, theme.radius);
+        let (warn, ok) = (theme.warning, theme.success);
+        let project = self
+            .workspace
+            .project(state.project)
+            .map_or_else(String::new, |p| p.name.clone());
+
+        let body: AnyElement = match state.found.as_deref() {
+            None => v_flex()
+                .items_center()
+                .justify_center()
+                .h(px(180.0))
+                .gap_3()
+                .child(Spinner::new())
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(t("Looking for agents…")),
+                )
+                .into_any_element(),
+            Some([]) => {
+                v_flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(180.0))
+                    .gap_2()
+                    .child(div().text_sm().text_color(muted).child(
+                        state.error.clone().unwrap_or_else(|| {
+                            t("Nothing to import — every agent here is already in muxel.")
+                                .to_string()
+                        }),
+                    ))
+                    .into_any_element()
+            }
+            Some(found) => {
+                let mut list = v_flex().gap_1();
+                for (ix, c) in found.iter().enumerate() {
+                    let (what, note, tint) = match &c.source {
+                        ImportSource::TmuxSession { session } => (
+                            tf("tmux session “{name}”", &[("name", session)]),
+                            t("Attaches to it — the agent keeps running, untouched.").to_string(),
+                            ok,
+                        ),
+                        ImportSource::Running {
+                            pid,
+                            session_id: Some(_),
+                        } => (
+                            tf("running outside tmux (pid {pid})", &[("pid", &pid.to_string())]),
+                            t("Can't attach to it. Resumes its conversation in a new pane — the one you started keeps running on it too.")
+                                .to_string(),
+                            warn,
+                        ),
+                        ImportSource::Running {
+                            pid,
+                            session_id: None,
+                        } => (
+                            tf("running outside tmux (pid {pid})", &[("pid", &pid.to_string())]),
+                            t("Nothing muxel can take over: it isn't in tmux, and its conversation couldn't be identified.")
+                                .to_string(),
+                            muted,
+                        ),
+                        ImportSource::Conversation { modified, .. } => (
+                            tf("conversation, {when}", &[("when", &ago_label(*modified))]),
+                            t("Nothing is running on it. Starts the agent and resumes where it left off.")
+                                .to_string(),
+                            ok,
+                        ),
+                    };
+                    let can = c.source.is_importable();
+                    list = list.child(
+                        h_flex()
+                            .w_full()
+                            .gap_3()
+                            .items_start()
+                            .p_2()
+                            .rounded(radius)
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_semibold()
+                                                    .child(c.preset_name.clone()),
+                                            )
+                                            .child(div().text_xs().text_color(tint).child(what))
+                                            .children((!c.in_tree).then(|| {
+                                                Tag::new().small().child(t("outside this project"))
+                                            })),
+                                    )
+                                    .child(div().text_xs().text_color(muted).child(c.cwd.clone()))
+                                    .child(div().text_xs().text_color(muted).child(note)),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("import-{ix}")))
+                                    .primary()
+                                    .small()
+                                    .disabled(!can)
+                                    .label(t("Import"))
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
+                                        this.import_candidate(ix, window, cx)
+                                    })),
+                            ),
+                    );
+                }
+                div()
+                    .id("import-list")
+                    .max_h(px(420.0))
+                    .overflow_y_scroll()
+                    .child(list)
+                    .into_any_element()
+            }
+        };
+
+        modal_backdrop()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _w, cx| {
+                    this.import = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                v_flex()
+                    .w(px(640.0))
+                    .gap_3()
+                    .p_5()
+                    .bg(theme.background)
+                    .border_1()
+                    .border_color(border)
+                    .rounded(theme.radius_lg)
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_semibold()
+                            .child(tf("Import into {project}", &[("project", &project)])),
+                    )
+                    .child(div().text_sm().text_color(muted).child(t(
+                        "Agents running, or last run, outside muxel. Attaching to a tmux session leaves the agent exactly as it is; anything else starts a second agent on the same conversation.",
+                    )))
+                    .child(body)
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .child(
+                                Button::new("import-rescan")
+                                    .ghost()
+                                    .label(t("Rescan"))
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        let Some(pid) = this.import.as_ref().map(|s| s.project)
+                                        else {
+                                            return;
+                                        };
+                                        if let Some(state) = this.import.as_mut() {
+                                            state.found = None;
+                                            state.error = None;
+                                        }
+                                        this.scan_for_import(pid, window, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(Button::new("import-close").label(t("Close")).on_click(
+                                cx.listener(|this, _e, _w, cx| {
+                                    this.import = None;
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// "Are you sure you want to quit?" confirmation over a dimmed backdrop.
     /// Confirmation modal for a destructive action (delete / close).
     fn render_confirm_modal(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -27394,6 +27890,7 @@ impl Render for MuxelApp {
                 self.show_new_remote
                     .then(|| self.render_remote_project_modal(cx)),
             )
+            .children(self.import.is_some().then(|| self.render_import_modal(cx)))
             .children(
                 self.password_prompt
                     .is_some()
