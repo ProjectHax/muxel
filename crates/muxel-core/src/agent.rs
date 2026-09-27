@@ -608,15 +608,18 @@ pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<
 /// `-home-u--local`). Pure path-building; use [`find_claude_session_path`] when
 /// deciding whether a durable session UUID still exists after a cwd change.
 pub fn claude_session_path(home: &Path, cwd: &Path, session_id: &str) -> PathBuf {
-    let slug: String = cwd
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
+    let slug = claude_project_slug(cwd);
     home.join(".claude")
         .join("projects")
         .join(slug)
         .join(format!("{session_id}.jsonl"))
+}
+
+fn claude_project_slug(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// Find Claude's transcript by its durable session UUID, preferring the pane's
@@ -664,6 +667,65 @@ pub fn find_claude_session_path(
         }
     }
     Ok(None)
+}
+
+/// Read the most recent working directory Claude recorded in a transcript.
+///
+/// Claude moves a conversation between project stores when `/cd` changes its
+/// cwd. Its resume command must start in that recorded directory, not merely in
+/// the directory where Muxel originally launched the pane. Transcripts can be
+/// very large, so only inspect a bounded tail; current entries carry `cwd`, and
+/// relocation entries carry the more specific `relocatedCwd`.
+pub fn claude_session_cwd(transcript: &Path) -> std::io::Result<Option<PathBuf>> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+    const TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+    let mut file = std::fs::File::open(transcript)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::new(file);
+    if start > 0 {
+        // The seek likely landed inside a JSON record, perhaps in the middle of
+        // a multi-byte UTF-8 character. Discard bytes rather than decoding the
+        // partial record as a String.
+        let mut partial = Vec::new();
+        reader.read_until(b'\n', &mut partial)?;
+    }
+
+    let expected_slug = transcript
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    let mut latest = None;
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            line.clear();
+            continue;
+        };
+        let recorded = value
+            .get("relocatedCwd")
+            .or_else(|| value.get("cwd"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(recorded) = recorded {
+            let path = PathBuf::from(recorded);
+            let slug_matches = expected_slug.is_some_and(|expected| {
+                let actual = claude_project_slug(&path);
+                if cfg!(windows) {
+                    actual.eq_ignore_ascii_case(expected)
+                } else {
+                    actual == expected
+                }
+            });
+            if path.is_absolute() && slug_matches {
+                latest = Some(path);
+            }
+        }
+        line.clear();
+    }
+    Ok(latest)
 }
 
 /// Whether a Codex rollout filename under `~/.codex/sessions` carries
@@ -1589,14 +1651,52 @@ mod tests {
         let home = root.join("home");
         let original = root.join("original");
         let moved = root.join("moved-worktree");
+        std::fs::create_dir_all(&moved).unwrap();
         let session_id = Uuid::new_v4().to_string();
         let moved_transcript = super::claude_session_path(&home, &moved, &session_id);
         std::fs::create_dir_all(moved_transcript.parent().unwrap()).unwrap();
-        std::fs::write(&moved_transcript, "{}\n").unwrap();
+        std::fs::write(
+            &moved_transcript,
+            format!(
+                "{{\"type\":\"assistant\",\"cwd\":{:?}}}\n{{\"type\":\"relocated\",\"relocatedCwd\":{:?}}}\n{{\"type\":\"assistant\",\"cwd\":{:?}}}\n",
+                original.to_string_lossy(),
+                moved.to_string_lossy(),
+                moved.join("nested-shell-cwd").to_string_lossy()
+            ),
+        )
+        .unwrap();
 
         assert_eq!(
             super::find_claude_session_path(&home, Some(&original), &session_id).unwrap(),
             Some(moved_transcript.clone())
+        );
+        assert_eq!(
+            super::claude_session_cwd(&moved_transcript).unwrap(),
+            Some(moved.clone()),
+            "resume must use Claude's relocated cwd, not the pane's original cwd"
+        );
+
+        let utf8_boundary = moved_transcript
+            .parent()
+            .unwrap()
+            .join("utf8-boundary.jsonl");
+        let final_record = format!(
+            "{{\"type\":\"relocated\",\"relocatedCwd\":{:?}}}\n",
+            moved.to_string_lossy()
+        );
+        let tail_bytes = 2 * 1024 * 1024;
+        let mut contents = "🙂".as_bytes().to_vec();
+        contents.extend(std::iter::repeat_n(
+            b'x',
+            tail_bytes + 1 - contents.len() - final_record.len() - 1,
+        ));
+        contents.push(b'\n');
+        contents.extend_from_slice(final_record.as_bytes());
+        std::fs::write(&utf8_boundary, contents).unwrap();
+        assert_eq!(
+            super::claude_session_cwd(&utf8_boundary).unwrap(),
+            Some(moved.clone()),
+            "a seek inside multi-byte UTF-8 must not hide the following cwd record"
         );
 
         let preferred_transcript = super::claude_session_path(&home, &original, &session_id);

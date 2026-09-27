@@ -1856,28 +1856,99 @@ fn is_claude_program(program: Option<&str>) -> bool {
     )
 }
 
-/// Whether a Claude agent's saved session transcript is confirmed missing from
-/// disk (so a `--resume` would just hang on "No conversation found"). Claude's
-/// `/cd` and worktree flows can move a conversation away from the pane's launch
-/// cwd, so search all Claude project directories by durable UUID. An I/O failure
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeSessionState {
+    NotClaude,
+    Found { cwd: Option<PathBuf> },
+    Missing,
+    Unknown,
+}
+
+/// Locate a Claude transcript and recover the cwd Claude recorded in it.
+/// Claude refuses to resume a conversation from another directory, so finding
+/// the UUID alone is insufficient after `/cd` or a worktree move. An I/O failure
 /// is not evidence of deletion and preserves the saved resume id.
-fn claude_session_gone(
+fn claude_session_state(
     preset: &muxel_core::AgentPreset,
     cwd: Option<&std::path::Path>,
     session_id: &str,
-) -> bool {
+) -> ClaudeSessionState {
     if !is_claude_program(preset.program.as_deref()) {
-        return false;
+        return ClaudeSessionState::NotClaude;
     }
     let Some(home) = home_dir() else {
-        return false;
+        return ClaudeSessionState::Unknown;
     };
     match muxel_core::find_claude_session_path(&home, cwd, session_id) {
-        Ok(path) => path.is_none(),
+        Ok(Some(path)) => match muxel_core::claude_session_cwd(&path) {
+            Ok(Some(cwd)) if cwd.is_dir() => ClaudeSessionState::Found { cwd: Some(cwd) },
+            Ok(Some(cwd)) => {
+                log::warn!(
+                    "Claude session recorded a cwd that is no longer a directory: {}",
+                    cwd.display()
+                );
+                ClaudeSessionState::Found { cwd: None }
+            }
+            Ok(None) => ClaudeSessionState::Found { cwd: None },
+            Err(error) => {
+                log::warn!("could not read Claude session cwd before resume: {error}");
+                ClaudeSessionState::Found { cwd: None }
+            }
+        },
+        Ok(None) => ClaudeSessionState::Missing,
         Err(error) => {
             log::warn!("could not scan Claude sessions before resume: {error}");
-            false
+            ClaudeSessionState::Unknown
         }
+    }
+}
+
+fn effective_local_cwd(
+    resume_cwd: Option<&Path>,
+    worktree_cwd: Option<&Path>,
+    project_cwd: Option<&Path>,
+) -> Option<String> {
+    resume_cwd
+        .or(worktree_cwd)
+        .or(project_cwd)
+        .map(|path| path.display().to_string())
+}
+
+/// Claude's transcript probe decides whether its UUID is missing before launch.
+/// Once launched, neither generic failure nor "No conversation found" proves the
+/// UUID is invalid: a cwd mismatch produces the same message. Other providers
+/// retain the established early-exit recovery.
+fn should_recover_expired_session(
+    is_claude: bool,
+    explicit_missing: bool,
+    early_nonzero_exit: bool,
+) -> bool {
+    !is_claude && (explicit_missing || early_nonzero_exit)
+}
+
+#[cfg(test)]
+mod claude_resume_tests {
+    use super::{effective_local_cwd, should_recover_expired_session};
+    use std::path::Path;
+
+    #[test]
+    fn relocated_resume_cwd_wins_over_saved_instance_paths() {
+        assert_eq!(
+            effective_local_cwd(
+                Some(Path::new("D:/dev/orez-wt-19497-flow")),
+                Some(Path::new("D:/dev/orez-wt-old")),
+                Some(Path::new("D:/dev/orez")),
+            )
+            .as_deref(),
+            Some("D:/dev/orez-wt-19497-flow")
+        );
+    }
+
+    #[test]
+    fn unrelated_claude_resume_failure_preserves_the_saved_uuid() {
+        assert!(!should_recover_expired_session(true, false, true));
+        assert!(!should_recover_expired_session(true, true, false));
+        assert!(should_recover_expired_session(false, false, true));
     }
 }
 
@@ -5320,7 +5391,7 @@ impl MuxelApp {
     /// - **Agent-minted** (only `resume_flag`, e.g. Codex): first launch bare;
     ///   bound panes resume their saved id. A legacy started pane with no saved id
     ///   recovers the newest cwd-matching rollout before `resume <id>`.
-    fn session_resume_for(&mut self, iid: Uuid) -> Option<Vec<String>> {
+    fn session_resume_for(&mut self, iid: Uuid) -> Option<(Vec<String>, Option<PathBuf>)> {
         let _phase = ui_profile::phase("activation", "session-resume", Some(iid));
         let (preset, cwd, local) = {
             let inst = self.workspace.instance(iid)?;
@@ -5346,6 +5417,7 @@ impl MuxelApp {
         }
         let inst = self.workspace.instance_mut(iid)?;
         let host_minted = preset.session_id_flag.is_some();
+        let mut resume_cwd = None;
         if host_minted {
             if inst.session_id.is_none() {
                 inst.session_id = Some(Uuid::new_v4().to_string());
@@ -5358,14 +5430,20 @@ impl MuxelApp {
             if local
                 && inst.session_started
                 && let Some(sid) = inst.session_id.clone()
-                && {
+            {
+                let state = {
                     let _phase =
                         ui_profile::phase("activation", "claude-session-exists", Some(iid));
-                    claude_session_gone(&preset, cwd.as_deref(), &sid)
+                    claude_session_state(&preset, cwd.as_deref(), &sid)
+                };
+                match state {
+                    ClaudeSessionState::Found { cwd } => resume_cwd = cwd,
+                    ClaudeSessionState::Missing => {
+                        inst.session_id = Some(Uuid::new_v4().to_string());
+                        inst.session_started = false;
+                    }
+                    ClaudeSessionState::NotClaude | ClaudeSessionState::Unknown => {}
                 }
-            {
-                inst.session_id = Some(Uuid::new_v4().to_string());
-                inst.session_started = false;
             }
         } else if inst.session_started {
             // Agent-minted (Codex): legacy panes created before exact title
@@ -5391,7 +5469,7 @@ impl MuxelApp {
             }
         }
         let snapshot = inst.clone();
-        muxel_core::session_resume_args(&preset, &snapshot)
+        muxel_core::session_resume_args(&preset, &snapshot).map(|args| (args, resume_cwd))
     }
 
     fn command_for(&mut self, instance_id: Uuid) -> CommandSpec {
@@ -5399,7 +5477,8 @@ impl MuxelApp {
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
         // resolve the --session-id / --resume flag *before* anything borrows the
         // instance. Mutates + persists the instance's session bookkeeping.
-        let resume_args = self.session_resume_for(instance_id);
+        let session_resume = self.session_resume_for(instance_id);
+        let resume_args = session_resume.as_ref().map(|(args, _)| args);
         let inst = self.workspace.instance(instance_id);
         let project = inst.and_then(|i| self.workspace.project(i.project_id));
         let resuming = inst
@@ -5408,7 +5487,7 @@ impl MuxelApp {
                     .preset_id
                     .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                     .or_else(|| self.presets.iter().find(|p| p.name == i.preset))?;
-                Some((preset.resume_flag.as_deref()?, resume_args.as_ref()?))
+                Some((preset.resume_flag.as_deref()?, resume_args?))
             })
             .is_some_and(|(flag, args)| args.first().is_some_and(|arg| arg == flag));
         // Build one instruction bundle, then let the preset's injection transport
@@ -5478,7 +5557,7 @@ impl MuxelApp {
             ));
         }
         // The session flag goes ahead of model / system-prompt args.
-        if let Some(mut resume) = resume_args {
+        if let Some((mut resume, _)) = session_resume.as_ref().cloned() {
             resume.append(&mut resolved.args);
             resolved.args = resume;
         }
@@ -5534,11 +5613,14 @@ impl MuxelApp {
                 self.remote_program_args(inst, &host, &remote_cwd, &resolved);
             (CommandSpec::program(program, args), None, env)
         } else {
-            // Local: worktree path wins as the working dir; otherwise project root.
-            let cwd: Option<String> = inst
-                .and_then(|i| i.worktree_path.clone())
-                .map(|p| p.display().to_string())
-                .or_else(|| project.map(|p| p.root_path.display().to_string()));
+            // A resumed Claude conversation must launch from the cwd recorded in
+            // its transcript. Claude rejects the UUID when invoked from another
+            // project directory, even though the transcript itself still exists.
+            let cwd = effective_local_cwd(
+                session_resume.as_ref().and_then(|(_, cwd)| cwd.as_deref()),
+                inst.and_then(|i| i.worktree_path.as_deref()),
+                project.map(|p| p.root_path.as_path()),
+            );
             // If this instance uses tmux, wrap the command in `tmux new-session -A`
             // so it persists and re-attaches across restarts.
             let spec = match inst.and_then(|i| i.tmux_session.clone()) {
@@ -9013,17 +9095,17 @@ impl MuxelApp {
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
                 let read_error = v.exit_read_error().map(str::to_string);
-                // A resume launch whose saved session is gone may *hang* on the
-                // agent's "No conversation found …" error instead of exiting —
-                // detect it on screen (only while the resume launch is still fresh)
-                // so we recover the same way as the exit case.
+                // Some providers hang on "No conversation found" instead of
+                // exiting. Search recent reflowed text while the resume is fresh;
+                // Claude still preserves its UUID because cwd mismatch produces
+                // the same message.
                 let resume_error =
                     self.terminal_launches
                         .get(iid)
                         .is_some_and(|&(at, was_resume)| {
                             was_resume && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
                         })
-                        && v.screen_has("No conversation found");
+                        && v.recent_text(40).contains("No conversation found");
                 let inst = self.workspace.instance(*iid);
                 let title = inst
                     .map(|i| i.display_name().to_string())
@@ -9257,10 +9339,24 @@ impl MuxelApp {
                 .workspace
                 .instance(iid)
                 .and_then(|i| i.tmux_session.clone());
+            let is_claude = self.workspace.instance(iid).is_some_and(|instance| {
+                instance
+                    .preset_id
+                    .and_then(|preset_id| self.presets.iter().find(|preset| preset.id == preset_id))
+                    .or_else(|| {
+                        self.presets
+                            .iter()
+                            .find(|preset| preset.name == instance.preset)
+                    })
+                    .is_some_and(|preset| is_claude_program(preset.program.as_deref()))
+            });
             // A `--resume` launch whose saved session is invalid (deleted/expired)
             // recovers by re-spawning the same agent with a fresh session, rather
-            // than closing it — whether the agent exited non-zero on the bad resume
-            // or is hanging on its "No conversation found" error (`resume_error`).
+            // than closing it. Claude never qualifies here: its proactive transcript
+            // probe already handles a confirmed miss, while both this message and a
+            // generic non-zero exit can be caused by a cwd mismatch. Replacing the
+            // UUID in that case would hide a valid conversation. Other providers
+            // retain the earlier generic early-exit recovery.
             // A clean exit (code 0) is a deliberate quit — left to close-on-exit.
             //
             // Never for a tmux pane: what exits there is the tmux *client*, and its
@@ -9302,7 +9398,7 @@ impl MuxelApp {
                     at.elapsed() >= reattach_backoff(self.reconnecting.get(&iid).copied())
                 });
 
-            if resume_error || exit_recover {
+            if should_recover_expired_session(is_claude, resume_error, exit_recover) {
                 to_recover.push((iid, title));
             } else if let Some(session) = tmux_session.filter(|_| tmux_lost) {
                 to_reattach.push((iid, title, session));
