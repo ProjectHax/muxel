@@ -286,15 +286,13 @@ pub fn process_candidates(
 /// non-ASCII-alphanumeric character replaced by `-`. The per-conversation
 /// transcripts are the `*.jsonl` files inside it.
 ///
-/// This is the directory half of [`crate::claude_session_path`]; the two must agree
-/// or an imported conversation would resume against a path Claude never wrote.
+/// This is the directory half of [`crate::claude_session_path`], and shares its
+/// slug encoding rather than repeating it — the two must agree or an imported
+/// conversation would resume against a path Claude never wrote.
 pub fn claude_project_dir(home: &Path, cwd: &Path) -> PathBuf {
-    let slug: String = cwd
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    home.join(".claude").join("projects").join(slug)
+    home.join(".claude")
+        .join("projects")
+        .join(crate::agent::claude_project_slug(cwd))
 }
 
 /// Turn `(session_id, modified)` pairs — read out of a conversation directory — into

@@ -615,7 +615,12 @@ pub fn claude_session_path(home: &Path, cwd: &Path, session_id: &str) -> PathBuf
         .join(format!("{session_id}.jsonl"))
 }
 
-fn claude_project_slug(cwd: &Path) -> String {
+/// Claude's encoding of a working directory as a project-store directory name:
+/// every character that is not ASCII alphanumeric becomes `-`. The one definition
+/// of it — [`claude_session_path`] and `import::claude_project_dir` both build on
+/// this rather than repeating it, because a second copy that drifted would aim a
+/// resume at a directory Claude never wrote.
+pub(crate) fn claude_project_slug(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
