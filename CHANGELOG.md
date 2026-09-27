@@ -5,6 +5,64 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-09-27
+
+### Added
+- **Take over an agent you started outside muxel** — a project's right-click menu has
+  **Import…**, which looks for agents running, or last run, outside muxel and lists
+  what that project can take over. A tmux session is the best case: muxel attaches a
+  pane to it, the agent keeps running exactly as it was, and the pane survives a
+  restart — that works whatever is inside, including agents that cannot resume a
+  conversation at all. An agent running outside tmux cannot have its terminal taken
+  over, so muxel offers to resume its conversation in a new pane instead and says so
+  in the row, because the one you started keeps running on it too. A past
+  conversation with nothing on it simply reopens where it left off. Each row says
+  what that agent was working on, which is what tells two sessions in the same folder
+  apart, and anything a pane already holds is left out, so importing can never put
+  two panes on one agent. Sessions elsewhere on the machine are listed as well,
+  tagged as outside the project, so you can pull one in on purpose. Remote projects
+  are searched over the connection they already have.
+- **muxel installs on NixOS** — `nix run github:ProjectHax/muxel` runs it,
+  `nix profile install` keeps it, and a NixOS or home-manager configuration can pull
+  it in through the flake's overlay. There is a development shell too, which is what
+  lets a checkout build there at all: nothing on NixOS puts the Wayland, Vulkan,
+  fontconfig and WebKit pieces where a build expects to find them. Linux, x86_64 and
+  aarch64.
+- **muxel offers to install tmux when it is missing** — without tmux, local agents
+  still run but do not survive closing muxel, and nothing said why. The first launch
+  that finds tmux missing now offers to install it and shows the exact commands
+  before anything runs. Only the install itself is elevated, through the desktop's
+  own password dialog; on a Mac it uses Homebrew as you, and a Mac without Homebrew
+  is pointed at it. The package manager's output streams into the dialog, which can
+  be hidden while it works, and a failure shows what went wrong along with a command
+  to paste into a terminal yourself. The offer is made once, and **Install tmux…**
+  in Settings opens it again.
+
+### Fixed
+- **A conversation Claude moved still resumes** — Claude can carry a conversation
+  into another project directory when its working directory changes, or when you
+  pick a conversation belonging to somewhere else. muxel only ever looked where the
+  pane had started, decided the conversation had been deleted, and opened the pane
+  blank on a new one. It now finds a conversation by its own id wherever it has
+  moved to, and starts Claude in the directory Claude recorded for it — which
+  matters, because Claude refuses to resume a conversation from anywhere else. A
+  conversation is given up on only once muxel has confirmed it is really gone: a
+  session store it could not read leaves the pane's conversation alone rather than
+  quietly replacing it.
+- **Reading a pane can no longer take every local agent down with it** — finding an
+  agent's last reply, for read-aloud or for an outside tool driving muxel, asked tmux
+  for the pane's scrollback. On some tmux builds that request crashes the tmux
+  server, and one server holds every local session, so a single read killed every
+  agent at once — and with something reading repeatedly, agents were relaunched and
+  killed again before any of them could finish starting. muxel now reads a pane from
+  its own terminal, which keeps far more than any of those callers ask for, so tmux
+  is not asked at all. Remote panes have always worked this way.
+- **The Linux `.deb` installs on the current Ubuntu and Debian** — it asked for
+  library names that both distributions have since retired, so it refused to install
+  on Ubuntu 24.04 and Debian 13 while working fine on older releases. It now names
+  the current and the previous names together, so one package installs on all of
+  them. The `.rpm` was never affected.
+
 ## [0.2.4] — 2026-09-24
 
 ### Added
