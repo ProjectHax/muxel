@@ -75,6 +75,49 @@ jobs:
           set +e; out="$(target/debug/muxel ctl projects)"; code=$?; set -e
           test "$code" -eq 1
           echo "$out" | grep -q "muxel isn't running"
+      # The .deb's `Depends` is hand-written (see `[package.metadata.deb]`), because
+      # cargo-deb's `$auto` resolves against this build host and so pins the
+      # pre-`t64` library names, which do not exist on Ubuntu 24.04 or Debian 13.
+      # Hand-written means nothing regenerates it when muxel gains a native
+      # dependency, so check it here: `dpkg-shlibdeps` is what `$auto` itself uses,
+      # and a library it needs that we do not name is a .deb that installs and then
+      # fails to start.
+      - name: The .deb declares every library the binary needs
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # dpkg-shlibdeps insists on being run from a source package.
+          mkdir -p debian
+          printf 'Source: muxel\n\nPackage: muxel\nArchitecture: any\n' > debian/control
+          dpkg-shlibdeps -O --ignore-missing-info target/debug/muxel > shlibdeps.txt
+          rm -rf debian
+          flatten() { tr ',' '\n' | tr '|' '\n' | sed 's/(.*//' | tr -d ' ' | grep -v '^$' | sort -u; }
+          needed=$(sed 's/^shlibs:Depends=//' shlibdeps.txt | flatten)
+          # Every alternative we declare counts as naming that package.
+          declared=$(sed -n 's/^depends = "\(.*\)"$/\1/p' crates/muxel/Cargo.toml | flatten)
+          if [ -z "$declared" ]; then
+            echo "::error::could not read the .deb Depends from crates/muxel/Cargo.toml"
+            exit 1
+          fi
+          # Guaranteed by another dependency, so cargo-deb omits them and so do we.
+          implied="libgcc-s1"
+          missing=""
+          for pkg in $needed; do
+            if grep -qxF "$pkg" <<<"$declared" || grep -qxF "$pkg" <<<"$implied"; then
+              echo "  ok       $pkg"
+            else
+              echo "  MISSING  $pkg"
+              missing="$missing $pkg"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::the .deb Depends in crates/muxel/Cargo.toml does not name:$missing"
+            echo "Add it there, with a t64 alternative if that library was renamed."
+            exit 1
+          fi
+          echo "Every library the binary needs is named in the .deb Depends."
+
       - name: Clippy (Windows-only code)
         if: runner.os == 'Windows'
         run: cargo clippy --workspace --all-targets -- -D warnings
