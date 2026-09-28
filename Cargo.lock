@@ -5041,6 +5041,7 @@ dependencies = [
  "windows 0.57.0",
  "windows 0.61.3",
  "winresource",
+ "zbus 5.16.0",
  "zip",
 ]
 

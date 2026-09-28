@@ -316,6 +316,12 @@ fn main() {
     #[cfg(target_os = "windows")]
     spawn_present_pump();
 
+    // Windows reports the lid only as change notifications, so start listening
+    // before a dropped remote pane asks whether to hold its reattach (power.rs).
+    // The callbacks run on system threads — so this too follows every `set_var`.
+    #[cfg(target_os = "windows")]
+    power::watch();
+
     gpui_platform::application()
         // Serves muxel's agent icons + gpui-component's bundled SVG icons.
         .with_assets(AppAssets)

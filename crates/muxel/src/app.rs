@@ -9445,7 +9445,7 @@ impl MuxelApp {
             }
         }
         // Read at most once per tick, and only when a remote pane wants back in.
-        let mut lid_closed = None;
+        let mut lid_shut = None;
         for (iid, title, session) in to_reattach {
             // Deliberately NOT resetting `session_id` the way `to_recover` does. If the
             // tmux session survived, relaunching reattaches to it and the agent never
@@ -9455,14 +9455,14 @@ impl MuxelApp {
             // casualty. Resetting the id would throw the conversation away.
             let is_remote = self.remote_host_for_instance(iid).is_some();
             // Attaching resizes the host's tmux window to this pane. With the lid shut
-            // the Mac is only up for a background wake (Power Nap, network
-            // maintenance) — nobody is here — so a reattach then just yanks the window
-            // size out from under whoever is using the session from another machine.
-            // Hold it until the lid opens: the drop is still recorded, so the pane
-            // reads "reconnecting…", and the backoff runs from the dead client's
+            // (and no external display in use) the laptop is only up for a background
+            // or spurious wake — nobody is here — so a reattach then just yanks the
+            // window size out from under whoever is using the session from another
+            // machine. Hold it until the lid opens: the drop is still recorded, so the
+            // pane reads "reconnecting…", and the backoff runs from the dead client's
             // launch, long past by then, so the first tick with the lid open
             // reattaches at once.
-            let held = is_remote && *lid_closed.get_or_insert_with(power::lid_closed_for_sleep);
+            let held = is_remote && *lid_shut.get_or_insert_with(power::lid_shut_unattended);
             // Announce the drop once per outage, not on every retry. The count is
             // this outage's attempt tally, which backs off the next retry; it is
             // cleared when the pane settles (or the terminal goes away). A held

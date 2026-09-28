@@ -133,6 +133,7 @@ windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    "Win32_System_Power",
     "Win32_System_ProcessStatus",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_SystemInformation",
@@ -152,6 +153,10 @@ wry = { version = "0.53.3", package = "lb-wry" }
 [target.'cfg(target_os = "linux")'.dependencies]
 wry = { version = "0.53.3", package = "lb-wry" }
 gtk = "0.18"
+# Reading the lid from logind over D-Bus — see power.rs. zbus is already in the
+# tree (notify-rust, ksni) with these same features; `blocking-api` only adds
+# code, no crates.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 
 # Embeds the .exe icon (see build.rs); Windows build-host only, so it never
 # affects the Linux/macOS builds.
