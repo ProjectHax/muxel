@@ -8,6 +8,7 @@ use crate::editor::{
 };
 use crate::i18n::{t, tf, tn};
 use crate::integrations;
+use crate::power;
 use crate::settings_view::{self, RemoteTestState, SettingsSection, SettingsUi};
 use crate::split::{h_resizable, resizable_panel, v_resizable};
 use crate::theme;
@@ -9443,6 +9444,8 @@ impl MuxelApp {
                 dirty = true;
             }
         }
+        // Read at most once per tick, and only when a remote pane wants back in.
+        let mut lid_closed = None;
         for (iid, title, session) in to_reattach {
             // Deliberately NOT resetting `session_id` the way `to_recover` does. If the
             // tmux session survived, relaunching reattaches to it and the agent never
@@ -9451,12 +9454,26 @@ impl MuxelApp {
             // conversation from its transcript — the tmux scrollback is the only
             // casualty. Resetting the id would throw the conversation away.
             let is_remote = self.remote_host_for_instance(iid).is_some();
+            // Attaching resizes the host's tmux window to this pane. With the lid shut
+            // the Mac is only up for a background wake (Power Nap, network
+            // maintenance) — nobody is here — so a reattach then just yanks the window
+            // size out from under whoever is using the session from another machine.
+            // Hold it until the lid opens: the drop is still recorded, so the pane
+            // reads "reconnecting…", and the backoff runs from the dead client's
+            // launch, long past by then, so the first tick with the lid open
+            // reattaches at once.
+            let held = is_remote && *lid_closed.get_or_insert_with(power::lid_closed_for_sleep);
             // Announce the drop once per outage, not on every retry. The count is
             // this outage's attempt tally, which backs off the next retry; it is
-            // cleared when the pane settles (or the terminal goes away).
+            // cleared when the pane settles (or the terminal goes away). A held
+            // attempt spawns nothing, so it doesn't count toward the backoff.
             let attempts = self.reconnecting.entry(iid).or_default();
             let first_drop = *attempts == 0;
-            *attempts += 1;
+            *attempts = if held {
+                (*attempts).max(1)
+            } else {
+                *attempts + 1
+            };
             if is_remote {
                 // The tmux session lives on the host and outlives a dropped relay, so
                 // `tmux_session_exists` (a *local* check) is meaningless here — never
@@ -9469,7 +9486,14 @@ impl MuxelApp {
                         t("The tmux session is still running on the host; muxel will reattach as soon as it's reachable.")
                             .to_string(),
                     );
-                    muxel_store::append_event_log(&format!("reconnect: \"{title}\" [{session}]"));
+                    muxel_store::append_event_log(&format!(
+                        "reconnect: \"{title}\" [{session}]{}",
+                        if held {
+                            " (held until the lid opens)"
+                        } else {
+                            ""
+                        }
+                    ));
                 }
             } else if first_drop {
                 // Local pane: the local has-session check is correct.
@@ -9491,6 +9515,10 @@ impl MuxelApp {
                     "{}: \"{title}\" [{session}]",
                     if alive { "reattach" } else { "resume" }
                 ));
+            }
+            if held {
+                dirty |= first_drop;
+                continue;
             }
             self.spawn_terminal(iid, window, cx);
             dirty = true;

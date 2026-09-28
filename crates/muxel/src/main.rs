@@ -16,6 +16,7 @@ mod editor;
 mod filetree;
 mod i18n;
 mod integrations;
+mod power;
 #[cfg(target_os = "windows")]
 mod present_pump;
 mod secrets;

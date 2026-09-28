@@ -813,8 +813,12 @@ feature is added or changed, update the matching entry here in the same change**
   and muxel keeps retrying on its own — backing off to one attempt every 30s, for as
   long as the outage lasts — until the host is reachable and reattaches the agent
   right where it left off. Resuming a laptop whose Wi-Fi isn't up yet just costs a
-  retry or two. (Tune or disable the probe per host in Settings → Remotes →
-  Keepalive; blank uses a 20s default, `0` turns it off.)
+  retry or two. On a MacBook, a drop noticed while the lid is shut (a Power Nap or
+  maintenance wake in your bag) waits for the lid to open before reattaching —
+  attaching resizes the host's tmux window, which would otherwise yank it out from
+  under you if you're using that session from another machine. Clamshell mode with
+  an external display reconnects as usual. (Tune or disable the probe per host in
+  Settings → Remotes → Keepalive; blank uses a 20s default, `0` turns it off.)
 - **Reattaches everything on launch** — on startup muxel reconnects the tmux panes of
   *every* remote project in the background, not just the one you had open, so agents
   left running on your hosts come back automatically. Hosts that would need a password

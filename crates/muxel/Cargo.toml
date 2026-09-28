@@ -116,6 +116,9 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"
+# Reading the lid (clamshell) state from IOKit — see power.rs. The version gpui
+# already pins, so this adds nothing new to the tree.
+core-foundation = "0.10"
 
 # --- Built-in browser (system webview via wry; no bundled Chromium) ---
 # macOS/Windows: an embedded in-pane webview via gpui-component's gpui-wry
