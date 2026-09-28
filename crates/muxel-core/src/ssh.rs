@@ -678,8 +678,21 @@ fn remote_command(spec: &SshSpec) -> String {
         // The program is appended separately, wrapped in a login shell — see
         // `login_shell_command` — so tmux is told to create the session with no
         // command of its own.
+        //
+        // The session's program starts from the remote tmux server's environment. A
+        // server started from a muxel pane on that host has that pane's
+        // `MUXEL_INSTANCE_ID`, which this pane's program would take as its own, so it
+        // is cleared from the server before creating a session. A local control id
+        // does not identify the remote program, so no id is passed to it.
         let session = spec.tmux_session.unwrap_or("muxel");
-        let targs = crate::tmux::launch_session_args(session, spec.remote_cwd, None, &[]);
+        let targs = crate::tmux::launch_session_args_with_env(
+            session,
+            spec.remote_cwd,
+            None,
+            &[],
+            &[],
+            &[crate::control::INSTANCE_ID_ENV],
+        );
         let program = spec.program.map(|p| login_shell_command(p, spec.args));
         // Fork the remote tmux server off a project-less command line first — it's a
         // separate process, so the server never inherits the argv below. Without this,
@@ -1287,7 +1300,8 @@ mod tests {
             ssh_args(&spec).last().unwrap(),
             &format!(
                 "{}; tmux start-server ';' set -s exit-empty off; \
-                 exec tmux -u set -g mouse on ';' new-session -A -s muxel-abc123 -c /srv/app \
+                 exec tmux -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
+                 new-session -A -s muxel-abc123 -c /srv/app \
                  -- \"${{SHELL:-/bin/sh}}\" -ilc 'exec claude'",
                 tmux_path_prelude()
             )
@@ -1448,10 +1462,12 @@ mod tests {
             format!(
                 "tmux list-commands new-session 2>/dev/null | grep -q 'f flags' \
                  && tmux list-clients -t '=s' 2>/dev/null | grep -q .; then \
-                 exec tmux -u set -g mouse on ';' new-session -A -s s -c /srv/app \
+                 exec tmux -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
+                 new-session -A -s s -c /srv/app \
                  -f ignore-size -- {program} ';' set-option -Fq -t '=s:' \
                  @muxel_client_ab12 '#{{client_name}}'; fi; \
-                 exec tmux -u set -g mouse on ';' new-session -A -s s -c /srv/app -- {program}"
+                 exec tmux -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
+                 new-session -A -s s -c /srv/app -- {program}"
             )
         );
         // Older tmux, or a session nobody else is in, falls through to exactly the
@@ -1478,6 +1494,45 @@ mod tests {
             "tmux refresh-client -t \"$c\" -f '!ignore-size' ';' \
              set-option -q -t '=muxel_app_1:' @muxel_client_ab12 \"$c\""
         ));
+    }
+
+    /// Both attach paths clear the server id before creating a session. Existing
+    /// sessions retain their own environment when reattached.
+    #[test]
+    fn remote_tmux_commands_clear_the_server_instance_id_in_both_attach_paths() {
+        use crate::control::INSTANCE_ID_ENV;
+        let h = host();
+        for (program, tag) in [
+            (None, None),
+            (Some("claude"), None),
+            (None, Some("ab12")),
+            (Some("claude"), Some("ab12")),
+        ] {
+            let spec = SshSpec {
+                host: &h,
+                control_path: "/s",
+                remote_cwd: Some("/srv/app"),
+                program,
+                args: &[],
+                use_tmux: true,
+                tmux_session: Some("s"),
+                tmux_client_tag: tag,
+            };
+            let cmd = ssh_args(&spec).last().unwrap().clone();
+            let clear = format!("set-environment -g -u {INSTANCE_ID_ENV} ';' new-session ");
+            let clients: Vec<_> = cmd.split("exec tmux ").skip(1).collect();
+            assert_eq!(clients.len(), if tag.is_some() { 2 } else { 1 });
+            for client in clients {
+                assert!(
+                    client.contains(&clear),
+                    "for {program:?}/{tag:?}, got: {client}"
+                );
+                assert!(
+                    !client.contains(" -e "),
+                    "for {program:?}/{tag:?}, got: {client}"
+                );
+            }
+        }
     }
 
     #[test]

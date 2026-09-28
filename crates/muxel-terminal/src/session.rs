@@ -120,6 +120,9 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub env: Vec<(String, String)>,
+    /// Variables the child must not have, whether muxel's own environment or
+    /// `env` has them.
+    pub env_remove: Vec<String>,
     /// Text to type into the terminal shortly after start (system-prompt
     /// "type-in" injection). Handled by the view, not the session.
     pub startup_input: Option<String>,
@@ -153,6 +156,7 @@ impl CommandSpec {
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
             startup_input: None,
             auto_mode_presses: 0,
             submit: true,
@@ -171,6 +175,7 @@ impl CommandSpec {
             args,
             cwd: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
             startup_input: None,
             auto_mode_presses: 0,
             submit: true,
@@ -600,9 +605,7 @@ impl TerminalSession {
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
         // Last, so anything the instance/preset sets wins over muxel's defaults.
-        for (k, v) in &spec.env {
-            builder.env(k, v);
-        }
+        apply_spec_env(&mut builder, &spec);
         // These are private transport slots, not preset-overridable child env.
         // Reapply them after preset env so a collision cannot replace the batch
         // program or argv that Muxel resolved.
@@ -1917,6 +1920,18 @@ fn ensure_utf8_locale(builder: &mut CommandBuilder) {
 #[cfg(not(unix))]
 fn ensure_utf8_locale(_builder: &mut CommandBuilder) {}
 
+/// `spec`'s variables on top of what `builder` already has (muxel's own
+/// environment and its defaults), then without `spec.env_remove`, which covers
+/// both.
+fn apply_spec_env(builder: &mut CommandBuilder, spec: &CommandSpec) {
+    for (k, v) in &spec.env {
+        builder.env(k, v);
+    }
+    for k in &spec.env_remove {
+        builder.env_remove(k);
+    }
+}
+
 /// Strip an AppImage runtime's environment leakage from a child command, so a
 /// shell/agent muxel spawns gets a clean system environment. No-op unless muxel
 /// itself is running from an AppImage (`$APPIMAGE` set).
@@ -2218,7 +2233,24 @@ mod content_damage_tests {
 
 #[cfg(test)]
 mod wheel_report_tests {
-    use super::{appimage_env_fixups, push_mouse_report, push_wheel_report};
+    use super::{
+        CommandSpec, appimage_env_fixups, apply_spec_env, push_mouse_report, push_wheel_report,
+    };
+
+    #[test]
+    fn a_removed_variable_is_gone_whether_inherited_or_set() {
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let mut spec = CommandSpec::program("x", Vec::new());
+        spec.env = vec![pair("MUXEL_TEST_SET", "set"), pair("MUXEL_TEST_KEEP", "1")];
+        spec.env_remove = vec!["MUXEL_TEST_SET".into(), "PATH".into()];
+        // A builder starts from this process's environment, which has PATH.
+        let mut builder = portable_pty::CommandBuilder::new("x");
+        assert!(builder.get_env("PATH").is_some());
+        apply_spec_env(&mut builder, &spec);
+        assert_eq!(builder.get_env("PATH"), None);
+        assert_eq!(builder.get_env("MUXEL_TEST_SET"), None);
+        assert_eq!(builder.get_env("MUXEL_TEST_KEEP"), Some("1".as_ref()));
+    }
 
     #[test]
     fn appimage_env_fixups_strip_leakage_keep_the_rest() {

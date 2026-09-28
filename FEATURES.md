@@ -508,6 +508,20 @@ feature is added or changed, update the matching entry here in the same change**
   polled as fast as its driver likes without being disturbed. The one thing tmux
   alone knew — a pane's history from before muxel attached to an adopted session —
   fills back in as the pane produces output.
+- **An agent can find its own pane** — programs muxel starts directly on this
+  computer, including shells, receive `MUXEL_INSTANCE_ID` set to the pane's id,
+  which `muxel ctl` takes as AGENT. An agent or script inside a pane
+  can check its own status or read its own screen without guessing at its name.
+  If a requested command cannot start, its local fallback shell receives the same
+  pane id without copying the failed command's transport variables.
+  A pane kept in tmux gets it when muxel creates its session, from tmux 3.2 on
+  (which can hand a new session's program a variable). On older tmux it goes
+  without, rather than inheriting another pane's id from the tmux server. Remote
+  panes go without too: muxel keeps the
+  variable off the ssh client, which an ssh `SendEnv` setting could forward, and
+  clears it from the remote tmux server, which a muxel pane on that host may have
+  started. A session muxel reattaches to or adopts keeps the environment it started
+  with.
 - **Local and owner-only** — the running app listens on a random loopback port and
   writes it, with a fresh random token, to `control.json` in muxel's data directory,
   readable only by the user; nothing is reachable from the network, and a request

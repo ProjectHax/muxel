@@ -23,6 +23,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// it. Owner-only: the token in it is the whole of the authorization.
 pub const ENDPOINT_FILE: &str = "control.json";
 
+/// The environment variable that tells a program muxel starts in a pane which
+/// pane it runs in: the pane's `uuid`, which works as AGENT. Only a pane on this
+/// computer has one; a remote pane is kept from taking one (see `ssh`).
+pub const INSTANCE_ID_ENV: &str = "MUXEL_INSTANCE_ID";
+
 /// How long after a prompt is sent an agent may take to visibly start working
 /// before `wait` stops expecting it to.
 pub const REPLY_GRACE_MS: i64 = 30_000;
@@ -1099,6 +1104,10 @@ AGENT is an agent's `id` from `panes` (like `1a2b3c4d`), its name (`Claude`),
 at. PROJECT is a project's id or name. muxels on different computers that share
 a project usually show its agents under the same ids, but each command only
 reaches the muxel on the computer it runs on.
+
+If you are running in a muxel pane yourself, the environment variable
+`MUXEL_INSTANCE_ID` holds your own pane's `uuid`, which works as AGENT: never
+`send` to it, since that types into your own input.
 
 ## Statuses
 

@@ -5867,19 +5867,14 @@ impl MuxelApp {
             .any(|arg| arg == "--settings" || arg.starts_with("--settings="));
         let local_claude = is_claude_program(agent_program.as_deref())
             && project.is_some_and(|project| project.remote.is_none());
+        // The hook finds its pane through `MUXEL_INSTANCE_ID`. Direct launches
+        // get it below; new tmux sessions get it when tmux supports `-e`.
         if local_claude
             && !has_custom_settings
             && let Some(settings_path) = crate::session_binding::claude_hook_settings()
         {
             resolved.args.push("--settings".to_string());
             resolved.args.push(settings_path);
-            resolved.env.retain(|(key, _)| {
-                !key.eq_ignore_ascii_case(crate::session_binding::MUXEL_INSTANCE_ID_ENV)
-            });
-            resolved.env.push((
-                crate::session_binding::MUXEL_INSTANCE_ID_ENV.to_string(),
-                instance_id.to_string(),
-            ));
         }
 
         // Remote (SSH) project? Resolve its configured host.
@@ -5891,6 +5886,7 @@ impl MuxelApp {
                 .effective(&self.identities);
             Some((host, r))
         });
+        let local = remote.is_none();
 
         // Build program/args (and, for local, the PTY working dir). For remote the
         // command becomes `ssh … -- 'cd <dir> && exec <program>'`; the cwd lives
@@ -5924,14 +5920,12 @@ impl MuxelApp {
                     // server inherits this argv and a stray `pkill -f <project>` kills
                     // every agent in every session. See `ensure_tmux_server`.
                     integrations::ensure_tmux_server();
-                    // No `-c`: the client is spawned with `cwd` already (below), which
-                    // is what tmux uses for a new session anyway. Passing it would put
-                    // the project's path in this client's argv for no gain.
-                    let args = muxel_core::tmux::launch_session_args(
+                    let args = crate::session_binding::tmux_pane_args(
                         &session,
-                        None,
                         resolved.program.as_deref(),
                         &resolved.args,
+                        instance_id,
+                        integrations::tmux_session_env_supported(),
                     );
                     CommandSpec::program("tmux", args)
                 }
@@ -5950,8 +5944,18 @@ impl MuxelApp {
         }
         spec = spec.with_auto_mode(resolved.auto_mode_presses);
         spec = spec.with_submit(resolved.submit);
-        spec.env = resolved.env.clone();
-        spec.env.extend(extra_env);
+        // A tmux pane's program gets its id through the tmux command above, and a
+        // tmux or ssh client none at all.
+        use crate::session_binding::PaneProcess;
+        let process = if !local {
+            PaneProcess::SshClient
+        } else if inst.is_some_and(|i| i.tmux_session.is_some()) {
+            PaneProcess::TmuxClient
+        } else {
+            PaneProcess::Program
+        };
+        (spec.env, spec.env_remove) =
+            crate::session_binding::pane_env(&resolved.env, extra_env, instance_id, process);
         // Point a memory-enabled *local* project's agent at its memory file so tools
         // can find it without being told the path. Remote agents get the path via the
         // system-prompt instruction instead (env vars don't cross the ssh boundary).

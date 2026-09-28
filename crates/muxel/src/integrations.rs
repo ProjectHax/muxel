@@ -1278,6 +1278,10 @@ pub fn ensure_tmux_server() {
     default_utf8_locale(&mut tmux);
     let _ = tmux
         .args(muxel_core::tmux::start_server_args())
+        // Every session's program inherits the server's environment. A muxel
+        // started from inside a muxel pane has that pane's id, which no session
+        // should inherit as its own.
+        .env_remove(crate::session_binding::MUXEL_INSTANCE_ID_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1293,6 +1297,28 @@ fn default_utf8_locale(cmd: &mut Command) {
     ) {
         cmd.env("LANG", muxel_core::locale::FALLBACK_UTF8_LOCALE);
     }
+}
+
+/// Whether the local tmux can start a session's program with variables of its
+/// own (`new-session -e`, tmux 3.2 and later). Asked once per run, and again
+/// while tmux can't be run at all, so one installed meanwhile is found.
+pub fn tmux_session_env_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(supported) = SUPPORTED.get() {
+        return *supported;
+    }
+    let Ok(out) = command("tmux")
+        .arg("-V")
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let version = String::from_utf8_lossy(&out.stdout);
+    *SUPPORTED.get_or_init(|| muxel_core::tmux::session_env_supported(&version))
 }
 
 /// Undo [`ensure_tmux_server`]'s `exit-empty off` so the server goes away with
