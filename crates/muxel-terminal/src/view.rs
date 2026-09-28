@@ -30,6 +30,22 @@ const FOCUSED_STREAM_INTERVAL: Duration = Duration::from_millis(33);
 /// Focused output shortly after user input: keep TUI feedback crisp.
 const FOCUSED_INTERACTION_INTERVAL: Duration = Duration::from_millis(8);
 
+/// How long a paint waits when the batch just *hid* the cursor.
+///
+/// A TUI hides the cursor to redraw and shows it again immediately after, and
+/// `coalesce_pending` only merges chunks that have already arrived — so when that
+/// pair straddles two PTY reads, the paint between them draws a frame with no
+/// cursor. Through tmux, or on a machine busy enough to split the reads, that
+/// happens often enough to look like the cursor is blinking at random.
+///
+/// Waiting briefly lets the matching show arrive and coalesce, so the missing
+/// cursor is never drawn at all. Nothing is faked: if the program really meant to
+/// hide the cursor, no show arrives and the deferred paint hides it, only this
+/// much later. The cost is bounded to batches that end with a *newly* hidden
+/// cursor, which are mid-redraw frames whose content the next batch supersedes
+/// anyway — a program that keeps its cursor hidden never pays it.
+const CURSOR_HIDE_HOLD: Duration = Duration::from_millis(80);
+
 /// Grok redraws its foreground background-work summary. Keep one exact positive
 /// observation through a brief missing frame so a repaint cannot forge a
 /// Working→Done→Working lifecycle and duplicate completion notifications.
@@ -56,13 +72,19 @@ enum PaintSchedule {
     KeepPending,
 }
 
+/// `defer` holds the paint off for at least that long from *now*, which the
+/// throttle alone cannot express: its interval is measured from the last paint, so
+/// after a quiet gap `now` is already past the deadline and the batch paints
+/// immediately however large the interval is. That is exactly the case a
+/// cursor-hide has to delay.
 fn next_paint_schedule(
     last_notify: Instant,
     pending: Option<Instant>,
     now: Instant,
     min_interval: Duration,
+    defer: Duration,
 ) -> PaintSchedule {
-    let deadline = last_notify + min_interval;
+    let deadline = (last_notify + min_interval).max(now + defer);
     if now >= deadline {
         PaintSchedule::Now
     } else if pending.is_some_and(|pending| pending <= deadline) {
@@ -1047,13 +1069,14 @@ impl TerminalView {
     /// Every path that calls `cx.notify()` here must also arm the Windows
     /// present pump ([`crate::present_flag`]): gpui-on-Windows can draw without
     /// presenting, so a frame we schedule but never mark stays off-screen.
-    fn schedule_paint(&mut self, min_interval: Duration, cx: &mut Context<Self>) {
+    fn schedule_paint(&mut self, min_interval: Duration, defer: Duration, cx: &mut Context<Self>) {
         let now = Instant::now();
         let deadline = match next_paint_schedule(
             self.last_paint_notify.get(),
             self.pending_paint_deadline.get(),
             now,
             min_interval,
+            defer,
         ) {
             PaintSchedule::Now => {
                 self.pending_paint_deadline.set(None);
@@ -1348,6 +1371,10 @@ impl TerminalView {
                 let stop = view
                     .update(cx, |view, cx| {
                         let focused = view.session.is_focused();
+                        // Sampled around `process_output` so only the *transition*
+                        // to hidden defers: a program that keeps its cursor hidden
+                        // throughout is never slowed down.
+                        let cursor_was_visible = view.session.cursor_visible();
                         if !output.is_empty() {
                             profile::output_update_started(instance_id);
                             let t0 = Instant::now();
@@ -1385,7 +1412,15 @@ impl TerminalView {
                         // trailing-edge notify if no later output arrives.
                         let interactive = view.session.is_interactive();
                         let min_interval = paint_min_interval(focused, interactive, stop);
-                        view.schedule_paint(min_interval, cx);
+                        // An exit must be drawn at once; otherwise let a batch that
+                        // just hid the cursor wait for the show that follows it.
+                        let defer = if !stop && cursor_was_visible && !view.session.cursor_visible()
+                        {
+                            CURSOR_HIDE_HOLD
+                        } else {
+                            Duration::ZERO
+                        };
+                        view.schedule_paint(min_interval, defer, cx);
                         stop
                     })
                     .unwrap_or(true);
@@ -1911,7 +1946,7 @@ mod tests {
     // Import specifically (not `super::*`) so `#[test]` resolves to the built-in
     // macro, not gpui's glob-imported `test` attribute.
     use super::{
-        AgentStatus, BACKGROUND_PAINT_INTERVAL, FOCUSED_INTERACTION_INTERVAL,
+        AgentStatus, BACKGROUND_PAINT_INTERVAL, CURSOR_HIDE_HOLD, FOCUSED_INTERACTION_INTERVAL,
         FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, TitleProvider,
         can_latch_completion, classify, clean_agent_title, combine_title_status, hold_grok_blocked,
         hold_grok_screen_working, latch_done, latch_done_after_readiness, next_paint_schedule,
@@ -2837,8 +2872,9 @@ mod tests {
         let last = std::time::Instant::now();
         let now = last + Duration::from_millis(10);
         let deadline = last + FOCUSED_STREAM_INTERVAL;
+        let no_defer = Duration::ZERO;
         assert_eq!(
-            next_paint_schedule(last, None, now, FOCUSED_STREAM_INTERVAL),
+            next_paint_schedule(last, None, now, FOCUSED_STREAM_INTERVAL, no_defer),
             PaintSchedule::At(deadline)
         );
         assert_eq!(
@@ -2847,12 +2883,76 @@ mod tests {
                 Some(deadline),
                 now + Duration::from_millis(1),
                 FOCUSED_STREAM_INTERVAL,
+                no_defer,
             ),
             PaintSchedule::KeepPending
         );
         assert_eq!(
-            next_paint_schedule(last, Some(deadline), deadline, FOCUSED_STREAM_INTERVAL),
+            next_paint_schedule(
+                last,
+                Some(deadline),
+                deadline,
+                FOCUSED_STREAM_INTERVAL,
+                no_defer
+            ),
             PaintSchedule::Now
         );
+    }
+
+    #[test]
+    fn no_defer_leaves_the_throttle_exactly_as_it_was() {
+        // The floor is measured from `now`, so zero must be a no-op on every arm.
+        let last = std::time::Instant::now();
+        let idle = last + Duration::from_secs(5);
+        assert_eq!(
+            next_paint_schedule(last, None, idle, FOCUSED_STREAM_INTERVAL, Duration::ZERO),
+            PaintSchedule::Now
+        );
+    }
+
+    #[test]
+    fn a_batch_that_hid_the_cursor_waits_even_after_a_quiet_gap() {
+        // The flicker case: output resumes long after the last paint, so the
+        // throttle would fire immediately and draw the cursorless mid-redraw
+        // frame. The defer is what holds it back.
+        let last = std::time::Instant::now();
+        let now = last + Duration::from_secs(5);
+        assert_eq!(
+            next_paint_schedule(last, None, now, FOCUSED_STREAM_INTERVAL, Duration::ZERO),
+            PaintSchedule::Now,
+            "without the defer this batch paints at once"
+        );
+        assert_eq!(
+            next_paint_schedule(last, None, now, FOCUSED_STREAM_INTERVAL, CURSOR_HIDE_HOLD),
+            PaintSchedule::At(now + CURSOR_HIDE_HOLD),
+            "with it, the matching cursor-show has time to arrive and coalesce"
+        );
+    }
+
+    #[test]
+    fn the_cursor_defer_never_paints_sooner_than_the_throttle_would() {
+        // A defer may only ever push a paint later, never pull it earlier.
+        let last = std::time::Instant::now();
+        let now = last + Duration::from_millis(1);
+        let throttled =
+            next_paint_schedule(last, None, now, BACKGROUND_PAINT_INTERVAL, Duration::ZERO);
+        let deferred =
+            next_paint_schedule(last, None, now, BACKGROUND_PAINT_INTERVAL, CURSOR_HIDE_HOLD);
+        let at = |s| match s {
+            PaintSchedule::At(t) => t,
+            other => panic!("expected At, got {other:?}"),
+        };
+        assert!(at(deferred) >= at(throttled));
+        // Here the throttle is the later of the two and still wins.
+        assert_eq!(at(throttled), last + BACKGROUND_PAINT_INTERVAL);
+        assert_eq!(at(deferred), last + BACKGROUND_PAINT_INTERVAL);
+    }
+
+    #[test]
+    fn the_hold_is_long_enough_to_bridge_a_split_but_short_enough_not_to_be_seen() {
+        // It has to outlast the gap between two reads of one redraw, while staying
+        // under the frame budget a viewer would notice as lag.
+        assert!(CURSOR_HIDE_HOLD > FOCUSED_STREAM_INTERVAL);
+        assert!(CURSOR_HIDE_HOLD <= Duration::from_millis(100));
     }
 }

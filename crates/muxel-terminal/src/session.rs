@@ -1252,6 +1252,13 @@ impl TerminalSession {
         f(&term)
     }
 
+    /// Whether the program currently wants its cursor drawn (DECTCEM, `CSI ?25h`
+    /// / `?25l`). A TUI hides it while it redraws and shows it again after, so
+    /// this flips constantly mid-frame — see the cursor-hide defer in `view.rs`.
+    pub(crate) fn cursor_visible(&self) -> bool {
+        self.with_term(|term| term.mode().contains(TermMode::SHOW_CURSOR))
+    }
+
     /// Cursor position metadata for the profiler. Terminal contents stay out of
     /// profiler state and logs.
     pub(crate) fn cursor_position(&self) -> (usize, i32) {
