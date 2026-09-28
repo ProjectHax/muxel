@@ -253,6 +253,40 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
 }
 
+/// Attach Windows GUI builds to the invoking shell's console so ctl can print.
+/// Preserve inherited redirection and avoid sharing the shell's keyboard input.
+/// If there is no parent console, or this process already has one, do nothing.
+#[cfg(windows)]
+pub fn attach_parent_console() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    // SAFETY: plain Win32 calls; the handles put back are the ones this process
+    // was started with.
+    unsafe {
+        let started = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .map(|id| (id, GetStdHandle(id).ok()));
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            return;
+        }
+        // AttachConsole replaces redirected handles too. Restore them, and leave
+        // absent stdin absent: the shell may already be reading its next prompt.
+        for (id, handle) in started {
+            match handle {
+                Some(handle) => {
+                    let _ = SetStdHandle(id, handle);
+                }
+                None if id == STD_INPUT_HANDLE => {
+                    let _ = SetStdHandle(id, HANDLE(0));
+                }
+                None => {}
+            }
+        }
+    }
+}
+
 fn fail(error: String, code: i32) -> i32 {
     emit(&with_host(json!({ "ok": false, "error": error })).to_string());
     code
@@ -325,7 +359,7 @@ fn endpoint_path() -> Option<PathBuf> {
 
 /// Whether the muxel that wrote the endpoint file is still running. A killed app
 /// leaves its file behind; its port may since belong to something else, which
-/// must not be sent the token.
+/// must not be sent the token or a prompt.
 fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -336,10 +370,28 @@ fn process_alive(pid: u32) -> bool {
         let signalled = unsafe { libc::kill(pid, 0) } == 0;
         signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = pid;
-        true
+        use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            WaitForSingleObject,
+        };
+        // SAFETY: plain Win32 calls on a handle this function opens and closes.
+        unsafe {
+            // Fail closed if either right is denied; synchronize access alone
+            // can be granted to unrelated processes. This is a liveness check,
+            // not proof of identity: an accessible reused PID can still pass.
+            let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+            let Ok(process) = OpenProcess(access, false, pid) else {
+                return false;
+            };
+            // Retained handles can keep exited processes open. Waiting avoids
+            // confusing a real exit code of 259 with STILL_ACTIVE.
+            let running = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+            let _ = CloseHandle(process);
+            running
+        }
     }
 }
 
@@ -421,8 +473,137 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_endpoint, same_secret, write_endpoint};
+    use super::{process_alive, read_endpoint, same_secret, write_endpoint};
     use muxel_core::control::Endpoint;
+
+    #[test]
+    fn a_running_process_is_alive_and_an_exited_one_is_not() {
+        assert!(process_alive(std::process::id()));
+        // 259 is also the exit code Windows reports for a process still running.
+        for code in [3, 259] {
+            let mut child = if cfg!(windows) {
+                std::process::Command::new("cmd")
+                    .args(["/C", &format!("exit {code}")])
+                    .spawn()
+            } else {
+                std::process::Command::new("sh")
+                    .args(["-c", &format!("exit {code}")])
+                    .spawn()
+            }
+            .unwrap();
+            let pid = child.id();
+            let status = child.wait().unwrap();
+            #[cfg(windows)]
+            assert_eq!(status.code(), Some(code));
+            // On Windows `child` still holds the process's handle, so the exited
+            // process is still there to open — and must still read as not running.
+            assert!(!process_alive(pid), "{status}");
+        }
+        // No process has this id.
+        assert!(!process_alive(u32::MAX));
+    }
+
+    /// Refuse inaccessible processes even when the filename or wait access fits.
+    #[cfg(windows)]
+    #[test]
+    fn a_process_we_may_not_open_is_not_alive() {
+        // A copy of cmd.exe named like muxel's own program, which no one may open:
+        // a check of the program's name would have let it through.
+        let dir = std::env::temp_dir().join(format!("muxel-ctl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let muxel = dir.join("muxel.exe");
+        std::fs::copy(std::env::var("ComSpec").unwrap(), &muxel).unwrap();
+        let named_like_muxel = alive_once_locked(&muxel, "D:");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !named_like_muxel,
+            "an unopenable muxel.exe counted as alive"
+        );
+        // cmd.exe, which lets everyone wait on it and do nothing else. Rights are
+        // granted one by one, so being allowed to wait proves nothing.
+        let cmd = std::path::Path::new("cmd");
+        let wait_only = alive_once_locked(cmd, "D:(A;;0x00100000;;;WD)");
+        assert!(!wait_only, "a process we may only wait on counted as alive");
+    }
+
+    /// Start `program` (cmd.exe or a copy, which runs until its input closes), give
+    /// its process the access list `dacl` (in SDDL), and say whether
+    /// `process_alive` then counts it as running. The child is ended either way.
+    #[cfg(windows)]
+    fn alive_once_locked(program: &std::path::Path, dacl: &str) -> bool {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+        use windows::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows::Win32::Security::{
+            AdjustTokenPrivileges, DACL_SECURITY_INFORMATION, ImpersonateSelf,
+            PSECURITY_DESCRIPTOR, RevertToSelf, SecurityImpersonation, SetKernelObjectSecurity,
+            TOKEN_ADJUST_PRIVILEGES,
+        };
+        use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        use windows::core::PCWSTR;
+        let mut child = std::process::Command::new(program)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let open = process_alive(pid);
+        let dacl: Vec<u16> = dacl.encode_utf16().chain([0]).collect();
+        // `child` keeps the full-access handle it was created with, to end it below.
+        // SAFETY: a NUL-terminated string that outlives the call, a descriptor
+        // Windows allocates and that is freed here, and the child's handle, which
+        // `child` owns and keeps open.
+        unsafe {
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(dacl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )
+            .unwrap();
+            let set = SetKernelObjectSecurity(
+                HANDLE(child.as_raw_handle() as isize),
+                DACL_SECURITY_INFORMATION,
+                sd,
+            );
+            LocalFree(HLOCAL(sd.0));
+            set.unwrap();
+        }
+        // An enabled SeDebugPrivilege bypasses process DACLs. Restrict only a
+        // fresh thread's token, leaving concurrent tests and the process alone.
+        // SAFETY: the token belongs to this thread and is closed before use of
+        // the liveness check. Impersonation ends here or when the thread exits.
+        let locked = std::thread::spawn(move || unsafe {
+            ImpersonateSelf(SecurityImpersonation).unwrap();
+            let mut token = HANDLE::default();
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_ADJUST_PRIVILEGES,
+                true,
+                &mut token,
+            )
+            .unwrap();
+            let adjusted = AdjustTokenPrivileges(token, true, None, 0, None, None);
+            let _ = CloseHandle(token);
+            adjusted.unwrap();
+            assert!(process_alive(std::process::id()));
+            let alive = process_alive(pid);
+            RevertToSelf().unwrap();
+            alive
+        })
+        .join();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            open,
+            "{} wasn't alive before it was locked",
+            program.display()
+        );
+        locked.unwrap()
+    }
 
     #[test]
     fn secrets_compare_whole() {
