@@ -5,6 +5,31 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-09-28
+
+### Fixed
+- **A laptop waking with its lid shut no longer resizes a remote session under
+  whoever is using it** — a closed laptop still wakes in the background for power
+  and network housekeeping, and muxel keeps working through those wakes. A remote
+  pane whose connection had dropped during sleep was reattached there and then, and
+  attaching resizes the tmux window on the host — so a session someone was using
+  from another machine jumped size, with nobody at the laptop at all. A remote
+  reattach now waits while the lid is shut and no external display is in use, on
+  macOS, Linux and Windows alike. The drop is still noticed, so the pane reads
+  "reconnecting…" rather than looking dead, and the first moment the lid opens it
+  reattaches immediately rather than serving out a backoff. A laptop closed with an
+  external display attached does not sleep, so it reconnects exactly as before, and
+  local panes are untouched.
+- **The cursor stops flickering while an agent is working** — an agent hides its
+  cursor to redraw and shows it again immediately afterwards, and muxel draws
+  whatever has arrived so far. When that pair landed in separate reads, the frame
+  drawn between them had no cursor, so the cursor appeared to blink at random —
+  only ever while output was flowing, and more often through tmux or on a machine
+  busy enough to split the reads. A frame that has just hidden the cursor now waits
+  a moment for the show that follows, so the cursorless frame is never drawn.
+  Nothing is guessed at: a program that really did mean to hide its cursor sends no
+  show, and the waiting frame hides it, only that much later.
+
 ## [0.2.5] — 2026-09-27
 
 ### Added
