@@ -7237,14 +7237,11 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Uuid {
-        let mut project = Project::new(name, root);
+        let project = Project::new(name, root);
         let pid = project.id;
         let preset = self.current_agent_preset();
         let instance = Instance::from_preset(pid, &preset);
-        let iid = instance.id;
-        project.layout = Some(PaneNode::leaf(iid));
 
-        self.workspace.add_instance(instance);
         self.workspace.add_project(project);
         self.workspace.active_project = Some(pid);
         // Point the open file browser at the new project right away.
@@ -7252,10 +7249,19 @@ impl MuxelApp {
             self.load_file_browser(pid, cx);
         }
 
-        self.spawn_terminal(iid, window, cx);
-        self.focus_instance(iid, window, cx);
-        self.persist();
-        cx.notify();
+        // Seed the (still empty) project through the shared path, so its first pane
+        // honours the tmux toggle like every later one. Launched bare, it would only
+        // move into tmux on the next start, when the layout sync binds it a session.
+        // The folder was just picked, so the first pane never makes a worktree.
+        self.place_and_spawn(
+            pid,
+            instance,
+            PlacementMode::Split(SplitDirection::Horizontal),
+            None,
+            Some(WorktreeChoice::None),
+            window,
+            cx,
+        );
         pid
     }
 
