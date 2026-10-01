@@ -953,6 +953,10 @@ feature is added or changed, update the matching entry here in the same change**
   with no terminal text, URLs, titles, or paths.
 - **Cross-platform** — Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and
   Windows (x86_64 + arm64).
+- **macOS menu bar** — the **muxel** application menu has Services, Hide muxel
+  (`Cmd+H`), Hide Others (`Option+Cmd+H`), Show All, and Quit muxel (`Cmd+Q`).
+  Quit asks for confirmation just like `Cmd+Q`, raising the window first so the
+  question shows even when muxel is minimized to the tray.
 - **Desktop integration** — app icon and a `.desktop` launcher entry (also the
   notification icon).
 - **Linux: self-cleaning AppImage mounts** — a muxel instance run from an

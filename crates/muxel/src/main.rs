@@ -338,6 +338,9 @@ fn main() {
             cx.set_global(theme::UiFontSize(settings.ui_font_size));
             theme::apply_initial_theme(&settings.theme, cx);
             app::install_keybindings(&settings, cx);
+            // After the keybindings: the menu shows each item's shortcut from them.
+            #[cfg(target_os = "macos")]
+            app::install_app_menu(cx);
 
             let window_bounds = muxel_store::load_window_geom().and_then(|g| {
                 if g.width > 0.0 && g.height > 0.0 {

@@ -1460,11 +1460,49 @@ pub fn register_actions(cx: &mut App) {
                     this.quit_kill_tmux_local = false;
                     this.quit_kill_tmux_remote = false;
                     this.show_quit_confirm = true;
+                    // The confirmation renders in the main window, which may be
+                    // minimized (to the tray, say) or behind a pop-out when this
+                    // comes from the menu bar or a pop-out's Cmd+Q — raise it so
+                    // the question is actually seen.
+                    if let Some(main) = this.main_window {
+                        let _ = main.update(cx, |_, window, _| window.activate_window());
+                    }
                     cx.notify();
                 }
             });
         }
     });
+    // The macOS app menu's Hide / Hide Others / Show All (see `install_app_menu`).
+    #[cfg(target_os = "macos")]
+    {
+        cx.on_action(|_: &HideApp, cx| cx.hide());
+        cx.on_action(|_: &HideOtherApps, cx| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAllApps, cx| cx.unhide_other_apps());
+    }
+}
+
+// The macOS application menu's own commands; elsewhere there's no menu bar to
+// hold them.
+#[cfg(target_os = "macos")]
+actions!(muxel, [HideApp, HideOtherApps, ShowAllApps]);
+
+/// macOS: the application menu — "muxel" in the menu bar. Its Quit dispatches the
+/// same [`Quit`] as Cmd+Q, so it asks first just the same.
+///
+/// Call after [`install_keybindings`], since the menu shows each item's shortcut
+/// from the keymap as it stands, and again after a language switch, since the
+/// labels are translated when set.
+#[cfg(target_os = "macos")]
+pub fn install_app_menu(cx: &mut App) {
+    cx.set_menus([gpui::Menu::new("muxel").items([
+        gpui::MenuItem::os_submenu(t("Services"), gpui::SystemMenuType::Services),
+        gpui::MenuItem::separator(),
+        gpui::MenuItem::action(t("Hide muxel"), HideApp),
+        gpui::MenuItem::action(t("Hide Others"), HideOtherApps),
+        gpui::MenuItem::action(t("Show All"), ShowAllApps),
+        gpui::MenuItem::separator(),
+        gpui::MenuItem::action(t("Quit muxel"), Quit),
+    ])]);
 }
 
 // Keyboard-driven actions, handled by the root view (so they have `&mut Window`)
@@ -1664,6 +1702,12 @@ pub fn install_keybindings(settings: &muxel_core::Settings, cx: &mut App) {
     // Cmd+Q (macOS) / Ctrl+Q (elsewhere) quits from any focus, including a
     // focused terminal — `secondary` resolves to the platform's quit modifier.
     bindings.push(KeyBinding::new("secondary-q", Quit, None));
+    // macOS's standard app-menu chords, shown beside their items in the menu.
+    #[cfg(target_os = "macos")]
+    {
+        bindings.push(KeyBinding::new("cmd-h", HideApp, None));
+        bindings.push(KeyBinding::new("alt-cmd-h", HideOtherApps, None));
+    }
     cx.bind_keys(bindings);
 }
 
@@ -6068,6 +6112,8 @@ impl MuxelApp {
     /// strings re-render without a restart.
     fn set_language(&mut self, lang: String, cx: &mut Context<Self>) {
         crate::i18n::set_language(&lang);
+        #[cfg(target_os = "macos")]
+        install_app_menu(cx);
         self.settings.language = if lang == "en" { None } else { Some(lang) };
         self.persist_settings();
         cx.refresh_windows();
