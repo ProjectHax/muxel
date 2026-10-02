@@ -137,6 +137,19 @@ mod imp {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn committed_url(webview: &wry::WebView) -> Option<String> {
+        use wry::WebViewExtMacOS as _;
+        let url = unsafe { webview.webview().URL() }?;
+        url.absoluteString()?;
+        webview.url().ok()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn committed_url(webview: &wry::WebView) -> Option<String> {
+        webview.url().ok()
+    }
+
     /// IPC message the page posts when it is clicked. Namespaced so it can't
     /// collide with a site that uses `window.ipc` for its own purposes.
     #[cfg(target_os = "macos")]
@@ -562,7 +575,7 @@ mod imp {
         /// tick so `Instance.browser_url` and the address bar stay fresh.
         pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
             let wv = self.webview.as_ref()?;
-            let current = wv.read(cx).url().ok()?;
+            let current = committed_url(wv.read(cx).raw())?;
             // A newly created WebView2 reports its bootstrap document before
             // the requested navigation commits. Persisting that transient URL
             // loses the resource identity and lets a fast second click create
