@@ -405,7 +405,11 @@ impl AgentPreset {
             env: Vec::new(),
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
-            startup_delay_ms: 0,
+            // Grok's welcome screen animates its logo for as long as it is shown,
+            // so its output never goes quiet and the auto wait would sit out its
+            // full cap before a runner typed anything. Its prompt is ready about a
+            // second and a half after the first draw.
+            startup_delay_ms: 3000,
             session_id_flag: Some("--session-id".to_string()),
             resume_flag: Some("--resume".to_string()),
         }

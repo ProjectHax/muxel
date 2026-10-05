@@ -105,7 +105,8 @@ feature is added or changed, update the matching entry here in the same change**
   system-prompt injection
   (via a CLI flag or by typing it in at startup), and a runner startup delay
   (ms to wait after the agent's first output before a runner types — for slow
-  starters like opencode; 0 = auto-wait until output goes quiet).
+  starters like opencode, and for Grok, whose animated welcome screen never goes
+  quiet; 0 = auto-wait until output goes quiet).
 - **Installed-binary autodetect** — agents whose binary isn't on `PATH` are hidden
   from the new-agent menus and marked "not installed" in settings; they reappear
   automatically once installed. A GUI launch reconstructs the bin dirs the desktop
@@ -355,7 +356,7 @@ feature is added or changed, update the matching entry here in the same change**
 - **Unattended firing** — when due, a loop spawns a fresh agent as its own new
   pane appended at the end of its project's layout, types the prompt, optionally
   sends auto-mode Shift+Tab presses, and respects the agent's startup delay (so
-  opencode works). The pane is **visible but not focused** and never switches your
+  opencode and Grok work). The pane is **visible but not focused** and never switches your
   active project — a loop firing on a timer can't interrupt what you're typing.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
