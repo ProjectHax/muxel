@@ -543,8 +543,13 @@ feature is added or changed, update the matching entry here in the same change**
   an empty reply, so a remote can probe for support but never see your clipboard.
 - **Color queries** — answers `OSC 10/11/12` and `OSC 4` color queries from the
   active theme's terminal palette, so TUIs detect dark/light mode correctly (and
-  the answer always matches what's painted). Replies are generated directly on
-  the PTY reader thread, while the requesting TUI is still waiting for them.
+  the answer always matches what's painted).
+- **Prompt query replies** — device-attributes (`DA1`/`DA2`), status, color and
+  OSC-52 read queries are answered directly on the PTY reader thread, while the
+  asker is still waiting, even when the UI is busy or backgrounded. A late reply
+  is read as typing (tmux forwards one into the pane, so a remote agent's prompt
+  fills with `0;2501;1c`). Replies keep query order: anything asked after a
+  cursor-position or mode report waits for that report to go first.
 - **Exit codes** — a pane's child exit status is captured, so close-on-exit and
   session-resume recovery can tell a clean `exit` from a crash (a deliberate quit
   no longer triggers resume recovery).

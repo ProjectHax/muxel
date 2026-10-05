@@ -1,7 +1,9 @@
 //! `alacritty_terminal` event listener: handles title/bell, queues OSC-52
-//! copies, answers color queries, and writes PTY responses (cursor-position
-//! reports, query replies) back to the child.
+//! copies, and writes the replies only the emulator can give (cursor-position
+//! and mode reports) back to the child. Every other query is answered on the
+//! PTY reader thread — see `replies`.
 
+use crate::replies::Replies;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::term::ClipboardType;
 use parking_lot::Mutex;
@@ -18,7 +20,7 @@ pub(crate) type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// and while the `Term` mutex is held, so it must never call back into the
 /// session; it only touches its own shared state and the PTY writer.
 pub(crate) struct MuxelListener {
-    pub writer: SharedWriter,
+    pub replies: Arc<Replies>,
     pub title: Arc<Mutex<Option<String>>>,
     /// Monotonic sequence for OSC title changes, including ResetTitle. Consumers
     /// use it to distinguish a repeated title event from an unchanged snapshot.
@@ -41,14 +43,6 @@ fn has_uuid_thread_field(title: &str) -> bool {
     uuid::Uuid::parse_str(thread).is_ok()
 }
 
-impl MuxelListener {
-    fn write_reply(&self, reply: &str) {
-        let mut writer = self.writer.lock();
-        let _ = writer.write_all(reply.as_bytes());
-        let _ = writer.flush();
-    }
-}
-
 impl EventListener for MuxelListener {
     fn send_event(&self, event: Event) {
         match event {
@@ -68,26 +62,17 @@ impl EventListener for MuxelListener {
             }
             Event::Bell => self.bell.store(true, Ordering::Relaxed),
             // Apps query the terminal (cursor position, device attributes, …);
-            // the reply must go back to the PTY's stdin.
-            Event::PtyWrite(text) => self.write_reply(&text),
+            // the reply must go back to the PTY's stdin. Those the reader thread
+            // already answered are dropped here, the rest kept in query order.
+            Event::PtyWrite(text) => self.replies.terminal_reply(&text),
             // OSC-52 copy: alacritty hands over the already-base64-decoded text;
             // queue it for the view to land on the system clipboard.
             Event::ClipboardStore(ty, text) => self.clipboard_store.lock().push((ty, text)),
-            // OSC-52 read: answer with a well-formed EMPTY reply. Returning real
-            // clipboard contents would let any program that can write to this
-            // PTY's stdout — including a compromised remote over SSH — silently
-            // exfiltrate whatever the user last copied (often a password). The
-            // empty reply keeps that hardening while TUIs that probe OSC-52
-            // support with `52;c;?` (e.g. vim autodetect) get an answer instead
-            // of hanging on a timeout.
-            Event::ClipboardLoad(_, format) => {
-                let reply = format("");
-                self.write_reply(&reply);
-            }
-            // Color queries are answered synchronously on the PTY reader thread.
-            // Waiting for this listener means waiting for the GPUI drain task,
-            // which is late enough for a TUI to treat the reply as typed text.
-            Event::ColorRequest(_, _) => {}
+            // OSC-52 reads and color queries are answered synchronously on the
+            // PTY reader thread. Waiting for this listener means waiting for the
+            // GPUI drain task, which is late enough for a TUI to treat the reply
+            // as typed text.
+            Event::ClipboardLoad(_, _) | Event::ColorRequest(_, _) => {}
             // `Wakeup` and `ChildExit` are emitted only by alacritty's own
             // EventLoop, which muxel doesn't run: repaints are driven by the
             // view's drain task, and exit (with its code) comes from the PTY
@@ -106,7 +91,9 @@ mod tests {
     fn uuid_title_hint_keeps_only_complete_thread_candidates() {
         let hint = Arc::new(Mutex::new(None));
         let listener = MuxelListener {
-            writer: Arc::new(Mutex::new(Box::new(Vec::<u8>::new()))),
+            replies: Arc::new(Replies::new(Arc::new(Mutex::new(Box::new(
+                Vec::<u8>::new(),
+            ))))),
             title: Arc::new(Mutex::new(None)),
             title_generation: Arc::new(AtomicU64::new(0)),
             title_changed_at: Arc::new(Mutex::new(None)),
