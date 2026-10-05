@@ -5,6 +5,43 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-10-05
+
+### Added
+- **The muxel menu on macOS has Quit and the usual Hide items** — the "muxel" menu
+  in the menu bar was empty, so there was no way to quit from it, and none of the
+  items every Mac app carries were there either. It now has Services, Hide muxel
+  (Cmd+H), Hide Others (Option+Cmd+H), Show All and Quit muxel (Cmd+Q). Quitting
+  from the menu asks the same confirmation as Cmd+Q, and now brings the main window
+  forward to ask it — a Quit from the menu bar, or Cmd+Q from a popped-out window,
+  could otherwise put the question in a main window that was minimized to the tray
+  or buried behind others, where nobody could see it.
+
+### Fixed
+- **A browser pane whose page can't load no longer crashes muxel on macOS** — a
+  browser pane pointed at an address that couldn't be reached (a typo in the host,
+  a site that no longer exists, or simply being offline) crashed muxel a few
+  seconds after it started. The pane is reopened on every launch, so muxel then
+  crashed every time it was opened, until the saved workspace was edited by hand.
+  A page that fails to load now just leaves the pane where it is, and muxel carries
+  on. Thanks to [@freddysae0](https://github.com/freddysae0)
+  ([#63](https://github.com/ProjectHax/muxel/pull/63)).
+- **Remote agents' prompts no longer fill up with "0;2501;1c"** — every time a
+  remote pane reattached, tmux on the host asked muxel's terminal to identify
+  itself, and muxel only answered once it got round to drawing that pane: late for
+  a pane in the background, and later still whenever the window was busy. tmux
+  stops waiting after about five seconds and hands a late answer to the agent as if
+  it had been typed, so a stray `0;2501;1c` landed in the prompt — and since the
+  session outlives reconnects, another copy piled up with every late reattach.
+  muxel now answers these questions the moment they arrive, whether or not the pane
+  is on screen. Programs that ask the terminal several questions in a row still get
+  their answers in the order they asked.
+- **A new project's first agent starts in tmux** — with tmux turned on, opening a
+  folder as a new project launched its first pane outside tmux, so that one agent
+  stopped when muxel quit and couldn't be attached to from another machine. It only
+  moved into tmux the next time muxel started. The first pane now starts in its own
+  tmux session, like every pane after it.
+
 ## [0.2.6] — 2026-09-28
 
 ### Fixed
