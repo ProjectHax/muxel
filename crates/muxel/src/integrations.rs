@@ -1267,12 +1267,25 @@ pub fn git_diff(dir: &Path) -> String {
 /// `new-session` would re-fork the server with the project name back in its argv.
 /// [`restore_tmux_exit_empty`] puts it back when muxel quits.
 pub fn ensure_tmux_server() {
-    let _ = command("tmux")
+    let mut tmux = command("tmux");
+    default_utf8_locale(&mut tmux);
+    let _ = tmux
         .args(muxel_core::tmux::start_server_args())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+}
+
+fn default_utf8_locale(cmd: &mut Command) {
+    let var = |k: &str| std::env::var(k).ok();
+    if muxel_core::locale::needs_utf8_locale(
+        var("LC_ALL").as_deref(),
+        var("LC_CTYPE").as_deref(),
+        var("LANG").as_deref(),
+    ) {
+        cmd.env("LANG", muxel_core::locale::FALLBACK_UTF8_LOCALE);
+    }
 }
 
 /// Undo [`ensure_tmux_server`]'s `exit-empty off` so the server goes away with
