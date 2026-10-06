@@ -5,6 +5,39 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.8] — 2026-10-06
+
+### Fixed
+- **A laptop reconnecting no longer resizes a session you're using on another
+  computer** — attaching to a tmux session gives the window the attaching
+  computer's size, so every time a remote pane reconnected, the session snapped to
+  that machine's pane. The lid-shut hold in 0.2.6 only covered a laptop asleep in a
+  bag: one left open on a desk, with its display asleep or simply unattended, still
+  yanked the window size out from under you whenever its Wi-Fi blipped, and the agent
+  inside redrew at the wrong size. A remote pane now reconnects without taking the
+  window size while another computer is attached, and takes part again the moment
+  you type, paste, click or scroll in a terminal on that machine — from then on the
+  window follows whoever used it last. A pane alone in its session sizes it as
+  before. This needs tmux 3.2 or newer on the host; older tmux reconnects the old
+  way.
+- **Text copied from an agent on macOS keeps its accents and symbols** — copying
+  non-ASCII text out of an agent in a tmux pane put garbage on the clipboard:
+  `aprobación` came back as `aprobaci√≥n`. The tmux server muxel starts inherited
+  the app's environment, which on macOS has no locale, so every agent inside ran
+  without one and the system clipboard read their UTF-8 as an old Mac encoding. The
+  server now starts with a UTF-8 locale when none is set. A tmux server that is
+  already running keeps its old environment until it next starts, after a reboot
+  for instance. Thanks to [@freddysae0](https://github.com/freddysae0)
+  ([#65](https://github.com/ProjectHax/muxel/pull/65)).
+- **Runners on Grok type their task in seconds, not after half a minute** — a
+  runner waits for the agent's screen to settle before it switches modes and types
+  its prompt, but Grok's welcome screen animates its logo for as long as it is
+  shown, so it never settled and the runner sat out its full 30-second limit first —
+  long enough to look like it never typed at all. Grok now waits a fixed three
+  seconds after it first draws, the way opencode already does; its prompt is ready
+  well before then. Existing Grok presets pick up the delay once, unless you've set
+  your own.
+
 ## [0.2.7] — 2026-10-05
 
 ### Added
