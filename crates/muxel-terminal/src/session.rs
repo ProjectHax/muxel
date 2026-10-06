@@ -368,6 +368,9 @@ pub struct TerminalSession {
     /// Set once Muxel deliberately submits a turn with Enter. Startup title
     /// activity alone is not evidence that a turn completed.
     turn_submitted: AtomicBool,
+    /// When the user last sent this terminal input themselves (see
+    /// [`Self::mark_user_input`]), as opposed to text muxel typed on its own.
+    last_user_input: Mutex<Option<Instant>>,
     /// Bumped whenever pixels that depend on the grid/selection/scroll/search
     /// would change. [`crate::element`] skips the full cell walk when this matches
     /// the last painted generation (draw-list replay).
@@ -743,6 +746,7 @@ impl TerminalSession {
             output_seen: AtomicBool::new(false),
             focused: AtomicBool::new(false),
             turn_submitted: AtomicBool::new(false),
+            last_user_input: Mutex::new(None),
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
@@ -921,6 +925,25 @@ impl TerminalSession {
         self.write_raw(data);
     }
 
+    /// [`Self::write_input`] for input the user produced themselves — a key typed
+    /// into the pane — so it counts as someone being at this machine.
+    pub fn write_user_input(&self, data: &[u8]) {
+        self.mark_user_input();
+        self.write_input(data);
+    }
+
+    /// Note that the user just sent this terminal input themselves: a key, a
+    /// paste, a drop, or a click or scroll the program receives. Runners, snippets,
+    /// auto-continue and outside control type on their own and never mark it.
+    pub fn mark_user_input(&self) {
+        *self.last_user_input.lock() = Some(Instant::now());
+    }
+
+    /// When the user last sent this terminal input themselves, if ever.
+    pub fn last_user_input(&self) -> Option<Instant> {
+        *self.last_user_input.lock()
+    }
+
     pub fn mark_turn_submitted(&self) {
         self.turn_submitted.store(true, Ordering::Relaxed);
     }
@@ -999,6 +1022,8 @@ impl TerminalSession {
         if lines == 0 {
             return false;
         }
+        // Only a person turns the wheel, whichever way it is dispatched below.
+        self.mark_user_input();
 
         // Decide what the wheel means, reading every relevant mode under one lock.
         enum Wheel {
@@ -1531,6 +1556,7 @@ impl TerminalSession {
             + (if control { 16 } else { 0 });
         let mut buf = Vec::with_capacity(24);
         push_mouse_report(&mut buf, button + mods, col, row, pressed, sgr);
+        self.mark_user_input();
         self.write_raw(&buf);
         // Remember an outstanding press so the matching release is guaranteed.
         self.mouse_pressed_button.store(
@@ -1587,6 +1613,7 @@ impl TerminalSession {
         let mut buf = Vec::with_capacity(24);
         // Motion is always "press" encoding in SGR (`M`).
         push_mouse_report(&mut buf, base + mods, col, row, true, sgr);
+        self.mark_user_input();
         self.write_raw(&buf);
     }
 }

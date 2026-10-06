@@ -417,6 +417,62 @@ pub struct SshSpec<'a> {
     /// Run inside a persistent tmux session on the remote host.
     pub use_tmux: bool,
     pub tmux_session: Option<&'a str>,
+    /// This machine's tag for its tmux client (see [`tmux_client_option`]). With
+    /// one, the client attaches without taking the window size and records its
+    /// name, so [`claim_window_size_command`] can hand the size back once someone
+    /// is actually at this machine. `None` attaches the plain way.
+    pub tmux_client_tag: Option<&'a str>,
+}
+
+/// The session option a tagged client records its own tmux client name in, so this
+/// machine can find its client among every other one attached to the session.
+pub fn tmux_client_option(tag: &str) -> String {
+    format!("@muxel_client_{tag}")
+}
+
+/// Whether the remote tmux supports client flags on `new-session` (tmux 3.2+,
+/// whose usage then lists `[-f flags]`). An older tmux, or one that can't list a
+/// single command, fails the match and attaches the plain way.
+const TMUX_HAS_CLIENT_FLAGS: &str =
+    "tmux list-commands new-session 2>/dev/null | grep -q 'f flags'";
+
+/// `exec tmux <targs> [-- <program>] [<tail>]`, every word shell-quoted except the
+/// program, which [`login_shell_command`] has already made a shell fragment.
+fn exec_tmux(targs: &[String], program: Option<&str>, tail: &[String]) -> String {
+    let mut cmd = "exec tmux".to_string();
+    for a in targs {
+        cmd.push(' ');
+        cmd.push_str(&sh_quote(a));
+    }
+    if let Some(program) = program {
+        cmd.push_str(" -- ");
+        cmd.push_str(program);
+    }
+    for a in tail {
+        cmd.push(' ');
+        cmd.push_str(&sh_quote(a));
+    }
+    cmd
+}
+
+/// A remote command line that gives this machine's tmux client for `session` the
+/// window size again: it clears the `ignore-size` flag the client attached with,
+/// then re-sets the client's own [`tmux_client_option`], because tmux recalculates
+/// window sizes after any option change but not after a flag change. Run once the
+/// user is at this machine. A no-op when the client never recorded itself (tmux
+/// older than 3.2) or is no longer attached to the session, since its tty name may
+/// have passed to someone else's client.
+pub fn claim_window_size_command(session: &str, tag: &str) -> String {
+    let pane = sh_quote(&format!("={session}:"));
+    let target = sh_quote(&format!("={session}"));
+    let option = sh_quote(&tmux_client_option(tag));
+    format!(
+        "{}; c=$(tmux show-options -qv -t {pane} {option}) && [ -n \"$c\" ] \
+         && tmux list-clients -t {target} -F '#{{client_name}}' | grep -qxF -- \"$c\" \
+         && tmux refresh-client -t \"$c\" -f '!ignore-size' ';' \
+         set-option -q -t {pane} {option} \"$c\"",
+        tmux_path_prelude()
+    )
 }
 
 /// A remote *program* — run through the user's login+interactive shell.
@@ -551,13 +607,14 @@ fn remote_command(spec: &SshSpec) -> String {
         // command of its own.
         let session = spec.tmux_session.unwrap_or("muxel");
         let targs = crate::tmux::launch_session_args(session, spec.remote_cwd, None, &[]);
+        let program = spec.program.map(|p| login_shell_command(p, spec.args));
         // Fork the remote tmux server off a project-less command line first — it's a
         // separate process, so the server never inherits the argv below. Without this,
         // a `pkill -f <project>` *on the remote host* matches the shared server and
         // kills every session on it. See `tmux::start_server_args`. This runs before
         // the `exec`, so it costs one short-lived process and nothing after.
         //
-        // Both `tmux` words below are resolved against the augmented PATH — sshd's bare
+        // Every `tmux` word below is resolved against the augmented PATH — sshd's bare
         // default doesn't have Homebrew's on it. See `tmux_path_prelude`.
         let mut cmd = tmux_path_prelude();
         cmd.push_str("; tmux");
@@ -565,15 +622,32 @@ fn remote_command(spec: &SshSpec) -> String {
             cmd.push(' ');
             cmd.push_str(&sh_quote(&a));
         }
-        cmd.push_str("; exec tmux");
-        for a in &targs {
-            cmd.push(' ');
-            cmd.push_str(&sh_quote(a));
+        cmd.push_str("; ");
+        // Attaching makes a client the window's latest, and under tmux's default
+        // `window-size latest` the window takes its size — so a pane reconnecting
+        // on an unattended laptop resized the session under whoever was using it
+        // elsewhere. An `ignore-size` client sits out the size while any unflagged
+        // client is attached (and still sizes the window when it is alone). It
+        // records its own name after attaching — the command after `;` runs as the
+        // attached client — so the app can clear the flag once someone is here.
+        if let Some(tag) = spec.tmux_client_tag {
+            let mut flagged = targs.clone();
+            flagged.extend(["-f".to_string(), "ignore-size".to_string()]);
+            let record = [
+                ";".to_string(),
+                "set-option".to_string(),
+                "-Fq".to_string(),
+                "-t".to_string(),
+                format!("={session}:"),
+                tmux_client_option(tag),
+                "#{client_name}".to_string(),
+            ];
+            cmd.push_str(&format!(
+                "if {TMUX_HAS_CLIENT_FLAGS}; then {}; fi; ",
+                exec_tmux(&flagged, program.as_deref(), &record)
+            ));
         }
-        if let Some(program) = spec.program {
-            cmd.push_str(" -- ");
-            cmd.push_str(&login_shell_command(program, spec.args));
-        }
+        cmd.push_str(&exec_tmux(&targs, program.as_deref(), &[]));
         cmd
     } else {
         let mut cmd = String::new();
@@ -652,6 +726,7 @@ mod tests {
                 args: &[],
                 use_tmux,
                 tmux_session: session,
+                tmux_client_tag: None,
             });
             assert!(
                 !cmd.contains("tmux"),
@@ -686,6 +761,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_client_tag: None,
         });
         assert!(cmd.starts_with("powershell.exe -NoLogo -NoExit -EncodedCommand "));
         let script = decode_encoded(&cmd);
@@ -704,6 +780,7 @@ mod tests {
             args: &["--model".to_string(), "be terse".to_string()],
             use_tmux: false,
             tmux_session: None,
+            tmux_client_tag: None,
         });
         assert!(!cmd.contains("-NoExit"), "{cmd}");
         let script = decode_encoded(&cmd);
@@ -726,6 +803,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_client_tag: None,
         });
         assert!(!cmd.contains("-NoProfile"), "{cmd}");
     }
@@ -742,6 +820,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_client_tag: None,
         });
         // A bare `cd` does not change drive on Windows.
         assert_eq!(shell, r"cmd.exe /K cd /d D:\work");
@@ -754,6 +833,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_client_tag: None,
         });
         assert!(prog.starts_with("cmd.exe /C "), "{prog}");
     }
@@ -770,6 +850,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_client_tag: None,
         });
         assert_eq!(cmd, "cd /srv/app && exec ${SHELL:-/bin/sh} -l");
     }
@@ -1000,6 +1081,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_client_tag: None,
         };
         let v = ssh_args(&spec);
         // …target, "--", command (last three).
@@ -1025,6 +1107,7 @@ mod tests {
             args: &args,
             use_tmux: false,
             tmux_session: None,
+            tmux_client_tag: None,
         };
         let v = ssh_args(&spec);
         assert_eq!(v[0], "-t");
@@ -1046,6 +1129,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_client_tag: None,
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
@@ -1064,6 +1148,7 @@ mod tests {
             args: &[],
             use_tmux: true,
             tmux_session: Some("muxel-abc123"),
+            tmux_client_tag: None,
         };
         // `-u` leads the attaching client: the remote host's login shell may hand
         // tmux no UTF-8 locale, and then it would mangle every non-ASCII cell. The
@@ -1097,6 +1182,7 @@ mod tests {
                 args: &[],
                 use_tmux: true,
                 tmux_session: Some("s"),
+                tmux_client_tag: None,
             };
             let cmd = ssh_args(&spec).last().unwrap().clone();
             let (prelude, rest) = cmd.split_once("; ").expect("a PATH prelude leads");
@@ -1133,6 +1219,7 @@ mod tests {
             args: &args,
             use_tmux: true,
             tmux_session: Some("s"),
+            tmux_client_tag: None,
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
         let (_, after) = cmd
@@ -1158,6 +1245,7 @@ mod tests {
             args: &[],
             use_tmux: true,
             tmux_session: Some("s"),
+            tmux_client_tag: None,
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
         assert!(!cmd.contains("SHELL"), "got: {cmd}");
@@ -1182,6 +1270,7 @@ mod tests {
             args: &[],
             use_tmux: true,
             tmux_session: Some("muxel_sro_client_abc123"),
+            tmux_client_tag: None,
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
         let (server, pane) = cmd.split_once("; exec ").expect("server starts first");
@@ -1191,6 +1280,66 @@ mod tests {
         );
         assert!(server.ends_with("tmux start-server ';' set -s exit-empty off"));
         assert!(pane.contains("muxel_sro_client_abc123"));
+    }
+
+    /// The bug this guards: attaching makes a client the window's latest, so a pane
+    /// reconnecting on an unattended laptop resized the session under whoever was
+    /// using it from another machine. A tagged client attaches with `ignore-size`
+    /// and records its name; a tmux too old for client flags attaches as before.
+    #[test]
+    fn a_tagged_tmux_client_attaches_without_taking_the_window_size() {
+        let h = host();
+        let spec = |tag| SshSpec {
+            host: &h,
+            control_path: "/s",
+            remote_cwd: Some("/srv/app"),
+            program: Some("claude"),
+            args: &[],
+            use_tmux: true,
+            tmux_session: Some("s"),
+            tmux_client_tag: tag,
+        };
+        let plain = ssh_args(&spec(None)).last().unwrap().clone();
+        let tagged = ssh_args(&spec(Some("ab12"))).last().unwrap().clone();
+        let program = "\"${SHELL:-/bin/sh}\" -ilc 'exec claude'";
+
+        // The server still starts first, from a command line naming no session.
+        let (server, rest) = tagged.split_once("; if ").expect("the flag probe follows");
+        assert!(plain.starts_with(&format!("{server}; exec tmux ")));
+        // tmux 3.2+: attach flagged, then record this client's name on the session.
+        assert_eq!(
+            rest,
+            format!(
+                "tmux list-commands new-session 2>/dev/null | grep -q 'f flags'; then \
+                 exec tmux -u set -g mouse on ';' new-session -A -s s -c /srv/app \
+                 -f ignore-size -- {program} ';' set-option -Fq -t '=s:' \
+                 @muxel_client_ab12 '#{{client_name}}'; fi; \
+                 exec tmux -u set -g mouse on ';' new-session -A -s s -c /srv/app -- {program}"
+            )
+        );
+        // Older tmux falls through to exactly the untagged attach.
+        let (_, untagged_exec) = plain.split_once("; exec ").unwrap();
+        assert!(tagged.ends_with(&format!("; exec {untagged_exec}")));
+    }
+
+    #[test]
+    fn claiming_the_window_size_clears_only_this_machines_client() {
+        let cmd = claim_window_size_command("muxel_app_1", "ab12");
+        let (prelude, rest) = cmd.split_once("; ").unwrap();
+        assert_eq!(prelude, tmux_path_prelude());
+        // Its own recorded client, and only while that client is still attached to
+        // this session — a tty name outlives the client that held it.
+        assert!(rest.starts_with(
+            "c=$(tmux show-options -qv -t '=muxel_app_1:' @muxel_client_ab12) && [ -n \"$c\" ]"
+        ));
+        assert!(rest.contains(
+            "tmux list-clients -t '=muxel_app_1' -F '#{client_name}' | grep -qxF -- \"$c\""
+        ));
+        // Clearing a flag recalculates nothing; re-setting an option does.
+        assert!(rest.ends_with(
+            "tmux refresh-client -t \"$c\" -f '!ignore-size' ';' \
+             set-option -q -t '=muxel_app_1:' @muxel_client_ab12 \"$c\""
+        ));
     }
 
     #[test]
@@ -1204,6 +1353,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_client_tag: None,
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),

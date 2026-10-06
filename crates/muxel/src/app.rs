@@ -2849,6 +2849,11 @@ pub struct MuxelApp {
     /// attempts this outage has made, which sets the backoff before the next one.
     /// Runtime-only.
     reconnecting: HashMap<Uuid, u32>,
+    /// Panes whose current terminal has already been through
+    /// `claim_remote_window_sizes`. A remote tmux pane attaches without taking the
+    /// window size; it claims it once someone is at this machine. Cleared on every
+    /// (re)spawn. Runtime-only.
+    size_claimed: HashSet<Uuid>,
     /// System-tray handle (when `minimize_to_tray` is on and a tray is available).
     tray: Option<muxel_tray::TrayController>,
     /// Last tray menu we pushed, so we only update on change.
@@ -3914,12 +3919,12 @@ impl Render for PopoutView {
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(|this, _: &SendTab, _w, cx| {
                 if let PaneView::Terminal(v) = &this.view {
-                    v.read(cx).session().write_input(b"\t");
+                    v.read(cx).session().write_user_input(b"\t");
                 }
             }))
             .on_action(cx.listener(|this, _: &SendBackTab, _w, cx| {
                 if let PaneView::Terminal(v) = &this.view {
-                    v.read(cx).session().write_input(b"\x1b[Z");
+                    v.read(cx).session().write_user_input(b"\x1b[Z");
                 }
             }))
             .child(
@@ -5092,6 +5097,7 @@ impl MuxelApp {
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashMap::new(),
+            size_claimed: HashSet::new(),
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
             terminal_launches: HashMap::new(),
@@ -5305,6 +5311,77 @@ impl MuxelApp {
         }
     }
 
+    /// This machine's tag for its tmux clients on `host` (see
+    /// `muxel_core::ssh::tmux_client_option`). A host's id is minted by the machine
+    /// that saved it, so every computer connecting to the same host has its own.
+    fn tmux_client_tag(host: &RemoteHost) -> String {
+        host.id.simple().to_string()
+    }
+
+    /// Hand the tmux window size back to this machine's remote panes once someone
+    /// is here. Each remote tmux pane attaches as an `ignore-size` client, so a
+    /// reconnect never resizes a session under whoever is using it from another
+    /// machine. Any key, paste, click or scroll in a terminal here after a pane
+    /// attached means someone is at this machine, and that pane's client takes part
+    /// in the size again — as attaching always did, but only once it is wanted.
+    fn claim_remote_window_sizes(&mut self, cx: &mut Context<Self>) {
+        let Some(present_at) = self
+            .terminals
+            .values()
+            .filter_map(|view| view.read(cx).session().last_user_input())
+            .max()
+        else {
+            return;
+        };
+        let due: Vec<Uuid> = self
+            .terminals
+            .iter()
+            .filter(|(iid, view)| {
+                let session = view.read(cx).session();
+                !self.size_claimed.contains(iid)
+                    // Attached by now: its client has drawn, so it recorded itself.
+                    && session.has_output()
+                    && self
+                        .terminal_launches
+                        .get(iid)
+                        .is_some_and(|&(launched, _)| present_at > launched)
+            })
+            .map(|(iid, _)| *iid)
+            .collect();
+        for iid in due {
+            self.size_claimed.insert(iid);
+            let Some(host) = self.remote_host_for_instance(iid) else {
+                continue;
+            };
+            let Some(inst) = self.workspace.instance(iid) else {
+                continue;
+            };
+            if !host.use_tmux(inst.use_tmux) {
+                continue;
+            }
+            let session =
+                muxel_core::tmux::session_for(inst.tmux_session.as_deref(), &host.name, iid);
+            let tag = Self::tmux_client_tag(&host);
+            let control_path = Self::control_path_for(host.id);
+            let password = self.remote_password(&host);
+            cx.background_executor()
+                .spawn(async move {
+                    if let Err(e) = integrations::claim_tmux_window_size(
+                        &host,
+                        &control_path,
+                        password.as_deref(),
+                        &session,
+                        &tag,
+                    ) {
+                        muxel_store::append_event_log(&format!(
+                            "window size claim failed for [{session}]: {e:#}"
+                        ));
+                    }
+                })
+                .detach();
+        }
+    }
+
     /// The configured remote host for an instance's project, if any — with any
     /// referenced login identity's credentials already overlaid ([`RemoteHost::effective`]).
     fn remote_host_for_instance(&self, iid: Uuid) -> Option<RemoteHost> {
@@ -5338,6 +5415,7 @@ impl MuxelApp {
         // `tmux::session_for`.
         let session = inst
             .map(|i| muxel_core::tmux::session_for(i.tmux_session.as_deref(), &host.name, i.id));
+        let tag = Self::tmux_client_tag(host);
         let ssh_argv = muxel_core::ssh::ssh_args(&muxel_core::ssh::SshSpec {
             host,
             control_path: &control_path,
@@ -5346,6 +5424,7 @@ impl MuxelApp {
             args: &resolved.args,
             use_tmux,
             tmux_session: session.as_deref(),
+            tmux_client_tag: Some(&tag),
         });
         // sshpass -e reads the password from $SSHPASS (kept off the command line /
         // process list). Without a password, never use `sshpass -e` (it would
@@ -5751,6 +5830,8 @@ impl MuxelApp {
     fn reset_terminal_runtime(&mut self, iid: Uuid) {
         // A respawn replaces any exited view; its next exit is a fresh event.
         self.exit_logged.remove(&iid);
+        // A fresh attach is a fresh `ignore-size` client, waiting to claim again.
+        self.size_claimed.remove(&iid);
         // Re-baseline auto-continue against the new screen (keeping its Auto toggle):
         // otherwise a reattach's replayed scrollback is compared to the old
         // fingerprint/cooldown and can fire `continue` again for already-done work.
@@ -7768,7 +7849,7 @@ impl MuxelApp {
         if let Some(iid) = self.active_instance
             && let Some(view) = self.terminals.get(&iid)
         {
-            view.read(cx).session().write_input(bytes);
+            view.read(cx).session().write_user_input(bytes);
         }
     }
 
@@ -8990,6 +9071,7 @@ impl MuxelApp {
         if resized {
             self.persist();
         }
+        self.claim_remote_window_sizes(cx);
 
         // Keep the program-supplied name for restart/resume UI. A manual name is
         // stored separately and always wins at render time.

@@ -1808,7 +1808,7 @@ impl TerminalView {
                 self.session.mark_turn_submitted();
             }
             profile::key_started(self.instance_id, t0);
-            self.session.write_input(&bytes);
+            self.session.write_user_input(&bytes);
             if cleared {
                 cx.notify();
             }
@@ -1827,6 +1827,8 @@ pub fn paste_clipboard_into_session(session: &TerminalSession, cx: &App) {
     let Some(item) = cx.read_from_clipboard() else {
         return;
     };
+    // Only ever a user's own paste (a key or a mouse button), never automation.
+    session.mark_user_input();
     for entry in item.entries() {
         match entry {
             ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
@@ -1880,6 +1882,7 @@ impl Render for TerminalView {
             // OS file drops (Explorer → pane) arrive as an internal gpui drag of
             // ExternalPaths, not as FileDropEvent listeners. Same path Zed uses.
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                this.session.mark_user_input();
                 this.session.paste_paths(paths.paths());
                 this.session.clear_selection();
                 cx.notify();
