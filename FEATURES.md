@@ -819,8 +819,12 @@ feature is added or changed, update the matching entry here in the same change**
   and muxel keeps retrying on its own — backing off to one attempt every 30s, for as
   long as the outage lasts — until the host is reachable and reattaches the agent
   right where it left off. Resuming a laptop whose Wi-Fi isn't up yet just costs a
-  retry or two. On a laptop, a drop noticed while the lid is shut (a Power Nap,
-  maintenance or wake-timer wake in your bag) waits for the lid to open before
+  retry or two. The notification feed reports an outage once per host, not per pane:
+  one entry counts the panes still reconnecting and turns into "reconnected" when
+  they're all back, so waking with a dozen agents running is one line, not two dozen
+  (dismiss it and it stays dismissed until the next outage). On a laptop, a drop
+  noticed while the lid is shut (a Power Nap, maintenance or wake-timer wake in your
+  bag) waits for the lid to open before
   reattaching — attaching resizes the host's tmux window, which would otherwise yank
   it out from under you if you're using that session from another machine. Working
   lid-down on an external display reconnects as usual. Works on macOS, Windows, and

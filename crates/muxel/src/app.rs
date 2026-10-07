@@ -24,6 +24,7 @@ use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
 use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
 use muxel_core::memory::{self, MemoryEntry};
+use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity, InjectionMode, Instance,
@@ -2849,6 +2850,9 @@ pub struct MuxelApp {
     /// attempts this outage has made, which sets the backoff before the next one.
     /// Runtime-only.
     reconnecting: HashMap<Uuid, u32>,
+    /// The same outages grouped by host, so the feed reports a host's dropped
+    /// panes in one entry instead of two per pane. Runtime-only.
+    host_outages: HostOutages,
     /// Panes whose current terminal has already been through
     /// `claim_remote_window_sizes`. A remote tmux pane attaches without taking the
     /// window size; it claims it once someone is at this machine. Cleared on every
@@ -5097,6 +5101,7 @@ impl MuxelApp {
             auto: HashMap::new(),
             exit_logged: HashSet::new(),
             reconnecting: HashMap::new(),
+            host_outages: HostOutages::default(),
             size_claimed: HashSet::new(),
             tray: None,
             last_tray_model: muxel_tray::TrayModel::default(),
@@ -9411,11 +9416,14 @@ impl MuxelApp {
                     .is_some_and(|&(at, _)| at.elapsed().as_secs() >= RECONNECT_SETTLE_SECS)
             {
                 self.reconnecting.remove(&iid);
-                self.add_event(
-                    NotifKind::Success,
-                    tf("{title}: reconnected", &[("title", &title)]),
-                    t("The remote session picked up where it left off.").to_string(),
-                );
+                match self.host_outages.reconnected(iid, Instant::now()) {
+                    Some(update) => self.show_outage(update),
+                    None => self.add_event(
+                        NotifKind::Success,
+                        tf("{title}: reconnected", &[("title", &title)]),
+                        t("The remote session picked up where it left off.").to_string(),
+                    ),
+                }
                 dirty = true;
             }
             // Record each process exit exactly once in the durable event log —
@@ -9587,7 +9595,8 @@ impl MuxelApp {
             // the session and the agent relaunches with `--resume <id>`, restoring the
             // conversation from its transcript — the tmux scrollback is the only
             // casualty. Resetting the id would throw the conversation away.
-            let is_remote = self.remote_host_for_instance(iid).is_some();
+            let host = self.remote_host_for_instance(iid).map(|h| h.id);
+            let is_remote = host.is_some();
             // Attaching resizes the host's tmux window to this pane. With the lid shut
             // (and no external display in use) the laptop is only up for a background
             // or spurious wake — nobody is here — so a reattach then just yanks the
@@ -9608,18 +9617,14 @@ impl MuxelApp {
             } else {
                 *attempts + 1
             };
-            if is_remote {
+            if let Some(host) = host {
                 // The tmux session lives on the host and outlives a dropped relay, so
                 // `tmux_session_exists` (a *local* check) is meaningless here — never
                 // claim the session was lost. The pane shows "reconnecting…" until
                 // this respawn's `tmux new-session -A` reattaches it.
                 if first_drop {
-                    self.add_event(
-                        NotifKind::Blocked,
-                        tf("{title}: connection lost — reconnecting…", &[("title", &title)]),
-                        t("The tmux session is still running on the host; muxel will reattach as soon as it's reachable.")
-                            .to_string(),
-                    );
+                    let update = self.host_outages.dropped(host, iid, Instant::now());
+                    self.show_outage(update);
                     muxel_store::append_event_log(&format!(
                         "reconnect: \"{title}\" [{session}]{}",
                         if held {
@@ -9700,6 +9705,18 @@ impl MuxelApp {
         self.last_activity_labels
             .retain(|iid, _| live.contains(iid));
         self.exit_logged.retain(|iid| live.contains(iid));
+        let closed_mid_outage: Vec<Uuid> = self
+            .reconnecting
+            .keys()
+            .filter(|iid| !live.contains(iid))
+            .copied()
+            .collect();
+        for iid in closed_mid_outage {
+            if let Some(update) = self.host_outages.forget(iid, Instant::now()) {
+                self.show_outage(update);
+                dirty = true;
+            }
+        }
         self.reconnecting.retain(|iid, _| live.contains(iid));
         self.auto.retain(|iid, _| live.contains(iid));
         self.readings.retain(&live);
@@ -9996,6 +10013,18 @@ impl MuxelApp {
         title: impl Into<String>,
         subtitle: impl Into<String>,
     ) {
+        self.put_event(Uuid::new_v4(), kind, title, subtitle);
+    }
+
+    /// Show event `id` in the feed as its newest entry, replacing the earlier
+    /// version of it — for an entry that follows something still unfolding.
+    fn put_event(
+        &mut self,
+        id: Uuid,
+        kind: NotifKind,
+        title: impl Into<String>,
+        subtitle: impl Into<String>,
+    ) {
         let title = title.into();
         let subtitle = subtitle.into();
         // Errors also land in the developer console — a persistent, detailed log.
@@ -10012,8 +10041,9 @@ impl MuxelApp {
                 self.dev_log.drain(0..len - DEV_MAX);
             }
         }
+        self.notifications.retain(|n| n.id != id);
         self.notifications.push(Notification {
-            id: Uuid::new_v4(),
+            id,
             instance: None,
             kind,
             title,
@@ -10042,6 +10072,61 @@ impl MuxelApp {
     /// Re-arm `report_save_error` for `target` after a successful save.
     fn clear_save_error(&mut self, target: SaveTarget) {
         self.save_errors.remove(&target);
+    }
+
+    /// Bring a host's single reconnect entry up to date. Once the user has
+    /// dismissed it, it stays dismissed for the rest of that outage; a new outage
+    /// is news again.
+    fn show_outage(&mut self, update: OutageUpdate) {
+        let shown = self.notifications.iter().any(|n| n.id == update.entry);
+        if !update.fresh && !shown {
+            return;
+        }
+        let host = self
+            .remotes
+            .iter()
+            .find(|h| h.id == update.host)
+            .map(|h| h.name.clone())
+            .unwrap_or_default();
+        match update.state {
+            OutageState::Reconnecting { waiting, back } => {
+                let title = if back == 0 {
+                    tn(
+                        "{host}: connection lost — reconnecting {n} pane…",
+                        "{host}: connection lost — reconnecting {n} panes…",
+                        waiting,
+                        &[("host", &host), ("n", &waiting.to_string())],
+                    )
+                } else {
+                    tf(
+                        "{host}: reconnecting — {back} of {total} panes back…",
+                        &[
+                            ("host", &host),
+                            ("back", &back.to_string()),
+                            ("total", &(back + waiting).to_string()),
+                        ],
+                    )
+                };
+                self.put_event(
+                    update.entry,
+                    NotifKind::Blocked,
+                    title,
+                    t("The tmux sessions are still running on the host; muxel will reattach as soon as it's reachable."),
+                );
+            }
+            OutageState::Reconnected { panes } => self.put_event(
+                update.entry,
+                NotifKind::Success,
+                tf("{host}: reconnected", &[("host", &host)]),
+                tn(
+                    "The remote session picked up where it left off.",
+                    "All {n} remote sessions picked up where they left off.",
+                    panes,
+                    &[("n", &panes.to_string())],
+                ),
+            ),
+            OutageState::Cleared => self.notifications.retain(|n| n.id != update.entry),
+        }
     }
 
     /// Remove any notification(s) targeting `iid` (attending or closing a pane).

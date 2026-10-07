@@ -13,6 +13,7 @@ mod gui_path;
 pub mod import;
 pub mod locale;
 pub mod memory;
+pub mod outage;
 mod pane;
 pub mod readaloud;
 pub mod remote_ops;
