@@ -13,8 +13,40 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// What gets typed (then Enter) when the agent is nudged.
+/// What gets typed (then Enter) when the agent is nudged, unless the user has set
+/// their own in Settings → Behavior ([`crate::Settings::auto_continue_message`]).
 pub const AUTO_CONTINUE_MESSAGE: &str = "continue";
+
+/// The auto-continue message to save for what the user typed into the setting.
+/// It is typed into the agent's prompt and followed by Enter, so a line break
+/// inside it would submit half of it: lines are joined with spaces. Blank restores
+/// the default, since an empty message would only press Enter on an empty prompt.
+pub fn auto_continue_message(typed: &str) -> String {
+    let joined = typed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if joined.is_empty() {
+        AUTO_CONTINUE_MESSAGE.to_string()
+    } else {
+        joined
+    }
+}
+
+/// A pane's own auto-continue message for what the user typed into its popup,
+/// given the `default` from Settings. `None` means the pane follows the default:
+/// a blank entry, or one that says the same as the default (the popup opens
+/// pre-filled with it, so saving it untouched mustn't pin today's default to the
+/// pane).
+pub fn pane_auto_continue_message(typed: &str, default: &str) -> Option<String> {
+    if typed.trim().is_empty() {
+        return None;
+    }
+    let message = auto_continue_message(typed);
+    (message != auto_continue_message(default)).then_some(message)
+}
 
 /// How many times in a row `continue` may fire without the screen changing at all
 /// before auto-continue gives up and hands the pane back to the user. This is the
@@ -313,9 +345,42 @@ fn count_before(hay: &str, word: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoAction, AutoContinue, PaneActivity, has_pending_tasks, is_checkpoint_pause,
-        looks_finished,
+        AUTO_CONTINUE_MESSAGE, AutoAction, AutoContinue, PaneActivity, auto_continue_message,
+        has_pending_tasks, is_checkpoint_pause, looks_finished, pane_auto_continue_message,
     };
+
+    #[test]
+    fn a_pane_message_overrides_only_when_it_differs_from_the_default() {
+        assert_eq!(
+            pane_auto_continue_message("finish phase 3\nthen stop", "continue"),
+            Some("finish phase 3 then stop".to_string())
+        );
+        // Saving the pre-filled default, or clearing the field, follows Settings.
+        assert_eq!(pane_auto_continue_message("  continue ", "continue"), None);
+        assert_eq!(pane_auto_continue_message("", "keep going"), None);
+        assert_eq!(pane_auto_continue_message(" \n ", "keep going"), None);
+        // "continue" is an override once the default says something else.
+        assert_eq!(
+            pane_auto_continue_message("continue", "keep going"),
+            Some("continue".to_string())
+        );
+    }
+
+    #[test]
+    fn auto_continue_message_is_one_line_and_never_blank() {
+        assert_eq!(
+            auto_continue_message("  keep going, next phase  "),
+            "keep going, next phase"
+        );
+        // A line break would press Enter mid-message.
+        assert_eq!(
+            auto_continue_message("continue\n  with phase 2\r\n"),
+            "continue with phase 2"
+        );
+        for blank in ["", "   ", "\n\n"] {
+            assert_eq!(auto_continue_message(blank), AUTO_CONTINUE_MESSAGE);
+        }
+    }
 
     // A todo panel like the one Claude renders, mid-plan.
     const MID_PLAN: &str = "\

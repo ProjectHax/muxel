@@ -80,6 +80,10 @@ struct Instance: Codable, Equatable, Identifiable {
     var worktreePath: String?
     var worktreeBranch: String?
     var autoModePresses: Int = 0
+    /// The pane's own auto-continue message (desktop Auto button, right-click).
+    /// iOS doesn't auto-continue, but preserves this so an iOS layout write-back
+    /// doesn't strip it from the peer.
+    var autoContinueMessage: String?
     var isRunner: Bool = false
     var autoSubmit: Bool = false
     var pinned: Bool = false
@@ -106,6 +110,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case worktreePath = "worktree_path"
         case worktreeBranch = "worktree_branch"
         case autoModePresses = "auto_mode_presses"
+        case autoContinueMessage = "auto_continue_message"
         case isRunner = "is_runner"
         case autoSubmit = "auto_submit"
         case pinned
@@ -148,6 +153,7 @@ struct Instance: Codable, Equatable, Identifiable {
         worktreePath = try c.decodeIfPresent(String.self, forKey: .worktreePath)
         worktreeBranch = try c.decodeIfPresent(String.self, forKey: .worktreeBranch)
         autoModePresses = (try c.decodeIfPresent(Int.self, forKey: .autoModePresses)) ?? 0
+        autoContinueMessage = try c.decodeIfPresent(String.self, forKey: .autoContinueMessage)
         isRunner = (try c.decodeIfPresent(Bool.self, forKey: .isRunner)) ?? false
         autoSubmit = (try c.decodeIfPresent(Bool.self, forKey: .autoSubmit)) ?? false
         pinned = (try c.decodeIfPresent(Bool.self, forKey: .pinned)) ?? false
@@ -179,6 +185,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(worktreePath, forKey: .worktreePath)
         try c.encode(worktreeBranch, forKey: .worktreeBranch)
         try c.encode(autoModePresses, forKey: .autoModePresses)
+        try c.encode(autoContinueMessage, forKey: .autoContinueMessage)
         try c.encode(isRunner, forKey: .isRunner)
         try c.encode(autoSubmit, forKey: .autoSubmit)
         try c.encode(pinned, forKey: .pinned)

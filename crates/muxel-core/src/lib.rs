@@ -543,6 +543,11 @@ pub struct Instance {
     /// Shift+Tab presses to send at startup (runner "auto mode"); 0 = none.
     #[serde(default)]
     pub auto_mode_presses: u8,
+    /// This pane's own auto-continue message, set from its **Auto** button's
+    /// right-click popup. `None` follows [`Settings::auto_continue_message`]. Lives
+    /// as long as the pane; see [`autopilot::pane_auto_continue_message`].
+    #[serde(default)]
+    pub auto_continue_message: Option<String>,
     /// Created by a runner (one-off task launcher).
     #[serde(default)]
     pub is_runner: bool,
@@ -636,6 +641,7 @@ impl Instance {
             worktree_path: None,
             worktree_branch: None,
             auto_mode_presses: 0,
+            auto_continue_message: None,
             is_runner: false,
             // New instances submit their startup prompt; persisted ones default
             // to false (so restored runners re-type without auto-submitting).
@@ -698,6 +704,7 @@ impl Instance {
             worktree_path: None,
             worktree_branch: None,
             auto_mode_presses: 0,
+            auto_continue_message: None,
             is_runner: false,
             auto_submit: false,
             pinned: false,
@@ -2150,6 +2157,11 @@ pub struct Settings {
     /// The spoken phrase that triggers the wake command.
     #[serde(default = "default_stt_wake_phrase")]
     pub stt_wake_phrase: String,
+    /// What a pane's **Auto** toggle types (then Enter) to resume an agent that
+    /// stalled with work left. Kept to one non-blank line by
+    /// [`autopilot::auto_continue_message`].
+    #[serde(default = "default_auto_continue_message")]
+    pub auto_continue_message: String,
     // --- Text-to-speech (the voice read-aloud speaks in; see crates/muxel/src/tts.rs) ---
     /// Which synthesizer speaks. Defaults to the OS voice: it needs no model and
     /// no key, so speech works on a fresh install with nothing configured.
@@ -2223,6 +2235,9 @@ fn default_stt_provider_model() -> String {
 }
 fn default_stt_wake_phrase() -> String {
     stt::DEFAULT_WAKE_PHRASE.to_string()
+}
+fn default_auto_continue_message() -> String {
+    autopilot::AUTO_CONTINUE_MESSAGE.to_string()
 }
 fn default_kokoro_voice() -> String {
     tts::DEFAULT_KOKORO_VOICE.to_string()
@@ -2477,6 +2492,7 @@ impl Default for Settings {
             stt_autosubmit: false,
             stt_wake_command: false,
             stt_wake_phrase: default_stt_wake_phrase(),
+            auto_continue_message: default_auto_continue_message(),
             tts_engine: TtsEngine::default(),
             tts_system_voice: String::new(),
             tts_rate: default_tts_rate(),

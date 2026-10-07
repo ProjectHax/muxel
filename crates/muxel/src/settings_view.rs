@@ -233,6 +233,10 @@ pub struct SettingsUi {
     // Appearance.
     pub font_family: Entity<InputState>,
 
+    // Behavior.
+    /// What a pane's Auto toggle types to resume a stalled agent.
+    pub auto_continue_message: Entity<InputState>,
+
     // Editor.
     pub editor_font_family: Entity<InputState>,
 
@@ -389,6 +393,10 @@ impl SettingsUi {
             proj_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Project name"))),
             font_family: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t("DejaVu Sans Mono"))),
+            auto_continue_message: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(muxel_core::autopilot::AUTO_CONTINUE_MESSAGE.to_string())
+            }),
             editor_font_family: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t("theme monospace"))),
             stt_provider_url: cx

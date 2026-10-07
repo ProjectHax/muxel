@@ -280,7 +280,11 @@ feature is added or changed, update the matching entry here in the same change**
   the first phase and just stops, waiting, with the todo list still half-unchecked.
   Each agent pane has an **Auto** toggle in its header: while it's on, muxel watches
   the pane and, whenever the agent goes idle with work still to do, types `continue`
-  and presses Enter for you. It fires when it can see pending work — Claude's `☐`
+  and presses Enter for you. The message is yours to change in Settings → Behavior
+  → Auto-continue message (kept to one line; blank restores `continue`), and
+  right-clicking a pane's **Auto** button gives that one pane its own, in a popup
+  pre-filled with what it types now. A pane's message stays with it, across
+  restarts, until the pane is closed; blank goes back to the default. It fires when it can see pending work — Claude's `☐`
   checkboxes or an "N pending" count — or when the agent voluntarily stops to check
   in ("My recommendation is to pause here.", "Shall I continue?", "I'd hold here
   unless you want that scaled run."), so a plan keeps moving without you babysitting

@@ -3078,6 +3078,10 @@ pub struct MuxelApp {
     /// Active password prompt (host without a saved password), + its input.
     password_prompt: Option<PasswordPrompt>,
     password_prompt_input: Entity<InputState>,
+    /// Pane whose Auto button was right-clicked: the popup editing that pane's own
+    /// auto-continue message is open. + its input.
+    auto_message_popup: Option<Uuid>,
+    auto_message_input: Entity<InputState>,
     /// Anchor point for the toolbar "Run task" runner popup, when open.
     runners_menu: Option<Point<Pixels>>,
     /// Anchor point for the toolbar "Loops" popup, when open.
@@ -4882,6 +4886,20 @@ impl MuxelApp {
         });
         let nr_name = cx.new(|cx| InputState::new(window, cx).placeholder(t("Project name")));
 
+        let auto_message_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t("blank = the default from Settings → Behavior"))
+        });
+        cx.subscribe_in(
+            &auto_message_input,
+            window,
+            |this, _input, ev: &InputEvent, _window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    this.save_auto_message_popup(cx);
+                }
+            },
+        )
+        .detach();
         let password_prompt_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .masked(true)
@@ -5085,6 +5103,8 @@ impl MuxelApp {
             session_passwords: HashMap::new(),
             password_prompt: None,
             password_prompt_input,
+            auto_message_popup: None,
+            auto_message_input,
             runners_menu: None,
             loops_menu: None,
             snippets_menu: None,
@@ -9718,6 +9738,13 @@ impl MuxelApp {
             }
         }
         self.reconnecting.retain(|iid, _| live.contains(iid));
+        if self
+            .auto_message_popup
+            .is_some_and(|iid| !live.contains(&iid))
+        {
+            self.auto_message_popup = None;
+            dirty = true;
+        }
         self.auto.retain(|iid, _| live.contains(iid));
         self.readings.retain(&live);
         // Auto-continue: nudge armed panes whose agent has stalled with work left.
@@ -9750,18 +9777,138 @@ impl MuxelApp {
     /// Type the auto-continue message into pane `iid` and press Enter — without
     /// stealing focus, since this fires while the user is doing something else.
     ///
-    /// Typed as literal keystrokes (not a bracketed paste): it's a one-word command,
-    /// and typing it is exactly what the user would do, with no paste-mode markers
-    /// for an agent's input box to mishandle.
+    /// Typed as literal keystrokes (not a bracketed paste): it's a short one-line
+    /// command (Settings → Behavior), and typing it is exactly what the user would
+    /// do, with no paste-mode markers for an agent's input box to mishandle.
     fn send_continue(&self, iid: Uuid, cx: &App) {
         if let Some(session) = self
             .terminals
             .get(&iid)
             .map(|v| v.read(cx).session().clone())
         {
-            session.write_input(autopilot::AUTO_CONTINUE_MESSAGE.as_bytes());
+            session.write_input(self.continue_message_for(iid).as_bytes());
             session.write_input(b"\r");
         }
+    }
+
+    /// What auto-continue types into pane `iid`: the pane's own message if it has
+    /// one, else the default from Settings → Behavior. Normalized here too, not only
+    /// when saved: a hand-edited settings or workspace file could hold a line break,
+    /// which would press Enter mid-message.
+    fn continue_message_for(&self, iid: Uuid) -> String {
+        let message = self
+            .workspace
+            .instance(iid)
+            .and_then(|inst| inst.auto_continue_message.as_deref())
+            .unwrap_or(&self.settings.auto_continue_message);
+        autopilot::auto_continue_message(message)
+    }
+
+    /// Right-click on a pane's Auto button: edit the message auto-continue types
+    /// into that pane, starting from what it types now.
+    fn open_auto_message_popup(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let message = self.continue_message_for(iid);
+        self.auto_message_popup = Some(iid);
+        self.auto_message_input
+            .update(cx, |s, cx| s.set_value(message, window, cx));
+        let handle = self.auto_message_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn close_auto_message_popup(&mut self, cx: &mut Context<Self>) {
+        self.auto_message_popup = None;
+        cx.notify();
+    }
+
+    /// Save the popup's message on its pane, where it stays until the pane is
+    /// closed. Blank, or the same as the default, goes back to following Settings.
+    fn save_auto_message_popup(&mut self, cx: &mut Context<Self>) {
+        let Some(iid) = self.auto_message_popup.take() else {
+            return;
+        };
+        let typed = self.auto_message_input.read(cx).value().to_string();
+        let message =
+            autopilot::pane_auto_continue_message(&typed, &self.settings.auto_continue_message);
+        if let Some(inst) = self.workspace.instance_mut(iid)
+            && inst.auto_continue_message != message
+        {
+            inst.auto_continue_message = message;
+            self.persist();
+        }
+        cx.notify();
+    }
+
+    /// The project window showing `auto_message_popup`'s pane, if it's one on
+    /// another monitor (see [`Self::secondary_pid_for_instance`]).
+    fn auto_message_window_pid(&self) -> Option<Uuid> {
+        self.secondary_pid_for_instance(self.auto_message_popup?)
+    }
+
+    fn render_auto_message_popup(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(iid) = self.auto_message_popup else {
+            return div().into_any_element();
+        };
+        let pane = self.instance_title(iid, cx);
+        modal_backdrop()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _window, cx| this.close_auto_message_popup(cx)),
+            )
+            .child(
+                div()
+                    .w(px(420.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_5()
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius_lg)
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                        if ev.keystroke.key == "escape" {
+                            this.close_auto_message_popup(cx);
+                        }
+                    }))
+                    .child(div().text_lg().font_semibold().child(tf(
+                        "Auto-continue message for “{pane}”",
+                        &[("pane", &pane)],
+                    )))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t("Typed, then Enter, when Auto resumes this pane. Kept until the pane is closed; blank uses the default from Settings → Behavior.")),
+                    )
+                    .child(Input::new(&self.auto_message_input))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .child(
+                                Button::new("auto-message-cancel")
+                                    .ghost()
+                                    .label(t("Cancel"))
+                                    .on_click(cx.listener(|this, _e, _window, cx| {
+                                        this.close_auto_message_popup(cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("auto-message-save")
+                                    .primary()
+                                    .label(t("Save"))
+                                    .on_click(cx.listener(|this, _e, _window, cx| {
+                                        this.save_auto_message_popup(cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Auto-continue pass, run each `tick`. For every armed pane, feed its current
@@ -10931,6 +11078,7 @@ impl MuxelApp {
             &self.nr_dir,
             &self.nr_name,
             &self.password_prompt_input,
+            &self.auto_message_input,
             &self.runner_input,
             &self.search_input,
             &self.find_input,
@@ -11012,6 +11160,7 @@ impl MuxelApp {
             || self.stt_state != SttState::Idle
             || self.git_modal.is_some()
             || self.password_prompt.is_some()
+            || self.auto_message_popup.is_some()
             || self.confirm.is_some()
             || self.place_menu.is_some()
             || self.runners_menu.is_some()
@@ -14813,6 +14962,10 @@ impl MuxelApp {
             .children(
                 (self.confirm_window_pid() == Some(pid)).then(|| self.render_confirm_modal(cx)),
             )
+            .children(
+                (self.auto_message_window_pid() == Some(pid))
+                    .then(|| self.render_auto_message_popup(cx)),
+            )
             .into_any_element()
     }
 
@@ -15200,7 +15353,12 @@ impl MuxelApp {
     /// sits on another monitor, and the modal would open over the main window
     /// while the pane the user just tried to close is somewhere else entirely.
     fn confirm_window_pid(&self) -> Option<Uuid> {
-        let iid = self.confirm.as_ref()?.action.pane_instance()?;
+        self.secondary_pid_for_instance(self.confirm.as_ref()?.action.pane_instance()?)
+    }
+
+    /// The project window on another monitor that shows pane `iid`, if any. A
+    /// dialog about a pane belongs in the window showing it, not over the main one.
+    fn secondary_pid_for_instance(&self, iid: Uuid) -> Option<Uuid> {
         let pid = self.workspace.instance(iid)?.project_id;
         self.secondary_windows
             .iter()
@@ -18302,19 +18460,33 @@ impl MuxelApp {
                     // button; diff panes get a "refresh" button instead.
                     .children((kind == InstanceKind::Terminal).then(|| {
                         let on = self.auto_continue_on(iid);
+                        let message = self.continue_message_for(iid);
                         Button::new(SharedString::from(format!("auto-{sid}")))
                             .ghost()
                             .xsmall()
                             .selected(on)
                             .label(t("Auto"))
                             .tooltip(if on {
-                                t("Auto-continue is on — types \"continue\" when the agent stalls with tasks still to do. Click to turn off.")
+                                tf(
+                                    "Auto-continue is on — types “{message}” when the agent stalls with tasks still to do. Click to turn off; right-click to change the message for this pane.",
+                                    &[("message", &message)],
+                                )
                             } else {
-                                t("Auto-continue: keep this agent going — type \"continue\" whenever it stalls with unfinished tasks on screen.")
+                                tf(
+                                    "Auto-continue: keep this agent going — type “{message}” whenever it stalls with unfinished tasks on screen. Right-click to change the message for this pane.",
+                                    &[("message", &message)],
+                                )
                             })
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 this.toggle_auto_continue(iid, cx)
                             }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, _e: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_auto_message_popup(iid, window, cx);
+                                }),
+                            )
                     }))
                     .children((kind == InstanceKind::Terminal).then(|| {
                         Button::new(SharedString::from(format!("diff-{sid}")))
@@ -21890,6 +22062,7 @@ impl MuxelApp {
                 notifications: self.notifications_enabled,
             });
             self.load_appearance_inputs(window, cx);
+            self.load_behavior_inputs(window, cx);
             self.load_speech_inputs(window, cx);
             self.load_read_aloud_inputs(window, cx);
             self.load_system_voices(cx);
@@ -21981,6 +22154,34 @@ impl MuxelApp {
     fn apply_font_family(&mut self, cx: &mut Context<Self>) {
         self.settings.font_family = self.settings_ui.font_family.read(cx).value().to_string();
         self.refresh_terminal_config(cx);
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Seed the Behavior section's text input from the current settings.
+    fn load_behavior_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let message = self.settings.auto_continue_message.clone();
+        self.settings_ui
+            .auto_continue_message
+            .update(cx, |s, cx| s.set_value(message, window, cx));
+    }
+
+    /// Read the auto-continue message input and persist it, showing back what was
+    /// actually saved: one line, and blank restores the default.
+    fn apply_auto_continue_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self
+            .settings_ui
+            .auto_continue_message
+            .read(cx)
+            .value()
+            .to_string();
+        let message = autopilot::auto_continue_message(&typed);
+        if message != typed {
+            self.settings_ui
+                .auto_continue_message
+                .update(cx, |s, cx| s.set_value(message.clone(), window, cx));
+        }
+        self.settings.auto_continue_message = message;
         self.persist_settings();
         cx.notify();
     }
@@ -26432,6 +26633,32 @@ impl MuxelApp {
             )
             .child(self.settings_label(&t("Default preset for new agents"), cx))
             .child(div().flex().child(preset_row.flex_1()))
+            .child(self.settings_label(&t("Auto-continue message"), cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .child(Input::new(&self.settings_ui.auto_continue_message)),
+                    )
+                    .child(
+                        Button::new("b-auto-continue-apply")
+                            .primary()
+                            .label(t("Apply"))
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                this.apply_auto_continue_message(window, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t("What a pane's Auto toggle types, then presses Enter, to resume an agent that stalls with work left. Blank restores “continue”. Right-click a pane's Auto button to give that pane its own.")),
+            )
             .into_any_element()
     }
 
@@ -28401,6 +28628,10 @@ impl Render for MuxelApp {
             .children(
                 (self.confirm.is_some() && self.confirm_window_pid().is_none())
                     .then(|| self.render_confirm_modal(cx)),
+            )
+            .children(
+                (self.auto_message_popup.is_some() && self.auto_message_window_pid().is_none())
+                    .then(|| self.render_auto_message_popup(cx)),
             )
             // Fullscreen with the sidebar hidden: a floating left-edge pill
             // brings it back without leaving fullscreen (F11's escape hatch).
