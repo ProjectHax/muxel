@@ -33,9 +33,24 @@ env:
 
 jobs:
   # ----------------------------------------------------------------------------
+  # Every release ships complete translations. A tag whose catalogs are missing
+  # strings fails here, before any build: run `python3 scripts/translate.py`
+  # (needs the `claude` CLI), commit crates/muxel/assets/i18n, and re-tag. Manual
+  # (workflow_dispatch) builds skip the check.
+  # ----------------------------------------------------------------------------
+  translations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Translation catalogs are complete
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python3 scripts/translate.py --check
+
+  # ----------------------------------------------------------------------------
   # Linux: build the release binary once, then reuse it for every package format.
   # ----------------------------------------------------------------------------
   linux-build:
+    needs: translations
     strategy:
       fail-fast: false
       matrix:
@@ -245,6 +260,7 @@ jobs:
   # ships one .dmg + .zip that runs on any Mac.
   # ----------------------------------------------------------------------------
   macos:
+    needs: translations
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v5
@@ -317,6 +333,7 @@ jobs:
   # cross-compiled with the MSVC ARM64 tools bundled in the windows-2022 image.
   # ----------------------------------------------------------------------------
   windows:
+    needs: translations
     strategy:
       fail-fast: false
       matrix:

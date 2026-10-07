@@ -9,10 +9,15 @@ crates/muxel/assets/i18n/ via an LLM CLI (claude/sonnet by default; opencode too
 Usage:
   python3 scripts/translate.py                 # extract en.json + translate all langs
   python3 scripts/translate.py --extract-only  # just refresh en.json (the key list)
-  python3 scripts/translate.py --check         # CI: exit 1 if en.json is stale
+  python3 scripts/translate.py --check         # release gate: exit 1 if en.json is
+                                               # stale or any catalog lacks a string
   python3 scripts/translate.py --lang es,fr    # only these languages
   python3 scripts/translate.py --backend opencode
   python3 scripts/translate.py --force         # re-translate existing entries too
+  python3 scripts/translate.py --jobs 1        # one language at a time (default 6)
+
+Run it before every release: the release workflow refuses to build a tag whose
+catalogs are incomplete (`--check`).
 
 The English source string IS the catalog key, so untranslated strings fall back to
 English at runtime. Technical terms / product names and {placeholder} tokens are
@@ -24,6 +29,7 @@ import json
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # BCP-47 tag -> language name handed to the model. Mirrors i18n::available_languages.
@@ -76,16 +82,33 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def _unescape(s: str) -> str:
-    """Turn a Rust string-literal body into its actual text (\\\" -> ", \\n -> NL)."""
+    """Turn a Rust string-literal body into the text rustc compiles it to — the
+    catalog key `t()` looks up at runtime. Beyond the simple escapes (\\" -> ",
+    \\n -> newline): `\\u{201c}` and `\\x41` are characters, and a backslash ending a
+    line continues the string, dropping the line break and the next line's
+    indentation."""
     out, i = [], 0
     simple = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "'": "'", "\\": "\\", "0": "\0"}
     while i < len(s):
-        if s[i] == "\\" and i + 1 < len(s):
-            out.append(simple.get(s[i + 1], s[i + 1]))
-            i += 2
-        else:
+        if s[i] != "\\" or i + 1 == len(s):
             out.append(s[i])
             i += 1
+            continue
+        esc = s[i + 1]
+        if esc in "\r\n":
+            i += 2
+            while i < len(s) and s[i] in " \t\r\n":
+                i += 1
+        elif esc == "u" and s.startswith("{", i + 2):
+            end = s.index("}", i + 3)
+            out.append(chr(int(s[i + 3 : end].replace("_", ""), 16)))
+            i = end + 1
+        elif esc == "x":
+            out.append(chr(int(s[i + 2 : i + 4], 16)))
+            i += 4
+        else:
+            out.append(simple.get(esc, esc))
+            i += 2
     return "".join(out)
 
 
@@ -253,6 +276,7 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=25, dest="batch_size")
     ap.add_argument("--check", action="store_true", help="exit 1 if en.json is stale")
     ap.add_argument("--force", action="store_true", help="re-translate existing entries")
+    ap.add_argument("--jobs", type=int, default=6, help="languages translated in parallel")
     ap.add_argument("--extract-only", action="store_true", dest="extract_only")
     args = ap.parse_args()
 
@@ -261,10 +285,20 @@ def main() -> None:
     en_catalog = {k: k for k in keys}  # identity map = authoritative key list
 
     if args.check:
-        if load_catalog(en_path) != en_catalog:
-            print("en.json is out of sync with the source. Run: scripts/translate.py --extract-only")
+        stale = load_catalog(en_path) != en_catalog
+        if stale:
+            print("en.json is out of sync with the source.")
+        incomplete = False
+        for code in SUPPORTED_LANGS:
+            catalog = load_catalog(CATALOG_DIR / f"{code}.json")
+            missing = [k for k in keys if k not in catalog or _dropped(k, catalog[k])]
+            if missing:
+                incomplete = True
+                print(f"{code}.json is missing {len(missing)} string(s), e.g. {missing[0]!r}")
+        if stale or incomplete:
+            print("Run: python3 scripts/translate.py — then commit crates/muxel/assets/i18n.")
             sys.exit(1)
-        print(f"en.json is up to date ({len(keys)} keys).")
+        print(f"en.json and all {len(SUPPORTED_LANGS)} catalogs are up to date ({len(keys)} keys).")
         return
 
     # Only rewrite en.json when it actually changed, so parallel `--lang` runs
@@ -285,8 +319,25 @@ def main() -> None:
                 sys.exit(f"error: unknown language {code!r}; known: {', '.join(SUPPORTED_LANGS)}")
             langs[code] = SUPPORTED_LANGS[code]
 
-    for code, name in langs.items():
-        translate_lang(code, name, keys, args.backend, args.model, args.batch_size, args.force)
+    # Each language is its own file, so languages translate in parallel; one at a
+    # time, a catalog-wide run is hours of sequential LLM calls.
+    sys.stdout.reconfigure(line_buffering=True)
+    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        runs = [
+            pool.submit(
+                translate_lang,
+                code,
+                name,
+                keys,
+                args.backend,
+                args.model,
+                args.batch_size,
+                args.force,
+            )
+            for code, name in langs.items()
+        ]
+        for run in runs:
+            run.result()
 
 
 if __name__ == "__main__":

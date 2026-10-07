@@ -119,6 +119,9 @@ Windows, Vulkan on Linux), so each platform builds on its own native runner.
   git tag v0.1.0 && git push origin v0.1.0
   ```
 
+  A tag only builds once every translation catalog is complete: run
+  `python3 scripts/translate.py` and commit `crates/muxel/assets/i18n` first.
+
 macOS release builds are Developer-ID-signed and notarized when the Apple signing
 secrets are configured; Windows `.exe`s are Authenticode-signed via Azure Trusted
 Signing as a post-release step (`scripts/sign-windows.sh`). tmux session

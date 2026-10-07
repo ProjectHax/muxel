@@ -119,6 +119,20 @@ Unit tests can't see the UI, so for anything visual:
 change** — add or edit its entry under the right category (sentence or two each;
 add a new `##` category if none fits).
 
+## Releasing
+
+A release is a version-bump commit (`Cargo.toml`, `Cargo.lock`, and a
+`CHANGELOG.md` entry) followed by a `vX.Y.Z` tag, which
+`.github/workflows/release.yml` builds. **Before the bump commit, run the
+translation script** and commit the catalogs it updates:
+
+```sh
+python3 scripts/translate.py   # needs the `claude` CLI; translates only new strings
+```
+
+The release workflow refuses to build a tag whose catalogs are incomplete
+(`translate.py --check`), so skipping this means deleting and re-pushing the tag.
+
 ## Git commits
 
 - Never put personal email, phone, home paths, API keys, or session URLs in commits.
