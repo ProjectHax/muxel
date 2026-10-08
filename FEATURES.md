@@ -284,7 +284,8 @@ feature is added or changed, update the matching entry here in the same change**
   → Auto-continue message (kept to one line; blank restores `continue`), and
   right-clicking a pane's **Auto** button gives that one pane its own, in a popup
   pre-filled with what it types now. A pane's message stays with it, across
-  restarts, until the pane is closed; blank goes back to the default. It fires when it can see pending work — Claude's `☐`
+  restarts, until the pane is closed; blank goes back to the default. While
+  auto-continue is on with a pane's own message, its button reads **Auto\***. It fires when it can see pending work — Claude's `☐`
   checkboxes or an "N pending" count — or when the agent voluntarily stops to check
   in ("My recommendation is to pause here.", "Shall I continue?", "I'd hold here
   unless you want that scaled run."), so a plan keeps moving without you babysitting

@@ -48,6 +48,13 @@ pub fn pane_auto_continue_message(typed: &str, default: &str) -> Option<String> 
     (message != auto_continue_message(default)).then_some(message)
 }
 
+/// Whether a pane's saved message (`pane`) is its own rather than the `default`
+/// from Settings — what the pane's **Auto** button marks with a `*` while it's on.
+/// Compared as typed, since a default changed later can come to say the same thing.
+pub fn has_own_auto_continue_message(pane: Option<&str>, default: &str) -> bool {
+    pane.is_some_and(|message| auto_continue_message(message) != auto_continue_message(default))
+}
+
 /// How many times in a row `continue` may fire without the screen changing at all
 /// before auto-continue gives up and hands the pane back to the user. This is the
 /// guard against a dead loop — e.g. an agent that errors out the instant it
@@ -346,8 +353,28 @@ fn count_before(hay: &str, word: &str) -> Option<u32> {
 mod tests {
     use super::{
         AUTO_CONTINUE_MESSAGE, AutoAction, AutoContinue, PaneActivity, auto_continue_message,
-        has_pending_tasks, is_checkpoint_pause, looks_finished, pane_auto_continue_message,
+        has_own_auto_continue_message, has_pending_tasks, is_checkpoint_pause, looks_finished,
+        pane_auto_continue_message,
     };
+
+    #[test]
+    fn only_a_pane_message_unlike_the_default_counts_as_its_own() {
+        assert!(has_own_auto_continue_message(
+            Some("finish phase 3"),
+            "continue"
+        ));
+        // Following Settings, or saying what Settings says, is not its own.
+        assert!(!has_own_auto_continue_message(None, "continue"));
+        assert!(!has_own_auto_continue_message(
+            Some("keep going"),
+            "keep going"
+        ));
+        // Compared the way it is typed: line breaks and padding don't matter.
+        assert!(!has_own_auto_continue_message(
+            Some(" keep\n going "),
+            "keep going"
+        ));
+    }
 
     #[test]
     fn a_pane_message_overrides_only_when_it_differs_from_the_default() {

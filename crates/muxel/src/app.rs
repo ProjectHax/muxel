@@ -18461,11 +18461,24 @@ impl MuxelApp {
                     .children((kind == InstanceKind::Terminal).then(|| {
                         let on = self.auto_continue_on(iid);
                         let message = self.continue_message_for(iid);
+                        // "Auto*": on, and typing this pane's own message rather
+                        // than the default from Settings.
+                        let own_message = autopilot::has_own_auto_continue_message(
+                            self.workspace
+                                .instance(iid)
+                                .and_then(|inst| inst.auto_continue_message.as_deref()),
+                            &self.settings.auto_continue_message,
+                        );
+                        let label = if on && own_message {
+                            SharedString::from(format!("{}*", t("Auto")))
+                        } else {
+                            t("Auto")
+                        };
                         Button::new(SharedString::from(format!("auto-{sid}")))
                             .ghost()
                             .xsmall()
                             .selected(on)
-                            .label(t("Auto"))
+                            .label(label)
                             .tooltip(if on {
                                 tf(
                                     "Auto-continue is on — types “{message}” when the agent stalls with tasks still to do. Click to turn off; right-click to change the message for this pane.",
