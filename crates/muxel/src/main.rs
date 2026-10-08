@@ -24,6 +24,8 @@ mod session_binding;
 mod settings_view;
 mod split;
 mod stt;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod tmux_install;
 mod tts;
