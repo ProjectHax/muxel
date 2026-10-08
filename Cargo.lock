@@ -5052,6 +5052,8 @@ dependencies = [
  "base64",
  "serde",
  "serde_json",
+ "toml 1.1.2+spec-1.1.0",
+ "unicode-properties",
  "uuid",
 ]
 

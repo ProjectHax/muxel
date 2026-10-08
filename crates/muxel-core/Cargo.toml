@@ -14,6 +14,11 @@ uuid.workspace = true
 # PowerShell's `-EncodedCommand` takes UTF-16LE base64. Already in the tree via
 # muxel-terminal, so this adds a dependency edge, not a new crate.
 base64 = "0.22"
+# Team libraries (`library`): parse `muxel-library.toml` and strip Unicode format
+# characters. Both already in the tree (via muxel-store and rustybuzz), so these
+# add dependency edges, not new crates.
+toml = "1"
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 
 [dev-dependencies]
 serde_json.workspace = true
