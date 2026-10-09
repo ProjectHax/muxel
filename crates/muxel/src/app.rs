@@ -23,8 +23,9 @@ use gpui_component::tag::Tag;
 use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
 use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
-use muxel_core::library::MENU_WINDOW_MARGIN;
 use muxel_core::library::menu::menu_list_max_height;
+use muxel_core::library::resolve::{SnippetStep, snippet_send_action};
+use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::winshell::WindowsShell;
@@ -16224,6 +16225,18 @@ impl MuxelApp {
         let Some(snip) = self.snippets.get(idx).cloned() else {
             return;
         };
+        let steps = snippet_send_action(&snip.text, snip.submit);
+        self.send_snippet_steps(iid, &steps, window, cx);
+    }
+
+    /// Apply a snippet's send action to pane `iid`, then focus it.
+    fn send_snippet_steps(
+        &mut self,
+        iid: Uuid,
+        steps: &[SnippetStep],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Only live terminal panes are in `terminals`; editors/missing → no-op.
         let Some(session) = self
             .terminals
@@ -16232,9 +16245,11 @@ impl MuxelApp {
         else {
             return;
         };
-        session.paste(&snip.text);
-        if snip.submit {
-            session.write_input(b"\r");
+        for step in steps {
+            match step {
+                SnippetStep::Paste(text) => session.paste(text),
+                SnippetStep::Write(bytes) => session.write_input(bytes),
+            }
         }
         self.focus_instance(iid, window, cx);
     }
@@ -24605,8 +24620,13 @@ impl MuxelApp {
         let Some(pos) = self.runners_menu else {
             return div().into_any_element();
         };
+        let lib_rows =
+            libraries_ui::library_menu_rows(&self.library_hub, LibKind::Runner, &self.presets);
         let mut list = v_flex().gap_px().w_full();
-        if self.runners.is_empty() {
+        if libraries_ui::show_empty_message(
+            self.runners.len(),
+            libraries_ui::library_item_count(&lib_rows),
+        ) {
             list = list.child(
                 div()
                     .px_2()
@@ -24658,6 +24678,7 @@ impl MuxelApp {
                     ),
             );
         }
+        let list = self.push_library_menu_rows(list, lib_rows, false, cx);
         div()
             .absolute()
             .inset_0()
@@ -24697,8 +24718,11 @@ impl MuxelApp {
             .and_then(|iid| self.workspace.instance(iid))
             .map(|i| i.display_name().to_string())
             .unwrap_or_default();
+        let lib_rows =
+            libraries_ui::library_menu_rows(&self.library_hub, LibKind::Snippet, &self.presets);
+        let lib_count = libraries_ui::library_item_count(&lib_rows);
         let mut list = v_flex().gap_px().w_full();
-        if self.snippets.is_empty() {
+        if libraries_ui::show_empty_message(self.snippets.len(), lib_count) {
             list = list.child(
                 div()
                     .px_2()
@@ -24707,7 +24731,7 @@ impl MuxelApp {
                     .text_color(cx.theme().muted_foreground)
                     .child(t("No snippets — add one in Settings → Snippets.")),
             );
-        } else if !has_target {
+        } else if libraries_ui::show_focus_hint(self.snippets.len(), lib_count, has_target) {
             list = list.child(
                 div()
                     .px_2()
@@ -24763,6 +24787,7 @@ impl MuxelApp {
                 ),
             );
         }
+        let list = self.push_library_menu_rows(list, lib_rows, has_target, cx);
         let header = if has_target {
             tf("Send to {name}", &[("name", &target_label)])
         } else {
@@ -24807,8 +24832,13 @@ impl MuxelApp {
         let Some(pos) = self.loops_menu else {
             return div().into_any_element();
         };
+        let lib_rows =
+            libraries_ui::library_menu_rows(&self.library_hub, LibKind::Loop, &self.presets);
         let mut list = v_flex().gap_px().w_full();
-        if self.loops.is_empty() {
+        if libraries_ui::show_empty_message(
+            self.loops.len(),
+            libraries_ui::library_item_count(&lib_rows),
+        ) {
             list = list.child(
                 div()
                     .px_2()
@@ -24871,8 +24901,10 @@ impl MuxelApp {
                     ),
             );
         }
-        // Footer: create a new loop (opens its editor in settings). It sits
-        // outside the scrollable list so it stays visible.
+        // Library sections go after the private loops, before the footer.
+        list = self.push_library_menu_rows(list, lib_rows, false, cx);
+        // Footer: create a new loop (opens its editor in settings). Outside the
+        // scrollable list so it stays visible.
         let footer = div()
             .id("loop-new")
             .flex_shrink_0()

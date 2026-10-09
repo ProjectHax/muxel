@@ -6,17 +6,20 @@
 
 use super::*;
 use crate::libraries::{
-    LibraryListMarker, add_error_text, branch_text, delete_error_text, delete_library_files,
-    library_list_marker, library_list_marker_tooltip, library_row_status, read_library_file,
-    resync_prompt_text, run_check, run_job, startup_cleanup, switched_off_text,
+    LibraryListMarker, add_error_text, branch_text, copy_error_text, copy_tooltip_text,
+    delete_error_text, delete_library_files, library_list_marker, library_list_marker_tooltip,
+    library_row_status, preset_not_found_text, read_library_file, resync_prompt_text, run_check,
+    run_job, startup_cleanup, switched_off_text,
 };
 use muxel_core::Settings;
 use muxel_core::library::config::display_name;
+use muxel_core::library::hub::LocalLists;
 use muxel_core::library::hub::{
     CheckDecision, JobKind, JobOutcome, JobSpec, LibraryHub, ResyncRequest,
 };
+use muxel_core::library::resolve::{CopyError, SnippetStep, resolve_preset, snippet_send_action};
 use muxel_core::library::resync::LocalChanges;
-use muxel_core::library::{FileError, GitFailure};
+use muxel_core::library::{FileError, GitFailure, LibItemKey, LibKind, PresetResolution};
 
 /// Settings read at startup, plus whether `config.toml` existed and parsed:
 /// the only case in which `LIB_DIR` may be cleaned up. A missing or invalid
@@ -81,6 +84,173 @@ fn load_for_background_save(path: &std::path::Path) -> anyhow::Result<Option<Set
     muxel_store::parse_settings(&text)
         .with_context(|| format!("parsing {}", path.display()))
         .map(Some)
+}
+
+// --- Library sections of the toolbar drop-downs ---
+
+/// The agent of a library runner or loop row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RowAgent {
+    /// Runnable with the resolved preset; `None` = no `preset` (a runner then uses
+    /// the toolbar's agent, a loop its pinned one).
+    Ready(Option<Uuid>),
+    /// The `preset` does not resolve: the row is disabled with this reason.
+    Unavailable(String),
+}
+
+/// One row of a drop-down's library part, in display order.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum LibMenuRow {
+    /// A section header: the library's display name.
+    Header(String),
+    /// Shown like a private snippet: name and `↵`, never the text.
+    Snippet {
+        key: LibItemKey,
+        name: String,
+        submit: bool,
+    },
+    Runner {
+        key: LibItemKey,
+        name: String,
+        agent: RowAgent,
+    },
+    Loop {
+        key: LibItemKey,
+        name: String,
+        schedule: LoopSchedule,
+        /// The file's `preset` resolved.
+        agent: RowAgent,
+    },
+}
+
+fn row_agent(preset: Option<&str>, presets: &[AgentPreset]) -> RowAgent {
+    match resolve_preset(preset, presets) {
+        PresetResolution::Unnamed => RowAgent::Ready(None),
+        PresetResolution::Preset(id) => RowAgent::Ready(Some(id)),
+        PresetResolution::NotFound(p) => RowAgent::Unavailable(preset_not_found_text(&p)),
+    }
+}
+
+/// The library rows of the `kind` drop-down: per library (add order) a header and
+/// its items in file order. Empty when no library has items of that kind.
+pub(super) fn library_menu_rows(
+    hub: &LibraryHub,
+    kind: LibKind,
+    presets: &[AgentPreset],
+) -> Vec<LibMenuRow> {
+    let mut rows = Vec::new();
+    for section in hub.library_menu_sections(kind) {
+        let library = section.config.id;
+        let key = |name: &str| LibItemKey {
+            library,
+            kind,
+            name: name.to_string(),
+        };
+        rows.push(LibMenuRow::Header(display_name(section.config)));
+        match kind {
+            LibKind::Snippet => {
+                rows.extend(section.items.snippets.iter().map(|s| LibMenuRow::Snippet {
+                    key: key(&s.name),
+                    name: s.name.clone(),
+                    submit: s.submit,
+                }))
+            }
+            LibKind::Runner => {
+                rows.extend(section.items.runners.iter().map(|r| LibMenuRow::Runner {
+                    key: key(&r.name),
+                    name: r.name.clone(),
+                    agent: row_agent(r.content.preset.as_deref(), presets),
+                }))
+            }
+            LibKind::Loop => rows.extend(section.items.loops.iter().map(|l| LibMenuRow::Loop {
+                key: key(&l.name),
+                name: l.name.clone(),
+                schedule: l.content.schedule,
+                agent: row_agent(l.content.preset.as_deref(), presets),
+            })),
+        }
+    }
+    rows
+}
+
+/// Number of item rows (headers excluded).
+pub(super) fn library_item_count(rows: &[LibMenuRow]) -> usize {
+    rows.iter()
+        .filter(|r| !matches!(r, LibMenuRow::Header(_)))
+        .count()
+}
+
+pub(super) fn show_empty_message(private: usize, library: usize) -> bool {
+    private == 0 && library == 0
+}
+
+/// Whether the Snippets drop-down shows the "focus a terminal pane" hint.
+pub(super) fn show_focus_hint(private: usize, library: usize, has_target: bool) -> bool {
+    !show_empty_message(private, library) && !has_target
+}
+
+/// Sending loaded library snippet `key` is exactly a private snippet's action;
+/// `None` when it is no longer loaded.
+pub(super) fn library_snippet_steps(
+    hub: &LibraryHub,
+    key: &LibItemKey,
+) -> Option<Vec<SnippetStep>> {
+    hub.loaded_snippet(key)
+        .map(|s| snippet_send_action(&s.text, s.submit))
+}
+
+/// The "Make a local copy" action of a library row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CopyAction {
+    pub tooltip: String,
+    pub enabled: bool,
+}
+
+/// Enabled with the copy tooltip, or disabled with the reason as tooltip while the
+/// preset does not resolve. `agent` is `None` for a snippet.
+pub(super) fn copy_action(agent: Option<&RowAgent>) -> CopyAction {
+    match agent {
+        Some(RowAgent::Unavailable(reason)) => CopyAction {
+            tooltip: reason.clone(),
+            enabled: false,
+        },
+        _ => CopyAction {
+            tooltip: copy_tooltip_text(),
+            enabled: true,
+        },
+    }
+}
+
+/// The editor opened for a new local copy at this index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CopyEditor {
+    Runner(usize),
+    Loop(usize),
+}
+
+/// What the app does after `LibraryHub::make_local_copy`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CopyOutcome {
+    /// Copied: persist, then open this editor (none for a snippet).
+    Copied(Option<CopyEditor>),
+    /// Failed: an error event with this title and body; no list changed.
+    Event(String, String),
+    /// The item is no longer loaded: nothing happens.
+    Ignore,
+}
+
+pub(super) fn copy_outcome(kind: LibKind, result: Result<usize, CopyError>) -> CopyOutcome {
+    match result {
+        Ok(idx) => CopyOutcome::Copied(match kind {
+            LibKind::Snippet => None,
+            LibKind::Runner => Some(CopyEditor::Runner(idx)),
+            LibKind::Loop => Some(CopyEditor::Loop(idx)),
+        }),
+        Err(e) => match copy_error_text(&e) {
+            Some((title, body)) => CopyOutcome::Event(title, body),
+            None => CopyOutcome::Ignore,
+        },
+    }
 }
 
 /// Run `spec`, turning a panic into a failed git operation, so the job always
@@ -579,6 +749,302 @@ impl MuxelApp {
     }
 }
 
+impl MuxelApp {
+    /// Send library snippet `key` exactly as a private one: no preview or confirmation.
+    fn send_library_snippet_to_active(
+        &mut self,
+        key: &LibItemKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(iid) = self.active_instance else {
+            return;
+        };
+        let Some(steps) = library_snippet_steps(&self.library_hub, key) else {
+            return;
+        };
+        self.send_snippet_steps(iid, &steps, window, cx);
+    }
+
+    /// A loop without `preset` gets the toolbar's preset, as `add_loop` does (none if
+    /// the selection is not a real preset).
+    fn make_local_copy(&mut self, key: &LibItemKey, window: &mut Window, cx: &mut Context<Self>) {
+        let toolbar_preset = self.current_preset_id();
+        let result = self.library_hub.make_local_copy(
+            key,
+            &self.presets,
+            toolbar_preset,
+            self.workspace.active_project,
+            unix_now(),
+            LocalLists {
+                snippets: &mut self.snippets,
+                runners: &mut self.runners,
+                loops: &mut self.loops,
+            },
+        );
+        match copy_outcome(key.kind, result) {
+            CopyOutcome::Copied(editor) => {
+                self.persist_settings();
+                match editor {
+                    Some(CopyEditor::Runner(idx)) => self.open_runner_settings(idx, window, cx),
+                    Some(CopyEditor::Loop(idx)) => self.open_loop_settings(idx, window, cx),
+                    None => {}
+                }
+            }
+            CopyOutcome::Event(title, body) => self.add_event(NotifKind::Error, title, body),
+            CopyOutcome::Ignore => {}
+        }
+        cx.notify();
+    }
+
+    /// The "Make a local copy" button, in place of a private row's edit pencil.
+    fn copy_button(
+        &self,
+        id: String,
+        key: LibItemKey,
+        agent: Option<&RowAgent>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let action = copy_action(agent);
+        div()
+            .flex_none()
+            .mr_1()
+            .child(
+                Button::new(SharedString::from(id))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Copy)
+                    .tooltip(action.tooltip)
+                    .disabled(!action.enabled)
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        // Only the copy, never the row's own action.
+                        cx.stop_propagation();
+                        this.make_local_copy(&key, window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Append library `rows` after the private items. Library rows are read-only (no
+    /// edit pencil); `has_target` = a terminal pane is focused (Snippets only).
+    pub(super) fn push_library_menu_rows(
+        &self,
+        mut list: Div,
+        rows: Vec<LibMenuRow>,
+        has_target: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let muted = cx.theme().muted_foreground;
+        for (i, row) in rows.into_iter().enumerate() {
+            let row_el = match row {
+                LibMenuRow::Header(title) => div()
+                    .mt_1()
+                    .px_2()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(muted)
+                    .child(title)
+                    .into_any_element(),
+                LibMenuRow::Snippet { key, name, submit } => {
+                    // Never shows the text; inert without a focused pane.
+                    let copy =
+                        self.copy_button(format!("lib-snippet-copy-{i}"), key.clone(), None, cx);
+                    let fg = if has_target {
+                        cx.theme().foreground
+                    } else {
+                        muted
+                    };
+                    let mut item = div()
+                        .id(SharedString::from(format!("lib-snippet-item-{i}")))
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded(cx.theme().radius)
+                        .text_color(fg)
+                        .child(Icon::new(IconName::SquareTerminal).small())
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_sm()
+                                .child(name),
+                        )
+                        .children(
+                            submit
+                                .then(|| div().flex_none().text_xs().text_color(muted).child("↵")),
+                        );
+                    if has_target {
+                        item = item
+                            .cursor_pointer()
+                            .hover(|s| s.bg(cx.theme().accent))
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                this.send_library_snippet_to_active(&key, window, cx)
+                            }));
+                    }
+                    div()
+                        .flex()
+                        .items_center()
+                        .w_full()
+                        .child(item)
+                        .child(copy)
+                        .into_any_element()
+                }
+                LibMenuRow::Runner { key, name, agent } => {
+                    let copy = self.copy_button(
+                        format!("lib-runner-copy-{i}"),
+                        key.clone(),
+                        Some(&agent),
+                        cx,
+                    );
+                    let item = self.library_agent_item(
+                        format!("lib-runner-item-{i}"),
+                        name,
+                        None,
+                        &agent,
+                        true,
+                        cx,
+                    );
+                    div()
+                        .flex()
+                        .items_center()
+                        .w_full()
+                        .child(item)
+                        .child(copy)
+                        .into_any_element()
+                }
+                LibMenuRow::Loop {
+                    key,
+                    name,
+                    schedule,
+                    agent,
+                } => {
+                    let copy = self.copy_button(
+                        format!("lib-loop-copy-{i}"),
+                        key.clone(),
+                        Some(&agent),
+                        cx,
+                    );
+                    let item = self.library_agent_item(
+                        format!("lib-loop-item-{i}"),
+                        name,
+                        Some(loop_schedule_summary(&schedule)),
+                        &agent,
+                        false,
+                        cx,
+                    );
+                    div()
+                        .flex()
+                        .items_center()
+                        .w_full()
+                        .child(item)
+                        .child(copy)
+                        .into_any_element()
+                }
+            };
+            list = list.child(row_el);
+        }
+        list
+    }
+
+    /// A library runner or loop row: agent icon, name, (loops) schedule, and the
+    /// reason under the name when the preset does not resolve. `lit` = normal colour.
+    fn library_agent_item(
+        &self,
+        id: String,
+        name: String,
+        schedule: Option<String>,
+        agent: &RowAgent,
+        lit: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let muted = cx.theme().muted_foreground;
+        let (icon, reason) = match agent {
+            RowAgent::Ready(preset_id) => {
+                let program = preset_id
+                    .and_then(|id| self.presets.iter().find(|p| p.id == id))
+                    .and_then(|p| p.program.clone());
+                let fg = if lit { cx.theme().foreground } else { muted };
+                (
+                    agent_icon(program.as_deref(), px(15.0), fg).into_any_element(),
+                    None,
+                )
+            }
+            RowAgent::Unavailable(reason) => (
+                Icon::new(IconName::CircleX)
+                    .size(px(15.0))
+                    .text_color(muted)
+                    .into_any_element(),
+                Some(reason.clone()),
+            ),
+        };
+        let fg = if lit && reason.is_none() {
+            cx.theme().foreground
+        } else {
+            muted
+        };
+        div()
+            .id(SharedString::from(id))
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded(cx.theme().radius)
+            .text_color(fg)
+            .child(icon)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .w_full()
+                            // One line: the name truncates with an ellipsis,
+                            // the schedule never shrinks.
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .child(name),
+                            )
+                            .children(schedule.map(|s| {
+                                div()
+                                    .flex_none()
+                                    .ml_1()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(s)
+                            })),
+                    )
+                    .children(reason.map(|r| {
+                        div()
+                            .text_xs()
+                            .line_height(relative(1.2))
+                            .text_color(muted)
+                            .child(r)
+                    })),
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -892,5 +1358,465 @@ mod tests {
                 assert_eq!(saved.libraries[0].last_pull_ok, Some(T1));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::{
+        CopyAction, CopyEditor, CopyOutcome, LibMenuRow, RowAgent, copy_action, copy_outcome,
+        library_item_count, library_menu_rows, library_snippet_steps, show_empty_message,
+        show_focus_hint,
+    };
+    use muxel_core::AgentPreset;
+    use muxel_core::library::hub::LocalLists;
+    use muxel_core::library::hub::{JobKind, JobOutcome, LibraryHub};
+    use muxel_core::library::resolve::CopyError;
+    use muxel_core::library::resolve::SnippetStep;
+    use muxel_core::library::{
+        FileError, LibItemKey, LibKind, LibLoop, LibRunner, LibSnippet, LoopContent, ParsedLibrary,
+        RunnerContent,
+    };
+    use muxel_core::{Loop, Runner, Snippet};
+    use muxel_core::{LoopSchedule, PostRunAction};
+    use uuid::Uuid;
+
+    fn snippet(name: &str, text: &str, submit: bool) -> LibSnippet {
+        LibSnippet {
+            name: name.to_string(),
+            text: text.to_string(),
+            submit,
+        }
+    }
+
+    fn runner(name: &str, preset: Option<&str>) -> LibRunner {
+        LibRunner {
+            name: name.to_string(),
+            content: RunnerContent {
+                prompt: "p".to_string(),
+                preset: preset.map(str::to_string),
+                auto_mode_presses: 0,
+            },
+        }
+    }
+
+    fn lib_loop(name: &str, preset: Option<&str>) -> LibLoop {
+        LibLoop {
+            name: name.to_string(),
+            content: LoopContent {
+                prompt: "p".to_string(),
+                preset: preset.map(str::to_string),
+                auto_mode_presses: 0,
+                schedule: LoopSchedule::EveryMinutes { minutes: 5 },
+                post_run: PostRunAction::Leave,
+            },
+        }
+    }
+
+    fn preset(name: &str, id: u128) -> AgentPreset {
+        let mut p = AgentPreset::shell();
+        p.name = name.to_string();
+        p.id = Uuid::from_u128(id);
+        p
+    }
+
+    /// Add a library and apply one finished update with `read`.
+    fn add_read(
+        hub: &mut LibraryHub,
+        url: &str,
+        name: &str,
+        read: Result<ParsedLibrary, FileError>,
+    ) -> Uuid {
+        let id = hub.add(url, "", name).unwrap();
+        hub.begin(id, JobKind::Update, 100).unwrap();
+        hub.finish(
+            JobOutcome {
+                id,
+                kind: JobKind::Update,
+                git: Ok(()),
+                read,
+            },
+            100,
+        );
+        id
+    }
+
+    fn snippets_only(names: &[&str]) -> ParsedLibrary {
+        ParsedLibrary {
+            snippets: names.iter().map(|n| snippet(n, n, false)).collect(),
+            ..ParsedLibrary::default()
+        }
+    }
+
+    fn names(rows: &[LibMenuRow]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                LibMenuRow::Header(h) => format!("# {h}"),
+                LibMenuRow::Snippet { name, .. }
+                | LibMenuRow::Runner { name, .. }
+                | LibMenuRow::Loop { name, .. } => name.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_libraries_adds_no_rows() {
+        let hub = LibraryHub::default();
+        for kind in [LibKind::Snippet, LibKind::Runner, LibKind::Loop] {
+            assert!(library_menu_rows(&hub, kind, &[]).is_empty());
+        }
+    }
+
+    #[test]
+    fn sections_in_add_order_with_display_name_headers() {
+        let mut hub = LibraryHub::default();
+        add_read(
+            &mut hub,
+            "file:///a",
+            "team-a",
+            Ok(snippets_only(&["A2", "A1"])),
+        );
+        add_read(
+            &mut hub,
+            "file:///b",
+            "team-b",
+            Ok(snippets_only(&["B1", "B2"])),
+        );
+        let rows = library_menu_rows(&hub, LibKind::Snippet, &[]);
+        assert_eq!(
+            names(&rows),
+            ["# team-a", "A2", "A1", "# team-b", "B1", "B2"]
+        );
+        assert_eq!(library_item_count(&rows), 4);
+    }
+
+    #[test]
+    fn header_falls_back_to_the_url_segment() {
+        let mut hub = LibraryHub::default();
+        add_read(
+            &mut hub,
+            "https://h/org/shared.git",
+            "",
+            Ok(snippets_only(&["S"])),
+        );
+        let rows = library_menu_rows(&hub, LibKind::Snippet, &[]);
+        assert_eq!(rows[0], LibMenuRow::Header("shared".to_string()));
+    }
+
+    #[test]
+    fn libraries_without_items_of_a_kind_get_no_header() {
+        let mut hub = LibraryHub::default();
+        add_read(
+            &mut hub,
+            "file:///a",
+            "only-snippets",
+            Ok(snippets_only(&["S"])),
+        );
+        add_read(
+            &mut hub,
+            "file:///no/existe",
+            "broken",
+            Err(FileError::Missing),
+        );
+        // Configured but never read (items = None).
+        hub.add("file:///c", "", "unread").unwrap();
+        assert_eq!(
+            names(&library_menu_rows(&hub, LibKind::Snippet, &[])),
+            ["# only-snippets", "S"]
+        );
+        assert!(library_menu_rows(&hub, LibKind::Runner, &[]).is_empty());
+        assert!(library_menu_rows(&hub, LibKind::Loop, &[]).is_empty());
+    }
+
+    #[test]
+    fn header_follows_a_rename() {
+        let mut hub = LibraryHub::default();
+        let id = add_read(&mut hub, "file:///a", "old", Ok(snippets_only(&["S"])));
+        assert!(hub.rename(id, "  new name  "));
+        let rows = library_menu_rows(&hub, LibKind::Snippet, &[]);
+        assert_eq!(rows[0], LibMenuRow::Header("new name".to_string()));
+    }
+
+    #[test]
+    fn rows_follow_the_last_read() {
+        let mut hub = LibraryHub::default();
+        let id = add_read(&mut hub, "file:///a", "lib", Ok(snippets_only(&["Old"])));
+        hub.begin(id, JobKind::Update, 500).unwrap();
+        hub.finish(
+            JobOutcome {
+                id,
+                kind: JobKind::Update,
+                git: Ok(()),
+                read: Ok(snippets_only(&["New"])),
+            },
+            500,
+        );
+        assert_eq!(
+            names(&library_menu_rows(&hub, LibKind::Snippet, &[])),
+            ["# lib", "New"]
+        );
+    }
+
+    #[test]
+    fn snippet_row_has_name_and_submit() {
+        let mut hub = LibraryHub::default();
+        let lib = add_read(
+            &mut hub,
+            "file:///a",
+            "lib",
+            Ok(ParsedLibrary {
+                snippets: vec![snippet("Multi", "one\ntwo\nthree", true)],
+                ..ParsedLibrary::default()
+            }),
+        );
+        let rows = library_menu_rows(&hub, LibKind::Snippet, &[]);
+        assert_eq!(
+            rows[1],
+            LibMenuRow::Snippet {
+                key: LibItemKey {
+                    library: lib,
+                    kind: LibKind::Snippet,
+                    name: "Multi".to_string(),
+                },
+                name: "Multi".to_string(),
+                submit: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unresolved_preset_disables_runner_and_loop_rows() {
+        let presets = [preset("Claude", 0xC1)];
+        let mut hub = LibraryHub::default();
+        add_read(
+            &mut hub,
+            "file:///a",
+            "lib",
+            Ok(ParsedLibrary {
+                runners: vec![
+                    runner("Bad", Some("NoSuchAgent")),
+                    runner("Good", Some(" claude ")),
+                    runner("Plain", None),
+                ],
+                loops: vec![lib_loop("BadLoop", Some("NoSuchAgent"))],
+                ..ParsedLibrary::default()
+            }),
+        );
+        let reason = "Agent preset \"NoSuchAgent\" not found".to_string();
+        let agents: Vec<RowAgent> = library_menu_rows(&hub, LibKind::Runner, &presets)
+            .into_iter()
+            .filter_map(|r| match r {
+                LibMenuRow::Runner { agent, .. } => Some(agent),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            agents,
+            [
+                RowAgent::Unavailable(reason.clone()),
+                RowAgent::Ready(Some(Uuid::from_u128(0xC1))),
+                RowAgent::Ready(None),
+            ]
+        );
+        let loop_rows = library_menu_rows(&hub, LibKind::Loop, &presets);
+        match &loop_rows[1] {
+            LibMenuRow::Loop { agent, .. } => assert_eq!(*agent, RowAgent::Unavailable(reason)),
+            other => panic!("expected a loop row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_message_only_without_private_and_library_items() {
+        assert!(show_empty_message(0, 0));
+        assert!(!show_empty_message(0, 1));
+        assert!(!show_empty_message(3, 0));
+        assert!(!show_empty_message(3, 2));
+    }
+
+    #[test]
+    fn focus_hint_with_only_library_snippets() {
+        assert!(show_focus_hint(0, 1, false));
+        assert!(show_focus_hint(3, 0, false));
+        assert!(!show_focus_hint(0, 1, true));
+        assert!(!show_focus_hint(3, 2, true));
+        // Nothing to send → the empty message instead of the hint.
+        assert!(!show_focus_hint(0, 0, false));
+    }
+
+    #[test]
+    fn library_snippet_sends_like_a_private_one() {
+        let mut hub = LibraryHub::default();
+        let lib = add_read(
+            &mut hub,
+            "file:///a",
+            "lib",
+            Ok(ParsedLibrary {
+                snippets: vec![snippet("Go", "go on", true), snippet("Say", "hi", false)],
+                ..ParsedLibrary::default()
+            }),
+        );
+        let key = |name: &str| LibItemKey {
+            library: lib,
+            kind: LibKind::Snippet,
+            name: name.to_string(),
+        };
+        assert_eq!(
+            library_snippet_steps(&hub, &key("Go")),
+            Some(vec![
+                SnippetStep::Paste("go on".to_string()),
+                SnippetStep::Write(b"\r"),
+            ])
+        );
+        assert_eq!(
+            library_snippet_steps(&hub, &key("Say")),
+            Some(vec![SnippetStep::Paste("hi".to_string())])
+        );
+        assert_eq!(library_snippet_steps(&hub, &key("Gone")), None);
+    }
+
+    const COPY_TOOLTIP: &str =
+        "Creates a private copy you can edit. It is not synced with the library.";
+
+    #[test]
+    fn enabled_copy_shows_the_copy_tooltip() {
+        let expected = CopyAction {
+            tooltip: COPY_TOOLTIP.to_string(),
+            enabled: true,
+        };
+        assert_eq!(copy_action(None), expected);
+        assert_eq!(copy_action(Some(&RowAgent::Ready(None))), expected);
+        assert_eq!(
+            copy_action(Some(&RowAgent::Ready(Some(Uuid::from_u128(1))))),
+            expected
+        );
+    }
+
+    #[test]
+    fn unresolved_preset_disables_copy_with_the_reason() {
+        let reason = "Agent preset \"NoSuchAgent\" not found";
+        let action = copy_action(Some(&RowAgent::Unavailable(reason.to_string())));
+        assert_eq!(
+            action,
+            CopyAction {
+                tooltip: reason.to_string(),
+                enabled: false,
+            }
+        );
+        assert_ne!(action.tooltip, COPY_TOOLTIP);
+    }
+
+    #[test]
+    fn copy_opens_the_editor_of_runners_and_loops_only() {
+        assert_eq!(
+            copy_outcome(LibKind::Snippet, Ok(4)),
+            CopyOutcome::Copied(None)
+        );
+        assert_eq!(
+            copy_outcome(LibKind::Runner, Ok(2)),
+            CopyOutcome::Copied(Some(CopyEditor::Runner(2)))
+        );
+        assert_eq!(
+            copy_outcome(LibKind::Loop, Ok(0)),
+            CopyOutcome::Copied(Some(CopyEditor::Loop(0)))
+        );
+    }
+
+    #[test]
+    fn copy_errors_become_events() {
+        assert_eq!(
+            copy_outcome(LibKind::Loop, Err(CopyError::NoProject)),
+            CopyOutcome::Event(
+                "Can't add a loop".to_string(),
+                "Open a project first — a loop runs in a specific project.".to_string()
+            )
+        );
+        match copy_outcome(
+            LibKind::Runner,
+            Err(CopyError::PresetNotFound("NoSuchAgent".to_string())),
+        ) {
+            CopyOutcome::Event(_, body) => {
+                assert_eq!(body, "Agent preset \"NoSuchAgent\" not found")
+            }
+            other => panic!("expected an event, got {other:?}"),
+        }
+        assert_eq!(
+            copy_outcome(LibKind::Snippet, Err(CopyError::Gone)),
+            CopyOutcome::Ignore
+        );
+    }
+
+    /// The loop has no `preset`, so its copy gets the toolbar's `Codex`.
+    #[test]
+    fn copy_through_the_hub() {
+        let presets = [preset("Claude", 0xC1), preset("Codex", 0xC2)];
+        let toolbar = Some(Uuid::from_u128(0xC2));
+        let mut hub = LibraryHub::default();
+        let lib = add_read(
+            &mut hub,
+            "file:///a",
+            "lib",
+            Ok(ParsedLibrary {
+                snippets: vec![snippet("Go", "go on", true)],
+                runners: vec![runner("Review", Some("Claude"))],
+                loops: vec![lib_loop("Nightly", None)],
+                ..ParsedLibrary::default()
+            }),
+        );
+        let key = |kind, name: &str| LibItemKey {
+            library: lib,
+            kind,
+            name: name.to_string(),
+        };
+        let (mut snippets, mut runners, mut loops) = (
+            Vec::<Snippet>::new(),
+            Vec::<Runner>::new(),
+            Vec::<Loop>::new(),
+        );
+        let project = Uuid::from_u128(0xF0);
+        let mut copy = |k: &LibItemKey, active: Option<Uuid>| {
+            let r = hub.make_local_copy(
+                k,
+                &presets,
+                toolbar,
+                active,
+                1_000,
+                LocalLists {
+                    snippets: &mut snippets,
+                    runners: &mut runners,
+                    loops: &mut loops,
+                },
+            );
+            copy_outcome(k.kind, r)
+        };
+        assert_eq!(
+            copy(&key(LibKind::Loop, "Nightly"), None),
+            CopyOutcome::Event(
+                "Can't add a loop".to_string(),
+                "Open a project first — a loop runs in a specific project.".to_string()
+            )
+        );
+        assert_eq!(
+            copy(&key(LibKind::Snippet, "Go"), Some(project)),
+            CopyOutcome::Copied(None)
+        );
+        assert_eq!(
+            copy(&key(LibKind::Runner, "Review"), Some(project)),
+            CopyOutcome::Copied(Some(CopyEditor::Runner(0)))
+        );
+        assert_eq!(
+            copy(&key(LibKind::Loop, "Nightly"), Some(project)),
+            CopyOutcome::Copied(Some(CopyEditor::Loop(0)))
+        );
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].name, "Go");
+        assert_eq!(runners.len(), 1);
+        assert_eq!(runners[0].name, "Review");
+        assert_eq!(runners[0].preset_id, Some(Uuid::from_u128(0xC1)));
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].name, "Nightly");
+        assert!(!loops[0].enabled);
+        assert_eq!(loops[0].project_id, project);
+        assert_eq!(loops[0].last_run, Some(1_000));
+        assert_eq!(loops[0].preset_id, toolbar);
     }
 }
