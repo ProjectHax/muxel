@@ -3623,6 +3623,9 @@ enum ConfirmAction {
         file: Option<String>,
         retry: SshRetry,
     },
+    /// Re-sync a team library from its repository, discarding local changes
+    /// of its clone.
+    ResyncLibrary(Uuid),
 }
 
 impl ConfirmAction {
@@ -15559,6 +15562,7 @@ impl MuxelApp {
             ConfirmAction::TrustHostKey { entry, file, retry } => {
                 self.trust_host_key(entry, file, retry, window, cx)
             }
+            ConfirmAction::ResyncLibrary(id) => self.confirm_library_resync(id, cx),
         }
         cx.notify();
     }
@@ -26317,23 +26321,30 @@ impl MuxelApp {
             (t("Runners"), SettingsSection::Runners),
             (t("Snippets"), SettingsSection::Snippets),
             (t("Loops"), SettingsSection::Loops),
+            (t("Libraries"), SettingsSection::Libraries),
             (t("Remotes"), SettingsSection::Remotes),
             (t("Identities"), SettingsSection::Identities),
             (t("Projects"), SettingsSection::Projects),
             (t("Keybindings"), SettingsSection::Keybindings),
         ];
-        let mut nav = v_flex()
-            .w(rems(10.0))
-            .flex_none()
-            .p_2()
-            .gap_1()
-            .bg(cx.theme().sidebar);
+        let mut nav_items = v_flex().p_2().gap_1();
         for (label, section) in sections {
-            nav = nav.child(
+            nav_items = nav_items.child(
                 nav_item(label, section)
                     .on_click(cx.listener(move |this, _e, _w, cx| this.set_section(section, cx))),
             );
         }
+        // The section list scrolls on its own so its last entries never paint
+        // over Cancel/Save when the modal is short.
+        let nav = div()
+            .id("settings-nav")
+            .w(rems(10.0))
+            .flex_none()
+            .h_full()
+            .min_h_0()
+            .overflow_y_scroll()
+            .bg(cx.theme().sidebar)
+            .child(nav_items);
 
         let content_w = self.settings_content_w(window);
         let content = match current {
@@ -26347,6 +26358,7 @@ impl MuxelApp {
             SettingsSection::Runners => self.render_settings_runners(cx),
             SettingsSection::Snippets => self.render_settings_snippets(cx),
             SettingsSection::Loops => self.render_settings_loops(cx),
+            SettingsSection::Libraries => self.render_settings_libraries(cx),
             SettingsSection::Remotes => self.render_settings_remotes(cx),
             SettingsSection::Identities => self.render_settings_identities(cx),
             SettingsSection::Projects => self.render_settings_projects(cx),

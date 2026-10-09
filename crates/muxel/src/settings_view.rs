@@ -121,6 +121,8 @@ pub enum SettingsSection {
     Runners,
     Snippets,
     Loops,
+    /// Team libraries: shared snippets, runners and loops from git.
+    Libraries,
     Remotes,
     Identities,
     Projects,
@@ -179,6 +181,17 @@ pub struct SettingsUi {
     pub l_interval: Entity<InputState>,
     pub l_hour: Entity<InputState>,
     pub l_minute: Entity<InputState>,
+
+    // Team libraries; the list itself lives in `MuxelApp::library_hub`.
+    /// The library whose details are shown; `None` = the add form.
+    pub selected_library: Option<Uuid>,
+    pub lib_url: Entity<InputState>,
+    pub lib_branch: Entity<InputState>,
+    pub lib_name: Entity<InputState>,
+    /// Display name of the selected library.
+    pub lib_rename: Entity<InputState>,
+    /// Inline message of the last refused or rolled-back add.
+    pub lib_add_error: Option<String>,
 
     // Grok Bot tab.
     /// Inline result of the last "Test" (running `muxel ctl` as Grok Bot would).
@@ -338,6 +351,19 @@ impl SettingsUi {
             l_interval: cx.new(|cx| InputState::new(window, cx).placeholder("1")),
             l_hour: cx.new(|cx| InputState::new(window, cx).placeholder("9")),
             l_minute: cx.new(|cx| InputState::new(window, cx).placeholder("00")),
+            selected_library: None,
+            lib_url: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("https://github.com/acme/team-lib.git")
+            }),
+            lib_branch: cx
+                .new(|cx| InputState::new(window, cx).placeholder(t("Branch (blank = default)"))),
+            lib_name: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(t("Display name (blank = from the URL)"))
+            }),
+            lib_rename: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(t("Display name (blank = from the URL)"))
+            }),
+            lib_add_error: None,
             grok_test: RemoteTestState::Idle,
             grok_skill_preview: false,
             grok_skill_copied: false,
