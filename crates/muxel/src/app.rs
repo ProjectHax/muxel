@@ -23,6 +23,8 @@ use gpui_component::tag::Tag;
 use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
 use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
+use muxel_core::library::MENU_WINDOW_MARGIN;
+use muxel_core::library::menu::menu_list_max_height;
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::winshell::WindowsShell;
@@ -3088,6 +3090,10 @@ pub struct MuxelApp {
     loops_menu: Option<Point<Pixels>>,
     /// Anchor point for the toolbar "Snippets" popup, when open.
     snippets_menu: Option<Point<Pixels>>,
+    /// Scroll state of the toolbar drop-down lists; reset when a popup opens.
+    runners_menu_scroll: ScrollHandle,
+    loops_menu_scroll: ScrollHandle,
+    snippets_menu_scroll: ScrollHandle,
     /// The runner whose run-dialog is open (index into `runners`).
     active_runner: Option<usize>,
     /// Whether the run-dialog (collect details) is shown.
@@ -5108,6 +5114,9 @@ impl MuxelApp {
             runners_menu: None,
             loops_menu: None,
             snippets_menu: None,
+            runners_menu_scroll: ScrollHandle::new(),
+            loops_menu_scroll: ScrollHandle::new(),
+            snippets_menu_scroll: ScrollHandle::new(),
             active_runner: None,
             show_run_dialog: false,
             runner_input,
@@ -21486,6 +21495,7 @@ impl MuxelApp {
                         MouseButton::Left,
                         cx.listener(|this, e: &MouseDownEvent, _w, cx| {
                             this.runners_menu = Some(e.position);
+                            this.runners_menu_scroll.set_offset(Point::default());
                             cx.notify();
                         }),
                     ),
@@ -21501,6 +21511,7 @@ impl MuxelApp {
                         MouseButton::Left,
                         cx.listener(|this, e: &MouseDownEvent, _w, cx| {
                             this.loops_menu = Some(e.position);
+                            this.loops_menu_scroll.set_offset(Point::default());
                             cx.notify();
                         }),
                     ),
@@ -21516,6 +21527,7 @@ impl MuxelApp {
                         MouseButton::Left,
                         cx.listener(|this, e: &MouseDownEvent, _w, cx| {
                             this.snippets_menu = Some(e.position);
+                            this.snippets_menu_scroll.set_offset(Point::default());
                             cx.notify();
                         }),
                     ),
@@ -24464,6 +24476,67 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    /// The floating box of a toolbar drop-down: a fixed title row, the
+    /// scrollable `list` and an optional fixed `footer`.
+    ///
+    /// `anchored` only applies its margin when the box overflows, so a
+    /// transparent `MENU_WINDOW_MARGIN` bottom padding (with a 0 bottom snap
+    /// margin) keeps the visible box that far from the bottom edge.
+    #[allow(clippy::too_many_arguments)]
+    fn toolbar_menu_popup(
+        &self,
+        pos: Point<Pixels>,
+        width: f32,
+        title: AnyElement,
+        list: Stateful<Div>,
+        footer: Option<AnyElement>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (box_max, list_max) =
+            toolbar_menu_max_heights(f32::from(window.viewport_size().height));
+        let margin = px(MENU_WINDOW_MARGIN);
+        deferred(
+            anchored()
+                .position(pos)
+                .snap_to_window_with_margin(gpui::Edges {
+                    top: margin,
+                    right: margin,
+                    bottom: px(0.0),
+                    left: margin,
+                })
+                .child(
+                    div().pb(margin).child(
+                        div()
+                            .occlude()
+                            .w(px(width))
+                            .max_h(px(box_max))
+                            .flex()
+                            .flex_col()
+                            .gap_px()
+                            .p_1()
+                            .bg(cx.theme().popover)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(cx.theme().radius)
+                            .shadow_lg()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(title),
+                            )
+                            .child(list.overflow_y_scroll().min_h_0().max_h(px(list_max)))
+                            .children(footer),
+                    ),
+                ),
+        )
+        .with_priority(1)
+    }
+
     /// Anchored dropdown for the toolbar "Run task" button: pick a runner.
     /// A small pencil "edit" button for the Run-task / Loops dropdown rows. The
     /// caller attaches the `.on_click`.
@@ -24485,7 +24558,7 @@ impl MuxelApp {
             )
     }
 
-    fn render_runners_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_runners_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(pos) = self.runners_menu else {
             return div().into_any_element();
         };
@@ -24553,42 +24626,23 @@ impl MuxelApp {
                 }),
             )
             .child(
-                deferred(
-                    anchored()
-                        .position(pos)
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            div()
-                                .occlude()
-                                .w(px(240.0))
-                                .flex()
-                                .flex_col()
-                                .gap_px()
-                                .p_1()
-                                .bg(cx.theme().popover)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .rounded(cx.theme().radius)
-                                .shadow_lg()
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(t("Run task")),
-                                )
-                                .child(list),
-                        ),
-                )
-                .with_priority(1),
+                self.toolbar_menu_popup(
+                    pos,
+                    240.0,
+                    t("Run task").into_any_element(),
+                    list.id("runners-menu-list")
+                        .track_scroll(&self.runners_menu_scroll),
+                    None,
+                    window,
+                    cx,
+                ),
             )
             .into_any_element()
     }
 
     /// The toolbar "Snippets" popup: pick a saved snippet to type into the active
     /// pane. Rows are inert (and a hint shows) when no terminal pane is focused.
-    fn render_snippets_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_snippets_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(pos) = self.snippets_menu else {
             return div().into_any_element();
         };
@@ -24682,35 +24736,16 @@ impl MuxelApp {
                 }),
             )
             .child(
-                deferred(
-                    anchored()
-                        .position(pos)
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            div()
-                                .occlude()
-                                .w(px(260.0))
-                                .flex()
-                                .flex_col()
-                                .gap_px()
-                                .p_1()
-                                .bg(cx.theme().popover)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .rounded(cx.theme().radius)
-                                .shadow_lg()
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(header),
-                                )
-                                .child(list),
-                        ),
-                )
-                .with_priority(1),
+                self.toolbar_menu_popup(
+                    pos,
+                    260.0,
+                    header.into_any_element(),
+                    list.id("snippets-menu-list")
+                        .track_scroll(&self.snippets_menu_scroll),
+                    None,
+                    window,
+                    cx,
+                ),
             )
             .into_any_element()
     }
@@ -24725,7 +24760,7 @@ impl MuxelApp {
         self.open_snippet_editor(idx, window, cx);
     }
 
-    fn render_loops_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_loops_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(pos) = self.loops_menu else {
             return div().into_any_element();
         };
@@ -24793,28 +24828,29 @@ impl MuxelApp {
                     ),
             );
         }
-        // Footer: create a new loop (opens its editor in settings).
-        list = list.child(
-            div()
-                .id("loop-new")
-                .flex()
-                .items_center()
-                .gap_2()
-                .w_full()
-                .px_2()
-                .py_1()
-                .mt_px()
-                .rounded(cx.theme().radius)
-                .cursor_pointer()
-                .text_color(cx.theme().muted_foreground)
-                .hover(|s| s.bg(cx.theme().accent))
-                .on_click(cx.listener(|this, _e, window, cx| {
-                    this.loops_menu = None;
-                    this.add_loop(window, cx);
-                }))
-                .child(Icon::new(IconName::Plus).size(px(14.0)))
-                .child(div().text_sm().child(t("New loop…"))),
-        );
+        // Footer: create a new loop (opens its editor in settings). It sits
+        // outside the scrollable list so it stays visible.
+        let footer = div()
+            .id("loop-new")
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_2()
+            .py_1()
+            .mt_px()
+            .rounded(cx.theme().radius)
+            .cursor_pointer()
+            .text_color(cx.theme().muted_foreground)
+            .hover(|s| s.bg(cx.theme().accent))
+            .on_click(cx.listener(|this, _e, window, cx| {
+                this.loops_menu = None;
+                this.add_loop(window, cx);
+            }))
+            .child(Icon::new(IconName::Plus).size(px(14.0)))
+            .child(div().text_sm().child(t("New loop…")))
+            .into_any_element();
         div()
             .absolute()
             .inset_0()
@@ -24826,35 +24862,16 @@ impl MuxelApp {
                 }),
             )
             .child(
-                deferred(
-                    anchored()
-                        .position(pos)
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            div()
-                                .occlude()
-                                .w(px(260.0))
-                                .flex()
-                                .flex_col()
-                                .gap_px()
-                                .p_1()
-                                .bg(cx.theme().popover)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .rounded(cx.theme().radius)
-                                .shadow_lg()
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(t("Loops — click to run now, pencil to edit")),
-                                )
-                                .child(list),
-                        ),
-                )
-                .with_priority(1),
+                self.toolbar_menu_popup(
+                    pos,
+                    260.0,
+                    t("Loops — click to run now, pencil to edit").into_any_element(),
+                    list.id("loops-menu-list")
+                        .track_scroll(&self.loops_menu_scroll),
+                    Some(footer),
+                    window,
+                    cx,
+                ),
             )
             .into_any_element()
     }
@@ -28671,17 +28688,17 @@ impl Render for MuxelApp {
             .children(
                 self.runners_menu
                     .is_some()
-                    .then(|| self.render_runners_menu(cx)),
+                    .then(|| self.render_runners_menu(window, cx)),
             )
             .children(
                 self.loops_menu
                     .is_some()
-                    .then(|| self.render_loops_menu(cx)),
+                    .then(|| self.render_loops_menu(window, cx)),
             )
             .children(
                 self.snippets_menu
                     .is_some()
-                    .then(|| self.render_snippets_menu(cx)),
+                    .then(|| self.render_snippets_menu(window, cx)),
             )
             .children(self.show_run_dialog.then(|| self.render_run_dialog(cx)))
             // A pane-scoped confirm belongs to the window showing that pane; when
@@ -28728,6 +28745,27 @@ impl Render for MuxelApp {
             // No toast layer: all notifications go to the sidebar feed instead.
             .into_any_element();
         ui_profile::finish_render(ui_profile::RenderView::Main, _render, root)
+    }
+}
+
+/// Height caps `(visible box, list area)` of a toolbar drop-down. The list gets
+/// `menu_list_max_height` with no fixed part; flex layout subtracts the real one.
+fn toolbar_menu_max_heights(viewport_h: f32) -> (f32, f32) {
+    let box_max = (viewport_h - 2.0 * MENU_WINDOW_MARGIN).max(0.0);
+    (box_max, menu_list_max_height(viewport_h, 0.0))
+}
+
+#[cfg(test)]
+mod toolbar_menu_tests {
+    use super::toolbar_menu_max_heights;
+
+    #[test]
+    fn toolbar_menu_heights_keep_window_margins() {
+        assert_eq!(toolbar_menu_max_heights(1000.0), (984.0, 600.0));
+        assert_eq!(toolbar_menu_max_heights(700.0), (684.0, 420.0));
+        assert_eq!(toolbar_menu_max_heights(400.0), (384.0, 240.0));
+        assert_eq!(toolbar_menu_max_heights(30.0), (14.0, 14.0));
+        assert_eq!(toolbar_menu_max_heights(10.0), (0.0, 0.0));
     }
 }
 
