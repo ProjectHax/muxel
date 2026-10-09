@@ -1673,12 +1673,8 @@ pub fn git_stash_drop(loc: &RepoLoc) -> Result<String> {
 // Team libraries: non-interactive git runner with a time limit. Blocking.
 // ---------------------------------------------------------------------------
 
-// Nothing in the app calls these yet: the `allow(dead_code)` attributes go
-// away once team libraries are wired in.
-
-/// How library git operations are run: which `git`, with what environment,
-/// and the test hooks (process counter, reaped children).
-#[cfg_attr(not(test), allow(dead_code))]
+/// How library git operations are run: which `git`, its environment and the
+/// test hooks.
 pub struct GitEnv {
     pub program: OsString,
     /// Replaces the child's `PATH`.
@@ -1700,17 +1696,14 @@ pub struct GitEnv {
     pub check_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-/// A directory rename: `(from, to)`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub type RenameFn = Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync>;
 
-/// A recursive directory delete.
-#[cfg_attr(not(test), allow(dead_code))]
 pub type RemoveDirFn = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl GitEnv {
-    /// Plain `git` from the user's `PATH`.
+    /// The environment the app uses: plain `git` from the user's `PATH`.
+    // Not called by the app until team libraries are wired in.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn production() -> Self {
         Self {
             program: OsString::from("git"),
@@ -1830,10 +1823,8 @@ impl GitEnv {
     }
 }
 
-/// Whether `url` is reached over SSH: `ssh://`, `git+ssh://`,
-/// `ssh+git://`, or scp-like `[user@]host:path` — no `://`, a `:` whose prefix
-/// has no `/` or `\` and is not a single ASCII letter (a Windows drive).
-#[cfg_attr(not(test), allow(dead_code))]
+/// Whether `url` is reached over SSH: `ssh://`, `git+ssh://`, `ssh+git://`, or
+/// scp-like `[user@]host:path` (not a Windows drive letter).
 pub fn is_ssh_url(url: &str) -> bool {
     let url = url.trim();
     let lower = url.to_ascii_lowercase();
@@ -1859,7 +1850,6 @@ pub fn is_ssh_url(url: &str) -> bool {
 
 /// Result of `git config --get core.sshCommand`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum SshConfigProbe {
     /// Exit 0: the user configured an SSH command.
     Set,
@@ -1872,7 +1862,6 @@ pub enum SshConfigProbe {
 /// Whether to run git with `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` so SSH never
 /// prompts: only for an SSH URL when the user set none of `GIT_SSH_COMMAND`,
 /// `GIT_SSH` or `core.sshCommand`. `probe` is called only when needed.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn ssh_batch_mode_needed(
     url: &str,
     env_git_ssh_command: bool,
@@ -1885,9 +1874,8 @@ pub fn ssh_batch_mode_needed(
     probe() == SshConfigProbe::Unset
 }
 
-/// `git config --get core.sshCommand` run in `cwd` with the same environment
-/// and deadline as the operation it precedes; counted in `env.spawned`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `git config --get core.sshCommand` in `cwd`, with the same environment and
+/// deadline as the operation it precedes.
 fn probe_ssh_command_config(
     env: &GitEnv,
     cwd: Option<&Path>,
@@ -1912,10 +1900,8 @@ fn probe_ssh_command_config(
     }
 }
 
-/// Poll `child` every 50 ms until it exits or `deadline` passes; on the
-/// deadline, kill its whole process tree and wait for it. Returns the child
-/// (always waited for) and its exit status, or `None` if it was killed.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Poll `child` until it exits or `deadline` passes, then kill its process
+/// tree. Returns the waited-for child and its status (`None` if killed).
 fn wait_until(mut child: Child, deadline: Instant) -> (Child, Option<ExitStatus>) {
     loop {
         match child.try_wait() {
@@ -1936,7 +1922,6 @@ fn wait_until(mut child: Child, deadline: Instant) -> (Child, Option<ExitStatus>
 
 /// Kill `child` and everything it started (git spawns helpers such as
 /// `git-remote-https` and `ssh`).
-#[cfg_attr(not(test), allow(dead_code))]
 fn kill_process_tree(child: &mut Child) {
     #[cfg(windows)]
     {
@@ -1958,8 +1943,6 @@ fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// Bytes of git's stderr kept for the error message.
-#[cfg_attr(not(test), allow(dead_code))]
 const GIT_STDERR_TAIL: usize = 4096;
 
 /// On Windows, `core.longpaths=true` lets git create and read paths past
@@ -1970,13 +1953,9 @@ const LONG_PATHS: Option<&str> = Some("core.longpaths=true");
 const LONG_PATHS: Option<&str> = None;
 
 /// Run `git <-c…> <args>` for a library operation on `url`, blocking until it
-/// ends or `deadline` passes: no stdin, no terminal prompts, no
-/// credential UI, SSH in batch mode per [`ssh_batch_mode_needed`], and the
-/// whole process tree killed on the deadline. `ceiling` stops git's
-/// repository discovery and must be a strict ancestor of `cwd` (git ignores
-/// an entry equal to `cwd`), so git never reaches a repository above
-/// `LIB_DIR`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// ends or `deadline` passes: no stdin, prompts or credential UI, SSH in batch
+/// mode per [`ssh_batch_mode_needed`], and the process tree killed on the
+/// deadline. `ceiling` as in [`GitEnv::base_command`].
 pub fn run_git(
     env: &GitEnv,
     cwd: Option<&Path>,
@@ -2088,18 +2067,14 @@ pub fn run_git(
 // Team libraries: clone, pull, re-sync and forced delete. Blocking.
 // ---------------------------------------------------------------------------
 
-/// `GitFailure::Io` from a filesystem error.
-#[cfg_attr(not(test), allow(dead_code))]
 fn io_failure(e: &std::io::Error) -> GitFailure {
     GitFailure::Io {
         detail: e.to_string(),
     }
 }
 
-/// `git clone --quiet --single-branch [--branch <branch>] -- <url> <target>`,
-/// run from `lib_dir`; on any failure the half-made `target` is removed
-/// (the one failure that deletes files: nothing usable was there before).
-#[cfg_attr(not(test), allow(dead_code))]
+/// `git clone --single-branch` from `lib_dir`; on failure the half-made
+/// `target` is removed.
 fn clone_into(
     env: &GitEnv,
     url: &str,
@@ -2134,11 +2109,8 @@ fn clone_into(
     res
 }
 
-/// The `GIT_CEILING_DIRECTORIES` entry for a clone run from `lib_dir`: its
-/// parent, because git ignores a ceiling entry equal to the working
-/// directory itself and would then find a repository above `LIB_DIR`.
-/// `lib_dir` itself only when it has no parent.
-#[cfg_attr(not(test), allow(dead_code))]
+/// The ceiling for a clone run from `lib_dir`: its parent, since git ignores a
+/// ceiling equal to the working directory.
 fn clone_ceiling(lib_dir: &Path) -> &Path {
     lib_dir.parent().unwrap_or(lib_dir)
 }
@@ -2151,11 +2123,9 @@ fn temp_suffix() -> String {
     hex
 }
 
-/// Clone `url` (`branch`, `""` = the remote's default) into `dest`
-/// (`LIB_DIR/<id>`) through a temporary sibling `<id>.c-<suffix>` that is
-/// renamed into place, so a failed clone never leaves a half-made `dest`.
-/// Starts with `create_dir_all(lib_dir)`, before the `core.sshCommand` query.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Clone `url` (`branch`, `""` = the remote's default) into `dest` through a
+/// temporary sibling renamed into place, so a failed clone never leaves a
+/// half-made `dest`.
 pub fn library_clone(
     env: &GitEnv,
     url: &str,
@@ -2178,14 +2148,10 @@ pub fn library_clone(
     Ok(())
 }
 
-/// `git -C <clone> pull --ff-only --quiet` and nothing else: no reset, stash,
-/// clean or checkout. `url` is the configured URL, used
-/// only for the SSH rule; the `core.sshCommand` query runs in the clone.
-/// git never looks above the clone's parent (`LIB_DIR`), and a clone folder
-/// without `.git` is reported as [`GitFailure::NotAClone`] without running
-/// git: pulling there would reach a repository above `LIB_DIR`, and cloning
-/// over it would delete what is in it.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `git pull --ff-only` and nothing else: no reset, stash, clean or checkout.
+/// `url` is only used for the SSH rule. A clone folder without `.git` is
+/// [`GitFailure::NotAClone`] without running git: pulling there would reach a
+/// repository above `LIB_DIR`, and cloning over it would delete its contents.
 pub fn library_pull(
     env: &GitEnv,
     url: &str,
@@ -2205,14 +2171,10 @@ pub fn library_pull(
     run_git(env, Some(clone), clone.parent(), url, &args, deadline)
 }
 
-/// Re-sync `LIB_DIR/<id>` with the remote branch:
-/// a full clone to `<id>.r-<suffix>`, then `<id>` → `<id>.o-<suffix>`,
-/// temporary → `<id>`, and the old clone removed. `deadline` is one total
-/// limit for every step (the clone time limit). On any failure the clone is
-/// left as it was, except when both moving the new clone in and moving the
-/// old one back fail (`ResyncRestoreFailed`), where `<id>` is missing and `<id>.o-<suffix>`
-/// remains.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Re-sync `LIB_DIR/<id>` with the remote: a full clone to `<id>.r-…`, then
+/// `<id>` → `<id>.o-…`, the new clone → `<id>`, and the old one removed. On any
+/// failure the clone is left as it was, except `ResyncRestoreFailed`, where
+/// `<id>` is missing and `<id>.o-…` remains.
 pub fn library_resync(
     env: &GitEnv,
     url: &str,
@@ -2272,21 +2234,8 @@ pub fn library_resync(
 /// changed files come from `git status` and local commits from
 /// `rev-list @{upstream}..HEAD`. Any failure or the deadline → `Unknown`.
 ///
-/// - `clone` missing → `NoClone`.
-/// - `clone` without `.git` → its files counted recursively without running
-///   git (directories do not count, links are not followed); none →
-///   `NoClone`; an unreadable entry or the deadline → `Unknown`.
-/// - Otherwise `git status --porcelain=v1 -z --untracked-files=all` (files:
-///   tracked modified or deleted and untracked one by one, ignored ones
-///   excluded) and `git rev-list --count @{upstream}..HEAD` (local commits,
-///   against the upstream as it is in the clone: no fetch). Any failure — git
-///   missing, a git error, no upstream, detached HEAD, the deadline — →
-///   `Unknown`.
-///
-/// git runs with the library environment of [`GitEnv::base_command`] (no
-/// askpass, never above `LIB_DIR`) plus `GIT_OPTIONAL_LOCKS=0`, so `status`
-/// never rewrites the index, and `core.fsmonitor=false`, so no daemon starts.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `GIT_OPTIONAL_LOCKS=0` keeps `status` from rewriting the index, and
+/// `core.fsmonitor=false` keeps it from starting a daemon.
 pub fn library_local_changes(env: &GitEnv, clone: &Path, deadline: Instant) -> LocalChanges {
     #[cfg(test)]
     if let Some(hook) = &env.check_hook {
@@ -2327,8 +2276,7 @@ pub fn library_local_changes(env: &GitEnv, clone: &Path, deadline: Instant) -> L
 }
 
 /// Files under `dir`, recursively, without following links; `None` on a
-/// read error or once `deadline` has passed.
-#[cfg_attr(not(test), allow(dead_code))]
+/// read error or past `deadline`.
 fn count_files(dir: &Path, deadline: Instant) -> Option<usize> {
     if Instant::now() >= deadline {
         return None;
@@ -2345,10 +2293,8 @@ fn count_files(dir: &Path, deadline: Instant) -> Option<usize> {
     Some(files)
 }
 
-/// Entries of `git status --porcelain=v1 -z`: NUL-terminated `XY <path>`
-/// fields, plus the source path as one more field after a rename or copy
-/// (`R`/`C`), which is not another entry.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Entries of `git status --porcelain=v1 -z`. A rename or copy (`R`/`C`) adds
+/// its source path as one more field, which is not another entry.
 fn status_entries(out: &[u8]) -> usize {
     let mut fields = out.split(|b| *b == 0).filter(|f| !f.is_empty());
     let mut entries = 0;
@@ -2361,11 +2307,8 @@ fn status_entries(out: &[u8]) -> usize {
     entries
 }
 
-/// Run `git -c core.fsmonitor=false <args>` in `clone` for the
-/// local-changes check and return its stdout; `None` if git is missing,
-/// fails, or `deadline` passes (its process tree is then killed). Counted in
-/// `env.spawned`. The deadline already passed → `None` without running git.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Run git `args` in `clone` for the local-changes check and return its stdout;
+/// `None` if git is missing, fails, or `deadline` passes.
 fn check_git_output(
     env: &GitEnv,
     clone: &Path,
@@ -2405,9 +2348,8 @@ fn check_git_output(
         .flatten()
 }
 
-/// Delete `dir` with `env.remove_dir`; if that fails, clear the read-only
-/// attribute of everything under it and try exactly once more.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Delete `dir`; if that fails, clear the read-only attribute of everything
+/// under it (git's packfiles are read-only on Windows) and try once more.
 pub fn remove_dir_force(env: &GitEnv, dir: &Path) -> std::io::Result<()> {
     if (env.remove_dir)(dir).is_ok() {
         return Ok(());
@@ -2416,9 +2358,8 @@ pub fn remove_dir_force(env: &GitEnv, dir: &Path) -> std::io::Result<()> {
     (env.remove_dir)(dir)
 }
 
-/// Make `path` and, for a directory, everything under it writable. Symlinks
-/// are not followed. Best effort: errors are ignored.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Make `path` and everything under it writable, without following symlinks.
+/// Best effort.
 fn clear_read_only(path: &Path) {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
