@@ -22,10 +22,13 @@ use muxel_core::library::hub::{
 use muxel_core::library::resolve::{CopyError, SnippetStep, resolve_preset, snippet_send_action};
 use muxel_core::library::resync::LocalChanges;
 use muxel_core::library::state::{
-    FireMode, TurnOn, TurnOnRequest, find_shared_loop, loop_row, request_turn_on, turn_off, turn_on,
+    FireMode, RunnerConfirm, RunnerLaunch, TurnOn, TurnOnRequest, confirm_runner,
+    find_confirmation, find_shared_loop, loop_row, request_turn_on, runner_launch, turn_off,
+    turn_on,
 };
 use muxel_core::library::{
     FileError, GitFailure, LibItemKey, LibKind, LoopContent, LoopOffReason, PresetResolution,
+    RunnerContent,
 };
 
 /// Settings read at startup, plus whether `config.toml` existed and parsed:
@@ -306,6 +309,11 @@ pub(super) enum LibraryDialog {
         project: Option<Uuid>,
         agent: Option<Uuid>,
     },
+    /// Confirm shared runner `key` before it runs.
+    RunnerConfirm {
+        key: LibItemKey,
+        shown: RunnerContent,
+    },
 }
 
 /// Asking to switch a shared loop on.
@@ -500,6 +508,125 @@ pub(super) fn post_run_text(post_run: PostRunAction) -> String {
     match post_run {
         PostRunAction::Leave => t("Leave the agent running").to_string(),
         PostRunAction::Exit => t("Exit the agent and close its pane").to_string(),
+    }
+}
+
+// --- Shared runners ---
+
+/// Shared runner `key`'s launch decision, with content and confirmation looked
+/// up by identity.
+fn launch_decision(hub: &LibraryHub, key: &LibItemKey, presets: &[AgentPreset]) -> RunnerLaunch {
+    let confirmation = find_confirmation(&hub.runner_confirmations, key.library, &key.name);
+    runner_launch(confirmation, hub.loaded_runner(key), presets)
+}
+
+fn runner_confirm_dialog(key: &LibItemKey, shown: RunnerContent) -> LibraryDialog {
+    LibraryDialog::RunnerConfirm {
+        key: key.clone(),
+        shown,
+    }
+}
+
+/// What a click on a shared runner's row does.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum RunnerRowClick {
+    /// Not loaded any more, or its preset does not resolve: nothing.
+    Nothing,
+    /// This version is not confirmed: show the confirmation.
+    Confirm(LibraryDialog),
+    /// Confirmed: the normal "Run task" details dialog.
+    Details(ActiveRunner),
+}
+
+pub(super) fn runner_row_click(
+    hub: &LibraryHub,
+    key: &LibItemKey,
+    presets: &[AgentPreset],
+) -> RunnerRowClick {
+    match launch_decision(hub, key, presets) {
+        RunnerLaunch::Gone | RunnerLaunch::Unavailable(_) => RunnerRowClick::Nothing,
+        RunnerLaunch::NeedsConfirm(shown) => {
+            RunnerRowClick::Confirm(runner_confirm_dialog(key, shown))
+        }
+        RunnerLaunch::Proceed { content, .. } => RunnerRowClick::Details(ActiveRunner::Library {
+            key: key.clone(),
+            shown: content,
+        }),
+    }
+}
+
+/// What confirming a shared runner's confirmation dialog does.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum RunnerConfirmStep {
+    /// Recorded (persist it): open the details dialog. The confirmation
+    /// stays even if that dialog is then cancelled.
+    Details(ActiveRunner),
+    /// The content changed: show this dialog instead; nothing recorded.
+    Reshow(LibraryDialog),
+    /// The runner is gone: close the dialog.
+    Close,
+    /// The `preset` does not resolve: close, post this reason.
+    Unavailable(String),
+}
+
+/// Confirm the dialog of `key`, which showed `shown`, against what is loaded now.
+pub(super) fn confirm_runner_dialog(
+    hub: &mut LibraryHub,
+    key: &LibItemKey,
+    shown: &RunnerContent,
+    presets: &[AgentPreset],
+) -> RunnerConfirmStep {
+    let loaded = hub.loaded_runner(key).cloned();
+    match confirm_runner(
+        &mut hub.runner_confirmations,
+        key,
+        shown,
+        loaded.as_ref(),
+        presets,
+    ) {
+        RunnerConfirm::OpenDetails => RunnerConfirmStep::Details(ActiveRunner::Library {
+            key: key.clone(),
+            shown: shown.clone(),
+        }),
+        RunnerConfirm::Reshow(c) => RunnerConfirmStep::Reshow(runner_confirm_dialog(key, c)),
+        RunnerConfirm::Close => RunnerConfirmStep::Close,
+        RunnerConfirm::Unavailable(p) => RunnerConfirmStep::Unavailable(preset_not_found_text(&p)),
+    }
+}
+
+/// What pressing Run in a shared runner's details dialog does.
+#[derive(Debug)]
+pub(super) enum RunnerRunStep {
+    /// Launch this transient runner, built from the content just compared.
+    Launch(Runner),
+    /// The content differs from the confirmed one: no pane; confirm again (the typed
+    /// details are dropped).
+    Confirm(LibraryDialog),
+    /// Not loaded any more: no pane, no event.
+    Nothing,
+    /// The `preset` does not resolve: no pane, post this reason.
+    Unavailable(String),
+}
+
+/// Run pressed: look `key` up by identity and decide with its loaded content.
+pub(super) fn library_runner_run(
+    hub: &LibraryHub,
+    key: &LibItemKey,
+    presets: &[AgentPreset],
+) -> RunnerRunStep {
+    match launch_decision(hub, key, presets) {
+        RunnerLaunch::Gone => RunnerRunStep::Nothing,
+        RunnerLaunch::Unavailable(p) => RunnerRunStep::Unavailable(preset_not_found_text(&p)),
+        RunnerLaunch::NeedsConfirm(shown) => {
+            RunnerRunStep::Confirm(runner_confirm_dialog(key, shown))
+        }
+        RunnerLaunch::Proceed { content, preset_id } => RunnerRunStep::Launch(Runner {
+            id: Uuid::new_v4(),
+            name: key.name.clone(),
+            preset_id,
+            auto_mode_presses: content.auto_mode_presses,
+            prompt: content.prompt,
+        }),
     }
 }
 
@@ -1241,6 +1368,9 @@ impl MuxelApp {
                 project,
                 agent,
             }) => (key, shown, *project, *agent),
+            Some(LibraryDialog::RunnerConfirm { key, shown }) => {
+                return self.render_runner_confirm_dialog(key, shown, cx);
+            }
             None => return div().into_any_element(),
         };
         let muted = cx.theme().muted_foreground;
@@ -1385,6 +1515,165 @@ impl MuxelApp {
                                     .on_click(
                                         cx.listener(|this, _e, _w, cx| this.confirm_library_dialog(cx)),
                                     ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared runners
+// ---------------------------------------------------------------------------
+
+impl MuxelApp {
+    /// Not confirmed → the confirmation; confirmed → the details dialog.
+    fn click_shared_runner(&mut self, key: &LibItemKey, cx: &mut Context<Self>) {
+        self.runners_menu = None;
+        match runner_row_click(&self.library_hub, key, &self.presets) {
+            RunnerRowClick::Nothing => {}
+            RunnerRowClick::Confirm(dialog) => self.library_dialog = Some(dialog),
+            RunnerRowClick::Details(active) => self.show_details_dialog(active, cx),
+        }
+        cx.notify();
+    }
+
+    /// Record exactly the content shown and open the details dialog, or reshow, or close.
+    fn confirm_runner_library_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(LibraryDialog::RunnerConfirm { key, shown }) = self.library_dialog.clone() else {
+            return;
+        };
+        match confirm_runner_dialog(&mut self.library_hub, &key, &shown, &self.presets) {
+            RunnerConfirmStep::Details(active) => {
+                self.library_dialog = None;
+                self.persist_settings();
+                self.show_details_dialog(active, cx);
+            }
+            RunnerConfirmStep::Reshow(dialog) => self.library_dialog = Some(dialog),
+            RunnerConfirmStep::Close => self.library_dialog = None,
+            RunnerConfirmStep::Unavailable(reason) => {
+                self.library_dialog = None;
+                self.add_event(
+                    NotifKind::Error,
+                    tf("Can't run task “{name}”", &[("name", &key.name)]),
+                    reason,
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// Run pressed in the (already closed) details dialog: look `key` up by identity
+    /// and launch only the confirmed content.
+    pub(super) fn run_library_runner(
+        &mut self,
+        key: &LibItemKey,
+        details: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match library_runner_run(&self.library_hub, key, &self.presets) {
+            RunnerRunStep::Launch(runner) => self.launch_runner(runner, details, window, cx),
+            RunnerRunStep::Confirm(dialog) => self.library_dialog = Some(dialog),
+            RunnerRunStep::Nothing => {}
+            RunnerRunStep::Unavailable(reason) => self.add_event(
+                NotifKind::Error,
+                tf("Can't run task “{name}”", &[("name", &key.name)]),
+                reason,
+            ),
+        }
+        cx.notify();
+    }
+
+    /// The full prompt (scrollable), the agent and `auto_mode_presses`.
+    fn render_runner_confirm_dialog(
+        &self,
+        key: &LibItemKey,
+        shown: &RunnerContent,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let mono = cx.theme().mono_font_family.clone();
+        let field = |label: SharedString, value: String| {
+            div()
+                .flex()
+                .gap_2()
+                .text_sm()
+                .child(div().flex_none().text_color(muted).child(label))
+                .child(div().min_w_0().child(value))
+        };
+        modal_backdrop()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _w, cx| this.close_library_dialog(cx)),
+            )
+            .child(
+                div()
+                    .w(px(520.0))
+                    .max_h(relative(0.9))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_5()
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius_lg)
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_semibold()
+                            .child(tf("Run shared task “{name}”", &[("name", &key.name)])),
+                    )
+                    .child(div().text_sm().text_color(muted).child(t(
+                        "This task comes from a shared library. Check what it does before it runs:",
+                    )))
+                    .child(div().text_xs().text_color(muted).child(t("Prompt")))
+                    .child(
+                        div()
+                            .id("lib-runner-confirm-prompt")
+                            .min_h(px(48.0))
+                            .max_h(px(240.0))
+                            .overflow_y_scroll()
+                            .p_2()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(cx.theme().radius)
+                            .text_sm()
+                            .font_family(mono)
+                            .child(shown.prompt.clone()),
+                    )
+                    .child(field(
+                        t("Agent:"),
+                        dialog_agent_text(shown.preset.as_deref(), &self.presets),
+                    ))
+                    .child(field(
+                        t("Auto-mode presses:"),
+                        shown.auto_mode_presses.to_string(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .child(
+                                Button::new("lib-runner-confirm-cancel")
+                                    .ghost()
+                                    .label(t("Cancel"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.close_library_dialog(cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("lib-runner-confirm-ok")
+                                    .primary()
+                                    .label(t("Confirm"))
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.confirm_runner_library_dialog(cx)
+                                    })),
                             ),
                     ),
             )
@@ -1542,13 +1831,14 @@ impl MuxelApp {
                         .into_any_element()
                 }
                 LibMenuRow::Runner { key, name, agent } => {
+                    let available = matches!(agent, RowAgent::Ready(_));
                     let copy = self.copy_button(
                         format!("lib-runner-copy-{i}"),
                         key.clone(),
                         Some(&agent),
                         cx,
                     );
-                    let item = self.library_agent_item(
+                    let mut item = self.library_agent_item(
                         format!("lib-runner-item-{i}"),
                         name,
                         None,
@@ -1556,6 +1846,14 @@ impl MuxelApp {
                         true,
                         cx,
                     );
+                    if available {
+                        item = item
+                            .cursor_pointer()
+                            .hover(|s| s.bg(cx.theme().accent))
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.click_shared_runner(&key, cx)
+                            }));
+                    }
                     div()
                         .flex()
                         .items_center()
@@ -2672,13 +2970,15 @@ mod shared_loop_tests {
 
     /// Key, shown content, picked project and picked agent of a dialog.
     fn parts(d: &LibraryDialog) -> (LibItemKey, LoopContent, Option<Uuid>, Option<Uuid>) {
-        let LibraryDialog::LoopSwitchOn {
-            key,
-            shown,
-            project,
-            agent,
-        } = d;
-        (key.clone(), shown.clone(), *project, *agent)
+        match d {
+            LibraryDialog::LoopSwitchOn {
+                key,
+                shown,
+                project,
+                agent,
+            } => (key.clone(), shown.clone(), *project, *agent),
+            other => panic!("expected the switch-on dialog, got {other:?}"),
+        }
     }
 
     /// Open the dialog of `name` and confirm it in project `p` at `T0`,
@@ -3326,5 +3626,278 @@ mod shared_loop_tests {
             &|pid| pid == p,
         );
         assert!(later.fire().is_some());
+    }
+}
+
+#[cfg(test)]
+mod shared_runner_tests {
+    use super::{
+        ActiveRunner, LibraryDialog, RunnerConfirmStep, RunnerRowClick, RunnerRunStep,
+        confirm_runner_dialog, dialog_agent_text, library_runner_run, runner_row_click,
+    };
+    use muxel_core::library::hub::{JobKind, JobOutcome, LibraryHub};
+    use muxel_core::library::state::find_confirmation;
+    use muxel_core::library::{LibItemKey, LibKind, LibRunner, ParsedLibrary, RunnerContent};
+    use muxel_core::{AgentPreset, Runner};
+    use uuid::Uuid;
+
+    const CURRENT_AGENT: &str = "Current (toolbar selection at run time)";
+
+    fn content(prompt: &str, preset: Option<&str>) -> RunnerContent {
+        RunnerContent {
+            prompt: prompt.to_string(),
+            preset: preset.map(str::to_string),
+            auto_mode_presses: 2,
+        }
+    }
+
+    fn runner(name: &str, prompt: &str, preset: Option<&str>) -> LibRunner {
+        LibRunner {
+            name: name.to_string(),
+            content: content(prompt, preset),
+        }
+    }
+
+    fn preset(name: &str, id: u128) -> AgentPreset {
+        let mut p = AgentPreset::shell();
+        p.name = name.to_string();
+        p.id = Uuid::from_u128(id);
+        p
+    }
+
+    /// A successful update of `id` that loads `runners` (a pull).
+    fn pull(hub: &mut LibraryHub, id: Uuid, runners: Vec<LibRunner>, now: u64) {
+        hub.begin(id, JobKind::Update, now).unwrap();
+        hub.finish(
+            JobOutcome {
+                id,
+                kind: JobKind::Update,
+                git: Ok(()),
+                read: Ok(ParsedLibrary {
+                    runners,
+                    ..ParsedLibrary::default()
+                }),
+            },
+            now,
+        );
+    }
+
+    fn hub_with(runners: Vec<LibRunner>) -> (LibraryHub, Uuid) {
+        let mut hub = LibraryHub::default();
+        let id = hub.add("file:///a", "", "team").unwrap();
+        pull(&mut hub, id, runners, 100);
+        (hub, id)
+    }
+
+    fn key(lib: Uuid, name: &str) -> LibItemKey {
+        LibItemKey {
+            library: lib,
+            kind: LibKind::Runner,
+            name: name.to_string(),
+        }
+    }
+
+    /// The confirmation dialog a click opens.
+    fn confirm_of(click: RunnerRowClick) -> (LibItemKey, RunnerContent) {
+        match click {
+            RunnerRowClick::Confirm(LibraryDialog::RunnerConfirm { key, shown }) => (key, shown),
+            other => panic!("expected the confirmation, got {other:?}"),
+        }
+    }
+
+    /// Click `name` and confirm the dialog unchanged.
+    fn confirm(hub: &mut LibraryHub, lib: Uuid, name: &str, presets: &[AgentPreset]) {
+        let (k, shown) = confirm_of(runner_row_click(hub, &key(lib, name), presets));
+        let step = confirm_runner_dialog(hub, &k, &shown, presets);
+        assert!(matches!(step, RunnerConfirmStep::Details(_)), "{step:?}");
+    }
+
+    fn confirmed_prompt(hub: &LibraryHub, lib: Uuid, name: &str) -> Option<String> {
+        find_confirmation(&hub.runner_confirmations, lib, name).map(|c| c.confirmed.prompt.clone())
+    }
+
+    fn launched(step: RunnerRunStep) -> Runner {
+        match step {
+            RunnerRunStep::Launch(r) => r,
+            other => panic!("expected a launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_on_unconfirmed_runner_opens_the_confirmation() {
+        let prompt: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let (hub, lib) = hub_with(vec![runner("R", &prompt, Some(" claude "))]);
+        let presets = [preset("Claude", 0xC1)];
+        let (k, shown) = confirm_of(runner_row_click(&hub, &key(lib, "R"), &presets));
+        assert_eq!(k, key(lib, "R"));
+        assert_eq!(shown.prompt.lines().count(), 40);
+        assert_eq!(shown.prompt, prompt);
+        assert_eq!(shown.preset.as_deref(), Some(" claude "));
+        assert_eq!(shown.auto_mode_presses, 2);
+        assert!(hub.runner_confirmations.is_empty());
+    }
+
+    #[test]
+    fn agent_text_is_the_preset_or_current_label() {
+        let presets = [preset("Claude", 0xC1)];
+        assert_eq!(dialog_agent_text(Some("claude"), &presets), "Claude");
+        assert_eq!(dialog_agent_text(None, &presets), CURRENT_AGENT);
+    }
+
+    #[test]
+    fn click_on_gone_or_unavailable_runner_does_nothing() {
+        let (hub, lib) = hub_with(vec![runner("R", "go", Some("Nope"))]);
+        assert_eq!(
+            runner_row_click(&hub, &key(lib, "R"), &[]),
+            RunnerRowClick::Nothing
+        );
+        assert_eq!(
+            runner_row_click(&hub, &key(lib, "Missing"), &[]),
+            RunnerRowClick::Nothing
+        );
+        // Once the preset resolves the click asks to confirm.
+        let presets = [preset("Nope", 1)];
+        confirm_of(runner_row_click(&hub, &key(lib, "R"), &presets));
+    }
+
+    #[test]
+    fn confirm_records_and_opens_details() {
+        let (mut hub, lib) = hub_with(vec![runner("R", "go", None)]);
+        let (k, shown) = confirm_of(runner_row_click(&hub, &key(lib, "R"), &[]));
+        let step = confirm_runner_dialog(&mut hub, &k, &shown, &[]);
+        assert_eq!(
+            step,
+            RunnerConfirmStep::Details(ActiveRunner::Library {
+                key: key(lib, "R"),
+                shown: content("go", None),
+            })
+        );
+        assert_eq!(confirmed_prompt(&hub, lib, "R").as_deref(), Some("go"));
+        // The details dialog is cancelled: nothing undoes the confirmation.
+        assert_eq!(
+            runner_row_click(&hub, &key(lib, "R"), &[]),
+            RunnerRowClick::Details(ActiveRunner::Library {
+                key: key(lib, "R"),
+                shown: content("go", None),
+            })
+        );
+    }
+
+    #[test]
+    fn confirm_after_a_change_reshows_and_records_nothing() {
+        let (mut hub, lib) = hub_with(vec![runner("X", "A", None)]);
+        let (k, shown) = confirm_of(runner_row_click(&hub, &key(lib, "X"), &[]));
+        assert_eq!(shown.prompt, "A");
+        pull(&mut hub, lib, vec![runner("X", "B", None)], 200);
+        let step = confirm_runner_dialog(&mut hub, &k, &shown, &[]);
+        assert_eq!(
+            step,
+            RunnerConfirmStep::Reshow(LibraryDialog::RunnerConfirm {
+                key: key(lib, "X"),
+                shown: content("B", None),
+            })
+        );
+        assert_eq!(confirmed_prompt(&hub, lib, "X"), None);
+        let (_, again) = confirm_of(runner_row_click(&hub, &key(lib, "X"), &[]));
+        assert_eq!(again.prompt, "B");
+    }
+
+    #[test]
+    fn runner_confirm_after_removal_closes() {
+        let (mut hub, lib) = hub_with(vec![runner("X", "A", None)]);
+        let (k, shown) = confirm_of(runner_row_click(&hub, &key(lib, "X"), &[]));
+        pull(&mut hub, lib, vec![], 200);
+        assert_eq!(
+            confirm_runner_dialog(&mut hub, &k, &shown, &[]),
+            RunnerConfirmStep::Close
+        );
+        assert!(hub.runner_confirmations.is_empty());
+    }
+
+    #[test]
+    fn confirm_with_an_unresolved_preset_records_nothing() {
+        let (mut hub, lib) = hub_with(vec![runner("X", "A", Some("Claude"))]);
+        let presets = [preset("Claude", 0xC1)];
+        let (k, shown) = confirm_of(runner_row_click(&hub, &key(lib, "X"), &presets));
+        let step = confirm_runner_dialog(&mut hub, &k, &shown, &[]);
+        assert_eq!(
+            step,
+            RunnerConfirmStep::Unavailable("Agent preset \"Claude\" not found".to_string())
+        );
+        assert!(hub.runner_confirmations.is_empty());
+    }
+
+    #[test]
+    fn run_launches_the_confirmed_content() {
+        let (mut hub, lib) = hub_with(vec![runner("X", "fix {{input}}", Some("claude"))]);
+        let presets = [preset("Codex", 0xC0), preset("Claude", 0xC1)];
+        confirm(&mut hub, lib, "X", &presets);
+        let r = launched(library_runner_run(&hub, &key(lib, "X"), &presets));
+        assert_eq!(r.name, "X");
+        assert_eq!(r.prompt, "fix {{input}}");
+        assert_eq!(r.auto_mode_presses, 2);
+        assert_eq!(r.preset_id, Some(Uuid::from_u128(0xC1)));
+        let inst = r.build_instance(Uuid::from_u128(9), &presets[1], "the bug");
+        assert_eq!(inst.custom_name.as_deref(), Some("X"));
+        assert_eq!(inst.system_prompt.as_deref(), Some("fix the bug"));
+    }
+
+    #[test]
+    fn run_after_a_change_asks_to_confirm_again() {
+        let (mut hub, lib) = hub_with(vec![runner("X", "old", None)]);
+        confirm(&mut hub, lib, "X", &[]);
+        pull(&mut hub, lib, vec![runner("X", "new", None)], 200);
+        match library_runner_run(&hub, &key(lib, "X"), &[]) {
+            RunnerRunStep::Confirm(LibraryDialog::RunnerConfirm { key: k, shown }) => {
+                assert_eq!(k, key(lib, "X"));
+                assert_eq!(shown.prompt, "new");
+            }
+            other => panic!("expected the confirmation, got {other:?}"),
+        }
+        assert_eq!(confirmed_prompt(&hub, lib, "X").as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn run_looks_the_runner_up_by_identity() {
+        let (mut hub, lib) = hub_with(vec![runner("X", "do x", None)]);
+        confirm(&mut hub, lib, "X", &[]);
+        pull(
+            &mut hub,
+            lib,
+            vec![runner("W", "do w", None), runner("X", "do x", None)],
+            200,
+        );
+        let r = launched(library_runner_run(&hub, &key(lib, "X"), &[]));
+        assert_eq!(r.name, "X");
+        assert_eq!(r.prompt, "do x");
+        let inst = r.build_instance(Uuid::from_u128(9), &AgentPreset::shell(), "");
+        assert_eq!(inst.custom_name.as_deref(), Some("X"));
+        assert_eq!(inst.system_prompt.as_deref(), Some("do x"));
+    }
+
+    #[test]
+    fn run_of_a_removed_runner_does_nothing() {
+        let (mut hub, lib) = hub_with(vec![runner("X", "do x", None)]);
+        confirm(&mut hub, lib, "X", &[]);
+        pull(&mut hub, lib, vec![runner("W", "do w", None)], 200);
+        assert!(matches!(
+            library_runner_run(&hub, &key(lib, "X"), &[]),
+            RunnerRunStep::Nothing
+        ));
+    }
+
+    #[test]
+    fn run_with_an_unresolved_preset_is_refused() {
+        let (mut hub, lib) = hub_with(vec![runner("X", "do x", Some("Claude"))]);
+        let presets = [preset("Claude", 0xC1)];
+        confirm(&mut hub, lib, "X", &presets);
+        match library_runner_run(&hub, &key(lib, "X"), &[]) {
+            RunnerRunStep::Unavailable(reason) => {
+                assert_eq!(reason, "Agent preset \"Claude\" not found")
+            }
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+        // With the preset back it launches.
+        launched(library_runner_run(&hub, &key(lib, "X"), &presets));
     }
 }

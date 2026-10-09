@@ -2116,6 +2116,18 @@ struct DragProject {
     from: usize,
 }
 
+/// The runner whose "Run task" details dialog is open.
+#[derive(Clone, Debug, PartialEq)]
+enum ActiveRunner {
+    /// A private runner: its index into `runners`.
+    Local(usize),
+    /// A library runner: Run looks it up again by identity, never by position.
+    Library {
+        key: muxel_core::library::LibItemKey,
+        shown: muxel_core::library::RunnerContent,
+    },
+}
+
 /// Runtime state for one in-flight Loop run (its spawned pane).
 struct LoopRun {
     loop_id: Uuid,
@@ -2744,8 +2756,7 @@ pub struct MuxelApp {
     /// Team library state, kept out of `settings` so Cancel in Settings never
     /// restores it; written back on every save.
     library_hub: muxel_core::library::hub::LibraryHub,
-    /// The open library dialog (a shared loop's switch-on dialog), an overlay
-    /// listed in `any_overlay_open`.
+    /// The open library dialog (an overlay listed in `any_overlay_open`).
     library_dialog: Option<libraries_ui::LibraryDialog>,
     git_env: Arc<integrations::GitEnv>,
     /// Tick counter throttling remote branch-label polling (every 5th tick).
@@ -3103,8 +3114,8 @@ pub struct MuxelApp {
     runners_menu_scroll: ScrollHandle,
     loops_menu_scroll: ScrollHandle,
     snippets_menu_scroll: ScrollHandle,
-    /// The runner whose run-dialog is open (index into `runners`).
-    active_runner: Option<usize>,
+    /// The runner whose run-dialog is open.
+    active_runner: Option<ActiveRunner>,
     /// Whether the run-dialog (collect details) is shown.
     show_run_dialog: bool,
     /// Detail-text editor for the run-dialog (main window).
@@ -12152,25 +12163,34 @@ impl MuxelApp {
 
     /// Open the run-dialog for a runner (collect details before launching).
     fn open_run_dialog(&mut self, idx: usize, cx: &mut Context<Self>) {
-        self.runners_menu = None;
         if idx < self.runners.len() {
-            self.active_runner = Some(idx);
-            self.show_run_dialog = true;
-            cx.notify();
+            self.show_details_dialog(ActiveRunner::Local(idx), cx);
+        } else {
+            self.runners_menu = None;
         }
+    }
+
+    /// Show the "Run task" details dialog for `runner`.
+    fn show_details_dialog(&mut self, runner: ActiveRunner, cx: &mut Context<Self>) {
+        self.runners_menu = None;
+        self.active_runner = Some(runner);
+        self.show_run_dialog = true;
+        cx.notify();
     }
 
     /// Run-dialog "Run": read the typed details and launch the active runner.
     fn execute_runner(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(idx) = self.active_runner else {
+        let Some(active) = self.active_runner.take() else {
             return;
         };
         let details = self.runner_input.read(cx).value().trim().to_string();
-        self.run_runner(idx, details, window, cx);
         self.runner_input
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.show_run_dialog = false;
-        self.active_runner = None;
+        match active {
+            ActiveRunner::Local(idx) => self.run_runner(idx, details, window, cx),
+            ActiveRunner::Library { key, .. } => self.run_library_runner(&key, details, window, cx),
+        }
         cx.notify();
     }
 
@@ -12184,11 +12204,26 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(runner) = self.runners.get(idx).cloned() else {
+            return;
+        };
+        self.launch_runner(runner, details, window, cx);
+    }
+
+    /// Launch `runner` (private, or a transient one built from a library
+    /// runner's content) in the active project, beside the active pane.
+    fn launch_runner(
+        &mut self,
+        runner: Runner,
+        details: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(pid) = self.workspace.active_project else {
             return;
         };
         let target = self.active_instance;
-        self.run_runner_inner(idx, details, pid, target, None, window, cx);
+        self.run_runner_inner(runner, details, pid, target, None, window, cx);
     }
 
     /// Run a runner (e.g. Review) INSIDE worktree `wid`, so the agent's cwd is the
@@ -12200,6 +12235,9 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(runner) = self.runners.get(idx).cloned() else {
+            return;
+        };
         let Some(pid) = self.workspace.worktree(wid).map(|w| w.project_id) else {
             return;
         };
@@ -12211,7 +12249,7 @@ impl MuxelApp {
             .next()
             .or(self.active_instance);
         self.run_runner_inner(
-            idx,
+            runner,
             String::new(),
             pid,
             target,
@@ -12224,7 +12262,7 @@ impl MuxelApp {
     #[allow(clippy::too_many_arguments)]
     fn run_runner_inner(
         &mut self,
-        idx: usize,
+        runner: Runner,
         details: String,
         pid: Uuid,
         target: Option<Uuid>,
@@ -12232,9 +12270,6 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(runner) = self.runners.get(idx).cloned() else {
-            return;
-        };
         // "Current" is a real choice for a task you start by hand. A preset that
         // has since been deleted is not: say so rather than run another agent.
         let preset = match saved_agent(runner.preset_id, &self.presets) {
@@ -12254,24 +12289,7 @@ impl MuxelApp {
                 return;
             }
         };
-        let prompt = if runner.prompt.contains("{{input}}") {
-            runner.prompt.replace("{{input}}", &details)
-        } else if details.is_empty() {
-            runner.prompt.clone()
-        } else {
-            format!("{}\n\n{}", runner.prompt, details)
-        };
-        // Trim trailing blank lines (e.g. from "…{{input}}" with no details) so
-        // the submit Enter lands on a clean line.
-        let prompt = prompt.trim_end().to_string();
-        let mut instance = Instance::from_preset(pid, &preset);
-        instance.system_prompt = Some(prompt);
-        instance.injection = InjectionMode::TypeIn;
-        instance.auto_mode_presses = runner.auto_mode_presses;
-        instance.custom_name = Some(runner.name.clone());
-        // Mark as a runner so its first launch submits the prompt, but reopening
-        // the app re-types it without auto-submitting (see spawn_terminal).
-        instance.is_runner = true;
+        let instance = runner.build_instance(pid, &preset, &details);
         self.place_and_spawn(
             pid,
             instance,
@@ -24963,11 +24981,18 @@ impl MuxelApp {
 
     /// Run-dialog: show the runner's prompt + collect extra details, then run.
     fn render_run_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(runner) = self.active_runner.and_then(|i| self.runners.get(i)) else {
-            return div().into_any_element();
+        let (name, prompt) = match self.active_runner.as_ref() {
+            Some(ActiveRunner::Local(i)) => match self.runners.get(*i) {
+                Some(r) => (r.name.as_str(), r.prompt.as_str()),
+                None => return div().into_any_element(),
+            },
+            Some(ActiveRunner::Library { key, shown }) => {
+                (key.name.as_str(), shown.prompt.as_str())
+            }
+            None => return div().into_any_element(),
         };
-        let title = tf("Run: {name}", &[("name", &runner.name)]);
-        let preview = runner.prompt.replace("{{input}}", "…").trim().to_string();
+        let title = tf("Run: {name}", &[("name", name)]);
+        let preview = prompt.replace("{{input}}", "…").trim().to_string();
         modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
