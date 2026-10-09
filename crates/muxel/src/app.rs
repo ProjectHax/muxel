@@ -2744,7 +2744,9 @@ pub struct MuxelApp {
     /// Team library state, kept out of `settings` so Cancel in Settings never
     /// restores it; written back on every save.
     library_hub: muxel_core::library::hub::LibraryHub,
-    /// How library git jobs run (shared with their worker threads).
+    /// The open library dialog (a shared loop's switch-on dialog), an overlay
+    /// listed in `any_overlay_open`.
+    library_dialog: Option<libraries_ui::LibraryDialog>,
     git_env: Arc<integrations::GitEnv>,
     /// Tick counter throttling remote branch-label polling (every 5th tick).
     remote_poll_count: u32,
@@ -5018,6 +5020,7 @@ impl MuxelApp {
             tmux_available,
             tmux_install,
             library_hub,
+            library_dialog: None,
             git_env: Arc::new(integrations::GitEnv::production()),
             remote_connect_failed: HashMap::new(),
             remote_poll_count: 0,
@@ -10057,6 +10060,19 @@ impl MuxelApp {
         for i in due {
             self.fire_loop(i, now_epoch, window, cx);
         }
+        // Snapshot the keys first: each fire needs `&mut self`.
+        for key in libraries_ui::shared_loop_keys(&self.library_hub) {
+            self.fire_shared_loop(
+                &key,
+                now_epoch,
+                muxel_core::library::state::FireMode::Scheduled {
+                    now: now_epoch,
+                    now_tod,
+                },
+                window,
+                cx,
+            );
+        }
     }
 
     /// Watch in-flight loop runs: close a finished `Exit` agent (idle after working,
@@ -10178,15 +10194,8 @@ impl MuxelApp {
     ) -> Option<Uuid> {
         let pid = lp.project_id;
         self.workspace.project(pid)?; // must still exist
-        let prompt = lp.prompt.replace("{{input}}", "").trim_end().to_string();
-        let mut instance = Instance::from_preset(pid, preset);
-        instance.system_prompt = Some(prompt);
-        instance.injection = InjectionMode::TypeIn;
-        instance.auto_mode_presses = lp.auto_mode_presses;
-        instance.custom_name = Some(lp.name.clone());
-        instance.is_runner = true;
         // Background pane: no tmux session (repeated fires would orphan sessions).
-        instance.use_tmux = false;
+        let instance = lp.build_instance(preset);
         let iid = instance.id;
         // Append as its own pane after the last leaf (an empty project seeds the
         // root). Closing it later (Exit policy) normalizes the layout back.
@@ -11251,6 +11260,7 @@ impl MuxelApp {
             || self.runners_menu.is_some()
             || self.loops_menu.is_some()
             || self.snippets_menu.is_some()
+            || self.library_dialog.is_some()
             || self.term_search.is_some()
             || !self.pending_worktree_dispose.is_empty()
             || cx.has_active_drag()
@@ -24901,7 +24911,7 @@ impl MuxelApp {
                     ),
             );
         }
-        // Library sections go after the private loops, before the footer.
+        let menu_width = libraries_ui::loops_menu_width(&lib_rows);
         list = self.push_library_menu_rows(list, lib_rows, false, cx);
         // Footer: create a new loop (opens its editor in settings). Outside the
         // scrollable list so it stays visible.
@@ -24939,7 +24949,7 @@ impl MuxelApp {
             .child(
                 self.toolbar_menu_popup(
                     pos,
-                    260.0,
+                    menu_width,
                     t("Loops — click to run now, pencil to edit").into_any_element(),
                     list.id("loops-menu-list")
                         .track_scroll(&self.loops_menu_scroll),
@@ -28784,6 +28794,11 @@ impl Render for MuxelApp {
                     .then(|| self.render_snippets_menu(window, cx)),
             )
             .children(self.show_run_dialog.then(|| self.render_run_dialog(cx)))
+            .children(
+                self.library_dialog
+                    .is_some()
+                    .then(|| self.render_library_dialog(cx)),
+            )
             // A pane-scoped confirm belongs to the window showing that pane; when
             // that's a project window on another monitor, it draws there instead.
             .children(

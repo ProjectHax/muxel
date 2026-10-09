@@ -16,8 +16,6 @@ mod editor;
 mod filetree;
 mod i18n;
 mod integrations;
-// Not wired into the app yet.
-#[allow(dead_code)]
 mod libraries;
 mod power;
 #[cfg(target_os = "windows")]
