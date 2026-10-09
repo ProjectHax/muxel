@@ -1701,9 +1701,7 @@ pub type RenameFn = Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Syn
 pub type RemoveDirFn = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
 
 impl GitEnv {
-    /// The environment the app uses: plain `git` from the user's `PATH`.
-    // Not called by the app until team libraries are wired in.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Plain `git` from the user's `PATH`.
     pub fn production() -> Self {
         Self {
             program: OsString::from("git"),

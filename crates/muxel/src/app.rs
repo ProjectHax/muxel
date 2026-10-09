@@ -51,6 +51,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod control_api;
+mod libraries_ui;
 mod tmux_install_modal;
 
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
@@ -2739,6 +2740,11 @@ pub struct MuxelApp {
     /// The offer to install a missing tmux, and its install — made on the first
     /// launch without it, or from Settings (`app/tmux_install_modal.rs`).
     tmux_install: Option<tmux_install_modal::TmuxInstall>,
+    /// Team library state, kept out of `settings` so Cancel in Settings never
+    /// restores it; written back on every save.
+    library_hub: muxel_core::library::hub::LibraryHub,
+    /// How library git jobs run (shared with their worker threads).
+    git_env: Arc<integrations::GitEnv>,
     /// Tick counter throttling remote branch-label polling (every 5th tick).
     remote_poll_count: u32,
     /// A background Grok PID→session-id refresh is already in flight.
@@ -4564,6 +4570,7 @@ impl MuxelApp {
                 if view
                     .update_in(cx, |this, window, cx| {
                         this.tick(window, cx);
+                        this.tick_libraries(cx);
                         this.handle_notification_click(window, cx);
                         this.pump_tray(window, cx);
                         this.sync_control(cx);
@@ -4740,7 +4747,8 @@ impl MuxelApp {
         })
         .detach();
 
-        let mut settings = muxel_store::load_settings();
+        let (mut settings, library_config_ok) =
+            libraries_ui::startup_settings(muxel_store::try_load_settings());
         // Merge in any new built-in presets (e.g. Hermes/Ollama) once. A failed
         // save is reported after construction, once the feed exists.
         let seed_save_error = if settings.seed_builtin_presets() {
@@ -4748,6 +4756,8 @@ impl MuxelApp {
         } else {
             None
         };
+        // Only after the seed save above, which must still include it.
+        let library_hub = muxel_core::library::hub::LibraryHub::take_from(&mut settings);
         let presets = if settings.presets.is_empty() {
             AgentPreset::defaults()
         } else {
@@ -5003,6 +5013,8 @@ impl MuxelApp {
             sshpass_available: program_on_path("sshpass"),
             tmux_available,
             tmux_install,
+            library_hub,
+            git_env: Arc::new(integrations::GitEnv::production()),
             remote_connect_failed: HashMap::new(),
             remote_poll_count: 0,
             #[cfg(windows)]
@@ -5242,6 +5254,8 @@ impl MuxelApp {
         if let Some(e) = seed_save_error {
             this.report_save_error(SaveTarget::Settings, format!("{e:#}"));
         }
+
+        this.start_library_startup(library_config_ok, cx);
 
         // No workspace is loaded yet — the workspace selector (shown at launch)
         // calls `enter_workspace`, which loads the chosen workspace.
@@ -8377,7 +8391,39 @@ impl MuxelApp {
     /// Persist the current toolbar preferences to the TOML config. A failure
     /// lands in the NOTIFICATIONS feed (deduped).
     fn persist_settings(&mut self) {
-        let settings = muxel_core::Settings {
+        match self.persist_settings_checked() {
+            Ok(()) => self.clear_save_error(SaveTarget::Settings),
+            Err(e) => {
+                log::warn!("failed to save settings: {e}");
+                self.report_save_error(SaveTarget::Settings, format!("{e:#}"));
+            }
+        }
+    }
+
+    /// Save after a library event the user did not trigger: only the library
+    /// fields are merged into `config.toml` on disk. A success does not clear an
+    /// earlier settings save error, since this process's other changes are unsaved.
+    fn persist_library_state(&mut self) {
+        let saved = muxel_store::settings_path()
+            .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))
+            .and_then(|path| {
+                libraries_ui::save_library_state_to(&path, self.settings_base(), &self.library_hub)
+            });
+        if let Err(e) = saved {
+            log::warn!("failed to save settings: {e}");
+            self.report_save_error(SaveTarget::Settings, format!("{e:#}"));
+        }
+    }
+
+    /// Save the settings including the team library state.
+    fn persist_settings_checked(&mut self) -> anyhow::Result<()> {
+        let settings = libraries_ui::settings_for_save(self.settings_base(), &self.library_hub);
+        muxel_store::save_settings(&settings)
+    }
+
+    /// The settings to save, without the team library state.
+    fn settings_base(&self) -> muxel_core::Settings {
+        muxel_core::Settings {
             default_use_tmux: self.use_tmux,
             default_use_worktree: self.use_worktree,
             notifications_enabled: self.notifications_enabled,
@@ -8390,13 +8436,6 @@ impl MuxelApp {
             theme: self.theme.clone(),
             theme_mode: self.theme_mode.clone(),
             ..self.settings.clone()
-        };
-        match muxel_store::save_settings(&settings) {
-            Ok(()) => self.clear_save_error(SaveTarget::Settings),
-            Err(e) => {
-                log::warn!("failed to save settings: {e}");
-                self.report_save_error(SaveTarget::Settings, format!("{e:#}"));
-            }
         }
     }
 
