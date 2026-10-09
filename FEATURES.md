@@ -358,6 +358,13 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Scheduled task launchers** — run a saved prompt on a chosen agent in a chosen
   project on a timer: every N minutes, every N hours, or daily at a local time.
+- **Runs the agent it names** — a loop keeps its own agent, starting with the one
+  selected in the toolbar when you create it, and never runs "whatever is selected"
+  when it fires (a shell there would run the prompt as commands). A loop whose
+  agent preset was deleted, or one saved as "Current" before this, is switched off
+  with a note in the feed instead; its editor opens on the toolbar's agent, so one
+  save fixes it. A run task whose preset was deleted says so rather than running
+  another agent.
 - **Unattended firing** — when due, a loop spawns a fresh agent as its own new
   pane appended at the end of its project's layout, types the prompt, optionally
   sends auto-mode Shift+Tab presses, and respects the agent's startup delay (so

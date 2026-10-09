@@ -1932,7 +1932,10 @@ pub struct Loop {
     #[serde(default = "Uuid::new_v4")]
     pub id: Uuid,
     pub name: String,
-    /// Agent preset to launch; `None` = the current/default preset.
+    /// Agent preset to launch. A loop names its own: it runs unattended, so
+    /// "whatever the toolbar has selected when it fires" could be a shell that runs
+    /// the prompt as commands. `None` is only a loop saved before that, which
+    /// [`saved_agent`] reports as [`SavedAgent::Current`] and never fires.
     #[serde(default)]
     pub preset_id: Option<Uuid>,
     /// Project to spawn the agent into.
@@ -1968,6 +1971,28 @@ impl Loop {
             enabled: true,
             last_run: None,
         }
+    }
+}
+
+/// What a runner's or loop's saved agent (`preset_id`) refers to now.
+#[derive(Clone, Copy, Debug)]
+pub enum SavedAgent<'a> {
+    /// No preset saved: "Current", whatever the toolbar has selected.
+    Current,
+    /// A preset that still exists.
+    Preset(&'a AgentPreset),
+    /// A preset that has since been deleted. Never stand another one in for it.
+    Missing,
+}
+
+/// Look up a runner's or loop's saved agent among `presets`.
+pub fn saved_agent(preset_id: Option<Uuid>, presets: &[AgentPreset]) -> SavedAgent<'_> {
+    match preset_id {
+        None => SavedAgent::Current,
+        Some(id) => presets
+            .iter()
+            .find(|p| p.id == id)
+            .map_or(SavedAgent::Missing, SavedAgent::Preset),
     }
 }
 
@@ -2803,6 +2828,22 @@ mod settings_tests {
         assert!(settings.presets[0].startup_delay_ms > 0);
         // A delay the user chose is left alone.
         assert_eq!(settings.presets[1].startup_delay_ms, 1500);
+    }
+
+    #[test]
+    fn a_saved_agent_is_found_current_or_missing_never_substituted() {
+        let presets = vec![AgentPreset::shell(), AgentPreset::claude()];
+        let claude = presets[1].id;
+        assert!(matches!(saved_agent(None, &presets), SavedAgent::Current));
+        assert!(matches!(
+            saved_agent(Some(claude), &presets),
+            SavedAgent::Preset(p) if p.id == claude
+        ));
+        // A deleted preset is reported, not swapped for the shell or anything else.
+        assert!(matches!(
+            saved_agent(Some(Uuid::new_v4()), &presets),
+            SavedAgent::Missing
+        ));
     }
 
     #[test]

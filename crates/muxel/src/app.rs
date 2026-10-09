@@ -29,12 +29,12 @@ use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity, InjectionMode, Instance,
     InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project,
-    RemoteHost, RemoteLayout, RemoteOs, RemoteRef, ResolvedLaunch, Runner, Snippet, SplitDirection,
-    SshAuth, StartupAgent, Workspace, WorkspaceMeta, WorkspacesIndex, Worktree, add_tab,
-    add_tab_at, agent_activity_label, append_agent_instruction,
+    RemoteHost, RemoteLayout, RemoteOs, RemoteRef, ResolvedLaunch, Runner, SavedAgent, Snippet,
+    SplitDirection, SshAuth, StartupAgent, Workspace, WorkspaceMeta, WorkspacesIndex, Worktree,
+    add_tab, add_tab_at, agent_activity_label, append_agent_instruction,
     codex_developer_instructions_override, file_link_instruction, focus_in_direction,
     memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
-    move_pane_beside, move_tab_to, remove, resolve_launch_for_session, set_active_tab,
+    move_pane_beside, move_tab_to, remove, resolve_launch_for_session, saved_agent, set_active_tab,
     set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
     sync_agent_injection_modes, sync_codex_approval_args,
 };
@@ -7380,6 +7380,13 @@ impl MuxelApp {
             .unwrap_or_else(AgentPreset::shell)
     }
 
+    /// The toolbar's selected preset, as an id a loop can keep. Unlike
+    /// [`Self::current_agent_preset`] there's no shell fallback: `None` when the
+    /// selection doesn't point at a real preset.
+    fn current_preset_id(&self) -> Option<Uuid> {
+        self.presets.get(self.current_preset).map(|p| p.id)
+    }
+
     /// Create a project rooted at `root`, spawn its first pane with the current
     /// preset, and make it active.
     fn create_project_at(
@@ -10049,11 +10056,40 @@ impl MuxelApp {
         let Some(lp) = self.loops.get(idx).cloned() else {
             return;
         };
+        // A loop runs unattended, so it only ever runs the agent it names. One
+        // saved as "Current" (before loops had to name one) or whose preset was
+        // deleted is switched off and says why, rather than running whatever the
+        // toolbar has selected — a shell there would run the prompt as commands.
+        let preset = match saved_agent(lp.preset_id, &self.presets) {
+            SavedAgent::Preset(preset) => Ok(preset.clone()),
+            SavedAgent::Missing => Err(t(
+                "Its agent preset no longer exists. Choose an agent for it in Settings → Loops, then turn it back on.",
+            )),
+            SavedAgent::Current => Err(t(
+                "It doesn't name an agent. Choose one for it in Settings → Loops, then turn it back on.",
+            )),
+        };
+        let preset = match preset {
+            Ok(preset) => preset,
+            Err(why) => {
+                if let Some(l) = self.loops.get_mut(idx) {
+                    l.enabled = false;
+                }
+                self.persist_settings();
+                self.add_event(
+                    NotifKind::Error,
+                    tf("Loop “{name}” turned off", &[("name", lp.name.as_str())]),
+                    why.to_string(),
+                );
+                cx.notify();
+                return;
+            }
+        };
         if let Some(l) = self.loops.get_mut(idx) {
             l.last_run = Some(now_epoch);
         }
         self.persist_settings();
-        if let Some(iid) = self.spawn_loop_agent(&lp, window, cx) {
+        if let Some(iid) = self.spawn_loop_agent(&lp, &preset, window, cx) {
             self.running_loops.insert(
                 iid,
                 LoopRun {
@@ -10084,17 +10120,14 @@ impl MuxelApp {
     fn spawn_loop_agent(
         &mut self,
         lp: &Loop,
+        preset: &AgentPreset,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
         let pid = lp.project_id;
         self.workspace.project(pid)?; // must still exist
-        let preset = lp
-            .preset_id
-            .and_then(|id| self.presets.iter().find(|p| p.id == id).cloned())
-            .unwrap_or_else(|| self.current_agent_preset());
         let prompt = lp.prompt.replace("{{input}}", "").trim_end().to_string();
-        let mut instance = Instance::from_preset(pid, &preset);
+        let mut instance = Instance::from_preset(pid, preset);
         instance.system_prompt = Some(prompt);
         instance.injection = InjectionMode::TypeIn;
         instance.auto_mode_presses = lp.auto_mode_presses;
@@ -12140,10 +12173,25 @@ impl MuxelApp {
         let Some(runner) = self.runners.get(idx).cloned() else {
             return;
         };
-        let preset = runner
-            .preset_id
-            .and_then(|id| self.presets.iter().find(|p| p.id == id).cloned())
-            .unwrap_or_else(|| self.current_agent_preset());
+        // "Current" is a real choice for a task you start by hand. A preset that
+        // has since been deleted is not: say so rather than run another agent.
+        let preset = match saved_agent(runner.preset_id, &self.presets) {
+            SavedAgent::Preset(preset) => preset.clone(),
+            SavedAgent::Current => self.current_agent_preset(),
+            SavedAgent::Missing => {
+                self.add_event(
+                    NotifKind::Error,
+                    tf(
+                        "Can't run “{name}”",
+                        &[("name", runner.name.as_str())],
+                    ),
+                    t("Its agent preset no longer exists. Choose an agent for it in Settings → Runners.")
+                        .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+        };
         let prompt = if runner.prompt.contains("{{input}}") {
             runner.prompt.replace("{{input}}", &details)
         } else if details.is_empty() {
@@ -23620,7 +23668,13 @@ impl MuxelApp {
             return;
         };
         self.settings_ui.selected_loop = Some(idx);
-        self.settings_ui.l_preset_id = l.preset_id;
+        // A loop without a usable agent (saved as "Current" before loops had to
+        // name one, or its preset deleted) opens on the toolbar's, so the agent it
+        // will run is on screen and one save pins it.
+        self.settings_ui.l_preset_id = match saved_agent(l.preset_id, &self.presets) {
+            SavedAgent::Preset(preset) => Some(preset.id),
+            SavedAgent::Current | SavedAgent::Missing => self.current_preset_id(),
+        };
         self.settings_ui.l_project_id = Some(l.project_id);
         self.settings_ui.l_presses = l.auto_mode_presses;
         self.settings_ui.l_exit = l.post_run == PostRunAction::Exit;
@@ -23715,6 +23769,8 @@ impl MuxelApp {
             return;
         };
         let mut lp = Loop::new(t("New loop"), pid);
+        // A loop keeps the agent it was made with, never "whatever is selected".
+        lp.preset_id = self.current_preset_id();
         // Arm so the first interval fire is after one interval.
         lp.last_run = Some(unix_now());
         self.loops.push(lp);
@@ -23733,8 +23789,8 @@ impl MuxelApp {
         cx.notify();
     }
 
-    fn set_loop_preset(&mut self, preset_id: Option<Uuid>, cx: &mut Context<Self>) {
-        self.settings_ui.l_preset_id = preset_id;
+    fn set_loop_preset(&mut self, preset_id: Uuid, cx: &mut Context<Self>) {
+        self.settings_ui.l_preset_id = Some(preset_id);
         cx.notify();
     }
 
@@ -27103,15 +27159,9 @@ impl MuxelApp {
         let ui = &self.settings_ui;
         let kind = ui.l_sched_kind;
 
-        // Agent picker.
+        // Agent picker. No "Current" here, unlike runners: a loop fires unattended,
+        // so it runs the agent it names, not whatever the toolbar has selected then.
         let mut agent_row = div().flex().flex_wrap().gap_1();
-        agent_row = agent_row.child(
-            Button::new("loop-agent-default")
-                .ghost()
-                .selected(ui.l_preset_id.is_none())
-                .label(t("Current/default"))
-                .on_click(cx.listener(|this, _e, _w, cx| this.set_loop_preset(None, cx))),
-        );
         for p in &self.presets {
             let id = p.id;
             agent_row = agent_row.child(
@@ -27120,9 +27170,7 @@ impl MuxelApp {
                     .selected(ui.l_preset_id == Some(id))
                     .icon(agent_icon_obj(p.program.as_deref()))
                     .label(p.name.clone())
-                    .on_click(
-                        cx.listener(move |this, _e, _w, cx| this.set_loop_preset(Some(id), cx)),
-                    ),
+                    .on_click(cx.listener(move |this, _e, _w, cx| this.set_loop_preset(id, cx))),
             );
         }
 
