@@ -5,6 +5,36 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.9] — 2026-10-08
+
+### Added
+- **Auto-continue types the message you choose** — a pane's **Auto** toggle always
+  typed `continue` when an agent stalled with work still to do. The message is now
+  yours: Settings → Behavior → Auto-continue message sets it for every pane, and
+  right-clicking a pane's **Auto** button gives that one pane its own, in a popup
+  pre-filled with what it types now. A pane's message stays with it across restarts
+  until the pane is closed, and leaving it blank goes back to the default. It is
+  kept to one line, since Enter follows it, and the button's tooltip shows exactly
+  what it will type. While a pane is on with a message of its own, its button reads
+  **Auto\***, so a custom message is hard to forget.
+
+### Fixed
+- **Waking a laptop no longer floods the feed with reconnect messages** — a laptop
+  that slept with many remote panes open had every pane's connection drop at once,
+  and each one posted its own "connection lost — reconnecting…" and then its own
+  "reconnected": two lines per running agent, pushing everything else out of the
+  feed. A host's panes now share a single entry that counts them back as they
+  reattach and reads "reconnected" once the last one is back. It is updated in place
+  rather than added again, so the feed keeps one line per host, and a pane that
+  drops a minute after the others joins the same outage instead of starting a new
+  one. Dismiss it and it stays dismissed until the next outage.
+- **Every language is fully translated again** — the translations had fallen well
+  behind the interface: about 350 strings, including the newest reconnect messages,
+  showed in English in all 24 of muxel's languages, and seven more could never be
+  translated because the tool that gathers them misread their quotation marks and
+  line breaks. All of them are translated now, and every release checks that each
+  language is complete before it is built, so they can't fall behind again.
+
 ## [0.2.8] — 2026-10-06
 
 ### Fixed
