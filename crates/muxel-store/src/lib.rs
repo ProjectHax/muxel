@@ -34,31 +34,142 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
     save_settings_to(&path, settings)
 }
 
-/// Load settings from an explicit path (defaults on missing/invalid).
-pub fn load_settings_from(path: &Path) -> Settings {
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-            log::warn!("ignoring invalid config at {}: {e}", path.display());
-            Settings::default()
-        }),
-        Err(_) => Settings::default(),
+/// Load settings from the default location: `Ok(None)` if missing (or the
+/// config dir can't be resolved), `Err` if unreadable or invalid.
+pub fn try_load_settings() -> Result<Option<Settings>> {
+    match settings_path() {
+        Some(path) => try_load_settings_from(&path),
+        None => Ok(None),
     }
 }
 
-/// Save settings to an explicit path as TOML.
+/// [`try_load_settings`] from an explicit path.
+pub fn try_load_settings_from(path: &Path) -> Result<Option<Settings>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let settings = parse_settings(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(settings))
+}
+
+pub fn parse_settings(text: &str) -> Result<Settings> {
+    Ok(toml::from_str(text)?)
+}
+
+/// Load settings from an explicit path (defaults on missing/invalid).
+pub fn load_settings_from(path: &Path) -> Settings {
+    match try_load_settings_from(path) {
+        Ok(Some(settings)) => settings,
+        Ok(None) => Settings::default(),
+        Err(e) => {
+            log::warn!("ignoring invalid config at {}: {e:#}", path.display());
+            Settings::default()
+        }
+    }
+}
+
+/// Save settings to an explicit path as TOML, atomically: written and flushed
+/// to a temporary sibling, then renamed over the target, so a reader never sees
+/// a half-written file. A symlink (even broken) is written through to its real
+/// file; on Unix the old permissions are kept. On failure the target is untouched.
 pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config dir {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(settings).context("serializing settings")?;
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    // Write through a symlink to its real file instead of replacing the link.
+    let target = resolve_symlinks(path);
+    let file_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Unique per save, so two processes saving at once never share it.
+    let tmp = target.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let written = write_synced(&tmp, text.as_bytes(), &target)
+        .and_then(|()| rename_with_retry(&tmp, &target))
+        .with_context(|| format!("writing {}", path.display()));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Most links followed when resolving a broken symlink chain.
+const MAX_SYMLINK_HOPS: u32 = 40;
+
+/// The real file behind `path`. A broken chain is followed with `read_link`, so
+/// the save creates the missing file instead of replacing the link.
+fn resolve_symlinks(path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let is_link = std::fs::symlink_metadata(&current)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            break;
+        }
+        let Ok(next) = std::fs::read_link(&current) else {
+            break;
+        };
+        current = match current.parent() {
+            Some(parent) if next.is_relative() => parent.join(next),
+            _ => next,
+        };
+    }
+    current
+}
+
+/// Write `bytes` to a new file at `tmp` and flush it. On Unix it takes `old`'s
+/// permissions before any byte is written.
+fn write_synced(tmp: &Path, bytes: &[u8], old: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(tmp)?;
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(old) {
+        file.set_permissions(meta.permissions())?;
+    }
+    #[cfg(not(unix))]
+    let _ = old;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// How many times a save retries a rename refused with `PermissionDenied`
+/// (on Windows, a file briefly held open by an antivirus or an editor).
+const RENAME_RETRIES: u32 = 3;
+/// Pause between those retries.
+const RENAME_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut retries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied && retries < RENAME_RETRIES =>
+            {
+                retries += 1;
+                std::thread::sleep(RENAME_RETRY_DELAY);
+            }
+            res => return res,
+        }
+    }
 }
 
 /// The muxel data directory (e.g. `~/.local/share/muxel` on Linux).
 pub fn data_dir() -> Option<PathBuf> {
     ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.data_dir().to_path_buf())
+}
+
+/// `LIB_DIR` = `<data_dir>/libraries`; each library is cloned into
+/// `LIB_DIR/<library id>`. Not created here.
+pub fn libraries_dir() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("libraries"))
 }
 
 /// Path to the persisted workspace document.
@@ -665,6 +776,538 @@ mod tests {
         // Re-running is idempotent (index already exists).
         assert_eq!(migrate_workspaces_at(&base).workspaces[0].id, id);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    use muxel_core::library::hub::LibraryHub;
+    use muxel_core::library::{
+        LibraryConfig, LoopContent, RunnerContent, SharedLoopState, SharedRunnerConfirmation,
+    };
+    use muxel_core::{LoopSchedule, PostRunAction};
+
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn persist_roundtrip(hub: &LibraryHub, settings: &mut Settings, path: &Path) -> LibraryHub {
+        hub.write_into(settings);
+        save_settings_to(path, settings).expect("save settings");
+        let mut loaded = try_load_settings_from(path)
+            .expect("config parses")
+            .expect("config exists");
+        LibraryHub::take_from(&mut loaded)
+    }
+
+    /// A `config.toml` as written before team libraries existed.
+    const PRE_LIBRARIES_CONFIG: &str = r#"
+theme = "Tokyo Night"
+font_size = 15.0
+
+[[runners]]
+id = "11111111-1111-1111-1111-111111111111"
+name = "Review"
+preset_id = "22222222-2222-2222-2222-222222222222"
+auto_mode_presses = 2
+prompt = "Review the diff\n\n{{input}}"
+
+[[runners]]
+id = "11111111-1111-1111-1111-111111111112"
+name = "Plain"
+auto_mode_presses = 0
+prompt = "just do it"
+
+[[snippets]]
+id = "33333333-3333-3333-3333-333333333331"
+name = "Continue"
+text = "continue"
+submit = true
+
+[[snippets]]
+id = "33333333-3333-3333-3333-333333333332"
+name = "Plan"
+text = "outline first"
+submit = false
+
+[[loops]]
+id = "44444444-4444-4444-4444-444444444441"
+name = "Nightly"
+project_id = "55555555-5555-5555-5555-555555555555"
+auto_mode_presses = 1
+prompt = "run the nightly checks"
+post_run = "exit"
+enabled = false
+last_run = 1700000000
+
+[loops.schedule]
+kind = "daily_at"
+hour = 3
+minute = 30
+"#;
+
+    fn assert_pre_libraries_contents(s: &Settings) {
+        let uuid = |t: &str| Uuid::parse_str(t).unwrap();
+        assert_eq!(s.runners.len(), 2);
+        let r = &s.runners[0];
+        assert_eq!(r.id, uuid("11111111-1111-1111-1111-111111111111"));
+        assert_eq!(r.name, "Review");
+        assert_eq!(
+            r.preset_id,
+            Some(uuid("22222222-2222-2222-2222-222222222222"))
+        );
+        assert_eq!(r.auto_mode_presses, 2);
+        assert_eq!(r.prompt, "Review the diff\n\n{{input}}");
+        let r = &s.runners[1];
+        assert_eq!(r.id, uuid("11111111-1111-1111-1111-111111111112"));
+        assert_eq!(r.name, "Plain");
+        assert_eq!(r.preset_id, None);
+        assert_eq!(r.auto_mode_presses, 0);
+        assert_eq!(r.prompt, "just do it");
+        assert_eq!(s.snippets.len(), 2);
+        let sn = &s.snippets[0];
+        assert_eq!(sn.id, uuid("33333333-3333-3333-3333-333333333331"));
+        assert_eq!(sn.name, "Continue");
+        assert_eq!(sn.text, "continue");
+        assert!(sn.submit);
+        let sn = &s.snippets[1];
+        assert_eq!(sn.id, uuid("33333333-3333-3333-3333-333333333332"));
+        assert_eq!(sn.name, "Plan");
+        assert_eq!(sn.text, "outline first");
+        assert!(!sn.submit);
+        assert_eq!(s.loops.len(), 1);
+        let l = &s.loops[0];
+        assert_eq!(l.id, uuid("44444444-4444-4444-4444-444444444441"));
+        assert_eq!(l.name, "Nightly");
+        assert_eq!(l.preset_id, None);
+        assert_eq!(l.project_id, uuid("55555555-5555-5555-5555-555555555555"));
+        assert_eq!(l.auto_mode_presses, 1);
+        assert_eq!(l.prompt, "run the nightly checks");
+        assert_eq!(
+            l.schedule,
+            LoopSchedule::DailyAt {
+                hour: 3,
+                minute: 30
+            }
+        );
+        assert_eq!(l.post_run, PostRunAction::Exit);
+        assert!(!l.enabled);
+        assert_eq!(l.last_run, Some(1_700_000_000));
+        assert!(s.libraries.is_empty());
+        assert!(s.shared_loops.is_empty());
+        assert!(s.shared_runner_confirmations.is_empty());
+    }
+
+    #[test]
+    fn pre_libraries_config_loads_with_load_settings_from() {
+        let dir = fresh_dir("muxel-store-test-pre-libraries-load");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, PRE_LIBRARIES_CONFIG).unwrap();
+        let s = load_settings_from(&path);
+        assert_eq!(s.theme, "Tokyo Night");
+        assert_eq!(s.font_size, 15.0);
+        assert_pre_libraries_contents(&s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_libraries_config_loads_with_try_load_settings_from() {
+        let dir = fresh_dir("muxel-store-test-pre-libraries-try");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, PRE_LIBRARIES_CONFIG).unwrap();
+        let mut s = try_load_settings_from(&path)
+            .expect("no error")
+            .expect("file present");
+        assert_pre_libraries_contents(&s);
+        let hub = LibraryHub::take_from(&mut s);
+        assert!(hub.configs.is_empty());
+        assert!(hub.shared_loops.is_empty());
+        assert!(hub.runner_confirmations.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second hard link to the old file keeps the old contents, which an
+    /// in-place write would change.
+    #[test]
+    fn save_settings_to_replaces_the_file_atomically() {
+        let dir = fresh_dir("muxel-store-test-atomic-settings");
+        let path = dir.join("config.toml");
+        const OLD: &str = "theme = \"Old theme with a long name\"\nfont_size = 13.0\n";
+        std::fs::write(&path, OLD).unwrap();
+        let link = dir.join("old-link.toml");
+        std::fs::hard_link(&path, &link).unwrap();
+
+        let settings = Settings {
+            theme: "New".to_string(),
+            font_size: 19.0,
+            snippets: vec![muxel_core::Snippet {
+                id: Uuid::from_u128(7),
+                name: "S".to_string(),
+                text: "x".repeat(10_000),
+                submit: false,
+            }],
+            ..Settings::default()
+        };
+        save_settings_to(&path, &settings).expect("save");
+
+        let old_link = std::fs::read_to_string(&link).unwrap();
+        assert!(old_link == OLD, "the old file was overwritten in place");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("theme = \"New\""), "{text}");
+        let loaded = try_load_settings_from(&path).unwrap().unwrap();
+        assert_eq!(loaded.theme, "New");
+        assert_eq!(loaded.font_size, 19.0);
+        assert_eq!(loaded.snippets.len(), 1);
+        assert_eq!(loaded.snippets[0].text.len(), 10_000);
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["config.toml", "old-link.toml"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_settings_to_failure_is_err_and_leaves_no_temp_file() {
+        let dir = fresh_dir("muxel-store-test-atomic-settings-err");
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(save_settings_to(&path, &Settings::default()).is_err());
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["config.toml"]);
+        assert!(path.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_settings_to_writes_through_a_symlink() {
+        let dir = fresh_dir("muxel-store-test-atomic-settings-symlink");
+        let real_dir = dir.join("dotfiles");
+        let link_dir = dir.join("config");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let real = real_dir.join("muxel.toml");
+        std::fs::write(&real, "theme = \"Old\"\n").unwrap();
+        let link = link_dir.join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let settings = Settings {
+            theme: "New".to_string(),
+            ..Settings::default()
+        };
+        save_settings_to(&link, &settings).expect("save");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), real);
+        let loaded = try_load_settings_from(&real).unwrap().unwrap();
+        assert_eq!(loaded.theme, "New");
+        let names = |d: &Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&real_dir), vec!["muxel.toml"]);
+        assert_eq!(names(&link_dir), vec!["config.toml"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_settings_to_keeps_the_old_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = fresh_dir("muxel-store-test-atomic-settings-perms");
+        // The old mode is chosen to differ from a fresh save's, whatever the umask.
+        let fresh = dir.join("fresh.toml");
+        save_settings_to(&fresh, &Settings::default()).expect("save fresh");
+        let fresh_mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        let old_mode = if fresh_mode == 0o600 { 0o640 } else { 0o600 };
+
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "theme = \"Old\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(old_mode)).unwrap();
+
+        save_settings_to(&path, &Settings::default()).expect("save");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, old_mode);
+        assert_ne!(mode, fresh_mode);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_settings_to_writes_through_a_broken_symlink() {
+        let dir = fresh_dir("muxel-store-test-atomic-settings-broken-symlink");
+        let real_dir = dir.join("dotfiles");
+        let link_dir = dir.join("config");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join("config.toml");
+        let relative = Path::new("../dotfiles/muxel.toml");
+        std::os::unix::fs::symlink(relative, &link).unwrap();
+        let real = real_dir.join("muxel.toml");
+        assert!(!real.exists());
+
+        let settings = Settings {
+            theme: "New".to_string(),
+            ..Settings::default()
+        };
+        save_settings_to(&link, &settings).expect("save");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), relative);
+        assert_eq!(try_load_settings_from(&real).unwrap().unwrap().theme, "New");
+        let names = |d: &Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&real_dir), vec!["muxel.toml"]);
+        assert_eq!(names(&link_dir), vec!["config.toml"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Open `path` with no sharing, so a rename over it fails while the handle lives.
+    #[cfg(windows)]
+    fn lock_exclusively(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap()
+    }
+
+    /// The lock is released at about 20 ms, well inside the retry window.
+    #[cfg(windows)]
+    #[test]
+    fn save_settings_to_retries_a_briefly_locked_target() {
+        let dir = fresh_dir("muxel-store-test-atomic-settings-locked-brief");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "theme = \"Old\"\n").unwrap();
+        let lock = lock_exclusively(&path);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(lock);
+        });
+        let settings = Settings {
+            theme: "New".to_string(),
+            ..Settings::default()
+        };
+        let res = save_settings_to(&path, &settings);
+        release.join().unwrap();
+        res.expect("save after the lock is released");
+        assert_eq!(try_load_settings_from(&path).unwrap().unwrap().theme, "New");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_settings_to_gives_up_on_a_locked_target() {
+        let dir = fresh_dir("muxel-store-test-atomic-settings-locked");
+        let path = dir.join("config.toml");
+        const OLD: &str = "theme = \"Old\"\n";
+        std::fs::write(&path, OLD).unwrap();
+        let lock = lock_exclusively(&path);
+        let res = save_settings_to(&path, &Settings::default());
+        drop(lock);
+        assert!(res.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["config.toml"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_load_settings_from_missing_is_ok_none() {
+        let dir = fresh_dir("muxel-store-test-try-missing");
+        let path = dir.join("config.toml");
+        assert!(matches!(try_load_settings_from(&path), Ok(None)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_load_settings_from_invalid_is_err_and_load_still_defaults() {
+        let dir = fresh_dir("muxel-store-test-try-invalid");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "font_size = [this is not toml").unwrap();
+        assert!(try_load_settings_from(&path).is_err());
+        let s = load_settings_from(&path);
+        assert!(s.notifications_enabled);
+        assert!(s.libraries.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_load_settings_from_valid_is_ok_some() {
+        let dir = fresh_dir("muxel-store-test-try-valid");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "font_size = 21.0\n").unwrap();
+        let s = try_load_settings_from(&path)
+            .expect("valid")
+            .expect("present");
+        assert_eq!(s.font_size, 21.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn libraries_dir_is_data_dir_libraries() {
+        let lib = libraries_dir().expect("platform data dir");
+        assert_eq!(lib.file_name().and_then(|n| n.to_str()), Some("libraries"));
+        assert_eq!(lib.parent().map(Path::to_path_buf), data_dir());
+    }
+
+    const APPROVED_LOOP_PROMPT: &str = "approved loop prompt 7f3a-unique";
+    const CONFIRMED_RUNNER_PROMPT: &str = "confirmed runner prompt 9c1b-unique";
+
+    #[test]
+    fn shared_state_round_trips_through_config_not_workspace() {
+        let dir = fresh_dir("muxel-store-test-shared-state");
+        let path = dir.join("config.toml");
+
+        let lib_id = Uuid::from_u128(0x11B);
+        let project_p = Uuid::from_u128(0xBEEF);
+        let run_id = Uuid::from_u128(0x5EED);
+        const L: u64 = 1_750_000_123;
+        const T: u64 = 1_760_000_456;
+
+        let mut hub = LibraryHub::default();
+        hub.configs.push(LibraryConfig {
+            id: lib_id,
+            url: "file:///tmp/R".to_string(),
+            branch: "main".to_string(),
+            name: "Team".to_string(),
+            last_pull_ok: Some(T),
+        });
+        hub.shared_loops.push(SharedLoopState {
+            library: lib_id,
+            name: "Nightly".to_string(),
+            run_id,
+            project_id: project_p,
+            last_run: Some(L),
+            approved: LoopContent {
+                prompt: APPROVED_LOOP_PROMPT.to_string(),
+                preset: Some("Claude".to_string()),
+                auto_mode_presses: 3,
+                schedule: LoopSchedule::EveryMinutes { minutes: 15 },
+                post_run: PostRunAction::Exit,
+            },
+            pinned_preset_id: None,
+        });
+        let pinned_c = Uuid::from_u128(0xC1);
+        hub.shared_loops.push(SharedLoopState {
+            library: lib_id,
+            name: "Hourly".to_string(),
+            run_id: Uuid::from_u128(0x5EEE),
+            project_id: project_p,
+            last_run: Some(L),
+            approved: LoopContent {
+                prompt: "hourly".to_string(),
+                preset: None,
+                auto_mode_presses: 0,
+                schedule: LoopSchedule::EveryHours { hours: 1 },
+                post_run: PostRunAction::Leave,
+            },
+            pinned_preset_id: Some(pinned_c),
+        });
+        hub.runner_confirmations.push(SharedRunnerConfirmation {
+            library: lib_id,
+            name: "Review".to_string(),
+            confirmed: RunnerContent {
+                prompt: CONFIRMED_RUNNER_PROMPT.to_string(),
+                preset: None,
+                auto_mode_presses: 1,
+            },
+        });
+
+        let mut settings = Settings::default();
+        let loaded = persist_roundtrip(&hub, &mut settings, &path);
+
+        assert_eq!(loaded.configs, hub.configs);
+        assert_eq!(loaded.shared_loops, hub.shared_loops);
+        assert_eq!(loaded.runner_confirmations, hub.runner_confirmations);
+        assert_eq!(loaded.shared_loops.len(), 2);
+        assert_eq!(loaded.shared_loops[0].pinned_preset_id, None);
+        assert_eq!(loaded.shared_loops[1].pinned_preset_id, Some(pinned_c));
+        let lp = &loaded.shared_loops[0];
+        assert_eq!(lp.project_id, project_p);
+        assert_eq!(lp.last_run, Some(L));
+        assert_eq!(lp.approved.prompt, APPROVED_LOOP_PROMPT);
+        assert_eq!(
+            lp.approved.schedule,
+            LoopSchedule::EveryMinutes { minutes: 15 }
+        );
+        assert_eq!(
+            loaded.runner_confirmations[0].confirmed.prompt,
+            CONFIRMED_RUNNER_PROMPT
+        );
+        assert_eq!(loaded.configs[0].last_pull_ok, Some(T));
+
+        let toml_text = std::fs::read_to_string(&path).unwrap();
+        assert!(toml_text.contains(APPROVED_LOOP_PROMPT));
+        assert!(toml_text.contains(CONFIRMED_RUNNER_PROMPT));
+        assert!(toml_text.contains(&format!("pinned_preset_id = \"{pinned_c}\"")));
+        let mut workspace = Workspace::default();
+        let mut project = Project::new("demo", "/tmp/demo");
+        project.id = project_p;
+        workspace.add_project(project);
+        let ws_json = serde_json::to_string(&workspace).unwrap();
+        assert!(!ws_json.contains(APPROVED_LOOP_PROMPT));
+        assert!(!ws_json.contains(CONFIRMED_RUNNER_PROMPT));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_hub_overwrites_previous_shared_state() {
+        // A previous `[[shared_loops]]` left in the settings does not survive.
+        let dir = fresh_dir("muxel-store-test-shared-state-off");
+        let path = dir.join("config.toml");
+        let mut settings = Settings::default();
+        settings.shared_loops.push(SharedLoopState {
+            library: Uuid::from_u128(1),
+            name: "Old".to_string(),
+            run_id: Uuid::from_u128(2),
+            project_id: Uuid::from_u128(3),
+            last_run: None,
+            approved: LoopContent {
+                prompt: "old".to_string(),
+                preset: None,
+                auto_mode_presses: 0,
+                schedule: LoopSchedule::EveryHours { hours: 1 },
+                post_run: PostRunAction::Leave,
+            },
+            pinned_preset_id: None,
+        });
+        let loaded = persist_roundtrip(&LibraryHub::default(), &mut settings, &path);
+        assert!(loaded.configs.is_empty());
+        assert!(loaded.shared_loops.is_empty());
+        assert!(loaded.runner_confirmations.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
