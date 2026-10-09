@@ -2,9 +2,11 @@
 //! repository's `muxel-library.toml`.
 
 pub mod config;
+pub mod hub;
 pub mod menu;
 pub mod parse;
 pub mod resolve;
+pub mod resync;
 pub mod sanitize;
 pub mod state;
 
