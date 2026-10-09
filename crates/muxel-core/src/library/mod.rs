@@ -6,6 +6,7 @@ pub mod menu;
 pub mod parse;
 pub mod resolve;
 pub mod sanitize;
+pub mod state;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
