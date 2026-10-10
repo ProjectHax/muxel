@@ -5,6 +5,67 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-10
+
+### Added
+- **Team libraries share snippets, run tasks and loops from a git repository** — a
+  team that wanted the same snippets, review prompts or scheduled checks had to copy
+  them into everyone's settings by hand and keep every copy in step. Settings →
+  Libraries now takes a git repository's URL, and optionally a branch. It clones the
+  repository with the git access you already have, then pulls it when muxel starts
+  and every five minutes after that; **Pull now** fetches on demand. The repository
+  holds a single `muxel-library.toml` listing its snippets, runners and loops, and
+  each library's items appear in their own section of the Snippets, Run task and
+  Loops drop-downs, after your own. Library items are read-only in muxel, so you
+  change them in the repository, but **Make a local copy** turns any one of them
+  into a private item you can edit. A mistake in the file skips only the item it is
+  in: the library's details in Settings list each skipped item and why, and
+  everything else still loads. **Re-sync from repository** puts a library back to
+  exactly what the repository holds, asking first only when that would throw away
+  local changes, and saying how many. Thanks to
+  [@freddysae0](https://github.com/freddysae0)
+  ([#68](https://github.com/ProjectHax/muxel/pull/68)).
+- **Nothing from a team library runs until you have read it** — a library is
+  someone else's text arriving on your machine, and a loop runs unattended, so
+  shared loops arrive switched off. Turning one on shows everything it will do and
+  asks which project it runs in, plus which of your agents to use when the library
+  doesn't name one. Any later change to the loop other than its name switches it
+  off again until you have looked. A shared runner shows its full prompt and asks
+  before its first run, and again each time the library changes it. Invisible and
+  control characters are stripped from everything a library provides, so what you
+  are shown is what gets typed, and a library can't make muxel open any file outside
+  its own copy of the repository.
+
+### Fixed
+- **A loop always runs the agent it was set up with** — a loop saved with the agent
+  "Current" didn't keep an agent of its own: each time it fired, it ran whatever was
+  selected in the toolbar at that moment. Loops fire unattended, so that could be a
+  different agent from the one you set it up with, and if a shell happened to be
+  selected, the prompt was typed into it and each line ran as a command. A loop
+  whose agent preset had been deleted quietly fell back the same way. A new loop now
+  starts on the toolbar's agent and the loop editor no longer offers "Current", so
+  every loop names a real agent. A loop saved as "Current" before this, or whose
+  agent was deleted, is switched off with a note in the feed when it is next due
+  instead of firing, and its editor opens on the toolbar's agent so a single save
+  puts it right. Run tasks, which you start by hand, can still use "Current", but
+  one whose agent was deleted now says so rather than running a different one.
+  Thanks to [@freddysae0](https://github.com/freddysae0) for reporting it
+  ([#67](https://github.com/ProjectHax/muxel/issues/67)).
+- **Long Run task, Snippets and Loops lists no longer run off the window** — these
+  drop-downs grew with their lists, so a long one could reach past the bottom of a
+  short window, leaving its last items out of reach. They now stop at 60% of the
+  window's height and scroll, with the title, and the Loops drop-down's "New loop…",
+  staying in place, and each one opens scrolled to the top. The list of sections in
+  Settings scrolls too when the window is too short to show them all.
+
+### Changed
+- **Settings are saved in a single step** — muxel used to rewrite its settings file
+  in place, so a crash or power cut in the middle of a save could leave the file cut
+  short, and muxel would then start on default settings. It now writes the new
+  settings beside the old ones and swaps them in at once, so the file always holds
+  either the old version or the new one, never part of each. A settings file that is
+  a symlink is written through to the file it points to, and keeps its permissions.
+
 ## [0.2.9] — 2026-10-08
 
 ### Added
