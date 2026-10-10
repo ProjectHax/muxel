@@ -342,6 +342,8 @@ feature is added or changed, update the matching entry here in the same change**
   startup to reach auto-accept mode.
 - **Ephemeral + restore-safe** — on app restore a runner re-types its prompt but
   does not auto-submit.
+- **Shared runners** — runners from a team library appear in their own section of
+  the "Run task" dropdown (see *Team libraries*).
 
 ## Snippets
 
@@ -353,6 +355,8 @@ feature is added or changed, update the matching entry here in the same change**
   pane), the command palette (*Send snippet: …*), or right-click a terminal tab →
   **Send snippet** (sends to that specific pane). Multi-line text goes in via a
   bracketed-paste-aware insert so it won't submit on its own newlines.
+- **Shared snippets** — snippets from a team library appear in their own section of
+  the Snippets dropdown (see *Team libraries*).
 
 ## Loops
 
@@ -377,6 +381,45 @@ feature is added or changed, update the matching entry here in the same change**
   click one to run it now, the pencil to edit it in Settings → Loops, or "New
   loop…" to create one. Schedules survive restarts (a daily-at whose time passed
   while closed fires once on next launch). Loops fire only while muxel is running.
+- **Scrolling dropdown lists** — in the Run task, Snippets and Loops dropdowns a
+  long list (private and library items alike) scrolls within up to 60% of the
+  window height, while the title and the "New loop…" footer stay in place.
+- **Shared loops** — loops from a team library appear in their own section of the
+  Loops dropdown, switched off until you turn them on (see *Team libraries*).
+
+## Team libraries
+
+- **Shared libraries from a git repo** — Settings → Libraries adds a git repository
+  by URL (optional branch, editable display name). muxel clones it into its data
+  dir and keeps it read-only, using your existing git auth. Selecting a library in
+  the list shows its URL, branch, last successful pull, item counts, and any errors
+  or skipped items; the list marks a library with an error (red dot) or an
+  operation in progress (…).
+- **Automatic updates** — each library is pulled with `git pull --ff-only` at launch
+  and every 5 minutes. **Pull now** updates it on demand, **Re-sync from
+  repository** resets the clone to the remote branch, and **Remove** deletes the
+  library. Re-sync first checks the clone (offline, read-only): with no local
+  changes it starts right away; otherwise it asks, saying how many modified or
+  untracked files and local commits will be lost.
+- **One file per library** — a `muxel-library.toml` at the repo root holds
+  `[[snippets]]`, `[[runners]]` and `[[loops]]`. An agent is named by its preset
+  name; a runner without one runs *Current*, and a loop without one runs the
+  preset you pick when you turn it on.
+- **In the toolbar dropdowns** — library items appear in the Snippets, Run task and
+  Loops dropdowns in a section per library, after your private items.
+- **Read-only, with local copies** — library items can't be edited in muxel; change
+  them in the repo. **Make a local copy** creates an independent private copy that
+  is no longer synced.
+- **Safe shared loops and runners** — shared loops arrive switched off; turning one
+  on shows its full content and asks for a project, plus an agent from your
+  presets if the loop doesn't name one. It switches off again when any field other
+  than its name changes. A shared loop never runs on *Current*: if its agent no
+  longer resolves (preset renamed or deleted), its next run switches it off and
+  says why. A shared runner shows its full prompt for confirmation before the
+  first run of each new version.
+- **Sanitized text** — the names, texts, prompts and preset names of library items,
+  and the parts of a library file quoted in messages, have control characters
+  (except newlines and tabs) and invisible formatting characters removed.
 
 ## Built-in browser
 

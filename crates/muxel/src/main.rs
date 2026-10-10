@@ -16,6 +16,7 @@ mod editor;
 mod filetree;
 mod i18n;
 mod integrations;
+mod libraries;
 mod power;
 #[cfg(target_os = "windows")]
 mod present_pump;
@@ -24,6 +25,8 @@ mod session_binding;
 mod settings_view;
 mod split;
 mod stt;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod tmux_install;
 mod tts;

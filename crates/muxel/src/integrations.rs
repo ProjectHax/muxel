@@ -3,12 +3,18 @@
 
 use crate::i18n::{t, tf};
 use anyhow::{Context, Result, bail};
+use muxel_core::library::GitFailure;
+use muxel_core::library::resync::LocalChanges;
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::{
     MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth, memory_header, remote_ops, ssh,
 };
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// `std::process::Command` for `program`, with the console window suppressed on
 /// Windows. muxel is a GUI app, so spawning a console child (git, ssh, gh, …)
@@ -1663,6 +1669,723 @@ pub fn git_stash_drop(loc: &RepoLoc) -> Result<String> {
     git_run_loc(loc, &["stash", "drop"])
 }
 
+// ---------------------------------------------------------------------------
+// Team libraries: non-interactive git runner with a time limit. Blocking.
+// ---------------------------------------------------------------------------
+
+/// How library git operations are run: which `git`, its environment and the
+/// test hooks.
+pub struct GitEnv {
+    pub program: OsString,
+    /// Replaces the child's `PATH`.
+    pub path_override: Option<OsString>,
+    pub extra_env: Vec<(OsString, OsString)>,
+    /// Tests: `-c` options passed after the production ones, so they win.
+    #[cfg(test)]
+    pub extra_config: Vec<String>,
+    /// Number of git processes spawned, the `core.sshCommand` query included.
+    pub spawned: Arc<AtomicUsize>,
+    /// Tests: every spawned child, already waited for.
+    pub reaped: Option<Arc<Mutex<Vec<Child>>>>,
+    /// Directory rename used by clone and re-sync (tests inject failures).
+    pub rename: RenameFn,
+    /// Recursive delete used by [`remove_dir_force`] (tests inject failures).
+    pub remove_dir: RemoveDirFn,
+    /// Tests: called first thing in the local-changes check.
+    #[cfg(test)]
+    pub check_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+pub type RenameFn = Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync>;
+
+pub type RemoveDirFn = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+
+impl GitEnv {
+    /// Plain `git` from the user's `PATH`.
+    pub fn production() -> Self {
+        Self {
+            program: OsString::from("git"),
+            path_override: None,
+            extra_env: Vec::new(),
+            #[cfg(test)]
+            extra_config: Vec::new(),
+            spawned: Arc::new(AtomicUsize::new(0)),
+            reaped: None,
+            rename: Arc::new(|from: &Path, to: &Path| std::fs::rename(from, to)),
+            remove_dir: Arc::new(|dir: &Path| std::fs::remove_dir_all(dir)),
+            #[cfg(test)]
+            check_hook: None,
+        }
+    }
+
+    /// Tests: ignore the system and global git config (set on each child's
+    /// `Command`, never with `set_var`) and keep every child for `try_wait`.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        static EMPTY_CONFIG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let empty = EMPTY_CONFIG.get_or_init(|| {
+            let path = crate::test_support::short_temp_path();
+            std::fs::write(&path, "").expect("write empty git config");
+            path
+        });
+        Self {
+            extra_env: vec![
+                (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+                (
+                    OsString::from("GIT_CONFIG_GLOBAL"),
+                    empty.clone().into_os_string(),
+                ),
+            ],
+            reaped: Some(Arc::new(Mutex::new(Vec::new()))),
+            ..Self::production()
+        }
+    }
+
+    fn has_env(&self, name: &str) -> bool {
+        std::env::var_os(name).is_some() || self.extra_env.iter().any(|(k, _)| k == name)
+    }
+
+    /// The program to spawn. With `path_override`, it is looked up only in
+    /// those directories (`None` = not there): on Windows, std would otherwise
+    /// fall back to muxel's own `PATH` and find git anyway.
+    fn resolve_program(&self) -> Option<OsString> {
+        let Some(paths) = &self.path_override else {
+            return Some(self.program.clone());
+        };
+        let exts: &[&str] = if cfg!(windows) {
+            &["", ".exe", ".cmd", ".bat", ".com"]
+        } else {
+            &[""]
+        };
+        std::env::split_paths(paths).find_map(|dir| {
+            exts.iter().find_map(|ext| {
+                let mut name = self.program.clone();
+                name.push(ext);
+                let candidate = dir.join(name);
+                candidate.is_file().then(|| candidate.into_os_string())
+            })
+        })
+    }
+
+    /// A git `Command` with the non-interactive environment; `None` when the
+    /// program is not on the overridden `PATH`. `ceiling` becomes
+    /// `GIT_CEILING_DIRECTORIES` so git never finds a repository above it; git
+    /// ignores an entry equal to `cwd`, so it must be a strict ancestor of `cwd`.
+    fn base_command(&self, cwd: Option<&Path>, ceiling: Option<&Path>) -> Option<Command> {
+        let mut cmd = command(self.resolve_program()?);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        if let Some(dir) = ceiling {
+            cmd.env("GIT_CEILING_DIRECTORIES", dir);
+        }
+        if let Some(path) = &self.path_override {
+            cmd.env("PATH", path);
+        }
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "never")
+            .envs(self.extra_env.iter().map(|(k, v)| (k, v)))
+            // Set after `extra_env` so nothing inherited can undo them. An empty
+            // `GIT_ASKPASS` makes git skip every askpass program (`GIT_ASKPASS`,
+            // `core.askPass`, `SSH_ASKPASS`), and ssh itself never runs `SSH_ASKPASS`.
+            .env("GIT_ASKPASS", "")
+            .env_remove("SSH_ASKPASS")
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: `setsid` is async-signal-safe and the only call between
+            // fork and exec. A new session has no controlling terminal, so git
+            // and ssh cannot open /dev/tty to prompt, and the child leads its
+            // own process group so the whole tree can be killed.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
+        Some(cmd)
+    }
+
+    /// Keep a waited-for child for the tests.
+    fn reap(&self, child: Child) {
+        if let Some(reaped) = &self.reaped {
+            reaped.lock().unwrap_or_else(|e| e.into_inner()).push(child);
+        }
+    }
+}
+
+/// Whether `url` is reached over SSH: `ssh://`, `git+ssh://`, `ssh+git://`, or
+/// scp-like `[user@]host:path` (not a Windows drive letter).
+pub fn is_ssh_url(url: &str) -> bool {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    if ["ssh://", "git+ssh://", "ssh+git://"]
+        .iter()
+        .any(|p| lower.starts_with(p))
+    {
+        return true;
+    }
+    if url.contains("://") {
+        return false;
+    }
+    let Some(colon) = url.find(':') else {
+        return false;
+    };
+    let host = &url[..colon];
+    if host.contains('/') || host.contains('\\') {
+        return false;
+    }
+    let drive = host.len() == 1 && host.as_bytes()[0].is_ascii_alphabetic();
+    !drive
+}
+
+/// Result of `git config --get core.sshCommand`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshConfigProbe {
+    /// Exit 0: the user configured an SSH command.
+    Set,
+    /// Exit 1: the key is not defined.
+    Unset,
+    /// Any other exit code, a spawn error or the deadline ran out.
+    Failed,
+}
+
+/// Whether to run git with `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` so SSH never
+/// prompts: only for an SSH URL when the user set none of `GIT_SSH_COMMAND`,
+/// `GIT_SSH` or `core.sshCommand`. `probe` is called only when needed.
+pub fn ssh_batch_mode_needed(
+    url: &str,
+    env_git_ssh_command: bool,
+    env_git_ssh: bool,
+    probe: impl FnOnce() -> SshConfigProbe,
+) -> bool {
+    if !is_ssh_url(url) || env_git_ssh_command || env_git_ssh {
+        return false;
+    }
+    probe() == SshConfigProbe::Unset
+}
+
+/// `git config --get core.sshCommand` in `cwd`, with the same environment and
+/// deadline as the operation it precedes.
+fn probe_ssh_command_config(
+    env: &GitEnv,
+    cwd: Option<&Path>,
+    ceiling: Option<&Path>,
+    deadline: Instant,
+) -> SshConfigProbe {
+    let Some(mut cmd) = env.base_command(cwd, ceiling) else {
+        return SshConfigProbe::Failed;
+    };
+    cmd.args(["config", "--get", "core.sshCommand"])
+        .stderr(Stdio::null());
+    let Ok(child) = cmd.spawn() else {
+        return SshConfigProbe::Failed;
+    };
+    env.spawned.fetch_add(1, Ordering::SeqCst);
+    let (child, status) = wait_until(child, deadline);
+    env.reap(child);
+    match status.and_then(|s| s.code()) {
+        Some(0) => SshConfigProbe::Set,
+        Some(1) => SshConfigProbe::Unset,
+        _ => SshConfigProbe::Failed,
+    }
+}
+
+/// Poll `child` until it exits or `deadline` passes, then kill its process
+/// tree. Returns the waited-for child and its status (`None` if killed).
+fn wait_until(mut child: Child, deadline: Instant) -> (Child, Option<ExitStatus>) {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return (child, Some(status)),
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+    }
+    kill_process_tree(&mut child);
+    let _ = child.wait();
+    (child, None)
+}
+
+/// Kill `child` and everything it started (git spawns helpers such as
+/// `git-remote-https` and `ssh`).
+fn kill_process_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let _ = command("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: plain syscall on a pid we spawned and have not reaped yet;
+        // it leads its own process group (setsid in `base_command`).
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+const GIT_STDERR_TAIL: usize = 4096;
+
+/// On Windows, `core.longpaths=true` lets git create and read paths past
+/// `MAX_PATH` under a deep `LIB_DIR`. The key exists only in git for Windows.
+#[cfg(windows)]
+const LONG_PATHS: Option<&str> = Some("core.longpaths=true");
+#[cfg(not(windows))]
+const LONG_PATHS: Option<&str> = None;
+
+/// Run `git <-c…> <args>` for a library operation on `url`, blocking until it
+/// ends or `deadline` passes: no stdin, prompts or credential UI, SSH in batch
+/// mode per [`ssh_batch_mode_needed`], and the process tree killed on the
+/// deadline. `ceiling` as in [`GitEnv::base_command`].
+pub fn run_git(
+    env: &GitEnv,
+    cwd: Option<&Path>,
+    ceiling: Option<&Path>,
+    url: &str,
+    args: &[&OsStr],
+    deadline: Instant,
+) -> Result<(), GitFailure> {
+    let start = Instant::now();
+    let limit_secs = deadline
+        .saturating_duration_since(start)
+        .as_secs_f64()
+        .ceil() as u64;
+    let batch_mode = ssh_batch_mode_needed(
+        url,
+        env.has_env("GIT_SSH_COMMAND"),
+        env.has_env("GIT_SSH"),
+        || probe_ssh_command_config(env, cwd, ceiling, deadline),
+    );
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(GitFailure::TimedOut { secs: limit_secs });
+    }
+
+    let Some(mut cmd) = env.base_command(cwd, ceiling) else {
+        return Err(GitFailure::NotFound);
+    };
+    if batch_mode {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    // Whole seconds left, rounded up, plus one: curl's stall abort is only a
+    // backstop and must never fire before the runner's own deadline.
+    let low_speed_secs = remaining.as_secs_f64().ceil() as u64 + 1;
+    let low_speed_time = format!("http.lowSpeedTime={low_speed_secs}");
+    for opt in [
+        "pull.rebase=false",
+        "merge.autoStash=false",
+        "rebase.autoStash=false",
+        "submodule.recurse=false",
+        "credential.interactive=false",
+        "http.lowSpeedLimit=1000",
+        low_speed_time.as_str(),
+    ] {
+        cmd.arg("-c").arg(opt);
+    }
+    if let Some(opt) = LONG_PATHS {
+        cmd.arg("-c").arg(opt);
+    }
+    #[cfg(test)]
+    for opt in &env.extra_config {
+        cmd.arg("-c").arg(opt);
+    }
+    cmd.args(args).stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(GitFailure::NotFound),
+        Err(e) => {
+            return Err(GitFailure::Io {
+                detail: e.to_string(),
+            });
+        }
+    };
+    env.spawned.fetch_add(1, Ordering::SeqCst);
+
+    // Drain stderr on a thread (a full pipe would block git), keeping the tail.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut tail: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stderr.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > GIT_STDERR_TAIL {
+                    tail.drain(..tail.len() - GIT_STDERR_TAIL);
+                }
+            }
+            let _ = tx.send(tail);
+        });
+    }
+
+    let (child, status) = wait_until(child, deadline);
+    env.reap(child);
+    let Some(status) = status else {
+        return Err(GitFailure::TimedOut { secs: limit_secs });
+    };
+    if status.success() {
+        return Ok(());
+    }
+    // A grandchild may still hold the pipe: wait at most 1 s for the reader.
+    let tail = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+    let text = String::from_utf8_lossy(&tail).trim().to_string();
+    let detail = if text.is_empty() {
+        tf(
+            "git exited with {status}",
+            &[("status", &status.to_string())],
+        )
+    } else {
+        text
+    };
+    Err(GitFailure::Failed { detail })
+}
+
+// ---------------------------------------------------------------------------
+// Team libraries: clone, pull, re-sync and forced delete. Blocking.
+// ---------------------------------------------------------------------------
+
+fn io_failure(e: &std::io::Error) -> GitFailure {
+    GitFailure::Io {
+        detail: e.to_string(),
+    }
+}
+
+/// `git clone --single-branch` from `lib_dir`; on failure the half-made
+/// `target` is removed.
+fn clone_into(
+    env: &GitEnv,
+    url: &str,
+    branch: &str,
+    target: &Path,
+    lib_dir: &Path,
+    deadline: Instant,
+) -> Result<(), GitFailure> {
+    let mut args: Vec<&OsStr> = vec![
+        OsStr::new("clone"),
+        OsStr::new("--quiet"),
+        OsStr::new("--single-branch"),
+    ];
+    if !branch.is_empty() {
+        args.push(OsStr::new("--branch"));
+        args.push(OsStr::new(branch));
+    }
+    args.push(OsStr::new("--"));
+    args.push(OsStr::new(url));
+    args.push(target.as_os_str());
+    let res = run_git(
+        env,
+        Some(lib_dir),
+        Some(clone_ceiling(lib_dir)),
+        url,
+        &args,
+        deadline,
+    );
+    if res.is_err() && std::fs::symlink_metadata(target).is_ok() {
+        let _ = remove_dir_force(env, target);
+    }
+    res
+}
+
+/// The ceiling for a clone run from `lib_dir`: its parent, since git ignores a
+/// ceiling equal to the working directory.
+fn clone_ceiling(lib_dir: &Path) -> &Path {
+    lib_dir.parent().unwrap_or(lib_dir)
+}
+
+/// 8 random hex digits for a clone's temporary siblings (`<id>.c-…`, `.r-…`,
+/// `.o-…`). Short so git's paths below them stay under Windows `MAX_PATH`.
+fn temp_suffix() -> String {
+    let mut hex = uuid::Uuid::new_v4().simple().to_string();
+    hex.truncate(8);
+    hex
+}
+
+/// Clone `url` (`branch`, `""` = the remote's default) into `dest` through a
+/// temporary sibling renamed into place, so a failed clone never leaves a
+/// half-made `dest`.
+pub fn library_clone(
+    env: &GitEnv,
+    url: &str,
+    branch: &str,
+    dest: &Path,
+    lib_dir: &Path,
+    deadline: Instant,
+) -> Result<(), GitFailure> {
+    std::fs::create_dir_all(lib_dir).map_err(|e| io_failure(&e))?;
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = lib_dir.join(format!("{name}.c-{}", temp_suffix()));
+    clone_into(env, url, branch, &tmp, lib_dir, deadline)?;
+    if let Err(e) = (env.rename)(&tmp, dest) {
+        let _ = remove_dir_force(env, &tmp);
+        return Err(io_failure(&e));
+    }
+    Ok(())
+}
+
+/// `git pull --ff-only` and nothing else: no reset, stash, clean or checkout.
+/// `url` is only used for the SSH rule. A clone folder without `.git` is
+/// [`GitFailure::NotAClone`] without running git: pulling there would reach a
+/// repository above `LIB_DIR`, and cloning over it would delete its contents.
+pub fn library_pull(
+    env: &GitEnv,
+    url: &str,
+    clone: &Path,
+    deadline: Instant,
+) -> Result<(), GitFailure> {
+    if std::fs::symlink_metadata(clone.join(".git")).is_err() {
+        return Err(GitFailure::NotAClone);
+    }
+    let args = [
+        OsStr::new("-C"),
+        clone.as_os_str(),
+        OsStr::new("pull"),
+        OsStr::new("--ff-only"),
+        OsStr::new("--quiet"),
+    ];
+    run_git(env, Some(clone), clone.parent(), url, &args, deadline)
+}
+
+/// Re-sync `LIB_DIR/<id>` with the remote: a full clone to `<id>.r-…`, then
+/// `<id>` → `<id>.o-…`, the new clone → `<id>`, and the old one removed. On any
+/// failure the clone is left as it was, except `ResyncRestoreFailed`, where
+/// `<id>` is missing and `<id>.o-…` remains.
+pub fn library_resync(
+    env: &GitEnv,
+    url: &str,
+    branch: &str,
+    lib_dir: &Path,
+    id: uuid::Uuid,
+    deadline: Instant,
+) -> Result<(), GitFailure> {
+    let limit_secs = deadline
+        .saturating_duration_since(Instant::now())
+        .as_secs_f64()
+        .ceil() as u64;
+    std::fs::create_dir_all(lib_dir).map_err(|e| io_failure(&e))?;
+    let suffix = temp_suffix();
+    let dest = lib_dir.join(id.to_string());
+    let tmp = lib_dir.join(format!("{id}.r-{suffix}"));
+    let old_name = format!("{id}.o-{suffix}");
+    let old = lib_dir.join(&old_name);
+
+    match clone_into(env, url, branch, &tmp, lib_dir, deadline) {
+        Ok(()) => {}
+        Err(GitFailure::TimedOut { .. }) => return Err(GitFailure::TimedOut { secs: limit_secs }),
+        Err(e) => return Err(e),
+    }
+    if Instant::now() >= deadline {
+        let _ = remove_dir_force(env, &tmp);
+        return Err(GitFailure::TimedOut { secs: limit_secs });
+    }
+
+    let moved_old = std::fs::symlink_metadata(&dest).is_ok();
+    if moved_old && let Err(e) = (env.rename)(&dest, &old) {
+        let _ = remove_dir_force(env, &tmp);
+        return Err(io_failure(&e));
+    }
+
+    if let Err(replace) = (env.rename)(&tmp, &dest) {
+        let _ = remove_dir_force(env, &tmp);
+        if moved_old && let Err(restore) = (env.rename)(&old, &dest) {
+            return Err(GitFailure::ResyncRestoreFailed {
+                replace: replace.to_string(),
+                restore: restore.to_string(),
+                leftover: old_name,
+            });
+        }
+        return Err(io_failure(&replace));
+    }
+
+    // A failure here is still a success: the startup cleanup removes the leftover.
+    if moved_old {
+        let _ = remove_dir_force(env, &old);
+    }
+    Ok(())
+}
+
+/// The local-changes check before a re-sync: read-only and offline (no fetch).
+/// A clone without `.git` has its files counted without running git; otherwise
+/// changed files come from `git status` and local commits from
+/// `rev-list @{upstream}..HEAD`. Any failure or the deadline → `Unknown`.
+///
+/// `GIT_OPTIONAL_LOCKS=0` keeps `status` from rewriting the index, and
+/// `core.fsmonitor=false` keeps it from starting a daemon.
+pub fn library_local_changes(env: &GitEnv, clone: &Path, deadline: Instant) -> LocalChanges {
+    #[cfg(test)]
+    if let Some(hook) = &env.check_hook {
+        hook();
+    }
+    if std::fs::symlink_metadata(clone).is_err() {
+        return LocalChanges::NoClone;
+    }
+    if std::fs::symlink_metadata(clone.join(".git")).is_err() {
+        return match count_files(clone, deadline) {
+            Some(0) => LocalChanges::NoClone,
+            Some(files) => LocalChanges::from_counts(files, 0),
+            None => LocalChanges::Unknown,
+        };
+    }
+    let status = [
+        OsStr::new("status"),
+        OsStr::new("--porcelain=v1"),
+        OsStr::new("-z"),
+        OsStr::new("--untracked-files=all"),
+    ];
+    let Some(files) =
+        check_git_output(env, clone, &status, deadline).map(|out| status_entries(&out))
+    else {
+        return LocalChanges::Unknown;
+    };
+    let rev_list = [
+        OsStr::new("rev-list"),
+        OsStr::new("--count"),
+        OsStr::new("@{upstream}..HEAD"),
+    ];
+    let commits = check_git_output(env, clone, &rev_list, deadline)
+        .and_then(|out| String::from_utf8_lossy(&out).trim().parse::<usize>().ok());
+    match commits {
+        Some(commits) => LocalChanges::from_counts(files, commits),
+        None => LocalChanges::Unknown,
+    }
+}
+
+/// Files under `dir`, recursively, without following links; `None` on a
+/// read error or past `deadline`.
+fn count_files(dir: &Path, deadline: Instant) -> Option<usize> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let mut files = 0;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        if entry.file_type().ok()?.is_dir() {
+            files += count_files(&entry.path(), deadline)?;
+        } else {
+            files += 1;
+        }
+    }
+    Some(files)
+}
+
+/// Entries of `git status --porcelain=v1 -z`. A rename or copy (`R`/`C`) adds
+/// its source path as one more field, which is not another entry.
+fn status_entries(out: &[u8]) -> usize {
+    let mut fields = out.split(|b| *b == 0).filter(|f| !f.is_empty());
+    let mut entries = 0;
+    while let Some(field) = fields.next() {
+        entries += 1;
+        if field.len() >= 2 && field[..2].iter().any(|c| matches!(c, b'R' | b'C')) {
+            fields.next();
+        }
+    }
+    entries
+}
+
+/// Run git `args` in `clone` for the local-changes check and return its stdout;
+/// `None` if git is missing, fails, or `deadline` passes.
+fn check_git_output(
+    env: &GitEnv,
+    clone: &Path,
+    args: &[&OsStr],
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let mut cmd = env.base_command(Some(clone), clone.parent())?;
+    cmd.env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-c", "core.fsmonitor=false"]);
+    if let Some(opt) = LONG_PATHS {
+        cmd.arg("-c").arg(opt);
+    }
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    env.spawned.fetch_add(1, Ordering::SeqCst);
+    // Drain stdout on a thread so a large status never blocks git.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut out = Vec::new();
+            let ok = stdout.read_to_end(&mut out).is_ok();
+            let _ = tx.send(ok.then_some(out));
+        });
+    }
+    let (child, status) = wait_until(child, deadline);
+    env.reap(child);
+    if !status?.success() {
+        return None;
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    rx.recv_timeout(left.max(Duration::from_millis(100)))
+        .ok()
+        .flatten()
+}
+
+/// Delete `dir`; if that fails, clear the read-only attribute of everything
+/// under it (git's packfiles are read-only on Windows) and try once more.
+pub fn remove_dir_force(env: &GitEnv, dir: &Path) -> std::io::Result<()> {
+    if (env.remove_dir)(dir).is_ok() {
+        return Ok(());
+    }
+    clear_read_only(dir);
+    (env.remove_dir)(dir)
+}
+
+/// Make `path` and everything under it writable, without following symlinks.
+/// Best effort.
+fn clear_read_only(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    let mut perms = meta.permissions();
+    #[cfg(windows)]
+    {
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(perms.mode() | 0o200);
+    }
+    let _ = std::fs::set_permissions(path, perms);
+    if meta.is_dir()
+        && let Ok(entries) = std::fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            clear_read_only(&entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2101,5 +2824,1377 @@ mod tests {
         assert!(!repo.join("junk.txt").exists(), "untracked file removed");
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ---- Team libraries: non-interactive git runner ----
+
+    use crate::test_support::{TestServer, askpass_script};
+    use std::ffi::OsStr;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    fn os_args<'a>(args: &[&'a str]) -> Vec<&'a OsStr> {
+        args.iter().map(|s| OsStr::new(*s)).collect()
+    }
+
+    fn lib_temp_dir() -> PathBuf {
+        let dir = crate::test_support::short_temp_path();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Every child the runner spawned has been waited for.
+    fn assert_all_reaped(env: &GitEnv) {
+        let reaped = env
+            .reaped
+            .as_ref()
+            .expect("for_tests keeps reaped children");
+        let mut reaped = reaped.lock().unwrap();
+        assert!(!reaped.is_empty(), "at least one child was spawned");
+        for child in reaped.iter_mut() {
+            assert!(
+                matches!(child.try_wait(), Ok(Some(_))),
+                "child still running"
+            );
+        }
+    }
+
+    #[test]
+    fn library_git_missing_from_path_is_not_found() {
+        let empty = lib_temp_dir();
+        let mut env = GitEnv::for_tests();
+        env.path_override = Some(empty.clone().into_os_string());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let res = run_git(
+            &env,
+            None,
+            None,
+            "https://example.invalid/r.git",
+            &os_args(&["--version"]),
+            deadline,
+        );
+        assert_eq!(res, Err(GitFailure::NotFound));
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn library_git_http_401_fails_fast_and_child_is_reaped() {
+        let server = TestServer::unauthorized();
+        let url = server.url("team-lib.git");
+        let env = GitEnv::for_tests();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(120);
+        let res = run_git(
+            &env,
+            None,
+            None,
+            &url,
+            &os_args(&["ls-remote", "--", &url]),
+            deadline,
+        );
+        assert!(
+            matches!(res, Err(GitFailure::Failed { ref detail }) if !detail.is_empty()),
+            "expected a git failure with a message, got {res:?}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(120));
+        let reaped = env.reaped.as_ref().unwrap();
+        assert!(matches!(reaped.lock().unwrap()[0].try_wait(), Ok(Some(_))));
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 1);
+    }
+
+    /// `credential.interactive` is turned back on to stand for a git older than
+    /// 2.46, so only `base_command`'s askpass environment can stop the prompt.
+    /// git also asks HTTP credentials through `SSH_ASKPASS`, so all three
+    /// sources are exercised over HTTP.
+    #[test]
+    fn library_git_never_runs_an_askpass_program() {
+        let server = TestServer::unauthorized();
+        let url = server.url("team-lib.git");
+        let dir = lib_temp_dir();
+        let mut ran = Vec::new();
+        for source in ["GIT_ASKPASS", "core.askPass", "SSH_ASKPASS"] {
+            // Positive control: unprotected git runs this source's script.
+            let plain_marker = dir.join(format!("{source}.plain.called"));
+            let plain_script = askpass_script(&dir, &plain_marker);
+            let mut plain = command("git");
+            plain
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", dir.join("empty.gitconfig"))
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_ASKPASS")
+                .env_remove("SSH_ASKPASS")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .args(["-c", "credential.interactive=true"]);
+            match source {
+                "core.askPass" => {
+                    plain
+                        .arg("-c")
+                        .arg(format!("core.askPass={}", plain_script.display()));
+                }
+                _ => {
+                    plain.env(source, &plain_script);
+                }
+            }
+            if source == "SSH_ASKPASS" {
+                plain.env("SSH_ASKPASS_REQUIRE", "force");
+            }
+            let status = plain.args(["ls-remote", "--", url.as_str()]).status();
+            assert!(status.is_ok(), "{source}: plain git did not start");
+            assert!(
+                plain_marker.exists(),
+                "{source}: plain git did not run the askpass program, so the check below would prove nothing"
+            );
+
+            let marker = dir.join(format!("{source}.called"));
+            let script = askpass_script(&dir, &marker);
+            let mut env = GitEnv::for_tests();
+            let config_arg = format!("core.askPass={}", script.display());
+            let mut args = vec!["-c", "credential.interactive=true"];
+            match source {
+                "core.askPass" => args.extend(["-c", config_arg.as_str()]),
+                _ => env
+                    .extra_env
+                    .push((OsString::from(source), script.clone().into_os_string())),
+            }
+            if source == "SSH_ASKPASS" {
+                env.extra_env.push((
+                    OsString::from("SSH_ASKPASS_REQUIRE"),
+                    OsString::from("force"),
+                ));
+            }
+            args.extend(["ls-remote", "--", url.as_str()]);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let res = run_git(&env, None, None, &url, &os_args(&args), deadline);
+            assert!(
+                matches!(res, Err(GitFailure::Failed { .. })),
+                "{source}: {res:?}"
+            );
+            if marker.exists() {
+                ran.push(source);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ran.is_empty(), "git ran the askpass program of {ran:?}");
+    }
+
+    #[test]
+    fn library_git_timeout_kills_silent_server_operation() {
+        let server = TestServer::silent();
+        let url = server.url("team-lib.git");
+        let env = GitEnv::for_tests();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(2);
+        let res = run_git(
+            &env,
+            None,
+            None,
+            &url,
+            &os_args(&["ls-remote", "--", &url]),
+            deadline,
+        );
+        let elapsed = start.elapsed();
+        assert_eq!(res, Err(GitFailure::TimedOut { secs: 2 }));
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "returned before the deadline: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+        assert_all_reaped(&env);
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn library_git_file_url_spawns_one_process() {
+        let repo = lib_temp_dir();
+        let init = command("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let path = repo.to_string_lossy().replace('\\', "/");
+        let url = format!("file:///{}", path.trim_start_matches('/'));
+        let env = GitEnv::for_tests();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let res = run_git(
+            &env,
+            None,
+            None,
+            &url,
+            &os_args(&["ls-remote", "--", &url]),
+            deadline,
+        );
+        assert_eq!(res, Ok(()));
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 1);
+        assert_all_reaped(&env);
+
+        let missing = format!("{url}-missing");
+        let res = run_git(
+            &env,
+            None,
+            None,
+            &missing,
+            &os_args(&["ls-remote", "--", &missing]),
+            deadline,
+        );
+        assert!(
+            matches!(res, Err(GitFailure::Failed { ref detail }) if !detail.is_empty()),
+            "{res:?}"
+        );
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn library_git_production_env_runs_plain_git() {
+        let env = GitEnv::production();
+        assert_eq!(env.program, OsStr::new("git"));
+        assert!(env.path_override.is_none());
+        assert!(env.extra_env.is_empty());
+        assert!(env.reaped.is_none());
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn library_git_is_ssh_url_cases() {
+        assert!(is_ssh_url("git@github.com:org/r.git"));
+        assert!(is_ssh_url("ssh://git@h/r"));
+        assert!(is_ssh_url("SSH://git@h/r"));
+        assert!(is_ssh_url("git+ssh://h/r"));
+        assert!(is_ssh_url("ssh+git://h/r"));
+        assert!(is_ssh_url("  git@h:r  "));
+        assert!(is_ssh_url("host:r"));
+        assert!(!is_ssh_url("https://h/r"));
+        assert!(!is_ssh_url("file:///C:/r"));
+        assert!(!is_ssh_url("C:/r"));
+        assert!(!is_ssh_url("C:\\r"));
+        assert!(!is_ssh_url("./a:b"));
+        assert!(!is_ssh_url("/srv/repos/r"));
+        assert!(!is_ssh_url(""));
+    }
+
+    #[test]
+    fn library_git_ssh_batch_mode_needed_rule() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let probe = |answer: SshConfigProbe| {
+            let calls = &calls;
+            move || {
+                calls.set(calls.get() + 1);
+                answer
+            }
+        };
+        assert!(!ssh_batch_mode_needed(
+            "https://h/r",
+            false,
+            false,
+            probe(SshConfigProbe::Unset)
+        ));
+        assert_eq!(calls.get(), 0);
+        assert!(ssh_batch_mode_needed(
+            "git@h:r",
+            false,
+            false,
+            probe(SshConfigProbe::Unset)
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(!ssh_batch_mode_needed(
+            "git@h:r",
+            false,
+            false,
+            probe(SshConfigProbe::Set)
+        ));
+        assert!(!ssh_batch_mode_needed(
+            "git@h:r",
+            false,
+            false,
+            probe(SshConfigProbe::Failed)
+        ));
+        assert_eq!(calls.get(), 3);
+        assert!(!ssh_batch_mode_needed(
+            "ssh://h/r",
+            true,
+            false,
+            probe(SshConfigProbe::Unset)
+        ));
+        assert!(!ssh_batch_mode_needed(
+            "ssh://h/r",
+            false,
+            true,
+            probe(SshConfigProbe::Unset)
+        ));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn library_git_ssh_config_probe_reads_core_ssh_command() {
+        let env = GitEnv::for_tests();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let plain = lib_temp_dir();
+        assert_eq!(
+            probe_ssh_command_config(&env, Some(&plain), None, deadline),
+            SshConfigProbe::Unset
+        );
+        let repo = lib_temp_dir();
+        assert!(
+            command("git")
+                .args(["init", "-q"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            command("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["config", "core.sshCommand", "ssh -i k"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            probe_ssh_command_config(&env, Some(&repo), None, deadline),
+            SshConfigProbe::Set
+        );
+        assert_eq!(
+            probe_ssh_command_config(&env, Some(&plain), None, Instant::now()),
+            SshConfigProbe::Failed
+        );
+        let missing = plain.join("does-not-exist");
+        assert_eq!(
+            probe_ssh_command_config(&env, Some(&missing), None, deadline),
+            SshConfigProbe::Failed
+        );
+        let _ = std::fs::remove_dir_all(&plain);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ---- Team libraries: clone / pull / re-sync / forced delete ----
+
+    use crate::test_support::{TestRepo, file_url, git_out};
+    use std::collections::BTreeMap;
+
+    const LIB_FILE: &str = "muxel-library.toml";
+    const FILE_V1: &str = "[[snippets]]\nname = \"A\"\ntext = \"one\"\n";
+    const FILE_V2: &str = "[[snippets]]\nname = \"A\"\ntext = \"one\"\n\n[[snippets]]\nname = \"New\"\ntext = \"two\"\n";
+
+    fn lib_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(120)
+    }
+
+    fn lib_remote() -> TestRepo {
+        let repo = TestRepo::init();
+        repo.commit(&[(LIB_FILE, FILE_V1), ("README.md", "readme\n")], "init");
+        repo
+    }
+
+    fn lib_cloned(repo: &TestRepo) -> (PathBuf, uuid::Uuid, PathBuf) {
+        let lib_dir = lib_temp_dir();
+        let id = uuid::Uuid::new_v4();
+        let dest = lib_dir.join(id.to_string());
+        let env = GitEnv::for_tests();
+        let res = library_clone(
+            &env,
+            &file_url(repo.path()),
+            "",
+            &dest,
+            &lib_dir,
+            lib_deadline(),
+        );
+        assert_eq!(res, Ok(()));
+        (lib_dir, id, dest)
+    }
+
+    fn lib_head(dir: &Path) -> String {
+        git_out(dir, &["log", "-1", "--format=%H"])
+    }
+
+    fn lib_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn lib_snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_name() == ".git" {
+                    continue;
+                }
+                if entry.file_type().unwrap().is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    let rel = path.strip_prefix(root).unwrap().to_string_lossy();
+                    out.insert(rel.replace('\\', "/"), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+
+    fn assert_no_temp_entries(lib_dir: &Path) {
+        for name in lib_entries(lib_dir) {
+            assert!(
+                !name.contains(".r-") && !name.contains(".o-") && !name.contains(".c-"),
+                "leftover entry {name}"
+            );
+        }
+    }
+
+    /// A rename hook that fails when the source's name contains any of `bad`.
+    fn lib_failing_rename(bad: &'static [&'static str]) -> RenameFn {
+        Arc::new(move |src: &Path, dst: &Path| {
+            let name = src.file_name().unwrap().to_string_lossy().into_owned();
+            if bad.iter().any(|b| name.contains(b)) {
+                Err(std::io::Error::other(format!(
+                    "injected rename failure: {name}"
+                )))
+            } else {
+                std::fs::rename(src, dst)
+            }
+        })
+    }
+
+    #[test]
+    fn library_clone_default_branch_copies_file() {
+        let repo = lib_remote();
+        let (lib_dir, id, dest) = lib_cloned(&repo);
+        assert_eq!(
+            std::fs::read_to_string(dest.join(LIB_FILE)).unwrap(),
+            FILE_V1
+        );
+        assert_eq!(lib_head(&dest), repo.git(&["rev-parse", "HEAD"]));
+        assert_eq!(lib_entries(&lib_dir), vec![id.to_string()]);
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_clone_checks_out_the_named_branch() {
+        let repo = lib_remote();
+        repo.git(&["checkout", "-q", "-b", "team"]);
+        let team_file = "[[snippets]]\nname = \"Team\"\ntext = \"t\"\n";
+        repo.commit(&[(LIB_FILE, team_file)], "team");
+        repo.git(&["checkout", "-q", "main"]);
+        let lib_dir = lib_temp_dir();
+        let dest = lib_dir.join(uuid::Uuid::new_v4().to_string());
+        let env = GitEnv::for_tests();
+        let res = library_clone(
+            &env,
+            &file_url(repo.path()),
+            "team",
+            &dest,
+            &lib_dir,
+            lib_deadline(),
+        );
+        assert_eq!(res, Ok(()));
+        assert_eq!(
+            std::fs::read_to_string(dest.join(LIB_FILE)).unwrap(),
+            team_file
+        );
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_clone_missing_branch_leaves_nothing() {
+        let repo = lib_remote();
+        let lib_dir = lib_temp_dir();
+        let dest = lib_dir.join(uuid::Uuid::new_v4().to_string());
+        let env = GitEnv::for_tests();
+        let res = library_clone(
+            &env,
+            &file_url(repo.path()),
+            "no-such-branch",
+            &dest,
+            &lib_dir,
+            lib_deadline(),
+        );
+        assert!(
+            matches!(res, Err(GitFailure::Failed { ref detail }) if !detail.is_empty()),
+            "{res:?}"
+        );
+        assert!(
+            lib_entries(&lib_dir).is_empty(),
+            "{:?}",
+            lib_entries(&lib_dir)
+        );
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_clone_creates_missing_lib_dir() {
+        let repo = lib_remote();
+        let parent = lib_temp_dir();
+        let lib_dir = parent.join("data").join("libraries");
+        assert!(!lib_dir.exists());
+        let dest = lib_dir.join(uuid::Uuid::new_v4().to_string());
+        let env = GitEnv::for_tests();
+        let res = library_clone(
+            &env,
+            &file_url(repo.path()),
+            "",
+            &dest,
+            &lib_dir,
+            lib_deadline(),
+        );
+        assert_eq!(res, Ok(()));
+        assert_eq!(
+            std::fs::read_to_string(dest.join(LIB_FILE)).unwrap(),
+            FILE_V1
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn library_resync_creates_missing_lib_dir_and_clones() {
+        let repo = lib_remote();
+        let parent = lib_temp_dir();
+        let lib_dir = parent.join("libraries");
+        let id = uuid::Uuid::new_v4();
+        let env = GitEnv::for_tests();
+        let res = library_resync(
+            &env,
+            &file_url(repo.path()),
+            "",
+            &lib_dir,
+            id,
+            lib_deadline(),
+        );
+        assert_eq!(res, Ok(()));
+        let dest = lib_dir.join(id.to_string());
+        assert_eq!(lib_head(&dest), repo.git(&["rev-parse", "HEAD"]));
+        assert_eq!(lib_entries(&lib_dir), vec![id.to_string()]);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn library_git_ceiling_keeps_git_inside_lib_dir() {
+        let outer = TestRepo::init();
+        outer.commit(&[("outer.txt", "outer\n")], "outer");
+        let lib_dir = outer.path().join("libs");
+        let folder = lib_dir.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+        let url = file_url(outer.path());
+        let args = os_args(&["rev-parse", "--git-dir"]);
+        let env = GitEnv::for_tests();
+
+        let unbounded = run_git(&env, Some(&folder), None, &url, &args, lib_deadline());
+        assert_eq!(unbounded, Ok(()), "the outer repository is found");
+        let bounded = run_git(
+            &env,
+            Some(&folder),
+            Some(&lib_dir),
+            &url,
+            &args,
+            lib_deadline(),
+        );
+        assert!(
+            matches!(bounded, Err(GitFailure::Failed { .. })),
+            "{bounded:?}"
+        );
+    }
+
+    /// `LIB_DIR` sits inside a repository that sets `core.sshCommand`.
+    #[test]
+    fn library_git_clone_probe_does_not_reach_repo_above_lib_dir() {
+        let outer = TestRepo::init();
+        outer.commit(&[("outer.txt", "outer\n")], "outer");
+        outer.git(&["config", "core.sshCommand", "ssh -i outer-key"]);
+        let lib_dir = outer.path().join("libs");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let env = GitEnv::for_tests();
+        assert_eq!(
+            probe_ssh_command_config(&env, Some(&lib_dir), None, lib_deadline()),
+            SshConfigProbe::Set
+        );
+        assert_eq!(
+            probe_ssh_command_config(
+                &env,
+                Some(&lib_dir),
+                Some(clone_ceiling(&lib_dir)),
+                lib_deadline()
+            ),
+            SshConfigProbe::Unset
+        );
+        let args = os_args(&["rev-parse", "--git-dir"]);
+        let res = run_git(
+            &env,
+            Some(&lib_dir),
+            Some(clone_ceiling(&lib_dir)),
+            &file_url(outer.path()),
+            &args,
+            lib_deadline(),
+        );
+        assert!(matches!(res, Err(GitFailure::Failed { .. })), "{res:?}");
+    }
+
+    #[test]
+    fn library_pull_without_dot_git_is_not_a_clone_and_spawns_nothing() {
+        let outer = TestRepo::init();
+        let head = outer.commit(&[("outer.txt", "outer\n")], "outer");
+        let clone = outer.path().join("libs").join("x");
+        std::fs::create_dir_all(&clone).unwrap();
+        let env = GitEnv::for_tests();
+        let res = library_pull(&env, &file_url(outer.path()), &clone, lib_deadline());
+        assert_eq!(res, Err(GitFailure::NotAClone));
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 0);
+        assert_eq!(outer.git(&["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn library_pull_fast_forward() {
+        let repo = lib_remote();
+        let (lib_dir, _, dest) = lib_cloned(&repo);
+        let new_head = repo.commit(&[(LIB_FILE, FILE_V2)], "add New");
+        let env = GitEnv::for_tests();
+        let res = library_pull(&env, &file_url(repo.path()), &dest, lib_deadline());
+        assert_eq!(res, Ok(()));
+        assert_eq!(lib_head(&dest), new_head);
+        assert_eq!(
+            std::fs::read_to_string(dest.join(LIB_FILE)).unwrap(),
+            FILE_V2
+        );
+        assert_eq!(git_out(&dest, &["status", "--porcelain"]), "");
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_pull_after_force_push_fails_and_head_unchanged() {
+        let repo = lib_remote();
+        let (lib_dir, _, dest) = lib_cloned(&repo);
+        let before = lib_head(&dest);
+        let rewritten = repo.force_push(&[(LIB_FILE, FILE_V2)], "rewritten");
+        assert_ne!(rewritten, before);
+        let env = GitEnv::for_tests();
+        let res = library_pull(&env, &file_url(repo.path()), &dest, lib_deadline());
+        assert!(
+            matches!(res, Err(GitFailure::Failed { ref detail }) if !detail.is_empty()),
+            "{res:?}"
+        );
+        assert_eq!(lib_head(&dest), before);
+        assert_eq!(
+            std::fs::read_to_string(dest.join(LIB_FILE)).unwrap(),
+            FILE_V1
+        );
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_pull_conflicting_local_change_fails_without_touching_files() {
+        let repo = lib_remote();
+        let (lib_dir, _, dest) = lib_cloned(&repo);
+        let local = "[[snippets]]\nname = \"A\"\ntext = \"local\"\n";
+        std::fs::write(dest.join(LIB_FILE), local).unwrap();
+        std::fs::write(dest.join("notes.txt"), "mine\n").unwrap();
+        let before_files = lib_snapshot(&dest);
+        let before_head = lib_head(&dest);
+        repo.commit(&[(LIB_FILE, FILE_V2)], "upstream change");
+        let env = GitEnv::for_tests();
+        let res = library_pull(&env, &file_url(repo.path()), &dest, lib_deadline());
+        assert!(
+            matches!(res, Err(GitFailure::Failed { ref detail }) if !detail.is_empty()),
+            "{res:?}"
+        );
+        assert_eq!(lib_snapshot(&dest), before_files);
+        assert_eq!(lib_head(&dest), before_head);
+        assert_eq!(git_out(&dest, &["stash", "list"]), "");
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_pull_non_conflicting_local_change_is_kept() {
+        let repo = lib_remote();
+        let (lib_dir, _, dest) = lib_cloned(&repo);
+        std::fs::write(dest.join("README.md"), "edited by hand\n").unwrap();
+        let new_head = repo.commit(&[(LIB_FILE, FILE_V2)], "upstream change");
+        let env = GitEnv::for_tests();
+        let res = library_pull(&env, &file_url(repo.path()), &dest, lib_deadline());
+        assert_eq!(res, Ok(()));
+        assert_eq!(lib_head(&dest), new_head);
+        assert_eq!(
+            std::fs::read_to_string(dest.join(LIB_FILE)).unwrap(),
+            FILE_V2
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("README.md")).unwrap(),
+            "edited by hand\n"
+        );
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_pull_with_index_lock_fails_and_lock_stays() {
+        let repo = lib_remote();
+        let (lib_dir, _, dest) = lib_cloned(&repo);
+        let lock = dest.join(".git").join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let before = lib_head(&dest);
+        repo.commit(&[(LIB_FILE, FILE_V2)], "upstream change");
+        let env = GitEnv::for_tests();
+        let res = library_pull(&env, &file_url(repo.path()), &dest, lib_deadline());
+        assert!(
+            matches!(res, Err(GitFailure::Failed { ref detail }) if !detail.is_empty()),
+            "{res:?}"
+        );
+        assert!(lock.exists());
+        assert_eq!(lib_head(&dest), before);
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_resync_dirty_clone_matches_remote() {
+        let repo = lib_remote();
+        repo.commit(&[(".gitignore", "build.log\n")], "ignore build.log");
+        let (lib_dir, id, dest) = lib_cloned(&repo);
+        // Hand edit, untracked, ignored, a local commit and an orphan index.lock.
+        std::fs::write(dest.join("README.md"), "local commit\n").unwrap();
+        git_out(&dest, &["commit", "-q", "-am", "local"]);
+        std::fs::write(dest.join(LIB_FILE), "edited by hand\n").unwrap();
+        std::fs::write(dest.join("notes.txt"), "mine\n").unwrap();
+        std::fs::write(dest.join("build.log"), "log\n").unwrap();
+        std::fs::write(dest.join(".git").join("index.lock"), "").unwrap();
+        let remote_head = repo.commit(&[(LIB_FILE, FILE_V2)], "add New");
+
+        let env = GitEnv::for_tests();
+        let res = library_resync(
+            &env,
+            &file_url(repo.path()),
+            "",
+            &lib_dir,
+            id,
+            lib_deadline(),
+        );
+        assert_eq!(res, Ok(()));
+        assert_eq!(git_out(&dest, &["status", "--porcelain", "--ignored"]), "");
+        assert_eq!(lib_head(&dest), remote_head);
+        assert!(!dest.join("notes.txt").exists());
+        assert!(!dest.join("build.log").exists());
+        assert!(!dest.join(".git").join("index.lock").exists());
+        assert_eq!(
+            std::fs::read(dest.join(LIB_FILE)).unwrap(),
+            std::fs::read(repo.path().join(LIB_FILE)).unwrap()
+        );
+        assert_eq!(lib_entries(&lib_dir), vec![id.to_string()]);
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_resync_after_force_push() {
+        let repo = lib_remote();
+        let (lib_dir, id, dest) = lib_cloned(&repo);
+        let rewritten = repo.force_push(&[(LIB_FILE, FILE_V2)], "rewritten");
+        let env = GitEnv::for_tests();
+        assert!(library_pull(&env, &file_url(repo.path()), &dest, lib_deadline()).is_err());
+        let res = library_resync(
+            &env,
+            &file_url(repo.path()),
+            "",
+            &lib_dir,
+            id,
+            lib_deadline(),
+        );
+        assert_eq!(res, Ok(()));
+        assert_eq!(lib_head(&dest), rewritten);
+        assert_eq!(
+            std::fs::read_to_string(dest.join(LIB_FILE)).unwrap(),
+            FILE_V2
+        );
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_resync_remote_gone_keeps_clone() {
+        let repo = lib_remote();
+        let url = file_url(repo.path());
+        let (lib_dir, id, dest) = lib_cloned(&repo);
+        std::fs::write(dest.join("notes.txt"), "mine\n").unwrap();
+        let before_files = lib_snapshot(&dest);
+        let before_head = lib_head(&dest);
+        drop(repo); // R deleted: the remote is unreachable.
+        let env = GitEnv::for_tests();
+        let res = library_resync(&env, &url, "", &lib_dir, id, lib_deadline());
+        assert!(
+            matches!(res, Err(GitFailure::Failed { ref detail }) if !detail.is_empty()),
+            "{res:?}"
+        );
+        assert_eq!(lib_snapshot(&dest), before_files);
+        assert_eq!(lib_head(&dest), before_head);
+        assert_eq!(lib_entries(&lib_dir), vec![id.to_string()]);
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_resync_timeout_keeps_clone() {
+        let repo = lib_remote();
+        let (lib_dir, id, dest) = lib_cloned(&repo);
+        std::fs::write(dest.join("notes.txt"), "mine\n").unwrap();
+        let before_files = lib_snapshot(&dest);
+        let before_head = lib_head(&dest);
+        let server = TestServer::silent();
+        let env = GitEnv::for_tests();
+        let start = Instant::now();
+        let res = library_resync(
+            &env,
+            &server.url("team-lib.git"),
+            "",
+            &lib_dir,
+            id,
+            start + Duration::from_secs(2),
+        );
+        let elapsed = start.elapsed();
+        assert!(matches!(res, Err(GitFailure::TimedOut { .. })), "{res:?}");
+        assert!(elapsed <= Duration::from_secs(7), "took {elapsed:?}");
+        assert_all_reaped(&env);
+        assert_eq!(lib_snapshot(&dest), before_files);
+        assert_eq!(lib_head(&dest), before_head);
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_resync_replace_failure_keeps_clone() {
+        let repo = lib_remote();
+        let (lib_dir, id, dest) = lib_cloned(&repo);
+        std::fs::write(dest.join("notes.txt"), "mine\n").unwrap();
+        let before_files = lib_snapshot(&dest);
+        let before_head = lib_head(&dest);
+        repo.commit(&[(LIB_FILE, FILE_V2)], "add New");
+        let mut env = GitEnv::for_tests();
+        env.rename = lib_failing_rename(&[".r-"]);
+        let res = library_resync(
+            &env,
+            &file_url(repo.path()),
+            "",
+            &lib_dir,
+            id,
+            lib_deadline(),
+        );
+        assert!(
+            matches!(res, Err(GitFailure::Io { ref detail }) if detail.contains("injected")),
+            "{res:?}"
+        );
+        assert_eq!(lib_snapshot(&dest), before_files);
+        assert_eq!(lib_head(&dest), before_head);
+        assert_no_temp_entries(&lib_dir);
+        assert_eq!(lib_entries(&lib_dir), vec![id.to_string()]);
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_resync_without_clone_and_remote_fails() {
+        let repo = lib_remote();
+        let url = file_url(repo.path());
+        drop(repo);
+        let lib_dir = lib_temp_dir();
+        let id = uuid::Uuid::new_v4();
+        let env = GitEnv::for_tests();
+        let res = library_resync(&env, &url, "", &lib_dir, id, lib_deadline());
+        assert!(res.is_err(), "{res:?}");
+        assert!(!lib_dir.join(id.to_string()).exists());
+        assert!(
+            lib_entries(&lib_dir).is_empty(),
+            "{:?}",
+            lib_entries(&lib_dir)
+        );
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_resync_double_failure_leaves_old_clone() {
+        let repo = lib_remote();
+        let (lib_dir, id, dest) = lib_cloned(&repo);
+        std::fs::write(dest.join("notes.txt"), "old clone\n").unwrap();
+        repo.commit(&[(LIB_FILE, FILE_V2)], "add New");
+        let mut env = GitEnv::for_tests();
+        env.rename = lib_failing_rename(&[".r-", ".o-"]);
+        let res = library_resync(
+            &env,
+            &file_url(repo.path()),
+            "",
+            &lib_dir,
+            id,
+            lib_deadline(),
+        );
+        let Err(GitFailure::ResyncRestoreFailed {
+            replace,
+            restore,
+            leftover,
+        }) = res
+        else {
+            panic!("expected ResyncRestoreFailed, got {res:?}");
+        };
+        assert!(replace.contains("injected"), "{replace}");
+        assert!(restore.contains("injected"), "{restore}");
+        assert!(!dest.exists());
+        let entries = lib_entries(&lib_dir);
+        let prefix = format!("{id}.o-");
+        let olds: Vec<&String> = entries.iter().filter(|n| n.starts_with(&prefix)).collect();
+        assert_eq!(olds.len(), 1, "{entries:?}");
+        assert_eq!(&leftover, olds[0]);
+        assert_eq!(
+            std::fs::read_to_string(lib_dir.join(&leftover).join("notes.txt")).unwrap(),
+            "old clone\n"
+        );
+        assert!(!entries.iter().any(|n| n.contains(".r-")), "{entries:?}");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    fn lib_make_read_only(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                lib_make_read_only(&path);
+            } else {
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                perms.set_readonly(true);
+                std::fs::set_permissions(&path, perms).unwrap();
+            }
+        }
+        let mut perms = std::fs::metadata(dir).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(dir, perms).unwrap();
+    }
+
+    #[test]
+    fn library_remove_dir_force_read_only_clone_is_deleted() {
+        let repo = lib_remote();
+        let (lib_dir, _, dest) = lib_cloned(&repo);
+        lib_make_read_only(&dest);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut env = GitEnv::for_tests();
+        let counter = calls.clone();
+        env.remove_dir = Arc::new(move |dir: &Path| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::fs::remove_dir_all(dir)
+        });
+        assert!(remove_dir_force(&env, &dest).is_ok());
+        assert!(!dest.exists());
+        let n = calls.load(Ordering::SeqCst);
+        assert!((1..=2).contains(&n), "{n} attempts");
+        let _ = std::fs::remove_dir_all(&lib_dir);
+    }
+
+    #[test]
+    fn library_remove_dir_force_failing_delete_is_tried_twice() {
+        let dir = lib_temp_dir();
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        lib_make_read_only(&dir);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut env = GitEnv::for_tests();
+        let counter = calls.clone();
+        env.remove_dir = Arc::new(move |_: &Path| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("injected delete failure"))
+        });
+        assert!(remove_dir_force(&env, &dir).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(dir.exists());
+        assert!(
+            !std::fs::metadata(dir.join("f.txt"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        assert!(remove_dir_force(&GitEnv::production(), &dir).is_ok());
+        assert!(!dir.exists());
+    }
+
+    // ---- Team libraries: local-changes check before a re-sync ----
+
+    /// Tracked `muxel-library.toml`, `a.txt`, `b.txt` and a `.gitignore` with `*.log`.
+    fn check_remote() -> TestRepo {
+        let repo = TestRepo::init();
+        repo.commit(
+            &[
+                (LIB_FILE, FILE_V1),
+                ("a.txt", "a\n"),
+                ("b.txt", "b\n"),
+                (".gitignore", "*.log\n"),
+            ],
+            "init",
+        );
+        repo
+    }
+
+    fn check(clone: &Path) -> LocalChanges {
+        library_local_changes(&GitEnv::for_tests(), clone, lib_deadline())
+    }
+
+    fn changes(files: usize, commits: usize) -> LocalChanges {
+        LocalChanges::Changes { files, commits }
+    }
+
+    fn local_commit(clone: &Path, name: &str) {
+        std::fs::write(clone.join(name), "local\n").unwrap();
+        git_out(clone, &["add", name]);
+        git_out(clone, &["commit", "-q", "-m", name]);
+    }
+
+    fn lib_cleanup(dir: &Path) {
+        let _ = remove_dir_force(&GitEnv::production(), dir);
+    }
+
+    #[test]
+    fn library_temp_suffix_is_eight_hex_digits_and_random() {
+        let a = temp_suffix();
+        let b = temp_suffix();
+        assert_eq!(a.len(), 8, "{a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b);
+    }
+
+    /// git's own files under the clone pass `MAX_PATH` while the clone's `.git`
+    /// stays well under it (git for Windows rejects a `.git` path of about 230
+    /// characters as "'$GIT_DIR' too big", `core.longpaths` or not).
+    ///
+    /// The padding is sized from the actual temp dir, so the window holds for
+    /// any `TEMP` length (CI's differs from a developer machine's).
+    #[cfg(windows)]
+    #[test]
+    fn library_ops_work_past_windows_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+        /// The `.git` path length the padding aims for.
+        const GIT_DIR_TARGET: usize = 205;
+        /// Kept clear of git for Windows' "'$GIT_DIR' too big".
+        const GIT_DIR_LIMIT: usize = 215;
+        const MAX_PATH: usize = 260;
+        const SEGMENT: &str = "deep_segment_past_max_path";
+        let len = |p: &Path| p.as_os_str().encode_wide().count();
+        // `<lib_dir>` + `\<36>.c-<8>\.git`, and that + `\objects\pack\pack-<40>.keep`.
+        let git_dir_suffix = 1 + 36 + ".c-".len() + 8 + r"\.git".len();
+        let keep_suffix = r"\objects\pack\pack-".len() + 40 + ".keep".len();
+
+        let root = lib_temp_dir();
+        let mut lib_dir = root.clone();
+        // Pad to exactly `GIT_DIR_TARGET - git_dir_suffix`; each component
+        // costs its name plus one separator.
+        let mut need = (GIT_DIR_TARGET - git_dir_suffix).saturating_sub(len(&lib_dir));
+        while need > SEGMENT.len() + 2 {
+            lib_dir.push(SEGMENT);
+            need -= SEGMENT.len() + 1;
+        }
+        if need >= 2 {
+            lib_dir.push("p".repeat(need - 1));
+        }
+        let git_dir = len(&lib_dir) + git_dir_suffix;
+        let keep = git_dir + keep_suffix;
+        if git_dir >= GIT_DIR_LIMIT {
+            eprintln!(
+                "skipping: temp dir {} is too long for a `.git` path under {GIT_DIR_LIMIT} \
+                 characters (got {git_dir})",
+                root.display()
+            );
+            lib_cleanup(&root);
+            return;
+        }
+        assert!(
+            keep > MAX_PATH,
+            "precondition: `.git` path is {git_dir} characters (target {GIT_DIR_TARGET}, \
+             limit {GIT_DIR_LIMIT}), pack `.keep` path is {keep} (must exceed {MAX_PATH}); \
+             lib_dir {}",
+            lib_dir.display()
+        );
+        let repo = check_remote();
+        let url = file_url(repo.path());
+        let id = uuid::Uuid::new_v4();
+        let dest = lib_dir.join(id.to_string());
+        let env = GitEnv::for_tests();
+        assert_eq!(
+            library_clone(&env, &url, "", &dest, &lib_dir, lib_deadline()),
+            Ok(())
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(LIB_FILE)).unwrap(),
+            FILE_V1
+        );
+        repo.commit(&[(LIB_FILE, FILE_V2)], "add New");
+        assert_eq!(library_pull(&env, &url, &dest, lib_deadline()), Ok(()));
+        assert_eq!(
+            std::fs::read_to_string(dest.join(LIB_FILE)).unwrap(),
+            FILE_V2
+        );
+        assert_eq!(
+            library_local_changes(&env, &dest, lib_deadline()),
+            LocalChanges::None
+        );
+        assert_eq!(
+            library_resync(&env, &url, "", &lib_dir, id, lib_deadline()),
+            Ok(())
+        );
+        assert_no_temp_entries(&lib_dir);
+        assert_eq!(lib_entries(&lib_dir), vec![id.to_string()]);
+        lib_cleanup(&root);
+    }
+
+    #[test]
+    fn library_check_clean_clone_is_none() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        // No fetch: a new commit in `R` is not looked at.
+        repo.commit(&[(LIB_FILE, FILE_V2)], "add New");
+        assert_eq!(check(&clone), LocalChanges::None);
+        lib_cleanup(&lib_dir);
+    }
+
+    #[test]
+    fn library_check_missing_or_empty_dir_is_no_clone() {
+        let lib_dir = lib_temp_dir();
+        let env = GitEnv::for_tests();
+        let missing = lib_dir.join(uuid::Uuid::new_v4().to_string());
+        assert_eq!(
+            library_local_changes(&env, &missing, lib_deadline()),
+            LocalChanges::NoClone
+        );
+        let empty = lib_dir.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            library_local_changes(&env, &empty, lib_deadline()),
+            LocalChanges::NoClone
+        );
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 0);
+        lib_cleanup(&lib_dir);
+    }
+
+    #[test]
+    fn library_check_counts_modified_deleted_and_untracked_files_one_by_one() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        std::fs::write(clone.join("a.txt"), "changed\n").unwrap();
+        std::fs::remove_file(clone.join("b.txt")).unwrap();
+        std::fs::write(clone.join("notes.txt"), "mine\n").unwrap();
+        std::fs::create_dir_all(clone.join("tmp")).unwrap();
+        std::fs::write(clone.join("tmp/x.txt"), "x\n").unwrap();
+        std::fs::write(clone.join("tmp/y.txt"), "y\n").unwrap();
+        assert_eq!(check(&clone), changes(5, 0));
+        lib_cleanup(&lib_dir);
+    }
+
+    #[test]
+    fn library_check_one_untracked_file() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        std::fs::write(clone.join("notes.txt"), "mine\n").unwrap();
+        assert_eq!(check(&clone), changes(1, 0));
+        lib_cleanup(&lib_dir);
+    }
+
+    #[test]
+    fn library_check_counts_a_staged_rename_once() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        git_out(&clone, &["mv", "a.txt", "renamed.txt"]);
+        // `R  renamed.txt\0a.txt\0`: one entry, its source path is not another.
+        assert_eq!(
+            git_out(&clone, &["status", "--porcelain"]),
+            "R  a.txt -> renamed.txt"
+        );
+        assert_eq!(check(&clone), changes(1, 0));
+        lib_cleanup(&lib_dir);
+    }
+
+    #[test]
+    fn library_check_local_commits_are_counted_against_the_upstream() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        local_commit(&clone, "local.txt");
+        assert_eq!(check(&clone), changes(0, 1));
+        local_commit(&clone, "local2.txt");
+        for name in ["u1.txt", "u2.txt", "u3.txt"] {
+            std::fs::write(clone.join(name), "u\n").unwrap();
+        }
+        assert_eq!(check(&clone), changes(3, 2));
+        lib_cleanup(&lib_dir);
+    }
+
+    #[test]
+    fn library_check_no_upstream_or_detached_head_is_unknown() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        git_out(&clone, &["branch", "--unset-upstream"]);
+        assert_eq!(check(&clone), LocalChanges::Unknown);
+        lib_cleanup(&lib_dir);
+
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        git_out(&clone, &["checkout", "-q", "--detach"]);
+        assert_eq!(check(&clone), LocalChanges::Unknown);
+        lib_cleanup(&lib_dir);
+    }
+
+    #[test]
+    fn library_check_folder_without_git_counts_its_files_without_git() {
+        let lib_dir = lib_temp_dir();
+        let dir = lib_dir.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::create_dir_all(dir.join("empty/nested")).unwrap();
+        std::fs::write(dir.join(LIB_FILE), FILE_V1).unwrap();
+        std::fs::write(dir.join("docs/notes.md"), "notes\n").unwrap();
+        let before = lib_snapshot(&dir);
+        let env = GitEnv::for_tests();
+        assert_eq!(
+            library_local_changes(&env, &dir, lib_deadline()),
+            changes(2, 0)
+        );
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 0);
+        assert!(!dir.join(".git").exists());
+        assert_eq!(lib_snapshot(&dir), before);
+        lib_cleanup(&lib_dir);
+    }
+
+    #[test]
+    fn library_check_ignored_files_do_not_count() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        std::fs::write(clone.join("build.log"), "log\n").unwrap();
+        assert_eq!(git_out(&clone, &["check-ignore", "build.log"]), "build.log");
+        assert_eq!(check(&clone), LocalChanges::None);
+        std::fs::write(clone.join("build.txt"), "log\n").unwrap();
+        assert_eq!(check(&clone), changes(1, 0));
+        lib_cleanup(&lib_dir);
+    }
+
+    #[test]
+    fn library_check_git_missing_is_unknown() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        std::fs::write(clone.join("notes.txt"), "mine\n").unwrap();
+        let empty_path = lib_temp_dir();
+        let env = GitEnv {
+            path_override: Some(empty_path.clone().into_os_string()),
+            ..GitEnv::for_tests()
+        };
+        assert_eq!(
+            library_local_changes(&env, &clone, lib_deadline()),
+            LocalChanges::Unknown
+        );
+        assert!(clone.join("notes.txt").is_file());
+        lib_cleanup(&lib_dir);
+        lib_cleanup(&empty_path);
+    }
+
+    #[test]
+    fn library_check_broken_head_is_unknown_even_inside_another_repo() {
+        // `LIB_DIR` inside a dirty clone `P`: if git fell back to `P` the check
+        // would answer `Changes`, not `Unknown`.
+        let p_origin = TestRepo::init();
+        p_origin.commit(&[("p.txt", "p\n")], "init");
+        let p_root = lib_temp_dir();
+        git_out(&p_root, &["clone", "-q", &file_url(p_origin.path()), "p"]);
+        let parent = p_root.join("p");
+        std::fs::write(parent.join("dirty.txt"), "dirty\n").unwrap();
+        let repo = check_remote();
+        let lib_dir = parent.join("libraries");
+        let id = uuid::Uuid::new_v4();
+        let clone = lib_dir.join(id.to_string());
+        let env = GitEnv::for_tests();
+        assert_eq!(
+            library_clone(
+                &env,
+                &file_url(repo.path()),
+                "",
+                &clone,
+                &lib_dir,
+                lib_deadline()
+            ),
+            Ok(())
+        );
+        std::fs::write(clone.join(".git/HEAD"), "garbage").unwrap();
+        assert_eq!(check(&clone), LocalChanges::Unknown);
+        assert_eq!(std::fs::read(clone.join(".git/HEAD")).unwrap(), b"garbage");
+        lib_cleanup(&p_root);
+    }
+
+    #[test]
+    fn library_check_expired_deadline_is_unknown_without_git() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        let env = GitEnv::for_tests();
+        assert_eq!(
+            library_local_changes(&env, &clone, Instant::now()),
+            LocalChanges::Unknown
+        );
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 0);
+        lib_cleanup(&lib_dir);
+    }
+
+    fn index_state(clone: &Path) -> (Vec<u8>, std::time::SystemTime) {
+        let index = clone.join(".git/index");
+        (
+            std::fs::read(&index).unwrap(),
+            std::fs::metadata(&index).unwrap().modified().unwrap(),
+        )
+    }
+
+    #[test]
+    fn library_check_is_read_only_and_offline() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        local_commit(&clone, "local.txt");
+        std::fs::write(clone.join("a.txt"), "changed\n").unwrap();
+        std::fs::write(clone.join("notes.txt"), "mine\n").unwrap();
+        // Same bytes, new mtime: a plain `git status` would rewrite the index.
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(clone.join(LIB_FILE), FILE_V1).unwrap();
+        drop(repo); // `R` gone: the check must not need the remote.
+
+        let files = lib_snapshot(&clone);
+        let head = lib_head(&clone);
+        let refs = git_out(&clone, &["for-each-ref"]);
+        let index = index_state(&clone);
+        let env = GitEnv::for_tests();
+
+        assert_eq!(
+            library_local_changes(&env, &clone, lib_deadline()),
+            changes(2, 1)
+        );
+        assert_eq!(env.spawned.load(Ordering::SeqCst), 2, "status + rev-list");
+        assert_all_reaped(&env);
+        assert_eq!(lib_snapshot(&clone), files);
+        assert_eq!(lib_head(&clone), head);
+        assert_eq!(git_out(&clone, &["for-each-ref"]), refs);
+        assert_eq!(index_state(&clone), index, "the index was rewritten");
+        assert!(!clone.join(".git/index.lock").exists());
+        assert!(!clone.join(".git/FETCH_HEAD").exists());
+
+        // Without GIT_OPTIONAL_LOCKS=0 the same status does rewrite the index.
+        git_out(&clone, &["status", "--porcelain"]);
+        assert_ne!(index_state(&clone), index, "control: plain status");
+        lib_cleanup(&lib_dir);
+    }
+
+    #[test]
+    fn library_check_runs_no_askpass_program() {
+        let repo = check_remote();
+        let (lib_dir, _, clone) = lib_cloned(&repo);
+        std::fs::write(clone.join("notes.txt"), "mine\n").unwrap();
+        let dir = lib_temp_dir();
+        let marker = dir.join("M");
+        let script = askpass_script(&dir, &marker);
+        let mut env = GitEnv::for_tests();
+        for var in ["GIT_ASKPASS", "SSH_ASKPASS"] {
+            env.extra_env
+                .push((OsString::from(var), script.clone().into_os_string()));
+        }
+        env.extra_env.push((
+            OsString::from("SSH_ASKPASS_REQUIRE"),
+            OsString::from("force"),
+        ));
+        assert_eq!(
+            library_local_changes(&env, &clone, lib_deadline()),
+            changes(1, 0)
+        );
+        assert!(!marker.exists());
+        lib_cleanup(&lib_dir);
+        lib_cleanup(&dir);
     }
 }

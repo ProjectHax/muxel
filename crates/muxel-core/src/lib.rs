@@ -11,6 +11,7 @@ pub mod diff;
 pub mod geometry;
 mod gui_path;
 pub mod import;
+pub mod library;
 pub mod locale;
 pub mod memory;
 pub mod outage;
@@ -1809,6 +1810,34 @@ impl Runner {
         }
     }
 
+    /// The instance a run of this runner spawns with the already resolved
+    /// `preset`. `details` replaces every `{{input}}`, or is appended after a
+    /// blank line; trailing blank lines are trimmed so the submit Enter lands
+    /// on a clean line.
+    pub fn build_instance(
+        &self,
+        project_id: Uuid,
+        preset: &AgentPreset,
+        details: &str,
+    ) -> Instance {
+        let prompt = if self.prompt.contains("{{input}}") {
+            self.prompt.replace("{{input}}", details)
+        } else if details.is_empty() {
+            self.prompt.clone()
+        } else {
+            format!("{}\n\n{}", self.prompt, details)
+        };
+        let mut instance = Instance::from_preset(project_id, preset);
+        instance.system_prompt = Some(prompt.trim_end().to_string());
+        instance.injection = InjectionMode::TypeIn;
+        instance.auto_mode_presses = self.auto_mode_presses;
+        instance.custom_name = Some(self.name.clone());
+        // Marked as a runner so its first launch submits the prompt, but
+        // reopening the app re-types it without auto-submitting.
+        instance.is_runner = true;
+        instance
+    }
+
     /// Built-in example runners.
     pub fn defaults() -> Vec<Runner> {
         vec![
@@ -1971,6 +2000,21 @@ impl Loop {
             enabled: true,
             last_run: None,
         }
+    }
+
+    /// The instance one fire of this loop spawns with the already resolved
+    /// `preset` (never the toolbar's). `{{input}}` is removed. No tmux session,
+    /// so repeated fires do not orphan sessions.
+    pub fn build_instance(&self, preset: &AgentPreset) -> Instance {
+        let prompt = self.prompt.replace("{{input}}", "").trim_end().to_string();
+        let mut instance = Instance::from_preset(self.project_id, preset);
+        instance.system_prompt = Some(prompt);
+        instance.injection = InjectionMode::TypeIn;
+        instance.auto_mode_presses = self.auto_mode_presses;
+        instance.custom_name = Some(self.name.clone());
+        instance.is_runner = true;
+        instance.use_tmux = false;
+        instance
     }
 }
 
@@ -2247,6 +2291,16 @@ pub struct Settings {
     /// default: outside control reaches coding agents only.
     #[serde(default)]
     pub control_allow_shells: bool,
+    // --- Team libraries (`library`) ---
+    /// Configured team libraries, in the order they were added.
+    #[serde(default)]
+    pub libraries: Vec<library::LibraryConfig>,
+    /// Shared loops the user switched on, with the content they approved.
+    #[serde(default)]
+    pub shared_loops: Vec<library::SharedLoopState>,
+    /// Shared runners the user confirmed, with the content they confirmed.
+    #[serde(default)]
+    pub shared_runner_confirmations: Vec<library::SharedRunnerConfirmation>,
 }
 
 fn default_stt_model() -> String {
@@ -2535,6 +2589,9 @@ impl Default for Settings {
             read_aloud_max_chars: 0,
             control_enabled: false,
             control_allow_shells: false,
+            libraries: Vec::new(),
+            shared_loops: Vec::new(),
+            shared_runner_confirmations: Vec::new(),
         }
     }
 }
@@ -3740,5 +3797,109 @@ mod identity_tests {
         // No reference → host owns it.
         let plain = RemoteHost::new("db", "db.example.com");
         assert_eq!(plain.secret_owner(&[id]), plain.id);
+    }
+}
+
+#[cfg(test)]
+mod build_instance_tests {
+    use super::{AgentPreset, InjectionMode, Loop, LoopSchedule, PostRunAction, Runner};
+    use uuid::Uuid;
+
+    fn agent() -> AgentPreset {
+        let mut p = AgentPreset::shell();
+        p.id = Uuid::from_u128(0xA6);
+        p.name = "Claude".to_string();
+        p.program = Some("claude".to_string());
+        p.args = vec!["--verbose".to_string()];
+        p.system_prompt = Some("preset prompt".to_string());
+        p.injection = InjectionMode::CliFlag {
+            flag: "--append-system-prompt".to_string(),
+        };
+        p
+    }
+
+    fn runner(prompt: &str) -> Runner {
+        Runner {
+            id: Uuid::from_u128(0x11),
+            name: "Review".to_string(),
+            preset_id: None,
+            auto_mode_presses: 3,
+            prompt: prompt.to_string(),
+        }
+    }
+
+    #[test]
+    fn runner_build_instance_matches_run_runner_inner() {
+        let pid = Uuid::from_u128(0x50);
+        let inst = runner("P {{input}}").build_instance(pid, &agent(), "fix the bug");
+        assert_eq!(inst.project_id, pid);
+        assert_eq!(inst.system_prompt.as_deref(), Some("P fix the bug"));
+        assert_eq!(inst.injection, InjectionMode::TypeIn);
+        assert_eq!(inst.auto_mode_presses, 3);
+        assert_eq!(inst.custom_name.as_deref(), Some("Review"));
+        assert!(inst.is_runner);
+        assert!(inst.auto_submit);
+        // Everything else comes from the preset, as `Instance::from_preset`.
+        assert_eq!(inst.preset_id, Some(Uuid::from_u128(0xA6)));
+        assert_eq!(inst.preset, "Claude");
+        assert_eq!(inst.program.as_deref(), Some("claude"));
+        assert_eq!(inst.args, vec!["--verbose".to_string()]);
+        assert_ne!(inst.id, Uuid::from_u128(0x11));
+    }
+
+    #[test]
+    fn runner_build_instance_trims_trailing_blank_lines() {
+        let inst = runner("Review this.\n\n{{input}}").build_instance(Uuid::nil(), &agent(), "");
+        assert_eq!(inst.system_prompt.as_deref(), Some("Review this."));
+    }
+
+    #[test]
+    fn runner_build_instance_appends_details_without_placeholder() {
+        let with = runner("Do it").build_instance(Uuid::nil(), &agent(), "more");
+        assert_eq!(with.system_prompt.as_deref(), Some("Do it\n\nmore"));
+        let without = runner("Do it").build_instance(Uuid::nil(), &agent(), "");
+        assert_eq!(without.system_prompt.as_deref(), Some("Do it"));
+    }
+
+    #[test]
+    fn runner_build_instance_replaces_every_placeholder() {
+        let inst = runner("{{input}} and {{input}}").build_instance(Uuid::nil(), &agent(), "x");
+        assert_eq!(inst.system_prompt.as_deref(), Some("x and x"));
+    }
+
+    fn lp(prompt: &str) -> Loop {
+        Loop {
+            id: Uuid::from_u128(0x22),
+            name: "Nightly".to_string(),
+            preset_id: None,
+            project_id: Uuid::from_u128(0x51),
+            auto_mode_presses: 2,
+            prompt: prompt.to_string(),
+            schedule: LoopSchedule::EveryMinutes { minutes: 5 },
+            post_run: PostRunAction::Exit,
+            enabled: true,
+            last_run: Some(10),
+        }
+    }
+
+    #[test]
+    fn loop_build_instance_matches_spawn_loop_agent() {
+        let inst = lp("check {{input}}\n").build_instance(&agent());
+        assert_eq!(inst.project_id, Uuid::from_u128(0x51));
+        assert_eq!(inst.system_prompt.as_deref(), Some("check"));
+        assert_eq!(inst.injection, InjectionMode::TypeIn);
+        assert_eq!(inst.auto_mode_presses, 2);
+        assert_eq!(inst.custom_name.as_deref(), Some("Nightly"));
+        assert!(inst.is_runner);
+        assert!(!inst.use_tmux);
+        assert_eq!(inst.preset_id, Some(Uuid::from_u128(0xA6)));
+        assert_eq!(inst.program.as_deref(), Some("claude"));
+        assert_ne!(inst.id, Uuid::from_u128(0x22));
+    }
+
+    #[test]
+    fn loop_build_instance_keeps_prompt_without_placeholder() {
+        let inst = lp("  run the checks").build_instance(&agent());
+        assert_eq!(inst.system_prompt.as_deref(), Some("  run the checks"));
     }
 }

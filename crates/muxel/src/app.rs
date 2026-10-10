@@ -23,6 +23,9 @@ use gpui_component::tag::Tag;
 use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
 use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
+use muxel_core::library::menu::menu_list_max_height;
+use muxel_core::library::resolve::{SnippetStep, snippet_send_action};
+use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::winshell::WindowsShell;
@@ -49,6 +52,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod control_api;
+mod libraries_ui;
 mod tmux_install_modal;
 
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
@@ -2112,6 +2116,18 @@ struct DragProject {
     from: usize,
 }
 
+/// The runner whose "Run task" details dialog is open.
+#[derive(Clone, Debug, PartialEq)]
+enum ActiveRunner {
+    /// A private runner: its index into `runners`.
+    Local(usize),
+    /// A library runner: Run looks it up again by identity, never by position.
+    Library {
+        key: muxel_core::library::LibItemKey,
+        shown: muxel_core::library::RunnerContent,
+    },
+}
+
 /// Runtime state for one in-flight Loop run (its spawned pane).
 struct LoopRun {
     loop_id: Uuid,
@@ -2737,6 +2753,12 @@ pub struct MuxelApp {
     /// The offer to install a missing tmux, and its install — made on the first
     /// launch without it, or from Settings (`app/tmux_install_modal.rs`).
     tmux_install: Option<tmux_install_modal::TmuxInstall>,
+    /// Team library state, kept out of `settings` so Cancel in Settings never
+    /// restores it; written back on every save.
+    library_hub: muxel_core::library::hub::LibraryHub,
+    /// The open library dialog (an overlay listed in `any_overlay_open`).
+    library_dialog: Option<libraries_ui::LibraryDialog>,
+    git_env: Arc<integrations::GitEnv>,
     /// Tick counter throttling remote branch-label polling (every 5th tick).
     remote_poll_count: u32,
     /// A background Grok PID→session-id refresh is already in flight.
@@ -3088,8 +3110,12 @@ pub struct MuxelApp {
     loops_menu: Option<Point<Pixels>>,
     /// Anchor point for the toolbar "Snippets" popup, when open.
     snippets_menu: Option<Point<Pixels>>,
-    /// The runner whose run-dialog is open (index into `runners`).
-    active_runner: Option<usize>,
+    /// Scroll state of the toolbar drop-down lists; reset when a popup opens.
+    runners_menu_scroll: ScrollHandle,
+    loops_menu_scroll: ScrollHandle,
+    snippets_menu_scroll: ScrollHandle,
+    /// The runner whose run-dialog is open.
+    active_runner: Option<ActiveRunner>,
     /// Whether the run-dialog (collect details) is shown.
     show_run_dialog: bool,
     /// Detail-text editor for the run-dialog (main window).
@@ -3611,6 +3637,9 @@ enum ConfirmAction {
         file: Option<String>,
         retry: SshRetry,
     },
+    /// Re-sync a team library from its repository, discarding local changes
+    /// of its clone.
+    ResyncLibrary(Uuid),
 }
 
 impl ConfirmAction {
@@ -4558,6 +4587,7 @@ impl MuxelApp {
                 if view
                     .update_in(cx, |this, window, cx| {
                         this.tick(window, cx);
+                        this.tick_libraries(cx);
                         this.handle_notification_click(window, cx);
                         this.pump_tray(window, cx);
                         this.sync_control(cx);
@@ -4734,7 +4764,8 @@ impl MuxelApp {
         })
         .detach();
 
-        let mut settings = muxel_store::load_settings();
+        let (mut settings, library_config_ok) =
+            libraries_ui::startup_settings(muxel_store::try_load_settings());
         // Merge in any new built-in presets (e.g. Hermes/Ollama) once. A failed
         // save is reported after construction, once the feed exists.
         let seed_save_error = if settings.seed_builtin_presets() {
@@ -4742,6 +4773,8 @@ impl MuxelApp {
         } else {
             None
         };
+        // Only after the seed save above, which must still include it.
+        let library_hub = muxel_core::library::hub::LibraryHub::take_from(&mut settings);
         let presets = if settings.presets.is_empty() {
             AgentPreset::defaults()
         } else {
@@ -4997,6 +5030,9 @@ impl MuxelApp {
             sshpass_available: program_on_path("sshpass"),
             tmux_available,
             tmux_install,
+            library_hub,
+            library_dialog: None,
+            git_env: Arc::new(integrations::GitEnv::production()),
             remote_connect_failed: HashMap::new(),
             remote_poll_count: 0,
             #[cfg(windows)]
@@ -5108,6 +5144,9 @@ impl MuxelApp {
             runners_menu: None,
             loops_menu: None,
             snippets_menu: None,
+            runners_menu_scroll: ScrollHandle::new(),
+            loops_menu_scroll: ScrollHandle::new(),
+            snippets_menu_scroll: ScrollHandle::new(),
             active_runner: None,
             show_run_dialog: false,
             runner_input,
@@ -5233,6 +5272,8 @@ impl MuxelApp {
         if let Some(e) = seed_save_error {
             this.report_save_error(SaveTarget::Settings, format!("{e:#}"));
         }
+
+        this.start_library_startup(library_config_ok, cx);
 
         // No workspace is loaded yet — the workspace selector (shown at launch)
         // calls `enter_workspace`, which loads the chosen workspace.
@@ -8368,7 +8409,39 @@ impl MuxelApp {
     /// Persist the current toolbar preferences to the TOML config. A failure
     /// lands in the NOTIFICATIONS feed (deduped).
     fn persist_settings(&mut self) {
-        let settings = muxel_core::Settings {
+        match self.persist_settings_checked() {
+            Ok(()) => self.clear_save_error(SaveTarget::Settings),
+            Err(e) => {
+                log::warn!("failed to save settings: {e}");
+                self.report_save_error(SaveTarget::Settings, format!("{e:#}"));
+            }
+        }
+    }
+
+    /// Save after a library event the user did not trigger: only the library
+    /// fields are merged into `config.toml` on disk. A success does not clear an
+    /// earlier settings save error, since this process's other changes are unsaved.
+    fn persist_library_state(&mut self) {
+        let saved = muxel_store::settings_path()
+            .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))
+            .and_then(|path| {
+                libraries_ui::save_library_state_to(&path, self.settings_base(), &self.library_hub)
+            });
+        if let Err(e) = saved {
+            log::warn!("failed to save settings: {e}");
+            self.report_save_error(SaveTarget::Settings, format!("{e:#}"));
+        }
+    }
+
+    /// Save the settings including the team library state.
+    fn persist_settings_checked(&mut self) -> anyhow::Result<()> {
+        let settings = libraries_ui::settings_for_save(self.settings_base(), &self.library_hub);
+        muxel_store::save_settings(&settings)
+    }
+
+    /// The settings to save, without the team library state.
+    fn settings_base(&self) -> muxel_core::Settings {
+        muxel_core::Settings {
             default_use_tmux: self.use_tmux,
             default_use_worktree: self.use_worktree,
             notifications_enabled: self.notifications_enabled,
@@ -8381,13 +8454,6 @@ impl MuxelApp {
             theme: self.theme.clone(),
             theme_mode: self.theme_mode.clone(),
             ..self.settings.clone()
-        };
-        match muxel_store::save_settings(&settings) {
-            Ok(()) => self.clear_save_error(SaveTarget::Settings),
-            Err(e) => {
-                log::warn!("failed to save settings: {e}");
-                self.report_save_error(SaveTarget::Settings, format!("{e:#}"));
-            }
         }
     }
 
@@ -10005,6 +10071,19 @@ impl MuxelApp {
         for i in due {
             self.fire_loop(i, now_epoch, window, cx);
         }
+        // Snapshot the keys first: each fire needs `&mut self`.
+        for key in libraries_ui::shared_loop_keys(&self.library_hub) {
+            self.fire_shared_loop(
+                &key,
+                now_epoch,
+                muxel_core::library::state::FireMode::Scheduled {
+                    now: now_epoch,
+                    now_tod,
+                },
+                window,
+                cx,
+            );
+        }
     }
 
     /// Watch in-flight loop runs: close a finished `Exit` agent (idle after working,
@@ -10126,15 +10205,8 @@ impl MuxelApp {
     ) -> Option<Uuid> {
         let pid = lp.project_id;
         self.workspace.project(pid)?; // must still exist
-        let prompt = lp.prompt.replace("{{input}}", "").trim_end().to_string();
-        let mut instance = Instance::from_preset(pid, preset);
-        instance.system_prompt = Some(prompt);
-        instance.injection = InjectionMode::TypeIn;
-        instance.auto_mode_presses = lp.auto_mode_presses;
-        instance.custom_name = Some(lp.name.clone());
-        instance.is_runner = true;
         // Background pane: no tmux session (repeated fires would orphan sessions).
-        instance.use_tmux = false;
+        let instance = lp.build_instance(preset);
         let iid = instance.id;
         // Append as its own pane after the last leaf (an empty project seeds the
         // root). Closing it later (Exit policy) normalizes the layout back.
@@ -11199,6 +11271,7 @@ impl MuxelApp {
             || self.runners_menu.is_some()
             || self.loops_menu.is_some()
             || self.snippets_menu.is_some()
+            || self.library_dialog.is_some()
             || self.term_search.is_some()
             || !self.pending_worktree_dispose.is_empty()
             || cx.has_active_drag()
@@ -12090,25 +12163,34 @@ impl MuxelApp {
 
     /// Open the run-dialog for a runner (collect details before launching).
     fn open_run_dialog(&mut self, idx: usize, cx: &mut Context<Self>) {
-        self.runners_menu = None;
         if idx < self.runners.len() {
-            self.active_runner = Some(idx);
-            self.show_run_dialog = true;
-            cx.notify();
+            self.show_details_dialog(ActiveRunner::Local(idx), cx);
+        } else {
+            self.runners_menu = None;
         }
+    }
+
+    /// Show the "Run task" details dialog for `runner`.
+    fn show_details_dialog(&mut self, runner: ActiveRunner, cx: &mut Context<Self>) {
+        self.runners_menu = None;
+        self.active_runner = Some(runner);
+        self.show_run_dialog = true;
+        cx.notify();
     }
 
     /// Run-dialog "Run": read the typed details and launch the active runner.
     fn execute_runner(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(idx) = self.active_runner else {
+        let Some(active) = self.active_runner.take() else {
             return;
         };
         let details = self.runner_input.read(cx).value().trim().to_string();
-        self.run_runner(idx, details, window, cx);
         self.runner_input
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.show_run_dialog = false;
-        self.active_runner = None;
+        match active {
+            ActiveRunner::Local(idx) => self.run_runner(idx, details, window, cx),
+            ActiveRunner::Library { key, .. } => self.run_library_runner(&key, details, window, cx),
+        }
         cx.notify();
     }
 
@@ -12122,11 +12204,26 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(runner) = self.runners.get(idx).cloned() else {
+            return;
+        };
+        self.launch_runner(runner, details, window, cx);
+    }
+
+    /// Launch `runner` (private, or a transient one built from a library
+    /// runner's content) in the active project, beside the active pane.
+    fn launch_runner(
+        &mut self,
+        runner: Runner,
+        details: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(pid) = self.workspace.active_project else {
             return;
         };
         let target = self.active_instance;
-        self.run_runner_inner(idx, details, pid, target, None, window, cx);
+        self.run_runner_inner(runner, details, pid, target, None, window, cx);
     }
 
     /// Run a runner (e.g. Review) INSIDE worktree `wid`, so the agent's cwd is the
@@ -12138,6 +12235,9 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(runner) = self.runners.get(idx).cloned() else {
+            return;
+        };
         let Some(pid) = self.workspace.worktree(wid).map(|w| w.project_id) else {
             return;
         };
@@ -12149,7 +12249,7 @@ impl MuxelApp {
             .next()
             .or(self.active_instance);
         self.run_runner_inner(
-            idx,
+            runner,
             String::new(),
             pid,
             target,
@@ -12162,7 +12262,7 @@ impl MuxelApp {
     #[allow(clippy::too_many_arguments)]
     fn run_runner_inner(
         &mut self,
-        idx: usize,
+        runner: Runner,
         details: String,
         pid: Uuid,
         target: Option<Uuid>,
@@ -12170,9 +12270,6 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(runner) = self.runners.get(idx).cloned() else {
-            return;
-        };
         // "Current" is a real choice for a task you start by hand. A preset that
         // has since been deleted is not: say so rather than run another agent.
         let preset = match saved_agent(runner.preset_id, &self.presets) {
@@ -12192,24 +12289,7 @@ impl MuxelApp {
                 return;
             }
         };
-        let prompt = if runner.prompt.contains("{{input}}") {
-            runner.prompt.replace("{{input}}", &details)
-        } else if details.is_empty() {
-            runner.prompt.clone()
-        } else {
-            format!("{}\n\n{}", runner.prompt, details)
-        };
-        // Trim trailing blank lines (e.g. from "…{{input}}" with no details) so
-        // the submit Enter lands on a clean line.
-        let prompt = prompt.trim_end().to_string();
-        let mut instance = Instance::from_preset(pid, &preset);
-        instance.system_prompt = Some(prompt);
-        instance.injection = InjectionMode::TypeIn;
-        instance.auto_mode_presses = runner.auto_mode_presses;
-        instance.custom_name = Some(runner.name.clone());
-        // Mark as a runner so its first launch submits the prompt, but reopening
-        // the app re-types it without auto-submitting (see spawn_terminal).
-        instance.is_runner = true;
+        let instance = runner.build_instance(pid, &preset, &details);
         self.place_and_spawn(
             pid,
             instance,
@@ -15511,6 +15591,7 @@ impl MuxelApp {
             ConfirmAction::TrustHostKey { entry, file, retry } => {
                 self.trust_host_key(entry, file, retry, window, cx)
             }
+            ConfirmAction::ResyncLibrary(id) => self.confirm_library_resync(id, cx),
         }
         cx.notify();
     }
@@ -16172,6 +16253,18 @@ impl MuxelApp {
         let Some(snip) = self.snippets.get(idx).cloned() else {
             return;
         };
+        let steps = snippet_send_action(&snip.text, snip.submit);
+        self.send_snippet_steps(iid, &steps, window, cx);
+    }
+
+    /// Apply a snippet's send action to pane `iid`, then focus it.
+    fn send_snippet_steps(
+        &mut self,
+        iid: Uuid,
+        steps: &[SnippetStep],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Only live terminal panes are in `terminals`; editors/missing → no-op.
         let Some(session) = self
             .terminals
@@ -16180,9 +16273,11 @@ impl MuxelApp {
         else {
             return;
         };
-        session.paste(&snip.text);
-        if snip.submit {
-            session.write_input(b"\r");
+        for step in steps {
+            match step {
+                SnippetStep::Paste(text) => session.paste(text),
+                SnippetStep::Write(bytes) => session.write_input(bytes),
+            }
         }
         self.focus_instance(iid, window, cx);
     }
@@ -21486,6 +21581,7 @@ impl MuxelApp {
                         MouseButton::Left,
                         cx.listener(|this, e: &MouseDownEvent, _w, cx| {
                             this.runners_menu = Some(e.position);
+                            this.runners_menu_scroll.set_offset(Point::default());
                             cx.notify();
                         }),
                     ),
@@ -21501,6 +21597,7 @@ impl MuxelApp {
                         MouseButton::Left,
                         cx.listener(|this, e: &MouseDownEvent, _w, cx| {
                             this.loops_menu = Some(e.position);
+                            this.loops_menu_scroll.set_offset(Point::default());
                             cx.notify();
                         }),
                     ),
@@ -21516,6 +21613,7 @@ impl MuxelApp {
                         MouseButton::Left,
                         cx.listener(|this, e: &MouseDownEvent, _w, cx| {
                             this.snippets_menu = Some(e.position);
+                            this.snippets_menu_scroll.set_offset(Point::default());
                             cx.notify();
                         }),
                     ),
@@ -24464,6 +24562,67 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    /// The floating box of a toolbar drop-down: a fixed title row, the
+    /// scrollable `list` and an optional fixed `footer`.
+    ///
+    /// `anchored` only applies its margin when the box overflows, so a
+    /// transparent `MENU_WINDOW_MARGIN` bottom padding (with a 0 bottom snap
+    /// margin) keeps the visible box that far from the bottom edge.
+    #[allow(clippy::too_many_arguments)]
+    fn toolbar_menu_popup(
+        &self,
+        pos: Point<Pixels>,
+        width: f32,
+        title: AnyElement,
+        list: Stateful<Div>,
+        footer: Option<AnyElement>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (box_max, list_max) =
+            toolbar_menu_max_heights(f32::from(window.viewport_size().height));
+        let margin = px(MENU_WINDOW_MARGIN);
+        deferred(
+            anchored()
+                .position(pos)
+                .snap_to_window_with_margin(gpui::Edges {
+                    top: margin,
+                    right: margin,
+                    bottom: px(0.0),
+                    left: margin,
+                })
+                .child(
+                    div().pb(margin).child(
+                        div()
+                            .occlude()
+                            .w(px(width))
+                            .max_h(px(box_max))
+                            .flex()
+                            .flex_col()
+                            .gap_px()
+                            .p_1()
+                            .bg(cx.theme().popover)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(cx.theme().radius)
+                            .shadow_lg()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(title),
+                            )
+                            .child(list.overflow_y_scroll().min_h_0().max_h(px(list_max)))
+                            .children(footer),
+                    ),
+                ),
+        )
+        .with_priority(1)
+    }
+
     /// Anchored dropdown for the toolbar "Run task" button: pick a runner.
     /// A small pencil "edit" button for the Run-task / Loops dropdown rows. The
     /// caller attaches the `.on_click`.
@@ -24485,12 +24644,17 @@ impl MuxelApp {
             )
     }
 
-    fn render_runners_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_runners_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(pos) = self.runners_menu else {
             return div().into_any_element();
         };
+        let lib_rows =
+            libraries_ui::library_menu_rows(&self.library_hub, LibKind::Runner, &self.presets);
         let mut list = v_flex().gap_px().w_full();
-        if self.runners.is_empty() {
+        if libraries_ui::show_empty_message(
+            self.runners.len(),
+            libraries_ui::library_item_count(&lib_rows),
+        ) {
             list = list.child(
                 div()
                     .px_2()
@@ -24542,6 +24706,7 @@ impl MuxelApp {
                     ),
             );
         }
+        let list = self.push_library_menu_rows(list, lib_rows, false, cx);
         div()
             .absolute()
             .inset_0()
@@ -24553,42 +24718,23 @@ impl MuxelApp {
                 }),
             )
             .child(
-                deferred(
-                    anchored()
-                        .position(pos)
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            div()
-                                .occlude()
-                                .w(px(240.0))
-                                .flex()
-                                .flex_col()
-                                .gap_px()
-                                .p_1()
-                                .bg(cx.theme().popover)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .rounded(cx.theme().radius)
-                                .shadow_lg()
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(t("Run task")),
-                                )
-                                .child(list),
-                        ),
-                )
-                .with_priority(1),
+                self.toolbar_menu_popup(
+                    pos,
+                    240.0,
+                    t("Run task").into_any_element(),
+                    list.id("runners-menu-list")
+                        .track_scroll(&self.runners_menu_scroll),
+                    None,
+                    window,
+                    cx,
+                ),
             )
             .into_any_element()
     }
 
     /// The toolbar "Snippets" popup: pick a saved snippet to type into the active
     /// pane. Rows are inert (and a hint shows) when no terminal pane is focused.
-    fn render_snippets_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_snippets_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(pos) = self.snippets_menu else {
             return div().into_any_element();
         };
@@ -24600,8 +24746,11 @@ impl MuxelApp {
             .and_then(|iid| self.workspace.instance(iid))
             .map(|i| i.display_name().to_string())
             .unwrap_or_default();
+        let lib_rows =
+            libraries_ui::library_menu_rows(&self.library_hub, LibKind::Snippet, &self.presets);
+        let lib_count = libraries_ui::library_item_count(&lib_rows);
         let mut list = v_flex().gap_px().w_full();
-        if self.snippets.is_empty() {
+        if libraries_ui::show_empty_message(self.snippets.len(), lib_count) {
             list = list.child(
                 div()
                     .px_2()
@@ -24610,7 +24759,7 @@ impl MuxelApp {
                     .text_color(cx.theme().muted_foreground)
                     .child(t("No snippets — add one in Settings → Snippets.")),
             );
-        } else if !has_target {
+        } else if libraries_ui::show_focus_hint(self.snippets.len(), lib_count, has_target) {
             list = list.child(
                 div()
                     .px_2()
@@ -24666,6 +24815,7 @@ impl MuxelApp {
                 ),
             );
         }
+        let list = self.push_library_menu_rows(list, lib_rows, has_target, cx);
         let header = if has_target {
             tf("Send to {name}", &[("name", &target_label)])
         } else {
@@ -24682,35 +24832,16 @@ impl MuxelApp {
                 }),
             )
             .child(
-                deferred(
-                    anchored()
-                        .position(pos)
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            div()
-                                .occlude()
-                                .w(px(260.0))
-                                .flex()
-                                .flex_col()
-                                .gap_px()
-                                .p_1()
-                                .bg(cx.theme().popover)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .rounded(cx.theme().radius)
-                                .shadow_lg()
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(header),
-                                )
-                                .child(list),
-                        ),
-                )
-                .with_priority(1),
+                self.toolbar_menu_popup(
+                    pos,
+                    260.0,
+                    header.into_any_element(),
+                    list.id("snippets-menu-list")
+                        .track_scroll(&self.snippets_menu_scroll),
+                    None,
+                    window,
+                    cx,
+                ),
             )
             .into_any_element()
     }
@@ -24725,12 +24856,17 @@ impl MuxelApp {
         self.open_snippet_editor(idx, window, cx);
     }
 
-    fn render_loops_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_loops_menu(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(pos) = self.loops_menu else {
             return div().into_any_element();
         };
+        let lib_rows =
+            libraries_ui::library_menu_rows(&self.library_hub, LibKind::Loop, &self.presets);
         let mut list = v_flex().gap_px().w_full();
-        if self.loops.is_empty() {
+        if libraries_ui::show_empty_message(
+            self.loops.len(),
+            libraries_ui::library_item_count(&lib_rows),
+        ) {
             list = list.child(
                 div()
                     .px_2()
@@ -24793,28 +24929,31 @@ impl MuxelApp {
                     ),
             );
         }
-        // Footer: create a new loop (opens its editor in settings).
-        list = list.child(
-            div()
-                .id("loop-new")
-                .flex()
-                .items_center()
-                .gap_2()
-                .w_full()
-                .px_2()
-                .py_1()
-                .mt_px()
-                .rounded(cx.theme().radius)
-                .cursor_pointer()
-                .text_color(cx.theme().muted_foreground)
-                .hover(|s| s.bg(cx.theme().accent))
-                .on_click(cx.listener(|this, _e, window, cx| {
-                    this.loops_menu = None;
-                    this.add_loop(window, cx);
-                }))
-                .child(Icon::new(IconName::Plus).size(px(14.0)))
-                .child(div().text_sm().child(t("New loop…"))),
-        );
+        let menu_width = libraries_ui::loops_menu_width(&lib_rows);
+        list = self.push_library_menu_rows(list, lib_rows, false, cx);
+        // Footer: create a new loop (opens its editor in settings). Outside the
+        // scrollable list so it stays visible.
+        let footer = div()
+            .id("loop-new")
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_2()
+            .py_1()
+            .mt_px()
+            .rounded(cx.theme().radius)
+            .cursor_pointer()
+            .text_color(cx.theme().muted_foreground)
+            .hover(|s| s.bg(cx.theme().accent))
+            .on_click(cx.listener(|this, _e, window, cx| {
+                this.loops_menu = None;
+                this.add_loop(window, cx);
+            }))
+            .child(Icon::new(IconName::Plus).size(px(14.0)))
+            .child(div().text_sm().child(t("New loop…")))
+            .into_any_element();
         div()
             .absolute()
             .inset_0()
@@ -24826,46 +24965,34 @@ impl MuxelApp {
                 }),
             )
             .child(
-                deferred(
-                    anchored()
-                        .position(pos)
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            div()
-                                .occlude()
-                                .w(px(260.0))
-                                .flex()
-                                .flex_col()
-                                .gap_px()
-                                .p_1()
-                                .bg(cx.theme().popover)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .rounded(cx.theme().radius)
-                                .shadow_lg()
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(t("Loops — click to run now, pencil to edit")),
-                                )
-                                .child(list),
-                        ),
-                )
-                .with_priority(1),
+                self.toolbar_menu_popup(
+                    pos,
+                    menu_width,
+                    t("Loops — click to run now, pencil to edit").into_any_element(),
+                    list.id("loops-menu-list")
+                        .track_scroll(&self.loops_menu_scroll),
+                    Some(footer),
+                    window,
+                    cx,
+                ),
             )
             .into_any_element()
     }
 
     /// Run-dialog: show the runner's prompt + collect extra details, then run.
     fn render_run_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(runner) = self.active_runner.and_then(|i| self.runners.get(i)) else {
-            return div().into_any_element();
+        let (name, prompt) = match self.active_runner.as_ref() {
+            Some(ActiveRunner::Local(i)) => match self.runners.get(*i) {
+                Some(r) => (r.name.as_str(), r.prompt.as_str()),
+                None => return div().into_any_element(),
+            },
+            Some(ActiveRunner::Library { key, shown }) => {
+                (key.name.as_str(), shown.prompt.as_str())
+            }
+            None => return div().into_any_element(),
         };
-        let title = tf("Run: {name}", &[("name", &runner.name)]);
-        let preview = runner.prompt.replace("{{input}}", "…").trim().to_string();
+        let title = tf("Run: {name}", &[("name", name)]);
+        let preview = prompt.replace("{{input}}", "…").trim().to_string();
         modal_backdrop()
             .on_mouse_down(
                 MouseButton::Left,
@@ -26261,23 +26388,30 @@ impl MuxelApp {
             (t("Runners"), SettingsSection::Runners),
             (t("Snippets"), SettingsSection::Snippets),
             (t("Loops"), SettingsSection::Loops),
+            (t("Libraries"), SettingsSection::Libraries),
             (t("Remotes"), SettingsSection::Remotes),
             (t("Identities"), SettingsSection::Identities),
             (t("Projects"), SettingsSection::Projects),
             (t("Keybindings"), SettingsSection::Keybindings),
         ];
-        let mut nav = v_flex()
-            .w(rems(10.0))
-            .flex_none()
-            .p_2()
-            .gap_1()
-            .bg(cx.theme().sidebar);
+        let mut nav_items = v_flex().p_2().gap_1();
         for (label, section) in sections {
-            nav = nav.child(
+            nav_items = nav_items.child(
                 nav_item(label, section)
                     .on_click(cx.listener(move |this, _e, _w, cx| this.set_section(section, cx))),
             );
         }
+        // The section list scrolls on its own so its last entries never paint
+        // over Cancel/Save when the modal is short.
+        let nav = div()
+            .id("settings-nav")
+            .w(rems(10.0))
+            .flex_none()
+            .h_full()
+            .min_h_0()
+            .overflow_y_scroll()
+            .bg(cx.theme().sidebar)
+            .child(nav_items);
 
         let content_w = self.settings_content_w(window);
         let content = match current {
@@ -26291,6 +26425,7 @@ impl MuxelApp {
             SettingsSection::Runners => self.render_settings_runners(cx),
             SettingsSection::Snippets => self.render_settings_snippets(cx),
             SettingsSection::Loops => self.render_settings_loops(cx),
+            SettingsSection::Libraries => self.render_settings_libraries(cx),
             SettingsSection::Remotes => self.render_settings_remotes(cx),
             SettingsSection::Identities => self.render_settings_identities(cx),
             SettingsSection::Projects => self.render_settings_projects(cx),
@@ -28671,19 +28806,24 @@ impl Render for MuxelApp {
             .children(
                 self.runners_menu
                     .is_some()
-                    .then(|| self.render_runners_menu(cx)),
+                    .then(|| self.render_runners_menu(window, cx)),
             )
             .children(
                 self.loops_menu
                     .is_some()
-                    .then(|| self.render_loops_menu(cx)),
+                    .then(|| self.render_loops_menu(window, cx)),
             )
             .children(
                 self.snippets_menu
                     .is_some()
-                    .then(|| self.render_snippets_menu(cx)),
+                    .then(|| self.render_snippets_menu(window, cx)),
             )
             .children(self.show_run_dialog.then(|| self.render_run_dialog(cx)))
+            .children(
+                self.library_dialog
+                    .is_some()
+                    .then(|| self.render_library_dialog(cx)),
+            )
             // A pane-scoped confirm belongs to the window showing that pane; when
             // that's a project window on another monitor, it draws there instead.
             .children(
@@ -28728,6 +28868,27 @@ impl Render for MuxelApp {
             // No toast layer: all notifications go to the sidebar feed instead.
             .into_any_element();
         ui_profile::finish_render(ui_profile::RenderView::Main, _render, root)
+    }
+}
+
+/// Height caps `(visible box, list area)` of a toolbar drop-down. The list gets
+/// `menu_list_max_height` with no fixed part; flex layout subtracts the real one.
+fn toolbar_menu_max_heights(viewport_h: f32) -> (f32, f32) {
+    let box_max = (viewport_h - 2.0 * MENU_WINDOW_MARGIN).max(0.0);
+    (box_max, menu_list_max_height(viewport_h, 0.0))
+}
+
+#[cfg(test)]
+mod toolbar_menu_tests {
+    use super::toolbar_menu_max_heights;
+
+    #[test]
+    fn toolbar_menu_heights_keep_window_margins() {
+        assert_eq!(toolbar_menu_max_heights(1000.0), (984.0, 600.0));
+        assert_eq!(toolbar_menu_max_heights(700.0), (684.0, 420.0));
+        assert_eq!(toolbar_menu_max_heights(400.0), (384.0, 240.0));
+        assert_eq!(toolbar_menu_max_heights(30.0), (14.0, 14.0));
+        assert_eq!(toolbar_menu_max_heights(10.0), (0.0, 0.0));
     }
 }
 
