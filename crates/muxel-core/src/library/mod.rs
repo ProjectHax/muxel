@@ -192,9 +192,15 @@ pub enum LibWarning {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileError {
     Missing,
+    /// There, but not a regular file — a symlink, say, which a repo could point
+    /// anywhere on this machine.
+    NotAFile,
     NotUtf8,
     Unreadable(String),
-    Syntax { line: Option<usize>, detail: String },
+    Syntax {
+        line: Option<usize>,
+        detail: String,
+    },
 }
 
 /// Why a git operation on a library failed.

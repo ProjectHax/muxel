@@ -870,6 +870,7 @@
   "{file} is not valid TOML (line {line}): {detail}": "{file} is not valid TOML (line {line}): {detail}",
   "{file} is not valid TOML: {detail}": "{file} is not valid TOML: {detail}",
   "{file} is not valid UTF-8 text.": "{file} is not valid UTF-8 text.",
+  "{file} must be a regular file in the repository, not a link or a folder.": "{file} must be a regular file in the repository, not a link or a folder.",
   "{file} was not found in the library repository.": "{file} was not found in the library repository.",
   "{host}: connection lost — reconnecting {n} panes…": "{host}: connection lost — reconnecting {n} panes…",
   "{host}: connection lost — reconnecting {n} pane…": "{host}: connection lost — reconnecting {n} pane…",

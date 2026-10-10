@@ -117,7 +117,17 @@ pub fn run_check_with_limit(
 
 /// Read and parse `<clone>/muxel-library.toml`.
 pub fn read_library_file(clone_dir: &Path) -> Result<ParsedLibrary, FileError> {
-    let bytes = match std::fs::read(clone_dir.join(LIBRARY_FILE)) {
+    let path = clone_dir.join(LIBRARY_FILE);
+    // Only a regular file in the clone. A repository can commit the file as a
+    // symlink to anything on this machine — an SSH key, say — and a syntax error
+    // would then quote the start of it in Settings.
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Err(FileError::NotAFile),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(FileError::Missing),
+        Err(e) => return Err(FileError::Unreadable(e.to_string())),
+    }
+    let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(FileError::Missing),
         Err(e) => return Err(FileError::Unreadable(e.to_string())),
@@ -279,6 +289,10 @@ pub fn file_error_text(err: &FileError) -> String {
     match err {
         FileError::Missing => tf(
             "{file} was not found in the library repository.",
+            &[("file", LIBRARY_FILE)],
+        ),
+        FileError::NotAFile => tf(
+            "{file} must be a regular file in the repository, not a link or a folder.",
             &[("file", LIBRARY_FILE)],
         ),
         FileError::NotUtf8 => tf("{file} is not valid UTF-8 text.", &[("file", LIBRARY_FILE)]),
@@ -1638,6 +1652,27 @@ mod tests {
         assert_eq!(parsed.snippets.len(), 1);
     }
 
+    /// The bug this guards: a repository committing `muxel-library.toml` as a
+    /// symlink made muxel read whatever it pointed at on this machine, and a
+    /// syntax error quoted it in Settings.
+    #[cfg(unix)]
+    #[test]
+    fn read_library_file_refuses_a_symlink_even_to_a_valid_library() {
+        let outside = TmpDir::new();
+        std::fs::create_dir_all(outside.path()).unwrap();
+        let target = outside.path().join("elsewhere.toml");
+        std::fs::write(&target, FILE_A).unwrap();
+        let dir = TmpDir::new();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(LIB_FILE)).unwrap();
+        assert_eq!(read_library_file(dir.path()), Err(FileError::NotAFile));
+        // A folder by that name is refused the same way.
+        std::fs::remove_file(dir.path().join(LIB_FILE)).unwrap();
+        std::fs::create_dir(dir.path().join(LIB_FILE)).unwrap();
+        assert_eq!(read_library_file(dir.path()), Err(FileError::NotAFile));
+        assert!(file_error_text(&FileError::NotAFile).contains("muxel-library.toml"));
+    }
+
     #[test]
     fn run_job_with_limits_times_out_a_pull_that_never_ends() {
         let repo = remote(FILE_A);
@@ -1814,6 +1849,7 @@ mod tests {
     fn file_error_texts_name_the_file() {
         for err in [
             FileError::Missing,
+            FileError::NotAFile,
             FileError::NotUtf8,
             FileError::Unreadable("busy".to_string()),
             FileError::Syntax {
