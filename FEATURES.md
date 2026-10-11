@@ -885,14 +885,14 @@ feature is added or changed, update the matching entry here in the same change**
   lid-down on an external display reconnects as usual. Works on macOS, Windows, and
   Linux with systemd-logind or elogind. (Tune or disable the probe per host in
   Settings → Remotes → Keepalive; blank uses a 20s default, `0` turns it off.)
-- **Reconnecting never resizes someone else's session** — a remote tmux pane attaches
-  as a client that stays out of the window size while another client is attached
+- **Reconnecting never resizes someone else's session** — a remote tmux pane joining
+  a session another client is already attached to stays out of the window size
   (tmux 3.2+'s `ignore-size`), so a laptop reconnecting on a desk, asleep or
   unattended can't resize a session you're using from another computer. Once you
   type, paste, click or scroll in a terminal on that machine, its panes take part in
   the size again, and the window follows whoever used it last, as tmux always does.
-  A pane alone in its session sizes it as before; with tmux older than 3.2 on the
-  host, panes attach the old way.
+  A pane alone in its session attaches normally and always follows its own size;
+  with tmux older than 3.2 on the host, panes attach the old way.
 - **Reattaches everything on launch** — on startup muxel reconnects the tmux panes of
   *every* remote project in the background, not just the one you had open, so agents
   left running on your hosts come back automatically. Hosts that would need a password

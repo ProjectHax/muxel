@@ -418,9 +418,10 @@ pub struct SshSpec<'a> {
     pub use_tmux: bool,
     pub tmux_session: Option<&'a str>,
     /// This machine's tag for its tmux client (see [`tmux_client_option`]). With
-    /// one, the client attaches without taking the window size and records its
-    /// name, so [`claim_window_size_command`] can hand the size back once someone
-    /// is actually at this machine. `None` attaches the plain way.
+    /// one, a client joining a session that already has a client attaches without
+    /// taking the window size and records its name, so
+    /// [`claim_window_size_command`] can hand the size back once someone is
+    /// actually at this machine. `None` attaches the plain way.
     pub tmux_client_tag: Option<&'a str>,
 }
 
@@ -627,10 +628,23 @@ fn remote_command(spec: &SshSpec) -> String {
         // `window-size latest` the window takes its size — so a pane reconnecting
         // on an unattended laptop resized the session under whoever was using it
         // elsewhere. An `ignore-size` client sits out the size while any unflagged
-        // client is attached (and still sizes the window when it is alone). It
-        // records its own name after attaching — the command after `;` runs as the
-        // attached client — so the app can clear the flag once someone is here.
+        // client is attached. It records its own name after attaching — the
+        // command after `;` runs as the attached client — so the app can clear the
+        // flag once someone is here.
+        //
+        // Only flag the client when the session already has one: that is the only
+        // time there is someone else's size to protect. tmux counts unflagged
+        // clients across the whole *server*, not the session, so a flagged pane
+        // alone in its session still sat out its own size whenever any other
+        // client was attached to anything on the host — this machine's own other
+        // panes included. Its window then stayed at the size it was created at
+        // (80×24 for a new pane) until the user typed, so the agent wrapped its
+        // lines at a width the pane didn't have and tmux cropped the rest.
         if let Some(tag) = spec.tmux_client_tag {
+            let attached = format!(
+                "tmux list-clients -t {} 2>/dev/null | grep -q .",
+                sh_quote(&format!("={session}"))
+            );
             let mut flagged = targs.clone();
             flagged.extend(["-f".to_string(), "ignore-size".to_string()]);
             let record = [
@@ -643,7 +657,7 @@ fn remote_command(spec: &SshSpec) -> String {
                 "#{client_name}".to_string(),
             ];
             cmd.push_str(&format!(
-                "if {TMUX_HAS_CLIENT_FLAGS}; then {}; fi; ",
+                "if {TMUX_HAS_CLIENT_FLAGS} && {attached}; then {}; fi; ",
                 exec_tmux(&flagged, program.as_deref(), &record)
             ));
         }
@@ -1284,8 +1298,14 @@ mod tests {
 
     /// The bug this guards: attaching makes a client the window's latest, so a pane
     /// reconnecting on an unattended laptop resized the session under whoever was
-    /// using it from another machine. A tagged client attaches with `ignore-size`
-    /// and records its name; a tmux too old for client flags attaches as before.
+    /// using it from another machine. A tagged client joining a session that already
+    /// has a client attaches with `ignore-size` and records its name; a tmux too old
+    /// for client flags attaches as before.
+    ///
+    /// The flag is conditional because tmux ignores a flagged client whenever an
+    /// unflagged one is attached *anywhere* on the server: flagged unconditionally,
+    /// a pane alone in its session stopped following its own size as soon as any
+    /// other pane on the host was, and the agent drew at the wrong width.
     #[test]
     fn a_tagged_tmux_client_attaches_without_taking_the_window_size() {
         let h = host();
@@ -1306,18 +1326,21 @@ mod tests {
         // The server still starts first, from a command line naming no session.
         let (server, rest) = tagged.split_once("; if ").expect("the flag probe follows");
         assert!(plain.starts_with(&format!("{server}; exec tmux ")));
-        // tmux 3.2+: attach flagged, then record this client's name on the session.
+        // tmux 3.2+ and someone already attached: attach flagged, then record this
+        // client's name on the session.
         assert_eq!(
             rest,
             format!(
-                "tmux list-commands new-session 2>/dev/null | grep -q 'f flags'; then \
+                "tmux list-commands new-session 2>/dev/null | grep -q 'f flags' \
+                 && tmux list-clients -t '=s' 2>/dev/null | grep -q .; then \
                  exec tmux -u set -g mouse on ';' new-session -A -s s -c /srv/app \
                  -f ignore-size -- {program} ';' set-option -Fq -t '=s:' \
                  @muxel_client_ab12 '#{{client_name}}'; fi; \
                  exec tmux -u set -g mouse on ';' new-session -A -s s -c /srv/app -- {program}"
             )
         );
-        // Older tmux falls through to exactly the untagged attach.
+        // Older tmux, or a session nobody else is in, falls through to exactly the
+        // untagged attach.
         let (_, untagged_exec) = plain.split_once("; exec ").unwrap();
         assert!(tagged.ends_with(&format!("; exec {untagged_exec}")));
     }
