@@ -26,6 +26,7 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../rust-toolchain.toml
       ../crates
+      ../vendor/portable-pty
       ../packaging/muxel.desktop
     ];
   };

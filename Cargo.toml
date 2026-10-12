@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/muxel", "crates/muxel-core", "crates/muxel-store", "crates/muxel-terminal", "crates/muxel-tray"]
+exclude = ["vendor/portable-pty"]
+
+[patch.crates-io]
+portable-pty = { path = "vendor/portable-pty" }
 
 [workspace.package]
 version = "0.3.0"

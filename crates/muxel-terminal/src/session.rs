@@ -18,7 +18,7 @@ use alacritty_terminal::term::{
 use alacritty_terminal::vte::ansi::Processor;
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
-use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -229,8 +229,8 @@ const NO_MOUSE_PRESS: u8 = u8::MAX;
 
 /// `Write` adapter that queues bytes to the dedicated PTY writer thread.
 /// `write` never blocks (unbounded channel); byte order is preserved. Errors
-/// only once the writer thread has exited (child gone), mirroring a broken
-/// pipe. Profiling timestamps are omitted entirely when the profiler is off.
+/// once input closes or the worker exits, mirroring a broken pipe. Profiling
+/// timestamps are omitted entirely when the profiler is off.
 struct QueuedWrite {
     bytes: Vec<u8>,
     queued_at: Option<Instant>,
@@ -251,22 +251,65 @@ fn queue_delay_excluding_profiler(
 }
 
 struct ChannelWriter {
-    tx: std::sync::mpsc::Sender<QueuedWrite>,
+    tx: std::sync::mpsc::Sender<Option<QueuedWrite>>,
     profile: bool,
+    closed: Arc<AtomicBool>,
 }
 
 impl Write for ChannelWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pty child exited",
+            ));
+        }
         self.tx
-            .send(QueuedWrite {
+            .send(Some(QueuedWrite {
                 bytes: buf.to_vec(),
                 queued_at: self.profile.then(Instant::now),
-            })
+            }))
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty writer gone"))?;
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Closing ConPTY must happen off the UI thread while its reader is draining.
+/// Taking ownership under the lock, then dropping outside it, also prevents
+/// a resize from waiting on ClosePseudoConsole's output flush.
+struct SessionMaster {
+    inner: Mutex<Option<Box<dyn MasterPty + Send>>>,
+}
+
+impl SessionMaster {
+    #[cfg(windows)]
+    fn close(&self) {
+        let master = self.inner.lock().take();
+        drop(master);
+    }
+}
+
+#[cfg(not(windows))]
+type SessionChild = Box<dyn portable_pty::Child + Send + Sync>;
+
+#[cfg(windows)]
+struct SessionChild {
+    exit: std::sync::mpsc::Receiver<std::io::Result<portable_pty::ExitStatus>>,
+}
+
+#[cfg(windows)]
+impl SessionChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        match self.exit.try_recv() {
+            Ok(result) => result.map(Some),
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(std::io::Error::other(
+                "PTY child monitor ended without an exit status",
+            )),
+        }
     }
 }
 
@@ -313,10 +356,12 @@ pub struct TerminalSession {
     // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
     // Unix foreground-process query), so a mutex lets a fully spawned session
     // move from the launch worker to the UI thread without weakening safety.
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    /// Kill handle for the child. The `Child` itself lives in the reader thread,
-    /// which harvests the exit code after EOF (see `read_loop`).
+    master: Arc<SessionMaster>,
+    /// On Windows a separate waiter observes process exit and closes ConPTY;
+    /// on Unix the reader harvests the child status after EOF.
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    input_closed: Arc<AtomicBool>,
+    input_stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
     /// The PTY child's pid (the shell/agent), captured at spawn. Compared against
     /// the terminal's foreground process group to tell whether the child is idle
     /// at its prompt vs. running a foreground command (see `is_idle_foreground`).
@@ -386,6 +431,8 @@ pub struct TerminalSession {
     /// when agent output is already queued.
     interactive_until: Mutex<Option<Instant>>,
     _reader: JoinHandle<()>,
+    #[cfg(all(test, windows))]
+    _monitor: JoinHandle<()>,
 }
 
 /// Viewport damage since the last paint, derived from alacritty's damage tracker.
@@ -635,14 +682,19 @@ impl TerminalSession {
         // bytes. Windows Terminal threads its PTY input for the same reason.
         let mut pipe_writer = pair.master.take_writer().context("take pty writer")?;
         let profile_writes = instance_id.filter(|_| crate::profile::is_enabled());
-        let (write_tx, write_rx) = std::sync::mpsc::channel::<QueuedWrite>();
-        std::thread::Builder::new()
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
+        let input_closed = Arc::new(AtomicBool::new(false));
+        let worker_closed = input_closed.clone();
+        let writer_handle = std::thread::Builder::new()
             .name("muxel-pty-writer".to_string())
             .spawn(move || {
                 // Exits when every sender is gone (session dropped) or the
                 // pipe breaks (child gone).
                 let mut prior_profiler_interval = None;
-                while let Ok(write) = write_rx.recv() {
+                while let Ok(Some(write)) = write_rx.recv() {
+                    if worker_closed.load(Ordering::Acquire) {
+                        break;
+                    }
                     let queue_delay = write.queued_at.map(|queued_at| {
                         queue_delay_excluding_profiler(
                             queued_at,
@@ -674,11 +726,23 @@ impl TerminalSession {
             })
             .context("spawn pty writer thread")?;
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter {
-            tx: write_tx,
+            tx: write_tx.clone(),
             profile: profile_writes.is_some(),
+            closed: input_closed.clone(),
         })));
-        // `pair.slave` is dropped at the end of this function, closing the
-        // parent's copy so the reader sees EOF when the child exits.
+        // The Windows slave shares ConPTY ownership with the master. Release
+        // it before the monitor can close the console after a fast child exit.
+        drop(pair.slave);
+        let master = Arc::new(SessionMaster {
+            inner: Mutex::new(Some(pair.master)),
+        });
+
+        #[cfg(windows)]
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        #[cfg(windows)]
+        let session_child = SessionChild { exit: exit_rx };
+        #[cfg(not(windows))]
+        let session_child = child;
 
         let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let term_config = term_config();
@@ -689,8 +753,58 @@ impl TerminalSession {
             tx.carries_timing() && instance_id.is_some() && crate::profile::is_enabled();
         let reader_handle = std::thread::Builder::new()
             .name("muxel-pty-reader".to_string())
-            .spawn(move || read_loop(reader, child, tx, immediate_replies, profile_reads))
+            .spawn({
+                let input_closed = input_closed.clone();
+                let input_stop = write_tx.clone();
+                move || {
+                    read_loop(
+                        reader,
+                        session_child,
+                        tx,
+                        immediate_replies,
+                        profile_reads,
+                        input_closed,
+                        input_stop,
+                    )
+                }
+            })
             .context("spawn reader thread")?;
+
+        #[cfg(windows)]
+        let monitor_handle = {
+            let monitor_master = master.clone();
+            let monitor_closed = input_closed.clone();
+            let monitor_stop = write_tx.clone();
+            let monitor = std::thread::Builder::new()
+                .name("muxel-pty-child".to_string())
+                .spawn(move || {
+                    let mut child = child;
+                    let status = child.wait();
+                    monitor_closed.store(true, Ordering::Release);
+                    let _ = monitor_stop.send(None);
+                    // Publish before close: the reader emits Exit only after
+                    // draining all output produced before the child died.
+                    let _ = exit_tx.send(status);
+                    cancel_finished_child_input(&writer_handle);
+                    monitor_master.close();
+                    let _ = writer_handle.join();
+                });
+            match monitor {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let mut killer = killer;
+                    let _ = killer.kill();
+                    input_closed.store(true, Ordering::Release);
+                    let _ = write_tx.send(None);
+                    master.close();
+                    return Err(error).context("spawn PTY child monitor");
+                }
+            }
+        };
+        #[cfg(all(windows, not(test)))]
+        drop(monitor_handle);
+        #[cfg(not(windows))]
+        drop(writer_handle);
 
         let title = Arc::new(Mutex::new(None));
         let title_generation = Arc::new(AtomicU64::new(0));
@@ -719,8 +833,10 @@ impl TerminalSession {
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
             writer,
-            master: Mutex::new(pair.master),
+            master,
             killer: Mutex::new(killer),
+            input_closed,
+            input_stop: write_tx,
             child_pid,
             title,
             title_generation,
@@ -752,6 +868,8 @@ impl TerminalSession {
             pending_damage: Mutex::new(ContentDamage::Full),
             interactive_until: Mutex::new(None),
             _reader: reader_handle,
+            #[cfg(all(test, windows))]
+            _monitor: monitor_handle,
         });
 
         if let Some(instance_id) = instance_id {
@@ -1113,12 +1231,14 @@ impl TerminalSession {
             return true; // same target, still settling
         }
         // Settled — apply to the PTY (SIGWINCH) and the grid together.
-        let _ = self.master.lock().resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if let Some(master) = self.master.inner.lock().as_ref() {
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
         self.term
             .lock()
             .resize(TermSize::new(cols as usize, rows as usize));
@@ -1506,7 +1626,14 @@ impl TerminalSession {
     pub fn is_idle_foreground(&self) -> bool {
         #[cfg(unix)]
         {
-            match (self.master.lock().process_group_leader(), self.child_pid) {
+            match (
+                self.master
+                    .inner
+                    .lock()
+                    .as_ref()
+                    .and_then(|master| master.process_group_leader()),
+                self.child_pid,
+            ) {
                 (Some(fg), Some(pid)) => fg == pid as libc::pid_t,
                 _ => false,
             }
@@ -1985,7 +2112,10 @@ fn appimage_env_fixups(
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        // Best-effort: kill the child so the reader thread sees EOF and exits.
+        self.input_closed.store(true, Ordering::Release);
+        let _ = self.input_stop.send(None);
+        // The Windows monitor closes ConPTY after this kill; its reader remains
+        // active for the console's final output flush.
         let _ = self.killer.lock().kill();
     }
 }
@@ -2002,15 +2132,34 @@ pub(crate) fn term_config() -> TermConfig {
     }
 }
 
-/// Blocking PTY reader. Owns the `Child` so that after EOF it can harvest the
-/// exit code — letting the app tell a clean `exit` from a crash (resume
-/// recovery must not treat a deliberate quit as recoverable).
+#[cfg(windows)]
+fn cancel_finished_child_input(writer: &JoinHandle<()>) {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::IO::CancelSynchronousIo;
+
+    // Check repeatedly because a writer admitted just before process exit can
+    // enter WriteFile after the first cancellation. Never join on the UI thread.
+    for _ in 0..20 {
+        if writer.is_finished() {
+            break;
+        }
+        let _ = unsafe { CancelSynchronousIo(HANDLE(writer.as_raw_handle() as isize)) };
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Drain PTY output before publishing Exit. Windows gets child status from a
+/// separate waiter: a live ConPTY can keep its output pipe open after every
+/// client process exits, so waiting for EOF before waiting for the child hangs.
 fn read_loop(
     mut reader: Box<dyn Read + Send>,
-    mut child: Box<dyn Child + Send + Sync>,
+    mut child: SessionChild,
     tx: PtyChunkSender,
     mut immediate_replies: ImmediateReplies,
     profile_reads: bool,
+    input_closed: Arc<AtomicBool>,
+    input_stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
 ) {
     let mut buf = [0u8; 65536];
     // Only a clean EOF or a real error ends the session. EINTR is a signal
@@ -2023,6 +2172,9 @@ fn read_loop(
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF → every slave fd closed; child is (probably) gone
             Ok(n) => {
+                if ui_gone {
+                    continue;
+                }
                 let timing = profile_reads.then(|| {
                     read_sequence = read_sequence.wrapping_add(1).max(1);
                     profile::pty_read(n, read_sequence)
@@ -2031,9 +2183,10 @@ fn read_loop(
                 // drain can miss the asker's window and be read as typing.
                 immediate_replies.advance(&buf[..n]);
                 if !tx.send_output(buf[..n].to_vec(), timing) {
-                    // Receiver dropped — UI is gone. Still fall through to reap
-                    // the child, or it lingers as a zombie.
+                    // Keep draining while the monitor closes ConPTY; it can
+                    // otherwise block flushing output into an unread pipe.
                     ui_gone = true;
+                    #[cfg(not(windows))]
                     break;
                 }
             }
@@ -2045,6 +2198,8 @@ fn read_loop(
             }
         }
     }
+    input_closed.store(true, Ordering::Release);
+    let _ = input_stop.send(None);
     // The reader's master-fd dup is no longer needed; free it before the
     // (potentially long) reap below so closed sessions don't hold PTYs open.
     drop(reader);
@@ -2361,6 +2516,221 @@ mod profiler_transport_tests {
             ),
             Duration::from_millis(5)
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_child_exit_tests {
+    use super::{CommandSpec, PtyChunk, RESIZE_SETTLE, TerminalSession};
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn spawn(script: &str) -> (Arc<TerminalSession>, async_channel::Receiver<PtyChunk>) {
+        let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        TerminalSession::spawn(
+            CommandSpec::program(
+                powershell.to_string_lossy(),
+                vec!["-NoProfile".into(), "-Command".into(), script.into()],
+            ),
+            80,
+            24,
+        )
+        .expect("spawn isolated PowerShell fixture")
+    }
+
+    fn wait_ready(session: &TerminalSession, rx: &async_channel::Receiver<PtyChunk>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    session.process_output(&bytes);
+                    if session.visible_text().contains("FIXTURE_READY") {
+                        return;
+                    }
+                }
+                Ok(PtyChunk::Exit { .. }) => panic!("fixture exited before becoming ready"),
+                Err(async_channel::TryRecvError::Closed) => panic!("fixture reader closed"),
+                Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        panic!("fixture never became ready");
+    }
+
+    fn wait_exit(
+        session: &TerminalSession,
+        rx: &async_channel::Receiver<PtyChunk>,
+    ) -> (Option<i32>, Vec<u8>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    // Feed the parser as the GUI does, including terminal replies.
+                    session.process_output(&bytes);
+                    output.extend_from_slice(&bytes);
+                }
+                Ok(PtyChunk::Exit {
+                    code,
+                    signal,
+                    read_error,
+                }) => {
+                    assert_eq!(signal, None);
+                    assert_eq!(read_error, None);
+                    assert!(
+                        session
+                            .input_closed
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    );
+                    assert!(session.writer.lock().write_all(b"AFTER_EXIT").is_err());
+                    return (code, output);
+                }
+                Err(async_channel::TryRecvError::Closed) => panic!("reader closed without Exit"),
+                Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        panic!("child exit was not reported while its terminal session stayed alive");
+    }
+
+    #[test]
+    fn natural_exit_is_reported_while_session_is_still_alive() {
+        for code in [0, 7] {
+            let (session, rx) = spawn(&format!(
+                "[Console]::WriteLine('FINAL_OUTPUT'); exit {code}"
+            ));
+            let (reported, output) = wait_exit(&session, &rx);
+            assert_eq!(reported, Some(code));
+            assert!(output.windows(12).any(|bytes| bytes == b"FINAL_OUTPUT"));
+            assert!(!matches!(
+                rx.try_recv(),
+                Ok(PtyChunk::Output(_)) | Ok(PtyChunk::Exit { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn startup_and_exit_need_no_ui_parser_or_cursor_reply() {
+        let (session, rx) = spawn("[Console]::WriteLine('FINAL_OUTPUT'); exit 7");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        let mut reported = false;
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => output.extend_from_slice(&bytes),
+                Ok(PtyChunk::Exit {
+                    code, read_error, ..
+                }) => {
+                    assert_eq!(code, Some(7));
+                    assert_eq!(read_error, None);
+                    reported = true;
+                    break;
+                }
+                Err(async_channel::TryRecvError::Closed) => panic!("reader closed without Exit"),
+                Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+            }
+        }
+        assert!(reported, "startup must not wait for a UI cursor reply");
+        assert!(output.windows(12).any(|bytes| bytes == b"FINAL_OUTPUT"));
+        assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[6n"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !session._reader.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            session._reader.is_finished(),
+            "exit must finish the reader, not just its event"
+        );
+        while !session._monitor.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            session._monitor.is_finished(),
+            "child monitor and writer did not finish"
+        );
+    }
+
+    #[test]
+    fn killed_before_any_ui_drain_finishes_without_a_cursor_reply() {
+        let (session, rx) = spawn("Start-Sleep -Seconds 60");
+        session.kill();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    assert!(!bytes.windows(4).any(|bytes| bytes == b"\x1b[6n"));
+                }
+                Ok(PtyChunk::Exit { code, .. }) => {
+                    assert!(code.is_some());
+                    exited = true;
+                    break;
+                }
+                Err(async_channel::TryRecvError::Closed) => panic!("closed without Exit"),
+                Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+            }
+        }
+        assert!(exited);
+        while (!session._reader.is_finished() || !session._monitor.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(session._reader.is_finished());
+        assert!(session._monitor.is_finished());
+    }
+
+    #[test]
+    fn output_is_drained_before_exit_after_a_large_final_write() {
+        let (session, rx) =
+            spawn("[Console]::Write(('X' * 262144)); [Console]::WriteLine('FINAL_OUTPUT'); exit 7");
+        let (code, output) = wait_exit(&session, &rx);
+        assert_eq!(code, Some(7));
+        assert!(
+            output.len() > 65536,
+            "fixture must span more than one reader batch"
+        );
+        assert!(output.windows(12).any(|bytes| bytes == b"FINAL_OUTPUT"));
+    }
+
+    #[test]
+    fn killed_child_reports_exit_even_with_blocked_input() {
+        let (session, rx) = spawn("[Console]::WriteLine('FIXTURE_READY'); Start-Sleep -Seconds 60");
+        wait_ready(&session, &rx);
+        session
+            .writer
+            .lock()
+            .write_all(&vec![b'x'; 2 * 1024 * 1024])
+            .unwrap();
+        // The child deliberately never reads stdin: this is much larger than
+        // its pipe buffer and lets the worker enter a blocking WriteFile.
+        std::thread::sleep(Duration::from_millis(100));
+        session.kill();
+        let (code, _) = wait_exit(&session, &rx);
+        assert!(code.is_some());
+    }
+
+    #[test]
+    fn a_live_child_still_receives_input_and_resizes() {
+        let (session, rx) = spawn(
+            "[Console]::WriteLine('FIXTURE_READY'); $null = [Console]::ReadLine(); [Console]::WriteLine(('WIDTH_' + [Console]::WindowWidth)); exit 0",
+        );
+        wait_ready(&session, &rx);
+        assert!(session.resize(101, 24));
+        std::thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
+        assert!(!session.resize(101, 24));
+        session.write_input(b"finish\r");
+        let (code, output) = wait_exit(&session, &rx);
+        assert_eq!(code, Some(0));
+        assert!(output.windows(9).any(|bytes| bytes == b"WIDTH_101"));
     }
 }
 
