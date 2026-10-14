@@ -656,7 +656,8 @@ feature is added or changed, update the matching entry here in the same change**
 - **Markdown & image rendering** — `.md`/`.markdown` files render as formatted
   markdown and image files (`png`, `jpg`, `gif`, `webp`, `bmp`, `svg`, …) render as
   images, both by default, with a header **Raw / Rendered** toggle to view the
-  source (e.g. an SVG's XML or the markdown text).
+  source (e.g. an SVG's XML or the markdown text). Paragraphs combining inline
+  images and line breaks render without crashing, including linked HTML images.
 - **Rendered-text copy parity** — Ctrl+C and Ctrl+Insert copy the exact selected
   text in rendered Markdown, images, and settings fields without intercepting Ctrl+C
   from a focused terminal.
