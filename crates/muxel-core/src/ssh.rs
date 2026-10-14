@@ -5,12 +5,14 @@
 //!
 //! A remote pane runs `ssh [opts] [user@]host -t -- '<remote command>'`, where
 //! the remote command is `cd <dir> && exec <program>` (or a `tmux new-session
-//! -A` for a persistent, reconnectable session). All hosts use a shared
-//! ControlMaster socket so repeated connections (the pane plus every git call)
-//! reuse one authenticated connection.
+//! -A` for a persistent, reconnectable session). Connections to a host ride
+//! ControlMaster sockets, so repeated connections reuse an authenticated one: the
+//! panes share a few masters, and muxel's own commands (git, layout sync, tmux
+//! queries) share another. See [`Master`].
 
 use crate::winshell::{self, WindowsShell};
 use crate::{RemoteHost, RemoteOs, SshAuth};
+use uuid::Uuid;
 
 /// POSIX single-quote `s` for safe embedding in a remote shell command. Tokens
 /// made only of safe characters are left bare (readability + test clarity).
@@ -141,10 +143,11 @@ pub fn base_args(host: &RemoteHost) -> Vec<String> {
     v
 }
 
-/// Base options **plus** ControlMaster multiplexing (one shared master per host
-/// → cheap repeated git calls, one auth, recoverable drops). Shared by remote
-/// panes and remote git. Windows OpenSSH doesn't support multiplexing, so it's
-/// omitted there. Callers append the [`target`] themselves.
+/// Base options **plus** ControlMaster multiplexing over `control_path` (cheap
+/// repeated git calls, one auth, recoverable drops). Shared by remote panes and
+/// remote git, each over its own master — see [`Master`]. Windows OpenSSH doesn't
+/// support multiplexing, so it's omitted there. Callers append the [`target`]
+/// themselves.
 pub fn connection_args(host: &RemoteHost, control_path: &str) -> Vec<String> {
     let mut v = base_args(host);
     if cfg!(not(target_os = "windows")) {
@@ -178,6 +181,75 @@ fn quote_option_value(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// Most panes muxel puts on one ControlMaster.
+///
+/// Every connection multiplexed over a master is a *session* on the host's sshd,
+/// and sshd caps those per connection (`MaxSessions`, 10 unless configured). Past
+/// the cap the host refuses the next one: ssh prints `mux_client_request_session:
+/// session request failed: Session open refused by peer` into the pane and falls
+/// back to a connection of its own, a full handshake later. With every pane *and*
+/// every background command sharing one master, a host running eight or nine
+/// agents hit that whenever a git or layout poll overlapped a pane launching.
+///
+/// So panes are spread over as many masters as it takes to stay under the cap, with
+/// room left for the `ssh … true` that warms a master before its panes connect.
+pub const PANES_PER_MASTER: usize = 8;
+
+/// Which of a host's ControlMasters a connection rides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Master {
+    /// Pane master `n`, each carrying at most [`PANES_PER_MASTER`] panes. A pane
+    /// keeps one for as long as it is connected.
+    Panes(usize),
+    /// muxel's own short commands: git, layout sync, tmux queries, kills. Off the
+    /// pane masters, so a burst of polls can never take the session a pane needs.
+    Commands,
+}
+
+/// File name of a host's ControlMaster socket: `<id8>p<n>` for pane master `n`,
+/// `<id8>c` for commands.
+///
+/// No longer than the `<id8>.sock` a host's one master used to have, and that is
+/// the point: a Unix socket path has to fit in 104 bytes on macOS, ssh appends 17
+/// more while it binds and *exits* when the path won't fit, and muxel's sockets
+/// already sit under `~/Library/Application Support/…` there. A longer name would
+/// break hosts for anyone whose home directory path was already close.
+pub fn control_socket_name(host_id: Uuid, master: Master) -> String {
+    let id = host_id.simple().to_string();
+    let id = &id[..8];
+    match master {
+        Master::Panes(n) => format!("{id}p{n}"),
+        Master::Commands => format!("{id}c"),
+    }
+}
+
+/// The pane master a new pane joins, given the masters the host's other panes ride:
+/// the first with room, so a host only opens another master once every earlier one
+/// is full.
+pub fn pane_master(taken: &[usize]) -> usize {
+    (0..)
+        .find(|n| taken.iter().filter(|t| *t == n).count() < PANES_PER_MASTER)
+        .unwrap_or_default()
+}
+
+/// The pane masters `pending` new panes will join, in order of first use — what a
+/// connect warms before its panes launch together. Panes launched at once onto a
+/// master that isn't up yet each open a connection of their own, racing to become
+/// the master; all but one lose, print `ControlSocket … already exists, disabling
+/// multiplexing` into their pane, and stay unshared.
+pub fn pane_masters_for(taken: &[usize], pending: usize) -> Vec<usize> {
+    let mut taken = taken.to_vec();
+    let mut used = Vec::new();
+    for _ in 0..pending {
+        let n = pane_master(&taken);
+        taken.push(n);
+        if !used.contains(&n) {
+            used.push(n);
+        }
+    }
+    used
 }
 
 /// A "REMOTE HOST IDENTIFICATION HAS CHANGED" refusal parsed from ssh stderr —
@@ -982,6 +1054,49 @@ mod tests {
     fn quoting_is_only_applied_where_it_is_needed() {
         assert_eq!(quote_option_value("/tmp/s.sock"), "/tmp/s.sock");
         assert_eq!(quote_option_value("/a b/s.sock"), "\"/a b/s.sock\"");
+    }
+
+    #[test]
+    fn each_master_has_its_own_short_socket() {
+        let id = Uuid::parse_str("ab12cd34-0000-4000-8000-000000000000").unwrap();
+        assert_eq!(control_socket_name(id, Master::Panes(0)), "ab12cd34p0");
+        assert_eq!(control_socket_name(id, Master::Panes(2)), "ab12cd34p2");
+        assert_eq!(control_socket_name(id, Master::Commands), "ab12cd34c");
+        // Never longer than the `ab12cd34.sock` every host's socket used to be: on
+        // macOS the whole path is tight, and ssh won't start when it doesn't fit.
+        for master in [Master::Panes(0), Master::Panes(99), Master::Commands] {
+            assert!(control_socket_name(id, master).len() <= "ab12cd34.sock".len());
+        }
+    }
+
+    /// sshd refuses sessions past `MaxSessions` (10 by default) on one connection.
+    #[test]
+    fn panes_fill_a_master_before_opening_another() {
+        const { assert!(PANES_PER_MASTER < 10, "must stay under sshd's default cap") };
+        assert_eq!(pane_master(&[]), 0);
+        let full = vec![0; PANES_PER_MASTER];
+        assert_eq!(pane_master(&full), 1);
+        // A pane closed on a full master makes room there again, ahead of a later one.
+        let mut gap = full.clone();
+        gap.pop();
+        gap.extend([1, 1]);
+        assert_eq!(pane_master(&gap), 0);
+        // Only how many ride each master matters, not the order they're listed in.
+        let mut mixed = vec![1, 1];
+        mixed.extend(vec![0; PANES_PER_MASTER]);
+        assert_eq!(pane_master(&mixed), 1);
+    }
+
+    #[test]
+    fn masters_to_warm_are_the_ones_pending_panes_join() {
+        assert!(pane_masters_for(&[], 0).is_empty());
+        assert_eq!(pane_masters_for(&[], 3), vec![0]);
+        assert_eq!(pane_masters_for(&[], PANES_PER_MASTER + 1), vec![0, 1]);
+        // Two panes into a host whose first master has one seat left.
+        let taken = vec![0; PANES_PER_MASTER - 1];
+        assert_eq!(pane_masters_for(&taken, 2), vec![0, 1]);
+        let full = vec![0; PANES_PER_MASTER];
+        assert_eq!(pane_masters_for(&full, 2), vec![1]);
     }
 
     #[test]

@@ -801,14 +801,15 @@ feature is added or changed, update the matching entry here in the same change**
   alone.
 - **Closing a remote agent really stops it** — closing a remote pane kills its tmux
   session on the host, and muxel *confirms* the session is gone rather than assuming
-  the kill landed. A kill that fails (a blip, a control socket that went down with
-  the pane's own ssh, a host that is briefly unreachable) is retried over the
-  following half-minute, and anything still unfinished is finished on the next
-  connect to that host — aimed at the session's real name, even if the host has been
-  renamed since. Until it is confirmed dead, the close is remembered, so a session
-  whose kill is still in flight is never adopted back into a pane: a closed agent
-  stays closed across a muxel restart. Unconfirmed closes are listed in the
-  developer log.
+  the kill landed. A kill that fails (a blip, a host that is busy or briefly
+  unreachable) is retried over the following half-minute, and anything still
+  unfinished is finished on the next connect to that host — aimed at the session's
+  real name, even if the host has been renamed since. Until it is confirmed dead, the
+  close is remembered, so a session whose kill is still in flight is never adopted
+  back into a pane: a closed agent stays closed across a muxel restart. A confirmed
+  close is still remembered for the rest of the run, so a connect that listed the
+  host's sessions a moment before the kill landed can't bring the pane back either.
+  Unconfirmed closes are listed in the developer log.
 - **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
   speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
   layout sync, the memory file, project scan, remote git, and the connection test
@@ -859,10 +860,15 @@ feature is added or changed, update the matching entry here in the same change**
   which work everywhere.
 - **Resilient sessions** — remote panes default to a persistent tmux session on
   the host, so a dropped connection is survivable: reconnecting re-attaches the
-  still-running agent. One multiplexed SSH connection per host is shared by all of
-  that host's projects, their panes and git calls: projects opening together (a
-  workspace, launch) wait for the first to connect instead of each opening its own,
-  and "Connected to …" is shown once per host rather than once per project.
+  still-running agent. A host's panes share multiplexed SSH connections across all
+  of its projects, at most 8 panes to a connection — under sshd's default limit of
+  10 sessions per connection, past which the host refuses the next one ("Session
+  open refused by peer") and the pane has to open a connection of its own. muxel's
+  own git, layout-sync and tmux calls ride a separate connection, so a background
+  poll never takes a pane's place. Projects opening together (a workspace, launch)
+  wait for the first to connect instead of each opening its own, that connect brings
+  up every connection its panes are about to use, and "Connected to …" is shown once
+  per host rather than once per project.
   Launching a tmux session (remote, or a local tmux-mode project) enables tmux
   `mouse on`, so the pane's scroll wheel scrolls tmux's own copy-mode history
   instead of just the visible screen.
@@ -908,8 +914,10 @@ feature is added or changed, update the matching entry here in the same change**
   adds appear, attached to their running tmux sessions; panes it closes go away;
   renames carry over — without restarting any pane both sides share. Only real
   layout changes are pushed: a pane's size and agent status are per-machine and never
-  trigger one. A failing push is reported once (not on every retry) and retried in
-  the background.
+  trigger one. A re-read that started before this machine's own push is thrown away
+  rather than mistaken for a peer's change, so a pane you just closed never pops back
+  on a slow connection. A failing push is reported once (not on every retry) and
+  retried in the background.
 - **Shareable local projects** — a *local* project also mirrors its layout to
   `<root>/.muxel/workspace.json` (and git-ignores `.muxel/`) when tmux mode is on,
   so its panes are tmux sessions a peer can attach to. The iOS companion app can

@@ -681,7 +681,8 @@ fn ssh_spawn_error(auth: SshAuth, e: std::io::Error) -> anyhow::Error {
 }
 
 /// Verify a host's SSH config by opening a quick connection (`ssh … -- true`).
-/// Also establishes the ControlMaster so a subsequent pane connects instantly.
+/// Also establishes the master at `control_path`, so the panes that ride it
+/// connect instantly.
 pub fn ssh_check(host: &RemoteHost, control_path: &str, password: Option<&str>) -> Result<()> {
     ssh_exec(host, control_path, password, "true")
 }
@@ -1471,8 +1472,7 @@ pub fn kill_tmux_session(session: &str) {
 }
 
 /// Kill a tmux session on a remote host over SSH, and **confirm it is gone**
-/// (reuses the host's ControlMaster, which is still alive right after the pane's
-/// ssh closed).
+/// (over the host's commands master, which outlives any pane's connection).
 ///
 /// `Ok(())` means the host answered and no longer has the session. An `Err` says
 /// "could not confirm" — the session may well still be running — and the caller is

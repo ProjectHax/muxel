@@ -163,9 +163,9 @@ mod maximize_follow_tests {
 }
 
 /// How long to wait before each attempt at killing a closed pane's remote tmux
-/// session (the first is immediate). Short enough that a blip or a control socket
-/// that died with the pane's own ssh is ridden out within the minute; anything
-/// longer-lived is left to the next connect — see `MuxelApp::reap_remote_session`.
+/// session (the first is immediate). Short enough that a blip or a busy host is
+/// ridden out within the minute; anything longer-lived is left to the next connect —
+/// see `MuxelApp::reap_remote_session`.
 const RETRY_REMOTE_KILL_SECS: [u64; 4] = [0, 3, 10, 30];
 
 const RESTORE_LAUNCH_CONCURRENCY: usize = 4;
@@ -2761,6 +2761,11 @@ pub struct MuxelApp {
     git_env: Arc<integrations::GitEnv>,
     /// Tick counter throttling remote branch-label polling (every 5th tick).
     remote_poll_count: u32,
+    /// A remote branch poll / layout poll is still out. The next waits for it: a
+    /// slow or unreachable host would otherwise stack one more batch of ssh
+    /// round trips every few seconds.
+    remote_branch_poll_inflight: bool,
+    remote_layout_poll_inflight: bool,
     /// A background Grok PID→session-id refresh is already in flight.
     #[cfg(windows)]
     grok_session_syncing: bool,
@@ -2935,6 +2940,16 @@ pub struct MuxelApp {
     /// Projects whose last layout push failed. Reported once per failing streak,
     /// not on every retry; cleared by the next successful push.
     layout_push_failing: HashSet<Uuid>,
+    /// Layout pushes started per project. A live poll that read the shared file
+    /// before the latest one began may have read this machine's *previous* write —
+    /// see `fetch_remote_layouts`.
+    layout_push_epoch: HashMap<Uuid, u64>,
+    /// Remote panes' seats on their host's pane masters: instance → (host, master).
+    /// See `pane_control_path`.
+    pane_masters: HashMap<Uuid, (Uuid, usize)>,
+    /// Remote closes confirmed this run, per project — kept after the persisted
+    /// ledger (`Project::closed_sessions`) lets them go. See `reap_closed_sessions`.
+    reaped_sessions: HashMap<Uuid, Vec<muxel_core::tmux::ClosedSession>>,
     /// Per-project generation for deferred pane fleets. Starting a newer restore
     /// cancels the older task before it can launch or focus another pane.
     deferred_activation_generation: HashMap<Uuid, u64>,
@@ -3660,10 +3675,10 @@ impl ConfirmAction {
 /// Who opens each remote host's ssh connection, and who waits for it.
 ///
 /// Several of a host's projects connect together — a workspace opening, the
-/// startup reattach — and until one of them has the host's ControlMaster up, each
-/// opens an ssh connection of its own (`ControlMaster=auto` only shares a master
+/// startup reattach — and until one of them has the host's pane masters up, each
+/// opens ssh connections of its own (`ControlMaster=auto` only shares a master
 /// that already exists). So one project per host leads the connect and the rest
-/// wait, then connect over the shared master. The host is announced once, too:
+/// wait, then connect over the shared masters. The host is announced once, too:
 /// "Connected to …" for every project on it was the same news said N times.
 #[derive(Default)]
 struct HostConnects {
@@ -4996,7 +5011,7 @@ impl MuxelApp {
         let remotes = settings.remotes.clone();
         let identities = settings.identities.clone();
         // Dir for per-host SSH ControlMaster sockets (created once; the path is
-        // computed purely thereafter by `control_path_for`).
+        // computed purely thereafter by `control_path_at`).
         if let Some(d) = muxel_store::data_dir() {
             let _ = std::fs::create_dir_all(d.join("ssh"));
         }
@@ -5035,6 +5050,8 @@ impl MuxelApp {
             git_env: Arc::new(integrations::GitEnv::production()),
             remote_connect_failed: HashMap::new(),
             remote_poll_count: 0,
+            remote_branch_poll_inflight: false,
+            remote_layout_poll_inflight: false,
             #[cfg(windows)]
             grok_session_syncing: false,
             theme: settings.theme.clone(),
@@ -5180,6 +5197,9 @@ impl MuxelApp {
             layout_synced_keys: HashMap::new(),
             remote_push_inflight: HashSet::new(),
             layout_push_failing: HashSet::new(),
+            layout_push_epoch: HashMap::new(),
+            pane_masters: HashMap::new(),
+            reaped_sessions: HashMap::new(),
             deferred_activation_generation: HashMap::new(),
             focus_handle: cx.focus_handle(),
             settings,
@@ -5343,19 +5363,96 @@ impl MuxelApp {
         }
     }
 
-    /// Per-host ControlMaster socket path (its directory is created). Shared by
-    /// the host's panes and its git calls so they reuse one authenticated
-    /// connection — making repeated git invocations cheap and one dropped
-    /// connection recoverable.
-    fn control_path_for(host_id: Uuid) -> String {
+    /// Socket path of one of a host's ControlMasters (see `ssh::Master`), so
+    /// connections reuse an authenticated one — making repeated git invocations
+    /// cheap and one dropped connection recoverable.
+    fn control_path_at(host_id: Uuid, master: muxel_core::ssh::Master) -> String {
         // Pure (safe to call during render). The `ssh/` dir is created once at
         // startup (see the constructor).
         muxel_store::data_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("ssh")
-            .join(format!("{}.sock", &host_id.simple().to_string()[..8]))
+            .join(muxel_core::ssh::control_socket_name(host_id, master))
             .display()
             .to_string()
+    }
+
+    /// The ControlMaster muxel's own commands to a host ride: git, layout sync,
+    /// tmux queries and kills, scans. Never a pane's — see `pane_control_path`.
+    fn commands_control_path(host_id: Uuid) -> String {
+        Self::control_path_at(host_id, muxel_core::ssh::Master::Commands)
+    }
+
+    /// The ControlMaster a remote pane's ssh rides, and which of its host's pane
+    /// masters that is (`None` for a pane that isn't remote).
+    ///
+    /// A pane keeps the master it was given for as long as it exists, so a reattach
+    /// goes back over the same one; a new pane joins the first master with room
+    /// (`ssh::pane_master`). Every remote pane muxel has launched counts against
+    /// its master, connected or not, so one coming back always finds its seat.
+    fn pane_control_path(&mut self, iid: Uuid) -> Option<String> {
+        let host = self.remote_host_for_instance(iid)?.id;
+        let workspace = &self.workspace;
+        self.pane_masters
+            .retain(|id, _| workspace.instance(*id).is_some());
+        let master = match self.pane_masters.get(&iid) {
+            Some(&(h, n)) if h == host => n,
+            _ => {
+                let n = muxel_core::ssh::pane_master(&self.pane_masters_taken(host, &[iid]));
+                self.pane_masters.insert(iid, (host, n));
+                n
+            }
+        };
+        Some(Self::control_path_at(
+            host,
+            muxel_core::ssh::Master::Panes(master),
+        ))
+    }
+
+    /// The pane masters `host`'s panes ride, one entry per pane, leaving out
+    /// `except`.
+    fn pane_masters_taken(&self, host: Uuid, except: &[Uuid]) -> Vec<usize> {
+        self.pane_masters
+            .iter()
+            .filter(|(id, (h, _))| *h == host && !except.contains(id))
+            .map(|(_, (_, n))| *n)
+            .collect()
+    }
+
+    /// The pane masters a connect to `host` should have up before `pid`'s panes
+    /// launch: each pane already seated keeps its master, the rest join the first
+    /// with room. Always includes the first master, which the connect's login check
+    /// runs over whether or not there is a pane to launch.
+    fn pane_masters_to_warm(&self, pid: Uuid, host: Uuid) -> Vec<usize> {
+        let pending = self
+            .workspace
+            .project(pid)
+            .map(|p| p.instances())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|iid| {
+                !self.terminals.contains_key(iid)
+                    && self
+                        .workspace
+                        .instance(*iid)
+                        .is_some_and(|i| i.kind == InstanceKind::Terminal)
+            });
+        let mut warm = vec![0];
+        let mut unseated = 0;
+        for iid in pending {
+            match self.pane_masters.get(&iid) {
+                Some(&(h, n)) if h == host => warm.push(n),
+                _ => unseated += 1,
+            }
+        }
+        // Seated panes keep their seats, so they count as taken.
+        warm.extend(muxel_core::ssh::pane_masters_for(
+            &self.pane_masters_taken(host, &[]),
+            unseated,
+        ));
+        let mut seen = HashSet::new();
+        warm.retain(|n| seen.insert(*n));
+        warm
     }
 
     /// An SSH password for a host: the in-memory session password first, else the
@@ -5428,7 +5525,7 @@ impl MuxelApp {
             let session =
                 muxel_core::tmux::session_for(inst.tmux_session.as_deref(), &host.name, iid);
             let tag = Self::tmux_client_tag(&host);
-            let control_path = Self::control_path_for(host.id);
+            let control_path = Self::commands_control_path(host.id);
             let password = self.remote_password(&host);
             cx.background_executor()
                 .spawn(async move {
@@ -5469,10 +5566,11 @@ impl MuxelApp {
         &self,
         inst: Option<&Instance>,
         host: &RemoteHost,
+        // The pane master this pane rides (`pane_control_path`).
+        control_path: &str,
         remote_cwd: &str,
         resolved: &ResolvedLaunch,
     ) -> (String, Vec<String>, Vec<(String, String)>) {
-        let control_path = Self::control_path_for(host.id);
         // `RemoteHost::use_tmux` is the single gate: it also answers "never" for a
         // Windows host, which has no tmux to attach to.
         let use_tmux = host.use_tmux(inst.is_some_and(|i| i.use_tmux));
@@ -5484,7 +5582,7 @@ impl MuxelApp {
         let tag = Self::tmux_client_tag(host);
         let ssh_argv = muxel_core::ssh::ssh_args(&muxel_core::ssh::SshSpec {
             host,
-            control_path: &control_path,
+            control_path,
             remote_cwd: Some(remote_cwd),
             program: resolved.program.as_deref(),
             args: &resolved.args,
@@ -5669,6 +5767,9 @@ impl MuxelApp {
         // instance. Mutates + persists the instance's session bookkeeping.
         let session_resume = self.session_resume_for(instance_id);
         let resume_args = session_resume.as_ref().map(|(args, _)| args);
+        // Seat a remote pane on one of its host's masters before anything borrows
+        // the workspace.
+        let pane_master = self.pane_control_path(instance_id);
         let inst = self.workspace.instance(instance_id);
         let project = inst.and_then(|i| self.workspace.project(i.project_id));
         let resuming = inst
@@ -5799,8 +5900,11 @@ impl MuxelApp {
                 .and_then(|i| i.worktree_path.as_ref())
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| rref.remote_root.clone());
+            let control_path = pane_master.unwrap_or_else(|| {
+                Self::control_path_at(host.id, muxel_core::ssh::Master::Panes(0))
+            });
             let (program, args, env) =
-                self.remote_program_args(inst, &host, &remote_cwd, &resolved);
+                self.remote_program_args(inst, &host, &control_path, &remote_cwd, &resolved);
             (CommandSpec::program(program, args), None, env)
         } else {
             // A resumed Claude conversation must launch from the cwd recorded in
@@ -6358,8 +6462,14 @@ impl MuxelApp {
                 return;
             }
             let host_id = host.id;
-            // Pre-flight: verify login (and warm the ControlMaster) before opening.
-            let control_path = Self::control_path_for(host.id);
+            // Pre-flight: verify login before opening, and warm the pane masters the
+            // panes about to launch will ride, so they find each one up rather than
+            // racing to open it.
+            let pane_masters: Vec<String> = self
+                .pane_masters_to_warm(pid, host_id)
+                .into_iter()
+                .map(|n| Self::control_path_at(host_id, muxel_core::ssh::Master::Panes(n)))
+                .collect();
             let password = self.remote_password(&host);
             let owner_id = host.secret_owner(&self.identities);
             let name = host.name.clone();
@@ -6371,8 +6481,22 @@ impl MuxelApp {
                 let (res, fetched, sessions, has_memory) = cx
                     .background_executor()
                     .spawn(async move {
-                        let res =
-                            integrations::ssh_check(&host, &control_path, password.as_deref());
+                        // The first is the login check; the rest are the same login
+                        // again, so a failure there only means that master's panes
+                        // open it themselves.
+                        let (first, rest) = pane_masters
+                            .split_first()
+                            .expect("pane_masters_to_warm always lists the first master");
+                        let res = integrations::ssh_check(&host, first, password.as_deref());
+                        if res.is_ok() {
+                            for control_path in rest {
+                                let _ = integrations::ssh_check(
+                                    &host,
+                                    control_path,
+                                    password.as_deref(),
+                                );
+                            }
+                        }
                         let (fetched, sessions, has_memory) = match (&res, loc) {
                             (Ok(()), Some(loc)) => (
                                 integrations::fetch_remote_layout(&loc),
@@ -6565,9 +6689,10 @@ impl MuxelApp {
             .filter(|i| i.project_id == pid)
             .map(|i| muxel_core::tmux::session_for(i.tmux_session.as_deref(), &host_name, i.id))
             .collect();
-        // A pane the user closed whose kill is still unconfirmed must not come back
-        // as a pane — `reap_closed_sessions` is still working on it.
-        let closed = project.closed_sessions.clone();
+        // A pane the user closed must not come back as a pane: neither one whose kill
+        // is still unconfirmed (`reap_closed_sessions` is working on it) nor one whose
+        // kill was confirmed after `sessions` was listed.
+        let closed = self.closed_sessions_of(pid);
 
         let orphans = muxel_core::tmux::orphan_sessions(sessions, &root, &owned, &closed);
         if orphans.is_empty() {
@@ -6815,7 +6940,7 @@ impl MuxelApp {
         for (pid, session, is_remote) in self.tmux_sessions() {
             if is_remote && remote {
                 if let Some(host) = self.remote_host_for_project(pid) {
-                    let control_path = Self::control_path_for(host.id);
+                    let control_path = Self::commands_control_path(host.id);
                     let password = self.remote_password(&host);
                     integrations::kill_remote_tmux_detached(
                         &host,
@@ -7552,7 +7677,7 @@ impl MuxelApp {
             cx.notify();
             return;
         }
-        let control_path = Self::control_path_for(host.id);
+        let control_path = Self::commands_control_path(host.id);
         // Inline result shown above the wizard buttons (not a sidebar event).
         self.nr_verify = RemoteTestState::Testing;
         cx.notify();
@@ -7607,7 +7732,7 @@ impl MuxelApp {
             cx.notify();
             return;
         }
-        let control_path = Self::control_path_for(host.id);
+        let control_path = Self::commands_control_path(host.id);
         self.nr_scan = RemoteScanState::Scanning;
         cx.notify();
         let host_for_err = host.clone();
@@ -8712,8 +8837,11 @@ impl MuxelApp {
     }
 
     /// Refresh the branch label for remote projects off the UI thread (their git
-    /// runs over SSH, reusing the pane's ControlMaster — no keychain read here).
+    /// runs over SSH, reusing the host's commands master — no keychain read here).
     fn poll_remote_branches(&mut self, cx: &mut Context<Self>) {
+        if self.remote_branch_poll_inflight {
+            return;
+        }
         let jobs: Vec<(Uuid, integrations::RepoLoc)> = self
             .workspace
             .projects
@@ -8730,7 +8858,7 @@ impl MuxelApp {
                     integrations::RepoLoc::remote(
                         host,
                         r.remote_root.clone(),
-                        Self::control_path_for(r.host_id),
+                        Self::commands_control_path(r.host_id),
                         None,
                     ),
                 ))
@@ -8739,6 +8867,7 @@ impl MuxelApp {
         if jobs.is_empty() {
             return;
         }
+        self.remote_branch_poll_inflight = true;
         cx.spawn(async move |this, cx| {
             let results = cx
                 .background_executor()
@@ -8753,6 +8882,7 @@ impl MuxelApp {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                this.remote_branch_poll_inflight = false;
                 for (pid, branch, branches) in results {
                     this.project_branches.insert(pid, branch);
                     this.project_branch_lists.insert(pid, branches);
@@ -8768,28 +8898,48 @@ impl MuxelApp {
     /// `poll_peer_layout`). Runs on the same ~5s throttle as branch polling — the
     /// live counterpart to the connect-time `apply_remote_layout_sync`.
     fn fetch_remote_layouts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote_layout_poll_inflight {
+            return;
+        }
         let synced: Vec<Uuid> = self.remote_synced.iter().copied().collect();
-        let jobs: Vec<(Uuid, integrations::RepoLoc)> = synced
+        let jobs: Vec<(Uuid, u64, integrations::RepoLoc)> = synced
             .into_iter()
             .filter(|pid| self.project_syncs_layout(*pid))
             // Mid-push, the file may be half written; the next poll reads it whole.
             .filter(|pid| !self.remote_push_inflight.contains(pid))
-            .filter_map(|pid| self.repo_loc(pid).map(|loc| (pid, loc)))
+            .filter_map(|pid| {
+                let epoch = self.layout_push_epoch.get(&pid).copied().unwrap_or(0);
+                self.repo_loc(pid).map(|loc| (pid, epoch, loc))
+            })
             .collect();
         if jobs.is_empty() {
             return;
         }
+        self.remote_layout_poll_inflight = true;
         cx.spawn_in(window, async move |this, cx| {
             let results = cx
                 .background_executor()
                 .spawn(async move {
                     jobs.into_iter()
-                        .map(|(pid, loc)| (pid, integrations::fetch_remote_layout(&loc)))
+                        .map(|(pid, epoch, loc)| {
+                            (pid, epoch, integrations::fetch_remote_layout(&loc))
+                        })
                         .collect::<Vec<_>>()
                 })
                 .await;
+            // Even with the window gone, or polling would stop for good.
+            let _ = this.update(cx, |this, _| this.remote_layout_poll_inflight = false);
             let _ = this.update_in(cx, |this, window, cx| {
-                for (pid, json) in results {
+                for (pid, epoch, json) in results {
+                    // A push began after this read did, so the read may be this
+                    // machine's own previous write. Taken for a peer's, it would be
+                    // adopted over the push — a pane just closed here coming straight
+                    // back. The next poll reads the file as it is now.
+                    if this.remote_push_inflight.contains(&pid)
+                        || this.layout_push_epoch.get(&pid).copied().unwrap_or(0) != epoch
+                    {
+                        continue;
+                    }
                     if let Some(json) = json {
                         this.poll_peer_layout(pid, &json, window, cx);
                     }
@@ -12359,8 +12509,8 @@ impl MuxelApp {
         // Remote tmux session: closing a pane always tears its session down —
         // a *dropped* SSH connection never reaches here (an abnormal exit leaves
         // a tombstone pane instead of auto-closing), so reconnectability is
-        // preserved where it matters. Killed over ssh in the background
-        // (reuses the host's still-warm ControlMaster).
+        // preserved where it matters. Killed over ssh in the background, over the
+        // host's commands master — never the pane's own, which is going away.
         //
         // Gated on the host having tmux *at all*, not on tmux being its current
         // default: a host whose default was switched off since the pane launched
@@ -12412,9 +12562,8 @@ impl MuxelApp {
     /// Kill the tmux session a closed pane left on a remote host, and keep at it
     /// until the host confirms the session is gone.
     ///
-    /// One ssh round trip is not a guarantee: it can lose a race with the control
-    /// socket the pane's own ssh just took down, hit a blip, or reach a host that is
-    /// busy. Unconfirmed, that failure used to be invisible *and* self-reversing —
+    /// One ssh round trip is not a guarantee: it can hit a blip, or reach a host that
+    /// is busy. Unconfirmed, that failure used to be invisible *and* self-reversing —
     /// the agent kept running and the next connect adopted it back into a pane, so
     /// closing a remote agent looked like it had worked until muxel restarted.
     ///
@@ -12435,13 +12584,13 @@ impl MuxelApp {
         if let Some(p) = self.workspace.project_mut(project_id) {
             p.remember_closed_session(session.clone(), iid);
         }
-        let control_path = Self::control_path_for(host.id);
+        let control_path = Self::commands_control_path(host.id);
         let password = (host.auth == SshAuth::Password)
             .then(|| self.remote_password(&host))
             .flatten();
         cx.spawn(async move |this, cx| {
-            // Immediately, then backing off — a control socket that went down with
-            // the pane, or a momentary network stall, is usually over in seconds.
+            // Immediately, then backing off — a momentary network stall is usually
+            // over in seconds.
             let mut err = None;
             for (attempt, wait) in RETRY_REMOTE_KILL_SECS.iter().enumerate() {
                 if attempt > 0 {
@@ -12475,7 +12624,7 @@ impl MuxelApp {
                 }
             }
             let _ = this.update(cx, |this, cx| match err {
-                None => this.finish_closed_session(project_id, iid),
+                None => this.finish_closed_session(project_id, iid, &session),
                 Some(msg) => {
                     // Not an error dialog: the session is remembered, the pane stays
                     // closed, and the next connect to the host finishes the job.
@@ -12496,14 +12645,48 @@ impl MuxelApp {
         .detach();
     }
 
-    /// A confirmed kill: drop the ledger entry so the session can be adopted again
-    /// if the host ever hands out that name once more.
-    fn finish_closed_session(&mut self, project_id: Uuid, iid: Uuid) {
+    /// A confirmed kill: drop the persisted ledger entry, but keep the close for the
+    /// rest of the run (`reaped_sessions`).
+    ///
+    /// A connect lists the host's sessions before it adopts any, so one that listed
+    /// them just before this kill landed still carries the session, and would adopt
+    /// it straight back into a pane the moment the ledger let it go. Held for the run,
+    /// the close also covers a session that comes back on its own after the kill —
+    /// a pane closed while its ssh was still connecting can start it on the host
+    /// after the kill has run.
+    fn finish_closed_session(&mut self, project_id: Uuid, iid: Uuid, session: &str) {
+        let reaped = self.reaped_sessions.entry(project_id).or_default();
+        if !reaped.iter().any(|c| c.instance == iid) {
+            reaped.push(muxel_core::tmux::ClosedSession {
+                name: session.to_string(),
+                instance: iid,
+            });
+        }
         if let Some(p) = self.workspace.project_mut(project_id)
             && p.forget_closed_session(iid)
         {
             self.persist();
         }
+    }
+
+    /// Every close of `pid`'s that must not come back as a pane: the persisted ones
+    /// still being reaped, and the ones confirmed this run.
+    fn closed_sessions_of(&self, pid: Uuid) -> Vec<muxel_core::tmux::ClosedSession> {
+        let mut closed = self
+            .workspace
+            .project(pid)
+            .map(|p| p.closed_sessions.clone())
+            .unwrap_or_default();
+        if let Some(reaped) = self.reaped_sessions.get(&pid) {
+            closed.extend(
+                reaped
+                    .iter()
+                    .filter(|r| !closed.iter().any(|c| c.instance == r.instance))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+        }
+        closed
     }
 
     /// Connect-time half of [`Self::reap_remote_session`]: reconcile a project's
@@ -12515,6 +12698,9 @@ impl MuxelApp {
     /// has, which a derived name may no longer match (a renamed host, a session a
     /// peer created under its own slug).
     ///
+    /// A close confirmed earlier this run is checked again too: the list may predate
+    /// its kill (then this kill just confirms it), or its session may have come back.
+    ///
     /// Runs before adoption, so a close that finished here doesn't keep a pane away.
     fn reap_closed_sessions(
         &mut self,
@@ -12522,29 +12708,27 @@ impl MuxelApp {
         sessions: &[muxel_core::tmux::RemoteSession],
         cx: &mut Context<Self>,
     ) {
-        let Some(project) = self.workspace.project(pid) else {
-            return;
-        };
-        if project.closed_sessions.is_empty() {
-            return;
-        }
-        let pending: Vec<(Uuid, Option<String>)> = project
-            .closed_sessions
+        let pending: Vec<(Uuid, String, Option<String>)> = self
+            .closed_sessions_of(pid)
             .iter()
             .map(|c| {
                 (
                     c.instance,
+                    c.name.clone(),
                     muxel_core::tmux::live_closed_session(sessions, c).map(|s| s.name.clone()),
                 )
             })
             .collect();
+        if pending.is_empty() {
+            return;
+        }
         let Some(host) = self.remote_host_for_project(pid) else {
             return;
         };
-        for (iid, live) in pending {
+        for (iid, name, live) in pending {
             match live {
                 Some(session) => self.reap_remote_session(pid, iid, host.clone(), session, cx),
-                None => self.finish_closed_session(pid, iid),
+                None => self.finish_closed_session(pid, iid, &name),
             }
         }
     }
@@ -12942,7 +13126,7 @@ impl MuxelApp {
                 Some(integrations::RepoLoc::remote(
                     host,
                     r.remote_root.clone(),
-                    Self::control_path_for(r.host_id),
+                    Self::commands_control_path(r.host_id),
                     password,
                 ))
             }
@@ -13262,6 +13446,7 @@ impl MuxelApp {
         let json = doc.to_json();
         let local_key = key.clone();
         self.remote_push_inflight.insert(pid);
+        *self.layout_push_epoch.entry(pid).or_default() += 1;
         cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -15853,7 +16038,7 @@ impl MuxelApp {
         // The session lives on the host: respawn only once it is gone, or
         // `new-session -A` would reattach the old agent.
         let session = muxel_core::tmux::session_for(recorded_session.as_deref(), &host.name, iid);
-        let control_path = Self::control_path_for(host.id);
+        let control_path = Self::commands_control_path(host.id);
         let password = (host.auth == SshAuth::Password)
             .then(|| self.remote_password(&host))
             .flatten();
