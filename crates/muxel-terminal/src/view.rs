@@ -132,6 +132,7 @@ enum TitleProvider {
     Claude,
     Codex,
     Grok,
+    Muse,
     Other,
 }
 
@@ -158,6 +159,7 @@ impl TitleProvider {
             "claude" => Self::Claude,
             "codex" => Self::Codex,
             "grok" => Self::Grok,
+            "muse" => Self::Muse,
             _ => Self::Other,
         }
     }
@@ -258,6 +260,17 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
             Some(AgentTitleFrame {
                 status,
                 name: (!name.is_empty()).then_some(name),
+            })
+        }
+        TitleProvider::Muse => {
+            let name = title
+                .split_once(' ')
+                .filter(|(spinner, _)| is_codex_spinner(spinner))
+                .map(|(_, name)| name)
+                .unwrap_or(title);
+            (!name.is_empty() && !name.contains(['/', '\\', ':'])).then(|| AgentTitleFrame {
+                status: None,
+                name: Some(name.to_string()),
             })
         }
         TitleProvider::Other => None,
@@ -914,6 +927,9 @@ pub struct TerminalView {
     working_markers: Vec<String>,
     blocked_markers: Vec<String>,
     title_provider: TitleProvider,
+    muse_cwd_label: std::cell::RefCell<Option<String>>,
+    muse_hook_state: std::cell::Cell<Option<muxel_core::muse::MuseState>>,
+    muse_done: std::cell::Cell<bool>,
     /// Latches `Done` from a working→finished transition so a completed turn shows
     /// Done (and notifies) even when the agent didn't ring the bell. `prev_raw` is
     /// the previous *raw* classification; the latch clears when the agent works
@@ -1178,6 +1194,11 @@ impl TerminalView {
         let startup_program = spec.program.clone();
         let title_provider =
             TitleProvider::from_program(spec.status_program.as_deref().unwrap_or(&startup_program));
+        let muse_cwd_label = spec
+            .cwd
+            .as_deref()
+            .and_then(|cwd| muxel_core::muse::cwd_label(std::path::Path::new(cwd)))
+            .map(str::to_string);
         let focus_handle = cx.focus_handle();
 
         // Forward focus in/out to the PTY (DECSET 1004) so agents like Claude
@@ -1456,6 +1477,9 @@ impl TerminalView {
             working_markers,
             blocked_markers,
             title_provider,
+            muse_cwd_label: std::cell::RefCell::new(muse_cwd_label),
+            muse_hook_state: std::cell::Cell::new(None),
+            muse_done: std::cell::Cell::new(false),
             prev_raw: std::cell::Cell::new(None),
             done_latch: std::cell::Cell::new(false),
             completion_armed: std::cell::Cell::new(false),
@@ -1549,11 +1573,23 @@ impl TerminalView {
             }
         }
 
-        let observed_title = title_status(
-            self.title_provider,
-            title_text.as_deref(),
-            self.session.title_age(),
-        );
+        let muse_cwd_label = self.muse_cwd_label.borrow();
+        let observed_title = if self.title_provider == TitleProvider::Muse {
+            title_text
+                .as_deref()
+                .zip(muse_cwd_label.as_deref())
+                .and_then(|(title, cwd)| muxel_core::muse::title_state(title, cwd))
+                .map(|state| match state {
+                    muxel_core::muse::MuseState::Working => AgentStatus::Working,
+                    _ => AgentStatus::Idle,
+                })
+        } else {
+            title_status(
+                self.title_provider,
+                title_text.as_deref(),
+                self.session.title_age(),
+            )
+        };
         let submitted_turn = self.session.has_submitted_turn();
         self.provider_settled.set(provider_settled_after_title(
             self.provider_settled.get(),
@@ -1622,7 +1658,16 @@ impl TerminalView {
         if title != Some(AgentStatus::Blocked) && provider_screen == Some(AgentStatus::Blocked) {
             title = provider_screen;
         }
-        let raw = combine_title_status(self.exited, base, title, screen_working);
+        let raw = if !self.exited && self.muse_done.replace(false) {
+            AgentStatus::Done
+        } else if !self.exited
+            && self.title_provider == TitleProvider::Muse
+            && self.muse_hook_state.get() == Some(muxel_core::muse::MuseState::Blocked)
+        {
+            AgentStatus::Blocked
+        } else {
+            combine_title_status(self.exited, base, title, screen_working)
+        };
         // Marker-less providers may latch only after proving that their semantic
         // title protocol is live. Older/custom CLIs otherwise infer Working from
         // typing echo and turn two seconds of quiet into a false completion.
@@ -1649,6 +1694,20 @@ impl TerminalView {
     /// submitted turn. Fallback PTY quiet is not startup-readiness evidence.
     pub fn completion_ready(&self) -> bool {
         self.provider_settled.get() || self.session.has_submitted_turn()
+    }
+
+    /// Permission notifications are stronger than Muse's still-spinning title.
+    pub fn set_muse_hook_state(&self, metadata: &muxel_core::muse::MuseMetadata) {
+        let label = muxel_core::muse::cwd_label(&metadata.cwd).map(str::to_string);
+        if *self.muse_cwd_label.borrow() != label {
+            *self.muse_cwd_label.borrow_mut() = label;
+            self.status_cache.set(None);
+        }
+        if self.muse_hook_state.replace(Some(metadata.state)) != Some(metadata.state) {
+            self.muse_done
+                .set(metadata.state == muxel_core::muse::MuseState::Done);
+            self.status_cache.set(None);
+        }
     }
 
     /// Whether `needle` appears in the current visible grid — used by the app to

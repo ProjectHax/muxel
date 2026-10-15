@@ -1131,7 +1131,7 @@ mod launch_instruction_transport_tests {
     }
 
     #[test]
-    fn muse_launch_assembly_sends_no_automatic_input_or_instructions() {
+    fn muse_launch_assembly_supplies_hidden_session_context_without_a_user_turn() {
         let mut project = Project::new("repo", "/tmp/repo");
         project.memory_enabled = true;
         let instance = Instance::from_preset(project.id, &AgentPreset::muse());
@@ -1149,6 +1149,9 @@ mod launch_instruction_transport_tests {
         );
         assert_eq!(launch.startup_input, None);
         assert_eq!(launch.auto_mode_presses, 0);
+        let context = launch.session_context.expect("SessionStart context");
+        assert!(context.contains("MEMORY.md"));
+        assert!(context.contains("file:"));
 
         // A transport-bearing preset still receives the same assembled bundle.
         let control = Instance::from_preset(project.id, &AgentPreset::opencode());
@@ -2310,8 +2313,22 @@ mod claude_resume_tests {
 }
 
 /// Whether an agent-minted session id is no longer on disk (Codex today).
-fn agent_minted_session_gone(preset: &muxel_core::AgentPreset, session_id: &str) -> bool {
+fn agent_minted_session_gone(
+    preset: &muxel_core::AgentPreset,
+    session_id: &str,
+    env: &[muxel_core::EnvVar],
+) -> bool {
     let program = preset.program.as_deref().unwrap_or_default();
+    if muxel_core::muse::is_program(Some(program)) {
+        let env = env
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.value.clone()))
+            .collect::<Vec<_>>();
+        return crate::session_binding::muse_data_dir(&env).is_some_and(|root| {
+            crate::session_binding::muse_session_exists(&root, session_id)
+                .is_ok_and(|exists| !exists)
+        });
+    }
     if !is_codex_program(Some(program)) {
         return false;
     }
@@ -6001,7 +6018,12 @@ impl MuxelApp {
                 .preset_id
                 .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                 .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
-            preset.resume_flag.as_ref()?;
+            preset.effective_resume_flag()?;
+            if muxel_core::muse::is_program(inst.program.as_deref())
+                && inst.args.iter().any(|arg| arg == "--no-session-log")
+            {
+                return None;
+            }
             let project = self.workspace.project(inst.project_id);
             let cwd = inst
                 .worktree_path
@@ -6016,6 +6038,9 @@ impl MuxelApp {
         if local && is_claude_program(preset.program.as_deref()) {
             let _phase = ui_profile::phase("activation", "claude-binding", Some(iid));
             self.adopt_claude_session_binding(iid);
+        }
+        if local && muxel_core::muse::is_program(preset.program.as_deref()) {
+            self.adopt_muse_session_binding(iid);
         }
         let sibling_session_ids: HashSet<String> = self
             .workspace
@@ -6071,7 +6096,7 @@ impl MuxelApp {
                 }
             } else if inst.session_id.as_deref().is_some_and(|sid| {
                 let _phase = ui_profile::phase("activation", "codex-session-exists", Some(iid));
-                agent_minted_session_gone(&preset, sid)
+                agent_minted_session_gone(&preset, sid, &inst.env)
             }) {
                 inst.session_id = None;
                 inst.session_started = false;
@@ -6099,7 +6124,7 @@ impl MuxelApp {
                     .preset_id
                     .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                     .or_else(|| self.presets.iter().find(|p| p.name == i.preset))?;
-                Some((preset.resume_flag.as_deref()?, resume_args?))
+                Some((preset.effective_resume_flag()?, resume_args?))
             })
             .is_some_and(|(flag, args)| args.first().is_some_and(|arg| arg == flag));
         // Build one instruction bundle, then let the preset's injection transport
@@ -6113,6 +6138,7 @@ impl MuxelApp {
                 program: None,
                 args: Vec::new(),
                 startup_input: None,
+                session_context: None,
                 auto_mode_presses: 0,
                 submit: true,
                 env: Vec::new(),
@@ -6124,6 +6150,24 @@ impl MuxelApp {
         }
         // Classify on the agent program (the matches below consume resolved.program).
         let agent_program = resolved.program.clone();
+        if muxel_core::muse::is_program(agent_program.as_deref())
+            && project.is_some_and(|project| project.remote.is_none())
+            && agent_program
+                .as_deref()
+                .is_some_and(muxel_terminal::muse_config_supported)
+            && let Some(data_dir) = muxel_store::data_dir()
+            && let Some(config) = crate::session_binding::prepare_muse_hooks(
+                &data_dir,
+                instance_id,
+                &resolved.env,
+                &resolved.args,
+                resolved.session_context.as_deref(),
+                inst.and_then(|instance| instance.tmux_session.as_deref())
+                    .is_some_and(integrations::tmux_session_exists),
+            )
+        {
+            muxel_core::muse::insert_hook_config(&mut resolved.args, config);
+        }
 
         // Claude emits an exact SessionStart event for an in-process `/resume`.
         // Add one process-local hook through an invocation-only settings file. A file
@@ -9784,6 +9828,9 @@ impl MuxelApp {
             self.browsers.remove(&iid);
             self.last_status.remove(&iid);
             self.failed_launches.remove(&iid);
+            if let Some(data_dir) = muxel_store::data_dir() {
+                crate::session_binding::clear_muse_binding(&data_dir, iid);
+            }
             self.workspace.remove_instance_meta(iid);
         }
         for instance in instances {
@@ -9928,6 +9975,64 @@ impl MuxelApp {
             instance.session_started = previous_session_started;
             instance.auto_name = previous_auto_name;
             false
+        }
+    }
+
+    fn adopt_muse_session_binding(
+        &mut self,
+        iid: Uuid,
+    ) -> Option<(muxel_core::muse::MuseMetadata, bool)> {
+        let data = muxel_store::data_dir()?;
+        let current = self.workspace.instance(iid)?.session_id.as_deref();
+        let metadata = crate::session_binding::read_muse_binding(&data, iid, current)?;
+        if session_id_bound_elsewhere(&self.workspace.instances, iid, &metadata.session_id) {
+            return None;
+        }
+        let instance = self.workspace.instance_mut(iid)?;
+        let changed = instance.session_id.as_deref() != Some(&metadata.session_id);
+        if changed {
+            let previous = (
+                instance.session_id.clone(),
+                instance.session_started,
+                instance.auto_name.clone(),
+            );
+            instance.session_id = Some(metadata.session_id.clone());
+            instance.session_started = true;
+            instance.auto_name = None;
+            if !self.try_persist() {
+                let instance = self.workspace.instance_mut(iid)?;
+                instance.session_id = previous.0;
+                instance.session_started = previous.1;
+                instance.auto_name = previous.2;
+                return None;
+            }
+        }
+        Some((metadata, changed))
+    }
+
+    fn sync_muse_session_ids(&mut self, cx: &mut Context<Self>) {
+        let candidates = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|instance| {
+                muxel_core::muse::is_program(instance.program.as_deref())
+                    && self
+                        .workspace
+                        .project(instance.project_id)
+                        .is_some_and(|project| project.remote.is_none())
+            })
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>();
+        for iid in candidates {
+            if let Some((metadata, changed)) = self.adopt_muse_session_binding(iid) {
+                if let Some(view) = self.terminals.get(&iid) {
+                    view.read(cx).set_muse_hook_state(&metadata);
+                }
+                if changed {
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -10164,6 +10269,7 @@ impl MuxelApp {
         // Poll independently of the slower remote-project cadence so a normal
         // quit shortly after `/resume` is unlikely to persist the old binding.
         self.sync_claude_session_ids(cx);
+        self.sync_muse_session_ids(cx);
         self.sync_grok_session_ids(cx);
         let focused = self.active_instance;
         // A `--resume` launch has this long to prove its saved session is valid;
@@ -13243,6 +13349,9 @@ impl MuxelApp {
         worktree_id: Option<Uuid>,
         cx: &mut Context<Self>,
     ) {
+        if let Some(data_dir) = muxel_store::data_dir() {
+            crate::session_binding::clear_muse_binding(&data_dir, iid);
+        }
         let is_remote = self
             .workspace
             .project(project_id)
@@ -24503,6 +24612,7 @@ impl MuxelApp {
                 },
             },
             InjectionMode::TypeIn => InjectionMode::TypeIn,
+            InjectionMode::SessionHook => InjectionMode::SessionHook,
             InjectionMode::None => InjectionMode::None,
         };
         let kind = self.settings_ui.p_kind;
@@ -28958,6 +29068,7 @@ impl MuxelApp {
         let ui = &self.settings_ui;
         let inj = ui.p_injection.clone();
         let is_flag = matches!(inj, InjectionMode::CliFlag { .. });
+        let is_muse = muxel_core::muse::is_program(Some(ui.p_program.read(cx).value().as_ref()));
         v_flex()
             .gap_2()
             .max_w(px(560.0))
@@ -29078,7 +29189,21 @@ impl MuxelApp {
                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                         this.set_editor_injection(InjectionMode::TypeIn, cx)
                                     })),
-                            ),
+                            )
+                            .children((is_muse || matches!(inj, InjectionMode::SessionHook)).then(
+                                || {
+                                    Button::new("inj-session")
+                                        .ghost()
+                                        .selected(matches!(inj, InjectionMode::SessionHook))
+                                        .label(t("At session start"))
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.set_editor_injection(
+                                                InjectionMode::SessionHook,
+                                                cx,
+                                            )
+                                        }))
+                                },
+                            )),
                     )
                     .children(is_flag.then(|| {
                         v_flex()
@@ -30096,7 +30221,7 @@ mod shell_title_tests {
             program: Some("codex-title-proxy.exe".to_string()),
             ..preset
         };
-        assert!(!agent_minted_session_gone(&proxy, &first));
+        assert!(!agent_minted_session_gone(&proxy, &first, &[]));
 
         let owner = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
         let mut sibling = Instance::from_preset(owner.project_id, &AgentPreset::claude());
