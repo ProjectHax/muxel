@@ -1359,19 +1359,23 @@ fn notify(summary: String, body: String, focus: Option<Uuid>) {
         if focus.is_some() {
             builder.action("default", &t("Open"));
         }
-        if let Ok(handle) = builder.show() {
-            // Blocks running the D-Bus loop until the notification is clicked or
-            // closed — which also keeps the sending connection alive (GNOME
-            // withdraws the popup when it closes), replacing the old keep-alive
-            // sleep. On a body click we record the target for the UI thread.
-            handle.wait_for_action(|action| {
-                if action == "default"
-                    && let Some(iid) = focus
-                {
-                    *PENDING_NOTIFICATION_FOCUS.lock().unwrap() = Some(iid);
-                }
-            });
-        }
+        let Ok(handle) = builder.show() else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        drop(handle);
+        // Blocks running the D-Bus loop until the notification is clicked or
+        // closed — which also keeps the sending connection alive (GNOME
+        // withdraws the popup when it closes), replacing the old keep-alive
+        // sleep. On a body click we record the target for the UI thread.
+        #[cfg(not(target_os = "macos"))]
+        handle.wait_for_action(|action| {
+            if action == "default"
+                && let Some(iid) = focus
+            {
+                *PENDING_NOTIFICATION_FOCUS.lock().unwrap() = Some(iid);
+            }
+        });
     });
 }
 
