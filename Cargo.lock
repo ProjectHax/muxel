@@ -5031,6 +5031,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "rust-embed",
  "self-replace",
+ "serde",
  "serde_json",
  "sys-locale",
  "tokio",

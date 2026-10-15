@@ -112,9 +112,21 @@ feature is added or changed, update the matching entry here in the same change**
   --model glm-5.2:cloud`); change the agent or model in the preset's args.
 - **Muse Code** — launches Meta's installed `muse` CLI, with optional model and
   reasoning-effort overrides. It uses Muse's configured defaults otherwise.
-  Startup instruction injection is disabled; the preset sends no automatic turn.
-  Resume through Muse's own `/resume` or `muse resume`; automatic conversation
-  capture on pane restart is not yet integrated.
+  Local retained sessions bind to their pane through Muse's root lifecycle
+  hooks and resume the exact conversation after restart, including panes in
+  the same folder. The status dot follows Muse's spinner and completion title,
+  with permission notifications marking a blocked turn. SessionStart context
+  delivers file-link, memory and custom instructions without submitting a turn.
+  Hooks are configured per launch outside the project; existing user, project
+  and managed hooks are preserved. Only permission notifications invoke the
+  notification helper, whose work is limited to one second and exits successfully
+  on unavailable data or blocked I/O. Windows uses the native binary selected by
+  the installed launcher. Custom hook overrides and nonstandard batch wrappers
+  keep their own configuration; automatic capture requires the native hook route.
+  Strict managed-hook schemas also launch with their configuration unchanged.
+  Positional input after `--` is preserved when configuring hooks.
+  Reattaching to a surviving local tmux pane retains its hook binding; a new
+  process rotates it. Closing a pane removes its generated hook metadata.
 - **Configurable launch** — per agent: program, model + model flag, effort +
   effort flag, extra args (shell-style quoting: `--append-system-prompt "be terse"`
   stays one argument, matching the iOS companion's parser; an unbalanced quote

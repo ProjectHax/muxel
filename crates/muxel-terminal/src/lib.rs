@@ -24,7 +24,7 @@ pub use colors::TerminalPalette;
 pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_uri};
 pub use present_flag::{mark_present_needed, take_present_needed};
 pub use profile::startup_event;
-pub use session::{CommandSpec, PtyChunk, TerminalSession};
+pub use session::{CommandSpec, PtyChunk, TerminalSession, muse_config_supported};
 pub use view::{
     AgentStatus, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
     TerminalFocusObserver, TerminalFocusProfile, TerminalLaunch, TerminalMouseMode,
