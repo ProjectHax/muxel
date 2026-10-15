@@ -274,29 +274,59 @@ pub fn write_remote_file(loc: &RepoLoc, abs_path: &str, content: &str) -> Result
     let RepoLoc::Remote(c) = loc else {
         bail!("not a remote file");
     };
-    use std::io::Write;
     let cmd = remote_ops::write_file(c.host.os, abs_path);
+    pipe_to_remote(c, cmd, content.as_bytes(), "write failed")?;
+    Ok(())
+}
+
+/// Copy a pasted file to the host — see [`remote_ops::upload_paste`] — and return
+/// its path there, ready to paste into a pane on that host.
+pub fn upload_paste(loc: &RepoLoc, name: &str, bytes: &[u8]) -> Result<String> {
+    let RepoLoc::Remote(c) = loc else {
+        bail!("not a remote project");
+    };
+    let cmd = remote_ops::upload_paste(c.host.os, name);
+    let out = pipe_to_remote(c, cmd, bytes, "upload failed")?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        bail!("the host didn't say where it saved “{name}”");
+    }
+    Ok(path)
+}
+
+/// Run `cmd` on the host with `input` piped to its stdin. `Err` with ssh's stderr
+/// (or `failed` when it said nothing) unless the command succeeds.
+fn pipe_to_remote(
+    c: &RemoteConn,
+    cmd: String,
+    input: &[u8],
+    failed: &str,
+) -> Result<std::process::Output> {
+    use std::io::Write;
     let mut command = remote_ssh_command(c, cmd);
     command
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|e| ssh_spawn_error(c.host.auth, e))?;
-    child
-        .stdin
-        .take()
-        .context("ssh stdin")?
-        .write_all(content.as_bytes())
-        .context("writing remote file")?;
+    // Written from its own thread: ssh may block writing stdout/stderr while this
+    // is still writing a large input, and both sides would wait on each other.
+    let mut stdin = child.stdin.take().context("ssh stdin")?;
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
     let out = child.wait_with_output().context("waiting for ssh")?;
+    let written = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("writing to ssh panicked"))?;
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr);
         let msg = msg.trim();
-        bail!("{}", if msg.is_empty() { "write failed" } else { msg });
+        bail!("{}", if msg.is_empty() { failed } else { msg });
     }
-    Ok(())
+    written.context("sending to ssh")?;
+    Ok(out)
 }
 
 /// Add `ignore_line` to `<root>/.gitignore` if not already present (the bare

@@ -20,6 +20,7 @@ mod libraries;
 mod power;
 #[cfg(target_os = "windows")]
 mod present_pump;
+mod remote_paste;
 mod secrets;
 mod session_binding;
 mod settings_view;

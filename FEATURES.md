@@ -567,6 +567,16 @@ feature is added or changed, update the matching entry here in the same change**
   Claude Code on Windows uses `Alt+V` (sent as `ESC v`) for images.
   `Shift+Insert` pastes and `Ctrl+Insert` copies. File **drag-and-drop** pastes
   shell-quoted paths into the focused terminal.
+- **Pasting images and files into a remote pane** — an agent on an SSH host (in
+  tmux or not) can read neither this machine's clipboard nor its files, so in a
+  remote pane a pasted image, or files copied in a file manager or dropped on the
+  pane, are first copied to the host and their paths *there* are pasted instead —
+  remote Claude Code attaches a pasted screenshot just as it would locally. Files
+  land in `~/.cache/muxel/paste` (owner-only; the user's temp folder on a Windows
+  host) and are cleared after a week. An image an agent won't take (a TIFF, as
+  copying from Preview gives, or a BMP) goes as a PNG. Folders and files over 25 MB
+  aren't copied, and the notification feed says which. Text pastes as it always
+  has.
 - **Mouse reporting** — when an app enables mouse mode (Grok, Claude, vim, …),
   clicks, drags, and motion are forwarded as SGR/X10 mouse events so the app can
   focus its prompt, scroll its own pane, set the cursor, etc. Hold **Shift** to

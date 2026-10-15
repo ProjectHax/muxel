@@ -37,8 +37,17 @@ notify-rust = "4"
 # icons render as empty gray plates. Feature unification applies this to
 # gpui-component-assets as well.
 rust-embed = { version = "8", features = ["debug-embed"] }
-# Decode the embedded app icon (PNG) to RGBA for the Windows/macOS tray icon.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Decode the embedded app icon (PNG) to RGBA for the Windows/macOS tray icon, and
+# re-encode a clipboard image an agent can't take (TIFF, BMP, …) as PNG before it is
+# pasted into a remote pane. gpui already builds these decoders, so the extra
+# features add no code.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "tiff",
+    "bmp",
+    "ico",
+    "pnm",
+] }
 # Detect the OS UI locale at startup for i18n (already resolved transitively).
 sys-locale = "0.3"
 # Gitignore-aware file walk for the Ctrl+P search palette.

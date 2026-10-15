@@ -1820,9 +1820,27 @@ impl TerminalView {
     }
 }
 
+/// A paste that names this machine's files rather than carrying text: what a
+/// [`LocalPasteHandler`] receives.
+#[derive(Clone, Debug)]
+pub enum LocalPaste {
+    /// An image on the clipboard (a screenshot, an image copied from a browser).
+    Image(Image),
+    /// Files copied in a file manager, or dropped on the pane.
+    Paths(Vec<std::path::PathBuf>),
+}
+
+/// Takes over a pane's [`LocalPaste`]s (see
+/// [`TerminalSession::set_local_paste_handler`]). Called on the UI thread; whatever
+/// it pastes into the pane it does later, through the session, once it is ready.
+pub type LocalPasteHandler = Arc<dyn Fn(LocalPaste, &App) + Send + Sync>;
+
 /// Paste from the system clipboard into the PTY.
 /// Image → forward Ctrl+V (0x16) so the agent reads the OS clipboard.
 /// File paths → shell-quoted paths. Text → bracketed paste.
+///
+/// A pane with a [`LocalPasteHandler`] hands images and file paths to it instead:
+/// the far side of an ssh pane can't read this machine's clipboard or its files.
 pub fn paste_clipboard_into_session(session: &TerminalSession, cx: &App) {
     let Some(item) = cx.read_from_clipboard() else {
         return;
@@ -1832,13 +1850,16 @@ pub fn paste_clipboard_into_session(session: &TerminalSession, cx: &App) {
     for entry in item.entries() {
         match entry {
             ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
-                session.write_input(&[0x16]);
+                match session.local_paste_handler() {
+                    Some(handler) => handler(LocalPaste::Image(image.clone()), cx),
+                    None => session.write_input(&[0x16]),
+                }
                 return;
             }
             ClipboardEntry::ExternalPaths(paths) => {
                 let paths: Vec<_> = paths.paths().to_vec();
                 if !paths.is_empty() {
-                    session.paste_paths(&paths);
+                    paste_local_paths(session, paths, cx);
                     return;
                 }
             }
@@ -1847,6 +1868,15 @@ pub fn paste_clipboard_into_session(session: &TerminalSession, cx: &App) {
     }
     if let Some(text) = item.text() {
         session.paste(&text);
+    }
+}
+
+/// Paste local files into the pane: their quoted paths, or — when the pane has a
+/// [`LocalPasteHandler`] — whatever it makes of them.
+fn paste_local_paths(session: &TerminalSession, paths: Vec<std::path::PathBuf>, cx: &App) {
+    match session.local_paste_handler() {
+        Some(handler) => handler(LocalPaste::Paths(paths), cx),
+        None => session.paste_paths(&paths),
     }
 }
 
@@ -1883,7 +1913,7 @@ impl Render for TerminalView {
             // ExternalPaths, not as FileDropEvent listeners. Same path Zed uses.
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.session.mark_user_input();
-                this.session.paste_paths(paths.paths());
+                paste_local_paths(&this.session, paths.paths().to_vec(), cx);
                 this.session.clear_selection();
                 cx.notify();
             }))

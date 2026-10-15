@@ -6311,6 +6311,23 @@ impl MuxelApp {
         } else {
             self.restoring_activity.remove(&instance_id);
         }
+        // A remote pane's agent can read neither this machine's clipboard nor its
+        // files: copy what is pasted to the host and paste its path there instead.
+        if self.remote_host_for_instance(instance_id).is_some() {
+            let app = cx.weak_entity();
+            let handler: muxel_terminal::LocalPasteHandler = Arc::new(move |paste, cx: &App| {
+                let app = app.clone();
+                cx.spawn(async move |cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.paste_into_remote(instance_id, paste, cx);
+                    });
+                })
+                .detach();
+            });
+            view.read(cx)
+                .session()
+                .set_local_paste_handler(Some(handler));
+        }
         self.terminals.insert(instance_id, view);
         self.terminal_launches
             .insert(instance_id, (Instant::now(), was_resume));
@@ -6327,6 +6344,72 @@ impl MuxelApp {
             self.persist();
         }
         cx.notify();
+    }
+
+    /// Paste a clipboard image or local files into remote pane `iid`: copy each to
+    /// its host, then paste the paths there, where the agent can open them (see
+    /// `remote_paste`). Whatever can't be copied is reported, and the rest still
+    /// pasted.
+    fn paste_into_remote(
+        &mut self,
+        iid: Uuid,
+        paste: muxel_terminal::LocalPaste,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(loc) = self
+            .workspace
+            .instance(iid)
+            .and_then(|i| self.repo_loc(i.project_id))
+        else {
+            return;
+        };
+        let integrations::RepoLoc::Remote(conn) = &loc else {
+            return;
+        };
+        let os = conn.host.os;
+        let unique = format!(
+            "{}-{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S"),
+            &Uuid::new_v4().simple().to_string()[..6]
+        );
+        cx.spawn(async move |this, cx| {
+            let (paths, failed) = cx
+                .background_executor()
+                .spawn(async move {
+                    let (files, mut failed) = crate::remote_paste::paste_files(paste, &unique);
+                    let mut paths = Vec::new();
+                    for file in files {
+                        match integrations::upload_paste(&loc, &file.name, &file.bytes) {
+                            Ok(path) => paths.push(path),
+                            Err(e) => failed.push(format!("{}: {e:#}", file.name)),
+                        }
+                    }
+                    (paths, failed)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if !paths.is_empty()
+                    && let Some(view) = this.terminals.get(&iid)
+                {
+                    let mut text = String::new();
+                    for path in &paths {
+                        text.push(' ');
+                        text.push_str(&muxel_core::remote_ops::paste_path(os, path));
+                    }
+                    text.push(' ');
+                    view.read(cx).session().paste(&text);
+                }
+                if !failed.is_empty() {
+                    this.add_event(
+                        NotifKind::Error,
+                        t("Couldn't paste into the remote pane"),
+                        failed.join("\n"),
+                    );
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Re-derive the terminal palette from the active theme and apply it to all

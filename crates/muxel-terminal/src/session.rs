@@ -350,6 +350,9 @@ pub struct TerminalSession {
     /// Active search needle (lowercased not required — matching is ASCII-insensitive).
     /// Empty = no search; the element highlights matches of this each paint.
     search: Mutex<Vec<char>>,
+    /// Where a paste naming this machine's files goes instead of the PTY — set for
+    /// a pane whose program runs on another host. See [`crate::LocalPaste`].
+    local_paste: Mutex<Option<crate::LocalPasteHandler>>,
     /// The local working directory the child was spawned in — the base for
     /// resolving relative file paths on ctrl+click. Remote panes run `ssh`
     /// locally with no cwd set, so their relative paths stay unresolvable.
@@ -739,6 +742,7 @@ impl TerminalSession {
                 since: Instant::now(),
             }),
             search: Mutex::new(Vec::new()),
+            local_paste: Mutex::new(None),
             cwd,
             hovered_link: Mutex::new(None),
             pointer_hit: Mutex::new(None),
@@ -937,6 +941,17 @@ impl TerminalSession {
     /// auto-continue and outside control type on their own and never mark it.
     pub fn mark_user_input(&self) {
         *self.last_user_input.lock() = Some(Instant::now());
+    }
+
+    /// Send pastes that name this machine's files — a clipboard image, copied or
+    /// dropped files — to `handler` rather than into the PTY. For a pane whose
+    /// program runs on another host, which can read neither.
+    pub fn set_local_paste_handler(&self, handler: Option<crate::LocalPasteHandler>) {
+        *self.local_paste.lock() = handler;
+    }
+
+    pub(crate) fn local_paste_handler(&self) -> Option<crate::LocalPasteHandler> {
+        self.local_paste.lock().clone()
     }
 
     /// When the user last sent this terminal input themselves, if ever.

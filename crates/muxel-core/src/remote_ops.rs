@@ -312,11 +312,90 @@ pub fn scan_projects(os: RemoteOs, marker_rel: &str, max_depth: usize, prune: &[
     }
 }
 
+/// Days a pasted file is kept on the host before the next paste clears it.
+const PASTE_KEEP_DAYS: u32 = 7;
+
+/// Store stdin as file `name` in muxel's paste folder on the host and print the
+/// file's absolute path — the text pasted into a remote pane in place of a
+/// clipboard image or a local file. An agent there can't read this machine's
+/// clipboard or disk, but it can read a path on its own host.
+///
+/// The folder is the user's own: `~/.cache/muxel/paste`, owner-only, rather than a
+/// shared `/tmp` directory another user could create first and then read every
+/// screenshot pasted through it. On Windows it is the user's temp directory, which
+/// is per-user already. Files older than [`PASTE_KEEP_DAYS`] are cleared on the way
+/// in, so the folder doesn't grow forever.
+///
+/// `name` must already be a plain file name ([`paste_file_name`]).
+pub fn upload_paste(os: RemoteOs, name: &str) -> String {
+    match os {
+        RemoteOs::Unix => format!(
+            "umask 077 && d=\"$HOME/.cache/muxel/paste\" && mkdir -p \"$d\" && \
+             {{ find \"$d\" -type f -mtime +{PASTE_KEEP_DAYS} -delete 2>/dev/null; true; }} && \
+             f=\"$d\"/{} && cat > \"$f\" && printf '%s\\n' \"$f\"",
+            sh_quote(name)
+        ),
+        RemoteOs::Windows => ps(&format!(
+            "$d = Join-Path ([System.IO.Path]::GetTempPath()) 'muxel-paste'; \
+             [void](New-Item -ItemType Directory -Force -Path $d); \
+             Get-ChildItem -LiteralPath $d -File | \
+             Where-Object {{ $_.LastWriteTime -lt (Get-Date).AddDays(-{PASTE_KEEP_DAYS}) }} | \
+             Remove-Item -Force -ErrorAction SilentlyContinue; \
+             $f = Join-Path $d {}; \
+             $stdin = [Console]::OpenStandardInput(); \
+             $buf = New-Object System.IO.MemoryStream; \
+             $stdin.CopyTo($buf); \
+             [System.IO.File]::WriteAllBytes($f, $buf.ToArray()); \
+             Write-Output $f",
+            ps_quote(name)
+        )),
+    }
+}
+
+/// The name a pasted file gets on the host: `unique`, then `original` reduced to
+/// characters that need no quoting anywhere (`[A-Za-z0-9._-]`, the rest `_`), so the
+/// path pasted into the prompt reads cleanly and an agent can't mistake part of it
+/// for something else. The extension survives; an overlong stem is cut.
+pub fn paste_file_name(unique: &str, original: &str) -> String {
+    const MAX_STEM: usize = 60;
+    let clean: String = original
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let clean = clean.trim_start_matches('.');
+    let (stem, ext) = match clean.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => (stem, Some(ext)),
+        _ => (clean, None),
+    };
+    let stem: String = stem.chars().take(MAX_STEM).collect();
+    let stem = if stem.is_empty() { "file" } else { &stem };
+    match ext {
+        Some(ext) => format!("{unique}-{stem}.{ext}"),
+        None => format!("{unique}-{stem}"),
+    }
+}
+
+/// A path on the host as it should be pasted into a pane there: shell-quoted on
+/// Unix, double-quoted on Windows when it has a space. Bare when it needs nothing.
+pub fn paste_path(os: RemoteOs, path: &str) -> String {
+    match os {
+        RemoteOs::Unix => sh_quote(path),
+        RemoteOs::Windows if path.contains(char::is_whitespace) => format!("\"{path}\""),
+        RemoteOs::Windows => path.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_seeded_file, git, list_files, push_prep, read_file, scan_projects, test_dir,
-        test_file, write_file,
+        ensure_seeded_file, git, list_files, paste_file_name, paste_path, push_prep, read_file,
+        scan_projects, test_dir, test_file, upload_paste, write_file,
     };
     use crate::RemoteOs;
     use base64::Engine as _;
@@ -527,6 +606,69 @@ mod tests {
         ));
         assert!(s.contains("-contains '.muxel/'"), "{s}");
         assert!(s.contains("$_.Trim()"), "{s}");
+    }
+
+    #[test]
+    fn a_paste_lands_in_an_owner_only_folder_and_prints_its_path() {
+        let u = upload_paste(UNIX, "20261014-a1b2c3-image.png");
+        assert!(u.starts_with("umask 077 && "), "{u}");
+        assert!(u.contains("\"$HOME/.cache/muxel/paste\""), "{u}");
+        assert!(u.contains("-mtime +7 -delete"), "{u}");
+        assert!(
+            u.ends_with(
+                "f=\"$d\"/20261014-a1b2c3-image.png && cat > \"$f\" && printf '%s\\n' \"$f\""
+            ),
+            "{u}"
+        );
+        // A name that needs quoting is quoted, never spliced in raw.
+        assert!(upload_paste(UNIX, "a b.png").contains("f=\"$d\"/'a b.png'"));
+
+        let w = upload_paste(WIN, "x.png");
+        assert_opaque(&w);
+        let w = script_of(&w);
+        assert!(w.contains("GetTempPath()"), "{w}");
+        assert!(w.contains("Join-Path $d 'x.png'"), "{w}");
+        assert!(w.contains("WriteAllBytes"), "binary-safe: {w}");
+        assert!(w.contains("Write-Output $f"), "{w}");
+    }
+
+    #[test]
+    fn pasted_file_names_need_no_quoting() {
+        assert_eq!(paste_file_name("u1", "image.png"), "u1-image.png");
+        assert_eq!(
+            paste_file_name("u1", "Screen Shot 2026-10-14 at 3.04.05 PM.png"),
+            "u1-Screen_Shot_2026-10-14_at_3.04.05_PM.png"
+        );
+        assert_eq!(
+            paste_file_name("u1", "$(rm -rf ~).txt"),
+            "u1-__rm_-rf___.txt"
+        );
+        assert_eq!(paste_file_name("u1", ".env"), "u1-env");
+        assert_eq!(paste_file_name("u1", "Makefile"), "u1-Makefile");
+        assert_eq!(paste_file_name("u1", "日本.jpg"), "u1-__.jpg");
+        assert_eq!(paste_file_name("u1", ""), "u1-file");
+        let long = format!("{}.png", "a".repeat(200));
+        assert_eq!(
+            paste_file_name("u1", &long),
+            format!("u1-{}.png", "a".repeat(60))
+        );
+    }
+
+    #[test]
+    fn pasted_paths_are_quoted_for_the_host() {
+        assert_eq!(
+            paste_path(UNIX, "/home/me/.cache/x.png"),
+            "/home/me/.cache/x.png"
+        );
+        assert_eq!(paste_path(UNIX, "/Users/a b/x.png"), "'/Users/a b/x.png'");
+        assert_eq!(
+            paste_path(WIN, "C:\\Users\\me\\x.png"),
+            "C:\\Users\\me\\x.png"
+        );
+        assert_eq!(
+            paste_path(WIN, "C:\\Users\\a b\\x.png"),
+            "\"C:\\Users\\a b\\x.png\""
+        );
     }
 
     #[test]
