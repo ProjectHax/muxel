@@ -290,6 +290,31 @@ pub fn launch_session_args(
     program: Option<&str>,
     args: &[String],
 ) -> Vec<String> {
+    launch_session_args_with_env(session, cwd, program, args, &[], &[])
+}
+
+/// [`launch_session_args`], with the program started with `env` set
+/// (`new-session -e NAME=VALUE`, which tmux 3.2 added: see
+/// [`session_env_supported`]) and without the variables named in `unset`.
+///
+/// tmux starts a new session's program from its server's environment, not from
+/// the environment of the client that asked for the session, so `-e` is the only
+/// way to hand the program a variable of its own. The server's environment is
+/// whatever the process that started it had, so `unset` is first removed from it
+/// (`set-environment -g -u`, which every tmux has, and which every session on that
+/// server shares). A session `-A` attaches to instead keeps the environment it
+/// started with.
+///
+/// The values land in the client's command line, where any process can read
+/// them, so pass nothing private and no project paths (see [`start_server_args`]).
+pub fn launch_session_args_with_env(
+    session: &str,
+    cwd: Option<&str>,
+    program: Option<&str>,
+    args: &[String],
+    env: &[(String, String)],
+    unset: &[&str],
+) -> Vec<String> {
     let mut v = vec![
         "-u".to_string(),
         "set".to_string(),
@@ -298,8 +323,38 @@ pub fn launch_session_args(
         "on".to_string(),
         ";".to_string(),
     ];
-    v.extend(new_session_args(session, cwd, program, args));
+    for name in unset {
+        v.extend(["set-environment", "-g", "-u", name, ";"].map(String::from));
+    }
+    let mut new = new_session_args(session, cwd, program, args);
+    // With `new-session`'s other options: after `-A -s NAME`, before `--`.
+    let options = env
+        .iter()
+        .flat_map(|(name, value)| ["-e".to_string(), format!("{name}={value}")]);
+    new.splice(4..4, options);
+    v.extend(new);
     v
+}
+
+/// Whether the tmux that printed `version` (`tmux -V`: `tmux 3.4`, `tmux 3.2a`,
+/// `tmux next-3.6`, `tmux master`) takes `new-session -e`, added in 3.2. Anything
+/// it can't read is taken as no, which only costs the variables.
+pub fn session_env_supported(version: &str) -> bool {
+    let version = version.trim();
+    let version = version.strip_prefix("tmux ").unwrap_or(version).trim();
+    if version == "master" {
+        return true;
+    }
+    let version = version.strip_prefix("next-").unwrap_or(version);
+    let number = |part: Option<&str>| -> Option<u32> {
+        let digits: String = part?.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    let mut parts = version.split('.');
+    let Some(major) = number(parts.next()) else {
+        return false;
+    };
+    (major, number(parts.next()).unwrap_or(0)) >= (3, 2)
 }
 
 /// Arguments for `tmux …` to read a session's user option (`@name`), printing its
@@ -601,6 +656,69 @@ mod tests {
                 "/work"
             ]
         );
+    }
+
+    #[test]
+    fn a_new_sessions_program_is_handed_its_variables_with_its_options() {
+        let env = [("MUXEL_INSTANCE_ID".to_string(), "1a2b".to_string())];
+        let unset = ["MUXEL_INSTANCE_ID", "OTHER"];
+        let args = launch_session_args_with_env("s", Some("/w"), Some("claude"), &[], &env, &unset);
+        assert_eq!(
+            args[6..],
+            [
+                // Off the server first, in the same client's command list.
+                "set-environment",
+                "-g",
+                "-u",
+                "MUXEL_INSTANCE_ID",
+                ";",
+                "set-environment",
+                "-g",
+                "-u",
+                "OTHER",
+                ";",
+                "new-session",
+                "-A",
+                "-s",
+                "s",
+                "-e",
+                "MUXEL_INSTANCE_ID=1a2b",
+                "-c",
+                "/w",
+                "--",
+                "claude"
+            ]
+        );
+        // Without variables it is exactly what it was.
+        assert_eq!(
+            launch_session_args_with_env("s", None, None, &[], &[], &[]),
+            launch_session_args("s", None, None, &[])
+        );
+    }
+
+    #[test]
+    fn session_variables_need_tmux_3_2() {
+        for yes in [
+            "tmux 3.2",
+            "tmux 3.2a",
+            "tmux 3.4\n",
+            "tmux 3.10",
+            "tmux 4.0",
+            "tmux next-3.6",
+            "tmux master",
+        ] {
+            assert!(session_env_supported(yes), "{yes}");
+        }
+        for no in [
+            "tmux 3.1c",
+            "tmux 3.0a",
+            "tmux 2.7",
+            "tmux openbsd-7.4",
+            "",
+            "tmux",
+        ] {
+            assert!(!session_env_supported(no), "{no}");
+        }
     }
 
     #[test]

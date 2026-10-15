@@ -1008,7 +1008,8 @@ impl TerminalLaunch {
         Self::spawn_with_fallback(spec, CommandSpec::shell(), size, None)
     }
 
-    /// Spawn while attributing PTY sub-phase timings to one pane.
+    /// Spawn for one pane, attributing PTY timings to it and giving any local
+    /// fallback shell that pane's identity.
     pub fn spawn_for_instance(
         spec: CommandSpec,
         size: (u16, u16),
@@ -1039,9 +1040,17 @@ impl TerminalLaunch {
                 // `{e:#}` includes the full anyhow context chain (e.g. the real
                 // OS error: "No such file or directory"), not just the top context.
                 let detail = launch_error.replace(['\'', '"', '\n', '\r'], " ");
-                let shell = fallback.with_startup_input(format!(
+                let mut shell = fallback.with_startup_input(format!(
                     "printf '%s\\n' 'muxel: could not launch {prog}: {detail}'"
                 ));
+                if let Some(instance_id) = instance_id {
+                    // The fallback is a local program even when the failed command
+                    // was ssh or tmux. Give it only its own id, not transport env.
+                    shell.env.push((
+                        muxel_core::control::INSTANCE_ID_ENV.to_string(),
+                        instance_id.to_string(),
+                    ));
+                }
                 let (session, rx) = spawn(shell.clone())
                     .with_context(|| format!("fallback shell (after `{prog}` failed: {detail})"))?;
                 Ok(Self {
@@ -1936,7 +1945,126 @@ impl Render for TerminalView {
     }
 }
 
-// These tests spawn real processes, so they are Unix-only.
+#[cfg(test)]
+mod launch_identity_tests {
+    use super::TerminalLaunch;
+    use crate::session::{CommandSpec, ProfiledPtyChunk};
+    use muxel_core::control::INSTANCE_ID_ENV;
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    #[test]
+    fn failed_launch_fallback_has_own_identity() {
+        const CHILD: &str = "MUXEL_FALLBACK_ID_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate inherited environment without mutating a parallel test's
+            // process environment. Cover both a foreign pane id and no id.
+            for inherited in [Some(Uuid::from_u128(1).to_string()), None] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                let test_name =
+                    concat!(module_path!(), "::failed_launch_fallback_has_own_identity");
+                let (_, test_name) = test_name
+                    .split_once("::")
+                    .expect("crate-qualified test name");
+                child.args(["--exact", test_name, "--nocapture", "--test-threads=1"]);
+                child
+                    .env(CHILD, "1")
+                    .env_remove("MUXEL_TEST_TRANSPORT_ONLY");
+                if let Some(id) = inherited {
+                    child.env(INSTANCE_ID_ENV, id);
+                } else {
+                    child.env_remove(INSTANCE_ID_ENV);
+                }
+                let result = child.output().expect("run isolated fallback regression");
+                assert!(
+                    result.status.success()
+                        && String::from_utf8_lossy(&result.stdout).contains("1 passed;"),
+                    "fallback regression failed: {}{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            return;
+        }
+
+        let own_id = Uuid::from_u128(2);
+        let mut requested = CommandSpec::program(
+            std::env::temp_dir()
+                .join(format!("muxel-missing-program-{}", Uuid::new_v4()))
+                .to_string_lossy(),
+            Vec::new(),
+        );
+        requested.env = vec![
+            (INSTANCE_ID_ENV.into(), Uuid::from_u128(3).to_string()),
+            (
+                "MUXEL_TEST_TRANSPORT_ONLY".into(),
+                "requested-transport-only".into(),
+            ),
+        ];
+        // A deterministic shell prints its real environment without a user
+        // profile or GUI. Only the fallback command is injected; failure and
+        // fallback dispatch run through the production path.
+        #[cfg(windows)]
+        let fallback = CommandSpec::program(
+            "powershell.exe",
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "[Console]::WriteLine('MUXEL_FALLBACK_ENV=' + $env:MUXEL_INSTANCE_ID + ':' + $env:MUXEL_TEST_TRANSPORT_ONLY)".into(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let fallback = CommandSpec::program(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "printf 'MUXEL_FALLBACK_ENV=%s:%s\\n' \"$MUXEL_INSTANCE_ID\" \"${MUXEL_TEST_TRANSPORT_ONLY-}\""
+                    .into(),
+            ],
+        );
+        let launch =
+            TerminalLaunch::spawn_with_fallback(requested, fallback, (120, 24), Some(own_id))
+                .expect("fallback shell should spawn");
+        assert!(
+            launch.launch_error().is_some(),
+            "requested launch must fail"
+        );
+        let expected = format!("MUXEL_FALLBACK_ENV={own_id}:\r\n");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            match launch.rx.try_recv() {
+                Ok(ProfiledPtyChunk::Output { bytes, .. }) => {
+                    launch.session.process_output(&bytes);
+                    output.extend(bytes);
+                    if output
+                        .windows(expected.len())
+                        .any(|w| w == expected.as_bytes())
+                    {
+                        break;
+                    }
+                }
+                Ok(ProfiledPtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => {
+                    break;
+                }
+                Err(async_channel::TryRecvError::Empty) => {}
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        launch.session.kill();
+        assert!(
+            output
+                .windows(expected.len())
+                .any(|w| w == expected.as_bytes()),
+            "fallback must have its own id and no requested transport env: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+// Existing launch smoke tests use Unix programs.
 #[cfg(all(test, unix))]
 mod launch_tests {
     // Import specifically (not `super::*`) so `#[test]` resolves to the built-in

@@ -13,7 +13,91 @@ const CLAUDE_BINDING_DIR: &str = "provider-session-bindings/claude";
 const CLAUDE_SETTINGS_DIR: &str = "provider-session-bindings/claude/settings";
 const CLAUDE_HOOK_FLAG: &str = "--claude-session-hook";
 const MAX_HOOK_INPUT_BYTES: u64 = 64 * 1024;
-pub(crate) const MUXEL_INSTANCE_ID_ENV: &str = "MUXEL_INSTANCE_ID";
+pub(crate) const MUXEL_INSTANCE_ID_ENV: &str = muxel_core::control::INSTANCE_ID_ENV;
+
+/// The process muxel starts for a pane, for [`pane_env`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaneProcess {
+    /// The pane's program itself, on this computer.
+    Program,
+    /// A tmux client; the program runs in a tmux session on this computer.
+    TmuxClient,
+    /// An ssh client; the program runs on another computer.
+    SshClient,
+}
+
+/// The environment a pane's process starts with, on top of muxel's own: the
+/// variables to set (what the preset and instance set, then `launch`, what the
+/// launch itself needs, such as ssh's password), and the ones to remove.
+///
+/// The pane's own program also gets `MUXEL_INSTANCE_ID`, the id of the pane it
+/// runs in, which `muxel ctl` takes as AGENT and Claude's session hook reads to
+/// say which pane switched conversations. It replaces any value set for it,
+/// since only muxel knows which pane that is.
+///
+/// A tmux or ssh client has none at all, not even one muxel itself inherited
+/// (from a pane it was started in) or one set for it, since each can pass its
+/// environment on to the program. A tmux pane's program starts from the tmux
+/// server's environment and gets its id through [`tmux_pane_args`], but tmux
+/// copies the variables its `update-environment` option names from the client
+/// into a new session, so a user who names this one would hand the session the
+/// client's. An ssh `SendEnv` naming this variable could forward the client's
+/// local control id to the remote program, where it does not identify that
+/// program.
+pub(crate) fn pane_env(
+    configured: &[(String, String)],
+    launch: Vec<(String, String)>,
+    instance_id: Uuid,
+    process: PaneProcess,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut env = configured.to_vec();
+    env.extend(launch);
+    let not_the_id = |(key, _): &(String, String)| !key.eq_ignore_ascii_case(MUXEL_INSTANCE_ID_ENV);
+    match process {
+        PaneProcess::Program => {
+            env.retain(not_the_id);
+            env.push((MUXEL_INSTANCE_ID_ENV.to_string(), instance_id.to_string()));
+            (env, Vec::new())
+        }
+        PaneProcess::TmuxClient | PaneProcess::SshClient => {
+            env.retain(not_the_id);
+            (env, vec![MUXEL_INSTANCE_ID_ENV.to_string()])
+        }
+    }
+}
+
+/// The tmux arguments for a local pane kept in tmux session `session`, running
+/// `program` (with none, the user's shell).
+///
+/// The program starts from the tmux server's environment, not this client's, so
+/// the pane's id is handed over with `new-session -e` where the local tmux takes
+/// it (`session_env`: tmux 3.2 and later). Only the id: a command line is visible
+/// to other processes, and the rest of a pane's environment can hold secrets and
+/// paths. First, on every tmux, the id is cleared from the server: one started
+/// from inside another pane (by a `tmux` typed in a shell pane, or by a muxel run
+/// there) has that pane's id, which a program started without `-e` would take as
+/// its own.
+pub(crate) fn tmux_pane_args(
+    session: &str,
+    program: Option<&str>,
+    args: &[String],
+    instance_id: Uuid,
+    session_env: bool,
+) -> Vec<String> {
+    let own = [(MUXEL_INSTANCE_ID_ENV.to_string(), instance_id.to_string())];
+    let env: &[(String, String)] = if session_env { &own } else { &[] };
+    // No `-c`: the client is spawned with `cwd` already, which is what tmux uses
+    // for a new session anyway. Passing it would put the project's path in this
+    // client's argv for no gain.
+    muxel_core::tmux::launch_session_args_with_env(
+        session,
+        None,
+        program,
+        args,
+        env,
+        &[MUXEL_INSTANCE_ID_ENV],
+    )
+}
 
 pub(crate) fn hook_instance_from_args(
     args: impl IntoIterator<Item = OsString>,
@@ -502,6 +586,66 @@ mod tests {
         }
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_pane_muxel_starts_itself_is_told_its_own_instance_id_and_no_other_carries_one() {
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let id = Uuid::new_v4();
+        let configured = vec![
+            pair("FOO", "bar"),
+            pair("muxel_instance_id", "stale"),
+            pair(MUXEL_INSTANCE_ID_ENV, "also-stale"),
+        ];
+
+        let (local, removed) = pane_env(&configured, Vec::new(), id, PaneProcess::Program);
+        assert_eq!(
+            local,
+            vec![
+                pair("FOO", "bar"),
+                pair(MUXEL_INSTANCE_ID_ENV, &id.to_string())
+            ]
+        );
+        assert!(removed.is_empty());
+        // It is what the Claude hook reads back.
+        assert_eq!(
+            hook_instance_from_args(
+                [OsString::from(CLAUDE_HOOK_FLAG)],
+                Some(local[1].1.clone().into())
+            ),
+            Ok(Some(id))
+        );
+
+        // A tmux client has no id, set or inherited (tmux hands the id over).
+        let (client, removed) = pane_env(&configured, Vec::new(), id, PaneProcess::TmuxClient);
+        assert_eq!(client, vec![pair("FOO", "bar")]);
+        assert_eq!(removed, [MUXEL_INSTANCE_ID_ENV]);
+
+        // Nor has an ssh client, which an ssh `SendEnv` could forward it from. What
+        // the launch needs, such as ssh's password, is kept.
+        let launch = vec![pair("SSHPASS", "pw")];
+        let (remote, removed) = pane_env(&configured, launch, id, PaneProcess::SshClient);
+        assert_eq!(remote, vec![pair("FOO", "bar"), pair("SSHPASS", "pw")]);
+        assert_eq!(removed, [MUXEL_INSTANCE_ID_ENV]);
+    }
+
+    #[test]
+    fn a_tmux_panes_program_gets_its_own_id_or_none_never_the_servers() {
+        let id = Uuid::new_v4();
+        let own = format!("{MUXEL_INSTANCE_ID_ENV}={id}");
+        let clear = ["set-environment", "-g", "-u", MUXEL_INSTANCE_ID_ENV, ";"];
+        // After `-u set -g mouse on ;`, before the session is created.
+        let args = tmux_pane_args("s", Some("claude"), &[], id, true);
+        assert_eq!(args[6..11], clear);
+        assert_eq!(
+            args[11..],
+            ["new-session", "-A", "-s", "s", "-e", &own, "--", "claude"]
+        );
+        // Older tmux has no `-e`: the program starts without an id rather than
+        // with whichever pane's the server had.
+        let args = tmux_pane_args("s", None, &[], id, false);
+        assert_eq!(args[6..11], clear);
+        assert_eq!(args[11..], ["new-session", "-A", "-s", "s"]);
     }
 
     #[test]
