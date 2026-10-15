@@ -86,7 +86,8 @@ feature is added or changed, update the matching entry here in the same change**
   Terminals and editors move across; a browser pane is re-created in the new window
   at the same URL (a native webview belongs to the window that built it).
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
-  button returns it to its original location.
+  button returns it to its original location. Re-docking a working agent clears
+  that pane's stale finished or needs-input card.
 - **Close terminates** — closing a pop-out window kills its terminal (with a
   confirmation). Editors and browser panes just close.
 
@@ -522,6 +523,9 @@ feature is added or changed, update the matching entry here in the same change**
   the pane closes or restarts. A withheld send fails and attempts to release only
   its own tmux claim; timeout, command failure or older tmux can leave the claim
   in place under its existing aging rules.
+- **Popped-out terminals** — `ctl` keeps reading their status and screen and can
+  send input when they move to a separate window or dock again. Their activity
+  timestamps stay current, so `wait` recognizes completed or blocked turns.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It

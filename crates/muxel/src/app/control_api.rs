@@ -661,7 +661,7 @@ impl MuxelApp {
         let id = inst.id;
         Some(if self.failed_launches.contains_key(&id) {
             AgentState::Failed
-        } else if let Some(view) = self.terminals.get(&id) {
+        } else if let Some(view) = self.terminal_view(id) {
             let view = view.read(cx);
             if self.reconnecting.contains_key(&id) {
                 AgentState::Starting
@@ -880,8 +880,7 @@ impl MuxelApp {
             })));
         };
         let visible = self
-            .terminals
-            .get(&iid)
+            .terminal_view(iid)
             .map(|view| view.read(cx).visible_text())
             .unwrap_or_default();
         let scope = if full {
@@ -962,8 +961,7 @@ impl MuxelApp {
             }
             _ => {}
         }
-        self.terminals
-            .get(&iid)
+        self.terminal_view(iid)
             .map(|view| view.read(cx).session().clone())
             .ok_or_else(|| format!("'{name}' isn't running"))
     }
@@ -1062,8 +1060,7 @@ impl MuxelApp {
             ));
         }
         let screen = self
-            .terminals
-            .get(&iid)
+            .terminal_view(iid)
             .map(|view| view.read(cx).visible_text())
             .unwrap_or_default();
         let question = ctl::pending_question(&screen).ok_or("couldn't read the question")?;
