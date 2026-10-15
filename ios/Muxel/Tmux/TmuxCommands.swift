@@ -105,6 +105,28 @@ enum TmuxCommands {
         return v
     }
 
+    /// The variable that tells a program desktop muxel starts which pane it runs in.
+    /// Port of `INSTANCE_ID_ENV` in `crates/muxel-core/src/control.rs`.
+    static let instanceIdEnv = "MUXEL_INSTANCE_ID"
+
+    /// `set-environment -g -u MUXEL_INSTANCE_ID ';'`: the tmux commands that lead every
+    /// `new-session` this app sends, removing `instanceIdEnv` from the server's global
+    /// environment first. Port of the `unset` half of `launch_session_args_with_env`
+    /// (`crates/muxel-core/src/tmux.rs`), which desktop's SSH panes run before theirs.
+    ///
+    /// tmux starts a new session's program from its *server's* environment, not the
+    /// client's. A host's one server is shared, and one first started from inside a
+    /// desktop muxel pane on that host holds that pane's id — which an agent launched
+    /// here would then take as its own, recording its conversation against that other
+    /// pane, and typing into it when it asks `muxel ctl` to type into "itself".
+    ///
+    /// Harmless when the variable isn't set, and needs no server: `new-session` in the
+    /// same command list starts one. A session `-A` attaches to keeps the environment it
+    /// started with. Shell text: the `';'` reaches tmux as its command separator.
+    static var clearInstanceId: String {
+        "set-environment -g -u \(instanceIdEnv) ';'"
+    }
+
     /// Kill a session (exact-match `=` target). Port of `kill_session_args`.
     static func killSession(_ session: String) -> [String] {
         ["kill-session", "-t", "=\(session)"]
@@ -119,9 +141,12 @@ enum TmuxCommands {
     /// exits instantly, taking the session (and, if it's the only one, the server)
     /// with it. With no `program`, tmux starts its own default login shell, so no
     /// wrapping is needed. Returned as a shell string (not a quoted arg array) because
-    /// it relies on the remote shell expanding `$SHELL`.
+    /// it relies on the remote shell expanding `$SHELL`. Clears a stale pane id from the
+    /// server first (`clearInstanceId`).
     static func launchAgent(session: String, cwd: String, program: String?, args: [String]) -> String {
-        var cmd = "\(pathPrelude); tmux new-session -d -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
+        var cmd =
+            "\(pathPrelude); tmux \(clearInstanceId) new-session -d -s \(Shell.quote(session)) "
+            + "-c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"
@@ -148,11 +173,12 @@ enum TmuxCommands {
     /// `program` in a login shell. Attached-at-init is the whole point: interactive
     /// TUI agents (claude) crash if they initialize with no client; over a live PTY
     /// they get one, exactly like desktop's `ssh -t`. `program == nil` → default shell.
+    /// Clears a stale pane id from the server first (`clearInstanceId`).
     static func newAttachedPTYCommand(session: String, cwd: String, program: String?, args: [String]) -> String {
         // `clear;` wipes the login banner + echoed command before tmux takes over.
         var cmd =
-            "\(pathPrelude); clear; exec tmux new-session -A -s \(Shell.quote(session)) "
-            + "-c \(Shell.quote(cwd))"
+            "\(pathPrelude); clear; exec tmux \(clearInstanceId) new-session -A "
+            + "-s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"

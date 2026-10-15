@@ -104,7 +104,8 @@ final class ProtocolPortTests: XCTestCase {
         let cmd = TmuxCommands.launchAgent(
             session: "muxel_h_abcdef12", cwd: "/work", program: "claude", args: ["--model", "opus"])
         XCTAssertTrue(cmd.hasPrefix(
-            "\(TmuxCommands.pathPrelude); tmux new-session -d -s 'muxel_h_abcdef12' -c '/work' "
+            "\(TmuxCommands.pathPrelude); tmux set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            + "new-session -d -s 'muxel_h_abcdef12' -c '/work' "
             + "-- \"${SHELL:-/bin/sh}\" -ilc "))
         XCTAssertTrue(cmd.contains("exec"))
         XCTAssertTrue(cmd.contains("claude"))
@@ -112,7 +113,30 @@ final class ProtocolPortTests: XCTestCase {
         // No program → tmux's own default login shell, no wrapping.
         XCTAssertEqual(
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); tmux new-session -d -s 's' -c '/w'")
+            "\(TmuxCommands.pathPrelude); tmux set-environment -g -u MUXEL_INSTANCE_ID ';' "
+                + "new-session -d -s 's' -c '/w'")
+    }
+
+    // Port of the `unset` half of `launch_session_args_with_env` (tmux.rs), which
+    // desktop's SSH panes run before `new-session`. A new session's program starts from
+    // the tmux *server's* environment; one first started inside a desktop muxel pane on
+    // the host holds that pane's id, and an agent launched here would take it as its own.
+    func testNewSessionsClearAStalePaneId() {
+        XCTAssertEqual(TmuxCommands.instanceIdEnv, "MUXEL_INSTANCE_ID")
+        XCTAssertEqual(
+            TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: nil, args: []),
+            "\(TmuxCommands.pathPrelude); clear; exec tmux set-environment -g -u MUXEL_INSTANCE_ID ';' "
+                + "new-session -A -s 's' -c '/w'")
+        // Cleared in the same tmux command list, ahead of the session it would leak into.
+        let clearThenCreate = "tmux set-environment -g -u MUXEL_INSTANCE_ID ';' new-session "
+        for cmd in [
+            TmuxCommands.launchAgent(session: "s", cwd: "/w", program: "claude", args: []),
+            TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: "claude", args: []),
+        ] {
+            XCTAssertTrue(cmd.contains(clearThenCreate), "no clear before new-session: \(cmd)")
+        }
+        // Attaching to a session leaves the environment it started with alone.
+        XCTAssertFalse(TmuxCommands.attachPTYCommand(session: "s").contains("set-environment"))
     }
 
     func testCommandLineShellQuotes() {

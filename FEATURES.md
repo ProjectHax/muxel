@@ -532,8 +532,8 @@ feature is added or changed, update the matching entry here in the same change**
   panes go without too: muxel keeps the
   variable off the ssh client, which an ssh `SendEnv` setting could forward, and
   clears it from the remote tmux server, which a muxel pane on that host may have
-  started. A session muxel reattaches to or adopts keeps the environment it started
-  with.
+  started. The iOS app clears it the same way before every session it creates. A
+  session muxel reattaches to or adopts keeps the environment it started with.
 - **Local and owner-only** — the running app listens on a random loopback port and
   writes it, with a fresh random token, to `control.json` in muxel's data directory,
   readable only by the user; nothing is reachable from the network, and a request
