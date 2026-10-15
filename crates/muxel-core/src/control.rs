@@ -16,8 +16,11 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Bumped when a request or reply changes shape incompatibly.
+/// Endpoint and plain-request version. Guarded sends require an explicit v2.
 pub const PROTOCOL_VERSION: u32 = 1;
+/// An older v1 host ignores unknown fields but rejects this request version
+/// before forwarding a guarded send to the app.
+pub const GUARDED_SEND_VERSION: u32 = 2;
 
 /// The file, in muxel's data directory, where the running app says how to reach
 /// it. Owner-only: the token in it is the whole of the authorization.
@@ -98,11 +101,29 @@ pub enum Command {
         /// Type even though the agent is working or blocked.
         #[serde(default)]
         force: bool,
+        /// Refuse if the pane no longer has this terminal launch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_id: Option<Uuid>,
     },
     /// Pick a numbered option of the question the agent is blocked on.
     Answer { agent: String, option: String },
     /// Press keys (see [`key_bytes`]).
     Keys { agent: String, keys: Vec<String> },
+}
+
+/// Require v2 for launch guards so older hosts refuse instead of ignoring them.
+pub fn request_version(command: &Command) -> u32 {
+    if matches!(
+        command,
+        Command::Send {
+            launch_id: Some(_),
+            ..
+        }
+    ) {
+        GUARDED_SEND_VERSION
+    } else {
+        PROTOCOL_VERSION
+    }
 }
 
 /// The reply to a [`Request`]: one line of JSON.
@@ -111,6 +132,13 @@ pub struct Response {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// Why it failed, when that is one of the [`ErrorCode`]s.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "known_code"
+    )]
+    pub code: Option<ErrorCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -120,17 +148,131 @@ impl Response {
         Self {
             ok: true,
             result: Some(result),
+            code: None,
             error: None,
         }
     }
 
-    pub fn err(error: impl Into<String>) -> Self {
+    pub fn err(error: impl Into<Error>) -> Self {
+        let error = error.into();
         Self {
             ok: false,
             result: None,
-            error: Some(error.into()),
+            code: error.code,
+            error: Some(error.message),
         }
     }
+
+    /// The result, or why there is none.
+    pub fn into_result(self) -> Result<Value, Error> {
+        if self.ok {
+            return Ok(self.result.unwrap_or(Value::Null));
+        }
+        Err(Error {
+            code: self.code,
+            message: self
+                .error
+                .unwrap_or_else(|| "muxel refused the request".into()),
+        })
+    }
+}
+
+/// A code from a newer muxel, which this one doesn't know, reads as none rather
+/// than making the whole reply unreadable.
+fn known_code<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<ErrorCode>, D::Error> {
+    Ok(Option::<Value>::deserialize(de)?.and_then(|code| serde_json::from_value(code).ok()))
+}
+
+/// Why `muxel ctl` didn't type into an agent, or couldn't reach muxel, as a word a
+/// script can act on; `error` says the same for people and may be reworded. Other
+/// failures (a bad command line, no agent by that name) carry only `error`.
+///
+/// These refusals type nothing, except `input_changed`: its prompt was pasted,
+/// but Enter was withheld. A lost reply after sending has an uncertain outcome;
+/// inspect the agent before retrying.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// The agent is working: `wait` for it (or `send --force`).
+    Working,
+    /// The agent is waiting on a question: `answer` it, or press `keys`.
+    Blocked,
+    /// The agent is still starting: try again in a moment.
+    Starting,
+    /// The pane isn't running this session, or its program failed to start.
+    NotRunning,
+    /// The agent's program has exited.
+    Exited,
+    /// Another request holds the shared tmux claim.
+    ClaimedElsewhere,
+    /// The pane's terminal was replaced since the caller inspected it.
+    LaunchMismatch,
+    /// The prompt was pasted but its delayed Enter was withheld.
+    InputChanged,
+    /// `muxel ctl` found no muxel to ask: it isn't running, outside control is
+    /// off, or its `control.json` can't be read or reached.
+    HostUnavailable,
+    /// The endpoint's owner process did not pass the liveness check.
+    StaleEndpoint,
+}
+
+/// A failed request: what to tell the user, and its [`ErrorCode`] when it has one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Error {
+    pub code: Option<ErrorCode>,
+    pub message: String,
+}
+
+impl Error {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code: Some(code),
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for Error {
+    fn from(message: String) -> Self {
+        Self {
+            code: None,
+            message,
+        }
+    }
+}
+
+impl From<&str> for Error {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Check immediately before pasting, including after asynchronous claim work.
+/// `--force` only overrides busy state; it never overrides a launch mismatch.
+pub fn check_launch_id(expected: Option<Uuid>, current: Option<Uuid>) -> Result<(), Error> {
+    if let Some(expected) = expected
+        && current != Some(expected)
+    {
+        return Err(Error::new(
+            ErrorCode::LaunchMismatch,
+            format!(
+                "the agent's terminal was replaced since you saw launch_id {expected}: check `status` before sending again"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A successful send receipt, created only after the paste was admitted to the
+/// PTY writer. Admission does not confirm delivery to or consumption by the agent.
+pub fn pasted_prompt_receipt(pane: Uuid, launch: Uuid) -> Value {
+    json!({ "sent": true, "pasted": true, "agent": short_id(pane), "launch_id": launch })
 }
 
 /// What an agent pane is doing, as `muxel ctl` reports it.
@@ -179,6 +321,15 @@ pub struct AgentInfo {
     /// When the agent last started working, finished or blocked (unix ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_since: Option<i64>,
+    /// This run of the pane's terminal: a new id each time muxel opens a terminal
+    /// for the pane (starting or restarting its program, reconnecting or
+    /// recovering its session, reopening its workspace), so a caller can tell
+    /// that what it saw may be out of date. An agent kept in tmux can still be in
+    /// the same conversation under a new id, and an agent that changes
+    /// conversation by itself (Claude's `/resume`) keeps its id. `None` while it
+    /// isn't running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<Uuid>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
     /// The pane the user has focused.
@@ -210,6 +361,18 @@ pub fn status_since(activity: &AgentActivity) -> Option<i64> {
     .into_iter()
     .flatten()
     .max()
+}
+
+/// The [`AgentInfo::launch_id`] of an agent in `state` whose pane's terminal has
+/// session id `terminal`: that id while the program runs, none while it starts
+/// and none once it has exited, though its pane keeps the terminal open.
+pub fn launch_id(state: Option<AgentState>, terminal: Option<Uuid>) -> Option<Uuid> {
+    match state? {
+        AgentState::Working | AgentState::Idle | AgentState::Blocked | AgentState::Done => terminal,
+        AgentState::Starting | AgentState::Exited | AgentState::NotRunning | AgentState::Failed => {
+            None
+        }
+    }
 }
 
 /// The value given to `flag` in `args` (`--model x` or `--model=x`).
@@ -844,7 +1007,9 @@ usage: muxel ctl <command> [args]
   status [AGENT]                 an agent's status (or every agent's)
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
-  send AGENT TEXT [--force]      type TEXT and press Enter ('-' reads stdin)
+  send AGENT TEXT [--force] [--launch-id ID]
+                                 type TEXT and press Enter ('-' reads stdin);
+                                 --launch-id refuses a replaced terminal
   wait AGENT [--timeout SECS] [--full]
                                  wait for the turn to end, then show it
   answer AGENT OPTION            pick a numbered option of a pending question
@@ -854,7 +1019,11 @@ usage: muxel ctl <command> [args]
 
 AGENT is an id from `panes`, a name, project/name, or `focused`.
 Everything after `--` is taken literally (for text that starts with --).
-muxel must be running with Settings > Grok Bot > \"Allow outside tools to control muxel\" on.";
+muxel must be running with Settings > Grok Bot > \"Allow outside tools to control muxel\" on.
+
+Replies are JSON. A failure is {\"ok\": false, \"error\": ...}, with a \"code\" when a
+script can act on it (see `muxel ctl skill`). Exit status: 0 success,
+1 request failure (including no running muxel), 2 invalid command line or stdin.";
 
 /// Parse the arguments after `muxel ctl`.
 pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
@@ -864,6 +1033,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     let mut words: Vec<String> = Vec::new();
     let mut full = false;
     let mut force = false;
+    let mut launch_id: Option<Uuid> = None;
     let mut lines: Option<usize> = None;
     let mut timeout: Option<u64> = None;
     let mut it = rest.iter();
@@ -875,6 +1045,10 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             }
             "--full" => full = true,
             "--force" => force = true,
+            "--launch-id" => {
+                let value = it.next().ok_or("--launch-id needs an ID")?;
+                launch_id = Some(Uuid::parse_str(value).map_err(|_| "--launch-id needs a UUID")?);
+            }
             "--lines" => lines = Some(number(it.next(), "--lines")?),
             "--timeout" => timeout = Some(number(it.next(), "--timeout")?),
             flag if flag.starts_with("--") && flag.len() > 2 => {
@@ -882,6 +1056,9 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             }
             _ => words.push(arg.clone()),
         }
+    }
+    if launch_id.is_some() && cmd != "send" {
+        return Err("--launch-id is only valid with send".into());
     }
     let agent = |words: &[String]| -> Result<String, String> {
         words
@@ -933,7 +1110,12 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             if text.is_empty() {
                 return Err("`send` needs the TEXT to type ('-' reads it from stdin)".into());
             }
-            Command::Send { agent, text, force }
+            Command::Send {
+                agent,
+                text,
+                force,
+                launch_id,
+            }
         }
         "answer" => {
             at_most(2)?;
@@ -1089,8 +1271,9 @@ If muxel won't run:
   put `MUXEL_CONTROL=/path/to/control.json` in front of the command.
 
 Every command prints JSON. A failure exits non-zero and prints
-`{"ok": false, "error": "..."}` - the error says what went wrong and what to do.
-If it says muxel isn't running or outside control is off, ask the user to open
+`{"ok": false, "error": "..."}` - the error says what went wrong and what to do,
+and a `code` is added when there is something to act on (see Errors below). If
+it says muxel isn't running or outside control is off, ask the user to open
 muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
 
 ## Commands
@@ -1116,6 +1299,12 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   in its input. A closed or restarted terminal also withholds Enter. Check
   `screen` before sending again. Focus reports, terminal replies and local scrollback do not
   count; input from another tmux client is outside this local guard.
+  Add `--launch-id ID` with the full ID from `panes` or `status` to refuse a replaced
+  terminal. This guard is checked again immediately before pasting after any
+  asynchronous claim work, and `--force` never bypasses it. A successful reply
+  includes the actual `launch_id` and `"pasted": true` for admission to the PTY
+  writer, not confirmation of agent delivery. A lost reply does not make a
+  retry safe; inspect the agent before typing again.
 - `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
   ends (or it blocks on a question, or exits), then print what `show` prints plus
   `wait.outcome`: finished, blocked, exited, not_running or timed_out. Default
@@ -1144,6 +1333,33 @@ If you are running in a muxel pane yourself, the environment variable
 - `starting` - launching. `exited` - the program ended. `failed` - it couldn't
   start. `not_running` - the pane hasn't been started this session; the user has
   to open it in muxel.
+
+Each agent also has a `launch_id`, which changes whenever muxel opens a new
+terminal for it: when its program starts or restarts, when muxel reconnects to
+it, and when the user reopens its workspace. A different one means the agent may
+have been restarted since you last looked (one kept in tmux can still be in the
+same conversation), so check `show` before relying on what you saw. It stays the
+same when the agent switches conversation by itself, as with Claude's `/resume`,
+and is left out while the agent is starting and once it has exited.
+
+## Errors
+
+When `send`, `answer` or `keys` didn't type anything, or muxel couldn't be
+reached, the failure has a `code`:
+
+- `working`, `blocked`, `starting` - not now: `wait`, answer its question, or try
+  again in a moment.
+- `not_running`, `exited` - the agent isn't running; the user has to open it.
+- `claimed_elsewhere` - another request holds the shared tmux claim.
+- `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
+- `input_changed` - the prompt was pasted but Enter was withheld. Inspect
+  `screen` before retrying; the input is still there.
+- `host_unavailable`, `stale_endpoint` - no running muxel to ask.
+
+A failure without a code after the request went out (no answer came back) may or
+may not have been carried out: check `status`, `show` or `screen` before typing
+anything again. After a paste, pane closure, restart or a writer failure can
+also withhold Enter and return an error without a code; inspect the input first.
 
 ## How to work
 
@@ -1179,10 +1395,10 @@ If you are running in a muxel pane yourself, the environment variable
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentEntry, AgentState, CliCommand, Command, PaneNode, Request, WaitOutcome,
-        awaiting_reply, describe_layout, flag_value, key_bytes, parse_cli, pending_question,
-        prompt_from_claude_transcript, resolve_agent, resolve_project, short_id, skill,
-        wait_outcome,
+        AgentEntry, AgentInfo, AgentState, CliCommand, Command, Error, ErrorCode, PaneNode,
+        Request, Response, WaitOutcome, awaiting_reply, describe_layout, flag_value, key_bytes,
+        parse_cli, pending_question, prompt_from_claude_transcript, resolve_agent, resolve_project,
+        short_id, skill, wait_outcome,
     };
     use crate::{AgentActivity, SplitDirection};
     use uuid::Uuid;
@@ -1269,9 +1485,223 @@ mod tests {
             Command::Send {
                 agent: "a".into(),
                 text: "hi".into(),
-                force: false
+                force: false,
+                launch_id: None,
             }
         );
+        // No launch guard: older requests retain their original shape.
+        let line = serde_json::to_string(&defaults).unwrap();
+        assert!(!line.contains("launch_id"), "{line}");
+    }
+
+    #[test]
+    fn a_failure_carries_a_code_when_there_is_something_to_act_on() {
+        let line = |reply: &Response| serde_json::to_string(reply).unwrap();
+        let working = Response::err(Error::new(ErrorCode::Working, "the agent is working"));
+        assert_eq!(
+            line(&working),
+            r#"{"ok":false,"code":"working","error":"the agent is working"}"#
+        );
+        // The rest keep the shape they had.
+        assert_eq!(
+            line(&Response::err("no agent matches 'x'")),
+            r#"{"ok":false,"error":"no agent matches 'x'"}"#
+        );
+        assert_eq!(
+            line(&Response::ok(serde_json::json!({ "sent": true }))),
+            r#"{"ok":true,"result":{"sent":true}}"#
+        );
+        let back: Response = serde_json::from_str(&line(&working)).unwrap();
+        assert_eq!(
+            back.into_result(),
+            Err(Error::new(ErrorCode::Working, "the agent is working"))
+        );
+        // A code this muxel doesn't know (from a newer one) reads as none.
+        let newer: Response =
+            serde_json::from_str(r#"{"ok":false,"code":"from_later","error":"x"}"#).unwrap();
+        assert_eq!(newer.code, None);
+        assert_eq!(newer.error.as_deref(), Some("x"));
+        for (code, word) in [
+            (ErrorCode::Working, "working"),
+            (ErrorCode::Blocked, "blocked"),
+            (ErrorCode::Starting, "starting"),
+            (ErrorCode::NotRunning, "not_running"),
+            (ErrorCode::Exited, "exited"),
+            (ErrorCode::ClaimedElsewhere, "claimed_elsewhere"),
+            (ErrorCode::LaunchMismatch, "launch_mismatch"),
+            (ErrorCode::InputChanged, "input_changed"),
+            (ErrorCode::HostUnavailable, "host_unavailable"),
+            (ErrorCode::StaleEndpoint, "stale_endpoint"),
+        ] {
+            assert_eq!(serde_json::to_value(code).unwrap(), word);
+            let response = Response::err(Error::new(code, "refused"));
+            let line = serde_json::to_string(&response).unwrap();
+            let decoded: Response = serde_json::from_str(&line).unwrap();
+            assert_eq!(decoded.into_result(), Err(Error::new(code, "refused")));
+        }
+    }
+
+    #[test]
+    fn guarded_sends_use_a_version_legacy_hosts_reject() {
+        assert_eq!(super::request_version(&Command::Projects), 1);
+        let mut send = Command::Send {
+            agent: "a".into(),
+            text: "hi".into(),
+            force: false,
+            launch_id: None,
+        };
+        assert_eq!(super::request_version(&send), 1);
+        if let Command::Send { launch_id, .. } = &mut send {
+            *launch_id = Some(id(42));
+        }
+        assert_eq!(super::request_version(&send), 2);
+    }
+
+    #[test]
+    fn launch_guard_accepts_only_the_expected_terminal() {
+        let launch = id(42);
+        assert_eq!(super::check_launch_id(None, None), Ok(()));
+        assert_eq!(super::check_launch_id(None, Some(launch)), Ok(()));
+        assert_eq!(super::check_launch_id(Some(launch), Some(launch)), Ok(()));
+        for current in [None, Some(id(43))] {
+            let error = super::check_launch_id(Some(launch), current).unwrap_err();
+            assert_eq!(error.code, Some(ErrorCode::LaunchMismatch));
+        }
+    }
+
+    #[test]
+    fn send_receipt_identifies_the_admitted_launch_and_paste() {
+        let receipt = super::pasted_prompt_receipt(id(7), id(42));
+        assert_eq!(receipt["agent"], short_id(id(7)));
+        assert_eq!(receipt["launch_id"], id(42).to_string());
+        assert_eq!(receipt["sent"], true);
+        assert_eq!(receipt["pasted"], true);
+    }
+
+    #[test]
+    fn cli_keeps_the_launch_guard_even_with_force_and_rejects_invalid_ids() {
+        let launch = id(42).to_string();
+        assert_eq!(
+            parse_cli(&words(&[
+                "send",
+                "a",
+                "hi",
+                "--force",
+                "--launch-id",
+                &launch
+            ])),
+            Ok(CliCommand::Request(Command::Send {
+                agent: "a".into(),
+                text: "hi".into(),
+                force: true,
+                launch_id: Some(id(42))
+            }))
+        );
+        for args in [
+            words(&["send", "a", "hi", "--launch-id"]),
+            words(&["send", "a", "hi", "--launch-id", "invalid"]),
+            words(&["status", "a", "--launch-id", &launch]),
+            words(&["send", "a", "hi", "--once", "key"]),
+        ] {
+            assert!(parse_cli(&args).is_err(), "{args:?}");
+        }
+        // A literal flag belongs to the prompt and does not set a guard.
+        assert_eq!(
+            parse_cli(&words(&["send", "a", "--", "--launch-id", "text"])),
+            Ok(CliCommand::Request(Command::Send {
+                agent: "a".into(),
+                text: "--launch-id text".into(),
+                force: false,
+                launch_id: None
+            }))
+        );
+    }
+
+    #[test]
+    fn an_agent_shows_its_launch_id_only_while_it_runs() {
+        let mut info = AgentInfo {
+            id: short_id(id(7)),
+            uuid: id(7),
+            name: "Claude".into(),
+            project: "p".into(),
+            project_id: "11111111".into(),
+            kind: "terminal".into(),
+            program: Some("claude".into()),
+            preset: "claude".into(),
+            model: None,
+            is_agent: true,
+            status: Some(AgentState::NotRunning),
+            status_since: None,
+            launch_id: None,
+            awaiting_reply: false,
+            focused: false,
+            pane: Some(1),
+            worktree_branch: None,
+            cwd: None,
+            remote: false,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("launch_id").is_none(), "{json}");
+        info.status = Some(AgentState::Idle);
+        info.launch_id = Some(id(42));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["launch_id"], id(42).to_string());
+        assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), info);
+    }
+
+    #[test]
+    fn launch_id_is_the_terminals_only_while_its_program_runs() {
+        let terminal = Some(id(42));
+        for state in [
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::Blocked,
+            AgentState::Done,
+        ] {
+            assert_eq!(
+                super::launch_id(Some(state), terminal),
+                terminal,
+                "{state:?}"
+            );
+        }
+        // Its pane keeps the terminal of a program that exited, or of a session
+        // being reconnected: that run is over, so it has no id to report.
+        for state in [
+            AgentState::Starting,
+            AgentState::Exited,
+            AgentState::NotRunning,
+            AgentState::Failed,
+        ] {
+            assert_eq!(super::launch_id(Some(state), terminal), None, "{state:?}");
+        }
+        // Editors and browsers have no status, and no terminal either.
+        assert_eq!(super::launch_id(None, terminal), None);
+        assert_eq!(super::launch_id(Some(AgentState::Idle), None), None);
+    }
+
+    #[test]
+    fn skill_explains_every_code() {
+        let text = skill("/usr/bin/muxel");
+        for code in [
+            ErrorCode::Working,
+            ErrorCode::Blocked,
+            ErrorCode::Starting,
+            ErrorCode::NotRunning,
+            ErrorCode::Exited,
+            ErrorCode::ClaimedElsewhere,
+            ErrorCode::LaunchMismatch,
+            ErrorCode::InputChanged,
+            ErrorCode::HostUnavailable,
+            ErrorCode::StaleEndpoint,
+        ] {
+            let word = serde_json::to_value(code).unwrap();
+            let word = format!("`{}`", word.as_str().unwrap());
+            assert!(text.contains(&word), "the skill doesn't explain {word}");
+        }
+        assert!(text.contains("--launch-id ID"));
+        assert!(text.contains("\"pasted\": true"));
+        assert!(!text.contains("--once"));
+        assert!(text.contains("launch_id"));
     }
 
     #[test]
@@ -1624,7 +2054,8 @@ Steps:
             Ok(CliCommand::Request(Command::Send {
                 agent: "a1b2".into(),
                 text: "fix the tests".into(),
-                force: false
+                force: false,
+                launch_id: None,
             }))
         );
         assert_eq!(
@@ -1632,7 +2063,8 @@ Steps:
             Ok(CliCommand::Request(Command::Send {
                 agent: "a1b2".into(),
                 text: "--help --force".into(),
-                force: false
+                force: false,
+                launch_id: None,
             }))
         );
         assert_eq!(

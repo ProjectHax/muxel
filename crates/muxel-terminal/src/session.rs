@@ -1114,12 +1114,18 @@ impl TerminalSession {
     /// receives it as a paste, not as typed keystrokes). Shared by the keyboard
     /// shortcut and the mouse copy/paste modes.
     pub fn paste(&self, text: &str) {
+        let _ = self.try_paste(text);
+    }
+
+    /// Paste text and report admission to the PTY writer. Success does not
+    /// confirm that the child consumed the text.
+    pub fn try_paste(&self, text: &str) -> std::io::Result<()> {
         let payload = if self.is_bracketed_paste() {
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {
             text.replace("\r\n", "\r").replace('\n', "\r")
         };
-        self.write_input(payload.as_bytes());
+        self.try_write_input(payload.as_bytes())
     }
 
     /// Paste filesystem paths into the PTY (drag-drop / clipboard files).

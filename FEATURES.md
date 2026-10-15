@@ -520,6 +520,9 @@ feature is added or changed, update the matching entry here in the same change**
   the pane closes or restarts. A withheld send fails and attempts to release only
   its own tmux claim; timeout, command failure or older tmux can leave the claim
   in place under its existing aging rules.
+- **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
+  `send --launch-id ID` checks the launch again before pasting. Its success
+  receipt confirms writer admission with `pasted: true`.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It
