@@ -2610,7 +2610,8 @@ impl Default for Settings {
 /// v15: repaired Grok presets saved with the generic Claude-only prompt flag.
 /// v16: added the Windows Git Bash preset.
 /// v17: Grok preset gains a runner startup delay (its output never goes quiet).
-pub const PRESET_SEED_VERSION: u32 = 17;
+/// v18: added the Muse Code preset.
+pub const PRESET_SEED_VERSION: u32 = 18;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
@@ -2628,85 +2629,97 @@ impl Settings {
         }
     }
 
-    /// Merge in any built-in presets + runners the user is missing (matched by
-    /// name), once per seed version, so new built-ins reach existing configs
-    /// without resurrecting ones the user deleted. Returns whether the settings
-    /// changed (and should be persisted).
+    /// Apply pending built-in migrations, matching presets by name. The v18
+    /// migration only adds Muse; older catch-up migrations must not replay over
+    /// choices saved at v17. Returns whether settings should be persisted.
     pub fn seed_builtin_presets(&mut self) -> bool {
         if self.preset_seed_version >= PRESET_SEED_VERSION {
             return false;
         }
-        for builtin in AgentPreset::defaults() {
-            if !self.presets.iter().any(|p| p.name == builtin.name) {
-                self.presets.push(builtin);
-            }
-        }
-        // Old Grok presets typed capability instructions into the live prompt
-        // after startup. If the user began typing first, delayed text could
-        // append to and submit their question. Migrate only the exact legacy
-        // built-in shape; preserve explicit None and custom flag choices.
-        let grok_rules = AgentPreset::grok().injection;
-        for preset in &mut self.presets {
-            let is_grok_program = preset
-                .program
-                .as_deref()
-                .and_then(|program| std::path::Path::new(program).file_stem())
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| stem.eq_ignore_ascii_case("grok"));
-            let wrong_generic_flag = matches!(
-                &preset.injection,
-                InjectionMode::CliFlag { flag } if flag == "--append-system-prompt"
-            );
-            if preset.name == "Grok"
-                && is_grok_program
-                && (preset.injection == InjectionMode::TypeIn || wrong_generic_flag)
+        // Preserve the historical catch-up for installs that have not reached
+        // v17. Later additions have their own migration below.
+        if self.preset_seed_version < 17 {
+            for builtin in AgentPreset::defaults()
+                .into_iter()
+                .filter(|p| p.name != "Muse Code")
             {
-                preset.injection = grok_rules.clone();
+                if !self.presets.iter().any(|p| p.name == builtin.name) {
+                    self.presets.push(builtin);
+                }
             }
-        }
-        for builtin in Runner::defaults() {
-            if !self.runners.iter().any(|r| r.name == builtin.name) {
-                self.runners.push(builtin);
+            // Old Grok presets typed capability instructions into the live prompt
+            // after startup. If the user began typing first, delayed text could
+            // append to and submit their question. Migrate only the exact legacy
+            // built-in shape; preserve explicit None and custom flag choices.
+            let grok_rules = AgentPreset::grok().injection;
+            for preset in &mut self.presets {
+                let is_grok_program = preset
+                    .program
+                    .as_deref()
+                    .and_then(|program| std::path::Path::new(program).file_stem())
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case("grok"));
+                let wrong_generic_flag = matches!(
+                    &preset.injection,
+                    InjectionMode::CliFlag { flag } if flag == "--append-system-prompt"
+                );
+                if preset.name == "Grok"
+                    && is_grok_program
+                    && (preset.injection == InjectionMode::TypeIn || wrong_generic_flag)
+                {
+                    preset.injection = grok_rules.clone();
+                }
             }
-        }
-        // Adopt the built-in runner startup delay for matching presets that don't
-        // have one set. The field is new (0 = unset), so this gives e.g. existing
-        // opencode users the sensible default once, without touching their edits.
-        for builtin in AgentPreset::defaults() {
-            if builtin.startup_delay_ms > 0 {
+            for builtin in Runner::defaults() {
+                if !self.runners.iter().any(|r| r.name == builtin.name) {
+                    self.runners.push(builtin);
+                }
+            }
+            // Adopt the built-in runner startup delay for matching presets that don't
+            // have one set. The field is new (0 = unset), so this gives e.g. existing
+            // opencode users the sensible default once, without touching their edits.
+            for builtin in AgentPreset::defaults() {
+                if builtin.startup_delay_ms > 0 {
+                    for p in self.presets.iter_mut() {
+                        if p.name == builtin.name && p.startup_delay_ms == 0 {
+                            p.startup_delay_ms = builtin.startup_delay_ms;
+                        }
+                    }
+                }
+            }
+            // Give matching built-in presets the session-resume flags (new fields)
+            // without overwriting user edits, so e.g. an existing Claude preset gains
+            // resume-on-restart after upgrading.
+            for builtin in AgentPreset::defaults() {
                 for p in self.presets.iter_mut() {
-                    if p.name == builtin.name && p.startup_delay_ms == 0 {
-                        p.startup_delay_ms = builtin.startup_delay_ms;
+                    if p.name == builtin.name {
+                        if p.session_id_flag.is_none() {
+                            p.session_id_flag = builtin.session_id_flag.clone();
+                        }
+                        if p.resume_flag.is_none() {
+                            p.resume_flag = builtin.resume_flag.clone();
+                        }
+                    }
+                }
+            }
+            // Adopt the built-in status markers (e.g. Claude's "esc to interrupt"
+            // working marker) for matching presets that have none, so existing configs
+            // get reliable status detection without overwriting a user's own markers.
+            for builtin in AgentPreset::defaults() {
+                if builtin.working_markers.is_empty() {
+                    continue;
+                }
+                for p in self.presets.iter_mut() {
+                    if p.name == builtin.name && p.working_markers.is_empty() {
+                        p.working_markers = builtin.working_markers.clone();
                     }
                 }
             }
         }
-        // Give matching built-in presets the session-resume flags (new fields)
-        // without overwriting user edits, so e.g. an existing Claude preset gains
-        // resume-on-restart after upgrading.
-        for builtin in AgentPreset::defaults() {
-            for p in self.presets.iter_mut() {
-                if p.name == builtin.name {
-                    if p.session_id_flag.is_none() {
-                        p.session_id_flag = builtin.session_id_flag.clone();
-                    }
-                    if p.resume_flag.is_none() {
-                        p.resume_flag = builtin.resume_flag.clone();
-                    }
-                }
-            }
-        }
-        // Adopt the built-in status markers (e.g. Claude's "esc to interrupt"
-        // working marker) for matching presets that have none, so existing configs
-        // get reliable status detection without overwriting a user's own markers.
-        for builtin in AgentPreset::defaults() {
-            if builtin.working_markers.is_empty() {
-                continue;
-            }
-            for p in self.presets.iter_mut() {
-                if p.name == builtin.name && p.working_markers.is_empty() {
-                    p.working_markers = builtin.working_markers.clone();
-                }
+        if self.preset_seed_version < 18 {
+            let muse = AgentPreset::muse();
+            if !self.presets.iter().any(|preset| preset.name == muse.name) {
+                self.presets.push(muse);
             }
         }
         self.preset_seed_version = PRESET_SEED_VERSION;
@@ -2735,6 +2748,7 @@ mod settings_tests {
         assert!(s.presets.iter().any(|p| p.name == "Hermes"));
         assert!(s.presets.iter().any(|p| p.name == "Ollama"));
         assert!(s.presets.iter().any(|p| p.name == "Pi"));
+        assert!(s.presets.iter().any(|p| p.name == "Muse Code"));
         // Built-in runners are seeded too.
         assert!(s.runners.iter().any(|r| r.name == "Review"));
         assert!(s.runners.iter().any(|r| r.name == "Security Review"));
@@ -2743,6 +2757,88 @@ mod settings_tests {
         let counts = (s.presets.len(), s.runners.len());
         assert!(!s.seed_builtin_presets());
         assert_eq!((s.presets.len(), s.runners.len()), counts);
+    }
+
+    #[test]
+    fn muse_preset_is_seeded_only_once() {
+        let mut settings = Settings {
+            preset_seed_version: 17,
+            presets: vec![AgentPreset::shell()],
+            ..Settings::default()
+        };
+        assert!(settings.seed_builtin_presets());
+        assert_eq!(
+            settings
+                .presets
+                .iter()
+                .filter(|preset| preset.name == "Muse Code")
+                .count(),
+            1
+        );
+        settings.presets.retain(|preset| preset.name != "Muse Code");
+        assert!(
+            !settings.seed_builtin_presets(),
+            "a deliberate deletion stays deleted"
+        );
+        assert!(
+            !settings
+                .presets
+                .iter()
+                .any(|preset| preset.name == "Muse Code")
+        );
+    }
+
+    #[test]
+    fn muse_upgrade_preserves_v17_settings_except_addition_and_version() {
+        for existing_muse in [false, true] {
+            let mut settings = Settings {
+                preset_seed_version: 17,
+                ..Settings::default()
+            };
+            settings
+                .presets
+                .retain(|preset| preset.name != "Muse Code" && preset.name != "Ollama");
+            settings.runners.retain(|runner| runner.name != "Review");
+            settings.runners[0].prompt = "custom review task".to_string();
+            for preset in &mut settings.presets {
+                preset.session_id_flag = None;
+                preset.resume_flag = None;
+                preset.startup_delay_ms = 0;
+                preset.working_markers.clear();
+                if preset.name == "Grok" {
+                    preset.injection = InjectionMode::TypeIn;
+                }
+            }
+            if existing_muse {
+                let mut custom = AgentPreset::muse();
+                custom.program = Some("custom-muse".to_string());
+                custom.effort = Some("medium".to_string());
+                custom.injection = InjectionMode::TypeIn;
+                settings.presets.push(custom);
+            }
+            let before = serde_json::to_value(&settings).unwrap();
+            assert!(settings.seed_builtin_presets());
+            assert_eq!(settings.preset_seed_version, 18);
+            assert_eq!(
+                settings
+                    .presets
+                    .iter()
+                    .filter(|preset| preset.name == "Muse Code")
+                    .count(),
+                1
+            );
+            if !existing_muse {
+                let added = settings.presets.pop().unwrap();
+                assert_eq!(added.name, "Muse Code");
+                assert_eq!(added.injection, InjectionMode::None);
+            }
+            settings.preset_seed_version = 17;
+            assert_eq!(
+                serde_json::to_value(&settings).unwrap(),
+                before,
+                "no old preset/runner resurrection or replay of saved defaults"
+            );
+        }
     }
 
     #[test]

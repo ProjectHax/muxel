@@ -442,6 +442,32 @@ impl AgentPreset {
         }
     }
 
+    /// Meta's Muse Code CLI (https://dev.meta.ai/docs/muse-code).
+    pub fn muse() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            kind: PresetKind::Terminal,
+            url: String::new(),
+            name: "Muse Code".to_string(),
+            program: Some("muse".to_string()),
+            model: None,
+            model_flag: default_model_flag(),
+            effort: None,
+            effort_flag: Some("--reasoning-effort".to_string()),
+            args: Vec::new(),
+            system_prompt: None,
+            // No verified hidden instruction transport; never type into a live prompt.
+            injection: InjectionMode::None,
+            env: Vec::new(),
+            working_markers: Vec::new(),
+            blocked_markers: Vec::new(),
+            startup_delay_ms: 0,
+            // Muse can resume by id, but muxel does not capture its session id.
+            session_id_flag: None,
+            resume_flag: None,
+        }
+    }
+
     /// A built-in web-browser preset. Picked like an agent; opens a browser pane
     /// (embedded on macOS/Windows, a separate window on Linux) at `url`.
     pub fn browser() -> Self {
@@ -481,6 +507,7 @@ impl AgentPreset {
             Self::amp(),
             Self::grok(),
             Self::codex(),
+            Self::muse(),
             Self::hermes(),
             Self::ollama(),
             Self::ollama_code(),
@@ -1281,6 +1308,29 @@ mod tests {
             session_resume_args(&g, &inst),
             Some(vec!["--resume".to_string(), "abc".to_string()])
         );
+    }
+
+    #[test]
+    fn muse_preset_resolves_supported_arguments_without_startup_input() {
+        let mut preset = AgentPreset::muse();
+        let launch = resolve_launch(&instance(&preset, None));
+        assert_eq!(launch.program.as_deref(), Some("muse"));
+        assert!(
+            launch.args.is_empty(),
+            "leave Muse's configured defaults in effect"
+        );
+
+        preset.model = Some("configured-model".to_string());
+        preset.effort = Some("high".to_string());
+        let inst = instance(&preset, Some("Project instructions\nwith details"));
+        let launch = resolve_launch(&inst);
+        assert_eq!(
+            launch.args,
+            ["--model", "configured-model", "--reasoning-effort", "high"]
+        );
+        assert_eq!(launch.startup_input, None);
+        assert_eq!(preset.injection, InjectionMode::None);
+        assert_eq!(session_resume_args(&preset, &inst), None);
     }
 
     #[test]

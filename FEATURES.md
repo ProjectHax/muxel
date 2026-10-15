@@ -81,8 +81,8 @@ feature is added or changed, update the matching entry here in the same change**
 ## Agents
 
 - **Built-in agent presets** — Shell, Claude, opencode, Amp (ampcode), Grok
-  (x.ai), Hermes, Ollama, **Ollama Code**, Pi, and a **Browser** preset, each with
-  its own icon. On Windows the default shell is **PowerShell**, with **Cmd** and
+  (x.ai), Muse Code (Meta), Hermes, Ollama, **Ollama Code**, Pi, and a **Browser**
+  preset. On Windows the default shell is **PowerShell**, with **Cmd** and
   **Git Bash** offered as additional presets (instead of the single "Shell"). A
   preset is either a terminal agent or a **Browser** (opens a browser pane at its
   homepage) — switch the type and edit the fields in Settings → Agents.
@@ -98,6 +98,11 @@ feature is added or changed, update the matching entry here in the same change**
 - **Ollama Code** — runs a coding agent backed by an Ollama model via
   `ollama launch <agent> --model <model>` (seeded as `ollama launch opencode
   --model glm-5.2:cloud`); change the agent or model in the preset's args.
+- **Muse Code** — launches Meta's installed `muse` CLI, with optional model and
+  reasoning-effort overrides. It uses Muse's configured defaults otherwise.
+  Startup instruction injection is disabled; the preset sends no automatic turn.
+  Resume through Muse's own `/resume` or `muse resume`; automatic conversation
+  capture on pane restart is not yet integrated.
 - **Configurable launch** — per agent: program, model + model flag, effort +
   effort flag, extra args (shell-style quoting: `--append-system-prompt "be terse"`
   stays one argument, matching the iOS companion's parser; an unbalanced quote

@@ -807,9 +807,71 @@ fn take_codex_rules_prompt(instance: &mut Instance, resuming: bool) -> Option<St
         .flatten()
 }
 
+/// Assemble launch instructions through the instance's selected transport.
+fn resolve_agent_launch(
+    instance: &Instance,
+    project: Option<&Project>,
+    resuming: bool,
+) -> ResolvedLaunch {
+    let mut instance = instance.clone();
+    let mut codex_instructions = Vec::new();
+    let is_codex = instance
+        .program
+        .as_deref()
+        .and_then(|program| std::path::Path::new(program).file_stem())
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("codex"));
+    if is_codex && let Some(custom) = take_codex_rules_prompt(&mut instance, resuming) {
+        codex_instructions.push(custom);
+    }
+    let mut add_automatic = |instruction: String, instance: &mut Instance| {
+        if is_codex {
+            if !resuming {
+                codex_instructions.push(instruction);
+            }
+        } else if instance.injection != InjectionMode::None {
+            append_agent_instruction(&mut instance.system_prompt, instruction);
+        }
+    };
+    if !resuming
+        && instance.injection != InjectionMode::None
+        && project.is_none_or(|project| project.remote.is_none())
+    {
+        add_automatic(file_link_instruction().to_string(), &mut instance);
+    }
+    if !resuming
+        && let Some(project) = project
+        && project.memory_enabled
+        && instance.injection != InjectionMode::None
+    {
+        let root = match &project.remote {
+            Some(remote) => remote.remote_root.clone(),
+            None => project.root_path.display().to_string(),
+        };
+        // Relative references keep project paths out of process argv.
+        let cwd = instance
+            .worktree_path
+            .as_ref()
+            .map(|w| w.display().to_string());
+        let instruction = memory_instruction(&memory_reference(&root, cwd.as_deref()));
+        add_automatic(instruction, &mut instance);
+    }
+    let mut resolved = resolve_launch_for_session(&instance, resuming);
+    if !codex_instructions.is_empty() {
+        resolved.args.push("--config".to_string());
+        resolved.args.push(codex_developer_instructions_override(
+            &codex_instructions.join("\n\n"),
+        ));
+    }
+    resolved
+}
+
 #[cfg(test)]
-mod codex_prompt_transport_tests {
-    use super::{AgentPreset, InjectionMode, Instance, take_codex_rules_prompt};
+mod launch_instruction_transport_tests {
+    use super::{
+        AgentPreset, InjectionMode, Instance, Project, resolve_agent_launch,
+        take_codex_rules_prompt,
+    };
     use muxel_core::resolve_launch_for_session;
     use uuid::Uuid;
 
@@ -853,6 +915,34 @@ mod codex_prompt_transport_tests {
             resolve_launch_for_session(&instance, true).startup_input,
             None
         );
+    }
+
+    #[test]
+    fn muse_launch_assembly_sends_no_automatic_input_or_instructions() {
+        let mut project = Project::new("repo", "/tmp/repo");
+        project.memory_enabled = true;
+        let instance = Instance::from_preset(project.id, &AgentPreset::muse());
+        assert!(
+            instance.auto_submit,
+            "exercise the normal new-pane submit default"
+        );
+        assert_eq!(instance.system_prompt, None);
+
+        let launch = resolve_agent_launch(&instance, Some(&project), false);
+        assert_eq!(launch.program.as_deref(), Some("muse"));
+        assert!(
+            launch.args.is_empty(),
+            "no file-link or memory instruction flag"
+        );
+        assert_eq!(launch.startup_input, None);
+        assert_eq!(launch.auto_mode_presses, 0);
+
+        // A transport-bearing preset still receives the same assembled bundle.
+        let control = Instance::from_preset(project.id, &AgentPreset::opencode());
+        let control = resolve_agent_launch(&control, Some(&project), false);
+        let instructions = control.startup_input.expect("TypeIn positive control");
+        assert!(instructions.contains("MEMORY.md"));
+        assert!(instructions.contains("file:"));
     }
 }
 
@@ -5786,53 +5876,8 @@ impl MuxelApp {
         // TypeIn submits one visible turn only for a new conversation. Codex's
         // developer-instructions override also becomes a submitted turn when it is
         // supplied to `resume`, so a resumed Codex receives no launch bundle.
-        let mut codex_instructions = Vec::new();
-        let inst_owned = inst.cloned().map(|mut i| {
-            let is_codex = i
-                .program
-                .as_deref()
-                .and_then(|program| std::path::Path::new(program).file_stem())
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| stem.eq_ignore_ascii_case("codex"));
-            if is_codex && let Some(custom) = take_codex_rules_prompt(&mut i, resuming) {
-                codex_instructions.push(custom);
-            }
-            let mut add_automatic = |instruction: String, i: &mut Instance| {
-                if is_codex {
-                    if !resuming {
-                        codex_instructions.push(instruction);
-                    }
-                } else if i.injection != InjectionMode::None {
-                    append_agent_instruction(&mut i.system_prompt, instruction);
-                }
-            };
-            if !resuming
-                && i.injection != InjectionMode::None
-                && project.is_none_or(|project| project.remote.is_none())
-            {
-                add_automatic(file_link_instruction().to_string(), &mut i);
-            }
-            if !resuming
-                && let Some(p) = project
-                && p.memory_enabled
-                && i.injection != InjectionMode::None
-            {
-                let root = match &p.remote {
-                    Some(r) => r.remote_root.clone(),
-                    None => p.root_path.display().to_string(),
-                };
-                // Refer to the file relatively when the agent starts at the project
-                // root: this string ends up in the agent's argv, and an absolute path
-                // there makes every pane of the project match `pkill -f <project>`.
-                let cwd = i.worktree_path.as_ref().map(|w| w.display().to_string());
-                let instruction = memory_instruction(&memory_reference(&root, cwd.as_deref()));
-                add_automatic(instruction, &mut i);
-            }
-            i
-        });
-        let mut resolved = inst_owned
-            .as_ref()
-            .map(|instance| resolve_launch_for_session(instance, resuming))
+        let mut resolved = inst
+            .map(|instance| resolve_agent_launch(instance, project, resuming))
             .unwrap_or(ResolvedLaunch {
                 program: None,
                 args: Vec::new(),
@@ -5841,12 +5886,6 @@ impl MuxelApp {
                 submit: true,
                 env: Vec::new(),
             });
-        if !codex_instructions.is_empty() {
-            resolved.args.push("--config".to_string());
-            resolved.args.push(codex_developer_instructions_override(
-                &codex_instructions.join("\n\n"),
-            ));
-        }
         // The session flag goes ahead of model / system-prompt args.
         if let Some((mut resume, _)) = session_resume.as_ref().cloned() {
             resume.append(&mut resolved.args);
