@@ -33,6 +33,18 @@ feature is added or changed, update the matching entry here in the same change**
   positions.
 - **Per-project focus** — switching away from a project and back restores the
   pane that was last focused there, falling back safely if that pane was removed.
+- **Responsive cold project restore** — opening a project whose agents have not
+  started yet paints the selected pane first and admits the remaining terminal
+  processes in bounded waves. On Windows the next pair starts only after every
+  terminal in the project, including any an earlier activation started or is
+  still launching, reaches provider readiness or settles after visible output; a
+  terminal holds it for at most five seconds once its process is running, so a
+  silent command cannot stall the rest. A launch still running after 20 seconds
+  stops holding back the others and keeps showing "Starting terminal…" until its
+  process comes up, or until Restart, closing the pane or leaving the project
+  supersedes it. Editors, diffs and browsers open
+  without waiting on terminals, and switching projects cancels the old project's
+  pending waves.
 - **Maximize** — temporarily expand one pane to fill the work area. The whole tab
   group comes along: every tab stays in the tab bar and switching tabs keeps the
   pane maximized, as does closing or popping out the tab being shown while others
