@@ -606,7 +606,14 @@ feature is added or changed, update the matching entry here in the same change**
   Ctrl+V (`0x16`) so agents that read the OS clipboard (Grok) can attach it.
   Claude Code on Windows uses `Alt+V` (sent as `ESC v`) for images.
   `Shift+Insert` pastes and `Ctrl+Insert` copies. File **drag-and-drop** pastes
-  shell-quoted paths into the focused terminal.
+  shell-quoted paths into the focused terminal. File clipboard and drop paths
+  use the pane's launch shell (PowerShell, cmd or POSIX, including Git Bash) for
+  one parse outside existing quotes. Manual shell switches and other input
+  grammars are not detected or protected. Unknown Windows programs receive
+  double-quoted text, with no shell-safety guarantee. Cmd refuses percent/exclamation filenames;
+  cmd and the fallback refuse embedded double quotes and trailing backslashes.
+  Invalid/control-character paths are refused in every format with a
+  notification, without inserting part of the file list.
 - **Pasting images and files into a remote pane** — an agent on an SSH host (in
   tmux or not) can read neither this machine's clipboard nor its files, so in a
   remote pane a pasted image, or files copied in a file manager or dropped on the
@@ -616,7 +623,11 @@ feature is added or changed, update the matching entry here in the same change**
   host) and are cleared after a week. An image an agent won't take (a TIFF, as
   copying from Preview gives, or a BMP) goes as a PNG. Folders and files over 25 MB
   aren't copied, and the notification feed says which. Text pastes as it always
-  has.
+  has. Uploaded paths use the original terminal's launch shell and the same
+  filename guard; a completion for a replaced or closed terminal is discarded.
+  Moving the terminal into its own window or re-docking it keeps that destination.
+  Windows agent panes receive generic quoted path text; only a shell pane uses
+  the configured host shell's format.
 - **Mouse reporting** — when an app enables mouse mode (Grok, Claude, vim, …),
   clicks, drags, and motion are forwarded as SGR/X10 mouse events so the app can
   focus its prompt, scroll its own pane, set the cursor, etc. Hold **Shift** to

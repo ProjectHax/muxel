@@ -381,21 +381,11 @@ pub fn paste_file_name(unique: &str, original: &str) -> String {
     }
 }
 
-/// A path on the host as it should be pasted into a pane there: shell-quoted on
-/// Unix, double-quoted on Windows when it has a space. Bare when it needs nothing.
-pub fn paste_path(os: RemoteOs, path: &str) -> String {
-    match os {
-        RemoteOs::Unix => sh_quote(path),
-        RemoteOs::Windows if path.contains(char::is_whitespace) => format!("\"{path}\""),
-        RemoteOs::Windows => path.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_seeded_file, git, list_files, paste_file_name, paste_path, push_prep, read_file,
-        scan_projects, test_dir, test_file, upload_paste, write_file,
+        ensure_seeded_file, git, list_files, paste_file_name, push_prep, read_file, scan_projects,
+        test_dir, test_file, upload_paste, write_file,
     };
     use crate::RemoteOs;
     use base64::Engine as _;
@@ -651,23 +641,6 @@ mod tests {
         assert_eq!(
             paste_file_name("u1", &long),
             format!("u1-{}.png", "a".repeat(60))
-        );
-    }
-
-    #[test]
-    fn pasted_paths_are_quoted_for_the_host() {
-        assert_eq!(
-            paste_path(UNIX, "/home/me/.cache/x.png"),
-            "/home/me/.cache/x.png"
-        );
-        assert_eq!(paste_path(UNIX, "/Users/a b/x.png"), "'/Users/a b/x.png'");
-        assert_eq!(
-            paste_path(WIN, "C:\\Users\\me\\x.png"),
-            "C:\\Users\\me\\x.png"
-        );
-        assert_eq!(
-            paste_path(WIN, "C:\\Users\\a b\\x.png"),
-            "\"C:\\Users\\a b\\x.png\""
         );
     }
 

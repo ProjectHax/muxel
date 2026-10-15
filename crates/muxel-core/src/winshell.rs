@@ -54,7 +54,8 @@ impl WindowsShell {
 
 /// A PowerShell single-quoted string literal. Inside `'…'` PowerShell expands
 /// nothing — no `$var`, no backtick escapes, no subexpressions — so the only
-/// character needing attention is `'` itself, which is escaped by doubling.
+/// characters needing attention are ASCII and smart single quotes, which are
+/// escaped by doubling each original character.
 ///
 /// This is why single quotes are used everywhere here rather than double: a path
 /// like `C:\Users\me$env` or one holding a backtick is a literal, not an
@@ -63,8 +64,8 @@ pub fn ps_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
-        if c == '\'' {
-            out.push('\'');
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+            out.push(c);
         }
         out.push(c);
     }

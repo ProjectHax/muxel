@@ -1063,6 +1063,22 @@ fn resolve_agent_launch(
     resolved
 }
 
+fn path_paste_error(error: muxel_core::path_paste::PastePathError) -> SharedString {
+    use muxel_core::path_paste::PastePathError;
+    match error {
+        PastePathError::InvalidPath => t("A filename is empty or contains control characters."),
+        PastePathError::UnsupportedCharacters => {
+            t("A filename contains characters unsupported by this paste format.")
+        }
+        PastePathError::TrailingBackslash => {
+            t("This paste format cannot represent a path ending in a backslash.")
+        }
+        PastePathError::NonUnicode => {
+            t("A filename cannot be represented as Unicode without changing it.")
+        }
+    }
+}
+
 #[cfg(test)]
 mod launch_instruction_transport_tests {
     use super::{
@@ -6128,6 +6144,14 @@ impl MuxelApp {
         });
         let local = remote.is_none();
 
+        let remote_paste_shell = remote.as_ref().map(|(host, _)| {
+            muxel_core::path_paste::PasteShell::for_remote_program(
+                agent_program.as_deref(),
+                host.os,
+                host.windows_shell,
+            )
+        });
+
         // Build program/args (and, for local, the PTY working dir). For remote the
         // command becomes `ssh … -- 'cd <dir> && exec <program>'`; the cwd lives
         // inside that remote string, so there is no local PTY cwd.
@@ -6176,6 +6200,14 @@ impl MuxelApp {
             };
             (spec, cwd, Vec::new())
         };
+        if let Some(shell) = remote_paste_shell {
+            spec = spec.with_paste_shell(shell);
+        } else if agent_program.is_some() {
+            spec = spec.with_paste_shell(muxel_core::path_paste::PasteShell::for_program(
+                agent_program.as_deref(),
+                muxel_core::path_paste::PasteShell::default(),
+            ));
+        }
         if let Some(cwd) = local_cwd {
             spec = spec.with_cwd(cwd);
         }
@@ -6579,14 +6611,25 @@ impl MuxelApp {
         } else {
             self.restoring_activity.remove(&instance_id);
         }
-        // A remote pane's agent can read neither this machine's clipboard nor its
-        // files: copy what is pasted to the host and paste its path there instead.
+        // Remote panes upload files/images before pasting. Successful local
+        // input stays synchronous; only a local refusal needs an app callback.
         if self.remote_host_for_instance(instance_id).is_some() {
+            let origin = Arc::downgrade(view.read(cx).session());
             let app = cx.weak_entity();
             let handler: muxel_terminal::LocalPasteHandler = Arc::new(move |paste, cx: &App| {
                 let app = app.clone();
+                let origin = origin.clone();
                 cx.spawn(async move |cx| {
                     let _ = app.update(cx, |this, cx| {
+                        let Some(origin) = origin.upgrade() else {
+                            return;
+                        };
+                        if !this
+                            .paste_session(instance_id, cx)
+                            .is_some_and(|current| Arc::ptr_eq(&current, &origin))
+                        {
+                            return;
+                        }
                         this.paste_into_remote(instance_id, paste, cx);
                     });
                 })
@@ -6595,6 +6638,26 @@ impl MuxelApp {
             view.read(cx)
                 .session()
                 .set_local_paste_handler(Some(handler));
+        } else {
+            let app = cx.weak_entity();
+            let handler: muxel_terminal::PathPasteErrorHandler =
+                Arc::new(move |error, cx: &App| {
+                    let app = app.clone();
+                    cx.spawn(async move |cx| {
+                        let _ = app.update(cx, |this, cx| {
+                            this.add_event(
+                                NotifKind::Error,
+                                t("Couldn't paste these files"),
+                                path_paste_error(error).to_string(),
+                            );
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                });
+            view.read(cx)
+                .session()
+                .set_path_paste_error_handler(Some(handler));
         }
         self.terminals.insert(instance_id, view);
         self.terminal_launches
@@ -6614,6 +6677,20 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Floating a terminal moves its view between these maps without replacing
+    /// the PTY. Pastes follow that same session through pop-out and re-dock.
+    fn paste_session(&self, iid: Uuid, cx: &App) -> Option<Arc<TerminalSession>> {
+        let view = self.terminals.get(&iid).or_else(|| {
+            self.popouts
+                .get(&iid)
+                .and_then(|popout| match &popout.view {
+                    PaneView::Terminal(view) => Some(view),
+                    _ => None,
+                })
+        })?;
+        Some(view.read(cx).session().clone())
+    }
+
     /// Paste a clipboard image or local files into remote pane `iid`: copy each to
     /// its host, then paste the paths there, where the agent can open them (see
     /// `remote_paste`). Whatever can't be copied is reported, and the rest still
@@ -6631,17 +6708,22 @@ impl MuxelApp {
         else {
             return;
         };
-        let integrations::RepoLoc::Remote(conn) = &loc else {
+        let integrations::RepoLoc::Remote(_) = &loc else {
             return;
         };
-        let os = conn.host.os;
+        let Some(session) = self
+            .paste_session(iid, cx)
+            .map(|session| Arc::downgrade(&session))
+        else {
+            return;
+        };
         let unique = format!(
             "{}-{}",
             chrono::Local::now().format("%Y%m%d-%H%M%S"),
             &Uuid::new_v4().simple().to_string()[..6]
         );
         cx.spawn(async move |this, cx| {
-            let (paths, failed) = cx
+            let (paths, mut failed) = cx
                 .background_executor()
                 .spawn(async move {
                     let (files, mut failed) = crate::remote_paste::paste_files(paste, &unique);
@@ -6656,16 +6738,18 @@ impl MuxelApp {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if !paths.is_empty()
-                    && let Some(view) = this.terminals.get(&iid)
+                let Some(session) = session.upgrade() else {
+                    return;
+                };
+                if !this
+                    .paste_session(iid, cx)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &session))
                 {
-                    let mut text = String::new();
-                    for path in &paths {
-                        text.push(' ');
-                        text.push_str(&muxel_core::remote_ops::paste_path(os, path));
-                    }
-                    text.push(' ');
-                    view.read(cx).session().paste(&text);
+                    return;
+                }
+                let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
+                if let Err(error) = session.paste_path_strings(&paths) {
+                    failed.push(path_paste_error(error).to_string());
                 }
                 if !failed.is_empty() {
                     this.add_event(

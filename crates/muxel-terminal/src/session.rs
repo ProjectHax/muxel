@@ -17,6 +17,7 @@ use alacritty_terminal::term::{
 };
 use alacritty_terminal::vte::ansi::Processor;
 use anyhow::{Context as _, Result};
+use muxel_core::path_paste::{PastePathError, PasteShell};
 use parking_lot::Mutex;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -114,6 +115,8 @@ impl PtyChunkSender {
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
     pub program: String,
+    /// Syntax for file arguments at launch, retained across transport wrappers.
+    pub paste_shell: PasteShell,
     /// Logical agent program when `program` is a transport/wrapper such as ssh
     /// or tmux. Lifecycle title parsing keys off this, not the local child name.
     pub status_program: Option<String>,
@@ -151,6 +154,7 @@ impl CommandSpec {
         #[cfg(not(windows))]
         let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         Self {
+            paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             program,
             status_program: None,
             args: Vec::new(),
@@ -170,6 +174,7 @@ impl CommandSpec {
     pub fn program(program: impl Into<String>, args: Vec<String>) -> Self {
         let program = program.into();
         Self {
+            paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             status_program: Some(program.clone()),
             program,
             args,
@@ -194,6 +199,11 @@ impl CommandSpec {
 
     pub fn with_status_program(mut self, program: Option<String>) -> Self {
         self.status_program = program;
+        self
+    }
+
+    pub fn with_paste_shell(mut self, shell: PasteShell) -> Self {
+        self.paste_shell = shell;
         self
     }
 
@@ -400,9 +410,10 @@ pub struct TerminalSession {
     /// Active search needle (lowercased not required — matching is ASCII-insensitive).
     /// Empty = no search; the element highlights matches of this each paint.
     search: Mutex<Vec<char>>,
-    /// Where a paste naming this machine's files goes instead of the PTY — set for
-    /// a pane whose program runs on another host. See [`crate::LocalPaste`].
+    /// Remote handling for file/image uploads. See [`crate::LocalPaste`].
     local_paste: Mutex<Option<crate::LocalPasteHandler>>,
+    path_paste_error: Mutex<Option<crate::PathPasteErrorHandler>>,
+    paste_shell: PasteShell,
     /// The local working directory the child was spawned in — the base for
     /// resolving relative file paths on ctrl+click. Remote panes run `ssh`
     /// locally with no cwd set, so their relative paths stay unresolvable.
@@ -862,6 +873,8 @@ impl TerminalSession {
             }),
             search: Mutex::new(Vec::new()),
             local_paste: Mutex::new(None),
+            path_paste_error: Mutex::new(None),
+            paste_shell: spec.paste_shell,
             cwd,
             hovered_link: Mutex::new(None),
             pointer_hit: Mutex::new(None),
@@ -1065,14 +1078,24 @@ impl TerminalSession {
     }
 
     /// Send pastes that name this machine's files — a clipboard image, copied or
-    /// dropped files — to `handler` rather than into the PTY. For a pane whose
-    /// program runs on another host, which can read neither.
+    /// dropped files — to `handler` rather than directly into the PTY, for panes
+    /// running on another host that cannot read this machine's files/clipboard.
     pub fn set_local_paste_handler(&self, handler: Option<crate::LocalPasteHandler>) {
         *self.local_paste.lock() = handler;
     }
 
     pub(crate) fn local_paste_handler(&self) -> Option<crate::LocalPasteHandler> {
         self.local_paste.lock().clone()
+    }
+
+    /// Only local refusals cross into the app; valid files/images keep their
+    /// synchronous input order relative to the next key.
+    pub fn set_path_paste_error_handler(&self, handler: Option<crate::PathPasteErrorHandler>) {
+        *self.path_paste_error.lock() = handler;
+    }
+
+    pub(crate) fn path_paste_error_handler(&self) -> Option<crate::PathPasteErrorHandler> {
+        self.path_paste_error.lock().clone()
     }
 
     /// When the user last sent this terminal input themselves, if ever.
@@ -1102,22 +1125,23 @@ impl TerminalSession {
 
     /// Paste filesystem paths into the PTY (drag-drop / clipboard files).
     ///
-    /// Paths are shell-quoted so a crafted filename can't inject shell code: a
-    /// file literally named `$(rm -rf ~).txt` must land in the input as one inert
-    /// argument, not run when the user hits Enter. `{:?}` (Rust `Debug`) is *not*
-    /// shell quoting — it leaves `$`, backticks, and `$(…)` live inside its double
-    /// quotes — so Unix uses POSIX single-quote escaping (`sh_quote`).
-    pub fn paste_paths(&self, paths: &[std::path::PathBuf]) {
-        if paths.is_empty() {
-            return;
+    /// Validate the complete batch before writing. Refused filenames never
+    /// produce partial input; callers show the error to the user.
+    pub fn paste_paths(&self, paths: &[std::path::PathBuf]) -> Result<(), PastePathError> {
+        let paths = paths
+            .iter()
+            .map(|path| path.to_str().ok_or(PastePathError::NonUnicode))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.paste_path_strings(&paths)
+    }
+
+    /// Remote uploads use the same launch target and validation as local files.
+    pub fn paste_path_strings(&self, paths: &[&str]) -> Result<(), PastePathError> {
+        let text = muxel_core::path_paste::format_paths(self.paste_shell, paths)?;
+        if !text.is_empty() {
+            self.paste(&text);
         }
-        let mut text = String::new();
-        for path in paths {
-            text.push(' ');
-            text.push_str(&quote_path_for_shell(&path.to_string_lossy()));
-        }
-        text.push(' ');
-        self.paste(&text);
+        Ok(())
     }
 
     /// Write bytes to the PTY without touching the scroll position (used for
@@ -1761,24 +1785,6 @@ impl TerminalSession {
         self.mark_user_input();
         self.write_raw(&buf);
     }
-}
-
-/// Quote a filesystem path so pasting it into the PTY's shell/agent can't inject
-/// commands. On Unix this is POSIX single-quote escaping (`sh_quote`), which
-/// neutralizes every metacharacter (`$`, backticks, `;`, spaces, …). On Windows
-/// the child may be cmd.exe or PowerShell, whose quoting differs from POSIX, so
-/// the original double-quoted form is kept for now — a crafted name with
-/// `& | ^ %` or an embedded `"` remains a gap to close alongside the Windows
-/// spawn work (see PR #4).
-#[cfg(unix)]
-fn quote_path_for_shell(path: &str) -> String {
-    muxel_core::ssh::sh_quote(path)
-}
-
-#[cfg(not(unix))]
-fn quote_path_for_shell(path: &str) -> String {
-    // TODO(windows): cmd.exe / PowerShell need dedicated escaping.
-    format!("{path:?}")
 }
 
 /// Append one mouse-wheel report — button 64 (scroll up) / 65 (scroll down) — at
@@ -2607,6 +2613,56 @@ mod windows_child_exit_tests {
         panic!("fixture never became ready");
     }
 
+    #[test]
+    fn refused_second_file_writes_no_partial_input_to_the_pty() {
+        let (session, rx) = spawn(
+            "[Console]::WriteLine('FIXTURE_READY'); $line=[Console]::ReadLine(); [Console]::WriteLine('RECORDED:'+ $line); exit 0",
+        );
+        wait_ready(&session, &rx);
+        let paths = [
+            std::path::PathBuf::from("C:\\safe.txt"),
+            std::path::PathBuf::from("C:\\tmp\\bad\nname.txt"),
+        ];
+        assert_eq!(
+            session.paste_paths(&paths),
+            Err(muxel_core::path_paste::PastePathError::InvalidPath)
+        );
+        use std::os::windows::ffi::OsStringExt;
+        let non_unicode = [
+            std::path::PathBuf::from("C:\\safe.txt"),
+            std::path::PathBuf::from(std::ffi::OsString::from_wide(&[0xd800])),
+        ];
+        assert_eq!(
+            session.paste_paths(&non_unicode),
+            Err(muxel_core::path_paste::PastePathError::NonUnicode)
+        );
+        session.write_input(b"SENTINEL\r");
+        let (code, output) = wait_exit(&session, &rx);
+        assert_eq!(code, Some(0));
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("RECORDED:SENTINEL"), "{output}");
+        assert!(!output.contains("safe.txt"), "{output}");
+    }
+
+    #[test]
+    fn valid_file_paste_precedes_the_next_key_in_the_pty() {
+        let (session, rx) = spawn(
+            "[Console]::WriteLine('FIXTURE_READY'); $line=[Console]::ReadLine(); [Console]::WriteLine('RECORDED:'+ $line); exit 0",
+        );
+        wait_ready(&session, &rx);
+        session
+            .paste_paths(&[std::path::PathBuf::from("C:\\tmp\\report (1).pdf")])
+            .unwrap();
+        session.write_input(b"SENTINEL\r");
+        let (code, output) = wait_exit(&session, &rx);
+        assert_eq!(code, Some(0));
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("RECORDED: 'C:\\tmp\\report (1).pdf' SENTINEL"),
+            "{output}"
+        );
+    }
+
     fn wait_exit(
         session: &TerminalSession,
         rx: &async_channel::Receiver<PtyChunk>,
@@ -2991,6 +3047,8 @@ mod tests {
     /// `{:?}` (Debug, not shell) quoting that left `$(…)`/backticks live.
     #[test]
     fn paste_paths_quoting_blocks_injection() {
+        let quote_path_for_shell =
+            |path: &str| muxel_core::path_paste::quote_path(PasteShell::Posix, path).unwrap();
         // Command-substitution payload → wrapped whole, nothing executes.
         assert_eq!(
             quote_path_for_shell("/tmp/$(touch pwned).txt"),

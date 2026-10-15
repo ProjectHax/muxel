@@ -16,6 +16,7 @@ pub mod locale;
 pub mod memory;
 pub mod outage;
 mod pane;
+pub mod path_paste;
 pub mod readaloud;
 pub mod remote_ops;
 mod shell;
