@@ -512,6 +512,11 @@ feature is added or changed, update the matching entry here in the same change**
   writes it, with a fresh random token, to `control.json` in muxel's data directory,
   readable only by the user; nothing is reachable from the network, and a request
   without the token is refused. Turning the setting off (or quitting) closes it.
+  Before connecting, `muxel ctl` checks that the process that wrote `control.json`
+  is still running, so a file left behind by a muxel that was killed isn't
+  trusted. The check goes by process id alone, so if that id has since gone to
+  another process, the file still passes. On Linux and macOS that is any process;
+  on Windows it is one the user may open, such as one of their own.
 - **Settings → Grok Bot** — a setup page that walks through connecting Grok Bot
   in four steps: turn on outside control (with a live status: on and listening,
   starting, or off), allow command execution on this computer in Grok Bot's own
@@ -541,6 +546,10 @@ feature is added or changed, update the matching entry here in the same change**
   and a caller whose home or `XDG_DATA_HOME` differs from muxel's (`MUXEL_CONTROL=`
   pointing at its `control.json`). CI checks that `muxel ctl` starts from each
   release package.
+- **At a Windows prompt too** — muxel is a GUI program on Windows, which Windows
+  gives no console, so `muxel ctl` attaches to the console of the Command Prompt or
+  PowerShell it was typed in to print its reply there; piped and redirected output
+  goes where it was sent, as before.
 - **Shared agents take turns** — an agent can be reached from more than one muxel:
   a remote project opened on several computers, or a local tmux project another
   computer attached to. Before typing, muxel checks a marker on the agent's tmux

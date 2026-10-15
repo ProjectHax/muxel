@@ -194,6 +194,8 @@ fn main() {
     // `muxel ctl …` talks to the running app and exits; it never opens a window.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("ctl") {
+        #[cfg(windows)]
+        control::attach_parent_console();
         std::process::exit(control::run_cli(&args[1..]));
     }
     match session_binding::hook_instance_from_args(
