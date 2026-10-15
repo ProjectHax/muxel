@@ -22,13 +22,13 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
 ] }
 
 # --- UI component library (Longbridge) ---
-# Pinned to the merged accessibility and link-handler changes verified locally.
+# Pinned through the inline-image Markdown newline fix (upstream #2676).
 # `tree-sitter-languages` enables all bundled syntax-highlighting grammars for
 # the code-editor panes (InputState::code_editor).
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "3cb3cc139619ce704387b69deb17822b0fc22497", features = [
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "26cc9366abb27ccedce386ac99a615a8fa7018da", features = [
     "tree-sitter-languages",
 ] }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "3cb3cc139619ce704387b69deb17822b0fc22497", package = "gpui-component-assets" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "26cc9366abb27ccedce386ac99a615a8fa7018da", package = "gpui-component-assets" }
 
 # --- workspace-internal crates (added in later phases) ---
 muxel-core = { path = "crates/muxel-core" }
