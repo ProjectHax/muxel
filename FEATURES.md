@@ -641,7 +641,10 @@ feature is added or changed, update the matching entry here in the same change**
   cursor-position or mode report waits for that report to go first.
 - **Exit codes** — a pane's child exit status is captured, so close-on-exit and
   session-resume recovery can tell a clean `exit` from a crash (a deliberate quit
-  no longer triggers resume recovery).
+  no longer triggers resume recovery). On Windows, process exit is observed
+  independently of the console's output pipe, so a dead child cannot leave a
+  pane looking live and accepting input forever. Final output is drained before
+  the exit banner appears.
 - **Crash tombstones** — a pane whose process dies abnormally (non-zero exit, or
   the PTY failing outright) is never auto-closed: it keeps its final screen under
   a "process exited — code N" banner, fires an error in the NOTIFICATIONS feed
