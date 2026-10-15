@@ -164,6 +164,7 @@
   "Couldn't list tmux sessions there.": "Không thể liệt kê các phiên tmux ở đó.",
   "Couldn't merge {name}": "Không thể merge {name}",
   "Couldn't open a window: {err}": "Không thể mở cửa sổ: {err}",
+  "Couldn't paste into the remote pane": "Không thể dán vào pane từ xa",
   "Couldn't push “{name}”": "Không thể push “{name}”",
   "Couldn't read file from disk": "Không thể đọc tệp từ đĩa",
   "Couldn't read {file}: {detail}": "Không thể đọc {file}: {detail}",

@@ -164,6 +164,7 @@
   "Couldn't list tmux sessions there.": "Impossibile elencare le sessioni tmux lì.",
   "Couldn't merge {name}": "Impossibile eseguire il merge di {name}",
   "Couldn't open a window: {err}": "Impossibile aprire una finestra: {err}",
+  "Couldn't paste into the remote pane": "Impossibile incollare nel pannello remoto",
   "Couldn't push “{name}”": "Impossibile eseguire il push di \"{name}\"",
   "Couldn't read file from disk": "Impossibile leggere il file dal disco",
   "Couldn't read {file}: {detail}": "Impossibile leggere {file}: {detail}",

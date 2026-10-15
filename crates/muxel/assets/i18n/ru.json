@@ -164,6 +164,7 @@
   "Couldn't list tmux sessions there.": "Не удалось получить список сессий tmux там.",
   "Couldn't merge {name}": "Не удалось выполнить слияние {name}",
   "Couldn't open a window: {err}": "Не удалось открыть окно: {err}",
+  "Couldn't paste into the remote pane": "Не удалось вставить в удалённую панель",
   "Couldn't push “{name}”": "Не удалось запушить «{name}»",
   "Couldn't read file from disk": "Не удалось прочитать файл с диска",
   "Couldn't read {file}: {detail}": "Не удалось прочитать {file}: {detail}",

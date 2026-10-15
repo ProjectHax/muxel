@@ -164,6 +164,7 @@
   "Couldn't list tmux sessions there.": "無法列出該處的 tmux 工作階段。",
   "Couldn't merge {name}": "無法合併 {name}",
   "Couldn't open a window: {err}": "無法開啟視窗：{err}",
+  "Couldn't paste into the remote pane": "無法貼上到遠端窗格",
   "Couldn't push “{name}”": "無法推送「{name}」",
   "Couldn't read file from disk": "無法從磁碟讀取檔案",
   "Couldn't read {file}: {detail}": "無法讀取 {file}:{detail}",

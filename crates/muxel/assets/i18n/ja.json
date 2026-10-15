@@ -164,6 +164,7 @@
   "Couldn't list tmux sessions there.": "そちらの tmux セッションを一覧表示できませんでした。",
   "Couldn't merge {name}": "{name}をマージできませんでした",
   "Couldn't open a window: {err}": "ウィンドウを開けませんでした: {err}",
+  "Couldn't paste into the remote pane": "リモートペインに貼り付けできませんでした",
   "Couldn't push “{name}”": "“{name}”をプッシュできませんでした",
   "Couldn't read file from disk": "ディスクからファイルを読み込めませんでした",
   "Couldn't read {file}: {detail}": "{file}を読み込めませんでした: {detail}",

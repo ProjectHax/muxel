@@ -164,6 +164,7 @@
   "Couldn't list tmux sessions there.": "Kunde inte lista tmux-sessioner där.",
   "Couldn't merge {name}": "Kunde inte sammanfoga {name}",
   "Couldn't open a window: {err}": "Kunde inte öppna ett fönster: {err}",
+  "Couldn't paste into the remote pane": "Det gick inte att klistra in i fjärrpanelen",
   "Couldn't push “{name}”": "Kunde inte pusha “{name}”",
   "Couldn't read file from disk": "Kunde inte läsa filen från disken",
   "Couldn't read {file}: {detail}": "Det gick inte att läsa {file}: {detail}",

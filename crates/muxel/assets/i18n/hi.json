@@ -164,6 +164,7 @@
   "Couldn't list tmux sessions there.": "वहाँ tmux सेशन की सूची नहीं मिल सकी।",
   "Couldn't merge {name}": "{name} को मर्ज नहीं कर सका",
   "Couldn't open a window: {err}": "विंडो नहीं खोली जा सकी: {err}",
+  "Couldn't paste into the remote pane": "रिमोट पेन में पेस्ट नहीं किया जा सका",
   "Couldn't push “{name}”": "“{name}” को push नहीं कर सका",
   "Couldn't read file from disk": "डिस्क से फ़ाइल नहीं पढ़ी जा सकी",
   "Couldn't read {file}: {detail}": "{file} पढ़ा नहीं जा सका: {detail}",
