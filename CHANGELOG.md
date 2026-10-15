@@ -5,6 +5,113 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-10-15
+
+### Added
+- **Paste screenshots and files into an agent on another machine** — pasting an
+  image into a remote pane did nothing. muxel hands an image paste to the agent,
+  which reads the clipboard itself, and over SSH that is the host's clipboard,
+  which never has your screenshot. Files copied in Finder or dropped on the pane
+  fared no better, because their paths name files on your computer. In a remote
+  pane, muxel now copies a pasted image, or the files you paste or drop, to the host
+  first and pastes their path there instead, so Claude Code attaches a pasted
+  screenshot just as it does locally. They go to a folder on the host that only you
+  can read, and are cleared after a week. An image Claude won't take, such as the
+  TIFF that copying from Preview gives, is sent as a PNG. Folders and files over
+  25 MB aren't copied, and the notification feed says which. Pasting text is
+  unchanged.
+- **A Muse Code preset** — Meta's Muse Code joins the built-in agents. It launches
+  the `muse` you have installed, with Muse's own default model and reasoning effort
+  unless you set them in the preset, and muxel types nothing into it on startup.
+  Muse's own resume works as usual, but muxel doesn't yet pick a Muse conversation
+  back up when the pane restarts. The upgrade adds the preset without bringing back
+  built-in presets you had deleted, which earlier upgrades did. Thanks to
+  [@railapex](https://github.com/railapex)
+  ([#76](https://github.com/ProjectHax/muxel/pull/76)).
+- **An agent can tell which pane it is in** — a program in a muxel pane on this
+  computer now gets `MUXEL_INSTANCE_ID` set to its pane's id, so an agent or script
+  can check its own status or read its own screen with `muxel ctl` instead of
+  guessing which pane is its own by name. A pane kept in tmux gets it from tmux 3.2
+  on. Before, only some local Claude panes had it, and a new tmux pane could inherit
+  another pane's id from the tmux server — the id muxel uses to match a Claude
+  conversation to its pane, so a conversation could be recorded against the wrong
+  one. Remote panes are kept from picking one up at all. Thanks to
+  [@railapex](https://github.com/railapex)
+  ([#72](https://github.com/ProjectHax/muxel/pull/72)).
+
+### Fixed
+- **A remote pane you close stays closed** — closing a remote pane sometimes
+  brought it straight back a few seconds later, agent and all. muxel re-reads the
+  layout it shares on the host every few seconds, and a read that started just
+  before your close was saved there, but finished after, still listed the pane.
+  muxel took that stale copy for a change made on another machine and put the pane
+  back. Reconnecting could do the same from a list of the host's sessions fetched a
+  moment before the agent was stopped. A re-read that started before muxel's own
+  save is now thrown away, and a pane you close isn't brought back for as long as
+  muxel stays open. A slow connection made this far more likely, which is the next
+  fix.
+- **No more "Session open refused by peer" with many remote agents** — muxel shared
+  one SSH connection per host between all of that host's panes and its own
+  background work (git, layout sync), and SSH servers allow ten sessions on one
+  connection by default. With eight or nine agents on a host, background work
+  overlapping a pane opening went over the limit: the pane printed "Session open
+  refused by peer" and had to open a slower connection of its own. Panes now share
+  connections at most eight to each, muxel's background work has a connection of
+  its own, and connecting brings up every connection a project's panes are about to
+  use before they start. Background checks also wait for the previous one to
+  finish, so a slow host no longer piles them up.
+- **muxel stays responsive on macOS however many notifications you leave unread** —
+  on macOS the window stopped responding after a few hours with several agents
+  running, while the agents carried on in the background. Every desktop
+  notification left behind a check that ran twice a second on the thread that draws
+  the window, for as long as the notification stayed in Notification Center, and
+  they added up. Notifications are now sent without waiting on them. Clicking one
+  still brings muxel to the front, but no longer switches to the agent's pane.
+  Thanks to [@freddysae0](https://github.com/freddysae0)
+  ([#74](https://github.com/ProjectHax/muxel/pull/74)), who tracked it down in
+  [#73](https://github.com/ProjectHax/muxel/issues/73).
+- **Markdown with images and line breaks no longer crashes muxel** — showing a
+  rendered Markdown file with a line break before an inline image in the same
+  paragraph, including a linked HTML image, closed muxel. These now render. The
+  interface library update that fixes it brings a handful of other upstream
+  interface fixes with it. Thanks to [@railapex](https://github.com/railapex)
+  ([#75](https://github.com/ProjectHax/muxel/pull/75)).
+- **A remote pane alone in its tmux session follows its own size** — over SSH,
+  Claude's prompt could show cut-off text and odd line wrapping. A newly attached
+  remote pane stayed at the size its session was created at, often 80 columns,
+  until you typed, whenever any other tmux client was attached on that host — this
+  computer's own other panes included. A remote pane now only stays out of the
+  window size when someone else is attached to the same session, which is the case
+  that rule is there for.
+- **Restoring a project never starts a pane twice, and on Windows starts agents in
+  pairs** — clicking a project again while its agents were starting could launch
+  the same pane a second time; a pane that is already starting is now left to
+  finish. On Windows, opening a project started its agents four at a time, all
+  loading at once. They now start in pairs, each pair waiting until the last has
+  drawn and gone quiet, or five seconds have passed. Thanks to
+  [@railapex](https://github.com/railapex)
+  ([#71](https://github.com/ProjectHax/muxel/pull/71)).
+- **Windows: a pane notices when its program exits** — a program could exit while
+  its pane went on showing it as running and refused typing and resizing. muxel now
+  watches the program itself rather than waiting for its output to close, and still
+  shows everything it printed before it ended. Thanks to
+  [@railapex](https://github.com/railapex)
+  ([#69](https://github.com/ProjectHax/muxel/pull/69)).
+- **Windows: `muxel ctl` only talks to a muxel that is running, and prints its
+  replies** — after muxel had been killed, `muxel ctl` could still find its old
+  address and send your command, and its access token, to whatever program had
+  taken that port since. It now checks that muxel is actually running first. Run
+  from a command prompt, the release build now prints its replies there as well,
+  where before nothing appeared; they can show up just after the prompt returns.
+  Thanks to [@railapex](https://github.com/railapex)
+  ([#70](https://github.com/ProjectHax/muxel/pull/70)).
+
+### iOS companion app (distributed via TestFlight / App Store, not in these downloads)
+- An agent started from the phone no longer picks up another pane's id. On a host
+  whose tmux server was first started inside a muxel pane, it inherited that pane's
+  id, as desktop's remote panes did before this release; the phone now clears it
+  before starting a session, the same way.
+
 ## [0.3.0] — 2026-10-10
 
 ### Added
