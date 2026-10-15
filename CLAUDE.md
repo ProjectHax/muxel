@@ -46,8 +46,13 @@ you change those Rust contracts, update the matching Swift port. See `ios/README
   id in `MuxelApp.terminals`. Runtime-only state (e.g. `AgentStatus`) is **not**
   persisted.
 - **Back-compat persistence** — every new field on a persisted struct gets
-  `#[serde(default)]` so older `workspace.json` / settings still load. Bump
-  `PRESET_SEED_VERSION` when adding a built-in preset so existing workspaces merge it.
+  `#[serde(default)]` so older `workspace.json` / settings still load.
+- **Adding a built-in preset** — bump `PRESET_SEED_VERSION` **and** add an
+  `if self.preset_seed_version < N` step to `Settings::seed_builtin_presets`
+  (`muxel-core/src/lib.rs`) that adds just the new preset, by name and only if it's
+  missing (Muse Code's v18 step is the model). Bumping alone only reaches installs
+  older than v17: earlier catch-ups are deliberately not replayed, so a user's
+  deleted presets and edited fields survive the upgrade.
 - **GPUI patterns** — render builds an element tree with `div()…`; handlers use
   `cx.listener(|this, ev, window, cx| …)`; the terminal is a custom `Element`
   (manual layout/paint). Mouse `on_drag_move` fires for all listeners — guard with
