@@ -2319,21 +2319,28 @@ fn capture_agent_session_id(
     muxel_core::codex_latest_session_id(&home, cwd)
 }
 
+fn unowned_captured_session_id(
+    captured: Option<String>,
+    sibling_session_ids: &HashSet<String>,
+) -> Option<String> {
+    captured.filter(|id| !sibling_session_ids.contains(id))
+}
+
 fn validated_codex_session_id(
     preset: &AgentPreset,
     current: Option<&str>,
     title_hint: Option<&str>,
     home: &std::path::Path,
     cwd: &std::path::Path,
-    bound_elsewhere: bool,
     profile_pane: Option<Uuid>,
 ) -> Option<String> {
-    let candidate = muxel_core::codex_session_id_from_title(preset, title_hint?)?;
-    if current == Some(candidate.as_str()) || bound_elsewhere {
+    let hint = muxel_core::codex_session_hint_from_title(preset, title_hint?)?;
+    let prefix = hint.strip_suffix("...").unwrap_or(&hint);
+    if current.is_some_and(|id| id.starts_with(prefix)) {
         return None;
     }
     let _phase = ui_profile::phase("status", "codex-session-validate", profile_pane);
-    muxel_core::codex_session_matches_cwd(home, &candidate, cwd).then_some(candidate)
+    muxel_core::codex_session_id_from_hint(home, &hint, cwd)
 }
 
 fn session_id_bound_elsewhere(instances: &[Instance], owner: Uuid, session_id: &str) -> bool {
@@ -5994,6 +6001,13 @@ impl MuxelApp {
             let _phase = ui_profile::phase("activation", "claude-binding", Some(iid));
             self.adopt_claude_session_binding(iid);
         }
+        let sibling_session_ids: HashSet<String> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|instance| instance.id != iid)
+            .filter_map(|instance| instance.session_id.clone())
+            .collect();
         let inst = self.workspace.instance_mut(iid)?;
         let host_minted = preset.session_id_flag.is_some();
         let mut resume_cwd = None;
@@ -6034,7 +6048,7 @@ impl MuxelApp {
                     let _phase = ui_profile::phase("activation", "codex-session-latest", Some(iid));
                     capture_agent_session_id(&preset, cwd.as_deref())
                 };
-                if let Some(id) = captured {
+                if let Some(id) = unowned_captured_session_id(captured, &sibling_session_ids) {
                     inst.session_id = Some(id);
                 } else {
                     inst.session_started = false;
@@ -10190,11 +10204,11 @@ impl MuxelApp {
             restoring,
         } in snapshot
         {
-            // Codex mints its own session id and publishes the active thread as a
-            // semantic OSC title. Accept an initial or later `/resume` title only
-            // after its rollout exists, its recorded cwd matches this pane, and no
-            // sibling pane already owns the id. That closes the common title-spoof
-            // and same-directory alias paths without falling back to "latest".
+            // Codex mints its own session id and publishes an immutable prefix in
+            // its semantic OSC title. Accept an initial or later `/resume` title
+            // only after exactly one rollout matches the prefix and cwd, and no
+            // sibling pane already owns the full id. That closes title-spoof and
+            // same-directory alias paths without falling back to "latest".
             let captured_codex_id = self.workspace.instance(iid).and_then(|inst| {
                 let preset = inst
                     .preset_id
@@ -10209,19 +10223,16 @@ impl MuxelApp {
                     .as_deref()
                     .unwrap_or(project.root_path.as_path());
                 let home = home_dir()?;
-                let candidate =
-                    muxel_core::codex_session_id_from_title(preset, session_id_hint.as_deref()?)?;
-                let bound_elsewhere =
-                    session_id_bound_elsewhere(&self.workspace.instances, iid, &candidate);
-                validated_codex_session_id(
+                let candidate = validated_codex_session_id(
                     preset,
                     inst.session_id.as_deref(),
                     session_id_hint.as_deref(),
                     &home,
                     cwd,
-                    bound_elsewhere,
                     Some(iid),
-                )
+                )?;
+                (!session_id_bound_elsewhere(&self.workspace.instances, iid, &candidate))
+                    .then_some(candidate)
             });
             if let Some(id) = captured_codex_id
                 && let Some(inst) = self.workspace.instance_mut(iid)
@@ -29800,10 +29811,10 @@ mod shell_title_tests {
     use super::{
         agent_minted_session_gone, authoritative_terminal_auto_title, codex_session_auto_title,
         session_id_bound_elsewhere, shell_dir_title, terminal_auto_title,
-        validated_codex_session_id,
+        unowned_captured_session_id, validated_codex_session_id,
     };
     use muxel_core::{AgentPreset, Instance};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use uuid::Uuid;
 
@@ -29826,6 +29837,10 @@ mod shell_title_tests {
 
         assert_eq!(terminal_auto_title(&codex, "cmd.exe"), None);
         assert_eq!(terminal_auto_title(&codex, "codex"), None);
+        assert_eq!(
+            terminal_auto_title(&codex, "01a0e807-a64d-7502-b922-cff0e... | Ready"),
+            None
+        );
         assert_eq!(
             terminal_auto_title(&codex, "npm run test-v8-historical"),
             None
@@ -29925,12 +29940,12 @@ mod shell_title_tests {
     }
 
     #[test]
-    fn codex_session_binding_accepts_only_an_exact_unowned_rollout() {
+    fn codex_session_binding_resolves_provider_hint_and_rejects_owned_rollout() {
         let first = Uuid::new_v4().to_string();
         let later = Uuid::new_v4().to_string();
         let preset = AgentPreset::codex();
-        let initial_frame = format!("{first} | Ready ·");
-        let later_frame = format!("{later} | Ready ·");
+        let initial_frame = format!("{}... | Ready", &first[..29]);
+        let later_frame = format!("{}... | Ready", &later[..29]);
         let home = std::env::temp_dir().join(format!("muxel-codex-binding-{}", Uuid::new_v4()));
         let cwd = home.join("project");
         let sessions = home.join(".codex/sessions/2026/08/23");
@@ -29949,17 +29964,20 @@ mod shell_title_tests {
         }
 
         assert_eq!(
+            validated_codex_session_id(&preset, None, Some(&initial_frame), &home, &cwd, None,)
+                .as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
             validated_codex_session_id(
                 &preset,
-                None,
+                Some(&first),
                 Some(&initial_frame),
                 &home,
                 &cwd,
-                false,
                 None,
-            )
-            .as_deref(),
-            Some(first.as_str())
+            ),
+            None
         );
         assert_eq!(
             validated_codex_session_id(
@@ -29968,7 +29986,6 @@ mod shell_title_tests {
                 Some(&later_frame),
                 &home,
                 &cwd,
-                false,
                 None,
             )
             .as_deref(),
@@ -29980,20 +29997,7 @@ mod shell_title_tests {
                 Some(&first),
                 Some(&later_frame),
                 &home,
-                &cwd,
-                true,
-                None,
-            ),
-            None
-        );
-        assert_eq!(
-            validated_codex_session_id(
-                &preset,
-                Some(&first),
-                Some(&later_frame),
-                &home,
                 Path::new("D:/different"),
-                false,
                 None,
             ),
             None
@@ -30018,6 +30022,15 @@ mod shell_title_tests {
             owner.id,
             &later
         ));
+        let sibling_ids = HashSet::from([later.clone()]);
+        assert_eq!(
+            unowned_captured_session_id(Some(first.clone()), &sibling_ids).as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            unowned_captured_session_id(Some(later.clone()), &sibling_ids),
+            None
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 

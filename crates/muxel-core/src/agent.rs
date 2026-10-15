@@ -844,38 +844,95 @@ pub fn codex_session_names(
     Ok(names)
 }
 
-/// A Codex terminal title that directly identifies its session.
+/// The Codex-owned thread field from a semantic terminal title.
 ///
-/// Codex publishes its agent-minted UUID as an OSC terminal title.
-/// Capturing that title binds each pane to its own rollout even when several
-/// Codex panes share a working directory. The normal pre-resume existence check
-/// still rejects a stale or missing UUID before it reaches the CLI.
-pub fn codex_session_id_from_title(preset: &AgentPreset, title: &str) -> Option<String> {
+/// `thread-id` is the immutable session UUID, but Codex truncates every terminal
+/// title field to 32 characters. Current releases therefore publish the first
+/// 29 UUID characters plus `...`; older releases may publish the full UUID.
+/// The caller must resolve a truncated hint against Codex's rollout store with
+/// [`codex_session_id_from_hint`] before adopting it.
+pub fn codex_session_hint_from_title(preset: &AgentPreset, title: &str) -> Option<String> {
     if !preset.program.as_deref().is_some_and(is_codex_program) {
         return None;
     }
     let title = title.trim();
-    if Uuid::parse_str(title).is_ok() {
+    if is_codex_thread_id_hint(title) {
         return Some(title.to_string());
     }
 
-    // Accept a UUID only when it owns the complete thread field. A UUID merely
-    // mentioned inside a renamed thread must never rebind the pane. Codex 0.147
+    // Accept an id only when it owns the complete thread field. A UUID merely
+    // mentioned inside another title must never rebind the pane. Codex 0.147+
     // uses `thread | run-state [spinner]`; older releases used a middle dot.
-    let thread = if let Some(thread) = title
+    let (thread, state) = if let Some(rest) = title
         .strip_prefix("[ ! ] Action Required | ")
         .or_else(|| title.strip_prefix("[ . ] Action Required | "))
     {
-        thread
+        rest.split_once(" | ").unwrap_or((rest, "Ready"))
     } else {
-        let (thread, state) = title.rsplit_once(" | ")?;
-        if !is_codex_title_state(state) {
-            return None;
-        }
-        thread
+        let (thread, state) = title.split_once(" | ")?;
+        (thread, state)
+    };
+    let thread = thread.trim();
+    (is_codex_title_state(state) && is_codex_thread_id_hint(thread)).then(|| thread.to_string())
+}
+
+pub(crate) fn is_codex_thread_id_hint(value: &str) -> bool {
+    if Uuid::parse_str(value).is_ok() {
+        return true;
     }
-    .trim();
-    Uuid::parse_str(thread).ok().map(|_| thread.to_string())
+    let Some(prefix) = value.strip_suffix("...") else {
+        return false;
+    };
+    if prefix.len() != 29 {
+        return false;
+    }
+    Uuid::parse_str(&format!("{prefix}0000000")).is_ok()
+}
+
+/// Resolve a validated Codex terminal-title hint to one rollout for `cwd`.
+///
+/// Truncated hints are accepted only when exactly one full session UUID with a
+/// matching recorded cwd exists. This preserves pane identity without trusting
+/// arbitrary OSC title text or a newest-file heuristic.
+pub fn codex_session_id_from_hint(home: &Path, hint: &str, cwd: &Path) -> Option<String> {
+    if !is_codex_thread_id_hint(hint) {
+        return None;
+    }
+    let prefix = hint.strip_suffix("...").unwrap_or(hint);
+    let root = home.join(".codex").join("sessions");
+    if !root.is_dir() {
+        return None;
+    }
+
+    let mut matched = None;
+    let mut ambiguous = false;
+    walk_jsonl(&root, &mut |path| {
+        // Filter by filename before opening rollouts. Codex rollout filenames
+        // carry the full UUID, including for compressed history files.
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(prefix))
+        {
+            return false;
+        }
+        let Some((id, recorded_cwd)) = codex_session_meta(path) else {
+            return false;
+        };
+        if !id.starts_with(prefix)
+            || Uuid::parse_str(&id).is_err()
+            || !paths_loosely_equal(Path::new(&recorded_cwd), cwd)
+        {
+            return false;
+        }
+        if matched.as_deref().is_some_and(|current| current != id) {
+            ambiguous = true;
+        } else {
+            matched = Some(id);
+        }
+        false
+    });
+    (!ambiguous).then_some(matched).flatten()
 }
 
 fn is_codex_title_state(state: &str) -> bool {
@@ -1203,7 +1260,10 @@ fn is_codex_program(program: &str) -> bool {
 /// One-run Codex title contract consumed by Muxel's lifecycle parser.
 /// Single-quoted TOML strings survive the npm `.cmd` wrapper on Windows.
 pub fn codex_terminal_title_override() -> &'static str {
-    "tui.terminal_title=['thread','run-state','activity']"
+    // `thread` becomes the mutable display name after `/rename` (and after
+    // `/resume` selects a named thread), so it cannot durably identify the
+    // conversation. `thread-id` stays the rollout UUID in every title frame.
+    "tui.terminal_title=['thread-id','run-state','activity']"
 }
 
 /// Seed contents written when a project's `MEMORY.md` is first created. Delegates to
@@ -1224,18 +1284,28 @@ mod tests {
     }
 
     #[test]
-    fn codex_title_override_is_an_argv_safe_toml_array() {
+    fn codex_rename_keeps_the_immutable_resume_binding_in_launch_titles() {
         assert_eq!(
             codex_terminal_title_override(),
-            "tui.terminal_title=['thread','run-state','activity']"
+            "tui.terminal_title=['thread-id','run-state','activity']"
         );
-        let launch = resolve_launch(&instance(&AgentPreset::codex(), None));
+        let preset = AgentPreset::codex();
+        let mut pane = instance(&preset, None);
+        let session_id = Uuid::new_v4().to_string();
+        pane.session_id = Some(session_id.clone());
+        pane.session_started = true;
+        pane.custom_name = Some("Renamed tab".to_string());
+        let launch = resolve_launch(&pane);
         assert!(launch.args.windows(2).any(|pair| {
             pair == [
                 "--config",
-                "tui.terminal_title=['thread','run-state','activity']",
+                "tui.terminal_title=['thread-id','run-state','activity']",
             ]
         }));
+        assert_eq!(
+            session_resume_args(&preset, &pane),
+            Some(vec!["resume".to_string(), session_id])
+        );
     }
 
     #[test]
@@ -1249,7 +1319,7 @@ mod tests {
             format!("[ ! ] Action Required | {id}"),
         ] {
             assert_eq!(
-                codex_session_id_from_title(&AgentPreset::codex(), &title).as_deref(),
+                codex_session_hint_from_title(&AgentPreset::codex(), &title).as_deref(),
                 Some(id.as_str()),
                 "rejected semantic title {title:?}"
             );
@@ -1257,14 +1327,14 @@ mod tests {
         let title = format!("{id} | Working ⠋");
 
         assert_eq!(
-            codex_session_id_from_title(
+            codex_session_hint_from_title(
                 &AgentPreset::codex(),
                 &format!("Review {id} carefully | Ready")
             ),
             None
         );
         assert_eq!(
-            codex_session_id_from_title(
+            codex_session_hint_from_title(
                 &AgentPreset {
                     program: Some("codex-title-proxy.exe".to_string()),
                     ..AgentPreset::codex()
@@ -1274,7 +1344,7 @@ mod tests {
             None
         );
         assert_eq!(
-            codex_session_id_from_title(
+            codex_session_hint_from_title(
                 &AgentPreset::codex(),
                 &format!("{id} | unowned child title")
             ),
@@ -1515,12 +1585,20 @@ mod tests {
         let codex = AgentPreset::codex();
         let id = Uuid::new_v4().to_string();
         assert_eq!(
-            codex_session_id_from_title(&codex, &format!(" {id} ")).as_deref(),
+            codex_session_hint_from_title(&codex, &format!(" {id} ")).as_deref(),
             Some(id.as_str())
         );
-        assert_eq!(codex_session_id_from_title(&codex, "Review changes"), None);
+        let shortened = format!("{}...", &id[..29]);
         assert_eq!(
-            codex_session_id_from_title(&AgentPreset::claude(), &id),
+            codex_session_hint_from_title(&codex, &format!("{shortened} | Ready")).as_deref(),
+            Some(shortened.as_str())
+        );
+        assert_eq!(
+            codex_session_hint_from_title(&codex, "Review changes"),
+            None
+        );
+        assert_eq!(
+            codex_session_hint_from_title(&AgentPreset::claude(), &id),
             None
         );
     }
@@ -1619,6 +1697,43 @@ mod tests {
         assert!(codex_session_exists(&tmp, &compressed_id.to_uppercase()));
         assert!(!codex_session_exists(&tmp, &content_only_id));
         assert!(!codex_session_exists(&tmp, "not-a-session-uuid"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn truncated_codex_hint_resolves_one_matching_cwd_and_rejects_ambiguity() {
+        let tmp = std::env::temp_dir().join(format!("muxel-codex-hint-{}", Uuid::new_v4()));
+        let day = tmp.join(".codex/sessions/2026/09/28");
+        let cwd = tmp.join("project");
+        let other = tmp.join("other");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let first = "019f95d7-db31-7db0-904d-9e08330e0000";
+        let second = "019f95d7-db31-7db0-904d-9e08330e0001";
+        let hint = format!("{}...", &first[..29]);
+        let write_rollout = |id: &str, recorded_cwd: &Path| {
+            let meta = serde_json::json!({
+                "type": "session_meta",
+                "payload": { "session_id": id, "cwd": recorded_cwd }
+            });
+            std::fs::write(day.join(format!("rollout-{id}.jsonl")), meta.to_string()).unwrap();
+        };
+
+        write_rollout(first, &cwd);
+        write_rollout(second, &other);
+        assert_eq!(
+            codex_session_id_from_hint(&tmp, &hint, &cwd).as_deref(),
+            Some(first)
+        );
+        assert_eq!(
+            codex_session_id_from_hint(&tmp, first, &cwd).as_deref(),
+            Some(first)
+        );
+
+        write_rollout(second, &cwd);
+        assert_eq!(codex_session_id_from_hint(&tmp, &hint, &cwd), None);
+        assert_eq!(codex_session_id_from_hint(&tmp, "not-a-hint", &cwd), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
