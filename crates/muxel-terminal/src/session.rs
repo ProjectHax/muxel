@@ -424,6 +424,13 @@ pub struct TerminalSession {
     /// When the user last sent this terminal input themselves (see
     /// [`Self::mark_user_input`]), as opposed to text muxel typed on its own.
     last_user_input: Mutex<Option<Instant>>,
+    /// Counts what this terminal sends to the program as input: keys, pastes,
+    /// and mouse and wheel reports (a wheel turn can arrive as arrow keys). Not
+    /// focus reports, and not the terminal's own replies to the program. Input
+    /// that reaches the program another way (another client attached to the
+    /// same tmux session) isn't counted. Code that pasted a prompt can tell from
+    /// it whether this terminal sent anything else before its Enter.
+    input_rev: AtomicU64,
     /// Bumped whenever pixels that depend on the grid/selection/scroll/search
     /// would change. [`crate::element`] skips the full cell walk when this matches
     /// the last painted generation (draw-list replay).
@@ -870,6 +877,7 @@ impl TerminalSession {
             focused: AtomicBool::new(false),
             turn_submitted: AtomicBool::new(false),
             last_user_input: Mutex::new(None),
+            input_rev: AtomicU64::new(0),
             content_gen: AtomicU64::new(1),
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
@@ -1032,6 +1040,13 @@ impl TerminalSession {
     /// jumps the viewport back to the bottom, so typing while scrolled up in the
     /// history snaps you to the live prompt.
     pub fn write_input(&self, data: &[u8]) {
+        let _ = self.try_write_input(data);
+    }
+
+    /// [`Self::write_input`], saying whether the bytes could be handed to the
+    /// PTY. An error means the terminal's writer is gone (its program exited and
+    /// a write has already failed); `Ok` only means the bytes were queued.
+    pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
         // Skip scroll work when already pinned to the live row — every key
         // otherwise takes the term mutex for a no-op scroll under load.
         {
@@ -1046,8 +1061,15 @@ impl TerminalSession {
             // A TUI reaction will follow; prioritize output during this short
             // interaction window even if stream output is already queued.
             self.mark_interactive();
+            self.input_rev.fetch_add(1, Ordering::AcqRel);
         }
-        self.write_raw(data);
+        self.try_write_raw(data)
+    }
+
+    /// How many times input has been sent so far (see the field). Read it after
+    /// pasting a prompt; a different value later means something else was sent.
+    pub fn input_rev(&self) -> u64 {
+        self.input_rev.load(Ordering::Acquire)
     }
 
     /// [`Self::write_input`] for input the user produced themselves — a key typed
@@ -1120,12 +1142,25 @@ impl TerminalSession {
         self.paste(&text);
     }
 
+    /// Send a mouse or wheel report: input from the user, so it counts, but it
+    /// leaves the scroll position alone.
+    fn write_pointer(&self, data: &[u8]) {
+        if !data.is_empty() {
+            self.input_rev.fetch_add(1, Ordering::AcqRel);
+        }
+        self.write_raw(data);
+    }
+
     /// Write bytes to the PTY without touching the scroll position (used for
     /// non-input writes like focus reports).
     fn write_raw(&self, data: &[u8]) {
+        let _ = self.try_write_raw(data);
+    }
+
+    fn try_write_raw(&self, data: &[u8]) -> std::io::Result<()> {
         let mut writer = self.writer.lock();
-        let _ = writer.write_all(data);
-        let _ = writer.flush();
+        writer.write_all(data)?;
+        writer.flush()
     }
 
     /// Scroll the viewport by a mouse-wheel delta. `delta_y` is the pixel delta
@@ -1196,7 +1231,7 @@ impl TerminalSession {
                 for _ in 0..count {
                     push_wheel_report(&mut buf, lines > 0, col, row, sgr);
                 }
-                self.write_raw(&buf);
+                self.write_pointer(&buf);
             }
             Wheel::Arrows { app_cursor } => {
                 let seq: &[u8] = match (lines > 0, app_cursor) {
@@ -1206,7 +1241,7 @@ impl TerminalSession {
                     (false, false) => b"\x1b[B",
                 };
                 for _ in 0..count {
-                    self.write_raw(seq);
+                    self.write_pointer(seq);
                 }
             }
         }
@@ -1702,7 +1737,7 @@ impl TerminalSession {
         let mut buf = Vec::with_capacity(24);
         push_mouse_report(&mut buf, button + mods, col, row, pressed, sgr);
         self.mark_user_input();
-        self.write_raw(&buf);
+        self.write_pointer(&buf);
         // Remember an outstanding press so the matching release is guaranteed.
         self.mouse_pressed_button.store(
             if pressed { button } else { NO_MOUSE_PRESS },
@@ -1759,7 +1794,7 @@ impl TerminalSession {
         // Motion is always "press" encoding in SGR (`M`).
         push_mouse_report(&mut buf, base + mods, col, row, true, sgr);
         self.mark_user_input();
-        self.write_raw(&buf);
+        self.write_pointer(&buf);
     }
 }
 
@@ -3413,6 +3448,57 @@ mod tests {
             session.is_idle_foreground(),
             "the direct child should be the foreground process group"
         );
+        session.kill();
+    }
+}
+
+#[cfg(test)]
+mod input_rev_tests {
+    use super::{CommandSpec, TermMode, TerminalSession};
+
+    #[test]
+    fn input_rev_counts_what_is_typed_after_a_paste() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn");
+        let before = session.input_rev();
+        session.paste("a prompt");
+        let pasted = session.input_rev();
+        assert_eq!(pasted, before + 1);
+        // Nothing written, and a focus report (not input): still unchanged. The
+        // program asks for focus reports first, so the report is really sent.
+        session.write_input(b"");
+        session.process_probe_output(b"\x1b[?1004h");
+        assert!(session.term.lock().mode().contains(TermMode::FOCUS_IN_OUT));
+        session.report_focus(false);
+        session.report_focus(true);
+        // Cursor-position replies go straight to the writer, not user input.
+        session.process_probe_output(b"\x1b[6n");
+        assert_eq!(session.input_rev(), pasted);
+        // A key typed after the paste: the prompt's Enter must now be withheld.
+        session.write_input(b"x");
+        assert_ne!(session.input_rev(), pasted);
+        // A click is input too; a wheel turn that only scrolls muxel's own
+        // scrollback never reaches the program, so it isn't.
+        let typed = session.input_rev();
+        session.report_mouse_button(0, 0, 0, true, false, false, false);
+        session.report_mouse_button(0, 0, 0, false, false, false, false);
+        assert_eq!(session.input_rev(), typed + 2);
+        let clicked = session.input_rev();
+        session.scroll_wheel(-40.0, 20.0, 0, 0);
+        assert_eq!(session.input_rev(), clicked);
+        // Mouse-mode wheel reports reach the child, as do alternate-screen
+        // wheel turns translated to arrows. Both move the input revision.
+        session.process_probe_output(b"\x1b[?1000h\x1b[?1006h");
+        session.scroll_wheel(-40.0, 20.0, 0, 0);
+        assert_ne!(session.input_rev(), clicked);
+        let wheeled = session.input_rev();
+        session.process_probe_output(b"\x1b[?1000l\x1b[?1049h\x1b[?1007h");
+        session.scroll_wheel(-40.0, 20.0, 0, 0);
+        assert_ne!(session.input_rev(), wheeled);
         session.kill();
     }
 }

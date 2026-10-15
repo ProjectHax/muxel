@@ -391,9 +391,55 @@ pub fn kill_session_args(session: &str) -> Vec<String> {
     ]
 }
 
+/// Atomically unset an option only while it matches this send's claim pattern.
+/// tmux 2.6+ supports the format match; older versions leave the claim to expire.
+pub fn unset_option_if_args(session: &str, option: &str, pattern: &str) -> Option<Vec<String>> {
+    let option_ok = option.strip_prefix('@').is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    });
+    if !option_ok
+        || session.contains('\'')
+        || !pattern
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "|*-_.".contains(c))
+    {
+        return None;
+    }
+    Some(vec![
+        "if-shell".into(),
+        "-F".into(),
+        "-t".into(),
+        format!("={session}:"),
+        format!("#{{m:{pattern},#{{{option}}}}}"),
+        format!("set-option -qu -t '={session}:' {option}"),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_cleanup_is_conditional_and_refuses_unsafe_patterns() {
+        let args = unset_option_if_args("pane", "@muxel-ctl", "v1|owner|*|*|*|nonce").unwrap();
+        assert_eq!(
+            args,
+            [
+                "if-shell",
+                "-F",
+                "-t",
+                "=pane:",
+                "#{m:v1|owner|*|*|*|nonce,#{@muxel-ctl}}",
+                "set-option -qu -t '=pane:' @muxel-ctl"
+            ]
+        );
+        assert!(unset_option_if_args("it's", "@muxel-ctl", "v1|*").is_none());
+        assert!(unset_option_if_args("pane", "@muxel-ctl", "v1|a,b|*").is_none());
+        assert!(unset_option_if_args("pane", "@bad option", "v1|*").is_none());
+    }
 
     #[test]
     fn option_args_target_exactly_one_session() {
