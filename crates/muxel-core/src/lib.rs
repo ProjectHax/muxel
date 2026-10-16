@@ -19,6 +19,7 @@ mod pane;
 pub mod path_paste;
 pub mod readaloud;
 pub mod remote_ops;
+pub mod session_discovery;
 mod shell;
 pub mod ssh;
 pub mod stt;
