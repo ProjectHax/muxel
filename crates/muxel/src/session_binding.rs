@@ -474,19 +474,47 @@ pub(crate) fn claim_claude_binding(
     data_dir: &Path,
     instance_id: Uuid,
 ) -> Option<ClaimedClaudeRecord> {
+    try_claim_claude_binding(data_dir, instance_id)
+        .ok()
+        .flatten()
+}
+
+fn try_claim_claude_binding(
+    data_dir: &Path,
+    instance_id: Uuid,
+) -> Result<Option<ClaimedClaudeRecord>> {
     let path = claude_claimed_binding_path(data_dir, instance_id);
-    if !path.exists() {
-        std::fs::rename(claude_binding_path(data_dir, instance_id), &path).ok()?;
+    if !path.try_exists()? {
+        match std::fs::rename(claude_binding_path(data_dir, instance_id), &path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("claim Claude conversation binding"),
+        }
     }
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = std::fs::read(&path).context("read claimed Claude conversation binding")?;
     let modified = std::fs::metadata(&path)
         .and_then(|metadata| metadata.modified())
         .ok();
-    Some(ClaimedClaudeRecord {
+    Ok(Some(ClaimedClaudeRecord {
         path,
         bytes,
         modified,
-    })
+    }))
+}
+
+/// Drain pending records before choosing launch arguments. A failed handler leaves
+/// its claim intact; failed acknowledgement stops recovery rather than retrying
+/// the same claim forever or launching over a pending newer binding.
+pub(crate) fn recover_claude_bindings_before_resume(
+    data_dir: &Path,
+    instance_id: Uuid,
+    mut adopt: impl FnMut(&ClaimedClaudeRecord) -> Result<()>,
+) -> Result<()> {
+    while let Some(record) = try_claim_claude_binding(data_dir, instance_id)? {
+        adopt(&record)?;
+        std::fs::remove_file(record.path).context("acknowledge recovered Claude conversation")?;
+    }
+    Ok(())
 }
 
 /// Delete a claimed record once it has been handled. Only the claimed file
@@ -530,6 +558,159 @@ mod tests {
         claude_binding_from_record(&record.bytes, home)
             .unwrap()
             .session_id
+    }
+
+    struct PendingResume {
+        root: PathBuf,
+        data: PathBuf,
+        home: PathBuf,
+        workspace_path: PathBuf,
+        instance_id: Uuid,
+        old_id: String,
+        new_id: String,
+    }
+
+    impl PendingResume {
+        fn new() -> Self {
+            let root = temp_dir();
+            let data = root.join("data");
+            let home = root.join("home");
+            let cwd = root.join("project");
+            let mut instance = muxel_core::Instance::from_preset(
+                Uuid::new_v4(),
+                &muxel_core::AgentPreset::claude(),
+            );
+            let instance_id = instance.id;
+            let old_id = Uuid::new_v4().to_string();
+            let new_id = Uuid::new_v4().to_string();
+            instance.session_id = Some(old_id.clone());
+            instance.session_started = true;
+            let mut workspace = muxel_core::Workspace::default();
+            workspace.instances.push(instance);
+            let workspace_path = root.join("workspace.json");
+            muxel_store::save_workspace_to(&workspace_path, &workspace).unwrap();
+            resume_hook(&data, &home, &cwd, instance_id, &old_id);
+            drop(claim_claude_binding(&data, instance_id).unwrap());
+            resume_hook(&data, &home, &cwd, instance_id, &new_id);
+            Self {
+                root,
+                data,
+                home,
+                workspace_path,
+                instance_id,
+                old_id,
+                new_id,
+            }
+        }
+
+        fn workspace(&self) -> muxel_core::Workspace {
+            muxel_store::load_workspace_from(&self.workspace_path).unwrap()
+        }
+
+        fn persist_record(
+            &self,
+            workspace: &mut muxel_core::Workspace,
+            record: &ClaimedClaudeRecord,
+        ) -> Result<()> {
+            let binding = claude_binding_from_record(&record.bytes, &self.home).unwrap();
+            let instance = workspace.instance_mut(self.instance_id).unwrap();
+            instance.session_id = Some(binding.session_id);
+            instance.session_started = true;
+            muxel_store::save_workspace_to(&self.workspace_path, workspace)
+        }
+
+        fn resume_args(&self, workspace: &muxel_core::Workspace) -> Vec<String> {
+            muxel_core::session_resume_args(
+                &muxel_core::AgentPreset::claude(),
+                workspace.instance(self.instance_id).unwrap(),
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for PendingResume {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn prelaunch_recovery_selects_newer_binding_after_a_claimed_record() {
+        let pending = PendingResume::new();
+        let mut workspace = pending.workspace();
+        recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+            pending.persist_record(&mut workspace, record)
+        })
+        .unwrap();
+        assert_eq!(
+            pending.resume_args(&workspace),
+            vec!["--resume".to_string(), pending.new_id.clone()]
+        );
+        assert_eq!(
+            pending.resume_args(&pending.workspace()),
+            pending.resume_args(&workspace)
+        );
+        assert!(claim_claude_binding(&pending.data, pending.instance_id).is_none());
+    }
+
+    #[test]
+    fn prelaunch_recovery_stops_on_a_partial_persistence_failure() {
+        let pending = PendingResume::new();
+        let mut workspace = pending.workspace();
+        let mut handled = Vec::new();
+        let result =
+            recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+                let session = claimed_session(record, &pending.home);
+                handled.push(session.clone());
+                if session == pending.new_id {
+                    bail!("simulated workspace save failure");
+                }
+                pending.persist_record(&mut workspace, record)
+            });
+        assert!(
+            result.is_err(),
+            "failed recovery must prevent launch argument selection"
+        );
+        assert_eq!(
+            handled,
+            vec![pending.old_id.clone(), pending.new_id.clone()]
+        );
+        assert_eq!(
+            pending
+                .workspace()
+                .instance(pending.instance_id)
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some(pending.old_id.as_str())
+        );
+        let retry = claim_claude_binding(&pending.data, pending.instance_id).unwrap();
+        assert_eq!(claimed_session(&retry, &pending.home), pending.new_id);
+        drop(retry);
+        recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+            pending.persist_record(&mut workspace, record)
+        })
+        .unwrap();
+        assert_eq!(
+            pending.resume_args(&workspace),
+            vec!["--resume".to_string(), pending.new_id.clone()]
+        );
+    }
+
+    #[test]
+    fn prelaunch_recovery_stops_if_acknowledgement_fails() {
+        let pending = PendingResume::new();
+        let mut handled = 0;
+        let result =
+            recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+                handled += 1;
+                std::fs::remove_file(&record.path)?;
+                std::fs::create_dir(&record.path)?;
+                Ok(())
+            });
+        assert!(result.unwrap_err().to_string().contains("acknowledge"));
+        assert_eq!(handled, 1);
+        assert!(claude_binding_path(&pending.data, pending.instance_id).exists());
     }
 
     #[test]

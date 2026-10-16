@@ -13,6 +13,7 @@ use crate::settings_view::{self, RemoteTestState, SettingsSection, SettingsUi};
 use crate::split::{h_resizable, resizable_panel, v_resizable};
 use crate::theme;
 use crate::ui_profile;
+use anyhow::Context as _;
 use gpui::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
@@ -3613,6 +3614,9 @@ struct TerminalSpawnMeta {
     started: Instant,
 }
 
+type SessionResume = (Vec<String>, Option<PathBuf>);
+type PreparedTerminalSpawn = (TerminalSpawnMeta, anyhow::Result<CommandSpec>, (u16, u16));
+
 pub struct MuxelApp {
     workspace: Workspace,
     /// Live terminals, keyed by instance id.
@@ -6615,7 +6619,7 @@ impl MuxelApp {
     ///
     /// This launch-time lookup still performs synchronous store I/O, including
     /// when tick recovery reaches it. Recurring discovery uses background workers.
-    fn session_resume_for(&mut self, iid: Uuid) -> Option<(Vec<String>, Option<PathBuf>)> {
+    fn session_resume_for(&mut self, iid: Uuid) -> anyhow::Result<Option<SessionResume>> {
         let started = ui_profile::is_enabled().then(Instant::now);
         self.bump_session_binding_generation(iid);
         let result = self.session_resume_for_inner(iid);
@@ -6632,28 +6636,30 @@ impl MuxelApp {
             } else {
                 None
             };
-            let outcome = if let Some((args, _)) = &result {
-                let resuming = instance
-                    .and_then(|instance| {
-                        instance
-                            .preset_id
-                            .and_then(|id| self.presets.iter().find(|preset| preset.id == id))
-                            .or_else(|| {
-                                self.presets
-                                    .iter()
-                                    .find(|preset| preset.name == instance.preset)
-                            })
-                    })
-                    .is_some_and(|preset| {
-                        args.first().map(String::as_str) == preset.resume_flag.as_deref()
-                    });
-                if resuming {
-                    ui_profile::SessionLookupOutcome::Resume
-                } else {
-                    ui_profile::SessionLookupOutcome::Fresh
+            let outcome = match &result {
+                Err(_) => ui_profile::SessionLookupOutcome::Failed,
+                Ok(None) => ui_profile::SessionLookupOutcome::NoResume,
+                Ok(Some((args, _))) => {
+                    let resuming = instance
+                        .and_then(|instance| {
+                            instance
+                                .preset_id
+                                .and_then(|id| self.presets.iter().find(|preset| preset.id == id))
+                                .or_else(|| {
+                                    self.presets
+                                        .iter()
+                                        .find(|preset| preset.name == instance.preset)
+                                })
+                        })
+                        .is_some_and(|preset| {
+                            args.first().map(String::as_str) == preset.resume_flag.as_deref()
+                        });
+                    if resuming {
+                        ui_profile::SessionLookupOutcome::Resume
+                    } else {
+                        ui_profile::SessionLookupOutcome::Fresh
+                    }
                 }
-            } else {
-                ui_profile::SessionLookupOutcome::NoResume
             };
             ui_profile::session_lookup_finished(
                 ui_profile::SessionLookupKind::Launch,
@@ -6666,9 +6672,9 @@ impl MuxelApp {
         result
     }
 
-    fn session_resume_for_inner(&mut self, iid: Uuid) -> Option<(Vec<String>, Option<PathBuf>)> {
+    fn session_resume_for_inner(&mut self, iid: Uuid) -> anyhow::Result<Option<SessionResume>> {
         let _phase = ui_profile::phase("activation", "session-resume", Some(iid));
-        let (preset, cwd, local) = {
+        let Some((preset, cwd, local)) = (|| {
             let inst = self.workspace.instance(iid)?;
             let preset = inst
                 .preset_id
@@ -6681,14 +6687,26 @@ impl MuxelApp {
                 .clone()
                 .or_else(|| project.map(|project| project.root_path.clone()));
             let local = project.is_some_and(|project| project.remote.is_none());
-            (preset.clone(), cwd, local)
+            Some((preset.clone(), cwd, local))
+        })() else {
+            return Ok(None);
         };
         // Claude can replace its conversation inside the same PTY. A process-local
         // SessionStart hook leaves an exact binding file; consume it before choosing
         // this launch's `--resume` id so even an immediate app restart is correct.
         if local && is_claude_program(preset.program.as_deref()) {
             let _phase = ui_profile::phase("activation", "claude-binding", Some(iid));
-            self.adopt_claude_session_binding(iid, None);
+            if let (Some(data_dir), Some(home)) = (muxel_store::data_dir(), home_dir()) {
+                crate::session_binding::recover_claude_bindings_before_resume(
+                    &data_dir,
+                    iid,
+                    |record| {
+                        self.adopt_claude_session_record(iid, None, record, &home)
+                            .map(|_| ())
+                    },
+                )
+                .with_context(|| t("Could not recover this conversation before launch."))?;
+            }
         }
         let sibling_session_ids: HashSet<String> = self
             .workspace
@@ -6697,7 +6715,9 @@ impl MuxelApp {
             .filter(|instance| instance.id != iid)
             .filter_map(|instance| instance.session_id.clone())
             .collect();
-        let inst = self.workspace.instance_mut(iid)?;
+        let Some(inst) = self.workspace.instance_mut(iid) else {
+            return Ok(None);
+        };
         let host_minted = preset.session_id_flag.is_some();
         let mut resume_cwd = None;
         if host_minted {
@@ -6751,15 +6771,15 @@ impl MuxelApp {
             }
         }
         let snapshot = inst.clone();
-        muxel_core::session_resume_args(&preset, &snapshot).map(|args| (args, resume_cwd))
+        Ok(muxel_core::session_resume_args(&preset, &snapshot).map(|args| (args, resume_cwd)))
     }
 
-    fn command_for(&mut self, instance_id: Uuid) -> CommandSpec {
+    fn command_for(&mut self, instance_id: Uuid) -> anyhow::Result<CommandSpec> {
         let _phase = ui_profile::phase("activation", "command-for", Some(instance_id));
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
         // resolve the --session-id / --resume flag *before* anything borrows the
         // instance. Mutates + persists the instance's session bookkeeping.
-        let session_resume = self.session_resume_for(instance_id);
+        let session_resume = self.session_resume_for(instance_id)?;
         let resume_args = session_resume.as_ref().map(|(args, _)| args);
         // Seat a remote pane on one of its host's masters before anything borrows
         // the workspace.
@@ -6951,9 +6971,35 @@ impl MuxelApp {
             .filter(|v| !v.is_empty())
             .unwrap_or(def_blocked);
         let startup_delay = preset.map(|p| p.startup_delay_ms).unwrap_or(0);
-        spec.with_status_program(agent_program)
+        Ok(spec
+            .with_status_program(agent_program)
             .with_startup_delay(startup_delay)
-            .with_markers(working, blocked)
+            .with_markers(working, blocked))
+    }
+
+    fn terminal_command_identity(
+        &self,
+        instance_id: Uuid,
+        command: &anyhow::Result<CommandSpec>,
+    ) -> (String, String) {
+        match command {
+            Ok(spec) => (spec.program.clone(), spec.cwd.clone().unwrap_or_default()),
+            Err(_) => {
+                let instance = self.workspace.instance(instance_id);
+                let project =
+                    instance.and_then(|instance| self.workspace.project(instance.project_id));
+                (
+                    instance
+                        .and_then(|instance| instance.program.clone())
+                        .unwrap_or_default(),
+                    instance
+                        .and_then(|instance| instance.worktree_path.as_deref())
+                        .or_else(|| project.map(|project| project.root_path.as_path()))
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                )
+            }
+        }
     }
 
     /// Reset the per-instance runtime state that's tied to a terminal's live
@@ -7005,8 +7051,7 @@ impl MuxelApp {
         let spec = self.command_for(instance_id);
         // Capture program + cwd before `spec` moves into the launch, so a failed
         // launch can be reported with the path it tried.
-        let prog = spec.program.clone();
-        let cwd = spec.cwd.clone().unwrap_or_default();
+        let (prog, cwd) = self.terminal_command_identity(instance_id, &spec);
         // Open the PTY at the size this pane will actually be laid out at, so its
         // program never has to be resized after its first paint. A `tmux attach`
         // otherwise draws the session's long-since-painted UI at 80×24, and rights
@@ -7027,7 +7072,8 @@ impl MuxelApp {
             was_resume,
             started: Instant::now(),
         };
-        let result = TerminalLaunch::spawn_for_instance(spec, size, instance_id);
+        let result =
+            spec.and_then(|spec| TerminalLaunch::spawn_for_instance(spec, size, instance_id));
         self.install_terminal_spawn(meta, result, window, cx);
     }
 
@@ -7066,7 +7112,7 @@ impl MuxelApp {
         instance_id: Uuid,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
+    ) -> Option<PreparedTerminalSpawn> {
         let token = self.reserve_terminal_spawn(instance_id, window, cx)?;
         self.prepare_reserved_terminal_spawn(instance_id, token, cx)
     }
@@ -7115,7 +7161,7 @@ impl MuxelApp {
         instance_id: Uuid,
         token: u64,
         cx: &App,
-    ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
+    ) -> Option<PreparedTerminalSpawn> {
         let _phase =
             ui_profile::phase("activation", "prepare-reserved-terminal", Some(instance_id));
         if !launch_token_current(&self.terminal_launching, instance_id, token)
@@ -7128,11 +7174,12 @@ impl MuxelApp {
             .instance(instance_id)
             .is_some_and(|i| i.session_started);
         let spec = self.command_for(instance_id);
+        let (program, cwd) = self.terminal_command_identity(instance_id, &spec);
         let meta = TerminalSpawnMeta {
             instance_id,
             token,
-            program: spec.program.clone(),
-            cwd: spec.cwd.clone().unwrap_or_default(),
+            program,
+            cwd,
             was_resume,
             started: Instant::now(),
         };
@@ -7202,7 +7249,11 @@ impl MuxelApp {
             };
             let result = cx
                 .background_executor()
-                .spawn(async move { TerminalLaunch::spawn_for_instance(spec, size, instance_id) })
+                .spawn(async move {
+                    spec.and_then(|spec| {
+                        TerminalLaunch::spawn_for_instance(spec, size, instance_id)
+                    })
+                })
                 .await;
             // Install in the window showing the pane's project: the terminal view
             // listens for focus in the window it is created in. A launch for a
@@ -8386,7 +8437,9 @@ impl MuxelApp {
                     if let Some((meta, spec, size)) = prepared {
                         owned_tokens.push((iid, meta.token));
                         let task = cx.background_executor().spawn(async move {
-                            TerminalLaunch::spawn_for_instance(spec, size, iid)
+                            spec.and_then(|spec| {
+                                TerminalLaunch::spawn_for_instance(spec, size, iid)
+                            })
                         });
                         launches.push((index, iid, meta, task));
                     }
@@ -10558,24 +10611,16 @@ impl MuxelApp {
     /// `launch` is the pane's live PTY launch, if it has one; the nonce of the
     /// last record read is remembered per launch. Returns when the hook ran if
     /// the record reports a switch and the binding was adopted.
-    fn adopt_claude_session_binding(
+    fn adopt_claude_session_record(
         &mut self,
         iid: Uuid,
         launch: Option<Uuid>,
-    ) -> Option<SystemTime> {
-        use crate::session_binding::acknowledge_claude_binding;
-        let (Some(data_dir), Some(home)) = (muxel_store::data_dir(), home_dir()) else {
-            return None;
-        };
-        // One claimed record, read once: the session id and the hook's stamp
-        // come from the same bytes, and a record the hook writes meanwhile
-        // waits for the next claim instead of being deleted unread.
-        let record = crate::session_binding::claim_claude_binding(&data_dir, iid)?;
-        let Some(binding) =
-            crate::session_binding::claude_binding_from_record(&record.bytes, &home)
+        record: &crate::session_binding::ClaimedClaudeRecord,
+        home: &std::path::Path,
+    ) -> anyhow::Result<Option<SystemTime>> {
+        let Some(binding) = crate::session_binding::claude_binding_from_record(&record.bytes, home)
         else {
-            acknowledge_claude_binding(record);
-            return None;
+            return Ok(None);
         };
         // The hook stamps when it ran. An older muxel's hook didn't; its
         // record's write time stands in, and an unreadable one falls back to now.
@@ -10585,8 +10630,7 @@ impl MuxelApp {
             .or(record.modified)
             .unwrap_or_else(SystemTime::now);
         if session_id_bound_elsewhere(&self.workspace.instances, iid, &binding.session_id) {
-            acknowledge_claude_binding(record);
-            return None;
+            return Ok(None);
         }
         let seen = self
             .claude_hook_seen
@@ -10599,12 +10643,10 @@ impl MuxelApp {
             .and_then(|instance| instance.session_id.as_deref());
         if !crate::session_binding::claude_record_switches(&binding, seen, bound) {
             self.remember_claude_hook(iid, launch, binding.stamp);
-            acknowledge_claude_binding(record);
-            return None;
+            return Ok(None);
         }
         let Some(instance) = self.workspace.instance_mut(iid) else {
-            acknowledge_claude_binding(record);
-            return None;
+            return Ok(None);
         };
         let previous_session_id = instance.session_id.clone();
         let previous_session_started = instance.session_started;
@@ -10615,8 +10657,7 @@ impl MuxelApp {
         self.bump_session_binding_generation(iid);
         if self.try_persist() {
             self.remember_claude_hook(iid, launch, binding.stamp);
-            acknowledge_claude_binding(record);
-            Some(switched_at)
+            Ok(Some(switched_at))
         } else {
             // The claimed record stays; the next claim retries it before any
             // record the hook has written since.
@@ -10628,7 +10669,12 @@ impl MuxelApp {
             instance.session_started = previous_session_started;
             instance.auto_name = previous_auto_name;
             self.bump_session_binding_generation(iid);
-            None
+            anyhow::bail!(
+                "{}",
+                t(
+                    "Could not save the recovered conversation. Fix the workspace save error and retry the launch."
+                )
+            )
         }
     }
 
