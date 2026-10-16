@@ -18,6 +18,7 @@ pub mod outage;
 mod pane;
 pub mod readaloud;
 pub mod remote_ops;
+pub mod session_discovery;
 mod shell;
 pub mod ssh;
 pub mod stt;
