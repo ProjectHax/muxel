@@ -450,8 +450,8 @@ pub fn tmux_path_prelude() -> String {
 /// `tmux` on `socket`, as the words that start a remote command. Every word is
 /// shell-safe, so none is quoted.
 fn tmux_on(socket: Socket) -> String {
-    std::iter::once("tmux")
-        .chain(socket.args().iter().copied())
+    std::iter::once("tmux".to_string())
+        .chain(socket.args())
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -475,8 +475,8 @@ pub fn select_tmux_socket(session: &str) -> String {
 pub fn select_session_socket(session: &crate::tmux::SessionTarget) -> String {
     let target = sh_quote(&format!("={}", session.name));
     let point_at = |socket: Socket| {
-        std::iter::once("set --")
-            .chain(socket.args().iter().copied())
+        std::iter::once("set --".to_string())
+            .chain(socket.args())
             .collect::<Vec<_>>()
             .join(" ")
     };

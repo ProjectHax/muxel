@@ -7,31 +7,24 @@
 #   scripts/dev.sh -- ARGS    # …and anything after `--` goes to muxel
 #   MUXEL_DEV_DIR=/tmp/x scripts/dev.sh   # override the sandbox location
 #
-# How the sandbox is made depends on the OS, because the `directories` crate
-# finds muxel's dirs differently on each:
-#
-# - Linux honours XDG_CONFIG_HOME / XDG_DATA_HOME, so those are enough, and panes
-#   keep your real HOME (agents in them stay logged in).
-# - macOS ignores XDG and uses ~/Library/Application Support — the real
-#   workspace — so only a sandbox HOME isolates it. Cargo needs the real HOME to
-#   find ~/.cargo and ~/.rustup, so muxel is built first and only the binary gets
-#   the sandbox HOME. Its panes inherit it: agents there start without your
-#   login/config.
+# muxel's own `--user-data-dir` flag puts its settings and state in the sandbox
+# on every OS. Environment variables can't: the `directories` crate honours
+# XDG_* only on Linux and HOME only on Linux and macOS, and a pane of a muxel
+# started with the flag inherits MUXEL_USER_DATA_DIR, which beats both. The flag
+# beats that variable; isolated ctl refuses a foreign MUXEL_CONTROL endpoint.
+# Panes keep your real profile, so agents in them stay logged in.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dev_dir="${MUXEL_DEV_DIR:-$repo_root/.muxel-dev}"
+mkdir -p "$dev_dir"
+case "$(uname -s)" in
+    # A Windows path for the Windows program.
+    MINGW* | MSYS* | CYGWIN*) user_data_dir="$(cygpath -m "$dev_dir")" ;;
+    *) user_data_dir="$dev_dir" ;;
+esac
 
-export XDG_CONFIG_HOME="$dev_dir/config"
-export XDG_DATA_HOME="$dev_dir/data"
-mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
-
-echo "muxel dev sandbox: $dev_dir" >&2
-if [ "$(uname -s)" != "Darwin" ]; then
-    exec cargo run -p muxel "$@"
-fi
-
-# macOS: split cargo's args from muxel's at the first `--`, as `cargo run` would.
+# Split cargo's args from muxel's at the first `--`, as `cargo run` would.
 # (The `${a[@]+…}` expansions keep bash 3.2 — macOS's /bin/bash — happy with an
 # empty array under `set -u`.)
 cargo_args=()
@@ -47,18 +40,7 @@ for arg in "$@"; do
     fi
 done
 
-# Build with the real environment, reading the binary's path from cargo's own
-# report (so `--release` and friends land on the right one). Compiler output
-# still goes to the terminal.
-bin="$(cd "$repo_root" &&
-    cargo build -p muxel ${cargo_args[@]+"${cargo_args[@]}"} \
-        --message-format=json-render-diagnostics |
-    sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
-if [ -z "$bin" ]; then
-    echo "dev.sh: cargo built no muxel binary" >&2
-    exit 1
-fi
-
-export HOME="$dev_dir/home"
-mkdir -p "$HOME"
-exec "$bin" ${app_args[@]+"${app_args[@]}"}
+echo "muxel dev sandbox: $dev_dir" >&2
+# The flag goes first, so it also covers `scripts/dev.sh -- ctl …`.
+exec cargo run -p muxel ${cargo_args[@]+"${cargo_args[@]}"} -- \
+    --user-data-dir "$user_data_dir" ${app_args[@]+"${app_args[@]}"}

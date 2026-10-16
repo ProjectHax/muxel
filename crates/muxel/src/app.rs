@@ -6254,7 +6254,7 @@ impl MuxelApp {
         muxel_core::session_resume_args(&preset, &snapshot).map(|args| (args, resume_cwd))
     }
 
-    fn command_for(&mut self, instance_id: Uuid) -> CommandSpec {
+    fn command_for(&mut self, instance_id: Uuid) -> Result<CommandSpec, String> {
         let _phase = ui_profile::phase("activation", "command-for", Some(instance_id));
         let unresolved = self.workspace.instance(instance_id).and_then(|instance| {
             let project = self.workspace.project(instance.project_id)?;
@@ -6378,37 +6378,45 @@ impl MuxelApp {
             );
             // If this instance uses tmux, wrap the command in `tmux new-session -A`
             // so it persists and re-attaches across restarts.
-            let spec = match inst.and_then(|i| {
+            let (spec, extra_env) = match inst.and_then(|i| {
                 i.tmux_session
                     .as_ref()
                     .map(|name| SessionTarget::new(name.clone(), i.tmux_socket))
             }) {
                 Some(session) => {
-                    // Fork the tmux server off a command line that names no project
-                    // *before* this client creates its session — otherwise the shared
-                    // server inherits this argv and a stray `pkill -f <project>` kills
-                    // every agent in every session. See `ensure_tmux_server`.
-                    // On muxel's own server, unless this pane's session is still
-                    // running on the default one from before muxel had its own:
-                    // that agent is reattached where it is, not replaced.
+                    let root = std::env::var_os(muxel_store::USER_DATA_DIR_ENV).map(PathBuf::from);
                     let socket = integrations::local_tmux_socket(&session);
-                    integrations::ensure_tmux_server(socket);
-                    let args = crate::session_binding::tmux_pane_args(
+                    let launch = crate::session_binding::tmux_pane_args(
                         socket,
                         &session.name,
                         resolved.program.as_deref(),
                         &resolved.args,
                         instance_id,
                         integrations::tmux_session_env_supported(),
-                    );
-                    CommandSpec::program("tmux", args)
+                        root.as_deref(),
+                    )
+                    .map_err(|error| match error {
+                        muxel_core::isolated_root::TmuxEnvironmentError::SessionEnvironmentUnsupported =>
+                            t("Isolated tmux panes require tmux 3.2 or newer. Upgrade tmux, then restart this pane.").to_string(),
+                        muxel_core::isolated_root::TmuxEnvironmentError::NonUnicodeRoot =>
+                            t("Isolated tmux panes require a Unicode user data directory.").to_string(),
+                    })?;
+                    // Fork the tmux server off a command line that names no project
+                    // *before* this client creates its session — otherwise the shared
+                    // server inherits this argv and a stray `pkill -f <project>` kills
+                    // every agent in every session. See `ensure_tmux_server`.
+                    integrations::ensure_tmux_server(socket);
+                    (CommandSpec::program("tmux", launch.args), launch.env)
                 }
-                None => match resolved.program.clone() {
-                    Some(program) => CommandSpec::program(program, resolved.args.clone()),
-                    None => CommandSpec::shell(),
-                },
+                None => (
+                    match resolved.program.clone() {
+                        Some(program) => CommandSpec::program(program, resolved.args.clone()),
+                        None => CommandSpec::shell(),
+                    },
+                    Vec::new(),
+                ),
             };
-            (spec, cwd, Vec::new())
+            (spec, cwd, extra_env)
         };
         if let Some(shell) = remote_paste_shell {
             spec = spec.with_paste_shell(shell);
@@ -6436,8 +6444,13 @@ impl MuxelApp {
         } else {
             PaneProcess::Program
         };
-        (spec.env, spec.env_remove) =
-            crate::session_binding::pane_env(&resolved.env, extra_env, instance_id, process);
+        (spec.env, spec.env_remove) = crate::session_binding::pane_env(
+            &resolved.env,
+            extra_env,
+            instance_id,
+            process,
+            crate::user_data_dir::is_isolated(),
+        );
         // Point a memory-enabled *local* project's agent at its memory file so tools
         // can find it without being told the path. Remote agents get the path via the
         // system-prompt instruction instead (env vars don't cross the ssh boundary).
@@ -6469,9 +6482,19 @@ impl MuxelApp {
             .filter(|v| !v.is_empty())
             .unwrap_or(def_blocked);
         let startup_delay = preset.map(|p| p.startup_delay_ms).unwrap_or(0);
-        spec.with_status_program(agent_program)
+        Ok(spec
+            .with_status_program(agent_program)
             .with_startup_delay(startup_delay)
-            .with_markers(working, blocked)
+            .with_markers(working, blocked))
+    }
+
+    /// Preparation refusals never reach TerminalLaunch's fallback-shell path.
+    fn refuse_terminal_launch(&mut self, iid: Uuid, error: String, cx: &mut Context<Self>) {
+        self.terminal_launching.remove(&iid);
+        self.terminals.remove(&iid);
+        self.terminal_launches.remove(&iid);
+        self.failed_launches.insert(iid, error);
+        cx.notify();
     }
 
     /// Reset the per-instance runtime state that's tied to a terminal's live
@@ -6526,7 +6549,13 @@ impl MuxelApp {
             .workspace
             .instance(instance_id)
             .is_some_and(|i| i.session_started);
-        let spec = self.command_for(instance_id);
+        let spec = match self.command_for(instance_id) {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.refuse_terminal_launch(instance_id, error, cx);
+                return;
+            }
+        };
         // Capture program + cwd before `spec` moves into the launch, so a failed
         // launch can be reported with the path it tried.
         let prog = spec.program.clone();
@@ -6718,7 +6747,7 @@ impl MuxelApp {
         &mut self,
         instance_id: Uuid,
         token: u64,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
         let _phase =
             ui_profile::phase("activation", "prepare-reserved-terminal", Some(instance_id));
@@ -6731,7 +6760,13 @@ impl MuxelApp {
             .workspace
             .instance(instance_id)
             .is_some_and(|i| i.session_started);
-        let spec = self.command_for(instance_id);
+        let spec = match self.command_for(instance_id) {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.refuse_terminal_launch(instance_id, error, cx);
+                return None;
+            }
+        };
         let meta = TerminalSpawnMeta {
             instance_id,
             token,
@@ -11557,25 +11592,48 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let url = muxel_core::normalize_url(url);
-        let url = if url.is_empty() {
-            "https://duckduckgo.com".to_string()
-        } else {
-            url
-        };
         #[cfg(target_os = "linux")]
         {
             let _ = (target, placement, window);
-            if !crate::browser::spawn_browser_window(&url) {
-                cx.open_url(&url);
-            }
+            self.dispatch_linux_browser(crate::browser::LinuxBrowserRequest::Preset(url), cx);
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let url = muxel_core::normalize_url(url);
+            let url = if url.is_empty() {
+                "https://duckduckgo.com".to_string()
+            } else {
+                url
+            };
             // Browser presets are resource opens, not requests for another agent
             // process. Route them through the canonical opener so the same full
             // URL focuses and refreshes its existing tab before placement runs.
             self.open_browser_at_with_placement(url, target, Some(placement), window, cx);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dispatch_linux_browser(
+        &mut self,
+        request: crate::browser::LinuxBrowserRequest<'_>,
+        cx: &mut Context<Self>,
+    ) {
+        let report_fallback = matches!(&request, crate::browser::LinuxBrowserRequest::Link(_));
+        match crate::browser::launch_linux_browser(request, cx) {
+            crate::browser::LinuxBrowserDispatch::SystemBrowser if report_fallback => self
+                .add_event(
+                    NotifKind::Error,
+                    t("Browser"),
+                    t("Couldn't start the browser window — opened in the system browser instead.")
+                        .to_string(),
+                ),
+            crate::browser::LinuxBrowserDispatch::Refused => self.add_event(
+                NotifKind::Error,
+                t("Browser"),
+                t("Couldn't start the isolated browser window.").to_string(),
+            ),
+            crate::browser::LinuxBrowserDispatch::Helper
+            | crate::browser::LinuxBrowserDispatch::SystemBrowser => {}
         }
     }
 
@@ -12016,15 +12074,7 @@ impl MuxelApp {
         }
         #[cfg(target_os = "linux")]
         {
-            if !crate::browser::spawn_browser_window(url) {
-                self.add_event(
-                    NotifKind::Error,
-                    t("Browser"),
-                    t("Couldn't start the browser window — opened in the system browser instead.")
-                        .to_string(),
-                );
-                cx.open_url(url);
-            }
+            self.dispatch_linux_browser(crate::browser::LinuxBrowserRequest::Link(url), cx);
         }
         #[cfg(not(target_os = "linux"))]
         {

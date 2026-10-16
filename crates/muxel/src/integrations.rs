@@ -245,11 +245,12 @@ pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::
 }
 
 /// Every tmux session on this machine, as [`list_remote_tmux_sessions`] reports a
-/// host's: muxel's own server's, then the default one's. An empty list when no tmux
-/// server is running; `None` when tmux couldn't be run at all.
+/// host's: muxel's own server's, then the default one's. Isolated profiles list
+/// only their own server. An empty list when no tmux server is running; `None`
+/// when tmux couldn't be run at all.
 pub fn list_local_tmux_sessions() -> Option<Vec<muxel_core::tmux::RemoteSession>> {
     let mut panes = Vec::new();
-    for socket in Socket::BOTH {
+    for socket in local_tmux_sockets() {
         let out = tmux_on(socket)
             .args(muxel_core::tmux::list_sessions_args())
             .stdin(std::process::Stdio::null())
@@ -1303,24 +1304,68 @@ pub fn git_diff(dir: &Path) -> String {
 /// `new-session` would re-fork the server with the project name back in its argv.
 /// [`restore_tmux_exit_empty`] puts it back when muxel quits.
 ///
-/// The server is muxel's own (`muxel_core::tmux::SOCKET_NAME`), where every new
-/// session goes.
+/// The server is this profile's own: `mxl` for the regular profile, or the
+/// isolated root's named socket. A recorded default owner is left alone.
 pub fn ensure_tmux_server(socket: Socket) {
+    let root = local_tmux_root();
+    let socket = SessionTarget::new("", Some(socket))
+        .for_profile(root.as_deref())
+        .socket
+        .unwrap();
     if socket == Socket::Default {
         return;
     }
-    let mut tmux = tmux_on(socket);
+    let mut tmux = tmux_server_command(socket, root.as_deref());
     default_utf8_locale(&mut tmux);
     let _ = tmux
-        .args(muxel_core::tmux::start_server_args())
-        // Every session's program inherits the server's environment. A muxel
-        // started from inside a muxel pane has that pane's id, which no session
-        // should inherit as its own.
-        .env_remove(crate::session_binding::MUXEL_INSTANCE_ID_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+}
+
+fn tmux_server_command(socket: Socket, root: Option<&Path>) -> Command {
+    let socket = SessionTarget::new("", Some(socket))
+        .for_profile(root)
+        .socket
+        .unwrap();
+    let mut tmux = tmux_on(socket);
+    tmux.args(muxel_core::tmux::start_server_args())
+        .env_remove(crate::session_binding::MUXEL_INSTANCE_ID_ENV);
+    if root.is_some() {
+        // A server first started by an isolated GUI must not make its profile
+        // the global default for unrelated sessions. Local panes get these
+        // values through new-session -e instead.
+        tmux.env_remove(muxel_store::USER_DATA_DIR_ENV)
+            .env_remove(crate::control::CONTROL_ENV);
+    }
+    tmux
+}
+
+#[cfg(test)]
+mod tmux_server_environment_tests {
+    use super::tmux_server_command;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn isolated_startup_uses_its_socket_without_seeding_profile_environment() {
+        for isolated in [false, true] {
+            let root = isolated.then_some(std::path::Path::new("/isolated"));
+            let command = tmux_server_command(muxel_core::tmux::Socket::Private, root);
+            let args: Vec<_> = command.get_args().collect();
+            let prefix = muxel_core::tmux::Socket::local(root)[0].args();
+            assert_eq!(args[..2], prefix.iter().map(OsStr::new).collect::<Vec<_>>());
+            let removed: Vec<_> = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key)
+                .collect();
+            assert!(removed.contains(&OsStr::new(crate::session_binding::MUXEL_INSTANCE_ID_ENV)));
+            for key in [muxel_store::USER_DATA_DIR_ENV, crate::control::CONTROL_ENV] {
+                assert_eq!(removed.contains(&OsStr::new(key)), isolated);
+            }
+        }
+    }
 }
 
 fn default_utf8_locale(cmd: &mut Command) {
@@ -1335,34 +1380,47 @@ fn default_utf8_locale(cmd: &mut Command) {
 }
 
 /// Whether the local tmux can start a session's program with variables of its
-/// own (`new-session -e`, tmux 3.2 and later). Asked once per run, and again
-/// while tmux can't be run at all, so one installed meanwhile is found.
+/// own (`new-session -e`, tmux 3.2 and later). Cache support, but probe each
+/// negative result again so restarting a pane after an upgrade can recover.
 pub fn tmux_session_env_supported() -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if let Some(supported) = SUPPORTED.get() {
-        return *supported;
+    cached_tmux_session_env_support(&SUPPORTED, || {
+        let Ok(out) = command("tmux")
+            .arg("-V")
+            .stdin(std::process::Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let version = String::from_utf8_lossy(&out.stdout);
+        muxel_core::tmux::session_env_supported(&version)
+    })
+}
+
+fn cached_tmux_session_env_support(
+    supported: &std::sync::OnceLock<bool>,
+    probe: impl FnOnce() -> bool,
+) -> bool {
+    if supported.get() == Some(&true) {
+        return true;
     }
-    let Ok(out) = command("tmux")
-        .arg("-V")
-        .stdin(std::process::Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
+    if probe() {
+        let _ = supported.set(true);
+        true
+    } else {
+        false
     }
-    let version = String::from_utf8_lossy(&out.stdout);
-    *SUPPORTED.get_or_init(|| muxel_core::tmux::session_env_supported(&version))
 }
 
 /// Undo [`ensure_tmux_server`]'s `exit-empty off` so the server goes away with
 /// its last session once muxel is gone. Best-effort, fire-and-forget.
 ///
-/// Only muxel's own server: the default one is the user's, and muxel no longer
-/// starts it or sets anything on it.
+/// Only this profile's own server: the default one is the user's.
 pub fn restore_tmux_exit_empty() {
-    let _ = tmux_on(Socket::Private)
+    let _ = tmux_on(local_tmux_sockets()[0])
         .args(muxel_core::tmux::restore_exit_empty_args())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1376,6 +1434,20 @@ fn tmux_on(socket: Socket) -> Command {
     let mut cmd = command("tmux");
     cmd.args(socket.args());
     cmd
+}
+
+fn local_tmux_root() -> Option<PathBuf> {
+    std::env::var_os(muxel_store::USER_DATA_DIR_ENV)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+}
+
+fn local_tmux_sockets() -> Vec<Socket> {
+    Socket::local(local_tmux_root().as_deref())
+}
+
+pub fn profile_tmux_target(session: &SessionTarget) -> SessionTarget {
+    session.for_profile(local_tmux_root().as_deref())
 }
 
 /// Whether the local server on `socket` has session `session`.
@@ -1392,17 +1464,20 @@ fn local_tmux_has_session(socket: Socket, session: &str) -> bool {
 /// The local server holding `session`: muxel's own, unless the session is a pane
 /// from before muxel had one, still running on the default server — which is then
 /// reattached where it is rather than replaced. See `Socket::locate`. Blocking:
-/// one or two `has-session` calls.
+/// one or two `has-session` calls for the regular profile. An isolated profile
+/// selects its own socket without probing either regular-profile server.
 pub fn local_tmux_socket(session: &SessionTarget) -> Socket {
+    let session = profile_tmux_target(session);
     session
         .socket
         .unwrap_or_else(|| Socket::locate(|socket| local_tmux_has_session(socket, &session.name)))
 }
 
-/// Whether a tmux session is still alive, on either server (exact-match target,
+/// Whether a tmux session is still alive, on this profile's servers (exact-match target,
 /// so `muxel_p_1` never matches `muxel_p_12`). Fast and blocking; only called for
 /// a pane that just died.
 pub fn tmux_session_exists(session: &SessionTarget) -> bool {
+    let session = profile_tmux_target(session);
     match session.socket {
         Some(socket) => local_tmux_has_session(socket, &session.name),
         None => Socket::BOTH
@@ -1762,6 +1837,7 @@ pub fn kill_remote_tmux_detached(
 
 /// Fire-and-forget kill of a local tmux session on its owner (quit-time cleanup).
 pub fn kill_local_tmux_detached(session: &SessionTarget) {
+    let session = profile_tmux_target(session);
     let mut cmd = match session.socket {
         Some(socket) => {
             let mut cmd = tmux_on(socket);
@@ -1770,7 +1846,7 @@ pub fn kill_local_tmux_detached(session: &SessionTarget) {
         }
         None => {
             let mut cmd = command("sh");
-            cmd.args(["-c", &ssh::kill_command(session)]);
+            cmd.args(["-c", &ssh::kill_command(&session)]);
             cmd
         }
     };
@@ -2757,6 +2833,22 @@ mod tests {
         .unwrap();
         assert_eq!(socket, Socket::Default);
         assert_eq!(lifecycle.spawned.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn negative_tmux_capability_reprobes_after_upgrade_and_caches_success() {
+        let supported = std::sync::OnceLock::new();
+        for version in ["tmux 3.1c", "unknown", "tmux 3.2a"] {
+            assert_eq!(
+                cached_tmux_session_env_support(&supported, || {
+                    muxel_core::tmux::session_env_supported(version)
+                }),
+                muxel_core::tmux::session_env_supported(version)
+            );
+        }
+        assert!(cached_tmux_session_env_support(&supported, || panic!(
+            "positive result should be cached"
+        )));
     }
 
     #[test]
