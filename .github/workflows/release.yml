@@ -256,12 +256,13 @@ jobs:
   # macOS — a single UNIVERSAL app (Intel x86_64 + Apple Silicon aarch64 in one
   # binary via `lipo`). Both arches build on Apple Silicon — aarch64 natively,
   # x86_64 cross-compiled (Apple's toolchain handles x86_64<->arm64 within macOS),
-  # avoiding the Intel macos-13 runner Apple is retiring. Bundles muxel.app and
+  # avoiding the retired Intel runners. The runner is pinned to macos-15 since
+  # GitHub retired macos-14 (Oct 2026). Bundles muxel.app and
   # ships one .dmg + .zip that runs on any Mac.
   # ----------------------------------------------------------------------------
   macos:
     needs: translations
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

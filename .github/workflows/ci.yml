@@ -39,7 +39,7 @@ jobs:
         # x86_64 + arm64 Linux (native runners), macOS (Apple Silicon), Windows.
         # Intel macOS isn't a separate test runner — it's covered by the release
         # job's x86_64 cross-compile (the code is arch-portable).
-        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-14, windows-2022]
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
