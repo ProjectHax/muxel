@@ -1363,7 +1363,8 @@ pub fn restore_tmux_exit_empty() {
 }
 
 /// Whether a tmux session is still alive (exact-match target, so `muxel_p_1` never
-/// matches `muxel_p_12`). Fast and blocking; only called for a pane that just died.
+/// matches `muxel_p_12`). Fast and blocking; also used to distinguish reattachment
+/// from a new local agent process before preparing its per-launch hooks.
 pub fn tmux_session_exists(session: &str) -> bool {
     command("tmux")
         .args(["has-session", "-t", &format!("={session}")])

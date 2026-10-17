@@ -198,6 +198,11 @@ fn main() {
         control::attach_parent_console();
         std::process::exit(control::run_cli(&args[1..]));
     }
+    if session_binding::run_muse_hook_from_args(&args) {
+        // Exit also terminates any hook worker whose filesystem or pipe I/O
+        // exceeded its deadline. Never let an observation hook block Muse.
+        std::process::exit(0);
+    }
     match session_binding::hook_instance_from_args(
         std::env::args_os().skip(1),
         std::env::var_os(session_binding::MUXEL_INSTANCE_ID_ENV),

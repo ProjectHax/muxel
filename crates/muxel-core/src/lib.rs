@@ -14,6 +14,7 @@ pub mod import;
 pub mod library;
 pub mod locale;
 pub mod memory;
+pub mod muse;
 pub mod outage;
 mod pane;
 pub mod readaloud;
@@ -2830,7 +2831,7 @@ mod settings_tests {
             if !existing_muse {
                 let added = settings.presets.pop().unwrap();
                 assert_eq!(added.name, "Muse Code");
-                assert_eq!(added.injection, InjectionMode::None);
+                assert_eq!(added.injection, InjectionMode::SessionHook);
             }
             settings.preset_seed_version = 17;
             assert_eq!(

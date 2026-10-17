@@ -695,16 +695,16 @@ fn system_voices(text: &str, cfg: &VoiceConfig) -> Vec<Command> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        // Single quotes delimit the PowerShell strings, so an apostrophe in the
-        // text ("don't") has to be doubled or it closes the string early.
-        let escaped = text.replace('\'', "''");
+        // Share the PowerShell literal rules with remote command construction,
+        // including smart apostrophes in spoken text and installed voice names.
+        let escaped = muxel_core::winshell::ps_quote(text);
         let select = if voice.is_empty() {
             String::new()
         } else {
             // A voice that isn't installed throws; keep the default instead.
             format!(
-                "try {{ $s.SelectVoice('{}') }} catch {{}}; ",
-                voice.replace('\'', "''")
+                "try {{ $s.SelectVoice({}) }} catch {{}}; ",
+                muxel_core::winshell::ps_quote(voice)
             )
         };
         let rate = muxel_core::tts::rate_step(cfg.rate, 10);
@@ -716,7 +716,7 @@ fn system_voices(text: &str, cfg: &VoiceConfig) -> Vec<Command> {
             &format!(
                 "Add-Type -AssemblyName System.Speech; \
                  $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
-                 {select}$s.Rate = {rate}; $s.Speak('{escaped}')"
+                 {select}$s.Rate = {rate}; $s.Speak({escaped})"
             ),
         ]);
         // CREATE_NO_WINDOW: a GUI app must not flash a console per utterance.

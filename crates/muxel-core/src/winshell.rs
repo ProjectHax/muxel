@@ -54,7 +54,8 @@ impl WindowsShell {
 
 /// A PowerShell single-quoted string literal. Inside `'…'` PowerShell expands
 /// nothing — no `$var`, no backtick escapes, no subexpressions — so the only
-/// character needing attention is `'` itself, which is escaped by doubling.
+/// characters needing attention are ASCII and smart single quotes, which are
+/// escaped by doubling each original character.
 ///
 /// This is why single quotes are used everywhere here rather than double: a path
 /// like `C:\Users\me$env` or one holding a backtick is a literal, not an
@@ -63,8 +64,8 @@ pub fn ps_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
-        if c == '\'' {
-            out.push('\'');
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+            out.push(c);
         }
         out.push(c);
     }
@@ -152,6 +153,63 @@ mod tests {
         assert_eq!(ps_quote("with space"), "'with space'");
         assert_eq!(ps_quote("it's"), "'it''s'");
         assert_eq!(ps_quote("''"), "''''''");
+    }
+
+    #[test]
+    fn ps_quote_doubles_every_powershell_single_quote() {
+        for quote in ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'] {
+            assert_eq!(
+                ps_quote(&format!("O{quote}Brien")),
+                format!("'O{quote}{quote}Brien'"),
+                "quote U+{:04X}",
+                quote as u32
+            );
+        }
+    }
+
+    #[test]
+    fn ps_quote_keeps_statement_text_inside_the_literal() {
+        for quote in ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'] {
+            let text = format!("before{quote}; Write-Output {quote}still text");
+            assert_eq!(
+                ps_quote(&text),
+                format!("'before{quote}{quote}; Write-Output {quote}{quote}still text'")
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ps_quote_round_trips_through_windows_powershell() {
+        use std::os::windows::process::CommandExt as _;
+
+        let cases: Vec<String> = ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}']
+            .into_iter()
+            .flat_map(|quote| {
+                [
+                    format!("C:/O{quote}Brien/with space"),
+                    format!("before{quote}; Write-Output {quote}still text"),
+                ]
+            })
+            .chain(["double \"quotes\" “ ” „, `$env:PATH $(2+2)".into()])
+            .collect();
+        let script = format!(
+            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); ConvertTo-Json -Compress -InputObject {}",
+            ps_string_array(&cases)
+        );
+        let result = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &encoded_command(&script),
+            ])
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "PowerShell literal probe failed");
+        let actual: Vec<String> = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(actual, cases);
     }
 
     #[test]
