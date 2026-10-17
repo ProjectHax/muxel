@@ -873,6 +873,8 @@ feature is added or changed, update the matching entry here in the same change**
   beyond enabling the SSH server. Interactive panes run PowerShell, pwsh 7+, or
   `cmd.exe`, chosen per host, and load your profile so agents installed by npm or
   winget are on `PATH`.
+  Paths, file contents and arguments retain literal apostrophes, including
+  smart quotes; the same quoting handles Windows system speech text and voices.
   The one real difference: Windows has no tmux, so a pane there lasts as long as
   its SSH connection rather than outliving it. On reconnect muxel relaunches the
   pane and the agent resumes its saved conversation, so the thread survives even
