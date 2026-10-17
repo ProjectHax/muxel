@@ -2483,8 +2483,15 @@ mod tests {
     #[test]
     fn claim_cleanup_stops_a_command_that_does_not_finish() {
         let mut cmd = if cfg!(windows) {
-            let mut cmd = command("cmd.exe");
-            cmd.args(["/C", "ping -n 30 127.0.0.1 >NUL"]);
+            let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            let mut cmd = command(powershell);
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
             cmd
         } else {
             let mut cmd = command("/bin/sh");
@@ -2493,8 +2500,9 @@ mod tests {
         };
         cmd.stdin(Stdio::null());
         let started = Instant::now();
-        let result = run_claim_cleanup(cmd, Duration::from_millis(50));
-        assert!(result.unwrap_err().to_string().contains("timed out"));
+        let err = run_claim_cleanup(cmd, Duration::from_millis(50))
+            .expect_err("a 30-second command must not finish within 50 ms");
+        assert!(err.to_string().contains("timed out"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
