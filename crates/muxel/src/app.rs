@@ -3072,7 +3072,13 @@ impl LoopRun {
             return LoopCleanup::Abandon;
         }
         if !runtime.is_attributable_to(current_binding_rev) {
-            return LoopCleanup::Continue;
+            // Uncertainty cannot authorize a close, but it must not retain an
+            // active run forever and prevent later scheduled fires.
+            return if elapsed >= MAX_LOOP_RUNTIME {
+                LoopCleanup::Abandon
+            } else {
+                LoopCleanup::Continue
+            };
         }
         self.seen_working |= runtime.status == AgentStatus::Working;
         if (self.seen_working && matches!(runtime.status, AgentStatus::Idle | AgentStatus::Done))
@@ -3106,8 +3112,8 @@ fn loop_schedule_summary(s: &LoopSchedule) -> String {
     }
 }
 
-/// Safety cap for an attributable, still-owned Loop run. It cannot authorize
-/// closing a replacement conversation or one whose state remains uncertain.
+/// Safety cap for tracking a Loop run. Closing at the cap additionally requires
+/// attributable evidence for its still-owned conversation.
 const MAX_LOOP_RUNTIME: Duration = Duration::from_secs(30 * 60);
 
 #[cfg(test)]
@@ -3148,8 +3154,10 @@ mod loop_cleanup_tests {
         }
     }
 
-    #[test]
-    fn loop_cleanup_does_not_complete_or_close_a_replacement_conversation() {
+    fn session() -> (
+        std::sync::Arc<TerminalSession>,
+        async_channel::Receiver<muxel_terminal::PtyChunk>,
+    ) {
         #[cfg(windows)]
         let spec = CommandSpec::program(
             "cmd.exe",
@@ -3157,7 +3165,12 @@ mod loop_cleanup_tests {
         );
         #[cfg(unix)]
         let spec = CommandSpec::program("/bin/cat", vec![]);
-        let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        TerminalSession::spawn(spec, 80, 24).expect("spawn fixture")
+    }
+
+    #[test]
+    fn loop_cleanup_does_not_complete_or_close_a_replacement_conversation() {
+        let (session, _receiver) = session();
         session.mark_turn_submitted();
         let a = session.binding_revision();
         let mut run = run(session.id);
@@ -3220,6 +3233,95 @@ mod loop_cleanup_tests {
     }
 
     #[test]
+    fn loop_cleanup_releases_an_ambiguous_initial_turn_at_the_cap() {
+        let (session, _receiver) = session();
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        session.mark_turn_submitted();
+        // The initial hook is discovered after submission. The task finishes
+        // inside its ambiguity window, then emits no more output. The terminal
+        // reducer regression covers the resulting persistent uncertainty.
+        session.provider_switched(hook, hook);
+        session.process_probe_output("\x1b]0;\u{2733} Finished\x07".as_bytes());
+        let rev = session.binding_revision();
+        assert_eq!(session.first_submission_binding(), Some(rev));
+        let uncertain = TerminalRuntimeSnapshot {
+            attributable: false,
+            ..snapshot(session.id, rev, AgentStatus::Idle)
+        };
+        let mut run = run(session.id);
+        assert_eq!(
+            run.cleanup(
+                uncertain,
+                rev,
+                session.first_submission_binding(),
+                MAX_LOOP_RUNTIME - Duration::from_secs(1)
+            ),
+            LoopCleanup::Continue
+        );
+        assert_eq!(
+            run.cleanup(
+                uncertain,
+                rev,
+                session.first_submission_binding(),
+                MAX_LOOP_RUNTIME
+            ),
+            LoopCleanup::Abandon,
+            "release the scheduled run without completion or pane close"
+        );
+        assert!(!run.seen_working);
+        session.kill();
+    }
+
+    #[test]
+    fn loop_cleanup_owns_a_first_uuid_discovered_after_submission() {
+        let (session, _receiver) = session();
+        let mut run = run(session.id);
+        session.mark_turn_submitted();
+        assert_eq!(session.first_submission_binding(), Some(0));
+        let first = Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+        let rev = session.binding_revision();
+        assert_eq!(rev, 1);
+        assert_eq!(session.first_submission_binding(), Some(rev));
+        assert_eq!(
+            run.cleanup(
+                snapshot(session.id, rev, AgentStatus::Working),
+                rev,
+                session.first_submission_binding(),
+                Duration::ZERO
+            ),
+            LoopCleanup::Continue
+        );
+        session.process_probe_output(format!("\x1b]0;{first} | Ready\x07").as_bytes());
+        assert_eq!(
+            run.cleanup(
+                snapshot(session.id, rev, AgentStatus::Done),
+                rev,
+                session.first_submission_binding(),
+                Duration::ZERO
+            ),
+            LoopCleanup::Finish
+        );
+        // Discovering the initial UUID is allowed once. A later UUID really
+        // replaces the owned conversation, regardless of further submissions.
+        let replacement = Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{replacement} | Ready\x07").as_bytes());
+        session.mark_turn_submitted();
+        let replaced = session.binding_revision();
+        assert_eq!(session.first_submission_binding(), Some(rev));
+        assert_eq!(
+            run.cleanup(
+                snapshot(session.id, replaced, AgentStatus::Done),
+                replaced,
+                session.first_submission_binding(),
+                MAX_LOOP_RUNTIME
+            ),
+            LoopCleanup::Abandon
+        );
+        session.kill();
+    }
+
+    #[test]
     fn loop_cleanup_requires_current_attributable_owned_evidence() {
         let launch = Uuid::new_v4();
         let mut run = run(launch);
@@ -3229,13 +3331,17 @@ mod loop_cleanup_tests {
             ..working
         };
         assert_eq!(
-            run.cleanup(uncertain, 1, Some(1), MAX_LOOP_RUNTIME),
+            run.cleanup(uncertain, 1, Some(1), Duration::ZERO),
             LoopCleanup::Continue
+        );
+        assert_eq!(
+            run.cleanup(uncertain, 1, Some(1), MAX_LOOP_RUNTIME),
+            LoopCleanup::Abandon
         );
         assert!(!run.seen_working);
         assert_eq!(
             run.cleanup(working, 2, Some(2), MAX_LOOP_RUNTIME),
-            LoopCleanup::Continue
+            LoopCleanup::Abandon
         );
         assert!(!run.seen_working, "a stale snapshot cannot seed Working");
         assert_eq!(
@@ -11757,7 +11863,7 @@ impl MuxelApp {
     }
 
     /// Scheduled-loop heartbeat (every ~30s): post-run cleanup, then fire any loop
-    /// that's due. `tick()` keeps `last_status` fresh, which this reads.
+    /// that's due. Cleanup reads each pane's current runtime snapshot.
     fn tick_loops(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.process_running_loops(cx);
         let now = chrono::Local::now();

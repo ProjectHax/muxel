@@ -3412,6 +3412,10 @@ mod tests {
         let spec = CommandSpec::program("/bin/cat", vec![]);
         let (session, _output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
 
+        // A replacement requires an already discovered original identity.
+        // First identity discovery after startup submission is tested separately.
+        let original = "019f95d7-db31-7db0-904d-9e08330e0000";
+        session.process_probe_output(format!("\x1b]0;{original} | Ready\x07").as_bytes());
         // Enter picks a conversation in Codex's `/resume` list, in the old binding.
         session.mark_turn_submitted();
         session.write_input(b"\r");
@@ -4044,6 +4048,93 @@ mod provider_switch_tests {
             output.push(bytes.as_bytes(), *read_at);
         }
         output
+    }
+
+    #[test]
+    fn delayed_initial_binding_can_remain_uncertain_after_the_task_finishes() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let clock = Instant::now();
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let learned = SystemTime::now() + Duration::from_secs(1);
+        session.mark_turn_submitted();
+        session.provider_switched_at(hook, hook, learned);
+        assert_eq!(
+            session.first_submission_binding(),
+            Some(session.binding_revision())
+        );
+        session.process_drained(&drained(&[
+            (
+                "\x1b]0;\u{25d0} Task\x07",
+                learned - Duration::from_millis(20),
+            ),
+            (
+                "\x1b]0;\u{2733} Task\x07",
+                learned - Duration::from_millis(10),
+            ),
+        ]));
+        // No more output arrives. Passage of time cannot attribute a final
+        // title that was read inside the switch window. Loop cleanup must
+        // therefore release tracking at its cap without closing this pane.
+        for elapsed in [Duration::ZERO, Duration::from_secs(30 * 60)] {
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &[],
+                &[],
+                false,
+                clock + elapsed,
+            );
+            let snapshot = runtime.snapshot(&session);
+            assert!(!snapshot.attributable);
+            assert!(
+                snapshot.completion_ready,
+                "the submitted turn is still owned"
+            );
+            assert_ne!(snapshot.status, AgentStatus::Done);
+            assert!(session.runtime_evidence(None).settling);
+        }
+        session.kill();
+    }
+
+    #[test]
+    fn submission_before_first_uuid_can_work_and_complete_its_initial_binding() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let clock = Instant::now();
+        let read_at = SystemTime::now();
+        let first = uuid::Uuid::new_v4();
+        session.mark_turn_submitted();
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{first} | Working\x07"),
+            read_at,
+        )]));
+        runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, clock);
+        let working = runtime.snapshot(&session);
+        assert_eq!(working.status, AgentStatus::Working);
+        assert!(working.attributable);
+        assert_eq!(
+            session.first_submission_binding(),
+            Some(working.binding_rev)
+        );
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{first} | Ready\x07"),
+            read_at + Duration::from_millis(10),
+        )]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            clock + Duration::from_millis(10),
+        );
+        let done = runtime.snapshot(&session);
+        assert_eq!(done.status, AgentStatus::Done);
+        assert!(done.attributable);
+        assert!(done.completion_ready);
+        assert_eq!(session.first_submission_binding(), Some(done.binding_rev));
+        session.kill();
     }
 
     #[test]

@@ -156,7 +156,8 @@ pub(crate) struct LifecycleEvidence {
     bell: Option<EvidenceMark>,
     submitted: Option<EvidenceMark>,
     /// The first submitted turn owns an unattended loop run. Later input must
-    /// never transfer that ownership to a replacement conversation.
+    /// never transfer that ownership to a replacement conversation. Revision
+    /// zero is provisional until the first provider identity is discovered.
     first_submission: Option<(EvidenceMark, u64)>,
     binding_rev: u64,
     binding_since: u64,
@@ -230,8 +231,15 @@ impl LifecycleEvidence {
     /// conversation, evidence from `since` on is the new one's, and no window
     /// is needed.
     pub(crate) fn begin_binding(&mut self, since: u64) -> BindingSwitch {
+        let initial = self.binding_rev == 0;
         self.window = None;
-        self.advance_binding(since)
+        let switch = self.advance_binding(since);
+        // Startup can submit before the provider publishes its first UUID.
+        // That discovers the initial conversation; it does not replace one.
+        if initial && let Some((_, rev)) = self.first_submission.as_mut() {
+            *rev = self.binding_rev;
+        }
+        switch
     }
 
     fn advance_binding(&mut self, since: u64) -> BindingSwitch {
@@ -277,11 +285,13 @@ impl LifecycleEvidence {
             .checked_sub(SWITCH_SLACK)
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let old_title = self.title.is_some_and(|mark| mark.at < old_before);
+        let initial = self.binding_rev == 0;
         let mut switch = self.advance_binding(self.seq + 1);
         // A hook can report the initial conversation after startup automation
         // submitted its prompt. Input after the reported switch belongs to
         // this binding even though we learned of it later.
-        if let Some((mark, rev)) = self.first_submission.as_mut()
+        if initial
+            && let Some((mark, rev)) = self.first_submission.as_mut()
             && mark.at > self.window.expect("switch window").input_after
         {
             *rev = self.binding_rev;
@@ -311,7 +321,15 @@ impl LifecycleEvidence {
                 // Input written after the switch went to the new conversation,
                 // even before muxel learned of the switch.
                 Some(window) => mark.at > window.input_after,
-                None => mark.seq >= self.binding_since,
+                // A first UUID can be discovered after startup submitted.
+                // Its resolved initial ownership also preserves that turn's
+                // completion arm; a replacement's revision cannot inherit it.
+                None => {
+                    mark.seq >= self.binding_since
+                        || self
+                            .first_submission
+                            .is_some_and(|(_, rev)| rev == self.binding_rev)
+                }
             }),
             settling: self.settling(),
             windowed: window.is_some(),
@@ -553,6 +571,29 @@ mod tests {
         evidence.record_submission(at + Duration::from_secs(6));
         assert_eq!(evidence.binding_rev(), 2);
         assert_eq!(evidence.first_submission_binding(), Some(1));
+        // An out-of-order later report must not transfer resolved ownership,
+        // even if its timestamp predates the original task submission.
+        evidence.switch_binding(at, at, at + Duration::from_secs(7));
+        assert_eq!(evidence.binding_rev(), 3);
+        assert_eq!(evidence.first_submission_binding(), Some(1));
+    }
+
+    #[test]
+    fn first_title_resolves_provisional_submission_ownership_only_once() {
+        let at = SystemTime::now();
+        let mut evidence = LifecycleEvidence::default();
+        evidence.record_submission(at);
+        assert_eq!(evidence.first_submission_binding(), Some(0));
+        let seq = evidence.record_title(Some("initial identity".into()), at);
+        evidence.begin_binding(seq);
+        assert_eq!(evidence.first_submission_binding(), Some(1));
+        assert!(evidence.read(None).submitted);
+        let seq = evidence.record_title(Some("replacement".into()), at);
+        evidence.begin_binding(seq);
+        assert!(!evidence.read(None).submitted);
+        evidence.record_submission(at);
+        assert_eq!(evidence.binding_rev(), 2);
+        assert_eq!(evidence.first_submission_binding(), Some(1));
     }
 
     #[test]
@@ -678,6 +719,10 @@ mod tests {
     fn a_submission_counts_only_in_the_binding_it_was_made_in() {
         let at = SystemTime::now();
         let mut evidence = LifecycleEvidence::default();
+        // Establish the original identity before entering /resume. A delayed
+        // first identity is discovery, covered separately above.
+        let seq = evidence.record_title(Some("initial identity".into()), at);
+        evidence.begin_binding(seq);
         evidence.record_submission(at);
         assert!(evidence.read(None).submitted);
         // A provider title opens a new binding after the Enter that chose it.

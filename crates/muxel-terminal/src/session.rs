@@ -1740,9 +1740,10 @@ impl TerminalSession {
         self.turn_submitted.load(Ordering::Relaxed)
     }
 
-    /// Conversation that received this launch's first submitted turn. A late
-    /// provider switch report can attribute that input by its timestamp; later
-    /// submissions never transfer ownership to a different conversation.
+    /// Conversation that received this launch's first submitted turn. Revision
+    /// zero follows the first discovered UUID; a late initial hook attributes
+    /// it by its timestamp. Once resolved, later identities or submissions
+    /// never transfer ownership to a different conversation.
     pub fn first_submission_binding(&self) -> Option<u64> {
         self.evidence.lock().first_submission_binding()
     }
