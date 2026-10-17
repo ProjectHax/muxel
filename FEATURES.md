@@ -141,7 +141,9 @@ feature is added or changed, update the matching entry here in the same change**
     launches with `--session-id` the first time and `--resume` on restart.
   - **Agent-minted** (Codex): only `resume_flag` (`resume`) — first launch is bare;
     muxel captures the UUID Codex publishes for that pane, validates it against
-    `~/.codex/sessions` before restart, and relaunches as `codex resume <id>`. Multiple Codex
+    `~/.codex/sessions` before restart, and relaunches as `codex resume <id>`. The immutable
+    `thread-id` title field preserves that binding across conversation renames; shortened
+    UUIDs resolve only when exactly one rollout matches the pane's directory. Multiple Codex
     panes can share a project without resuming one another's conversations.
   **Conversation switches stick** — an agent can swap its conversation inside a live
   pane (`/resume`, `/clear`, a fork) without restarting the PTY, and muxel rebinds the

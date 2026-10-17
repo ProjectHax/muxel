@@ -32,10 +32,10 @@ pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
     append_agent_instruction, claude_session_cwd, claude_session_path,
     codex_developer_instructions_override, codex_latest_session_id, codex_session_exists,
-    codex_session_id_from_title, codex_session_matches_cwd, codex_session_names,
-    codex_terminal_title_override, file_link_instruction, find_claude_session_path, memory_header,
-    memory_instruction, memory_reference, resolve_launch, resolve_launch_for_session,
-    session_resume_args,
+    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_matches_cwd,
+    codex_session_names, codex_terminal_title_override, file_link_instruction,
+    find_claude_session_path, memory_header, memory_instruction, memory_reference, resolve_launch,
+    resolve_launch_for_session, session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
@@ -2370,7 +2370,7 @@ pub fn is_plain_ctrl_letter(keystroke: &str) -> bool {
 /// thread; that is identity, not a display name.
 pub fn is_useful_auto_name(name: &str) -> bool {
     let name = name.trim();
-    !name.is_empty() && Uuid::parse_str(name).is_err()
+    !name.is_empty() && Uuid::parse_str(name).is_err() && !agent::is_codex_thread_id_hint(name)
 }
 
 /// Reject launcher-generated absolute paths such as Codex's packaged

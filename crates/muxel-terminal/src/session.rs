@@ -1586,8 +1586,8 @@ impl TerminalSession {
         self.bump_content();
     }
 
-    /// Latest UUID-shaped OSC title retained when an agent replaces it with a
-    /// display name. Muxel uses this as an exact agent session identity hint.
+    /// Latest provider-owned OSC session hint retained across ordinary title
+    /// changes. Muxel resolves and validates it before adopting the identity.
     pub fn session_id_hint(&self) -> Option<String> {
         self.session_id_hint.lock().clone()
     }
