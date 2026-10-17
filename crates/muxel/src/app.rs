@@ -475,6 +475,55 @@ fn activity_needs_observation(
     previous != Some(status) || activity.current_state() != Some(activity_state(status))
 }
 
+fn observe_terminal_activity(
+    activity: &mut AgentActivity,
+    previous: Option<AgentStatus>,
+    status: AgentStatus,
+    attended: bool,
+    now: i64,
+) -> bool {
+    if !activity_needs_observation(previous, status, activity) {
+        return false;
+    }
+    let previous_activity = activity
+        .current_state()
+        .or_else(|| previous.map(activity_state));
+    let mut changed = activity.observe(previous_activity, activity_state(status), now);
+    if attended && status == AgentStatus::Done {
+        changed |= activity.attend(now);
+    }
+    changed
+}
+
+fn observe_popout_activity(
+    activity: &mut AgentActivity,
+    previous: Option<AgentStatus>,
+    status: AgentStatus,
+    attended: bool,
+    now: i64,
+) -> bool {
+    let mut changed = observe_terminal_activity(activity, previous, status, attended, now);
+    // A popout has no main-pane focus callback. Record later attendance once,
+    // rather than rewriting the workspace every tick while Done stays visible.
+    if attended && status == AgentStatus::Done && activity.has_unattended_completion() {
+        changed |= activity.attend(now);
+    }
+    changed
+}
+
+struct TerminalActivitySample {
+    status: AgentStatus,
+    raw_status: AgentStatus,
+    submitted_turn: bool,
+    restoring: bool,
+}
+
+#[derive(Default)]
+struct ActivityUpdates {
+    persist: bool,
+    redraw: bool,
+}
+
 /// Record a visible runtime completion before marking its notification read.
 /// This ordering keeps bell-derived Done as lifecycle state after focus clears
 /// the bell that supplied the live signal.
@@ -1517,6 +1566,32 @@ fn authoritative_terminal_auto_title(
             .map(str::to_string);
     }
     live_title.and_then(|title| terminal_auto_title(instance, title))
+}
+
+/// Resolve a terminal by pane id across the window-owned resource maps.
+fn terminal_view_in<'a, T, P>(
+    iid: Uuid,
+    docked: &'a HashMap<Uuid, T>,
+    popouts: &'a HashMap<Uuid, P>,
+    terminal: impl FnOnce(&'a P) -> Option<&'a T>,
+) -> Option<&'a T> {
+    docked
+        .get(&iid)
+        .or_else(|| popouts.get(&iid).and_then(terminal))
+}
+
+fn popout_terminal_views<'a, T, P>(
+    docked: &'a HashMap<Uuid, T>,
+    popouts: &'a HashMap<Uuid, P>,
+    terminal: impl Fn(&'a P) -> Option<&'a T> + 'a,
+) -> impl Iterator<Item = (&'a Uuid, &'a P, &'a T)> + 'a {
+    popouts.iter().filter_map(move |(iid, popout)| {
+        if docked.contains_key(iid) {
+            None
+        } else {
+            terminal(popout).map(|view| (iid, popout, view))
+        }
+    })
 }
 
 /// Terminal as a **cached** view element. Without `.cached(...)`, every window
@@ -3606,6 +3681,15 @@ struct PopOut {
     redock: RedockAnchor,
 }
 
+impl PopOut {
+    fn terminal_view(&self) -> Option<&Entity<TerminalView>> {
+        match &self.view {
+            PaneView::Terminal(view) => Some(view),
+            _ => None,
+        }
+    }
+}
+
 /// Enough about a popped-out pane's original spot to re-dock it faithfully.
 #[derive(Clone, Copy, Debug)]
 enum RedockAnchor {
@@ -4210,6 +4294,19 @@ fn clear_stale_agent_notification(
     let before = notifications.len();
     notifications.retain(|notification| notification.instance != Some(instance));
     notifications.len() != before
+}
+
+/// Transfer the live terminal and reconcile attention cards even if popout
+/// sampling already cached this status, so the docked tick sees no transition.
+fn redock_terminal_resource<T>(
+    terminals: &mut HashMap<Uuid, T>,
+    notifications: &mut Vec<Notification>,
+    instance: Uuid,
+    terminal: T,
+    status: AgentStatus,
+) -> bool {
+    terminals.insert(instance, terminal);
+    clear_stale_agent_notification(notifications, instance, status)
 }
 
 /// One line in the developer console — a timestamped error/event with details
@@ -10088,33 +10185,13 @@ impl MuxelApp {
             .iter()
             .map(|(iid, view)| {
                 let v = view.read(cx);
-                let raw_status = v.status();
                 let session_id_hint = v.session_id_hint();
-                let submitted_turn = v.session().has_submitted_turn();
-                let startup_delay_ms = self
-                    .workspace
-                    .instance(*iid)
-                    .and_then(|instance| {
-                        instance
-                            .preset_id
-                            .and_then(|preset_id| {
-                                self.presets.iter().find(|preset| preset.id == preset_id)
-                            })
-                            .or_else(|| {
-                                self.presets
-                                    .iter()
-                                    .find(|preset| preset.name == instance.preset)
-                            })
-                    })
-                    .map_or(0, |preset| preset.startup_delay_ms);
-                let restoring = restore_activity_guard_active(
-                    self.restoring_activity.contains(iid),
+                let TerminalActivitySample {
+                    status,
+                    raw_status,
                     submitted_turn,
-                    v.completion_ready(),
-                    self.terminal_launches.get(iid).map(|&(at, _)| at.elapsed()),
-                    startup_delay_ms,
-                );
-                let status = persisted_status(raw_status, self.workspace.instance(*iid), restoring);
+                    restoring,
+                } = self.terminal_activity_sample(*iid, v);
                 let exited = v.exited();
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
@@ -10264,21 +10341,14 @@ impl MuxelApp {
             if !keep_restore_guard {
                 self.restoring_activity.remove(&iid);
             }
-            if !preserve_restored
-                && let Some(instance) = self.workspace.instance_mut(iid)
-                && activity_needs_observation(previous, status, &instance.activity)
-            {
-                let previous_activity = instance
-                    .activity
-                    .current_state()
-                    .or_else(|| previous.map(activity_state));
-                activity_changed |=
-                    instance
-                        .activity
-                        .observe(previous_activity, activity_state(status), now_epoch);
-                if attended && status == AgentStatus::Done {
-                    activity_changed |= instance.activity.attend(now_epoch);
-                }
+            if !preserve_restored && let Some(instance) = self.workspace.instance_mut(iid) {
+                activity_changed |= observe_terminal_activity(
+                    &mut instance.activity,
+                    previous,
+                    status,
+                    attended,
+                    now_epoch,
+                );
             }
             if let Some(instance) = self.workspace.instance(iid) {
                 let label =
@@ -10580,14 +10650,24 @@ impl MuxelApp {
             self.enqueue_read_aloud(iid, cx);
         }
 
+        let popout_activity = self.sync_popout_activity(now_epoch, cx);
+        activity_changed |= popout_activity.persist;
+        dirty |= popout_activity.redraw;
         if activity_changed {
             self.persist();
         }
 
+        // Activity follows the live view across windows. The remaining cleanup
+        // below keeps its existing docked-pane automation/recovery scope.
+        let docked = &self.terminals;
+        let popouts = &self.popouts;
+        self.last_status.retain(|iid, _| {
+            terminal_view_in(*iid, docked, popouts, PopOut::terminal_view).is_some()
+        });
+        self.last_activity_labels.retain(|iid, _| {
+            terminal_view_in(*iid, docked, popouts, PopOut::terminal_view).is_some()
+        });
         let live: HashSet<Uuid> = self.terminals.keys().copied().collect();
-        self.last_status.retain(|iid, _| live.contains(iid));
-        self.last_activity_labels
-            .retain(|iid, _| live.contains(iid));
         self.exit_logged.retain(|iid| live.contains(iid));
         let closed_mid_outage: Vec<Uuid> = self
             .reconnecting
@@ -16060,7 +16140,16 @@ impl MuxelApp {
         };
         match popout.view {
             PaneView::Terminal(view) => {
-                self.terminals.insert(iid, view);
+                let status = self.terminal_activity_sample(iid, view.read(cx)).status;
+                if redock_terminal_resource(
+                    &mut self.terminals,
+                    &mut self.notifications,
+                    iid,
+                    view,
+                    status,
+                ) {
+                    cx.notify();
+                }
                 if let Some(pid) = self.workspace.instance(iid).map(|i| i.project_id) {
                     self.redock_into_layout(iid, pid, popout.redock, cx);
                 }
@@ -17407,10 +17496,100 @@ impl MuxelApp {
         self.begin_read_aloud(None, cx, move || Utterance::Notice(notice));
     }
 
+    /// The live terminal view, regardless of which window owns it.
+    fn terminal_view(&self, iid: Uuid) -> Option<&Entity<TerminalView>> {
+        terminal_view_in(iid, &self.terminals, &self.popouts, PopOut::terminal_view)
+    }
+
+    fn terminal_activity_sample(
+        &self,
+        iid: Uuid,
+        terminal: &TerminalView,
+    ) -> TerminalActivitySample {
+        let raw_status = terminal.status();
+        let submitted_turn = terminal.session().has_submitted_turn();
+        let instance = self.workspace.instance(iid);
+        let startup_delay_ms = instance
+            .and_then(|instance| {
+                instance
+                    .preset_id
+                    .and_then(|preset_id| self.presets.iter().find(|preset| preset.id == preset_id))
+                    .or_else(|| {
+                        self.presets
+                            .iter()
+                            .find(|preset| preset.name == instance.preset)
+                    })
+            })
+            .map_or(0, |preset| preset.startup_delay_ms);
+        let restoring = restore_activity_guard_active(
+            self.restoring_activity.contains(&iid),
+            submitted_turn,
+            terminal.completion_ready(),
+            self.terminal_launches
+                .get(&iid)
+                .map(|&(at, _)| at.elapsed()),
+            startup_delay_ms,
+        );
+        TerminalActivitySample {
+            status: persisted_status(raw_status, instance, restoring),
+            raw_status,
+            submitted_turn,
+            restoring,
+        }
+    }
+
+    /// Observe popout lifecycle for ctl and durable status, without entering the
+    /// docked notification, audio, exit-log or recovery/auto-close pipeline.
+    fn sync_popout_activity(&mut self, now: i64, cx: &mut Context<Self>) -> ActivityUpdates {
+        let samples: Vec<_> =
+            popout_terminal_views(&self.terminals, &self.popouts, PopOut::terminal_view)
+                .map(|(iid, popout, view)| {
+                    (
+                        *iid,
+                        self.terminal_activity_sample(*iid, view.read(cx)),
+                        popout.window,
+                    )
+                })
+                .collect();
+        let mut updates = ActivityUpdates::default();
+        for (iid, sample, window) in samples {
+            let attended = window
+                .update(cx, |_, window, _| window.is_window_active())
+                .unwrap_or(false);
+            let previous = self.last_status.insert(iid, sample.status);
+            let (preserve, keep_guard) = restored_activity_sample(
+                sample.restoring,
+                sample.submitted_turn,
+                sample.raw_status,
+            );
+            if !keep_guard {
+                self.restoring_activity.remove(&iid);
+            }
+            if !preserve && let Some(instance) = self.workspace.instance_mut(iid) {
+                updates.persist |= observe_popout_activity(
+                    &mut instance.activity,
+                    previous,
+                    sample.status,
+                    attended,
+                    now,
+                );
+            }
+            if let Some(instance) = self.workspace.instance(iid) {
+                let label =
+                    agent_activity_label(activity_state(sample.status), &instance.activity, now);
+                let previous_label = self.last_activity_labels.insert(iid, label.clone());
+                updates.redraw |= previous_label.as_ref() != Some(&label);
+            }
+            updates.redraw |= previous != Some(sample.status);
+        }
+        updates.redraw |= updates.persist;
+        updates
+    }
+
     /// What `iid`'s last reply can be found in: the terminal's buffer, the tmux
     /// session behind it, and — for a local Claude pane — its session transcript.
     fn reply_source(&self, iid: Uuid, cx: &App) -> Option<ReplySource> {
-        let view = self.terminals.get(&iid)?;
+        let view = self.terminal_view(iid)?;
         let inst = self.workspace.instance(iid)?;
         let project = self.workspace.project(inst.project_id)?;
         let local = project.remote.is_none();
@@ -30748,7 +30927,11 @@ mod dev_log_tests {
 
 #[cfg(test)]
 mod agent_notification_tests {
-    use super::{AgentStatus, NotifKind, Notification, clear_stale_agent_notification};
+    use super::{
+        AgentStatus, NotifKind, Notification, clear_stale_agent_notification,
+        popout_terminal_views, redock_terminal_resource,
+    };
+    use std::{collections::HashMap, sync::Arc};
     use uuid::Uuid;
 
     fn notification(instance: Option<Uuid>, kind: NotifKind) -> Notification {
@@ -30799,6 +30982,74 @@ mod agent_notification_tests {
                 .iter()
                 .any(|notification| notification.instance.is_none())
         );
+    }
+
+    #[test]
+    fn redock_resumed_work_clears_cards_with_working_already_cached() {
+        for (old_status, old_kind) in [
+            (AgentStatus::Done, NotifKind::Done),
+            (AgentStatus::Blocked, NotifKind::Blocked),
+        ] {
+            let pane = Uuid::new_v4();
+            let other = Uuid::new_v4();
+            let terminal = Arc::new(AgentStatus::Working);
+            let mut docked = HashMap::new();
+            let mut popouts = HashMap::from([(pane, Some(terminal.clone()))]);
+            let mut last_status = HashMap::from([(pane, old_status)]);
+            let mut notifications = vec![
+                notification(Some(pane), old_kind),
+                notification(Some(other), NotifKind::Done),
+                notification(Some(other), NotifKind::Blocked),
+                notification(None, NotifKind::Success),
+                notification(None, NotifKind::Error),
+            ];
+            let retained_ids: Vec<_> = notifications[1..].iter().map(|card| card.id).collect();
+
+            // The activity-only popout pass has already cached Working. Redock
+            // must reconcile the old card even though the next tick sees no change.
+            for (iid, _, view) in popout_terminal_views(&docked, &popouts, Option::as_ref) {
+                last_status.insert(*iid, **view);
+            }
+            assert_eq!(last_status.get(&pane), Some(&AgentStatus::Working));
+            let cached = last_status.clone();
+            let view = popouts.remove(&pane).unwrap().unwrap();
+            let status = *view;
+            let changed =
+                redock_terminal_resource(&mut docked, &mut notifications, pane, view, status);
+
+            assert_eq!(
+                notifications.iter().map(|card| card.id).collect::<Vec<_>>(),
+                retained_ids,
+                "redock must remove only the Working pane's stale attention card"
+            );
+            assert!(changed);
+            assert!(Arc::ptr_eq(docked.get(&pane).unwrap(), &terminal));
+            assert!(popouts.is_empty());
+            assert_eq!(last_status, cached, "redock must preserve the status cache");
+        }
+    }
+
+    #[test]
+    fn redock_retains_current_done_and_blocked_notifications() {
+        for (status, kind) in [
+            (AgentStatus::Done, NotifKind::Done),
+            (AgentStatus::Blocked, NotifKind::Blocked),
+        ] {
+            let pane = Uuid::new_v4();
+            let mut docked = HashMap::new();
+            let mut notifications = vec![notification(Some(pane), kind)];
+            let card_id = notifications[0].id;
+            assert!(!redock_terminal_resource(
+                &mut docked,
+                &mut notifications,
+                pane,
+                status,
+                status,
+            ));
+            assert_eq!(docked.get(&pane), Some(&status));
+            assert_eq!(notifications.len(), 1);
+            assert_eq!(notifications[0].id, card_id);
+        }
     }
 }
 
@@ -30909,5 +31160,181 @@ mod split_resize_tests {
         });
 
         assert_eq!(ids, vec![terminal_a, terminal_b]);
+    }
+}
+
+#[cfg(test)]
+mod terminal_lookup_tests {
+    use super::terminal_view_in;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    #[test]
+    fn terminal_lookup_follows_the_same_resource_through_popout_redock_and_close() {
+        let pane = Uuid::new_v4();
+        let terminal = Arc::new(());
+        let mut docked = HashMap::from([(pane, terminal.clone())]);
+        let mut popouts = HashMap::<Uuid, Option<Arc<()>>>::new();
+        assert!(Arc::ptr_eq(
+            terminal_view_in(pane, &docked, &popouts, Option::as_ref).unwrap(),
+            &terminal,
+        ));
+
+        popouts.insert(pane, Some(docked.remove(&pane).unwrap()));
+        assert!(Arc::ptr_eq(
+            terminal_view_in(pane, &docked, &popouts, Option::as_ref)
+                .expect("a popped-out terminal must remain available to ctl"),
+            &terminal,
+        ));
+
+        docked.insert(pane, popouts.remove(&pane).unwrap().unwrap());
+        assert!(Arc::ptr_eq(
+            terminal_view_in(pane, &docked, &popouts, Option::as_ref).unwrap(),
+            &terminal,
+        ));
+        docked.remove(&pane);
+        assert!(terminal_view_in(pane, &docked, &popouts, Option::as_ref).is_none());
+    }
+
+    #[test]
+    fn terminal_lookup_uses_pane_identity_and_ignores_nonterminal_popouts() {
+        let pane = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let terminal = Arc::new(());
+        let other_terminal = Arc::new(());
+        let mut docked = HashMap::new();
+        let mut popouts = HashMap::from([(pane, None), (other, Some(other_terminal.clone()))]);
+        assert!(terminal_view_in(pane, &docked, &popouts, Option::as_ref).is_none());
+        assert!(terminal_view_in(Uuid::new_v4(), &docked, &popouts, Option::as_ref).is_none());
+        assert!(Arc::ptr_eq(
+            terminal_view_in(other, &docked, &popouts, Option::as_ref)
+                .expect("the lookup must use the requested pane id"),
+            &other_terminal,
+        ));
+
+        docked.insert(pane, terminal.clone());
+        popouts.insert(pane, Some(other_terminal));
+        assert!(Arc::ptr_eq(
+            terminal_view_in(pane, &docked, &popouts, Option::as_ref).unwrap(),
+            &terminal,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod popout_activity_tests {
+    use super::{observe_popout_activity, popout_terminal_views, terminal_view_in};
+    use muxel_core::control::{
+        AgentState, REPLY_GRACE_MS, WaitOutcome, awaiting_reply, wait_outcome,
+    };
+    use muxel_core::{AgentActivity, AgentActivityState};
+    use muxel_terminal::AgentStatus;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    #[test]
+    fn popout_activity_finishes_ctl_wait_before_grace_for_done_and_blocked() {
+        for (end, state, outcome) in [
+            (AgentStatus::Done, AgentState::Done, WaitOutcome::Finished),
+            (
+                AgentStatus::Blocked,
+                AgentState::Blocked,
+                WaitOutcome::Blocked,
+            ),
+        ] {
+            let pane = Uuid::new_v4();
+            let mut docked = HashMap::from([(pane, AgentStatus::Idle)]);
+            let mut popouts = HashMap::from([(pane, Some(docked.remove(&pane).unwrap()))]);
+            let mut previous = HashMap::from([(pane, AgentStatus::Idle)]);
+            let mut activity = AgentActivity::default();
+            activity.observe(None, AgentActivityState::Idle, 9_000);
+            let sent = 10_000;
+            for (status, now) in [(AgentStatus::Working, 10_500), (end, 12_000)] {
+                popouts.insert(pane, Some(status));
+                for (iid, _, observed) in popout_terminal_views(&docked, &popouts, Option::as_ref) {
+                    let before = previous.insert(*iid, *observed);
+                    observe_popout_activity(&mut activity, before, *observed, false, now);
+                }
+                previous.retain(|iid, _| {
+                    terminal_view_in(*iid, &docked, &popouts, Option::as_ref).is_some()
+                });
+            }
+            let awaiting =
+                awaiting_reply(Some(sent), REPLY_GRACE_MS, Some(state), &activity, 12_000);
+            assert!(
+                !awaiting,
+                "a popped-out {state:?} turn must not wait out grace"
+            );
+            assert_eq!(wait_outcome(Some(state), awaiting), Some(outcome));
+            assert_eq!(activity.work_started_at, Some(10_500));
+            assert_eq!(previous.get(&pane), Some(&end));
+
+            let completed = activity.clone();
+            for (iid, _, observed) in popout_terminal_views(&docked, &popouts, Option::as_ref) {
+                let before = previous.insert(*iid, *observed);
+                assert!(!observe_popout_activity(
+                    &mut activity,
+                    before,
+                    *observed,
+                    false,
+                    13_000
+                ));
+            }
+            assert_eq!(
+                activity, completed,
+                "steady samples must retain transition times"
+            );
+        }
+    }
+
+    #[test]
+    fn popout_activity_records_later_attendance_once() {
+        let mut activity = AgentActivity::default();
+        observe_popout_activity(&mut activity, None, AgentStatus::Working, false, 100);
+        observe_popout_activity(
+            &mut activity,
+            Some(AgentStatus::Working),
+            AgentStatus::Done,
+            false,
+            200,
+        );
+        assert!(activity.has_unattended_completion());
+        assert!(observe_popout_activity(
+            &mut activity,
+            Some(AgentStatus::Done),
+            AgentStatus::Done,
+            true,
+            300,
+        ));
+        assert_eq!(activity.completed_at, Some(200));
+        assert_eq!(activity.last_attended_at, Some(300));
+        assert!(!activity.has_unattended_completion());
+        let attended = activity.clone();
+        assert!(!observe_popout_activity(
+            &mut activity,
+            Some(AgentStatus::Done),
+            AgentStatus::Done,
+            true,
+            400,
+        ));
+        assert_eq!(activity, attended);
+    }
+
+    #[test]
+    fn popout_activity_samples_only_terminals_owned_by_the_popout_map() {
+        let docked_pane = Uuid::new_v4();
+        let popup = Uuid::new_v4();
+        let editor = Uuid::new_v4();
+        let docked = HashMap::from([(docked_pane, AgentStatus::Working)]);
+        let popouts = HashMap::from([
+            (docked_pane, Some(AgentStatus::Done)),
+            (popup, Some(AgentStatus::Blocked)),
+            (editor, None),
+        ]);
+        let samples: Vec<_> = popout_terminal_views(&docked, &popouts, Option::as_ref)
+            .map(|(iid, _, status)| (*iid, *status))
+            .collect();
+        assert_eq!(samples, vec![(popup, AgentStatus::Blocked)]);
     }
 }
