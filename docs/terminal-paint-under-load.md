@@ -132,6 +132,12 @@ arms no SIGKILL, so such a child keeps running as it did before this change.
 The five seconds are muxel's delay, not a guaranteed cleanup window: when the
 last PTY master closes, the kernel hangs the terminal up and signals the child
 itself, outside muxel's control.
+
+If Windows child-monitor thread creation fails after the reader starts, cleanup
+closes queue admission before closing the pseudoconsole. The receiver is still
+held by the spawn caller at that point, so it cannot drain a full queue while
+`ClosePseudoConsole` waits for the reader.
+
 `queue_high=<bytes>B/<chunks>chunks` in `term-prof[v8]` reports the largest
 occupancy any pane's queue reached during that log interval. Each queue records
 its peak when it admits a read, so a prompt dequeue cannot hide it. The public

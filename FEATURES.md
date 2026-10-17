@@ -608,7 +608,9 @@ feature is added or changed, update the matching entry here in the same change**
   reading), terminal bytes and the final exit event stay in order and none are
   dropped to protect memory. The UI separately holds one bounded drain batch
   while parsing it. Closing a pane never waits on its queue, and output not yet
-  shown is discarded. On macOS and Linux muxel sends the program one SIGHUP.
+  shown is discarded. Failed Windows launches also release output backpressure
+  before closing their terminal. On macOS and Linux muxel sends the program one
+  SIGHUP.
   If the pane was still reading the program's terminal when it closed, muxel
   kills a program still running about five seconds after that SIGHUP. A program
   that had already closed its terminal is not force-killed, as before. The

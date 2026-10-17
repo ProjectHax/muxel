@@ -280,6 +280,24 @@ impl OutputQueueState {
     }
 }
 
+/// Resolve the monitor-thread spawn result. A failed spawn must release a
+/// reader blocked on queue admission before closing the Windows pseudoconsole.
+#[cfg(windows)]
+fn monitor_spawn_result<T>(
+    result: std::io::Result<T>,
+    output_queue: &OutputQueueState,
+    cleanup: impl FnOnce(),
+) -> std::io::Result<T> {
+    match result {
+        Ok(handle) => Ok(handle),
+        Err(error) => {
+            output_queue.close_session();
+            cleanup();
+            Err(error)
+        }
+    }
+}
+
 pub(crate) trait OutputQueueItem {
     fn output_bytes(&self) -> usize;
 }
@@ -1252,16 +1270,13 @@ impl TerminalSession {
                     monitor_master.close();
                     let _ = writer_handle.join();
                 });
-            match monitor {
-                Ok(handle) => handle,
-                Err(error) => {
-                    let _ = killer.lock().kill();
-                    input_closed.store(true, Ordering::Release);
-                    let _ = write_tx.send(None);
-                    master.close();
-                    return Err(error).context("spawn PTY child monitor");
-                }
-            }
+            monitor_spawn_result(monitor, &output_queue, || {
+                let _ = killer.lock().kill();
+                input_closed.store(true, Ordering::Release);
+                let _ = write_tx.send(None);
+                master.close();
+            })
+            .context("spawn PTY child monitor")?
         };
         #[cfg(all(windows, not(test)))]
         drop(monitor_handle);
@@ -3441,6 +3456,70 @@ mod profiler_transport_tests {
             read_error: None,
         }));
         assert!(matches!(rx.try_recv(), Ok(PtyChunk::Exit { .. })));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn monitor_spawn_failure_closes_queue_before_console_cleanup() {
+        let (tx, rx) = output_queue::<PtyChunk>(4, 1);
+        let state = tx.state.clone();
+        assert!(tx.send_blocking(PtyChunk::Output(vec![1, 2, 3, 4])));
+
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let sender = std::thread::spawn(move || {
+            started_tx.send(()).expect("report sender start");
+            let sent = tx.send_blocking(PtyChunk::Output(vec![5]));
+            done_tx.send(sent).expect("report sender completion");
+        });
+        started_rx.recv().expect("sender started");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "sender must be blocked by the full queue"
+        );
+
+        let mut close_saw_reader_finished = false;
+        let result = monitor_spawn_result::<()>(
+            Err(std::io::Error::other("injected monitor spawn failure")),
+            &state,
+            || {
+                // Model ClosePseudoConsole waiting for the reader to drain.
+                close_saw_reader_finished =
+                    matches!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(false));
+            },
+        );
+
+        // Always release and join before assertions, so a broken ordering
+        // reports a test failure without leaving the sender parked.
+        state.close_session();
+        sender.join().expect("blocked sender must be joined");
+
+        let error = result.expect_err("injected spawn failure must be returned");
+        assert_eq!(error.to_string(), "injected monitor spawn failure");
+        assert!(
+            close_saw_reader_finished,
+            "queue shutdown must unblock the reader before console close"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PtyChunk::Output(bytes)) if bytes == [1, 2, 3, 4]
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn successful_monitor_spawn_does_not_close_queue_or_run_cleanup() {
+        let (tx, rx) = output_queue::<PtyChunk>(4, 1);
+        let state = tx.state.clone();
+        let cleanup_called = std::sync::atomic::AtomicBool::new(false);
+        let result = monitor_spawn_result(Ok(7), &state, || {
+            cleanup_called.store(true, Ordering::Release);
+        });
+        assert_eq!(result.unwrap(), 7);
+        assert!(!cleanup_called.load(Ordering::Acquire));
+        assert!(!state.counters.lock().session_closed);
+        assert!(tx.send_blocking(PtyChunk::Output(vec![1])));
+        assert!(matches!(rx.try_recv(), Ok(PtyChunk::Output(bytes)) if bytes == [1]));
     }
 
     #[test]
