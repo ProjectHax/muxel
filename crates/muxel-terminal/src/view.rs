@@ -1844,6 +1844,10 @@ pub enum LocalPaste {
 /// it pastes into the pane it does later, through the session, once it is ready.
 pub type LocalPasteHandler = Arc<dyn Fn(LocalPaste, &App) + Send + Sync>;
 
+/// Report a refused local file list without deferring successful terminal input.
+pub type PathPasteErrorHandler =
+    Arc<dyn Fn(muxel_core::path_paste::PastePathError, &App) + Send + Sync>;
+
 /// Paste from the system clipboard into the PTY.
 /// Image → forward Ctrl+V (0x16) so the agent reads the OS clipboard.
 /// File paths → shell-quoted paths. Text → bracketed paste.
@@ -1885,7 +1889,14 @@ pub fn paste_clipboard_into_session(session: &TerminalSession, cx: &App) {
 fn paste_local_paths(session: &TerminalSession, paths: Vec<std::path::PathBuf>, cx: &App) {
     match session.local_paste_handler() {
         Some(handler) => handler(LocalPaste::Paths(paths), cx),
-        None => session.paste_paths(&paths),
+        None => {
+            if let Err(error) = session.paste_paths(&paths) {
+                match session.path_paste_error_handler() {
+                    Some(handler) => handler(error, cx),
+                    None => log::warn!("file paste refused: {error:?}"),
+                }
+            }
+        }
     }
 }
 
