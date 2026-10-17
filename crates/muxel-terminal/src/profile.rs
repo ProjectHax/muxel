@@ -21,6 +21,8 @@
 //!
 //! `MUXEL_PROFILE_STDERR=1` also echoes dump lines to stderr (default: file only
 //! — keeps GUI launches quiet and avoids console I/O on the hot path).
+//! `MUXEL_PROFILE_CHAINS=1` emits every completed focused latency chain instead
+//! of only slow chains. This is intended for bounded measurement runs.
 //!
 //! Example (PowerShell, second instance / sandbox):
 //! ```text
@@ -48,10 +50,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use crate::session::PtyReadTiming;
+use crate::session::{OutputQueuePeak, PtyReadTiming};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_STDERR: OnceLock<bool> = OnceLock::new();
+static LOG_CHAINS: OnceLock<bool> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 
@@ -138,6 +141,10 @@ fn enabled() -> bool {
 
 fn log_stderr() -> bool {
     *LOG_STDERR.get_or_init(|| env_truthy("MUXEL_PROFILE_STDERR").unwrap_or(false))
+}
+
+fn log_chains() -> bool {
+    *LOG_CHAINS.get_or_init(|| env_truthy("MUXEL_PROFILE_CHAINS").unwrap_or(false))
 }
 
 fn log_path() -> &'static PathBuf {
@@ -383,6 +390,8 @@ struct Counters {
     read_drain_us: AtomicU64,
     read_drain_max_us: AtomicU64,
     read_drain_n: AtomicU64,
+    read_queue_bytes_high: AtomicU64,
+    read_queue_chunks_high: AtomicU64,
     notify: AtomicU64,
     process_batches: AtomicU64,
     process_bytes: AtomicU64,
@@ -440,6 +449,8 @@ fn counters() -> &'static Counters {
         read_drain_us: AtomicU64::new(0),
         read_drain_max_us: AtomicU64::new(0),
         read_drain_n: AtomicU64::new(0),
+        read_queue_bytes_high: AtomicU64::new(0),
+        read_queue_chunks_high: AtomicU64::new(0),
         notify: AtomicU64::new(0),
         process_batches: AtomicU64::new(0),
         process_bytes: AtomicU64::new(0),
@@ -783,6 +794,8 @@ fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
     let read_drain_us = c.read_drain_us.swap(0, Ordering::Relaxed);
     let read_drain_max = c.read_drain_max_us.swap(0, Ordering::Relaxed);
     let read_drain_n = c.read_drain_n.swap(0, Ordering::Relaxed);
+    let read_queue_bytes_high = c.read_queue_bytes_high.swap(0, Ordering::Relaxed);
+    let read_queue_chunks_high = c.read_queue_chunks_high.swap(0, Ordering::Relaxed);
     let notify = c.notify.swap(0, Ordering::Relaxed);
     let batches = c.process_batches.swap(0, Ordering::Relaxed);
     let bytes = c.process_bytes.swap(0, Ordering::Relaxed);
@@ -889,6 +902,7 @@ fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
          writer={writes}/{write_bytes}B queue_avg={write_queue_avg}µs queue_max={write_queue_max}µs \
          write_avg={write_avg}µs write_max={write_max}µs \
          reader={reads}/{read_bytes}B drain_avg={read_drain_avg}µs drain_max={read_drain_max}µs \
+         queue_high={read_queue_bytes_high}B/{read_queue_chunks_high}chunks \
          notify={notify} (~{notify_hz}/s) \
          process={batches} batches/{bytes}B avg={proc_avg}µs max={process_max}µs \
          paint={paints} (focus={paints_f} bg={paints_bg} full={paint_full} replay={paint_replay}, ~{paint_hz}/s) \
@@ -1029,8 +1043,13 @@ pub(crate) fn pty_read(bytes: usize, sequence: u64) -> PtyReadTiming {
 
 /// Record when one identified reader batch leaves the async channel. Every
 /// batch contributes to the reader→drain aggregate; the sequence also attaches
-/// the exact post-key batch to its per-pane latency chain.
-pub(crate) fn output_drained(instance_id: Uuid, timing: PtyReadTiming) {
+/// the exact post-key batch to its per-pane latency chain. `queue_peak` is the
+/// pane queue's peak occupancy since its previous sample.
+pub(crate) fn output_drained(
+    instance_id: Uuid,
+    timing: PtyReadTiming,
+    queue_peak: OutputQueuePeak,
+) {
     if !enabled() {
         return;
     }
@@ -1040,6 +1059,10 @@ pub(crate) fn output_drained(instance_id: Uuid, timing: PtyReadTiming) {
     c.read_drain_us.fetch_add(elapsed, Ordering::Relaxed);
     c.read_drain_max_us.fetch_max(elapsed, Ordering::Relaxed);
     c.read_drain_n.fetch_add(1, Ordering::Relaxed);
+    c.read_queue_bytes_high
+        .fetch_max(queue_peak.bytes as u64, Ordering::Relaxed);
+    c.read_queue_chunks_high
+        .fetch_max(queue_peak.chunks as u64, Ordering::Relaxed);
     // Background output has no per-key chain to correlate. Keep aggregate
     // counters, but do not contend on the pane map for every PTY batch.
     if !PANE_LATENCY_ACTIVE.load(Ordering::Acquire) {
@@ -1181,7 +1204,8 @@ pub fn paint_with_phases(
             c.process_paint_lat_max
                 .fetch_max(sample.process_paint_us, Ordering::Relaxed);
             c.process_paint_lat_n.fetch_add(1, Ordering::Relaxed);
-            if sample.key_read_us >= 50_000
+            if log_chains()
+                || sample.key_read_us >= 50_000
                 || sample.read_process_us >= 50_000
                 || sample.process_paint_us >= 50_000
                 || sample.read_drain_us.is_some_and(|us| us >= 30_000)

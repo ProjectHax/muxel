@@ -602,6 +602,18 @@ feature is added or changed, update the matching entry here in the same change**
 ## Terminal
 
 - **alacritty-based emulator** — full VTE terminal with truecolor support.
+- **Bounded output backpressure** — each pane's reader-to-UI queue admits at most
+  256 KiB / 64 chunks. A noisy child pauses at that boundary and resumes as the
+  pane drains. While the pane is open (its session lives and the pane keeps
+  reading), terminal bytes and the final exit event stay in order and none are
+  dropped to protect memory. The UI separately holds one bounded drain batch
+  while parsing it. Closing a pane never waits on its queue, and output not yet
+  shown is discarded. On macOS and Linux muxel sends the program one SIGHUP.
+  If the pane was still reading the program's terminal when it closed, muxel
+  kills a program still running about five seconds after that SIGHUP. A program
+  that had already closed its terminal is not force-killed, as before. The
+  operating system's own hangup when the pane's terminal closes is separate and
+  outside muxel's control, so a program is not guaranteed those five seconds.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
