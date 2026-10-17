@@ -158,7 +158,12 @@ feature is added or changed, update the matching entry here in the same change**
   directly inside that store, which is what stops a stray path from rebinding a pane,
   and `/clear` or a fork may announce its new UUID before Claude has written the first
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
-  starter binding. A saved conversation is abandoned only once muxel has confirmed it
+  starter binding. Recurring Codex rollout discovery and Claude hook validation run
+  in the background, alongside Grok's process lookup. Each pane keeps one pending
+  lookup across pop-out and docking, and unresolved results retry with backoff.
+  Discovery continues in popped-out terminals. A result applies only when
+  the pane still has the same launch, binding and directory, and no sibling owns it.
+  A saved conversation is abandoned only once muxel has confirmed it
   is really gone — a session store it couldn't read leaves the pane's resume id alone —
   and the pane then quietly starts fresh.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
@@ -1100,6 +1105,10 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Platform & distribution
 
+- **Opt-in session diagnostics** — `MUXEL_PROFILE=1` records background
+  session lookup durations and outcomes, plus the remaining launch-time resume
+  lookup. Records contain fixed labels, timings and short pane ids, with no
+  terminal content, session ids, titles or paths.
 - **Opt-in focus diagnostics** — the UI profiler correlates GPUI focus-path
   loss with redraw requests and native Windows ownership. WebView children
   must descend from a registered Muxel window; unrelated WRY apps remain

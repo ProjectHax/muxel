@@ -53,6 +53,7 @@ use uuid::Uuid;
 
 mod control_api;
 mod libraries_ui;
+mod session_discovery;
 mod tmux_install_modal;
 
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
@@ -2179,7 +2180,6 @@ fn active_grok_session_for_process(
         .map(|session| session.session_id.clone())
 }
 
-#[cfg(any(windows, test))]
 fn is_grok_program(program: Option<&str>) -> bool {
     let Some(name) = program.and_then(|program| program.rsplit(['/', '\\']).next()) else {
         return false;
@@ -2342,6 +2342,7 @@ fn unowned_captured_session_id(
     captured.filter(|id| !sibling_session_ids.contains(id))
 }
 
+/// Performs rollout-store I/O; recurring callers must run on a background executor.
 fn validated_codex_session_id(
     preset: &AgentPreset,
     current: Option<&str>,
@@ -2355,7 +2356,11 @@ fn validated_codex_session_id(
     if current.is_some_and(|id| id.starts_with(prefix)) {
         return None;
     }
-    let _phase = ui_profile::phase("status", "codex-session-validate", profile_pane);
+    let _phase = ui_profile::phase(
+        "background-discovery",
+        "codex-session-validate",
+        profile_pane,
+    );
     muxel_core::codex_session_id_from_hint(home, &hint, cwd)
 }
 
@@ -3080,9 +3085,8 @@ pub struct MuxelApp {
     /// round trips every few seconds.
     remote_branch_poll_inflight: bool,
     remote_layout_poll_inflight: bool,
-    /// A background Grok PID→session-id refresh is already in flight.
-    #[cfg(windows)]
-    grok_session_syncing: bool,
+    /// Coalescing/backoff and stale-result guards for background provider scans.
+    session_discoveries: muxel_core::session_discovery::SessionDiscoveries,
     /// Full persisted settings (source of truth for config not mirrored above).
     settings: muxel_core::Settings,
     /// Active theme name + mode override (persisted).
@@ -5366,8 +5370,7 @@ impl MuxelApp {
             remote_poll_count: 0,
             remote_branch_poll_inflight: false,
             remote_layout_poll_inflight: false,
-            #[cfg(windows)]
-            grok_session_syncing: false,
+            session_discoveries: Default::default(),
             theme: settings.theme.clone(),
             theme_mode: settings.theme_mode.clone(),
             use_tmux: settings.default_use_tmux,
@@ -5993,7 +5996,61 @@ impl MuxelApp {
     /// - **Agent-minted** (only `resume_flag`, e.g. Codex): first launch bare;
     ///   bound panes resume their saved id. A legacy started pane with no saved id
     ///   recovers the newest cwd-matching rollout before `resume <id>`.
+    ///
+    /// This launch-time lookup still performs synchronous store I/O, including
+    /// when tick recovery reaches it. Recurring discovery uses background workers.
     fn session_resume_for(&mut self, iid: Uuid) -> Option<(Vec<String>, Option<PathBuf>)> {
+        let started = ui_profile::is_enabled().then(Instant::now);
+        self.bump_session_binding_generation(iid);
+        let result = self.session_resume_for_inner(iid);
+        if let Some(started) = started {
+            use muxel_core::session_discovery::SessionProvider;
+            let instance = self.workspace.instance(iid);
+            let program = instance.and_then(|instance| instance.program.as_deref());
+            let provider = if is_codex_program(program) {
+                Some(SessionProvider::Codex)
+            } else if is_claude_program(program) {
+                Some(SessionProvider::Claude)
+            } else if is_grok_program(program) {
+                Some(SessionProvider::Grok)
+            } else {
+                None
+            };
+            let outcome = if let Some((args, _)) = &result {
+                let resuming = instance
+                    .and_then(|instance| {
+                        instance
+                            .preset_id
+                            .and_then(|id| self.presets.iter().find(|preset| preset.id == id))
+                            .or_else(|| {
+                                self.presets
+                                    .iter()
+                                    .find(|preset| preset.name == instance.preset)
+                            })
+                    })
+                    .is_some_and(|preset| {
+                        args.first().map(String::as_str) == preset.resume_flag.as_deref()
+                    });
+                if resuming {
+                    ui_profile::SessionLookupOutcome::Resume
+                } else {
+                    ui_profile::SessionLookupOutcome::Fresh
+                }
+            } else {
+                ui_profile::SessionLookupOutcome::NoResume
+            };
+            ui_profile::session_lookup_finished(
+                ui_profile::SessionLookupKind::Launch,
+                provider,
+                iid,
+                started.elapsed(),
+                outcome,
+            );
+        }
+        result
+    }
+
+    fn session_resume_for_inner(&mut self, iid: Uuid) -> Option<(Vec<String>, Option<PathBuf>)> {
         let _phase = ui_profile::phase("activation", "session-resume", Some(iid));
         let (preset, cwd, local) = {
             let inst = self.workspace.instance(iid)?;
@@ -6373,6 +6430,7 @@ impl MuxelApp {
             && !inst.session_started
         {
             inst.session_started = true;
+            self.bump_session_binding_generation(instance_id);
             true
         } else {
             false
@@ -9782,6 +9840,8 @@ impl MuxelApp {
             self.workspace.remove_instance_meta(iid);
         }
         for instance in instances {
+            // A peer can replace the binding while this pane keeps its PTY.
+            self.bump_session_binding_generation(instance.id);
             self.workspace.remove_instance_meta(instance.id);
             self.workspace.add_instance(instance);
         }
@@ -9911,6 +9971,7 @@ impl MuxelApp {
         instance.session_id = Some(session_id);
         instance.session_started = true;
         instance.auto_name = None;
+        self.bump_session_binding_generation(iid);
         if self.try_persist() {
             crate::session_binding::clear_claude_binding(&data_dir, iid);
             true
@@ -9922,115 +9983,10 @@ impl MuxelApp {
             instance.session_id = previous_session_id;
             instance.session_started = previous_session_started;
             instance.auto_name = previous_auto_name;
+            self.bump_session_binding_generation(iid);
             false
         }
     }
-
-    /// Poll the small per-pane Claude binding records. Usually the hook lands
-    /// while Muxel is still open; `session_resume_for` repeats this read before a
-    /// later launch to close the quit-before-next-tick race.
-    fn sync_claude_session_ids(&mut self, cx: &mut Context<Self>) {
-        let candidates: Vec<Uuid> = self
-            .workspace
-            .instances
-            .iter()
-            .filter_map(|instance| {
-                let project = self.workspace.project(instance.project_id)?;
-                if project.remote.is_some() || !is_claude_program(instance.program.as_deref()) {
-                    return None;
-                }
-                Some(instance.id)
-            })
-            .collect();
-        let mut changed = false;
-        for iid in candidates {
-            changed |= self.adopt_claude_session_binding(iid);
-        }
-        if changed {
-            cx.notify();
-        }
-    }
-
-    /// Refresh persisted Grok session IDs after an in-process `/resume` switch.
-    /// Grok records the active session against its own process PID; walk through
-    /// the shell launchers between that process and Muxel's direct PTY child.
-    /// Windows supplies the required process ancestry snapshot. Other platforms
-    /// keep the previously persisted session binding and skip this poll.
-    #[cfg(windows)]
-    fn sync_grok_session_ids(&mut self, cx: &mut Context<Self>) {
-        if self.grok_session_syncing {
-            return;
-        }
-        let processes: Vec<(Uuid, u32)> = self
-            .terminals
-            .iter()
-            .filter_map(|(iid, view)| {
-                let instance = self.workspace.instance(*iid)?;
-                let local_plain_process = self
-                    .workspace
-                    .project(instance.project_id)
-                    .is_some_and(|project| project.remote.is_none())
-                    && instance.tmux_session.is_none();
-                if !local_plain_process || !is_grok_program(instance.program.as_deref()) {
-                    return None;
-                }
-                view.read(cx).child_pid().map(|pid| (*iid, pid))
-            })
-            .collect();
-        if processes.is_empty() {
-            return;
-        }
-        self.grok_session_syncing = true;
-        cx.spawn(async move |this, cx| {
-            let roots = processes.clone();
-            let bindings = cx
-                .background_executor()
-                .spawn(async move {
-                    let active = read_grok_active_sessions();
-                    let parents = process_parent_map();
-                    roots
-                        .into_iter()
-                        .filter_map(|(iid, pid)| {
-                            active_grok_session_for_process(pid, &active, &parents)
-                                .map(|session_id| (iid, pid, session_id))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.grok_session_syncing = false;
-                let mut changed = false;
-                for (iid, pid, session_id) in bindings {
-                    let same_process = this
-                        .terminals
-                        .get(&iid)
-                        .is_some_and(|view| view.read(cx).child_pid() == Some(pid));
-                    if same_process
-                        && let Some(instance) = this.workspace.instance_mut(iid)
-                        && instance.session_id.as_deref() != Some(session_id.as_str())
-                    {
-                        instance.session_id = Some(session_id);
-                        instance.session_started = true;
-                        // A pane name generated by the prior conversation is
-                        // actively misleading after an in-process session
-                        // switch. Grok's next useful OSC title repopulates it.
-                        instance.auto_name = None;
-                        if let Some(view) = this.terminals.get(&iid) {
-                            view.read(cx).clear_title();
-                        }
-                        changed = true;
-                    }
-                }
-                if changed {
-                    this.persist();
-                }
-            });
-        })
-        .detach();
-    }
-
-    #[cfg(not(windows))]
-    fn sync_grok_session_ids(&mut self, _cx: &mut Context<Self>) {}
 
     /// Status-refresh tick: re-render and fire desktop notifications for
     /// unfocused agents when they finish or ring the terminal bell. The bell is
@@ -10155,11 +10111,10 @@ impl MuxelApp {
             self.fetch_remote_layouts(window, cx);
         }
         self.remote_poll_count = (self.remote_poll_count + 1) % 5;
-        // Session switches happen inside Grok without replacing the PTY child.
+        // Providers can switch sessions without replacing the PTY child.
         // Poll independently of the slower remote-project cadence so a normal
         // quit shortly after `/resume` is unlikely to persist the old binding.
-        self.sync_claude_session_ids(cx);
-        self.sync_grok_session_ids(cx);
+        self.sync_provider_session_ids(cx);
         let focused = self.active_instance;
         // A `--resume` launch has this long to prove its saved session is valid;
         // past that we stop watching it for recovery signals.
@@ -10168,7 +10123,6 @@ impl MuxelApp {
             iid: Uuid,
             status: AgentStatus,
             raw_status: AgentStatus,
-            session_id_hint: Option<String>,
             exited: bool,
             exit_code: Option<i32>,
             /// `Some` when a signal killed the child — the only way to tell a
@@ -10187,7 +10141,6 @@ impl MuxelApp {
             .map(|(iid, view)| {
                 let v = view.read(cx);
                 let raw_status = v.status();
-                let session_id_hint = v.session_id_hint();
                 let submitted_turn = v.session().has_submitted_turn();
                 let startup_delay_ms = self
                     .workspace
@@ -10240,7 +10193,6 @@ impl MuxelApp {
                     iid: *iid,
                     status,
                     raw_status,
-                    session_id_hint,
                     exited,
                     exit_code,
                     exit_signal,
@@ -10276,7 +10228,6 @@ impl MuxelApp {
             iid,
             status,
             raw_status,
-            session_id_hint,
             exited,
             exit_code,
             exit_signal,
@@ -10288,43 +10239,6 @@ impl MuxelApp {
             restoring,
         } in snapshot
         {
-            // Codex mints its own session id and publishes an immutable prefix in
-            // its semantic OSC title. Accept an initial or later `/resume` title
-            // only after exactly one rollout matches the prefix and cwd, and no
-            // sibling pane already owns the full id. That closes title-spoof and
-            // same-directory alias paths without falling back to "latest".
-            let captured_codex_id = self.workspace.instance(iid).and_then(|inst| {
-                let preset = inst
-                    .preset_id
-                    .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
-                    .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
-                let project = self.workspace.project(inst.project_id)?;
-                if project.remote.is_some() {
-                    return None;
-                }
-                let cwd = inst
-                    .worktree_path
-                    .as_deref()
-                    .unwrap_or(project.root_path.as_path());
-                let home = home_dir()?;
-                let candidate = validated_codex_session_id(
-                    preset,
-                    inst.session_id.as_deref(),
-                    session_id_hint.as_deref(),
-                    &home,
-                    cwd,
-                    Some(iid),
-                )?;
-                (!session_id_bound_elsewhere(&self.workspace.instances, iid, &candidate))
-                    .then_some(candidate)
-            });
-            if let Some(id) = captured_codex_id
-                && let Some(inst) = self.workspace.instance_mut(iid)
-            {
-                inst.session_id = Some(id);
-                inst.auto_name = None;
-                self.persist();
-            }
             // A completion that happens in the pane the user is actively watching
             // is already attended. Record that at the same transition timestamp so
             // it cannot reappear as unseen after restart.
@@ -10644,6 +10558,7 @@ impl MuxelApp {
         for (iid, title) in to_recover {
             // Reset to a brand-new session so the relaunch uses `--session-id`
             // (not the invalid `--resume`), then re-spawn the agent in place.
+            self.bump_session_binding_generation(iid);
             if let Some(inst) = self.workspace.instance_mut(iid) {
                 inst.session_id = Some(Uuid::new_v4().to_string());
                 inst.session_started = false;
@@ -25279,6 +25194,8 @@ impl MuxelApp {
                 && let Some(dir) = paths.pop()
             {
                 let _ = this.update_in(cx, |this, _window, cx| {
+                    this.session_discoveries
+                        .project_directory_changed(&this.workspace, pid);
                     if let Some(p) = this.workspace.project_mut(pid) {
                         p.root_path = dir;
                     }
