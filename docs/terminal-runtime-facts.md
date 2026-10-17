@@ -121,14 +121,18 @@ current title without a completion edge.
 
   Scheduled-loop cleanup also reads the current snapshot, never retained
   attention history. It owns the launch and the conversation that received
-  the first submitted turn. Its initial ownership is provisional until the
-  first UUID arrives; a late initial hook attributes it by its timestamp.
-  Later identities or submissions do not transfer ownership. Replacement
+  the first submitted turn, only when its identity was observed before that
+  submission. Without a prior identity, ownership stays unknown for the whole
+  run: a later UUID or hook cannot prove which conversation received the prompt.
+  Later identities or submissions do not establish or transfer ownership.
+  Replacement
   launches or conversations abandon the old run without completion or close.
   Completion and closing at the runtime safety cap require attributable
   evidence for the owned binding. The cap always releases tracking: if startup
   never submits or the status stays uncertain, it abandons the run without
-  completion or pane close, allowing later scheduled fires.
+  completion or pane close, allowing later scheduled fires. Unknown ownership
+  has the same non-closing behavior. In that ordering, an Exit-policy loop
+  leaves its pane open until a human closes it.
 
   The app records each pane's last status with its binding (launch and binding
   revision). Within one PTY launch, the first attributable status after a
@@ -151,8 +155,7 @@ current title without a completion edge.
   and validated before the next shared record.
 - A submission counts only in the binding it was made in, so the Enter that
   picks a conversation in `/resume` doesn't arm the resumed conversation's
-  completion. Discovering the launch's first UUID after startup submission
-  preserves that initial turn's ownership and completion arm.
+  completion, including when the resumed UUID is the first identity observed.
 
 ## Submissions
 

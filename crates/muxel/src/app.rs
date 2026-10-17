@@ -3060,8 +3060,8 @@ impl LoopRun {
             return LoopCleanup::Abandon;
         }
         let Some(owner) = first_submission_binding else {
-            // Startup never submitted the task. Stop tracking after the cap,
-            // but there is no owned conversation whose pane we may close.
+            // No submission or no identity observed before it: stop tracking
+            // at the cap, but never close or complete an unverified recipient.
             return if elapsed >= MAX_LOOP_RUNTIME {
                 LoopCleanup::Abandon
             } else {
@@ -3171,6 +3171,9 @@ mod loop_cleanup_tests {
     #[test]
     fn loop_cleanup_does_not_complete_or_close_a_replacement_conversation() {
         let (session, _receiver) = session();
+        // Observe A before submitting, so this exercises verified ownership.
+        let first = Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Ready\x07").as_bytes());
         session.mark_turn_submitted();
         let a = session.binding_revision();
         let mut run = run(session.id);
@@ -3243,7 +3246,7 @@ mod loop_cleanup_tests {
         session.provider_switched(hook, hook);
         session.process_probe_output("\x1b]0;\u{2733} Finished\x07".as_bytes());
         let rev = session.binding_revision();
-        assert_eq!(session.first_submission_binding(), Some(rev));
+        assert_eq!(session.first_submission_binding(), None);
         let uncertain = TerminalRuntimeSnapshot {
             attributable: false,
             ..snapshot(session.id, rev, AgentStatus::Idle)
@@ -3273,42 +3276,47 @@ mod loop_cleanup_tests {
     }
 
     #[test]
-    fn loop_cleanup_owns_a_first_uuid_discovered_after_submission() {
+    fn loop_cleanup_never_owns_a_replacement_before_the_first_uuid() {
         let (session, _receiver) = session();
         let mut run = run(session.id);
         session.mark_turn_submitted();
-        assert_eq!(session.first_submission_binding(), Some(0));
+        assert_eq!(session.first_submission_binding(), None);
         let first = Uuid::new_v4();
         session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
         let rev = session.binding_revision();
         assert_eq!(rev, 1);
-        assert_eq!(session.first_submission_binding(), Some(rev));
-        assert_eq!(
-            run.cleanup(
-                snapshot(session.id, rev, AgentStatus::Working),
-                rev,
-                session.first_submission_binding(),
-                Duration::ZERO
-            ),
-            LoopCleanup::Continue
-        );
+        assert_eq!(session.first_submission_binding(), None);
         session.process_probe_output(format!("\x1b]0;{first} | Ready\x07").as_bytes());
-        assert_eq!(
-            run.cleanup(
-                snapshot(session.id, rev, AgentStatus::Done),
-                rev,
-                session.first_submission_binding(),
-                Duration::ZERO
-            ),
-            LoopCleanup::Finish
-        );
-        // Discovering the initial UUID is allowed once. A later UUID really
-        // replaces the owned conversation, regardless of further submissions.
+        // That UUID may belong to B, replacing the unidentified recipient A.
+        // Even an attributable B Done cannot authorize this run's completion.
+        for status in [AgentStatus::Working, AgentStatus::Done] {
+            for elapsed in [
+                Duration::ZERO,
+                MAX_LOOP_RUNTIME - Duration::from_secs(1),
+                MAX_LOOP_RUNTIME,
+            ] {
+                assert_eq!(
+                    run.cleanup(
+                        snapshot(session.id, rev, status),
+                        rev,
+                        session.first_submission_binding(),
+                        elapsed
+                    ),
+                    if elapsed >= MAX_LOOP_RUNTIME {
+                        LoopCleanup::Abandon
+                    } else {
+                        LoopCleanup::Continue
+                    }
+                );
+            }
+        }
+        assert!(!run.seen_working);
+        // Later identities and submissions cannot repair unknown ownership.
         let replacement = Uuid::new_v4();
         session.process_probe_output(format!("\x1b]0;{replacement} | Ready\x07").as_bytes());
         session.mark_turn_submitted();
         let replaced = session.binding_revision();
-        assert_eq!(session.first_submission_binding(), Some(rev));
+        assert_eq!(session.first_submission_binding(), None);
         assert_eq!(
             run.cleanup(
                 snapshot(session.id, replaced, AgentStatus::Done),

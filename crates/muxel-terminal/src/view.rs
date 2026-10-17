@@ -3412,10 +3412,6 @@ mod tests {
         let spec = CommandSpec::program("/bin/cat", vec![]);
         let (session, _output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
 
-        // A replacement requires an already discovered original identity.
-        // First identity discovery after startup submission is tested separately.
-        let original = "019f95d7-db31-7db0-904d-9e08330e0000";
-        session.process_probe_output(format!("\x1b]0;{original} | Ready\x07").as_bytes());
         // Enter picks a conversation in Codex's `/resume` list, in the old binding.
         session.mark_turn_submitted();
         session.write_input(b"\r");
@@ -4059,10 +4055,7 @@ mod provider_switch_tests {
         let learned = SystemTime::now() + Duration::from_secs(1);
         session.mark_turn_submitted();
         session.provider_switched_at(hook, hook, learned);
-        assert_eq!(
-            session.first_submission_binding(),
-            Some(session.binding_revision())
-        );
+        assert_eq!(session.first_submission_binding(), None);
         session.process_drained(&drained(&[
             (
                 "\x1b]0;\u{25d0} Task\x07",
@@ -4089,7 +4082,7 @@ mod provider_switch_tests {
             assert!(!snapshot.attributable);
             assert!(
                 snapshot.completion_ready,
-                "the submitted turn is still owned"
+                "input after the hook still arms a turn"
             );
             assert_ne!(snapshot.status, AgentStatus::Done);
             assert!(session.runtime_evidence(None).settling);
@@ -4098,7 +4091,7 @@ mod provider_switch_tests {
     }
 
     #[test]
-    fn submission_before_first_uuid_can_work_and_complete_its_initial_binding() {
+    fn replacement_before_first_uuid_cannot_complete_the_unidentified_submission() {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         let clock = Instant::now();
@@ -4113,10 +4106,7 @@ mod provider_switch_tests {
         let working = runtime.snapshot(&session);
         assert_eq!(working.status, AgentStatus::Working);
         assert!(working.attributable);
-        assert_eq!(
-            session.first_submission_binding(),
-            Some(working.binding_rev)
-        );
+        assert_eq!(session.first_submission_binding(), None);
         session.process_drained(&drained(&[(
             &format!("\x1b]0;{first} | Ready\x07"),
             read_at + Duration::from_millis(10),
@@ -4130,10 +4120,10 @@ mod provider_switch_tests {
             clock + Duration::from_millis(10),
         );
         let done = runtime.snapshot(&session);
-        assert_eq!(done.status, AgentStatus::Done);
+        assert_eq!(done.status, AgentStatus::Idle);
         assert!(done.attributable);
         assert!(done.completion_ready);
-        assert_eq!(session.first_submission_binding(), Some(done.binding_rev));
+        assert_eq!(session.first_submission_binding(), None);
         session.kill();
     }
 

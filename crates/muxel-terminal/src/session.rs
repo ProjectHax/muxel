@@ -1740,10 +1740,9 @@ impl TerminalSession {
         self.turn_submitted.load(Ordering::Relaxed)
     }
 
-    /// Conversation that received this launch's first submitted turn. Revision
-    /// zero follows the first discovered UUID; a late initial hook attributes
-    /// it by its timestamp. Once resolved, later identities or submissions
-    /// never transfer ownership to a different conversation.
+    /// Conversation observed before this launch's first submitted turn. None
+    /// means no turn was submitted or its recipient was unknown. A later
+    /// identity or submission never establishes or transfers that ownership.
     pub fn first_submission_binding(&self) -> Option<u64> {
         self.evidence.lock().first_submission_binding()
     }
