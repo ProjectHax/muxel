@@ -112,6 +112,21 @@ current title without a completion edge.
   and attendance. A popout records later attendance once without delivering
   alerts or audio. Redocking always transfers the live terminal, but preserves
   attention cards until its status is attributable to the current binding.
+  Scheduled-loop heartbeats also resolve the live terminal across both windows;
+  moving a pane does not release its run. Existing Exit cleanup removes the
+  live terminal and popout window when it closes that pane.
+  Window removal runs after the app update returns so synchronous close
+  observers can update the app safely. Restart redocks a popped-out terminal
+  before stopping its old process and installing its replacement.
+
+  Scheduled-loop cleanup also reads the current snapshot, never retained
+  attention history. It owns the launch and the conversation that received
+  the first submitted turn. A late hook report attributes that submission by
+  its timestamp; later submissions do not transfer ownership. Replacement
+  launches or conversations abandon the old run without completion or close.
+  Completion and the runtime safety cap require attributable evidence for the
+  owned binding. If startup never submits, the cap stops tracking without
+  closing a conversation the loop has not established ownership of.
 
   The app records each pane's last status with its binding (launch and binding
   revision). Within one PTY launch, the first attributable status after a

@@ -418,7 +418,9 @@ feature is added or changed, update the matching entry here in the same change**
   active project — a loop firing on a timer can't interrupt what you're typing.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
-  copy.
+  copy. Cleanup requires current attributable evidence from the launch and
+  conversation that received the first submitted turn. Switching conversations
+  or reopening its pane stops tracking the old run without closing the new one.
 - **Managed from the main window** — a toolbar "Loops" dropdown lists your loops:
   click one to run it now, the pencil to edit it in Settings → Loops, or "New
   loop…" to create one. Schedules survive restarts (a daily-at whose time passed

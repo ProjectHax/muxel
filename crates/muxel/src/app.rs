@@ -3031,12 +3031,58 @@ enum ActiveRunner {
 /// Runtime state for one in-flight Loop run (its spawned pane).
 struct LoopRun {
     loop_id: Uuid,
+    /// The launch we spawned; reopening the pane never transfers this run.
+    launch: Option<Uuid>,
     /// True once the agent has been seen Working (so we don't close it during the
     /// brief idle window before its prompt is typed).
     seen_working: bool,
     /// When the run was spawned (for the max-runtime safety cap).
     started: std::time::Instant,
     post_run: PostRunAction,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LoopCleanup {
+    Continue,
+    Abandon,
+    Finish,
+}
+
+impl LoopRun {
+    fn cleanup(
+        &mut self,
+        runtime: muxel_terminal::TerminalRuntimeSnapshot,
+        current_binding_rev: u64,
+        first_submission_binding: Option<u64>,
+        elapsed: Duration,
+    ) -> LoopCleanup {
+        if self.launch != Some(runtime.launch_id) {
+            return LoopCleanup::Abandon;
+        }
+        let Some(owner) = first_submission_binding else {
+            // Startup never submitted the task. Stop tracking after the cap,
+            // but there is no owned conversation whose pane we may close.
+            return if elapsed >= MAX_LOOP_RUNTIME {
+                LoopCleanup::Abandon
+            } else {
+                LoopCleanup::Continue
+            };
+        };
+        if owner != current_binding_rev {
+            return LoopCleanup::Abandon;
+        }
+        if !runtime.is_attributable_to(current_binding_rev) {
+            return LoopCleanup::Continue;
+        }
+        self.seen_working |= runtime.status == AgentStatus::Working;
+        if (self.seen_working && matches!(runtime.status, AgentStatus::Idle | AgentStatus::Done))
+            || elapsed >= MAX_LOOP_RUNTIME
+        {
+            LoopCleanup::Finish
+        } else {
+            LoopCleanup::Continue
+        }
+    }
 }
 
 /// Current wall-clock time in unix seconds (local clock; never negative here).
@@ -3060,9 +3106,185 @@ fn loop_schedule_summary(s: &LoopSchedule) -> String {
     }
 }
 
-/// Safety cap: force-close a Loop's `Exit` agent if it's still running this long
-/// after launch (so a wedged run never leaves a pane open forever).
+/// Safety cap for an attributable, still-owned Loop run. It cannot authorize
+/// closing a replacement conversation or one whose state remains uncertain.
 const MAX_LOOP_RUNTIME: Duration = Duration::from_secs(30 * 60);
+
+#[cfg(test)]
+mod loop_cleanup_tests {
+    use super::{
+        AgentStatus, LoopCleanup, LoopRun, MAX_LOOP_RUNTIME, PostRunAction, SeenStatus,
+        StatusBinding, StatusSample, apply_status_sample,
+    };
+    use muxel_terminal::{
+        CommandSpec, TerminalRuntimeSnapshot, TerminalSession, TerminalStatusCoverage,
+        TerminalStatusReason,
+    };
+    use std::time::{Duration, Instant, SystemTime};
+    use uuid::Uuid;
+
+    fn run(launch: Uuid) -> LoopRun {
+        LoopRun {
+            loop_id: Uuid::new_v4(),
+            launch: Some(launch),
+            seen_working: false,
+            started: Instant::now(),
+            post_run: PostRunAction::Exit,
+        }
+    }
+
+    fn snapshot(launch: Uuid, rev: u64, status: AgentStatus) -> TerminalRuntimeSnapshot {
+        TerminalRuntimeSnapshot {
+            status,
+            attributable: true,
+            reason: TerminalStatusReason::Quiet,
+            coverage: TerminalStatusCoverage::ProviderVisible,
+            launch_id: launch,
+            binding_rev: rev,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: status == AgentStatus::Done,
+        }
+    }
+
+    #[test]
+    fn loop_cleanup_does_not_complete_or_close_a_replacement_conversation() {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        session.mark_turn_submitted();
+        let a = session.binding_revision();
+        let mut run = run(session.id);
+        let working = snapshot(session.id, a, AgentStatus::Working);
+        assert_eq!(
+            run.cleanup(
+                working,
+                a,
+                session.first_submission_binding(),
+                Duration::ZERO
+            ),
+            LoopCleanup::Continue
+        );
+        assert!(run.seen_working);
+        let done = snapshot(session.id, a, AgentStatus::Done);
+        let mut attention = Some(SeenStatus {
+            status: AgentStatus::Done,
+            binding: StatusBinding {
+                launch: session.id,
+                rev: a,
+            },
+        });
+        // A completes between loop heartbeats. B is adopted before the next
+        // heartbeat, and the runtime has not refreshed its cached A snapshot.
+        let now = SystemTime::now();
+        session.provider_switched(now, now);
+        let b = session.binding_revision();
+        assert_ne!(a, b);
+        assert_eq!(
+            run.cleanup(done, b, session.first_submission_binding(), Duration::ZERO),
+            LoopCleanup::Abandon
+        );
+        let uncertain = TerminalRuntimeSnapshot {
+            attributable: false,
+            ..snapshot(session.id, b, AgentStatus::Working)
+        };
+        let effect = apply_status_sample(
+            &mut attention,
+            None,
+            StatusSample::from_runtime(uncertain, b, uncertain.status, false, false),
+            300,
+        );
+        assert!(!effect.completed);
+        assert_eq!(attention.unwrap().status, AgentStatus::Done);
+        // This is the decision used by the destructive consumer. Only Finish
+        // permits post-run close; retained attention history is never read.
+        for runtime in [uncertain, snapshot(session.id, b, AgentStatus::Done)] {
+            assert_eq!(
+                run.cleanup(
+                    runtime,
+                    b,
+                    session.first_submission_binding(),
+                    MAX_LOOP_RUNTIME
+                ),
+                LoopCleanup::Abandon,
+                "neither completion nor the safety cap may close B"
+            );
+        }
+        session.kill();
+    }
+
+    #[test]
+    fn loop_cleanup_requires_current_attributable_owned_evidence() {
+        let launch = Uuid::new_v4();
+        let mut run = run(launch);
+        let working = snapshot(launch, 1, AgentStatus::Working);
+        let uncertain = TerminalRuntimeSnapshot {
+            attributable: false,
+            ..working
+        };
+        assert_eq!(
+            run.cleanup(uncertain, 1, Some(1), MAX_LOOP_RUNTIME),
+            LoopCleanup::Continue
+        );
+        assert!(!run.seen_working);
+        assert_eq!(
+            run.cleanup(working, 2, Some(2), MAX_LOOP_RUNTIME),
+            LoopCleanup::Continue
+        );
+        assert!(!run.seen_working, "a stale snapshot cannot seed Working");
+        assert_eq!(
+            run.cleanup(working, 1, None, Duration::ZERO),
+            LoopCleanup::Continue
+        );
+        assert_eq!(
+            run.cleanup(working, 1, None, MAX_LOOP_RUNTIME),
+            LoopCleanup::Abandon
+        );
+        assert_eq!(
+            run.cleanup(
+                snapshot(launch, 1, AgentStatus::Idle),
+                1,
+                Some(1),
+                Duration::ZERO
+            ),
+            LoopCleanup::Continue,
+            "startup idle is not a completed turn"
+        );
+        assert_eq!(
+            run.cleanup(working, 1, Some(1), Duration::ZERO),
+            LoopCleanup::Continue
+        );
+        assert!(run.seen_working);
+        assert_eq!(
+            run.cleanup(
+                snapshot(launch, 1, AgentStatus::Done),
+                1,
+                Some(1),
+                Duration::ZERO
+            ),
+            LoopCleanup::Finish
+        );
+        assert_eq!(
+            run.cleanup(working, 1, Some(1), MAX_LOOP_RUNTIME),
+            LoopCleanup::Finish
+        );
+        assert_eq!(
+            run.cleanup(
+                snapshot(Uuid::new_v4(), 1, AgentStatus::Done),
+                1,
+                Some(1),
+                MAX_LOOP_RUNTIME
+            ),
+            LoopCleanup::Abandon
+        );
+    }
+}
 
 /// Drag payload for moving a single tab (tabifies into the pane it's dropped on).
 #[derive(Clone)]
@@ -11573,15 +11795,24 @@ impl MuxelApp {
         }
     }
 
-    /// Watch in-flight loop runs: close a finished `Exit` agent (idle after working,
-    /// or past the safety cap); stop tracking ones that completed or vanished.
+    /// Watch in-flight loop runs using current evidence from their owned launch
+    /// and submitted conversation. A replacement is untracked, never closed.
     fn process_running_loops(&mut self, cx: &mut Context<Self>) {
         let close = loop_heartbeat(
             &mut self.running_loops,
             &self.terminals,
             &self.popouts,
             PopOut::terminal_view,
-            |iid, _| self.last_status.get(&iid).map(|seen| seen.status),
+            |view, run| {
+                let view = view.read(cx);
+                let session = view.session();
+                run.cleanup(
+                    view.runtime_snapshot(),
+                    session.binding_revision(),
+                    session.first_submission_binding(),
+                    run.started.elapsed(),
+                )
+            },
         );
         for iid in close {
             self.close_instance_inner(iid, "loop post-run", cx);
@@ -11638,6 +11869,10 @@ impl MuxelApp {
                 iid,
                 LoopRun {
                     loop_id: lp.id,
+                    launch: self
+                        .terminals
+                        .get(&iid)
+                        .map(|view| view.read(cx).session().id),
                     seen_working: false,
                     started: std::time::Instant::now(),
                     post_run: lp.post_run,

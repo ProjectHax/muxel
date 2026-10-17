@@ -155,6 +155,9 @@ pub(crate) struct LifecycleEvidence {
     /// The latest bell. Acknowledging it clears the session's flag, not this.
     bell: Option<EvidenceMark>,
     submitted: Option<EvidenceMark>,
+    /// The first submitted turn owns an unattended loop run. Later input must
+    /// never transfer that ownership to a replacement conversation.
+    first_submission: Option<(EvidenceMark, u64)>,
     binding_rev: u64,
     binding_since: u64,
     /// The window of the switch reported out of band that began the current
@@ -208,7 +211,14 @@ impl LifecycleEvidence {
     }
 
     pub(crate) fn record_submission(&mut self, at: SystemTime) {
-        self.submitted = Some(self.mark(at));
+        let mark = self.mark(at);
+        self.submitted = Some(mark);
+        self.first_submission
+            .get_or_insert((mark, self.binding_rev));
+    }
+
+    pub(crate) fn first_submission_binding(&self) -> Option<u64> {
+        self.first_submission.map(|(_, rev)| rev)
     }
 
     pub(crate) fn binding_rev(&self) -> u64 {
@@ -268,6 +278,14 @@ impl LifecycleEvidence {
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let old_title = self.title.is_some_and(|mark| mark.at < old_before);
         let mut switch = self.advance_binding(self.seq + 1);
+        // A hook can report the initial conversation after startup automation
+        // submitted its prompt. Input after the reported switch belongs to
+        // this binding even though we learned of it later.
+        if let Some((mark, rev)) = self.first_submission.as_mut()
+            && mark.at > self.window.expect("switch window").input_after
+        {
+            *rev = self.binding_rev;
+        }
         switch.title = old_title;
         if old_title {
             self.title = None;
@@ -500,6 +518,41 @@ mod tests {
         let read = evidence.read(Some(cursor));
         assert!(read.titles.is_empty());
         assert!(read.overflowed);
+    }
+
+    #[test]
+    fn first_submission_ownership_survives_later_submissions_and_switches() {
+        let at = SystemTime::now();
+        let mut evidence = LifecycleEvidence::default();
+        assert_eq!(evidence.first_submission_binding(), None);
+        // Initial provider identity can arrive before startup types the task.
+        let seq = evidence.record_title(Some("initial binding".into()), at);
+        evidence.begin_binding(seq);
+        evidence.record_submission(at + Duration::from_secs(1));
+        assert_eq!(evidence.first_submission_binding(), Some(1));
+        let seq = evidence.record_title(Some("replacement".into()), at + Duration::from_secs(2));
+        evidence.begin_binding(seq);
+        evidence.record_submission(at + Duration::from_secs(3));
+        assert_eq!(evidence.binding_rev(), 2);
+        assert_eq!(evidence.first_submission_binding(), Some(1));
+    }
+
+    #[test]
+    fn delayed_initial_binding_attributes_the_first_submission_by_time() {
+        let at = SystemTime::now();
+        let mut evidence = LifecycleEvidence::default();
+        evidence.record_submission(at + Duration::from_secs(2));
+        evidence.switch_binding(at, at, at + Duration::from_secs(3));
+        assert_eq!(evidence.first_submission_binding(), Some(1));
+        // A later conversation switch retires the first task's ownership.
+        evidence.switch_binding(
+            at + Duration::from_secs(4),
+            at + Duration::from_secs(4),
+            at + Duration::from_secs(5),
+        );
+        evidence.record_submission(at + Duration::from_secs(6));
+        assert_eq!(evidence.binding_rev(), 2);
+        assert_eq!(evidence.first_submission_binding(), Some(1));
     }
 
     #[test]

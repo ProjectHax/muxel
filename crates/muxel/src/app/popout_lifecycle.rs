@@ -1,35 +1,30 @@
 //! Window ownership must not change a live terminal's background lifecycle.
 
-use super::{AgentStatus, LoopRun, MAX_LOOP_RUNTIME, PostRunAction, terminal_view_in};
+use super::{LoopCleanup, LoopRun, PostRunAction, terminal_view_in};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-// Provider capture/apply now belongs to the merged session_discovery worker.
 pub(super) fn loop_heartbeat<'a, T, P>(
     runs: &mut HashMap<Uuid, LoopRun>,
     docked: &'a HashMap<Uuid, T>,
     popouts: &'a HashMap<Uuid, P>,
     terminal: impl Fn(&'a P) -> Option<&'a T>,
-    status: impl Fn(Uuid, &T) -> Option<AgentStatus>,
+    cleanup: impl Fn(&T, &mut LoopRun) -> LoopCleanup,
 ) -> Vec<Uuid> {
     let mut close = Vec::new();
     runs.retain(|iid, run| {
         let Some(view) = terminal_view_in(*iid, docked, popouts, &terminal) else {
             return false;
         };
-        let status = status(*iid, view);
-        if status == Some(AgentStatus::Working) {
-            run.seen_working = true;
-        }
-        let finished =
-            run.seen_working && matches!(status, Some(AgentStatus::Idle) | Some(AgentStatus::Done));
-        if finished || run.started.elapsed() >= MAX_LOOP_RUNTIME {
-            if run.post_run == PostRunAction::Exit {
-                close.push(*iid);
+        match cleanup(view, run) {
+            LoopCleanup::Continue => true,
+            LoopCleanup::Abandon => false,
+            LoopCleanup::Finish => {
+                if run.post_run == PostRunAction::Exit {
+                    close.push(*iid);
+                }
+                false
             }
-            false
-        } else {
-            true
         }
     });
     close
@@ -42,20 +37,37 @@ mod tests {
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::rc::Rc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use uuid::Uuid;
 
     #[test]
-    fn popout_loop_grok_heartbeat_retains_run_through_redock_and_exit_cleanup() {
+    fn popout_loop_grok_heartbeat_retains_owned_run_through_redock_and_exit_cleanup() {
+        use muxel_terminal::{
+            TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason,
+        };
         let pane = Uuid::new_v4();
         let loop_id = Uuid::new_v4();
-        let terminal = Rc::new(Cell::new(AgentStatus::Working));
+        let launch = Uuid::new_v4();
+        let runtime = TerminalRuntimeSnapshot {
+            status: AgentStatus::Working,
+            attributable: true,
+            reason: TerminalStatusReason::Quiet,
+            coverage: TerminalStatusCoverage::ProviderVisible,
+            launch_id: launch,
+            binding_rev: 1,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: false,
+        };
+        let terminal = Rc::new(Cell::new(runtime));
         let mut docked = HashMap::from([(pane, terminal.clone())]);
         let mut popouts = HashMap::new();
         let mut runs = HashMap::from([(
             pane,
             LoopRun {
                 loop_id,
+                launch: Some(launch),
                 seen_working: false,
                 started: Instant::now(),
                 post_run: PostRunAction::Exit,
@@ -67,7 +79,9 @@ mod tests {
                 docked,
                 popouts,
                 Option::as_ref,
-                |_, view: &Rc<Cell<AgentStatus>>| Some(view.get()),
+                |view: &Rc<Cell<TerminalRuntimeSnapshot>>, run| {
+                    run.cleanup(view.get(), 1, Some(1), Duration::ZERO)
+                },
             )
         };
         assert!(beat(&mut runs, &docked, &popouts).is_empty());
@@ -81,7 +95,11 @@ mod tests {
         docked.insert(pane, popouts.remove(&pane).unwrap().unwrap());
         assert!(Rc::ptr_eq(docked.get(&pane).unwrap(), &terminal));
         assert!(beat(&mut runs, &docked, &popouts).is_empty());
-        terminal.set(AgentStatus::Done);
+        terminal.set(TerminalRuntimeSnapshot {
+            status: AgentStatus::Done,
+            completion_ready: true,
+            ..runtime
+        });
         assert_eq!(beat(&mut runs, &docked, &popouts), vec![pane]);
         assert!(runs.is_empty());
     }

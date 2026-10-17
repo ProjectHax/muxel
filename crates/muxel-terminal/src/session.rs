@@ -1740,6 +1740,13 @@ impl TerminalSession {
         self.turn_submitted.load(Ordering::Relaxed)
     }
 
+    /// Conversation that received this launch's first submitted turn. A late
+    /// provider switch report can attribute that input by its timestamp; later
+    /// submissions never transfer ownership to a different conversation.
+    pub fn first_submission_binding(&self) -> Option<u64> {
+        self.evidence.lock().first_submission_binding()
+    }
+
     /// The input revision and draft bit. Ordinary non-empty input writes (keys,
     /// pastes, mouse and wheel reports) advance the revision before writer
     /// admission; fallible submissions commit it after successful admission.
