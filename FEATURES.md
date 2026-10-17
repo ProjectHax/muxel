@@ -518,6 +518,10 @@ feature is added or changed, update the matching entry here in the same change**
   the prompt actually offers, and a pane that isn't running says so rather than
   swallowing the input. Shell panes are off limits unless "Also allow typing into
   shell panes" is on too, since typing into a shell is running commands.
+  `send` waits for its delayed Enter and withholds it if local input changes or
+  the pane closes or restarts. A withheld send fails and attempts to release only
+  its own tmux claim; timeout, command failure or older tmux can leave the claim
+  in place under its existing aging rules.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It

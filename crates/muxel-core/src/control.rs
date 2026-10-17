@@ -723,7 +723,8 @@ pub fn wait_outcome(state: Option<AgentState>, awaiting: bool) -> Option<WaitOut
 pub const CLAIM_OPTION: &str = "@muxel-ctl";
 
 /// Which muxel last typed into an agent through `muxel ctl`, and when: stored on
-/// the agent's tmux session as `v1|owner|host|at|grace`.
+/// the agent's tmux session as `v1|owner|host|at|grace[|nonce]`. Older readers
+/// ignore the optional suffix; their claims remain readable without it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     /// A random id for the muxel process (not secret; it only tells muxels apart).
@@ -734,28 +735,46 @@ pub struct Claim {
     pub at: i64,
     /// [`REPLY_GRACE_MS`] or [`ANSWER_GRACE_MS`], as for [`awaiting_reply`].
     pub grace_ms: i64,
+    /// Unique per send, including concurrent sends from the same process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<Uuid>,
+}
+
+fn claim_field(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c == '|' || c.is_whitespace() || c.is_control() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 impl Claim {
     pub fn encode(&self) -> String {
-        fn field(s: &str) -> String {
-            s.chars()
-                .map(|c| {
-                    if c == '|' || c.is_whitespace() || c.is_control() {
-                        '-'
-                    } else {
-                        c
-                    }
-                })
-                .collect()
-        }
-        format!(
+        let mut value = format!(
             "v1|{}|{}|{}|{}",
-            field(&self.owner),
-            field(&self.host),
+            claim_field(&self.owner),
+            claim_field(&self.host),
             self.at,
             self.grace_ms
-        )
+        );
+        if let Some(nonce) = self.nonce {
+            value.push('|');
+            value.push_str(&nonce.to_string());
+        }
+        value
+    }
+
+    /// Both admission and cleanup must distinguish same-process, same-ms sends.
+    pub fn same_turn(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.nonce.is_some() && self.nonce == other.nonce
+    }
+
+    pub fn pattern(owner: &str, nonce: Uuid) -> String {
+        format!("v1|{}|*|*|*|{nonce}", claim_field(owner))
     }
 
     /// `None` for an unset option, or a value this version doesn't understand.
@@ -768,11 +787,13 @@ impl Claim {
         let host = parts.next()?.to_string();
         let at = parts.next()?.parse().ok()?;
         let grace_ms = parts.next()?.parse().ok()?;
+        let nonce = parts.next().map(Uuid::parse_str).transpose().ok()?;
         (!owner.is_empty()).then_some(Self {
             owner,
             host,
             at,
             grace_ms,
+            nonce,
         })
     }
 }
@@ -1090,6 +1111,11 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   while the agent is working or blocked, or while muxel on another computer is
   mid-turn with it. For long or multi-line text, pass `-` and pipe the text on
   stdin.
+  The reply waits for Enter. If keys, pastes, mouse or wheel reports reach the
+  pane after the paste, Enter is withheld and `send` fails with the prompt left
+  in its input. A closed or restarted terminal also withholds Enter. Check
+  `screen` before sending again. Focus reports, terminal replies and local scrollback do not
+  count; input from another tmux client is outside this local guard.
 - `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
   ends (or it blocks on a question, or exits), then print what `show` prints plus
   `wait.outcome`: finished, blocked, exited, not_running or timed_out. Default
@@ -1167,6 +1193,54 @@ mod tests {
 
     fn id(n: u128) -> Uuid {
         Uuid::from_u128(n)
+    }
+
+    fn claim_matches(pattern: &str, value: &str) -> bool {
+        match pattern.split_once('*') {
+            None => pattern == value,
+            Some((head, tail)) => {
+                value.starts_with(head)
+                    && (head.len()..=value.len()).any(|at| claim_matches(tail, &value[at..]))
+            }
+        }
+    }
+
+    #[test]
+    fn same_process_claims_in_the_same_millisecond_have_distinct_identity() {
+        let first = super::Claim {
+            owner: "same-process".into(),
+            host: "desk".into(),
+            at: 1234,
+            grace_ms: 30_000,
+            nonce: Some(id(1)),
+        };
+        let second = super::Claim {
+            nonce: Some(id(2)),
+            ..first.clone()
+        };
+        assert!(first.same_turn(&super::Claim::decode(&first.encode()).unwrap()));
+        assert!(!first.same_turn(&second));
+        let pattern = super::Claim::pattern(&first.owner, first.nonce.unwrap());
+        assert!(claim_matches(&pattern, &first.encode()));
+        assert!(
+            !claim_matches(&pattern, &second.encode()),
+            "cleanup must preserve a newer same-ms claim"
+        );
+        let legacy = super::Claim {
+            nonce: None,
+            ..first.clone()
+        };
+        assert!(!claim_matches(&pattern, &legacy.encode()));
+        assert_eq!(super::Claim::decode(&legacy.encode()), Some(legacy));
+    }
+
+    #[test]
+    fn claims_from_before_the_nonce_field_still_deserialize() {
+        let legacy: super::Claim =
+            serde_json::from_str(r#"{"owner":"old","host":"desk","at":1,"grace_ms":30000}"#)
+                .unwrap();
+        assert_eq!(legacy.nonce, None);
+        assert_eq!(super::Claim::decode("v1|old|desk|1|30000"), Some(legacy));
     }
 
     #[test]
@@ -1626,6 +1700,7 @@ Steps:
             host: "Sam's Mac|mini".into(),
             at: 1_790_000_000_000,
             grace_ms: super::REPLY_GRACE_MS,
+            nonce: None,
         };
         let value = claim.encode();
         assert_eq!(value, "v1|a1b2c3d4e5f6|Sam's-Mac-mini|1790000000000|30000");
@@ -1647,6 +1722,7 @@ Steps:
             host: "desk".into(),
             at,
             grace_ms: super::REPLY_GRACE_MS,
+            nonce: None,
         };
         let before = AgentActivity {
             completed_at: Some(at - 10_000),

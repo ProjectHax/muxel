@@ -510,26 +510,52 @@ impl MuxelApp {
             Answer::Type(mut typing) => {
                 let Some((site, turn)) = typing.site.take().zip(typing.turn.as_ref()) else {
                     // No tmux session (so nothing to share), or keys that start no turn.
-                    let _ = reply.send(respond(self.control_press(*typing, None, cx)));
+                    let pressed = self.control_press(*typing, None, cx);
+                    cx.spawn(async move |_this: WeakEntity<Self>, _cx| {
+                        let _ = reply.send(respond(pressed.await));
+                    })
+                    .detach();
                     return;
                 };
                 let (grace_ms, lead_ms) = (turn.grace_ms, turn.lead_ms);
+                let site = Arc::new(site);
                 let (state, activity, force) =
                     (typing.state, typing.activity.clone(), typing.force);
                 let can_force = matches!(typing.input, Input::Prompt(_));
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    let claim_site = site.clone();
                     let claimed = cx
                         .background_executor()
                         .spawn(async move {
                             claim_agent(
-                                &site, grace_ms, lead_ms, force, can_force, state, &activity,
+                                &claim_site,
+                                grace_ms,
+                                lead_ms,
+                                force,
+                                can_force,
+                                state,
+                                &activity,
                             )
                         })
                         .await;
-                    let result = claimed.and_then(|at| {
-                        this.update(cx, |app, cx| app.control_press(*typing, Some(at), cx))
-                            .unwrap_or_else(|_| Err("muxel is shutting down".into()))
-                    });
+                    let result = match claimed {
+                        Ok(claim) => {
+                            let pressed = this.update(cx, |app, cx| {
+                                app.control_press(*typing, Some(claim.at), cx)
+                            });
+                            let sent = match pressed {
+                                Ok(pressed) => pressed.await,
+                                Err(_) => Err("muxel is shutting down".into()),
+                            };
+                            if sent.is_err() {
+                                cx.background_executor()
+                                    .spawn(async move { release_claim(&site, &claim) })
+                                    .await;
+                            }
+                            sent
+                        }
+                        Err(error) => Err(error),
+                    };
                     let _ = reply.send(respond(result));
                 })
                 .detach();
@@ -1111,26 +1137,41 @@ impl MuxelApp {
     }
 
     /// Type `typing` into its agent, and note the turn it starts at `at` (when a
-    /// claim fixed it) or now.
+    /// claim fixed it) or when its Enter lands. The reply to a prompt comes once
+    /// its Enter is written, or withheld.
     fn control_press(
         &mut self,
         typing: Typing,
         at: Option<i64>,
         cx: &mut Context<Self>,
-    ) -> Result<Value, String> {
+    ) -> Task<Result<Value, String>> {
         // The pane may have closed while another muxel's claim was checked.
-        let session = self.control_writable(typing.iid, cx)?;
+        let session = match self.control_writable(typing.iid, cx) {
+            Ok(session) => session,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let Typing {
+            iid, turn, reply, ..
+        } = typing;
         match typing.input {
             Input::Prompt(text) => {
                 session.paste(&text);
-                cx.spawn(async move |_this: WeakEntity<Self>, cx| {
+                let pasted = session.input_rev();
+                cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     cx.background_executor()
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                         .await;
-                    session.mark_turn_submitted();
-                    session.write_input(b"\r");
+                    this.update(cx, |app, cx| {
+                        let live = app.control_writable(iid, cx);
+                        enter_verdict(live, &session, pasted, session.input_rev())?;
+                        press_prompt_enter(&session, pasted)?;
+                        // Claim timestamps predict settlement. Local wait starts
+                        // at the actual Enter admission, never at the prediction.
+                        app.note_control_turn(iid, turn, now_ms());
+                        Ok(reply)
+                    })
+                    .unwrap_or_else(|_| Err("muxel is shutting down".into()))
                 })
-                .detach();
             }
             Input::Keys(presses) => {
                 cx.spawn(async move |_this: WeakEntity<Self>, cx| {
@@ -1147,22 +1188,27 @@ impl MuxelApp {
                     }
                 })
                 .detach();
+                let lead_ms = turn.as_ref().map_or(0, |turn| turn.lead_ms);
+                self.note_control_turn(iid, turn, at.unwrap_or_else(|| now_ms() + lead_ms));
+                Task::ready(Ok(reply))
             }
         }
-        if let Some(turn) = typing.turn {
-            let sent_at = at.unwrap_or_else(|| now_ms() + turn.lead_ms);
-            let entry = self.control_turns.entry(typing.iid).or_insert(ControlTurn {
-                prompt: None,
-                sent_at,
-                grace_ms: turn.grace_ms,
-            });
-            entry.sent_at = sent_at;
-            entry.grace_ms = turn.grace_ms;
-            if turn.prompt.is_some() {
-                entry.prompt = turn.prompt;
-            }
+    }
+
+    /// Remember the turn a prompt or answer typed through `muxel ctl` started, so
+    /// `wait` knows which one it is waiting for.
+    fn note_control_turn(&mut self, iid: Uuid, turn: Option<Turn>, sent_at: i64) {
+        let Some(turn) = turn else { return };
+        let entry = self.control_turns.entry(iid).or_insert(ControlTurn {
+            prompt: None,
+            sent_at,
+            grace_ms: turn.grace_ms,
+        });
+        entry.sent_at = sent_at;
+        entry.grace_ms = turn.grace_ms;
+        if turn.prompt.is_some() {
+            entry.prompt = turn.prompt;
         }
-        Ok(typing.reply)
     }
 }
 
@@ -1170,6 +1216,44 @@ fn typed(typing: Result<Typing, String>) -> Answer {
     match typing {
         Ok(typing) => Answer::Type(Box::new(typing)),
         Err(error) => Answer::Now(Err(error)),
+    }
+}
+
+fn enter_verdict<T>(
+    live: Result<Arc<T>, String>,
+    pasted_into: &Arc<T>,
+    pasted: u64,
+    now: u64,
+) -> Result<(), String> {
+    match live {
+        Ok(live) if Arc::ptr_eq(&live, pasted_into) => {}
+        Ok(_) => return Err("the pane restarted after the prompt was pasted, so Enter wasn't pressed: check its `screen`".into()),
+        Err(why) => return Err(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`")),
+    }
+    if now != pasted {
+        return Err("something else was typed, clicked or scrolled into the agent after the prompt was pasted, so Enter wasn't pressed: check its `screen` before sending again".into());
+    }
+    Ok(())
+}
+
+fn press_prompt_enter(session: &Arc<TerminalSession>, pasted: u64) -> Result<(), String> {
+    enter_verdict(Ok(session.clone()), session, pasted, session.input_rev())?;
+    session.try_write_input(b"\r").map_err(|error| {
+        format!(
+            "the prompt was pasted but Enter couldn't be admitted ({error}): check its `screen`"
+        )
+    })?;
+    session.mark_turn_submitted();
+    Ok(())
+}
+
+fn release_claim(site: &ClaimSite, claim: &ctl::Claim) {
+    let Some(nonce) = claim.nonce else { return };
+    let pattern = ctl::Claim::pattern(&claim.owner, nonce);
+    if let Err(error) =
+        integrations::unset_tmux_option_if(&site.loc, &site.session, ctl::CLAIM_OPTION, &pattern)
+    {
+        log::warn!("muxel ctl: couldn't release {}: {error:#}", site.session);
     }
 }
 
@@ -1183,8 +1267,8 @@ fn read_claim(site: &ClaimSite) -> Option<ctl::Claim> {
 /// read the claim back after a pause, so that when two muxels reach an idle agent
 /// at the same moment only the later write types. The pause is twice the read's
 /// round trip (so a slower host gets a longer one), but at least
-/// [`CLAIM_SETTLE_MIN`]. Returns when the turn starts (unix ms): typing begins as
-/// this returns, and the turn's Enter or last key lands `lead_ms` later.
+/// [`CLAIM_SETTLE_MIN`]. Returns the claim's unique identity and shared timing
+/// estimate. A prompt's local turn uses its actual Enter admission time.
 ///
 /// Best effort: a host whose tmux can't be reached leaves the agent unclaimed
 /// rather than untypeable — the pane itself works, or `control_writable` would
@@ -1197,7 +1281,7 @@ fn claim_agent(
     can_force: bool,
     state: Option<AgentState>,
     activity: &AgentActivity,
-) -> Result<i64, String> {
+) -> Result<ctl::Claim, String> {
     let busy = |claim: &ctl::Claim, how: &str| {
         let hint = if can_force {
             "`wait` on the agent and try again (or pass --force to send anyway)"
@@ -1225,20 +1309,24 @@ fn claim_agent(
         host: crate::control::local_hostname().to_string(),
         at,
         grace_ms,
+        nonce: Some(Uuid::new_v4()),
     };
     if let Err(error) =
         integrations::set_tmux_option(&site.loc, &site.session, ctl::CLAIM_OPTION, &mine.encode())
     {
         log::warn!("muxel ctl: couldn't claim {}: {error:#}", site.session);
-        return Ok(now_ms() + lead_ms);
+        return Ok(ctl::Claim {
+            at: now_ms() + lead_ms,
+            ..mine
+        });
     }
     std::thread::sleep(settle);
     match read_claim(site) {
-        Some(claim) if claim.owner != mine.owner && !force => Err(busy(
+        Some(claim) if !claim.same_turn(&mine) && !force => Err(busy(
             &claim,
             "started typing into this agent at the same moment",
         )),
-        _ => Ok(at),
+        _ => Ok(mine),
     }
 }
 
@@ -1296,4 +1384,43 @@ fn show_value(
         "last_reply": reply.map(|text| json!({ "text": text, "source": reply_from })),
         "question": question,
     })
+}
+
+#[cfg(test)]
+mod prompt_submission_tests {
+    use super::{enter_verdict, press_prompt_enter};
+    use muxel_terminal::{CommandSpec, TerminalSession};
+    use std::sync::Arc;
+
+    #[test]
+    fn a_prompt_enter_is_withheld_after_intervening_input() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
+        session.paste("a prompt");
+        let pasted = session.input_rev();
+        session.write_input(b"x");
+        let entered = press_prompt_enter(&session, pasted);
+        let submitted = session.has_submitted_turn();
+        let revision = session.input_rev();
+        session.kill();
+        assert!(
+            entered.is_err(),
+            "intervening input was submitted: {entered:?}"
+        );
+        assert!(!submitted);
+        assert_eq!(revision, pasted + 1, "withholding must not queue Enter");
+    }
+
+    #[test]
+    fn enter_rejects_closed_or_replaced_panes_and_accepts_unchanged_input() {
+        let original = Arc::new(1_u8);
+        assert_eq!(enter_verdict(Ok(original.clone()), &original, 7, 7), Ok(()));
+        assert!(enter_verdict(Err("closed".into()), &original, 7, 7).is_err());
+        assert!(enter_verdict(Ok(Arc::new(1)), &original, 7, 7).is_err());
+        assert!(enter_verdict(Ok(original.clone()), &original, 7, 8).is_err());
+    }
 }

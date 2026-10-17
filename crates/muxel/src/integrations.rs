@@ -1465,12 +1465,16 @@ pub fn claude_conversation_summary(path: &Path) -> Option<String> {
 /// SSH host (reusing the host's ControlMaster). `None` for a Windows host, which
 /// has no tmux.
 fn tmux_at(loc: &RepoLoc, args: &[String]) -> Option<std::process::Output> {
-    match loc {
-        RepoLoc::Local(_) => command("tmux")
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok(),
+    tmux_command_at(loc, args)?.output().ok()
+}
+
+fn tmux_command_at(loc: &RepoLoc, args: &[String]) -> Option<Command> {
+    let mut cmd = match loc {
+        RepoLoc::Local(_) => {
+            let mut cmd = command("tmux");
+            cmd.args(args);
+            cmd
+        }
         RepoLoc::Remote(c) => {
             if c.host.os.is_windows() {
                 return None;
@@ -1480,11 +1484,10 @@ fn tmux_at(loc: &RepoLoc, args: &[String]) -> Option<std::process::Output> {
                 .collect::<Vec<_>>()
                 .join(" ");
             remote_ssh_command(c, format!("{}; {cmd}", ssh::tmux_path_prelude()))
-                .stdin(std::process::Stdio::null())
-                .output()
-                .ok()
         }
-    }
+    };
+    cmd.stdin(Stdio::null());
+    Some(cmd)
 }
 
 /// Run this muxel's own `ctl` command (`exe ctl <args>`), the way an outside
@@ -1518,6 +1521,37 @@ pub fn set_tmux_option(loc: &RepoLoc, session: &str, option: &str, value: &str) 
         );
     }
     Ok(())
+}
+
+/// Give claim cleanup two seconds before terminating its command.
+pub fn unset_tmux_option_if(
+    loc: &RepoLoc,
+    session: &str,
+    option: &str,
+    pattern: &str,
+) -> Result<()> {
+    let args = muxel_core::tmux::unset_option_if_args(session, option, pattern)
+        .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim cleanup safely"))?;
+    let cmd = tmux_command_at(loc, &args).ok_or_else(|| anyhow::anyhow!("tmux is unavailable"))?;
+    run_claim_cleanup(cmd, Duration::from_secs(2))
+}
+
+fn run_claim_cleanup(mut cmd: Command, timeout: Duration) -> Result<()> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn().context("starting tmux claim cleanup")?;
+    let (_, status) = wait_until(child, Instant::now() + timeout);
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => bail!("tmux claim cleanup failed: {status}"),
+        None => bail!("tmux claim cleanup timed out"),
+    }
 }
 
 /// Kill a tmux session. Best-effort.
@@ -2445,6 +2479,32 @@ fn clear_read_only(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_cleanup_stops_a_command_that_does_not_finish() {
+        let mut cmd = if cfg!(windows) {
+            let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            let mut cmd = command(powershell);
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
+            cmd
+        } else {
+            let mut cmd = command("/bin/sh");
+            cmd.args(["-c", "sleep 30"]);
+            cmd
+        };
+        cmd.stdin(Stdio::null());
+        let started = Instant::now();
+        let err = run_claim_cleanup(cmd, Duration::from_millis(50))
+            .expect_err("a 30-second command must not finish within 50 ms");
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn transport_failure_vs_command_failure() {
