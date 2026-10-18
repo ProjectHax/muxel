@@ -1100,7 +1100,8 @@ feature is added or changed, update the matching entry here in the same change**
   and cleanup. The regular profile keeps the `mxl` socket and reattaches legacy
   default-socket sessions. Version and help exit without initializing a profile.
   Relative paths and `--user-data-dir=DIR` work; empty, repeated or malformed
-  forms are refused before startup. Child agents still use their normal
+  forms are refused before startup. The flag can also precede Linux browser-helper
+  commands. Child agents still use their normal
   login/config and project files; profiler paths retain their usual locations.
   Credentials are not migrated from the default profile; if a root cannot be
   resolved when first used, its fallback keychain name may differ from a later

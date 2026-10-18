@@ -240,7 +240,7 @@ fn main() {
         std::process::exit(control::run_cli(&args));
     }
     match session_binding::hook_instance_from_args(
-        args,
+        args.iter().cloned(),
         std::env::var_os(session_binding::MUXEL_INSTANCE_ID_ENV),
     ) {
         Ok(Some(instance_id)) => {
@@ -275,9 +275,9 @@ fn main() {
     // a standalone WebKitGTK window (gpui can't host one — see browser_helper).
     // Must run before anything gpui-related initializes.
     #[cfg(target_os = "linux")]
-    if std::env::args().nth(1).as_deref() == Some("--browser") {
-        match std::env::args().nth(2) {
-            Some(url) => browser_helper::run(&url),
+    if args.first().is_some_and(|arg| arg == "--browser") {
+        match args.get(1).and_then(|arg| arg.to_str()) {
+            Some(url) => browser_helper::run(url),
             None => {
                 eprintln!("usage: muxel --browser <url>");
                 std::process::exit(2);
