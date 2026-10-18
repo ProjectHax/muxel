@@ -10,6 +10,7 @@
 //! panes share a few masters, and muxel's own commands (git, layout sync, tmux
 //! queries) share another. See [`Master`].
 
+use crate::tmux::Socket;
 use crate::winshell::{self, WindowsShell};
 use crate::{RemoteHost, RemoteOs, SshAuth};
 use uuid::Uuid;
@@ -446,10 +447,129 @@ pub fn tmux_path_prelude() -> String {
     format!("export PATH=\"$PATH:{}\"", REMOTE_TMUX_PATH_DIRS.join(":"))
 }
 
+/// `tmux` on `socket`, as the words that start a remote command. Every word is
+/// shell-safe, so none is quoted.
+fn tmux_on(socket: Socket) -> String {
+    std::iter::once("tmux")
+        .chain(socket.args().iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How a remote command names tmux after [`select_tmux_socket`]: on whichever
+/// server that chose.
+const SELECTED_TMUX: &str = "tmux \"$@\"";
+
+/// A remote shell fragment that points `"$@"` at the tmux server holding `session`
+/// — muxel's own, unless the session is running only on the default server (see
+/// [`Socket::locate`]) — so every tmux word after it can be [`SELECTED_TMUX`].
+///
+/// Positional parameters rather than a variable, because zsh (the login shell that
+/// runs ssh's command on a macOS host) doesn't split an unquoted `$s` holding
+/// `-L mxl` into two words, and rather than a function, because a pane has to
+/// `exec` tmux itself. Must follow [`tmux_path_prelude`].
+pub fn select_tmux_socket(session: &str) -> String {
+    let target = sh_quote(&format!("={session}"));
+    let point_at = |socket: Socket| {
+        std::iter::once("set --")
+            .chain(socket.args().iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    format!(
+        "if ! {} has-session -t {target} 2>/dev/null \
+         && {} has-session -t {target} 2>/dev/null; then {}; else {}; fi",
+        tmux_on(Socket::Private),
+        tmux_on(Socket::Default),
+        point_at(Socket::Default),
+        point_at(Socket::Private),
+    )
+}
+
+/// A remote command line running `tmux <args>` on the server holding `session`.
+pub fn session_tmux_command(session: &str, args: &[String]) -> String {
+    let mut cmd = format!(
+        "{}; {}; {SELECTED_TMUX}",
+        tmux_path_prelude(),
+        select_tmux_socket(session)
+    );
+    for a in args {
+        cmd.push(' ');
+        cmd.push_str(&sh_quote(a));
+    }
+    cmd
+}
+
+/// What closes each server's part of [`list_sessions_command`]'s output, followed by
+/// that listing's exit status. No listed pane can look like it: each of their lines
+/// starts with a session name, and tmux never puts a `:` in one.
+const LISTING_END: &str = ":muxel-listed:";
+
+/// A remote command line listing every pane on both of the host's tmux servers
+/// ([`crate::tmux::list_sessions_args`]), each listing closed by its exit status so
+/// [`parse_session_listings`] can tell a server that isn't running from one that
+/// couldn't be asked. One round trip for both.
+pub fn list_sessions_command() -> String {
+    let args: Vec<String> = crate::tmux::list_sessions_args()
+        .iter()
+        .map(|a| sh_quote(a))
+        .collect();
+    let mut cmd = tmux_path_prelude();
+    for socket in Socket::BOTH {
+        cmd.push_str(&format!(
+            "; {} {} 2>&1; echo \"{LISTING_END}$?\"",
+            tmux_on(socket),
+            args.join(" ")
+        ));
+    }
+    cmd
+}
+
+/// The sessions in [`list_sessions_command`]'s output, muxel's own server's first.
+///
+/// `None` unless both servers answered. A server that isn't running is an answer —
+/// nothing there — but one that couldn't be asked is not: read as "no sessions", it
+/// would let a closed pane's unconfirmed kill be forgotten (see
+/// [`crate::tmux::ClosedSession`]).
+pub fn parse_session_listings(out: &str) -> Option<Vec<crate::tmux::RemoteSession>> {
+    let mut panes = String::new();
+    let mut listing = String::new();
+    let mut answered = 0;
+    for line in out.lines() {
+        let Some(status) = line.strip_prefix(LISTING_END) else {
+            listing.push_str(line);
+            listing.push('\n');
+            continue;
+        };
+        if status.trim() == "0" {
+            panes.push_str(&listing);
+        } else if !crate::tmux::no_server(&listing) {
+            return None;
+        }
+        listing.clear();
+        answered += 1;
+    }
+    (answered == Socket::BOTH.len()).then(|| crate::tmux::parse_sessions(&panes))
+}
+
 /// Exit codes for [`kill_and_confirm_command`], chosen above the range a shell
 /// hands out for a command that merely failed.
 pub const TMUX_STILL_ALIVE: i32 = 91;
 pub const TMUX_MISSING: i32 = 92;
+
+/// A remote command line that kills tmux session `session` on both of the host's
+/// servers, ignoring the answer — for quit-time cleanup, which can't wait for one.
+/// Both, because a pane from before muxel had its own server still has its session
+/// on the default one. The `=` target is exact-match, as in
+/// [`crate::tmux::kill_session_args`].
+pub fn kill_command(session: &str) -> String {
+    let target = sh_quote(&format!("={session}"));
+    let mut cmd = tmux_path_prelude();
+    for socket in Socket::BOTH {
+        cmd.push_str(&format!("; {} kill-session -t {target}", tmux_on(socket)));
+    }
+    cmd
+}
 
 /// A remote command line that kills tmux session `session` and then **says whether
 /// it worked**: exit `0` when the host no longer has the session,
@@ -460,21 +580,32 @@ pub const TMUX_MISSING: i32 = 92;
 /// when the session was never there (fine) and when nothing ran at all (not fine),
 /// so a caller that only looks at the kill cannot tell a finished teardown from a
 /// silently dropped one — and a dropped one leaves the agent running on the host.
-/// `has-session` is the question actually being asked.
+/// `has-session` is the question actually being asked — of both servers, as in
+/// [`kill_command`].
 ///
 /// `tmux` is separately checked with `command -v`, because an unfindable `tmux`
 /// makes `has-session` fail too, which would otherwise read as "the session is
 /// gone". The `=` target is exact-match, as in [`crate::tmux::kill_session_args`].
 pub fn kill_and_confirm_command(session: &str) -> String {
     let target = sh_quote(&format!("={session}"));
-    [
+    let mut steps = vec![
         tmux_path_prelude(),
         format!("command -v tmux >/dev/null 2>&1 || exit {TMUX_MISSING}"),
-        format!("tmux kill-session -t {target} >/dev/null 2>&1"),
-        format!("tmux has-session -t {target} >/dev/null 2>&1 && exit {TMUX_STILL_ALIVE}"),
-        "exit 0".to_string(),
-    ]
-    .join("; ")
+    ];
+    for socket in Socket::BOTH {
+        steps.push(format!(
+            "{} kill-session -t {target} >/dev/null 2>&1",
+            tmux_on(socket)
+        ));
+    }
+    for socket in Socket::BOTH {
+        steps.push(format!(
+            "{} has-session -t {target} >/dev/null 2>&1 && exit {TMUX_STILL_ALIVE}",
+            tmux_on(socket)
+        ));
+    }
+    steps.push("exit 0".to_string());
+    steps.join("; ")
 }
 
 /// Parameters for a remote interactive pane command.
@@ -505,14 +636,16 @@ pub fn tmux_client_option(tag: &str) -> String {
 
 /// Whether the remote tmux supports client flags on `new-session` (tmux 3.2+,
 /// whose usage then lists `[-f flags]`). An older tmux, or one that can't list a
-/// single command, fails the match and attaches the plain way.
+/// single command, fails the match and attaches the plain way. Asked of the server
+/// [`select_tmux_socket`] chose: `list-commands` starts a server where none runs.
 const TMUX_HAS_CLIENT_FLAGS: &str =
-    "tmux list-commands new-session 2>/dev/null | grep -q 'f flags'";
+    "tmux \"$@\" list-commands new-session 2>/dev/null | grep -q 'f flags'";
 
-/// `exec tmux <targs> [-- <program>] [<tail>]`, every word shell-quoted except the
-/// program, which [`login_shell_command`] has already made a shell fragment.
+/// `exec tmux "$@" <targs> [-- <program>] [<tail>]` — on the server
+/// [`select_tmux_socket`] chose — every word shell-quoted except the program, which
+/// [`login_shell_command`] has already made a shell fragment.
 fn exec_tmux(targs: &[String], program: Option<&str>, tail: &[String]) -> String {
-    let mut cmd = "exec tmux".to_string();
+    let mut cmd = format!("exec {SELECTED_TMUX}");
     for a in targs {
         cmd.push(' ');
         cmd.push_str(&sh_quote(a));
@@ -540,11 +673,14 @@ pub fn claim_window_size_command(session: &str, tag: &str) -> String {
     let target = sh_quote(&format!("={session}"));
     let option = sh_quote(&tmux_client_option(tag));
     format!(
-        "{}; c=$(tmux show-options -qv -t {pane} {option}) && [ -n \"$c\" ] \
-         && tmux list-clients -t {target} -F '#{{client_name}}' | grep -qxF -- \"$c\" \
-         && tmux refresh-client -t \"$c\" -f '!ignore-size' ';' \
+        "{}; {}; c=$({SELECTED_TMUX} show-options -qv -t {pane} {option}) \
+         && [ -n \"$c\" ] \
+         && {SELECTED_TMUX} list-clients -t {target} -F '#{{client_name}}' \
+         | grep -qxF -- \"$c\" \
+         && {SELECTED_TMUX} refresh-client -t \"$c\" -f '!ignore-size' ';' \
          set-option -q -t {pane} {option} \"$c\"",
-        tmux_path_prelude()
+        tmux_path_prelude(),
+        select_tmux_socket(session)
     )
 }
 
@@ -702,12 +838,20 @@ fn remote_command(spec: &SshSpec) -> String {
         //
         // Every `tmux` word below is resolved against the augmented PATH — sshd's bare
         // default doesn't have Homebrew's on it. See `tmux_path_prelude`.
+        //
+        // The server started is muxel's own (`tmux::SOCKET_NAME`). The pane then
+        // attaches on whichever server holds its session: muxel's own, unless the
+        // session is still running on the default server from before muxel had
+        // one. See `select_tmux_socket`.
         let mut cmd = tmux_path_prelude();
-        cmd.push_str("; tmux");
+        cmd.push_str("; ");
+        cmd.push_str(&tmux_on(Socket::Private));
         for a in crate::tmux::start_server_args() {
             cmd.push(' ');
             cmd.push_str(&sh_quote(&a));
         }
+        cmd.push_str("; ");
+        cmd.push_str(&select_tmux_socket(session));
         cmd.push_str("; ");
         // Attaching makes a client the window's latest, and under tmux's default
         // `window-size latest` the window takes its size — so a pane reconnecting
@@ -727,7 +871,7 @@ fn remote_command(spec: &SshSpec) -> String {
         // lines at a width the pane didn't have and tmux cropped the rest.
         if let Some(tag) = spec.tmux_client_tag {
             let attached = format!(
-                "tmux list-clients -t {} 2>/dev/null | grep -q .",
+                "{SELECTED_TMUX} list-clients -t {} 2>/dev/null | grep -q .",
                 sh_quote(&format!("={session}"))
             );
             let mut flagged = targs.clone();
@@ -1000,14 +1144,21 @@ mod tests {
     #[test]
     fn kill_and_confirm_targets_one_session_exactly() {
         let cmd = kill_and_confirm_command("muxel_p_1");
+        // The kill and the confirmation, on each of the two servers.
         assert_eq!(
             cmd.matches("-t '=muxel_p_1' ").count(),
-            2,
+            4,
             "both the kill and the confirmation name the same exact target: {cmd}"
         );
         // A session name is data, never a second command: it arrives single-quoted,
         // with its own quotes escaped, so the shell reads it as one word.
         let hostile = kill_and_confirm_command("x'; rm -rf ~; '");
+        assert_eq!(
+            hostile.matches(r"-t '=x'\''; rm -rf ~; '\''' ").count(),
+            4,
+            "hostile name is quoted whole: {hostile}"
+        );
+        let hostile = select_tmux_socket("x'; rm -rf ~; '");
         assert_eq!(
             hostile.matches(r"-t '=x'\''; rm -rf ~; '\''' ").count(),
             2,
@@ -1299,13 +1450,122 @@ mod tests {
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
             &format!(
-                "{}; tmux start-server ';' set -s exit-empty off; \
-                 exec tmux -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
+                "{}; tmux -L mxl start-server ';' set -s exit-empty off; \
+                 if ! tmux -L mxl has-session -t '=muxel-abc123' 2>/dev/null \
+                 && tmux has-session -t '=muxel-abc123' 2>/dev/null; \
+                 then set --; else set -- -L mxl; fi; \
+                 exec tmux \"$@\" -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s muxel-abc123 -c /srv/app \
                  -- \"${{SHELL:-/bin/sh}}\" -ilc 'exec claude'",
                 tmux_path_prelude()
             )
         );
+    }
+
+    /// The migration on a host: a session still running on the default server from
+    /// before muxel had its own is reattached where it is (`set --` leaves tmux on
+    /// the default socket); every other session — a new one included — is on
+    /// muxel's own (`set -- -L mxl`).
+    #[test]
+    fn a_remote_session_is_found_on_muxels_server_unless_it_runs_only_on_the_default_one() {
+        assert_eq!(
+            select_tmux_socket("muxel_app_1"),
+            "if ! tmux -L mxl has-session -t '=muxel_app_1' 2>/dev/null \
+             && tmux has-session -t '=muxel_app_1' 2>/dev/null; \
+             then set --; else set -- -L mxl; fi"
+        );
+        assert_eq!(
+            session_tmux_command("muxel_app_1", &crate::tmux::kill_session_args("x")),
+            format!(
+                "{}; {}; tmux \"$@\" kill-session -t '=x'",
+                tmux_path_prelude(),
+                select_tmux_socket("muxel_app_1")
+            )
+        );
+    }
+
+    /// Both servers are listed in one round trip, muxel's own first, and only a
+    /// server that isn't running counts as having no sessions.
+    #[test]
+    fn remote_sessions_are_listed_from_both_servers() {
+        let cmd = list_sessions_command();
+        let (prelude, rest) = cmd.split_once("; ").unwrap();
+        assert_eq!(prelude, tmux_path_prelude());
+        let format = "'#{session_name}|#{session_path}|#{pane_current_command}|#{pane_title}'";
+        assert_eq!(
+            rest,
+            format!(
+                "tmux -L mxl list-panes -a -F {format} 2>&1; echo \":muxel-listed:$?\"; \
+                 tmux list-panes -a -F {format} 2>&1; echo \":muxel-listed:$?\""
+            )
+        );
+
+        let names = |out: &str| {
+            parse_session_listings(out).map(|s| s.into_iter().map(|s| s.name).collect::<Vec<_>>())
+        };
+        // A new session on muxel's server, a pane from before on the default one,
+        // and the user's own tmux — all of them, muxel's own first.
+        assert_eq!(
+            names(
+                "muxel_p_00000002|/w|claude|\n:muxel-listed:0\n\
+                 muxel_p_00000001|/w|claude|\nwork|/home|zsh|\n:muxel-listed:0\n"
+            ),
+            Some(vec![
+                "muxel_p_00000002".to_string(),
+                "muxel_p_00000001".to_string(),
+                "work".to_string()
+            ])
+        );
+        // A server that isn't running has nothing on it — muxel's own on a host
+        // that never started it, and the default one once the last pane from
+        // before has ended.
+        assert_eq!(
+            names(
+                "error connecting to /tmp/tmux-1000/mxl (No such file or directory)\n\
+                 :muxel-listed:1\nno server running on /tmp/tmux-1000/default\n:muxel-listed:1\n"
+            ),
+            Some(vec![])
+        );
+        // The same session on both servers is listed once, as muxel's own.
+        assert_eq!(
+            names("s|/a|claude|\n:muxel-listed:0\ns|/b|zsh|\n:muxel-listed:0\n"),
+            Some(vec!["s".to_string()])
+        );
+        // A server that couldn't be asked is not "no sessions": a closed pane's
+        // unconfirmed kill would be forgotten.
+        assert_eq!(
+            names(":muxel-listed:0\nsh: tmux: command not found\n:muxel-listed:127\n"),
+            None
+        );
+        // Nor is an answer cut short, such as by a dropped connection.
+        assert_eq!(
+            names("muxel_p_00000002|/w|claude|\n:muxel-listed:0\n"),
+            None
+        );
+        assert_eq!(names(""), None);
+    }
+
+    /// Closing a pane from before muxel had its own server must reach the session
+    /// where it is still running, and the confirmation must ask both servers.
+    #[test]
+    fn a_remote_session_is_killed_on_both_servers() {
+        assert_eq!(
+            kill_command("muxel_app_1"),
+            format!(
+                "{}; tmux -L mxl kill-session -t '=muxel_app_1'; \
+                 tmux kill-session -t '=muxel_app_1'",
+                tmux_path_prelude()
+            )
+        );
+        let cmd = kill_and_confirm_command("muxel_app_1");
+        for check in [
+            "tmux -L mxl kill-session -t '=muxel_app_1' >/dev/null 2>&1",
+            "tmux kill-session -t '=muxel_app_1' >/dev/null 2>&1",
+            "tmux -L mxl has-session -t '=muxel_app_1' >/dev/null 2>&1 && exit 91",
+            "; tmux has-session -t '=muxel_app_1' >/dev/null 2>&1 && exit 91",
+        ] {
+            assert!(cmd.contains(check), "missing {check:?}: {cmd}");
+        }
     }
 
     /// The bug this guards: sshd runs the remote command with its bare default PATH
@@ -1365,8 +1625,9 @@ mod tests {
             tmux_client_tag: None,
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
+        // The last ` -- `: the first is the `set -- -L mxl` choosing the server.
         let (_, after) = cmd
-            .split_once(" -- ")
+            .rsplit_once(" -- ")
             .expect("a command follows the separator");
         assert!(
             after.starts_with("\"${SHELL:-/bin/sh}\" -ilc "),
@@ -1416,12 +1677,16 @@ mod tests {
             tmux_client_tag: None,
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
-        let (server, pane) = cmd.split_once("; exec ").expect("server starts first");
+        // Only that one process may start a server. The `has-session` probes after
+        // it name the session but start nothing; they only ask.
+        let server = "; tmux -L mxl start-server ';' set -s exit-empty off; ";
+        let (before, pane) = cmd.split_once(server).expect("server starts first");
         assert!(
-            !server.contains("sro_client"),
-            "the server's command line must not name the project: {server}"
+            !before.contains("sro_client"),
+            "the server's command line must not name the project: {before}"
         );
-        assert!(server.ends_with("tmux start-server ';' set -s exit-empty off"));
+        // …nor muxel: a `pkill -f muxel` on the host must not match it either.
+        assert!(!format!("{before}{server}").contains("muxel"), "{cmd}");
         assert!(pane.contains("muxel_sro_client_abc123"));
     }
 
@@ -1452,21 +1717,25 @@ mod tests {
         let tagged = ssh_args(&spec(Some("ab12"))).last().unwrap().clone();
         let program = "\"${SHELL:-/bin/sh}\" -ilc 'exec claude'";
 
-        // The server still starts first, from a command line naming no session.
-        let (server, rest) = tagged.split_once("; if ").expect("the flag probe follows");
-        assert!(plain.starts_with(&format!("{server}; exec tmux ")));
+        // The server still starts first, from a command line naming no session, and
+        // the session's server is chosen before anything asks it a question.
+        let select = select_tmux_socket("s");
+        let (server, rest) = tagged
+            .split_once(&format!("; {select}; if "))
+            .expect("the flag probe follows");
+        assert!(plain.starts_with(&format!("{server}; {select}; exec tmux \"$@\" ")));
         // tmux 3.2+ and someone already attached: attach flagged, then record this
         // client's name on the session.
         assert_eq!(
             rest,
             format!(
-                "tmux list-commands new-session 2>/dev/null | grep -q 'f flags' \
-                 && tmux list-clients -t '=s' 2>/dev/null | grep -q .; then \
-                 exec tmux -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
+                "tmux \"$@\" list-commands new-session 2>/dev/null | grep -q 'f flags' \
+                 && tmux \"$@\" list-clients -t '=s' 2>/dev/null | grep -q .; then \
+                 exec tmux \"$@\" -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s s -c /srv/app \
                  -f ignore-size -- {program} ';' set-option -Fq -t '=s:' \
                  @muxel_client_ab12 '#{{client_name}}'; fi; \
-                 exec tmux -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
+                 exec tmux \"$@\" -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s s -c /srv/app -- {program}"
             )
         );
@@ -1481,17 +1750,23 @@ mod tests {
         let cmd = claim_window_size_command("muxel_app_1", "ab12");
         let (prelude, rest) = cmd.split_once("; ").unwrap();
         assert_eq!(prelude, tmux_path_prelude());
+        // On whichever server holds the session.
+        let rest = rest
+            .strip_prefix(&format!("{}; ", select_tmux_socket("muxel_app_1")))
+            .expect("the session's server is chosen first");
         // Its own recorded client, and only while that client is still attached to
         // this session — a tty name outlives the client that held it.
         assert!(rest.starts_with(
-            "c=$(tmux show-options -qv -t '=muxel_app_1:' @muxel_client_ab12) && [ -n \"$c\" ]"
+            "c=$(tmux \"$@\" show-options -qv -t '=muxel_app_1:' @muxel_client_ab12) \
+             && [ -n \"$c\" ]"
         ));
         assert!(rest.contains(
-            "tmux list-clients -t '=muxel_app_1' -F '#{client_name}' | grep -qxF -- \"$c\""
+            "tmux \"$@\" list-clients -t '=muxel_app_1' -F '#{client_name}' \
+             | grep -qxF -- \"$c\""
         ));
         // Clearing a flag recalculates nothing; re-setting an option does.
         assert!(rest.ends_with(
-            "tmux refresh-client -t \"$c\" -f '!ignore-size' ';' \
+            "tmux \"$@\" refresh-client -t \"$c\" -f '!ignore-size' ';' \
              set-option -q -t '=muxel_app_1:' @muxel_client_ab12 \"$c\""
         ));
     }

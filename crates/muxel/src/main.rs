@@ -190,9 +190,39 @@ fn raise_open_file_limit() {
     }
 }
 
+/// What `muxel --version` (`-V`) and `muxel --help` (`-h`) print; `None` for any
+/// other command line.
+fn cli_info(first_arg: Option<&str>) -> Option<String> {
+    let version = env!("CARGO_PKG_VERSION");
+    match first_arg? {
+        "--version" | "-V" => Some(format!("muxel {version}")),
+        "--help" | "-h" => Some(format!(
+            "muxel {version} — a multi-agent terminal multiplexer\n\
+             \n\
+             usage: muxel                  open the muxel window\n       \
+             muxel ctl <command>    control the running muxel (`muxel ctl help`)\n       \
+             muxel --version        print the version and exit\n       \
+             muxel --help           print this help and exit"
+        )),
+        _ => None,
+    }
+}
+
 fn main() {
-    // `muxel ctl …` talks to the running app and exits; it never opens a window.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Answered before anything else runs: asking muxel's binary for its version
+    // must not start a second instance, which would take over the running one's
+    // control.json (so `muxel ctl` talks to the wrong muxel) and save its own
+    // window.json over it.
+    if let Some(text) = cli_info(args.first().map(String::as_str)) {
+        #[cfg(windows)]
+        control::attach_parent_console();
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{text}").and_then(|()| out.flush());
+        return;
+    }
+    // `muxel ctl …` talks to the running app and exits; it never opens a window.
     if args.first().map(String::as_str) == Some("ctl") {
         #[cfg(windows)]
         control::attach_parent_console();
@@ -388,6 +418,35 @@ fn main() {
             })
             .detach();
         });
+}
+
+#[cfg(test)]
+mod cli_info_tests {
+    use super::cli_info;
+
+    #[test]
+    fn version_and_help_are_answered_without_the_app() {
+        let version = format!("muxel {}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(cli_info(Some("--version")), Some(version.clone()));
+        assert_eq!(cli_info(Some("-V")), Some(version.clone()));
+        for help in ["--help", "-h"] {
+            let text = cli_info(Some(help)).unwrap();
+            assert!(text.starts_with(&version), "{text}");
+            assert!(text.contains("muxel ctl <command>"), "{text}");
+        }
+    }
+
+    #[test]
+    fn every_other_command_line_is_left_to_the_app() {
+        for arg in [
+            None,
+            Some("ctl"),
+            Some("--browser"),
+            Some("--claude-session-hook"),
+        ] {
+            assert_eq!(cli_info(arg), None, "{arg:?}");
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

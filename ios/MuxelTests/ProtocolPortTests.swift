@@ -68,10 +68,39 @@ final class ProtocolPortTests: XCTestCase {
         // The `;` has to reach tmux as a literal argument (tmux's command separator);
         // if the remote shell ate it, `set -s exit-empty off` would run as a shell
         // command and the server would exit the moment it had no sessions.
+        // Started on muxel's own server (`-L mxl`), whose name is chosen so that the
+        // server's command line still names no project, no session, and not muxel.
         XCTAssertEqual(
             TmuxCommands.commandLine(TmuxCommands.startServer()),
-            "\(TmuxCommands.pathPrelude); 'tmux' 'start-server' ';' 'set' '-s' 'exit-empty' 'off'")
+            "\(TmuxCommands.pathPrelude); 'tmux' '-L' 'mxl' 'start-server' ';' 'set' '-s' 'exit-empty' 'off'")
         XCTAssertFalse(TmuxCommands.commandLine(TmuxCommands.startServer()).contains("muxel"))
+    }
+
+    // Port of `SOCKET_NAME` / `ssh::select_tmux_socket` (tmux.rs, ssh.rs). Desktop and
+    // the phone must agree on the server: a session one creates on muxel's own socket
+    // is invisible to a client still asking the default one.
+    func testSessionsLiveOnMuxelsOwnServer() {
+        XCTAssertEqual(TmuxCommands.socketName, "mxl")
+        // Byte-for-byte the desktop's fragment: the default server only for a session
+        // running there and not on muxel's own (a pane from before), else muxel's own.
+        XCTAssertEqual(
+            TmuxCommands.selectSocket("muxel_app_1"),
+            "if ! tmux -L mxl has-session -t '=muxel_app_1' 2>/dev/null "
+                + "&& tmux has-session -t '=muxel_app_1' 2>/dev/null; "
+                + "then set --; else set -- -L mxl; fi")
+        let select = TmuxCommands.selectSocket("s")
+        XCTAssertEqual(
+            TmuxCommands.commandLine(TmuxCommands.setMouseOn(session: "s"), session: "s"),
+            "\(TmuxCommands.pathPrelude); \(select); tmux \"$@\" 'set-option' '-t' '=s:' 'mouse' 'on'")
+        XCTAssertEqual(
+            TmuxCommands.attachPTYCommand(session: "s"),
+            "\(TmuxCommands.pathPrelude); \(select); clear; exec tmux \"$@\" attach-session -t '=s'")
+        // Listings and kills reach both servers, muxel's own first, and fail only for a
+        // host with no tmux (a server that isn't running lists nothing).
+        XCTAssertEqual(
+            TmuxCommands.commandLineOnBothServers(TmuxCommands.killSession("s")),
+            "\(TmuxCommands.pathPrelude); { 'tmux' '-L' 'mxl' 'kill-session' '-t' '=s'; "
+                + "'tmux' 'kill-session' '-t' '=s'; } 2>/dev/null; command -v tmux >/dev/null")
     }
 
     // sshd runs an exec channel's command with its bare default PATH and no profile, so a
@@ -104,7 +133,8 @@ final class ProtocolPortTests: XCTestCase {
         let cmd = TmuxCommands.launchAgent(
             session: "muxel_h_abcdef12", cwd: "/work", program: "claude", args: ["--model", "opus"])
         XCTAssertTrue(cmd.hasPrefix(
-            "\(TmuxCommands.pathPrelude); tmux set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("muxel_h_abcdef12")); "
+            + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
             + "new-session -d -s 'muxel_h_abcdef12' -c '/work' "
             + "-- \"${SHELL:-/bin/sh}\" -ilc "))
         XCTAssertTrue(cmd.contains("exec"))
@@ -113,7 +143,8 @@ final class ProtocolPortTests: XCTestCase {
         // No program → tmux's own default login shell, no wrapping.
         XCTAssertEqual(
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); tmux set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); "
+                + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -d -s 's' -c '/w'")
     }
 
@@ -125,10 +156,11 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(TmuxCommands.instanceIdEnv, "MUXEL_INSTANCE_ID")
         XCTAssertEqual(
             TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); clear; exec tmux set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); clear; "
+                + "exec tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -A -s 's' -c '/w'")
         // Cleared in the same tmux command list, ahead of the session it would leak into.
-        let clearThenCreate = "tmux set-environment -g -u MUXEL_INSTANCE_ID ';' new-session "
+        let clearThenCreate = "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' new-session "
         for cmd in [
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: "claude", args: []),
             TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: "claude", args: []),
@@ -143,7 +175,7 @@ final class ProtocolPortTests: XCTestCase {
         let line = TmuxCommands.commandLine(TmuxCommands.capturePane(session: "muxel_h_abcdef12"))
         XCTAssertEqual(
             line,
-            "\(TmuxCommands.pathPrelude); 'tmux' 'capture-pane' '-p' '-t' '=muxel_h_abcdef12:'")
+            "\(TmuxCommands.pathPrelude); 'tmux' '-L' 'mxl' 'capture-pane' '-p' '-t' '=muxel_h_abcdef12:'")
     }
 
     // Pane/window-target commands must use `=session:` (active pane of the session).

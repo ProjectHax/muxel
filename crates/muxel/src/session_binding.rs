@@ -66,8 +66,9 @@ pub(crate) fn pane_env(
     }
 }
 
-/// The tmux arguments for a local pane kept in tmux session `session`, running
-/// `program` (with none, the user's shell).
+/// The tmux arguments for a local pane kept in tmux session `session` on the
+/// server `socket` (see `integrations::local_tmux_socket`), running `program`
+/// (with none, the user's shell).
 ///
 /// The program starts from the tmux server's environment, not this client's, so
 /// the pane's id is handed over with `new-session -e` where the local tmux takes
@@ -78,6 +79,7 @@ pub(crate) fn pane_env(
 /// there) has that pane's id, which a program started without `-e` would take as
 /// its own.
 pub(crate) fn tmux_pane_args(
+    socket: muxel_core::tmux::Socket,
     session: &str,
     program: Option<&str>,
     args: &[String],
@@ -89,14 +91,14 @@ pub(crate) fn tmux_pane_args(
     // No `-c`: the client is spawned with `cwd` already, which is what tmux uses
     // for a new session anyway. Passing it would put the project's path in this
     // client's argv for no gain.
-    muxel_core::tmux::launch_session_args_with_env(
+    socket.argv(muxel_core::tmux::launch_session_args_with_env(
         session,
         None,
         program,
         args,
         env,
         &[MUXEL_INSTANCE_ID_ENV],
-    )
+    ))
 }
 
 pub(crate) fn hook_instance_from_args(
@@ -354,6 +356,7 @@ pub(crate) fn clear_claude_binding(data_dir: &Path, instance_id: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxel_core::tmux::Socket;
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("muxel-claude-binding-{}", Uuid::new_v4()));
@@ -635,7 +638,7 @@ mod tests {
         let own = format!("{MUXEL_INSTANCE_ID_ENV}={id}");
         let clear = ["set-environment", "-g", "-u", MUXEL_INSTANCE_ID_ENV, ";"];
         // After `-u set -g mouse on ;`, before the session is created.
-        let args = tmux_pane_args("s", Some("claude"), &[], id, true);
+        let args = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true);
         assert_eq!(args[6..11], clear);
         assert_eq!(
             args[11..],
@@ -643,9 +646,22 @@ mod tests {
         );
         // Older tmux has no `-e`: the program starts without an id rather than
         // with whichever pane's the server had.
-        let args = tmux_pane_args("s", None, &[], id, false);
+        let args = tmux_pane_args(Socket::Default, "s", None, &[], id, false);
         assert_eq!(args[6..11], clear);
         assert_eq!(args[11..], ["new-session", "-A", "-s", "s"]);
+    }
+
+    /// muxel's own server is named ahead of everything else the client is told; a
+    /// pane from before it had one reattaches on the default server with exactly
+    /// the argv it always had.
+    #[test]
+    fn a_tmux_pane_names_the_server_its_session_is_on() {
+        let id = Uuid::new_v4();
+        let private = tmux_pane_args(Socket::Private, "s", Some("claude"), &[], id, true);
+        let default = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true);
+        assert_eq!(private[..2], ["-L", "mxl"]);
+        assert_eq!(private[2..], default[..]);
+        assert_eq!(default[0], "-u");
     }
 
     #[test]

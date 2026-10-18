@@ -22,6 +22,93 @@ pub fn session_name(project: &str, instance: Uuid) -> String {
 /// Every muxel session name starts with this.
 const SESSION_PREFIX: &str = "muxel_";
 
+/// The name of muxel's own tmux socket: `tmux -L mxl`.
+///
+/// On the default socket muxel's sessions shared one server with the user's own
+/// tmux and with every tool that runs a bare `tmux …`, and any of them could take
+/// that server down with every agent in it. RHEL 10's tmux 3.3a aborts in
+/// `capture-pane`, so an outside tool merely *reading* a muxel pane killed every
+/// session muxel had. Only a command that names this socket reaches muxel's server.
+///
+/// Not `muxel`: the server keeps the command line of the client that started it
+/// (see [`start_server_args`]), which names this socket, so a socket called `muxel`
+/// would let a `pkill -f muxel` — an agent clearing away a dev build of muxel
+/// itself — kill the server and every agent in it.
+///
+/// By hand: `tmux -L mxl ls`, `tmux -L mxl attach -t <session>`.
+///
+/// Ported to Swift as `TmuxCommands.socketName` — keep both in step.
+pub const SOCKET_NAME: &str = "mxl";
+
+/// Which tmux server a command talks to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Socket {
+    /// muxel's own server ([`SOCKET_NAME`]). Every session muxel creates goes here.
+    Private,
+    /// The default server: where muxel kept its sessions before it had its own, and
+    /// where the user's own tmux runs. muxel only uses a session here that is already
+    /// running and is nowhere else — a pane from an earlier muxel, or a session the
+    /// user imported.
+    Default,
+}
+
+impl Socket {
+    /// Both servers, muxel's own first: the order a session is looked for in.
+    pub const BOTH: [Socket; 2] = [Socket::Private, Socket::Default];
+
+    /// The client flags selecting this server. Like `-u`, they go before the first
+    /// command of a `tmux …` argv.
+    pub fn args(self) -> &'static [&'static str] {
+        match self {
+            Socket::Private => &["-L", SOCKET_NAME],
+            Socket::Default => &[],
+        }
+    }
+
+    /// The argv for `tmux …` running `args` on this server.
+    pub fn argv(self, args: Vec<String>) -> Vec<String> {
+        let mut v: Vec<String> = self.args().iter().map(|a| a.to_string()).collect();
+        v.extend(args);
+        v
+    }
+
+    /// The server holding `session`, given a way to ask a server whether it has it
+    /// ([`has_session_args`]): muxel's own, unless the session is running on the
+    /// default server and not on muxel's. A session on neither is about to be
+    /// created, so it goes on muxel's own too.
+    ///
+    /// This is the whole migration. A pane muxel started before it had a socket of
+    /// its own keeps its session where it is — a live session can't move between
+    /// servers, and recreating it would kill the agent inside — until that session
+    /// ends; the next one starts on muxel's server.
+    pub fn locate(mut has_session: impl FnMut(Socket) -> bool) -> Socket {
+        if !has_session(Socket::Private) && has_session(Socket::Default) {
+            Socket::Default
+        } else {
+            Socket::Private
+        }
+    }
+}
+
+/// Arguments for `tmux …` that succeed only while session `session` exists
+/// (exact-match `=` target, so `muxel_p_1` never matches `muxel_p_12`).
+pub fn has_session_args(session: &str) -> Vec<String> {
+    vec![
+        "has-session".to_string(),
+        "-t".to_string(),
+        format!("={session}"),
+    ]
+}
+
+/// Whether a failed tmux command's error says only that no server is running on
+/// its socket — which answers "what sessions are there?" with "none" rather than
+/// failing to answer. tmux says `no server running on …` when the socket is stale
+/// and `error connecting to …` when it was never made, as muxel's own is on a host
+/// that hasn't started it yet.
+pub fn no_server(stderr: &str) -> bool {
+    stderr.contains("no server running") || stderr.contains("error connecting to")
+}
+
 /// A tmux session living on a host, as reported by [`list_sessions_args`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteSession {
@@ -535,11 +622,82 @@ mod tests {
             restore_exit_empty_args(),
             vec!["set", "-s", "exit-empty", "on"]
         );
+        // The server's command line names its socket, and must not name muxel
+        // either: a `pkill -f muxel` would take every agent down with it.
+        let server = Socket::Private.argv(start_server_args()).join(" ");
+        assert_eq!(server, "-L mxl start-server ; set -s exit-empty off");
+        assert!(!server.contains("muxel"), "{server}");
     }
 
     #[test]
     fn kill_uses_exact_match_target() {
         assert_eq!(kill_session_args("s"), vec!["kill-session", "-t", "=s"]);
+        assert_eq!(has_session_args("s"), vec!["has-session", "-t", "=s"]);
+    }
+
+    /// Mirrored by `TmuxCommands.socketName` in the iOS port.
+    #[test]
+    fn muxels_own_server_is_named_and_the_default_one_is_bare_tmux() {
+        assert_eq!(Socket::Private.args(), ["-L", "mxl"]);
+        assert!(Socket::Default.args().is_empty());
+        assert_eq!(
+            Socket::Private.argv(kill_session_args("s")),
+            ["-L", "mxl", "kill-session", "-t", "=s"]
+        );
+        assert_eq!(
+            Socket::Default.argv(kill_session_args("s")),
+            ["kill-session", "-t", "=s"]
+        );
+        // The socket is a client flag, so it leads — ahead of `-u` and the first
+        // command alike.
+        let launch = Socket::Private.argv(launch_session_args("s", None, None, &[]));
+        assert_eq!(launch[..3], ["-L", "mxl", "-u"]);
+    }
+
+    /// The migration: a session still running on the default server from before
+    /// muxel had its own is used where it is; everything else is muxel's own.
+    #[test]
+    fn a_session_is_found_on_muxels_server_unless_it_runs_only_on_the_default_one() {
+        let on = |private: bool, default: bool| {
+            Socket::locate(|s| match s {
+                Socket::Private => private,
+                Socket::Default => default,
+            })
+        };
+        assert_eq!(on(true, false), Socket::Private);
+        assert_eq!(
+            on(false, true),
+            Socket::Default,
+            "a pane from before keeps running"
+        );
+        assert_eq!(
+            on(false, false),
+            Socket::Private,
+            "a new session is muxel's own"
+        );
+        assert_eq!(on(true, true), Socket::Private, "muxel's own wins a tie");
+    }
+
+    /// Asking the default server is a subprocess muxel only spends when its own
+    /// server doesn't have the session.
+    #[test]
+    fn the_default_server_is_asked_only_when_muxels_own_lacks_the_session() {
+        let mut asked = Vec::new();
+        Socket::locate(|s| {
+            asked.push(s);
+            true
+        });
+        assert_eq!(asked, [Socket::Private]);
+    }
+
+    #[test]
+    fn only_a_missing_server_counts_as_no_sessions() {
+        assert!(no_server("no server running on /tmp/tmux-1000/default\n"));
+        assert!(no_server(
+            "error connecting to /tmp/tmux-1000/mxl (No such file or directory)\n"
+        ));
+        assert!(!no_server("sh: tmux: command not found\n"));
+        assert!(!no_server(""));
     }
 
     /// The recorded name wins. muxel writes `muxel_<project>_<id>` onto an instance

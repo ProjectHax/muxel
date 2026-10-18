@@ -775,7 +775,7 @@ final class AppState: ObservableObject {
             // Resolve the *live* session by uuid8 suffix so we kill the real one (which
             // may carry desktop's host slug), not a phone-slug name that doesn't exist.
             if let session = await liveSessionName(instance.id, on: host) {
-                _ = try? await conn.tmux(TmuxCommands.killSession(session))
+                _ = try? await conn.tmuxOnBothServers(TmuxCommands.killSession(session))
             }
             terminals.disconnect(instance.id)
             layout = try await RemoteLayoutStore.removeInstance(conn, root: project.remoteRoot, instanceId: instance.id)
@@ -795,7 +795,7 @@ final class AppState: ObservableObject {
             try await conn.connect()
             for inst in others where inst.kind == .terminal {
                 if let session = await liveSessionName(inst.id, on: host) {
-                    _ = try? await conn.tmux(TmuxCommands.killSession(session))
+                    _ = try? await conn.tmuxOnBothServers(TmuxCommands.killSession(session))
                 }
                 terminals.disconnect(inst.id)
             }
@@ -952,10 +952,10 @@ final class AppState: ObservableObject {
             let delay = delayMs > 0 ? delayMs : 2000
             try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000 + 300_000_000)
             let conn = self.connection(for: host)
-            _ = try? await conn.tmux(TmuxCommands.sendLiteral(session: sessionName, text: text))
+            _ = try? await conn.tmux(TmuxCommands.sendLiteral(session: sessionName, text: text), session: sessionName)
             if submit {
                 try? await Task.sleep(nanoseconds: 400_000_000)
-                _ = try? await conn.tmux(TmuxCommands.sendKey(session: sessionName, key: "Enter"))
+                _ = try? await conn.tmux(TmuxCommands.sendKey(session: sessionName, key: "Enter"), session: sessionName)
             }
         }
     }
@@ -1065,7 +1065,7 @@ final class AppState: ObservableObject {
     /// (so it finds sessions created by any peer — desktop or phone). nil if none.
     private func liveSessionName(_ instanceId: String, on host: Host) async -> String? {
         let conn = connection(for: host)
-        let out = (try? await conn.run(TmuxCommands.commandLine(TmuxCommands.listSessions()))) ?? ""
+        let out = (try? await conn.tmuxOnBothServers(TmuxCommands.listSessions())) ?? ""
         return out.split(separator: "\n").map(String.init)
             .first { TmuxSession.session($0, matchesInstanceId: instanceId) }
     }

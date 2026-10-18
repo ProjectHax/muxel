@@ -1068,6 +1068,18 @@ feature is added or changed, update the matching entry here in the same change**
 - **Agents survive a stray `pkill`** — muxel starts the tmux server itself, from a
   command line naming no project, so an agent running `pkill -f <project>` (to clear
   its own dev server) can't match the *shared* server and kill every session with it.
+  Its socket is named `mxl` rather than `muxel` for the same reason: a `pkill -f
+  muxel` stops muxel's windows but leaves the agents running in tmux.
+- **A tmux server of its own** — muxel keeps its sessions on a private tmux socket
+  (`tmux -L mxl`), on this computer and on remote hosts alike, so nothing that runs
+  a bare `tmux` command can reach them: not your own tmux, and not another tool's
+  `tmux capture-pane`, which on builds that abort on it (RHEL 10's stock tmux) used to
+  take down the server and every agent in it. To look at a session by hand, use
+  `tmux -L mxl ls` and `tmux -L mxl attach -t muxel_…`. Upgrading stops nothing: a
+  pane whose session is still running on the default server from an earlier muxel
+  reattaches to it there (closing the pane still stops it), and its next session
+  starts on muxel's own. A tmux session of your own that you import stays on the
+  default server too. The iOS app follows the same rule.
   Such a `pkill` reaches only that pane's tmux client: the session and the agent keep
   running, and muxel **reattaches the pane automatically** — you see it blink, not die.
   Local and remote alike (SSH panes and the iOS companion do the same), since a host
@@ -1113,6 +1125,10 @@ feature is added or changed, update the matching entry here in the same change**
   question shows even when muxel is minimized to the tray.
 - **Desktop integration** — app icon and a `.desktop` launcher entry (also the
   notification icon).
+- **`muxel --version` and `--help`** — print the version (`-V`) or a short usage
+  and exit, without opening a window, so asking the binary for its version never
+  starts a second muxel that would take over the running one's `muxel ctl`
+  endpoint and window position.
 - **Linux: self-cleaning AppImage mounts** — a muxel instance run from an
   AppImage that crashes or is SIGKILLed can't unmount its squashfuse mount, and a
   dead leftover mount makes any filesystem scan (a desktop monitor's periodic

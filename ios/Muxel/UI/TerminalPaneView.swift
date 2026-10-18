@@ -224,8 +224,8 @@ struct TerminalPaneView: View {
             // it; a freshly-created session may not exist yet when this runs, but it
             // has no history to scroll anyway and picks it up on the next open.
             Task {
-                _ = try? await conn.tmux(TmuxCommands.setMouseOn(session: sessionName))
-                _ = try? await conn.tmux(TmuxCommands.setClipboardOn())
+                _ = try? await conn.tmux(TmuxCommands.setMouseOn(session: sessionName), session: sessionName)
+                _ = try? await conn.tmux(TmuxCommands.setClipboardOn(), session: sessionName)
             }
             return true
         } catch {
@@ -236,15 +236,13 @@ struct TerminalPaneView: View {
         }
     }
 
-    /// `tmux list-sessions` exits non-zero with "no server running" before any session
-    /// has been created — that's an empty list, not a connection error. Real SSH /
-    /// auth / transport errors still propagate so the pane can surface them.
+    /// Every session on both of the host's servers, muxel's own first (a pane from
+    /// before muxel had its own server is still on the default one). A server that
+    /// isn't running — any server, before its first session — lists nothing rather
+    /// than failing (`commandLineOnBothServers`). Real SSH / auth / transport errors,
+    /// and a host with no tmux, still propagate so the pane can surface them.
     private func listSessionNames(_ conn: SSHConnection) async throws -> [String] {
-        do {
-            let out = try await conn.run(TmuxCommands.commandLine(TmuxCommands.listSessions()))
-            return out.split(separator: "\n").map(String.init)
-        } catch SSHError.command(let msg) where msg.contains("no server running") {
-            return []
-        }
+        let out = try await conn.tmuxOnBothServers(TmuxCommands.listSessions())
+        return out.split(separator: "\n").map(String.init)
     }
 }

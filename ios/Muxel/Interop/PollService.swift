@@ -60,10 +60,12 @@ final class PollService {
         return classify(rows: rows, instances: instances, liveScreens: liveScreens)
     }
 
-    /// Fetch every pane's status signals on the host in one round trip. A host with
-    /// no running tmux server exits non-zero → empty (no sessions, all idle).
+    /// Fetch every pane's status signals on the host in one round trip, from both of
+    /// its tmux servers (muxel's own, and the default one a pane from before muxel had
+    /// its own still runs on). A server that isn't running lists nothing; a host with
+    /// no tmux at all → empty (no sessions, all idle).
     func fetchPaneRows(_ conn: SSHConnection) async -> [PaneRow] {
-        let raw = (try? await conn.run(TmuxCommands.commandLine(TmuxCommands.allPaneStatuses()))) ?? ""
+        let raw = (try? await conn.tmuxOnBothServers(TmuxCommands.allPaneStatuses())) ?? ""
         return Self.parseAllPanes(raw)
     }
 

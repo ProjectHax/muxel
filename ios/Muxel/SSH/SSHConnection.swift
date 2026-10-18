@@ -48,8 +48,20 @@ protocol SSHConnection: AnyObject {
 }
 
 extension SSHConnection {
-    /// Convenience: run a `tmux …` command line built from an argument array.
+    /// Convenience: run a `tmux …` command line built from an argument array, on
+    /// muxel's own tmux server.
     func tmux(_ args: [String]) async throws -> String {
         try await run(TmuxCommands.commandLine(args))
+    }
+
+    /// Run a `tmux …` command line on the server holding `session` (muxel's own, or
+    /// the default one for a session from before muxel had its own).
+    func tmux(_ args: [String], session: String) async throws -> String {
+        try await run(TmuxCommands.commandLine(args, session: session))
+    }
+
+    /// Run a `tmux …` command line on both servers, muxel's own first.
+    func tmuxOnBothServers(_ args: [String]) async throws -> String {
+        try await run(TmuxCommands.commandLineOnBothServers(args))
     }
 }

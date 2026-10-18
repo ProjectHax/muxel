@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use muxel_core::library::GitFailure;
 use muxel_core::library::resync::LocalChanges;
 use muxel_core::memory::{self, MemoryEntry};
+use muxel_core::tmux::Socket;
 use muxel_core::{
     MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth, memory_header, remote_ops, ssh,
 };
@@ -216,9 +217,12 @@ pub fn read_remote_file(loc: &RepoLoc, abs_path: &str) -> Option<String> {
 }
 
 /// Every tmux session on a remote host — the input to adopting the ones no instance
-/// owns (see `muxel_core::tmux::orphan_sessions`). `None` when the host can't be
-/// reached or tmux isn't there; an empty list means "reached it, no sessions", and
-/// the two must not be confused — a blip would otherwise read as "nothing running".
+/// owns (see `muxel_core::tmux::orphan_sessions`) — from muxel's own server and the
+/// default one alike: a pane from before muxel had its own server is still running
+/// on the default one, as is the user's own tmux, which Import offers. `None` when
+/// the host can't be reached or tmux isn't there; an empty list means "reached it,
+/// no sessions", and the two must not be confused — a blip would otherwise read as
+/// "nothing running".
 pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::RemoteSession>> {
     let RepoLoc::Remote(c) = loc else {
         return None;
@@ -229,44 +233,34 @@ pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::
         // `None` would read as "couldn't reach it" and strand the UI in a retry.
         return Some(Vec::new());
     }
-    let args = muxel_core::tmux::list_sessions_args();
     // `tmux` is not on sshd's bare default PATH when it came from Homebrew — see
     // `ssh::tmux_path_prelude`. Unresolved, this reads as "no sessions on the host"
     // and every running agent there stays stranded.
-    let cmd = std::iter::once("tmux".to_string())
-        .chain(args.iter().map(|a| ssh::sh_quote(a)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let cmd = format!("{}; {cmd}", ssh::tmux_path_prelude());
-    let out = remote_ssh_command(c, cmd).output().ok()?;
-    if !out.status.success() {
-        // "no server running" is a perfectly good answer: nothing is running there.
-        let err = String::from_utf8_lossy(&out.stderr);
-        return err.contains("no server running").then(Vec::new);
-    }
-    Some(muxel_core::tmux::parse_sessions(&String::from_utf8_lossy(
-        &out.stdout,
-    )))
+    let out = remote_ssh_command(c, ssh::list_sessions_command())
+        .output()
+        .ok()?;
+    ssh::parse_session_listings(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Every tmux session on this machine, as [`list_remote_tmux_sessions`] reports a
-/// host's. An empty list when no tmux server is running; `None` when tmux couldn't
-/// be run at all.
+/// host's: muxel's own server's, then the default one's. An empty list when no tmux
+/// server is running; `None` when tmux couldn't be run at all.
 pub fn list_local_tmux_sessions() -> Option<Vec<muxel_core::tmux::RemoteSession>> {
-    let out = command("tmux")
-        .args(muxel_core::tmux::list_sessions_args())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let mut panes = String::new();
+    for socket in Socket::BOTH {
+        let out = tmux_on(socket)
+            .args(muxel_core::tmux::list_sessions_args())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
         // No server (or no socket yet) is a perfectly good answer: nothing running.
-        let err = String::from_utf8_lossy(&out.stderr);
-        return (err.contains("no server running") || err.contains("error connecting to"))
-            .then(Vec::new);
+        if out.status.success() {
+            panes.push_str(&String::from_utf8_lossy(&out.stdout));
+        } else if !muxel_core::tmux::no_server(&String::from_utf8_lossy(&out.stderr)) {
+            return None;
+        }
     }
-    Some(muxel_core::tmux::parse_sessions(&String::from_utf8_lossy(
-        &out.stdout,
-    )))
+    Some(muxel_core::tmux::parse_sessions(&panes))
 }
 
 /// Write `content` to a remote file (overwriting), piping it over SSH stdin.
@@ -1303,8 +1297,11 @@ pub fn git_diff(dir: &Path) -> String {
 /// exits at once, so `start-server` alone would evaporate and the next
 /// `new-session` would re-fork the server with the project name back in its argv.
 /// [`restore_tmux_exit_empty`] puts it back when muxel quits.
+///
+/// The server is muxel's own (`muxel_core::tmux::SOCKET_NAME`), where every new
+/// session goes.
 pub fn ensure_tmux_server() {
-    let mut tmux = command("tmux");
+    let mut tmux = tmux_on(Socket::Private);
     default_utf8_locale(&mut tmux);
     let _ = tmux
         .args(muxel_core::tmux::start_server_args())
@@ -1353,8 +1350,11 @@ pub fn tmux_session_env_supported() -> bool {
 
 /// Undo [`ensure_tmux_server`]'s `exit-empty off` so the server goes away with
 /// its last session once muxel is gone. Best-effort, fire-and-forget.
+///
+/// Only muxel's own server: the default one is the user's, and muxel no longer
+/// starts it or sets anything on it.
 pub fn restore_tmux_exit_empty() {
-    let _ = command("tmux")
+    let _ = tmux_on(Socket::Private)
         .args(muxel_core::tmux::restore_exit_empty_args())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1362,16 +1362,40 @@ pub fn restore_tmux_exit_empty() {
         .spawn();
 }
 
-/// Whether a tmux session is still alive (exact-match target, so `muxel_p_1` never
-/// matches `muxel_p_12`). Fast and blocking; only called for a pane that just died.
-pub fn tmux_session_exists(session: &str) -> bool {
-    command("tmux")
-        .args(["has-session", "-t", &format!("={session}")])
+/// `tmux` on `socket` — muxel's own server, or the default one (see
+/// `muxel_core::tmux::Socket`).
+fn tmux_on(socket: Socket) -> Command {
+    let mut cmd = command("tmux");
+    cmd.args(socket.args());
+    cmd
+}
+
+/// Whether the local server on `socket` has session `session`.
+fn local_tmux_has_session(socket: Socket, session: &str) -> bool {
+    tmux_on(socket)
+        .args(muxel_core::tmux::has_session_args(session))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// The local server holding `session`: muxel's own, unless the session is a pane
+/// from before muxel had one, still running on the default server — which is then
+/// reattached where it is rather than replaced. See `Socket::locate`. Blocking:
+/// one or two `has-session` calls.
+pub fn local_tmux_socket(session: &str) -> Socket {
+    Socket::locate(|socket| local_tmux_has_session(socket, session))
+}
+
+/// Whether a tmux session is still alive, on either server (exact-match target,
+/// so `muxel_p_1` never matches `muxel_p_12`). Fast and blocking; only called for
+/// a pane that just died.
+pub fn tmux_session_exists(session: &str) -> bool {
+    Socket::BOTH
+        .into_iter()
+        .any(|socket| local_tmux_has_session(socket, session))
 }
 
 // --- import discovery ----------------------------------------------------------
@@ -1461,17 +1485,17 @@ pub fn claude_conversation_summary(path: &Path) -> Option<String> {
     muxel_core::import::conversation_summary(&String::from_utf8_lossy(&head))
 }
 
-/// Run `tmux <args>` where a project's sessions live: on this machine, or on its
-/// SSH host (reusing the host's ControlMaster). `None` for a Windows host, which
-/// has no tmux.
-fn tmux_at(loc: &RepoLoc, args: &[String]) -> Option<std::process::Output> {
-    tmux_command_at(loc, args)?.output().ok()
+/// Run `tmux <args>` on the server holding `session`, where its project's sessions
+/// live: on this machine, or on its SSH host (reusing the host's ControlMaster).
+/// `None` for a Windows host, which has no tmux.
+fn tmux_at(loc: &RepoLoc, session: &str, args: &[String]) -> Option<std::process::Output> {
+    tmux_command_at(loc, session, args)?.output().ok()
 }
 
-fn tmux_command_at(loc: &RepoLoc, args: &[String]) -> Option<Command> {
+fn tmux_command_at(loc: &RepoLoc, session: &str, args: &[String]) -> Option<Command> {
     let mut cmd = match loc {
         RepoLoc::Local(_) => {
-            let mut cmd = command("tmux");
+            let mut cmd = tmux_on(local_tmux_socket(session));
             cmd.args(args);
             cmd
         }
@@ -1479,11 +1503,7 @@ fn tmux_command_at(loc: &RepoLoc, args: &[String]) -> Option<Command> {
             if c.host.os.is_windows() {
                 return None;
             }
-            let cmd = std::iter::once("tmux".to_string())
-                .chain(args.iter().map(|a| ssh::sh_quote(a)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            remote_ssh_command(c, format!("{}; {cmd}", ssh::tmux_path_prelude()))
+            remote_ssh_command(c, ssh::session_tmux_command(session, args))
         }
     };
     cmd.stdin(Stdio::null());
@@ -1503,7 +1523,11 @@ pub fn run_muxel_ctl(exe: &str, args: &[&str]) -> std::io::Result<std::process::
 /// A tmux session's user option (`@name`), wherever the session lives. `None`
 /// when it is unset, the session is gone, or tmux couldn't be reached.
 pub fn tmux_option(loc: &RepoLoc, session: &str, option: &str) -> Option<String> {
-    let out = tmux_at(loc, &muxel_core::tmux::show_option_args(session, option))?;
+    let out = tmux_at(
+        loc,
+        session,
+        &muxel_core::tmux::show_option_args(session, option),
+    )?;
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !value.is_empty()).then_some(value)
 }
@@ -1511,7 +1535,7 @@ pub fn tmux_option(loc: &RepoLoc, session: &str, option: &str) -> Option<String>
 /// Set a tmux session's user option (`@name`), wherever the session lives.
 pub fn set_tmux_option(loc: &RepoLoc, session: &str, option: &str, value: &str) -> Result<()> {
     let args = muxel_core::tmux::set_option_args(session, option, value);
-    let Some(out) = tmux_at(loc, &args) else {
+    let Some(out) = tmux_at(loc, session, &args) else {
         bail!("tmux isn't reachable for session “{session}”");
     };
     if !out.status.success() {
@@ -1532,7 +1556,8 @@ pub fn unset_tmux_option_if(
 ) -> Result<()> {
     let args = muxel_core::tmux::unset_option_if_args(session, option, pattern)
         .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim cleanup safely"))?;
-    let cmd = tmux_command_at(loc, &args).ok_or_else(|| anyhow::anyhow!("tmux is unavailable"))?;
+    let cmd = tmux_command_at(loc, session, &args)
+        .ok_or_else(|| anyhow::anyhow!("tmux is unavailable"))?;
     run_claim_cleanup(cmd, Duration::from_secs(2))
 }
 
@@ -1554,11 +1579,14 @@ fn run_claim_cleanup(mut cmd: Command, timeout: Duration) -> Result<()> {
     }
 }
 
-/// Kill a tmux session. Best-effort.
+/// Kill a tmux session, on both servers: a pane from before muxel had its own
+/// server still has its session on the default one. Best-effort.
 pub fn kill_tmux_session(session: &str) {
-    let _ = command("tmux")
-        .args(muxel_core::tmux::kill_session_args(session))
-        .output();
+    for socket in Socket::BOTH {
+        let _ = tmux_on(socket)
+            .args(muxel_core::tmux::kill_session_args(session))
+            .output();
+    }
 }
 
 /// Kill a tmux session on a remote host over SSH, and **confirm it is gone**
@@ -1624,12 +1652,7 @@ pub fn kill_remote_tmux_detached(
     password: Option<&str>,
     session: &str,
 ) {
-    let target = format!("={session}"); // exact-match target, as in kill_session_args
-    let remote_cmd = format!(
-        "{}; tmux kill-session -t {}",
-        ssh::tmux_path_prelude(),
-        ssh::sh_quote(&target)
-    );
+    let remote_cmd = ssh::kill_command(session);
     let mut argv = ssh::connection_args(host, control_path);
     if password.is_none() {
         argv.push("-o".into());
@@ -1656,14 +1679,17 @@ pub fn kill_remote_tmux_detached(
         .spawn();
 }
 
-/// Fire-and-forget kill of a local tmux session (quit-time cleanup).
+/// Fire-and-forget kill of a local tmux session (quit-time cleanup), on both
+/// servers as in [`kill_tmux_session`].
 pub fn kill_local_tmux_detached(session: &str) {
-    let _ = command("tmux")
-        .args(muxel_core::tmux::kill_session_args(session))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    for socket in Socket::BOTH {
+        let _ = tmux_on(socket)
+            .args(muxel_core::tmux::kill_session_args(session))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
 }
 
 /// Open the OS file manager at (or selecting) `path`. Best-effort, cross-platform.

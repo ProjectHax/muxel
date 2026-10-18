@@ -1,7 +1,9 @@
 import Foundation
 
 /// tmux command builders. Each returns a tmux argument array; `commandLine(_:)`
-/// turns it into a shell-quoted `tmux …` string to run over an SSH exec channel.
+/// turns it into a shell-quoted `tmux …` string to run over an SSH exec channel —
+/// on muxel's own server, or on the server holding a session
+/// (`commandLine(_:session:)`), or on both (`commandLineOnBothServers`).
 ///
 /// Ports `new-session`/`kill-session` from `crates/muxel-core/src/tmux.rs`, plus
 /// the read-only status/capture commands the iOS poller needs (these have no
@@ -46,10 +48,56 @@ enum TmuxCommands {
         "export PATH=\"$PATH:\(pathDirs.joined(separator: ":"))\""
     }
 
-    /// `tmux <args…>` as a single shell-quoted command line, behind the PATH that makes
-    /// tmux resolvable (`pathPrelude`).
+    // MARK: Servers
+
+    /// The name of muxel's own tmux socket: `tmux -L mxl`. Port of `SOCKET_NAME` in
+    /// `crates/muxel-core/src/tmux.rs` — keep the two in step.
+    ///
+    /// On the default socket muxel's sessions shared one server with the user's own tmux
+    /// and with every tool that runs a bare `tmux …`, any of which could take that server
+    /// down with every agent in it: RHEL 10's tmux 3.3a aborts in `capture-pane`. Every
+    /// session this app creates goes on muxel's server. One still running on the default
+    /// server from before muxel had its own is used where it is (`selectSocket`).
+    ///
+    /// Not `muxel`: the server keeps the command line of the client that started it
+    /// (`startServer`), which names this socket, so a socket called `muxel` would let a
+    /// `pkill -f muxel` on the host kill the server and every agent in it.
+    static let socketName = "mxl"
+
+    /// The client flags selecting muxel's server. Like `-u`, they go before the command.
+    static var socketArgs: [String] { ["-L", socketName] }
+
+    /// A shell fragment pointing `"$@"` at the server holding `session` — muxel's own,
+    /// unless the session is running on the default server and not on muxel's — so the
+    /// tmux words after it can be `tmux "$@" …`. Port of `ssh::select_tmux_socket`; both
+    /// must produce the same text. Positional parameters, because zsh won't split a
+    /// variable holding `-L mxl` into two words, and a PTY command has to `exec` tmux
+    /// itself. Must follow `pathPrelude`.
+    static func selectSocket(_ session: String) -> String {
+        let target = Shell.quote("=\(session)")
+        return "if ! tmux -L \(socketName) has-session -t \(target) 2>/dev/null "
+            + "&& tmux has-session -t \(target) 2>/dev/null; "
+            + "then set --; else set -- -L \(socketName); fi"
+    }
+
+    /// `tmux <args…>` on muxel's own server, as a single shell-quoted command line,
+    /// behind the PATH that makes tmux resolvable (`pathPrelude`).
     static func commandLine(_ args: [String]) -> String {
-        "\(pathPrelude); " + Shell.command(["tmux"] + args)
+        "\(pathPrelude); " + Shell.command(["tmux"] + socketArgs + args)
+    }
+
+    /// `tmux <args…>` on the server holding `session` (`selectSocket`).
+    static func commandLine(_ args: [String], session: String) -> String {
+        "\(pathPrelude); \(selectSocket(session)); tmux \"$@\" " + Shell.command(args)
+    }
+
+    /// `tmux <args…>` on both servers, muxel's own first: listings, which must find a
+    /// pane from before muxel had its own server, and kills, which must reach it. A
+    /// server that isn't running contributes nothing; the line fails only when there is
+    /// no tmux to run at all.
+    static func commandLineOnBothServers(_ args: [String]) -> String {
+        "\(pathPrelude); { " + Shell.command(["tmux"] + socketArgs + args) + "; "
+            + Shell.command(["tmux"] + args) + "; } 2>/dev/null; command -v tmux >/dev/null"
     }
 
     // MARK: Lifecycle
@@ -59,8 +107,9 @@ enum TmuxCommands {
     /// — both must produce the same argv.
     ///
     /// tmux forks its server from whichever client first needs one, and the server keeps
-    /// that client's command line. One server hosts every session on the host — shared by
-    /// this app, muxel desktop's SSH panes, and the user's own tmux. So if the first
+    /// that client's command line. One server hosts every muxel session on the host —
+    /// shared by this app and muxel desktop's SSH panes (muxel's own server, run through
+    /// `commandLine`, which names `socketName`). So if the first
     /// client is `tmux new-session -A -s muxel_<project>_… -c <project root>`, the shared
     /// server's argv names a project, and an agent on that host running
     /// `pkill -f <project>` to clear its dev server SIGKILLs the server and every agent
@@ -145,8 +194,8 @@ enum TmuxCommands {
     /// server first (`clearInstanceId`).
     static func launchAgent(session: String, cwd: String, program: String?, args: [String]) -> String {
         var cmd =
-            "\(pathPrelude); tmux \(clearInstanceId) new-session -d -s \(Shell.quote(session)) "
-            + "-c \(Shell.quote(cwd))"
+            "\(pathPrelude); \(selectSocket(session)); tmux \"$@\" \(clearInstanceId) "
+            + "new-session -d -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"
@@ -164,21 +213,24 @@ enum TmuxCommands {
     /// exists (created by desktop or a prior launch). The PTY is opened at the phone's
     /// real grid size (see `TerminalSession`), so the attaching client is correctly
     /// sized from the start. `clear;` wipes the login banner + echoed command so they
-    /// don't bleed through under tmux's redraw.
+    /// don't bleed through under tmux's redraw. On the server holding the session
+    /// (`selectSocket`).
     static func attachPTYCommand(session: String) -> String {
-        "\(pathPrelude); clear; exec tmux attach-session -t \(Shell.quote("=\(session)"))"
+        "\(pathPrelude); \(selectSocket(session)); clear; "
+            + "exec tmux \"$@\" attach-session -t \(Shell.quote("=\(session)"))"
     }
 
     /// Raw PTY command: `exec tmux new-session -A` **attached** (no `-d`), running
     /// `program` in a login shell. Attached-at-init is the whole point: interactive
     /// TUI agents (claude) crash if they initialize with no client; over a live PTY
     /// they get one, exactly like desktop's `ssh -t`. `program == nil` → default shell.
-    /// Clears a stale pane id from the server first (`clearInstanceId`).
+    /// Clears a stale pane id from the server first (`clearInstanceId`). A new session
+    /// goes on muxel's own server; `-A` reattaches one wherever it runs (`selectSocket`).
     static func newAttachedPTYCommand(session: String, cwd: String, program: String?, args: [String]) -> String {
         // `clear;` wipes the login banner + echoed command before tmux takes over.
         var cmd =
-            "\(pathPrelude); clear; exec tmux \(clearInstanceId) new-session -A "
-            + "-s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
+            "\(pathPrelude); \(selectSocket(session)); clear; exec tmux \"$@\" \(clearInstanceId) "
+            + "new-session -A -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"

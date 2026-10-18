@@ -6198,7 +6198,12 @@ impl MuxelApp {
                     // server inherits this argv and a stray `pkill -f <project>` kills
                     // every agent in every session. See `ensure_tmux_server`.
                     integrations::ensure_tmux_server();
+                    // On muxel's own server, unless this pane's session is still
+                    // running on the default one from before muxel had its own:
+                    // that agent is reattached where it is, not replaced.
+                    let socket = integrations::local_tmux_socket(&session);
                     let args = crate::session_binding::tmux_pane_args(
+                        socket,
                         &session,
                         resolved.program.as_deref(),
                         &resolved.args,
