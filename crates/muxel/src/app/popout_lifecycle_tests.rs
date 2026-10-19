@@ -1,4 +1,4 @@
-use super::{Instance, MuxelApp, Project};
+use super::{Instance, MuxelApp, Project, Workspace, WorkspaceMeta};
 use crate::theme;
 use gpui::{AppContext, Entity, TestAppContext, WindowHandle};
 use muxel_terminal::{CommandSpec, TerminalLaunch, TerminalSession, TerminalView};
@@ -143,6 +143,175 @@ fn wait_for_exit(cx: &mut TestAppContext, child: &StopChild) {
         assert!(Instant::now() < deadline, "old PTY did not exit");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn secondary_fixture(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+) -> (Uuid, gpui::AnyWindowHandle) {
+    let project = window
+        .update(cx, |app, window, cx| {
+            let root = muxel_store::data_dir().unwrap().join("secondary-project");
+            std::fs::create_dir_all(&root).unwrap();
+            let project = app.workspace.add_project(Project::new("secondary", root));
+            let display = cx.displays().into_iter().next().expect("test display");
+            app.open_project_on_monitor(project, display.id(), display.uuid().unwrap(), window, cx);
+            project
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let handle = window
+        .read_with(cx, |app, _| {
+            assert!(app.workspace.project_windows.contains_key(&project));
+            app.secondary_windows
+                .iter()
+                .find(|secondary| secondary.pid == project)
+                .expect("production open installed secondary window")
+                .handle
+        })
+        .unwrap();
+    (project, handle)
+}
+
+#[test]
+fn actual_popout_lifecycle_workspace_switch_closes_windows_and_preserves_target_workspace() {
+    with_app(|cx, window| {
+        let (pane, _view, child) = popout_fixture(cx, window);
+        let (_, secondary) = secondary_fixture(cx, window);
+        let popup = window
+            .read_with(cx, |app, _| app.popouts[&pane].window)
+            .unwrap();
+        let next = Uuid::new_v4();
+        let next_project = window
+            .update(cx, |app, window, cx| {
+                let previous = Uuid::new_v4();
+                app.current_workspace = Some(previous);
+                app.workspaces.workspaces.extend([
+                    WorkspaceMeta {
+                        id: previous,
+                        name: "previous".into(),
+                    },
+                    WorkspaceMeta {
+                        id: next,
+                        name: "target".into(),
+                    },
+                ]);
+                let root = muxel_store::data_dir().unwrap().join("target-project");
+                std::fs::create_dir_all(&root).unwrap();
+                let mut target = Workspace::default();
+                let project = target.add_project(Project::new("target project", root));
+                muxel_store::save_workspace_to(
+                    &muxel_store::workspace_doc_path(next).unwrap(),
+                    &target,
+                )
+                .unwrap();
+                // The production observer must not borrow MuxelApp again while
+                // enter_workspace is still tearing down the old window owners.
+                app.enter_workspace(next, window, cx);
+                assert_eq!(app.current_workspace, Some(next));
+                project
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(popup.read_with(cx, |_, _| ()).is_err());
+        assert!(secondary.update(cx, |_, _, _| ()).is_err());
+        window
+            .read_with(cx, |app, _| {
+                assert_eq!(app.current_workspace, Some(next));
+                assert!(app.workspace.project(next_project).is_some());
+                assert!(app.workspace.instance(pane).is_none());
+                assert!(app.popouts.is_empty());
+                assert!(app.terminals.is_empty());
+                assert!(app.secondary_windows.is_empty());
+                assert!(app.workspace.project_windows.is_empty());
+            })
+            .unwrap();
+        wait_for_exit(cx, &child);
+    });
+}
+
+#[test]
+fn actual_popout_lifecycle_dev_console_close_does_not_reenter_the_borrowed_app() {
+    with_app(|cx, window| {
+        let console = window
+            .update(cx, |app, _, cx| {
+                app.open_dev_console(cx);
+                app.dev_console_window.expect("dev console opened")
+            })
+            .unwrap();
+        window
+            .update(cx, |app, _, cx| app.toggle_dev_console(cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(console.read_with(cx, |_, _| ()).is_err());
+        window
+            .read_with(cx, |app, _| assert!(app.dev_console_window.is_none()))
+            .unwrap();
+    });
+}
+
+#[test]
+fn actual_popout_lifecycle_bring_project_to_main_cleans_up_secondary_window() {
+    with_app(|cx, window| {
+        let (project, secondary) = secondary_fixture(cx, window);
+        window
+            .update(cx, |app, _, cx| app.bring_project_to_main(project, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(secondary.update(cx, |_, _, _| ()).is_err());
+        window
+            .read_with(cx, |app, _| {
+                assert!(app.secondary_windows.is_empty());
+                assert!(!app.workspace.project_windows.contains_key(&project));
+                assert_eq!(app.workspace.active_project, Some(project));
+                assert!(app.workspace.project(project).is_some());
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn actual_popout_lifecycle_old_console_close_keeps_replacement_window() {
+    with_app(|cx, window| {
+        let (closed, replacement) = window
+            .update(cx, |app, _, cx| {
+                app.open_dev_console(cx);
+                let closed = app.dev_console_window.unwrap();
+                app.toggle_dev_console(cx);
+                app.open_dev_console(cx);
+                (closed, app.dev_console_window.unwrap())
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(closed.read_with(cx, |_, _| ()).is_err());
+        assert!(replacement.read_with(cx, |_, _| ()).is_ok());
+        window
+            .read_with(cx, |app, _| {
+                assert_eq!(app.dev_console_window, Some(replacement));
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn actual_popout_lifecycle_window_close_still_kills_owned_terminal() {
+    with_app(|cx, window| {
+        let (pane, _view, child) = popout_fixture(cx, window);
+        let popup = window
+            .read_with(cx, |app, _| app.popouts[&pane].window)
+            .unwrap();
+        popup
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .read_with(cx, |app, _| {
+                assert!(!app.popouts.contains_key(&pane));
+                assert!(app.workspace.instance(pane).is_none());
+            })
+            .unwrap();
+        wait_for_exit(cx, &child);
+    });
 }
 
 #[test]

@@ -90,6 +90,8 @@ feature is added or changed, update the matching entry here in the same change**
   that pane's stale finished or needs-input card.
 - **Close terminates** — closing a pop-out window kills its terminal (with a
   confirmation). Editors and browser panes just close.
+- **Workspace changes** — switching workspaces closes the previous workspace's
+  pop-out and per-monitor project windows without interrupting the switch.
 
 ## Agents
 

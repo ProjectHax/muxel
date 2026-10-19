@@ -5662,23 +5662,27 @@ impl MuxelApp {
         })
         .detach();
 
-        // Terminate a popped-out terminal when the user closes its window.
+        // Window removal can happen inside a MuxelApp update (workspace switch,
+        // bring-to-main, dev console). GPUI notifies close observers inline, so
+        // return the app lease before handling the closed window's ownership.
         let weak = cx.weak_entity();
         cx.on_window_closed(move |cx, window_id| {
             ui_profile::unregister_profile_window(window_id.as_u64());
-            if let Some(app) = weak.upgrade() {
-                app.update(cx, |this, cx| {
-                    this.handle_secondary_closed(window_id, cx);
-                    this.close_popout(window_id, cx);
-                    // Forget the dev-console handle if its window was just closed.
-                    if this
-                        .dev_console_window
-                        .is_some_and(|h| gpui::AnyWindowHandle::from(h).window_id() == window_id)
-                    {
-                        this.dev_console_window = None;
-                    }
-                });
-            }
+            let weak = weak.clone();
+            cx.defer(move |cx| {
+                if let Some(app) = weak.upgrade() {
+                    app.update(cx, |this, cx| {
+                        this.handle_secondary_closed(window_id, cx);
+                        this.close_popout(window_id, cx);
+                        // The generational ID cannot match a replacement window.
+                        if this.dev_console_window.is_some_and(|h| {
+                            gpui::AnyWindowHandle::from(h).window_id() == window_id
+                        }) {
+                            this.dev_console_window = None;
+                        }
+                    });
+                }
+            });
         })
         .detach();
 
@@ -16747,8 +16751,8 @@ impl MuxelApp {
             return;
         };
         self.redock_popout(iid, cx);
-        // Window-closed observers update this entity synchronously. Closing
-        // after it has been returned to GPUI avoids a nested mutable borrow.
+        // Return the app lease before closing the window so synchronous close
+        // observers can inspect its ownership without a nested mutable borrow.
         cx.defer(move |cx| {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
         });
