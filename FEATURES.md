@@ -915,6 +915,11 @@ feature is added or changed, update the matching entry here in the same change**
   close is still remembered for the rest of the run, so a connect that listed the
   host's sessions a moment before the kill landed can't bring the pane back either.
   Unconfirmed closes are listed in the developer log.
+  Discovery and import retain the session's socket as well as its name. Attach,
+  restart, close and quit use that owner, leaving a same-named session on another
+  socket alone. Older panes resolve their owner before teardown. Claim cleanup
+  includes any socket discovery in its two-second deadline and reaps timed-out
+  commands before returning.
 - **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
   speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
   layout sync, the memory file, project scan, remote git, and the connection test

@@ -704,6 +704,7 @@ final class AppState: ObservableObject {
         // (desktop muxel) adopts this instance into tmux under the same name rather
         // than spawning a second session for it.
         instance.tmuxSession = TmuxSession.name(hostName: host.name, instanceId: instanceId)
+        instance.tmuxSocket = TmuxCommands.socketName
 
         // Create the git worktree first (the pane's cwd depends on it). On failure,
         // fall back to the project root with a notice — desktop's `setup_worktree`
@@ -774,8 +775,9 @@ final class AppState: ObservableObject {
             try await conn.connect()
             // Resolve the *live* session by uuid8 suffix so we kill the real one (which
             // may carry desktop's host slug), not a phone-slug name that doesn't exist.
-            if let session = await liveSessionName(instance.id, on: host) {
-                _ = try? await conn.tmuxOnBothServers(TmuxCommands.killSession(session))
+            if let target = await liveSessionTarget(instance, on: host) {
+                _ = try? await conn.tmux(TmuxCommands.killSession(target.name),
+                                        session: target.name, socket: target.socket)
             }
             terminals.disconnect(instance.id)
             layout = try await RemoteLayoutStore.removeInstance(conn, root: project.remoteRoot, instanceId: instance.id)
@@ -794,8 +796,9 @@ final class AppState: ObservableObject {
             let conn = connection(for: host)
             try await conn.connect()
             for inst in others where inst.kind == .terminal {
-                if let session = await liveSessionName(inst.id, on: host) {
-                    _ = try? await conn.tmuxOnBothServers(TmuxCommands.killSession(session))
+                if let target = await liveSessionTarget(inst, on: host) {
+                    _ = try? await conn.tmux(TmuxCommands.killSession(target.name),
+                                            session: target.name, socket: target.socket)
                 }
                 terminals.disconnect(inst.id)
             }
@@ -836,6 +839,7 @@ final class AppState: ObservableObject {
         var copy = instance
         copy.id = newId
         copy.tmuxSession = TmuxSession.name(hostName: host.name, instanceId: newId)
+        copy.tmuxSocket = TmuxCommands.socketName
         // Desktop "Inherit" semantics: the duplicate shares the source's worktree
         // (a worktree can back several panes) but gets a fresh, not-yet-started
         // session so it doesn't collide on `--resume`.
@@ -938,7 +942,7 @@ final class AppState: ObservableObject {
     /// type its system prompt into the pane (and optionally submit). Mirrors desktop's
     /// timing (`view.rs`): wait for first output, then the preset's startup delay, then
     /// type via `tmux send-keys`. Owned here (not the view) so it survives navigation.
-    func scheduleStartupInjection(instanceId: String, sessionName: String, host: Host,
+    func scheduleStartupInjection(instanceId: String, sessionName: String, socket: String, host: Host,
                                   text: String, delayMs: Int, submit: Bool) {
         guard !text.isEmpty else { return }
         Task { [weak self] in
@@ -952,10 +956,10 @@ final class AppState: ObservableObject {
             let delay = delayMs > 0 ? delayMs : 2000
             try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000 + 300_000_000)
             let conn = self.connection(for: host)
-            _ = try? await conn.tmux(TmuxCommands.sendLiteral(session: sessionName, text: text), session: sessionName)
+            _ = try? await conn.tmux(TmuxCommands.sendLiteral(session: sessionName, text: text), session: sessionName, socket: socket)
             if submit {
                 try? await Task.sleep(nanoseconds: 400_000_000)
-                _ = try? await conn.tmux(TmuxCommands.sendKey(session: sessionName, key: "Enter"), session: sessionName)
+                _ = try? await conn.tmux(TmuxCommands.sendKey(session: sessionName, key: "Enter"), session: sessionName, socket: socket)
             }
         }
     }
@@ -1061,12 +1065,31 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// The live tmux session name for `instanceId` on `host`, matched by uuid8 suffix
-    /// (so it finds sessions created by any peer — desktop or phone). nil if none.
-    private func liveSessionName(_ instanceId: String, on host: Host) async -> String? {
+    /// Persist the resolved owner before attachment so subsequent close/restart
+    /// operations use that same server even if another gains the same name.
+    func bindTmuxTarget(_ target: TmuxCommands.SessionTarget, instance: Instance,
+                        in project: RemoteProject) async throws {
+        guard let host = host(for: project) else { return }
+        if instance.tmuxSession == target.name, instance.tmuxSocket == target.socket { return }
         let conn = connection(for: host)
-        let out = (try? await conn.tmuxOnBothServers(TmuxCommands.listSessions())) ?? ""
-        return out.split(separator: "\n").map(String.init)
-            .first { TmuxSession.session($0, matchesInstanceId: instanceId) }
+        if let written = try await RemoteLayoutStore.mutate(
+            conn, root: project.remoteRoot, seedIfMissing: false, transform: { layout in
+                guard let idx = layout.instances.firstIndex(where: { $0.id == instance.id }) else { return false }
+                layout.instances[idx].tmuxSession = target.name
+                layout.instances[idx].tmuxSocket = target.socket
+                return true
+            }) {
+            layout = written
+        }
+    }
+
+    private func liveSessionTarget(_ instance: Instance, on host: Host) async -> TmuxCommands.SessionTarget? {
+        let current = layout?.instances.first { $0.id == instance.id } ?? instance
+        if let socket = current.tmuxSocket, let name = current.tmuxSession {
+            return TmuxCommands.SessionTarget(name: name, socket: socket)
+        }
+        let conn = connection(for: host)
+        let out = (try? await conn.run(TmuxCommands.listTargetsCommand(socket: current.tmuxSocket))) ?? ""
+        return TmuxCommands.resolveTarget(current, in: TmuxCommands.parseTargets(out))
     }
 }

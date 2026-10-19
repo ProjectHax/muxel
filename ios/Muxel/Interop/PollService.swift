@@ -15,6 +15,7 @@ struct PaneRow: Equatable {
     let exited: Bool
     let bell: Bool
     let idle: TimeInterval
+    var socket: String? = nil
 }
 
 /// A snapshot of an attached pane's live screen, so `classify` can scan it for the
@@ -65,7 +66,11 @@ final class PollService {
     /// its own still runs on). A server that isn't running lists nothing; a host with
     /// no tmux at all → empty (no sessions, all idle).
     func fetchPaneRows(_ conn: SSHConnection) async -> [PaneRow] {
-        let raw = (try? await conn.tmuxOnBothServers(TmuxCommands.allPaneStatuses())) ?? ""
+        let commands = [TmuxCommands.socketName, "default"].map { socket in
+            TmuxCommands.commandLine(TmuxCommands.allPaneStatuses(socket: socket), session: "", socket: socket)
+                + " 2>/dev/null"
+        }
+        let raw = (try? await conn.run(commands.joined(separator: "; "))) ?? ""
         return Self.parseAllPanes(raw)
     }
 
@@ -83,7 +88,8 @@ final class PollService {
         var out: [InstanceStatus] = []
         for inst in instances where inst.kind == .terminal {
             guard let row = rows.first(where: {
-                TmuxSession.session($0.session, matchesInstanceId: inst.id)
+                (inst.tmuxSocket == nil || inst.tmuxSocket == $0.socket)
+                    && ($0.session == inst.tmuxSession || TmuxSession.session($0.session, matchesInstanceId: inst.id))
             }) else {
                 out.append(InstanceStatus(instanceId: inst.id, status: .idle, running: false))
                 continue
@@ -142,7 +148,7 @@ final class PollService {
     /// Parse a batched `list-panes -a` sweep: one line per pane, each
     /// `session_name<TAB>pane_dead<TAB>window_bell_flag<TAB>window_activity`. muxel
     /// sessions are single-pane, but if a session ever reports multiple panes the
-    /// first row wins (dedupe by session name). Blank/short lines are skipped.
+    /// first row wins per socket and session. Blank/short lines are skipped.
     static func parseAllPanes(_ s: String) -> [PaneRow] {
         var rows: [PaneRow] = []
         var seen = Set<String>()
@@ -151,14 +157,15 @@ final class PollService {
             let parts = line.split(separator: "\t", omittingEmptySubsequences: false)
             guard let first = parts.first else { continue }
             let session = String(first)
-            guard !session.isEmpty, seen.insert(session).inserted else { continue }
+            let socket = parts.count > 4 ? String(parts[4]) : nil
+            guard !session.isEmpty, seen.insert("\(socket ?? "")\t\(session)").inserted else { continue }
             let dead = parts.count > 1 && parts[1] == "1"
             let bell = parts.count > 2 && parts[2] == "1"
             var idle: TimeInterval = 0
             if parts.count > 3, let activity = TimeInterval(parts[3]) {
                 idle = max(0, now - activity)
             }
-            rows.append(PaneRow(session: session, exited: dead, bell: bell, idle: idle))
+            rows.append(PaneRow(session: session, exited: dead, bell: bell, idle: idle, socket: socket))
         }
         return rows
     }

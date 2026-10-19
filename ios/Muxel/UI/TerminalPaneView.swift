@@ -154,19 +154,22 @@ struct TerminalPaneView: View {
         do {
             let conn = state.connection(for: host)
             try await conn.connect()
-            let names = try await listSessionNames(conn)
+            let targets = TmuxCommands.parseTargets(try await conn.run(
+                TmuxCommands.listTargetsCommand(socket: instance.tmuxSocket)))
             let command: String
             let sessionName: String
+            let socket: String
             var creating = false
             var startupInput: String?
             var startupDelayMs = 0
             var startupSubmit = false
             var resumeSessionId: String?
-            if let live = names.first(where: { TmuxSession.session($0, matchesInstanceId: instance.id) }) {
+            if let live = TmuxCommands.resolveTarget(instance, in: targets) {
                 // A live session for this instance already exists (created by desktop or
                 // a prior attach) — attach to its real name, whatever slug it carries.
-                sessionName = live
-                command = TmuxCommands.attachPTYCommand(session: live)
+                sessionName = live.name
+                socket = live.socket
+                command = TmuxCommands.attachPTYCommand(session: live.name, socket: socket)
             } else {
                 // Creating it: prefer the authoritative name recorded in the shared
                 // layout (`tmux_session`) so we converge with the name desktop uses for
@@ -177,7 +180,10 @@ struct TerminalPaneView: View {
                 // its own argv to the long-lived server — and a `pkill -f <project>` on
                 // that host then kills every session on it. Idempotent and cheap; a
                 // failure here is not fatal (tmux may already be running).
-                _ = try? await conn.tmux(TmuxCommands.startServer())
+                socket = instance.tmuxSocket ?? TmuxCommands.socketName
+                if socket != "default" {
+                    _ = try? await conn.tmux(TmuxCommands.startServer(), session: "", socket: socket)
+                }
                 let name = (instance.tmuxSession?.isEmpty == false)
                     ? instance.tmuxSession!
                     : TmuxSession.name(hostName: host.name, instanceId: instance.id)
@@ -195,12 +201,13 @@ struct TerminalPaneView: View {
                 let resumeArgs = preset.flatMap { AgentLaunch.sessionResumeArgs(preset: $0, instance: inst) } ?? []
                 command = TmuxCommands.newAttachedPTYCommand(
                     session: name, cwd: inst.worktreePath ?? project.remoteRoot,
-                    program: resolved.program, args: resumeArgs + resolved.args)
+                    program: resolved.program, args: resumeArgs + resolved.args, socket: socket)
                 startupInput = resolved.startupInput
                 startupDelayMs = preset?.startupDelayMs ?? 0
                 startupSubmit = resolved.submit
                 if resumeCapable { resumeSessionId = inst.sessionId }
             }
+            try await state.bindTmuxTarget(.init(name: sessionName, socket: socket), instance: instance, in: project)
             let s = state.terminals.session(
                 for: instance.id, hostId: host.id, connection: conn, command: command)
             s.onFocusRequested = onFocus
@@ -213,7 +220,7 @@ struct TerminalPaneView: View {
                 }
                 // TypeIn agents: type the system prompt once the agent is ready.
                 if let input = startupInput {
-                    state.scheduleStartupInjection(instanceId: instance.id, sessionName: sessionName,
+                    state.scheduleStartupInjection(instanceId: instance.id, sessionName: sessionName, socket: socket,
                                                    host: host, text: input,
                                                    delayMs: startupDelayMs, submit: startupSubmit)
                 }
@@ -224,8 +231,8 @@ struct TerminalPaneView: View {
             // it; a freshly-created session may not exist yet when this runs, but it
             // has no history to scroll anyway and picks it up on the next open.
             Task {
-                _ = try? await conn.tmux(TmuxCommands.setMouseOn(session: sessionName), session: sessionName)
-                _ = try? await conn.tmux(TmuxCommands.setClipboardOn(), session: sessionName)
+                _ = try? await conn.tmux(TmuxCommands.setMouseOn(session: sessionName), session: sessionName, socket: socket)
+                _ = try? await conn.tmux(TmuxCommands.setClipboardOn(), session: sessionName, socket: socket)
             }
             return true
         } catch {
@@ -236,13 +243,4 @@ struct TerminalPaneView: View {
         }
     }
 
-    /// Every session on both of the host's servers, muxel's own first (a pane from
-    /// before muxel had its own server is still on the default one). A server that
-    /// isn't running — any server, before its first session — lists nothing rather
-    /// than failing (`commandLineOnBothServers`). Real SSH / auth / transport errors,
-    /// and a host with no tmux, still propagate so the pane can surface them.
-    private func listSessionNames(_ conn: SSHConnection) async throws -> [String] {
-        let out = try await conn.tmuxOnBothServers(TmuxCommands.listSessions())
-        return out.split(separator: "\n").map(String.init)
-    }
 }

@@ -77,6 +77,7 @@ struct Instance: Codable, Equatable, Identifiable {
     var useTmux: Bool = false
     var useWorktree: Bool = false
     var tmuxSession: String?
+    var tmuxSocket: String?
     var worktreePath: String?
     var worktreeBranch: String?
     var autoModePresses: Int = 0
@@ -107,6 +108,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case useTmux = "use_tmux"
         case useWorktree = "use_worktree"
         case tmuxSession = "tmux_session"
+        case tmuxSocket = "tmux_socket"
         case worktreePath = "worktree_path"
         case worktreeBranch = "worktree_branch"
         case autoModePresses = "auto_mode_presses"
@@ -150,6 +152,7 @@ struct Instance: Codable, Equatable, Identifiable {
         useTmux = (try c.decodeIfPresent(Bool.self, forKey: .useTmux)) ?? false
         useWorktree = (try c.decodeIfPresent(Bool.self, forKey: .useWorktree)) ?? false
         tmuxSession = try c.decodeIfPresent(String.self, forKey: .tmuxSession)
+        tmuxSocket = try c.decodeIfPresent(String.self, forKey: .tmuxSocket)
         worktreePath = try c.decodeIfPresent(String.self, forKey: .worktreePath)
         worktreeBranch = try c.decodeIfPresent(String.self, forKey: .worktreeBranch)
         autoModePresses = (try c.decodeIfPresent(Int.self, forKey: .autoModePresses)) ?? 0
@@ -182,6 +185,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(useTmux, forKey: .useTmux)
         try c.encode(useWorktree, forKey: .useWorktree)
         try c.encode(tmuxSession, forKey: .tmuxSession)
+        try c.encode(tmuxSocket, forKey: .tmuxSocket)
         try c.encode(worktreePath, forKey: .worktreePath)
         try c.encode(worktreeBranch, forKey: .worktreeBranch)
         try c.encode(autoModePresses, forKey: .autoModePresses)
