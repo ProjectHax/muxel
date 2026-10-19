@@ -588,22 +588,26 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
     let mut startup_input = None;
 
     if let Some(prompt) = instance.system_prompt.as_ref().filter(|p| !p.is_empty()) {
-        match &instance.injection {
-            InjectionMode::CliFlag { flag } => {
-                args.push(flag.clone());
-                args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+        if instance.control_prompt {
+            if !resuming && instance.auto_submit {
+                startup_input = Some(prompt.clone());
             }
-            InjectionMode::TypeIn
-                if !resuming && (!instance.control_prompt || instance.auto_submit) =>
-            {
-                // A raw newline is Enter in TUIs without bracketed-paste mode.
-                // Keep the instruction bundle to one startup turn everywhere.
-                // Consumed ctl tasks leave no text, including automatically
-                // assembled instructions, in a later conversation's input.
-                startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+        } else {
+            match &instance.injection {
+                InjectionMode::CliFlag { flag } => {
+                    args.push(flag.clone());
+                    args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                InjectionMode::TypeIn if !resuming => {
+                    // A raw newline is Enter in TUIs without bracketed-paste mode.
+                    // Keep the instruction bundle to one startup turn everywhere.
+                    // Consumed ctl tasks leave no text, including automatically
+                    // assembled instructions, in a later conversation's input.
+                    startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                InjectionMode::TypeIn => {}
+                InjectionMode::None => {}
             }
-            InjectionMode::TypeIn => {}
-            InjectionMode::None => {}
         }
     }
 
@@ -612,12 +616,13 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
         args.push(codex_terminal_title_override().to_string());
     }
 
+    let submit = instance.auto_submit && (!instance.control_prompt || startup_input.is_some());
     ResolvedLaunch {
         program: instance.program.clone(),
         args,
         startup_input,
         auto_mode_presses: instance.auto_mode_presses,
-        submit: instance.auto_submit,
+        submit,
         env: instance
             .env
             .iter()

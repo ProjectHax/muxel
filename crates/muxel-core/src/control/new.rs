@@ -177,6 +177,10 @@ impl NewOptions {
                 }
                 .build_instance(project.id, &preset, prompt);
                 instance.control_prompt = true;
+                // The task is a user turn, independently of the preset's frozen
+                // transport for automatic launch instructions.
+                instance.system_prompt = Some(prompt.clone());
+                instance.instruction_injection = Some(preset.injection.clone());
                 instance
             } else {
                 Instance::from_preset(project.id, &preset)

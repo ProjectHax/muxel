@@ -72,6 +72,7 @@ struct Instance: Codable, Equatable, Identifiable {
     var literalArgv: Bool = false
     var systemPrompt: String?
     var injection: InjectionMode = .none
+    var instructionInjection: InjectionMode?
     var preset: String = ""
     var presetId: String?
     var env: [EnvVar] = []
@@ -88,6 +89,7 @@ struct Instance: Codable, Equatable, Identifiable {
     /// doesn't strip it from the peer.
     var autoContinueMessage: String?
     var isRunner: Bool = false
+    var controlPrompt: Bool = false
     var autoSubmit: Bool = false
     var pinned: Bool = false
     var worktreeId: String?
@@ -106,6 +108,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case literalArgv = "literal_argv"
         case systemPrompt = "system_prompt"
         case injection, preset
+        case instructionInjection = "instruction_injection"
         case presetId = "preset_id"
         case env
         case useTmux = "use_tmux"
@@ -118,6 +121,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case autoModePresses = "auto_mode_presses"
         case autoContinueMessage = "auto_continue_message"
         case isRunner = "is_runner"
+        case controlPrompt = "control_prompt"
         case autoSubmit = "auto_submit"
         case pinned
         case worktreeId = "worktree_id"
@@ -151,6 +155,7 @@ struct Instance: Codable, Equatable, Identifiable {
         literalArgv = (try c.decodeIfPresent(Bool.self, forKey: .literalArgv)) ?? false
         systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt)
         injection = (try c.decodeIfPresent(InjectionMode.self, forKey: .injection)) ?? .none
+        instructionInjection = try c.decodeIfPresent(InjectionMode.self, forKey: .instructionInjection)
         preset = (try c.decodeIfPresent(String.self, forKey: .preset)) ?? ""
         presetId = try c.decodeIfPresent(String.self, forKey: .presetId)
         env = (try c.decodeIfPresent([EnvVar].self, forKey: .env)) ?? []
@@ -164,6 +169,7 @@ struct Instance: Codable, Equatable, Identifiable {
         autoModePresses = (try c.decodeIfPresent(Int.self, forKey: .autoModePresses)) ?? 0
         autoContinueMessage = try c.decodeIfPresent(String.self, forKey: .autoContinueMessage)
         isRunner = (try c.decodeIfPresent(Bool.self, forKey: .isRunner)) ?? false
+        controlPrompt = (try c.decodeIfPresent(Bool.self, forKey: .controlPrompt)) ?? false
         autoSubmit = (try c.decodeIfPresent(Bool.self, forKey: .autoSubmit)) ?? false
         pinned = (try c.decodeIfPresent(Bool.self, forKey: .pinned)) ?? false
         worktreeId = try c.decodeIfPresent(String.self, forKey: .worktreeId)
@@ -186,6 +192,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(literalArgv, forKey: .literalArgv)
         try c.encode(systemPrompt, forKey: .systemPrompt)
         try c.encode(injection, forKey: .injection)
+        try c.encode(instructionInjection, forKey: .instructionInjection)
         try c.encode(preset, forKey: .preset)
         try c.encode(presetId, forKey: .presetId)
         try c.encode(env, forKey: .env)
@@ -199,6 +206,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(autoModePresses, forKey: .autoModePresses)
         try c.encode(autoContinueMessage, forKey: .autoContinueMessage)
         try c.encode(isRunner, forKey: .isRunner)
+        try c.encode(controlPrompt, forKey: .controlPrompt)
         try c.encode(autoSubmit, forKey: .autoSubmit)
         try c.encode(pinned, forKey: .pinned)
         try c.encode(worktreeId, forKey: .worktreeId)

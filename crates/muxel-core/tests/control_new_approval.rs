@@ -287,6 +287,7 @@ fn new_prompt_is_submitted_once_and_not_retyped_after_nonresume_relaunch() {
         AgentPreset::grok(),
         AgentPreset::codex(),
     ] {
+        let instruction_transport = preset.injection.clone();
         let options = NewOptions {
             prompt: Some("do {{input}} literally\nsecond line".into()),
             ..Default::default()
@@ -294,11 +295,12 @@ fn new_prompt_is_submitted_once_and_not_retyped_after_nonresume_relaunch() {
         let mut instance = options.instance(&project, &[preset], 0).unwrap();
         assert!(instance.is_runner);
         assert_eq!(instance.injection, InjectionMode::TypeIn);
+        assert_eq!(instance.instruction_injection, Some(instruction_transport));
         assert_eq!(instance.auto_mode_presses, 0);
         let launch = resolve_launch_for_session(&instance, false);
         assert_eq!(
             launch.startup_input.as_deref(),
-            Some("do {{input}} literally second line")
+            Some("do {{input}} literally\nsecond line")
         );
         assert!(launch.submit);
         assert_eq!(

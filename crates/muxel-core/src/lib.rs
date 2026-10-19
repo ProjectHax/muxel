@@ -513,6 +513,10 @@ pub struct Instance {
     /// How the system prompt is delivered.
     #[serde(default)]
     pub injection: InjectionMode,
+    /// Frozen separate transport for automatic instructions on a ctl task.
+    /// Older task records omit this and receive no extra typed instructions.
+    #[serde(default)]
+    pub instruction_injection: Option<InjectionMode>,
     /// Name of the preset this instance was created from (for display).
     #[serde(default)]
     pub preset: String,
@@ -569,6 +573,8 @@ pub struct Instance {
     pub is_runner: bool,
     /// A task supplied by `ctl new --prompt`. Erase its text after building the
     /// first launch plan so a non-resuming relaunch cannot re-type the old task.
+    /// `instruction_injection` keeps the preset's separate rules transport;
+    /// `injection` remains TypeIn for the exact typed user task.
     #[serde(default)]
     pub control_prompt: bool,
     /// Press Enter to submit after typing the startup prompt. New instances set
@@ -748,6 +754,7 @@ impl Instance {
             auto_continue_message: None,
             is_runner: false,
             control_prompt: false,
+            instruction_injection: None,
             // New instances submit their startup prompt; persisted ones default
             // to false (so restored runners re-type without auto-submitting).
             auto_submit: true,
@@ -815,6 +822,7 @@ impl Instance {
             auto_continue_message: None,
             is_runner: false,
             control_prompt: false,
+            instruction_injection: None,
             auto_submit: false,
             pinned: false,
             worktree_id: None,

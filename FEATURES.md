@@ -571,7 +571,10 @@ feature is added or changed, update the matching entry here in the same change**
   arguments. `--prompt TEXT` (or `--prompt -` for stdin) submits a user task
   through the existing one-shot runner path for a configured non-shell terminal
   preset. This replaces the preset's configured system prompt with the task;
-  preset arguments are kept. The task text is discarded after first launch.
+  preset arguments are kept. The typed first turn is exactly the task. Automatic
+  file-link and memory instructions use the preset's separate flag/config
+  transport when available, and are omitted for TypeIn-only presets.
+  The task text is discarded after first launch.
   Restart, restore and resume neither re-type nor resubmit it, including launches without a resumable
   conversation. Literal, shell and browser launches refuse prompts with
   `prompt_unsupported`. `--cwd`

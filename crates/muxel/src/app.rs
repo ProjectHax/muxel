@@ -1280,6 +1280,17 @@ fn resolve_agent_launch(
     resuming: bool,
 ) -> ResolvedLaunch {
     let mut instance = instance.clone();
+    let control_prompt = instance.control_prompt;
+    let control_task = if control_prompt {
+        instance.control_prompt = false;
+        instance.injection = instance
+            .instruction_injection
+            .clone()
+            .unwrap_or(InjectionMode::None);
+        instance.system_prompt.take()
+    } else {
+        None
+    };
     let mut codex_instructions = Vec::new();
     let is_codex = instance
         .program
@@ -1287,6 +1298,11 @@ fn resolve_agent_launch(
         .and_then(|program| std::path::Path::new(program).file_stem())
         .and_then(|stem| stem.to_str())
         .is_some_and(|stem| stem.eq_ignore_ascii_case("codex"));
+    if control_prompt && !is_codex && instance.injection == InjectionMode::TypeIn {
+        // A TypeIn-only preset has no separate instruction channel. Keep the
+        // caller's task exact rather than joining instructions onto its turn.
+        instance.injection = InjectionMode::None;
+    }
     if is_codex && let Some(custom) = take_codex_rules_prompt(&mut instance, resuming) {
         codex_instructions.push(custom);
     }
@@ -1345,6 +1361,11 @@ fn resolve_agent_launch(
             &codex_instructions.join("\n\n"),
         ));
     }
+    if control_prompt {
+        resolved.startup_input =
+            control_task.filter(|task| !task.is_empty() && !resuming && instance.auto_submit);
+        resolved.submit = resolved.startup_input.is_some();
+    }
     resolved
 }
 
@@ -1372,6 +1393,87 @@ mod launch_instruction_transport_tests {
     };
     use muxel_core::resolve_launch_for_session;
     use uuid::Uuid;
+
+    #[test]
+    fn ctl_prompt_keeps_task_separate_from_automatic_instructions() {
+        let mut project = Project::new("repo", std::env::current_dir().unwrap());
+        project.memory_enabled = true;
+        for preset in [AgentPreset::claude(), AgentPreset::codex()] {
+            let instance = muxel_core::control::NewOptions {
+                prompt: Some("/or-spar 20689".into()),
+                ..Default::default()
+            }
+            .instance(&project, &[preset], 0)
+            .unwrap();
+            let launch = resolve_agent_launch(&instance, Some(&project), false);
+            assert_eq!(launch.startup_input.as_deref(), Some("/or-spar 20689"));
+            assert!(launch.submit);
+            assert!(!launch.args.iter().any(|arg| arg.contains("/or-spar")));
+            let instructions = launch.args.join(" ");
+            assert!(instructions.contains("MEMORY.md"));
+            assert!(instructions.contains("file:"));
+            if instance.program.as_deref() == Some("claude") {
+                assert!(
+                    launch
+                        .args
+                        .iter()
+                        .any(|arg| arg == "--append-system-prompt")
+                );
+            } else {
+                assert!(instructions.contains("developer_instructions"));
+            }
+            let resumed = resolve_agent_launch(&instance, Some(&project), true);
+            assert!(resumed.startup_input.is_none());
+            assert!(!resumed.submit);
+        }
+    }
+
+    #[test]
+    fn ctl_prompt_type_in_only_presets_omit_automatic_instructions() {
+        let mut project = Project::new("repo", std::env::current_dir().unwrap());
+        project.memory_enabled = true;
+        for injection in [InjectionMode::TypeIn, InjectionMode::None] {
+            let mut preset = AgentPreset::claude();
+            preset.injection = injection;
+            preset.system_prompt = Some("old preset rules".into());
+            let mut instance = muxel_core::control::NewOptions {
+                prompt: Some("/or-spar 20689".into()),
+                ..Default::default()
+            }
+            .instance(&project, &[preset], 0)
+            .unwrap();
+            let launch = resolve_agent_launch(&instance, Some(&project), false);
+            assert_eq!(launch.startup_input.as_deref(), Some("/or-spar 20689"));
+            assert_eq!(launch.args, instance.args);
+            assert!(launch.submit);
+            instance.consume_runner_prompt();
+            let later = resolve_agent_launch(&instance, Some(&project), false);
+            assert!(later.startup_input.is_none());
+            assert!(!later.submit);
+        }
+    }
+
+    #[test]
+    fn ctl_prompt_legacy_records_do_not_append_instructions_to_task() {
+        let mut project = Project::new("repo", std::env::current_dir().unwrap());
+        project.memory_enabled = true;
+        let original = muxel_core::control::NewOptions {
+            prompt: Some("/or-spar 20689".into()),
+            ..Default::default()
+        }
+        .instance(&project, &[AgentPreset::claude()], 0)
+        .unwrap();
+        let mut saved = serde_json::to_value(original).unwrap();
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("instruction_injection");
+        let legacy: Instance = serde_json::from_value(saved).unwrap();
+        let launch = resolve_agent_launch(&legacy, Some(&project), false);
+        assert_eq!(launch.startup_input.as_deref(), Some("/or-spar 20689"));
+        assert_eq!(launch.args, legacy.args);
+        assert!(launch.submit);
+    }
 
     fn codex(prompt: &str, runner: bool) -> Instance {
         let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());

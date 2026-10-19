@@ -4,6 +4,34 @@ import XCTest
 /// Mirrors the agent.rs launch-resolution tests, so the iOS command matches what
 /// desktop would run (injection modes, arg ordering, session-resume progression).
 final class AgentLaunchTests: XCTestCase {
+    func testCtlTaskPreservesSeparateInstructionTransportAcrossWriteBack() throws {
+        var original = inst(args: ["--model", "sonnet"], prompt: "/or-spar 20689",
+                            injection: .typeIn)
+        original.controlPrompt = true
+        original.instructionInjection = .cliFlag(flag: "--append-system-prompt")
+        original.isRunner = true
+        original.autoSubmit = true
+        let data = try JSONEncoder().encode(original)
+        let restored = try JSONDecoder().decode(Instance.self, from: data)
+        XCTAssertEqual(restored, original)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["control_prompt"] as? Bool, true)
+        XCTAssertNotNil(json["instruction_injection"])
+        let launch = AgentLaunch.resolveLaunch(restored)
+        XCTAssertEqual(launch.args, original.args)
+        XCTAssertEqual(launch.startupInput, "/or-spar 20689")
+        XCTAssertTrue(launch.submit)
+    }
+
+    func testLegacyTaskDefaultsToNoSeparateInstructionTransport() throws {
+        let data = Data("""
+        {"id":"pane","project_id":"project","title":"task"}
+        """.utf8)
+        let restored = try JSONDecoder().decode(Instance.self, from: data)
+        XCTAssertFalse(restored.controlPrompt)
+        XCTAssertNil(restored.instructionInjection)
+    }
+
     func testLiteralLaunchPreservesPolicyAcrossWriteBack() throws {
         var original = inst(args: ["brief with spaces", "", "--"], prompt: "do not inject",
                             injection: .typeIn, sessionId: "old-session", started: true)

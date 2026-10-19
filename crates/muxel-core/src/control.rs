@@ -1074,6 +1074,8 @@ Each card disables Allow and Deny for 750 ms after appearing and ignores double-
 Both mouse-down and release must belong to that same armed card.
 `--prompt` submits a user task through the one-shot runner path, once on first launch; only non-shell terminal presets support it.
 It replaces the preset's configured system prompt with the task; preset arguments are kept.
+The typed task stays exact; automatic instructions use a separate flag/config channel when available.
+In Git Bash, set MSYS_NO_PATHCONV=1 for leading-slash prompts, or use --prompt - with stdin.
 Its task text is discarded after the first launch and is not re-typed on a later launch.
 Ask returns a pending request id immediately; the CLI polls once per second until the final reply.
 Connection and host-availability failures retry up to three times against the same id; creation is never reissued.
@@ -1388,9 +1390,12 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   presets remain eligible for Allow; Ask shows the requested model and effort.
   Everything after `--` is literal argv, including spaces, quotes and empty
   arguments. `--prompt TEXT` sends a user task through the existing runner path;
-  `--prompt -` reads stdin. This replaces the preset's configured system prompt
-  with the task; preset arguments are kept. The task is submitted once and its
-  text is discarded after first launch. Restart, restore and resume neither
+  `--prompt -` reads stdin. In Git Bash, set `MSYS_NO_PATHCONV=1` for leading-slash
+  prompts, or use stdin. This replaces the preset's configured system prompt
+  with the task; preset arguments are kept. The typed task stays exact.
+  Automatic instructions use the preset's separate flag/config transport when
+  available; they are omitted for TypeIn-only presets. The task is submitted
+  once and its text is discarded after first launch. Restart, restore and resume neither
   re-type nor resubmit it, including launches without a resumable conversation.
   Prompts for literal, shell and browser launches receive
   `prompt_unsupported`. `--background` preserves focus, project and window.
