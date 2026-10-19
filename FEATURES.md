@@ -927,7 +927,9 @@ feature is added or changed, update the matching entry here in the same change**
   restart follows its project back to the main window if its original window
   closes. The iOS companion serializes all layout changes with ownership binding,
   verifies saved pane membership before attachment even for an unchanged owner,
-  and discards stale publication after a project switch. Its host status sweep
+  preserves an already saved owner when a stale attachment disagrees, and rebuilds
+  that attachment once from the refreshed layout. It discards stale publication
+  after a project switch. Its host status sweep
   includes recorded named sockets and uses the same session as attachment.
 - **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
   speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,

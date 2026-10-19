@@ -9,16 +9,19 @@ private actor LayoutTransactionConnection: SSHConnection {
     private var document: RemoteLayout
     private var pauseNextRead: Bool
     private var writeFailuresRemaining: Int
+    private let listedTargets: String
     private var releaseRead: CheckedContinuation<Void, Never>?
     private let onPaused: () -> Void
     private let onOverlappingRead: () -> Void
     private(set) var commands: [String] = []
 
     init(_ document: RemoteLayout, pauseFirstRead: Bool = true, failWrites: Int = 0,
+         listedTargets: String = "mxl\tmuxel_host_aaaaaaaa\n",
          onPaused: @escaping () -> Void = {}, onOverlappingRead: @escaping () -> Void = {}) {
         self.document = document
         self.pauseNextRead = pauseFirstRead
         self.writeFailuresRemaining = failWrites
+        self.listedTargets = listedTargets
         self.onPaused = onPaused
         self.onOverlappingRead = onOverlappingRead
     }
@@ -51,7 +54,7 @@ private actor LayoutTransactionConnection: SSHConnection {
             let json = command.components(separatedBy: "\n").dropFirst().dropLast(2).joined(separator: "\n")
             document = try MuxelJSON.decoder.decode(RemoteLayout.self, from: Data(json.utf8))
         }
-        if command.contains("list-sessions") { return "mxl\tmuxel_host_aaaaaaaa\n" }
+        if command.contains("list-sessions") { return listedTargets }
         return ""
     }
 
@@ -188,6 +191,235 @@ final class LayoutTransactionTests: XCTestCase {
                        "a persisted owner must not be resolved again on the legacy servers")
         let saved = await conn.snapshot()
         XCTAssertFalse(saved.instances.contains { $0.id == a.id })
+    }
+
+    func testStaleBindingDeclinesSavedOwnerAndRefreshesWithoutWriting() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var persisted = layout
+        persisted.instances[0].tmuxSession = "muxel_host_aaaaaaaa"
+        persisted.instances[0].tmuxSocket = "default"
+        let conn = LayoutTransactionConnection(persisted, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+
+        let permitted = try await state.bindTmuxTarget(.init(name: "muxel_host_aaaaaaaa", socket: "mxl"),
+                                                      instance: a, in: project)
+
+        XCTAssertFalse(permitted)
+        XCTAssertEqual(state.layout, persisted, "the next resolution must see the durable owner")
+        let saved = await conn.snapshot()
+        XCTAssertEqual(saved, persisted)
+        let commands = await conn.commands
+        XCTAssertEqual(commands.filter { $0.hasPrefix("f=") }.count, 1)
+        XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") })
+    }
+
+    func testAttachmentDiscardsStalePlanResolvesSavedDefaultAndClosesOnlyDefault() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var persisted = layout
+        persisted.instances[0].tmuxSession = "muxel_host_aaaaaaaa"
+        persisted.instances[0].tmuxSocket = "default"
+        let conn = LayoutTransactionConnection(persisted, pauseFirstRead: false,
+            listedTargets: "mxl\tmuxel_host_aaaaaaaa\ndefault\tmuxel_host_aaaaaaaa\n")
+        state.connectionFactory = { _, _ in conn }
+        var plannedSockets: [String?] = []
+        var startedCommands: [String] = []
+
+        let command = try await state.prepareTmuxAttachment(instanceId: a.id, in: project) { current in
+            plannedSockets.append(current.tmuxSocket)
+            let targets = TmuxCommands.parseTargets(try await conn.run(
+                TmuxCommands.listTargetsCommand(socket: current.tmuxSocket)))
+            let target = try XCTUnwrap(TmuxCommands.resolveTarget(current, in: targets))
+            return (target: target, attachment: TmuxCommands.attachPTYCommand(session: target.name, socket: target.socket))
+        }
+        if let command { startedCommands.append(command) }
+
+        XCTAssertEqual(plannedSockets, [nil, "default"])
+        XCTAssertEqual(startedCommands, [TmuxCommands.attachPTYCommand(session: "muxel_host_aaaaaaaa", socket: "default")],
+                       "only the re-resolved plan may cross the PTY start guard")
+        var commands = await conn.commands
+        XCTAssertEqual(commands.filter { $0.hasPrefix("f=") }.count, 2)
+        XCTAssertEqual(commands.filter { $0.contains("list-sessions") }.count, 2)
+        XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") })
+        let saved = await conn.snapshot()
+        XCTAssertEqual(saved, persisted)
+
+        await state.close(a, in: project) // the mounted view may still hold its legacy instance
+        commands = await conn.commands
+        let kills = commands.filter { $0.contains("kill-session") }
+        XCTAssertEqual(kills.count, 1)
+        XCTAssertTrue(kills.first?.contains("; set --; tmux") ?? false)
+        XCTAssertFalse(kills.first?.contains("-L") ?? true)
+    }
+
+    func testQueuedStaleBindingCannotReplaceOwnerSavedByEarlierBinding() async throws {
+        let (state, project, a, _, layout) = fixture()
+        let paused = expectation(description: "first binding captured unresolved ownership")
+        let overlap = expectation(description: "stale binding read before first binding saved")
+        overlap.isInverted = true
+        let conn = LayoutTransactionConnection(layout, onPaused: { paused.fulfill() },
+                                               onOverlappingRead: { overlap.fulfill() })
+        state.connectionFactory = { _, _ in conn }
+        let first = Task { try await state.bindTmuxTarget(.init(name: "muxel_host_aaaaaaaa", socket: "default"),
+                                                        instance: a, in: project) }
+        await fulfillment(of: [paused], timeout: 1)
+        let submitted = expectation(description: "stale binding submitted while earlier binding is paused")
+        let stale = Task { @MainActor in
+            submitted.fulfill()
+            return try await state.bindTmuxTarget(.init(name: "muxel_host_aaaaaaaa", socket: "mxl"),
+                                                 instance: a, in: project)
+        }
+        await fulfillment(of: [submitted], timeout: 1)
+        await fulfillment(of: [overlap], timeout: 0.1)
+        await conn.resumeRead()
+        let firstPermitted = try await first.value
+        let stalePermitted = try await stale.value
+
+        XCTAssertTrue(firstPermitted)
+        XCTAssertFalse(stalePermitted)
+        let saved = await conn.snapshot()
+        XCTAssertEqual(saved.instances[0].tmuxSocket, "default")
+        XCTAssertEqual(state.layout, saved)
+        let commands = await conn.commands
+        XCTAssertEqual(commands.filter { $0.hasPrefix("f=") }.count, 2)
+        XCTAssertEqual(commands.filter { $0.hasPrefix("cat > ") }.count, 1)
+    }
+
+    func testSavedSocketWithoutNameOnlyAcceptsNameOnThatSocket() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var persisted = layout
+        persisted.instances[0].tmuxSocket = "default"
+        let conn = LayoutTransactionConnection(persisted, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+
+        let wrong = try await state.bindTmuxTarget(.init(name: "muxel_host_aaaaaaaa", socket: "mxl"),
+                                                  instance: a, in: project)
+        XCTAssertFalse(wrong)
+        XCTAssertEqual(state.layout, persisted)
+        let right = try await state.bindTmuxTarget(.init(name: "muxel_host_aaaaaaaa", socket: "default"),
+                                                  instance: a, in: project)
+        XCTAssertTrue(right)
+        let saved = await conn.snapshot()
+        XCTAssertEqual(saved.instances[0].tmuxSocket, "default")
+        XCTAssertEqual(saved.instances[0].tmuxSession, "muxel_host_aaaaaaaa")
+        let commands = await conn.commands
+        XCTAssertEqual(commands.filter { $0.hasPrefix("cat > ") }.count, 1)
+    }
+
+    func testSavedConcreteOwnerCannotChangeNameOnSameSocket() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var persisted = layout
+        persisted.instances[0].tmuxSession = "muxel_original_aaaaaaaa"
+        persisted.instances[0].tmuxSocket = "default"
+        let conn = LayoutTransactionConnection(persisted, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+
+        let permitted = try await state.bindTmuxTarget(.init(name: "muxel_renamed_aaaaaaaa", socket: "default"),
+                                                      instance: a, in: project)
+        XCTAssertFalse(permitted)
+        XCTAssertEqual(state.layout, persisted)
+        let commands = await conn.commands
+        XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") })
+    }
+
+    func testLegacyNameWithoutSocketCanStillResolveRenamedSession() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var persisted = layout
+        persisted.instances[0].tmuxSession = "muxel_original_aaaaaaaa"
+        let conn = LayoutTransactionConnection(persisted, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+        let target = try XCTUnwrap(TmuxCommands.resolveTarget(persisted.instances[0], in: [
+            .init(name: "muxel_renamed_aaaaaaaa", socket: "default")
+        ]))
+
+        let permitted = try await state.bindTmuxTarget(target, instance: a, in: project)
+
+        XCTAssertTrue(permitted)
+        let saved = await conn.snapshot()
+        XCTAssertEqual(saved.instances[0].tmuxSession, target.name)
+        XCTAssertEqual(saved.instances[0].tmuxSocket, target.socket)
+    }
+
+    func testAttachmentStopsAfterOneConflictRetry() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var persisted = layout
+        persisted.instances[0].tmuxSession = "muxel_host_aaaaaaaa"
+        persisted.instances[0].tmuxSocket = "default"
+        let conn = LayoutTransactionConnection(persisted, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+        var attempts = 0
+        let command = try await state.prepareTmuxAttachment(instanceId: a.id, in: project) { _ in
+            attempts += 1
+            return (target: TmuxCommands.SessionTarget(name: "muxel_host_aaaaaaaa", socket: "mxl"), attachment: "stale")
+        }
+
+        XCTAssertNil(command)
+        XCTAssertEqual(attempts, 2)
+        let saved = await conn.snapshot()
+        XCTAssertEqual(saved, persisted)
+        let commands = await conn.commands
+        XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") })
+    }
+
+    func testAttachmentDoesNotRetryRemovedPaneOrStartAfterNavigation() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var persisted = layout
+        persisted.removeInstance(id: a.id, now: 2)
+        let conn = LayoutTransactionConnection(persisted, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+        var attempts = 0
+        let removed = try await state.prepareTmuxAttachment(instanceId: a.id, in: project) { _ in
+            attempts += 1
+            return (target: TmuxCommands.SessionTarget(name: "muxel_host_aaaaaaaa", socket: "mxl"), attachment: "removed")
+        }
+        XCTAssertNil(removed)
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(state.layout, persisted)
+
+        state.layout = layout
+        let navigated = try await state.prepareTmuxAttachment(instanceId: a.id, in: project) { _ in
+            state.selectedProject = nil
+            return (target: TmuxCommands.SessionTarget(name: "muxel_host_aaaaaaaa", socket: "mxl"), attachment: "navigated")
+        }
+        XCTAssertNil(navigated)
+        let commands = await conn.commands
+        XCTAssertEqual(commands.filter { $0.hasPrefix("f=") }.count, 1,
+                       "navigation after planning cannot enter the binding queue")
+        XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") })
+    }
+
+    func testAttachmentDoesNotReturnPlanOrRetryAfterBindingWriteFailure() async {
+        let (state, project, a, _, layout) = fixture()
+        let conn = LayoutTransactionConnection(layout, pauseFirstRead: false, failWrites: 1)
+        state.connectionFactory = { _, _ in conn }
+        var attempts = 0
+        do {
+            _ = try await state.prepareTmuxAttachment(instanceId: a.id, in: project) { _ in
+                attempts += 1
+                return (target: TmuxCommands.SessionTarget(name: "muxel_host_aaaaaaaa", socket: "mxl"), attachment: "unsaved")
+            }
+            XCTFail("a plan whose owner could not be saved must not reach PTY startup")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("layout write failed"))
+        }
+        XCTAssertEqual(attempts, 1)
+        let saved = await conn.snapshot()
+        XCTAssertEqual(saved, layout)
+    }
+
+    func testAttachmentDoesNotBindAfterCancellationDuringPlanning() async throws {
+        let (state, project, a, _, layout) = fixture()
+        let conn = LayoutTransactionConnection(layout, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+        let preparing = Task { @MainActor in
+            try await state.prepareTmuxAttachment(instanceId: a.id, in: project) { _ in
+                withUnsafeCurrentTask { $0?.cancel() }
+                return (target: TmuxCommands.SessionTarget(name: "muxel_host_aaaaaaaa", socket: "mxl"), attachment: "cancelled")
+            }
+        }
+        let command = try await preparing.value
+        XCTAssertNil(command)
+        let commands = await conn.commands
+        XCTAssertTrue(commands.isEmpty)
     }
 
     func testCloseOfAlreadyRemovedInstanceDoesNotKillNamesake() async {

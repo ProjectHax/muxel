@@ -1143,6 +1143,28 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Rebuild the whole attachment plan once if binding finds a newer saved owner.
+    /// Never reuse the view's captured instance after a conflict or removed pane.
+    func prepareTmuxAttachment<Attachment>(
+        instanceId: String, in project: RemoteProject,
+        prepare: @MainActor (Instance) async throws -> (target: TmuxCommands.SessionTarget, attachment: Attachment)
+    ) async throws -> Attachment? {
+        for _ in 0..<2 {
+            guard !Task.isCancelled, selectedProject?.id == project.id,
+                  let current = layout?.instances.first(where: { $0.id == instanceId }) else { return nil }
+            let prepared = try await prepare(current)
+            guard !Task.isCancelled, selectedProject?.id == project.id else { return nil }
+            if try await bindTmuxTarget(prepared.target, instance: current, in: project) {
+                guard !Task.isCancelled, selectedProject?.id == project.id,
+                      let bound = layout?.instances.first(where: { $0.id == instanceId }),
+                      bound.tmuxSocket == prepared.target.socket,
+                      bound.tmuxSession == prepared.target.name else { return nil }
+                return prepared.attachment
+            }
+        }
+        return nil
+    }
+
     /// Confirm saved membership and the resolved owner before attachment so close
     /// and restart use that server even if another gains the same name.
     func bindTmuxTarget(_ target: TmuxCommands.SessionTarget, instance: Instance,
@@ -1162,22 +1184,35 @@ final class AppState: ObservableObject {
                     // A new pane already has its intended owner in the optimistic
                     // UI. Await its append and verify durable membership before
                     // allowing a PTY, even when that owner appears unchanged.
-                    var memberFound = false
+                    var observed: RemoteLayout?
+                    var permitted = false
                     let written = try await RemoteLayoutStore.mutate(
                         conn, root: project.remoteRoot, seedIfMissing: false, transform: { layout in
+                            observed = layout
                             guard let idx = layout.instances.firstIndex(where: { $0.id == instance.id }) else { return false }
-                            memberFound = true
+                            let saved = layout.instances[idx]
+                            // A resolved server is authoritative, including when
+                            // its session name has not been backfilled yet. A
+                            // legacy name without a socket still needs discovery.
+                            if let socket = saved.tmuxSocket {
+                                guard socket == target.socket else { return false }
+                                if let name = saved.tmuxSession, !name.isEmpty,
+                                   name != target.name { return false }
+                            }
+                            permitted = true
                             if layout.instances[idx].tmuxSession == target.name,
                                layout.instances[idx].tmuxSocket == target.socket { return false }
                             layout.instances[idx].tmuxSession = target.name
                             layout.instances[idx].tmuxSocket = target.socket
                             return true
                         })
-                    guard selectedProject?.id == project.id, memberFound else {
+                    guard selectedProject?.id == project.id else {
                         continuation.resume(returning: false); return
                     }
-                    if let written { publishLayout(written, for: project) }
-                    continuation.resume(returning: true)
+                    // A declined transform does not write, but its fresh durable
+                    // state must replace the snapshot used for the rejected plan.
+                    publishLayout(written ?? observed, for: project)
+                    continuation.resume(returning: permitted)
                 } catch {
                     continuation.resume(throwing: error)
                 }
