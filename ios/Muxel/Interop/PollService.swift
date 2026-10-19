@@ -57,16 +57,19 @@ final class PollService {
     /// host — the cross-project sidebar sweep reuses `classify(rows:instances:)`.
     func poll(_ conn: SSHConnection, instances: [Instance],
               liveScreens: [String: LiveScreen] = [:]) async -> [InstanceStatus] {
-        let rows = await fetchPaneRows(conn)
+        let rows = await fetchPaneRows(conn, instances: instances)
         return classify(rows: rows, instances: instances, liveScreens: liveScreens)
     }
 
-    /// Fetch every pane's status signals on the host in one round trip, from both of
-    /// its tmux servers (muxel's own, and the default one a pane from before muxel had
-    /// its own still runs on). A server that isn't running lists nothing; a host with
-    /// no tmux at all → empty (no sessions, all idle).
-    func fetchPaneRows(_ conn: SSHConnection) async -> [PaneRow] {
-        let commands = [TmuxCommands.socketName, "default"].map { socket in
+    /// Fetch one host-wide sweep from the legacy servers and every server recorded
+    /// by its projects (including named servers used by isolated desktop profiles).
+    /// Each socket is queried once, retaining its owner tag beside each pane row.
+    /// A server that isn't running contributes nothing.
+    func fetchPaneRows(_ conn: SSHConnection, instances: [Instance]) async -> [PaneRow] {
+        var seen = Set<String>()
+        let sockets = ([TmuxCommands.socketName, "default"] + instances.compactMap(\.tmuxSocket))
+            .filter { seen.insert($0).inserted }
+        let commands = sockets.map { socket in
             TmuxCommands.commandLine(TmuxCommands.allPaneStatuses(socket: socket), session: "", socket: socket)
                 + " 2>/dev/null"
         }

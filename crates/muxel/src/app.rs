@@ -57,10 +57,12 @@ mod libraries_ui;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
+mod restart_guard;
 mod session_discovery;
 mod tmux_install_modal;
 
 use popout_lifecycle::loop_heartbeat;
+use restart_guard::PendingRestarts;
 
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
 /// TUIs (Claude/opencode/…) don't get squished narrow enough to overflow.
@@ -3299,6 +3301,9 @@ pub struct MuxelApp {
     /// start the same agent twice.
     terminal_launching: HashMap<Uuid, LaunchTicket>,
     next_terminal_launch_token: u64,
+    /// A restart owns its pane across remote discovery and teardown. Repeated
+    /// clicks cannot launch another lookup against a different namesake.
+    terminal_restarts: PendingRestarts,
     /// Instances whose launch failed *completely* (even the fallback shell
     /// couldn't spawn), with the error. The pane shows it in place; Restart
     /// retries. Runtime-only, cleared on success / teardown.
@@ -5606,6 +5611,7 @@ impl MuxelApp {
             terminal_launches: HashMap::new(),
             terminal_launching: HashMap::new(),
             next_terminal_launch_token: 0,
+            terminal_restarts: PendingRestarts::default(),
             failed_launches: HashMap::new(),
             save_errors: HashMap::new(),
             split_resize_notify_task: None,
@@ -6490,6 +6496,9 @@ impl MuxelApp {
 
     /// Spawn (or replace) the live terminal for an instance id.
     fn spawn_terminal(&mut self, instance_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_restarts.contains(instance_id) {
+            return;
+        }
         let _phase = ui_profile::phase("activation", "spawn-terminal-immediate", Some(instance_id));
         // An explicit/immediate spawn supersedes a deferred launch still creating
         // its PTY. Its token will fail validation and dropping it kills the child.
@@ -6596,6 +6605,7 @@ impl MuxelApp {
         if self.terminals.contains_key(&instance_id)
             || self.failed_launches.contains_key(&instance_id)
             || self.terminal_launching.contains_key(&instance_id)
+            || self.terminal_restarts.contains(instance_id)
         {
             return None;
         }
@@ -8424,6 +8434,7 @@ impl MuxelApp {
         // Invalidate background launches from the old workspace before ids from
         // the new document can be admitted.
         self.terminal_launching.clear();
+        self.terminal_restarts.clear();
         self.terminal_launches.clear();
         ui_profile::clear_focus_panes();
         {
@@ -10062,6 +10073,7 @@ impl MuxelApp {
             ui_profile::unregister_focus_pane(iid);
             self.terminal_launching.remove(&iid);
             self.clear_notifications_for(iid);
+            self.terminal_restarts.cancel(iid);
             if let Some(view) = self.terminals.remove(&iid) {
                 view.read(cx).session().kill();
             }
@@ -13668,6 +13680,7 @@ impl MuxelApp {
     /// dropped remote connection exits abnormally and tombstones the pane instead,
     /// so a still-running session stays reconnectable.
     fn close_instance_inner(&mut self, iid: Uuid, reason: &'static str, cx: &mut Context<Self>) {
+        self.terminal_restarts.cancel(iid);
         ui_profile::unregister_focus_pane(iid);
         // Invalidate a PTY still being created. Its eventual result sees the
         // missing token, drops, and kills the child instead of becoming invisible.
@@ -14538,6 +14551,7 @@ impl MuxelApp {
             .map(|p| p.instances())
             .unwrap_or_default()
         {
+            self.terminal_restarts.cancel(iid);
             if let Some(view) = self.terminals.remove(&iid) {
                 view.read(cx).session().kill();
             }
@@ -16442,6 +16456,7 @@ impl MuxelApp {
         };
         ui_profile::unregister_focus_pane(iid);
         self.clear_notifications_for(iid);
+        self.terminal_restarts.cancel(iid);
         // Terminals must be killed; editors just drop (unsaved changes lost — the
         // pop-out window already confirmed the close).
         if let PaneView::Terminal(view) = &popout.view {
@@ -16975,6 +16990,9 @@ impl MuxelApp {
         if inst.kind != InstanceKind::Terminal {
             return;
         }
+        let Some(restart) = self.terminal_restarts.begin(inst) else {
+            return;
+        };
         let recorded_session = inst
             .tmux_session
             .as_ref()
@@ -17003,6 +17021,7 @@ impl MuxelApp {
                     integrations::kill_tmux_session(&session);
                 }
             }
+            self.terminal_restarts.finish(iid, restart);
             self.spawn_terminal(iid, window, cx);
             self.focus_instance(iid, window, cx);
             cx.notify();
@@ -17046,11 +17065,14 @@ impl MuxelApp {
                             if this.current_workspace != workspace {
                                 return false;
                             }
-                            let Some(instance) = this.workspace.instance_mut(iid) else {
+                            if !this.terminal_restarts.record_owner(
+                                &mut this.workspace,
+                                iid,
+                                restart,
+                                &closed,
+                            ) {
                                 return false;
-                            };
-                            instance.tmux_session = Some(closed.name.clone());
-                            instance.tmux_socket = closed.socket;
+                            }
                             this.try_persist()
                         })
                         .unwrap_or(false);
@@ -17073,8 +17095,11 @@ impl MuxelApp {
                 }
                 Err(error) => Err(error),
             };
-            let _ = this.update_in(cx, |this, window, cx| {
-                if this.current_workspace != workspace || this.workspace.instance(iid).is_none() {
+            let completed = this.update_in(cx, |this, window, cx| {
+                if this.current_workspace != workspace
+                    || !this.terminal_restarts.finish(iid, restart)
+                    || this.workspace.instance(iid).is_none()
+                {
                     return; // closed while the kill was in flight
                 }
                 // Say so rather than letting it pass as a restart: the respawn below
@@ -17104,6 +17129,13 @@ impl MuxelApp {
                 }
                 cx.notify();
             });
+            if completed.is_err() {
+                // The pane may now belong to another window. Release admission
+                // even if the original window vanished while SSH was pending.
+                let _ = this.update(cx, |this, _| {
+                    this.terminal_restarts.finish(iid, restart);
+                });
+            }
         })
         .detach();
         self.focus_instance(iid, window, cx);

@@ -493,10 +493,13 @@ final class AppState: ObservableObject {
         do {
             let conn = connection(for: host)
             try await conn.connect()
-            layout = try await RemoteLayoutStore.read(conn, root: project.remoteRoot)
+            let fresh = try await RemoteLayoutStore.read(conn, root: project.remoteRoot)
+            guard selectedProject?.id == project.id else { return }
+            layout = fresh
             layoutLoad = .loaded
             await runPollOnce()
         } catch {
+            guard selectedProject?.id == project.id else { return }
             if layout == nil {
                 layoutLoad = .failed(error.localizedDescription)
                 // A changed key additionally needs the decision prompt.
@@ -536,8 +539,11 @@ final class AppState: ObservableObject {
         await refreshNotificationStatus()
         if selectedProject != nil { await refreshLayout() }
         if let host = selectedProject.flatMap({ host(for: $0) }) {
-            let rows = await poll.fetchPaneRows(connection(for: host))
-            await sweepOtherProjects(selectedHostId: host.id, selectedRows: rows)
+            let conn = connection(for: host)
+            let instances = await hostInstances(on: host.id, conn: conn)
+            let rows = await poll.fetchPaneRows(conn, instances: instances.values.flatMap { $0 })
+            await sweepOtherProjects(selectedHostId: host.id, selectedRows: rows,
+                                     selectedInstances: instances)
         } else {
             // No selection → sweep every host that already has a pooled connection.
             await sweepOtherProjects(selectedHostId: UUID(), selectedRows: [])
@@ -555,12 +561,15 @@ final class AppState: ObservableObject {
         pollTick &+= 1
         if pollTick % 2 == 0,
            let fresh = try? await RemoteLayoutStore.read(conn, root: project.remoteRoot) {
+            guard selectedProject?.id == project.id else { return }
             layout = fresh
         }
-        guard let layout else { return }
+        guard selectedProject?.id == project.id, let layout else { return }
         // One batched fetch for the selected host serves both the selected project's
         // statuses and (on sweep ticks) its sibling projects — no extra round trip.
-        let selectedRows = await poll.fetchPaneRows(conn)
+        let instances = await hostInstances(on: host.id, conn: conn)
+        let selectedRows = await poll.fetchPaneRows(conn, instances: instances.values.flatMap { $0 })
+        guard selectedProject?.id == project.id else { return }
         let screens = liveScreens(for: layout.orderedTerminalInstances)
         let results = poll.classify(rows: selectedRows,
                                     instances: layout.orderedTerminalInstances,
@@ -576,7 +585,8 @@ final class AppState: ObservableObject {
         // cadence and near-free: one `list-panes -a` per other host + TTL-cached
         // layout reads. Reuses the selected host's rows.
         if pollTick % 4 == 0 {
-            await sweepOtherProjects(selectedHostId: host.id, selectedRows: selectedRows)
+            await sweepOtherProjects(selectedHostId: host.id, selectedRows: selectedRows,
+                                     selectedInstances: instances)
         }
     }
 
@@ -613,16 +623,26 @@ final class AppState: ObservableObject {
     /// Refresh `projectActivity` for every non-selected project on a host we already
     /// hold a connection to. Never dials (unreachable hosts can't stall the loop); a
     /// project with no resolvable instances drops its badge.
-    private func sweepOtherProjects(selectedHostId: UUID, selectedRows: [PaneRow]) async {
+    private func sweepOtherProjects(selectedHostId: UUID, selectedRows: [PaneRow],
+                                    selectedInstances: [UUID: [Instance]] = [:]) async {
         let selectedProjectId = selectedProject?.id
         let byHost = Dictionary(grouping: doc.projects.filter { $0.id != selectedProjectId },
                                 by: { $0.hostId })
         for (hostId, projects) in byHost {
             guard let conn = existingConnection(for: hostId) else { continue }
-            // Reuse the selected host's already-fetched rows; fetch once for others.
-            let rows = hostId == selectedHostId ? selectedRows : await poll.fetchPaneRows(conn)
+            // Collect layouts before fetching so every recorded socket is included,
+            // even when only a sibling project uses that server.
+            let instancesByProject: [UUID: [Instance]]
+            let rows: [PaneRow]
+            if hostId == selectedHostId {
+                instancesByProject = selectedInstances
+                rows = selectedRows
+            } else {
+                instancesByProject = await hostInstances(on: hostId, conn: conn)
+                rows = await poll.fetchPaneRows(conn, instances: instancesByProject.values.flatMap { $0 })
+            }
             for project in projects {
-                guard let instances = await cachedInstances(for: project, conn: conn),
+                guard let instances = instancesByProject[project.id],
                       !instances.isEmpty else {
                     projectActivity[project.id] = nil
                     continue
@@ -633,6 +653,20 @@ final class AppState: ObservableObject {
                 projectActivity[project.id] = Self.aggregate(results)
             }
         }
+    }
+
+    /// The complete host input for a sweep. The selected layout is already live;
+    /// sibling layouts use the existing TTL cache and failed-read fallback.
+    private func hostInstances(on hostId: UUID, conn: SSHConnection) async -> [UUID: [Instance]] {
+        var instances: [UUID: [Instance]] = [:]
+        for project in doc.projects where project.hostId == hostId {
+            if selectedProject?.id == project.id, let layout {
+                instances[project.id] = layout.orderedTerminalInstances
+            } else {
+                instances[project.id] = await cachedInstances(for: project, conn: conn)
+            }
+        }
+        return instances
     }
 
     /// A non-selected project's terminal instances, cached with a short TTL so a sweep
@@ -742,25 +776,28 @@ final class AppState: ObservableObject {
         // (`new-session -A` over a PTY) when the pane opens — it doesn't need the shared
         // layout written first. We deliberately don't create a detached session here (it
         // crashes a TUI agent at init).
-        var next = layout ?? RemoteLayout(remoteRoot: project.remoteRoot)
-        next.addInstanceAsTab(instance, now: unixNow(), targetLeafAnchor: targetLeafAnchor)
-        if let worktreeRecord { next.worktrees.append(worktreeRecord) }
         pendingLaunches.insert(instanceId)
-        layout = next
-        lastLaunched = instanceId
+        if selectedProject?.id == project.id {
+            var next = layout ?? RemoteLayout(remoteRoot: project.remoteRoot)
+            next.addInstanceAsTab(instance, now: unixNow(), targetLeafAnchor: targetLeafAnchor)
+            if let worktreeRecord { next.worktrees.append(worktreeRecord) }
+            layout = next
+            lastLaunched = instanceId
+        }
 
         // Persist `.muxel/workspace.json` to the remote in the background (read-modify-
         // write over SSH) rather than blocking the UI on those round-trips; reassign the
         // authoritative layout when it returns (newer-wins also picks up peer changes).
-        Task {
+        enqueueLayoutWrite { [self] in
             defer { self.pendingLaunches.remove(instanceId) }
             do {
                 let conn = self.connection(for: host)
                 try await conn.connect()
-                self.layout = try await RemoteLayoutStore.appendInstance(
+                let written = try await RemoteLayoutStore.appendInstance(
                     conn, root: project.remoteRoot, instance: instance,
                     targetLeafAnchor: targetLeafAnchor, worktree: worktreeRecord)
-                await self.runPollOnce()
+                publishLayout(written, for: project)
+                if selectedProject?.id == project.id { await self.runPollOnce() }
             } catch {
                 self.surface(error, host: host)
             }
@@ -770,20 +807,32 @@ final class AppState: ObservableObject {
     /// Kill an instance's tmux session and drop it from the layout.
     func close(_ instance: Instance, in project: RemoteProject) async {
         guard let host = host(for: project) else { return }
-        do {
-            let conn = connection(for: host)
-            try await conn.connect()
-            // Resolve the *live* session by uuid8 suffix so we kill the real one (which
-            // may carry desktop's host slug), not a phone-slug name that doesn't exist.
-            if let target = await liveSessionTarget(instance, on: host) {
-                _ = try? await conn.tmux(TmuxCommands.killSession(target.name),
-                                        session: target.name, socket: target.socket)
+        await enqueueLayoutWrite { [self] in
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                // The caller's tab snapshot (and the selected project's in-memory
+                // layout) may predate a queued binding or a peer's close. Only a
+                // surviving instance in the shared document authorizes a kill.
+                let fresh = try await RemoteLayoutStore.read(conn, root: project.remoteRoot)
+                guard let current = fresh?.instances.first(where: { $0.id == instance.id }) else {
+                    terminals.disconnect(instance.id)
+                    publishLayout(fresh, for: project)
+                    return
+                }
+                // Resolve the *live* session by uuid8 suffix so we kill the real one (which
+                // may carry desktop's host slug), not a phone-slug name that doesn't exist.
+                if current.kind == .terminal, let target = await liveSessionTarget(current, on: host) {
+                    _ = try? await conn.tmux(TmuxCommands.killSession(target.name),
+                                            session: target.name, socket: target.socket)
+                }
+                terminals.disconnect(instance.id)
+                let written = try await RemoteLayoutStore.removeInstance(conn, root: project.remoteRoot, instanceId: instance.id)
+                publishLayout(written, for: project)
+            } catch {
+                surface(error, host: host)
             }
-            terminals.disconnect(instance.id)
-            layout = try await RemoteLayoutStore.removeInstance(conn, root: project.remoteRoot, instanceId: instance.id)
-        } catch {
-            surface(error, host: host)
-        }
+        }.value
     }
 
     /// Close every pane except `keepId`: kill each other terminal's tmux session, then
@@ -792,42 +841,55 @@ final class AppState: ObservableObject {
         guard let host = host(for: project) else { return }
         let others = (layout?.orderedPaneInstances ?? []).filter { $0.id != keepId }
         guard !others.isEmpty else { return }
-        do {
-            let conn = connection(for: host)
-            try await conn.connect()
-            for inst in others where inst.kind == .terminal {
-                if let target = await liveSessionTarget(inst, on: host) {
-                    _ = try? await conn.tmux(TmuxCommands.killSession(target.name),
-                                            session: target.name, socket: target.socket)
+        let ids = Set(others.map(\.id))
+        await enqueueLayoutWrite { [self] in
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                let fresh = try await RemoteLayoutStore.read(conn, root: project.remoteRoot)
+                // Keep the action's intended IDs, while taking each surviving
+                // target's current owner from the document inside this queue slot.
+                let current = fresh?.instances.filter { ids.contains($0.id) } ?? []
+                for inst in current where inst.kind == .terminal {
+                    if let target = await liveSessionTarget(inst, on: host) {
+                        _ = try? await conn.tmux(TmuxCommands.killSession(target.name),
+                                                session: target.name, socket: target.socket)
+                    }
                 }
-                terminals.disconnect(inst.id)
+                for id in ids { terminals.disconnect(id) }
+                guard !current.isEmpty else {
+                    publishLayout(fresh, for: project)
+                    return
+                }
+                let written = try await RemoteLayoutStore.mutate(conn, root: project.remoteRoot, seedIfMissing: false) { layout in
+                    layout.instances.removeAll { ids.contains($0.id) }
+                    for id in ids { _ = PaneTree.remove(&layout.layout, target: id) }
+                    return true
+                }
+                publishLayout(written, for: project)
+            } catch {
+                surface(error, host: host)
             }
-            let ids = Set(others.map(\.id))
-            layout = try await RemoteLayoutStore.mutate(conn, root: project.remoteRoot, seedIfMissing: false) { layout in
-                layout.instances.removeAll { ids.contains($0.id) }
-                for id in ids { _ = PaneTree.remove(&layout.layout, target: id) }
-                return true
-            }
-        } catch {
-            surface(error, host: host)
-        }
+        }.value
     }
 
     /// Rename an instance (its tab label) in the shared layout. A blank name clears
     /// the custom name, reverting to the program-derived title.
     func rename(_ instance: Instance, to name: String, in project: RemoteProject) async {
         guard let host = host(for: project) else { return }
-        do {
-            let conn = connection(for: host)
-            try await conn.connect()
-            if let updated = try await RemoteLayoutStore.renameInstance(
-                conn, root: project.remoteRoot, instanceId: instance.id, name: name)
-            {
-                layout = updated
+        await enqueueLayoutWrite { [self] in
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                if let updated = try await RemoteLayoutStore.renameInstance(
+                    conn, root: project.remoteRoot, instanceId: instance.id, name: name)
+                {
+                    publishLayout(updated, for: project)
+                }
+            } catch {
+                surface(error, host: host)
             }
-        } catch {
-            surface(error, host: host)
-        }
+        }.value
     }
 
     /// Duplicate an instance: a new pane running the same program/args, with a fresh
@@ -844,26 +906,42 @@ final class AppState: ObservableObject {
         // (a worktree can back several panes) but gets a fresh, not-yet-started
         // session so it doesn't collide on `--resume`.
         copy.resetConversationForDuplicate()
-        do {
-            let conn = connection(for: host)
-            try await conn.connect()
-            layout = try await RemoteLayoutStore.appendInstance(
-                conn, root: project.remoteRoot, instance: copy)
-            lastLaunched = newId
-            await runPollOnce()
-        } catch {
-            surface(error, host: host)
-        }
+        await enqueueLayoutWrite { [self] in
+            do {
+                let conn = connection(for: host)
+                try await conn.connect()
+                let written = try await RemoteLayoutStore.appendInstance(
+                    conn, root: project.remoteRoot, instance: copy)
+                publishLayout(written, for: project)
+                if selectedProject?.id == project.id {
+                    lastLaunched = newId
+                    await runPollOnce()
+                }
+            } catch {
+                surface(error, host: host)
+            }
+        }.value
     }
 
     /// Run `op` after any in-flight layout write completes, so the phone's own
     /// mutations serialize into one RMW-at-a-time queue.
-    func enqueueLayoutWrite(_ op: @escaping @MainActor () async -> Void) {
+    @discardableResult
+    func enqueueLayoutWrite(_ op: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
         let prev = layoutWriteChain
-        layoutWriteChain = Task { @MainActor in
+        let task = Task { @MainActor in
             await prev?.value
             await op()
         }
+        layoutWriteChain = task
+        return task
+    }
+
+    /// A queued write may finish after navigation; keep its remote result out of
+    /// the newly selected project's UI and invalidate the sidebar's cached layout.
+    private func publishLayout(_ written: RemoteLayout?, for project: RemoteProject) {
+        instanceCache[project.id] = nil
+        guard selectedProject?.id == project.id else { return }
+        layout = written
     }
 
     /// iPad basic split editing: pull `instance`'s tab out of its group into a new pane
@@ -890,7 +968,7 @@ final class AppState: ObservableObject {
                 if let written = try await RemoteLayoutStore.moveIntoSplit(
                     conn, root: project.remoteRoot, dragged: instance.id, target: sibling,
                     direction: direction, before: before) {
-                    layout = written
+                    publishLayout(written, for: project)
                 }
             } catch {
                 surface(error, host: host)
@@ -930,7 +1008,7 @@ final class AppState: ObservableObject {
                         }
                         return true
                     }) {
-                    layout = written
+                    publishLayout(written, for: project)
                 }
             } catch {
                 // Non-fatal: resume just won't engage on the next attach.
@@ -984,7 +1062,7 @@ final class AppState: ObservableObject {
                 if let written = try await RemoteLayoutStore.moveIntoSplit(
                     conn, root: project.remoteRoot, dragged: dragged, target: targetAnchor,
                     direction: direction, before: before) {
-                    layout = written
+                    publishLayout(written, for: project)
                 }
             } catch {
                 surface(error, host: host)
@@ -1007,7 +1085,7 @@ final class AppState: ObservableObject {
                 try await conn.connect()
                 if let written = try await RemoteLayoutStore.setSplitSizes(
                     conn, root: project.remoteRoot, key: key, sizes: sizes) {
-                    layout = written
+                    publishLayout(written, for: project)
                 }
             } catch {
                 surface(error, host: host)
@@ -1033,7 +1111,7 @@ final class AppState: ObservableObject {
                 try await conn.connect()
                 if let written = try await RemoteLayoutStore.moveTabTo(
                     conn, root: project.remoteRoot, dragged: dragged, targetAnchor: targetChip, index: index) {
-                    layout = written
+                    publishLayout(written, for: project)
                 }
             } catch {
                 surface(error, host: host)
@@ -1056,7 +1134,7 @@ final class AppState: ObservableObject {
                 try await conn.connect()
                 if let written = try await RemoteLayoutStore.moveIntoTabs(
                     conn, root: project.remoteRoot, dragged: dragged, target: targetAnchor) {
-                    layout = written
+                    publishLayout(written, for: project)
                 }
             } catch {
                 surface(error, host: host)
@@ -1092,7 +1170,7 @@ final class AppState: ObservableObject {
                     guard selectedProject?.id == project.id, let written else {
                         continuation.resume(returning: false); return
                     }
-                    layout = written
+                    publishLayout(written, for: project)
                     continuation.resume(returning: true)
                 } catch {
                     continuation.resume(throwing: error)
@@ -1101,13 +1179,13 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Callers supply a surviving instance read inside their queued transaction.
     private func liveSessionTarget(_ instance: Instance, on host: Host) async -> TmuxCommands.SessionTarget? {
-        let current = layout?.instances.first { $0.id == instance.id } ?? instance
-        if let socket = current.tmuxSocket, let name = current.tmuxSession {
+        if let socket = instance.tmuxSocket, let name = instance.tmuxSession {
             return TmuxCommands.SessionTarget(name: name, socket: socket)
         }
         let conn = connection(for: host)
-        let out = (try? await conn.run(TmuxCommands.listTargetsCommand(socket: current.tmuxSocket))) ?? ""
-        return TmuxCommands.resolveTarget(current, in: TmuxCommands.parseTargets(out))
+        let out = (try? await conn.run(TmuxCommands.listTargetsCommand(socket: instance.tmuxSocket))) ?? ""
+        return TmuxCommands.resolveTarget(instance, in: TmuxCommands.parseTargets(out))
     }
 }

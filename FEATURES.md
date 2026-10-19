@@ -921,9 +921,12 @@ feature is added or changed, update the matching entry here in the same change**
   includes any socket discovery in its two-second deadline and reaps timed-out
   commands before returning.
   A legacy close saves its selected server before the first kill and keeps that
-  owner through lost replies, retries and reconnect cleanup. The iOS companion
-  serializes ownership writes with layout edits and discards stale attachment
-  work after a project switch; polling uses the same session as attachment.
+  owner through lost replies, retries and reconnect cleanup. Only one restart
+  per pane can resolve and stop a session at a time; stale completions from a
+  closed pane or a previous workspace cannot overwrite its new owner. The iOS
+  companion serializes all layout changes with ownership binding and discards
+  stale publication after a project switch. Its host status sweep includes
+  recorded named sockets and uses the same session as attachment.
 - **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
   speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
   layout sync, the memory file, project scan, remote git, and the connection test
