@@ -61,6 +61,10 @@ pub fn run_job_with_limits(
 ) -> JobOutcome {
     let clone_dir = lib_dir.join(spec.id.to_string());
     let start = Instant::now();
+    #[cfg(test)]
+    if let Some(timings) = &env.timings {
+        timings.lock().unwrap().job_starts.push(start);
+    }
     let git = match spec.kind {
         JobKind::Update if clone_dir.exists() => {
             library_pull(env, &spec.url, &clone_dir, start + limits.pull)
@@ -3255,16 +3259,18 @@ mod tests {
         assert_eq!(snippet_names(&hub, id), vec!["A".to_string()]);
         let state = before(&hub, id, &clone);
 
-        let env = GitEnv::for_tests();
+        let env = GitEnv {
+            timings: Some(Default::default()),
+            ..GitEnv::for_tests()
+        };
         let limits = JobLimits {
             clone: Duration::from_secs(2),
             pull: Duration::from_secs(2),
         };
         let spec = hub.begin(id, JobKind::Resync, T0 + 400).unwrap();
-        let start = Instant::now();
         let outcome = run_job_with_limits(&env, lib_dir.path(), &spec, limits);
-        let elapsed = start.elapsed();
-        assert!(elapsed <= Duration::from_secs(7), "took {elapsed:?}");
+        let finished = Instant::now();
+        let deadline = crate::test_support::git_job_deadline(&env, limits.clone);
         {
             let mut reaped = env.reaped.as_ref().unwrap().lock().unwrap();
             assert!(!reaped.is_empty());
@@ -3281,6 +3287,7 @@ mod tests {
         assert!(clone.join("notes.txt").is_file());
         assert_eq!(before(&hub, id, &clone), state);
         assert_eq!(entries(lib_dir.path()), vec![id.to_string()]);
+        crate::test_support::assert_git_timeout(&env, deadline, finished);
     }
 
     #[test]

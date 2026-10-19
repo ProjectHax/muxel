@@ -2,6 +2,8 @@
 //! muxel-core's pure tmux/worktree helpers.
 
 use crate::i18n::{t, tf};
+#[cfg(test)]
+use crate::test_support::{GitStopReason, GitTimingReceipt, GitTimings};
 use anyhow::{Context, Result, bail};
 use muxel_core::library::GitFailure;
 use muxel_core::library::resync::LocalChanges;
@@ -1570,8 +1572,11 @@ fn run_claim_cleanup(mut cmd: Command, timeout: Duration) -> Result<()> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = cmd.spawn().context("starting tmux claim cleanup")?;
-    let (_, status) = wait_until(child, Instant::now() + timeout);
+    let lifecycle = GitEnv::production();
+    let child = lifecycle
+        .spawn(&mut cmd)
+        .context("starting tmux claim cleanup")?;
+    let (_, status) = lifecycle.wait_until(child, Instant::now() + timeout);
     match status {
         Some(status) if status.success() => Ok(()),
         Some(status) => bail!("tmux claim cleanup failed: {status}"),
@@ -1810,6 +1815,17 @@ pub struct GitEnv {
     /// Tests: called first thing in the local-changes check.
     #[cfg(test)]
     pub check_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Opt-in test receipts; no collector or clocks in production builds.
+    #[cfg(test)]
+    pub timings: Option<Arc<Mutex<GitTimings>>>,
+}
+
+struct GitChild {
+    child: Child,
+    #[cfg(test)]
+    spawn_started: Instant,
+    #[cfg(test)]
+    spawn_finished: Instant,
 }
 
 pub type RenameFn = Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync>;
@@ -1831,6 +1847,8 @@ impl GitEnv {
             remove_dir: Arc::new(|dir: &Path| std::fs::remove_dir_all(dir)),
             #[cfg(test)]
             check_hook: None,
+            #[cfg(test)]
+            timings: None,
         }
     }
 
@@ -1935,6 +1953,29 @@ impl GitEnv {
             reaped.lock().unwrap_or_else(|e| e.into_inner()).push(child);
         }
     }
+
+    fn spawn(&self, command: &mut Command) -> std::io::Result<GitChild> {
+        #[cfg(test)]
+        let spawn_started = Instant::now();
+        let child = command.spawn()?;
+        #[cfg(test)]
+        let spawn_finished = Instant::now();
+        self.spawned.fetch_add(1, Ordering::SeqCst);
+        Ok(GitChild {
+            child,
+            #[cfg(test)]
+            spawn_started,
+            #[cfg(test)]
+            spawn_finished,
+        })
+    }
+
+    #[cfg(test)]
+    fn record_timing(&self, receipt: GitTimingReceipt) {
+        if let Some(timings) = &self.timings {
+            timings.lock().unwrap().children.push(receipt);
+        }
+    }
 }
 
 /// Whether `url` is reached over SSH: `ssh://`, `git+ssh://`, `ssh+git://`, or
@@ -2001,11 +2042,10 @@ fn probe_ssh_command_config(
     };
     cmd.args(["config", "--get", "core.sshCommand"])
         .stderr(Stdio::null());
-    let Ok(child) = cmd.spawn() else {
+    let Ok(child) = env.spawn(&mut cmd) else {
         return SshConfigProbe::Failed;
     };
-    env.spawned.fetch_add(1, Ordering::SeqCst);
-    let (child, status) = wait_until(child, deadline);
+    let (child, status) = env.wait_until(child, deadline);
     env.reap(child);
     match status.and_then(|s| s.code()) {
         Some(0) => SshConfigProbe::Set,
@@ -2014,24 +2054,75 @@ fn probe_ssh_command_config(
     }
 }
 
-/// Poll `child` until it exits or `deadline` passes, then kill its process
-/// tree. Returns the waited-for child and its status (`None` if killed).
-fn wait_until(mut child: Child, deadline: Instant) -> (Child, Option<ExitStatus>) {
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return (child, Some(status)),
-            Ok(None) => {}
-            Err(_) => break,
+impl GitEnv {
+    /// Poll until exit or the original deadline, then kill and wait. Test
+    /// receipts distinguish deadline expiry from a poll error and OS latency.
+    fn wait_until(&self, spawned: GitChild, deadline: Instant) -> (Child, Option<ExitStatus>) {
+        #[cfg(test)]
+        let wait_entered = Instant::now();
+        let mut child = spawned.child;
+        #[cfg(test)]
+        let mut stop = GitStopReason::Deadline;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    #[cfg(test)]
+                    self.record_timing(GitTimingReceipt {
+                        pid: child.id(),
+                        deadline,
+                        spawn_started: spawned.spawn_started,
+                        spawn_finished: spawned.spawn_finished,
+                        wait_entered,
+                        stop: GitStopReason::Exited,
+                        stop_observed: Instant::now(),
+                        kill_started: None,
+                        kill_finished: None,
+                        wait_finished: Instant::now(),
+                        wait_succeeded: false,
+                    });
+                    return (child, Some(status));
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    #[cfg(test)]
+                    {
+                        stop = GitStopReason::PollError;
+                    }
+                    break;
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
         }
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+        #[cfg(test)]
+        let stop_observed = Instant::now();
+        #[cfg(test)]
+        let kill_started = Instant::now();
+        kill_process_tree(&mut child);
+        #[cfg(test)]
+        let kill_finished = Instant::now();
+        let wait_succeeded = child.wait().is_ok();
+        #[cfg(not(test))]
+        let _ = wait_succeeded;
+        #[cfg(test)]
+        self.record_timing(GitTimingReceipt {
+            pid: child.id(),
+            deadline,
+            spawn_started: spawned.spawn_started,
+            spawn_finished: spawned.spawn_finished,
+            wait_entered,
+            stop,
+            stop_observed,
+            kill_started: Some(kill_started),
+            kill_finished: Some(kill_finished),
+            wait_finished: Instant::now(),
+            wait_succeeded,
+        });
+        (child, None)
     }
-    kill_process_tree(&mut child);
-    let _ = child.wait();
-    (child, None)
 }
 
 /// Kill `child` and everything it started (git spawns helpers such as
@@ -2124,7 +2215,7 @@ pub fn run_git(
     }
     cmd.args(args).stderr(Stdio::piped());
 
-    let mut child = match cmd.spawn() {
+    let mut child = match env.spawn(&mut cmd) {
         Ok(child) => child,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(GitFailure::NotFound),
         Err(e) => {
@@ -2133,11 +2224,9 @@ pub fn run_git(
             });
         }
     };
-    env.spawned.fetch_add(1, Ordering::SeqCst);
-
     // Drain stderr on a thread (a full pipe would block git), keeping the tail.
     let (tx, rx) = std::sync::mpsc::channel();
-    if let Some(mut stderr) = child.stderr.take() {
+    if let Some(mut stderr) = child.child.stderr.take() {
         std::thread::spawn(move || {
             use std::io::Read;
             let mut tail: Vec<u8> = Vec::new();
@@ -2155,7 +2244,7 @@ pub fn run_git(
         });
     }
 
-    let (child, status) = wait_until(child, deadline);
+    let (child, status) = env.wait_until(child, deadline);
     env.reap(child);
     let Some(status) = status else {
         return Err(GitFailure::TimedOut { secs: limit_secs });
@@ -2439,11 +2528,10 @@ fn check_git_output(
         cmd.arg("-c").arg(opt);
     }
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::null());
-    let mut child = cmd.spawn().ok()?;
-    env.spawned.fetch_add(1, Ordering::SeqCst);
+    let mut child = env.spawn(&mut cmd).ok()?;
     // Drain stdout on a thread so a large status never blocks git.
     let (tx, rx) = std::sync::mpsc::channel();
-    if let Some(mut stdout) = child.stdout.take() {
+    if let Some(mut stdout) = child.child.stdout.take() {
         std::thread::spawn(move || {
             use std::io::Read;
             let mut out = Vec::new();
@@ -2451,7 +2539,7 @@ fn check_git_output(
             let _ = tx.send(ok.then_some(out));
         });
     }
-    let (child, status) = wait_until(child, deadline);
+    let (child, status) = env.wait_until(child, deadline);
     env.reap(child);
     if !status?.success() {
         return None;
@@ -3784,22 +3872,27 @@ mod tests {
         let before_files = lib_snapshot(&dest);
         let before_head = lib_head(&dest);
         let server = TestServer::silent();
-        let env = GitEnv::for_tests();
+        let env = GitEnv {
+            timings: Some(Default::default()),
+            ..GitEnv::for_tests()
+        };
         let start = Instant::now();
+        let deadline = start + Duration::from_secs(2);
         let res = library_resync(
             &env,
             &server.url("team-lib.git"),
             "",
             &lib_dir,
             id,
-            start + Duration::from_secs(2),
+            deadline,
         );
-        let elapsed = start.elapsed();
+        let finished = Instant::now();
         assert!(matches!(res, Err(GitFailure::TimedOut { .. })), "{res:?}");
-        assert!(elapsed <= Duration::from_secs(7), "took {elapsed:?}");
         assert_all_reaped(&env);
         assert_eq!(lib_snapshot(&dest), before_files);
         assert_eq!(lib_head(&dest), before_head);
+        assert_eq!(lib_entries(&lib_dir), vec![id.to_string()]);
+        crate::test_support::assert_git_timeout(&env, deadline, finished);
         let _ = std::fs::remove_dir_all(&lib_dir);
     }
 
