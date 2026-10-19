@@ -1390,8 +1390,8 @@ pub fn local_tmux_socket(session: &str) -> Socket {
 }
 
 /// Whether a tmux session is still alive, on either server (exact-match target,
-/// so `muxel_p_1` never matches `muxel_p_12`). Fast and blocking; only called for
-/// a pane that just died.
+/// so `muxel_p_1` never matches `muxel_p_12`). Fast and blocking; also distinguishes
+/// reattachment from a new process before preparing per-launch Muse hooks.
 pub fn tmux_session_exists(session: &str) -> bool {
     Socket::BOTH
         .into_iter()
