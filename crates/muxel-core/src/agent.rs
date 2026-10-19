@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+mod codex_sessions;
+pub use codex_sessions::{
+    CodexSession, CodexSessionNames, codex_resume_path, codex_session_from_hint,
+};
+
+#[cfg(test)]
+mod codex_lookup_tests;
+
 /// What a preset opens: a terminal agent or a web-browser pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PresetKind {
@@ -768,20 +776,10 @@ pub fn claude_session_cwd(transcript: &Path) -> std::io::Result<Option<PathBuf>>
 /// `session_id`. Used to decide if a stored id is still resumable before
 /// `codex resume <id>` without opening rollout contents on the activation path.
 pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
-    let Ok(session_id) = Uuid::parse_str(session_id) else {
-        return false;
-    };
-    let root = home.join(".codex").join("sessions");
-    if !root.is_dir() {
-        return false;
-    }
-    let plain_suffix = format!("-{}.jsonl", session_id.hyphenated());
-    let compressed_suffix = format!("-{}.jsonl.zst", session_id.hyphenated());
-    walk_jsonl(&root, &mut |path| {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name.ends_with(&plain_suffix) || name.ends_with(&compressed_suffix))
-    })
+    codex_resume_path(home, session_id, None)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Whether Codex has an exact rollout whose session id and recorded cwd both
@@ -789,25 +787,7 @@ pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
 /// in-process `/resume` switch: existence alone is not enough when sibling panes
 /// share one directory.
 pub fn codex_session_matches_cwd(home: &Path, session_id: &str, cwd: &Path) -> bool {
-    let root = home.join(".codex").join("sessions");
-    if !root.is_dir() {
-        return false;
-    }
-    walk_jsonl(&root, &mut |path| {
-        // Current Codex rollout filenames carry the exact session UUID. Filter
-        // before opening anything so a stale/forged title cannot make the UI
-        // reread every rollout file on every lifecycle tick.
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains(session_id))
-        {
-            return false;
-        }
-        codex_session_meta(path).is_some_and(|(id, recorded_cwd)| {
-            id == session_id && paths_loosely_equal(Path::new(&recorded_cwd), cwd)
-        })
-    })
+    codex_session_from_hint(home, session_id, cwd).is_some()
 }
 
 /// Latest saved display name for each Codex session id.
@@ -819,29 +799,9 @@ pub fn codex_session_matches_cwd(home: &Path, session_id: &str, cwd: &Path) -> b
 pub fn codex_session_names(
     home: &Path,
 ) -> std::io::Result<std::collections::HashMap<String, String>> {
-    use std::io::{BufRead, BufReader};
-
-    let mut names = std::collections::HashMap::new();
-    let path = home.join(".codex").join("session_index.jsonl");
-    let file = std::fs::File::open(path)?;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let Some(id) = value.get("id").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(name) = value
-            .get("thread_name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        else {
-            continue;
-        };
-        names.insert(id.to_string(), name.to_string());
-    }
-    Ok(names)
+    let mut index = CodexSessionNames::default();
+    index.refresh(home)?;
+    Ok(index.into_names())
 }
 
 /// The Codex-owned thread field from a semantic terminal title.
@@ -895,44 +855,7 @@ pub(crate) fn is_codex_thread_id_hint(value: &str) -> bool {
 /// matching recorded cwd exists. This preserves pane identity without trusting
 /// arbitrary OSC title text or a newest-file heuristic.
 pub fn codex_session_id_from_hint(home: &Path, hint: &str, cwd: &Path) -> Option<String> {
-    if !is_codex_thread_id_hint(hint) {
-        return None;
-    }
-    let prefix = hint.strip_suffix("...").unwrap_or(hint);
-    let root = home.join(".codex").join("sessions");
-    if !root.is_dir() {
-        return None;
-    }
-
-    let mut matched = None;
-    let mut ambiguous = false;
-    walk_jsonl(&root, &mut |path| {
-        // Filter by filename before opening rollouts. Codex rollout filenames
-        // carry the full UUID, including for compressed history files.
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains(prefix))
-        {
-            return false;
-        }
-        let Some((id, recorded_cwd)) = codex_session_meta(path) else {
-            return false;
-        };
-        if !id.starts_with(prefix)
-            || Uuid::parse_str(&id).is_err()
-            || !paths_loosely_equal(Path::new(&recorded_cwd), cwd)
-        {
-            return false;
-        }
-        if matched.as_deref().is_some_and(|current| current != id) {
-            ambiguous = true;
-        } else {
-            matched = Some(id);
-        }
-        false
-    });
-    (!ambiguous).then_some(matched).flatten()
+    codex_session_from_hint(home, hint, cwd).map(|session| session.id)
 }
 
 fn is_codex_title_state(state: &str) -> bool {
@@ -971,9 +894,8 @@ fn is_codex_title_state(state: &str) -> bool {
 
 /// Most recently modified Codex session id whose `session_meta.cwd` matches `cwd`.
 ///
-/// This is a legacy recovery path for a pane that was already started before exact
-/// title binding existed but has no saved session id. New and already-bound panes
-/// use their exact captured id and never replace it with this cwd heuristic.
+/// Explicit Import uses this history search in the background. Restore and spawn
+/// never reconstruct pane identity with a newest-by-directory heuristic.
 pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
     let root = home.join(".codex").join("sessions");
     if !root.is_dir() {
@@ -1005,12 +927,17 @@ pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
 /// calling `visit` on each. `visit` returns `true` to stop the walk early (used by
 /// existence checks); returns whether the walk was stopped.
 fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
+    #[cfg(test)]
+    codex_lookup_tests::record_directory(dir);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             if walk_jsonl(&path, visit) {
                 return true;
             }
@@ -1029,6 +956,8 @@ fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
 /// First `session_meta` line in a Codex rollout → `(session_id, cwd)`.
 fn codex_session_meta(path: &Path) -> Option<(String, String)> {
     use std::io::{BufRead, BufReader};
+    #[cfg(test)]
+    codex_lookup_tests::record_open(path);
     let file = std::fs::File::open(path).ok()?;
     for line in BufReader::new(file).lines().take(8) {
         let line = line.ok()?;
@@ -1658,13 +1587,6 @@ mod tests {
             codex_latest_session_id(&tmp, &cwd).as_deref(),
             Some("id-new")
         );
-        assert!(codex_session_matches_cwd(&tmp, "id-new", &cwd));
-        assert!(!codex_session_matches_cwd(
-            &tmp,
-            "id-new",
-            &tmp.join("other")
-        ));
-        assert!(!codex_session_matches_cwd(&tmp, "missing", &cwd));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1673,11 +1595,11 @@ mod tests {
         use std::io::Write;
 
         let tmp = std::env::temp_dir().join(format!("muxel-codex-exists-{}", Uuid::new_v4()));
-        let day = tmp.join(".codex/sessions/2026/09/04");
+        let present_id = "01a1543c-9700-7000-8000-000000000001".to_string();
+        let compressed_id = "01a1543c-9700-7000-8000-000000000002".to_string();
+        let content_only_id = "01a1543c-9700-7000-8000-000000000003".to_string();
+        let day = codex_sessions::directories(&tmp, &present_id)[0].clone();
         std::fs::create_dir_all(&day).unwrap();
-        let present_id = Uuid::new_v4().to_string();
-        let compressed_id = Uuid::new_v4().to_string();
-        let content_only_id = Uuid::new_v4().to_string();
         let path = day.join(format!("rollout-2026-09-04T00-00-00-{present_id}.jsonl"));
         let mut f = std::fs::File::create(path).unwrap();
         writeln!(
@@ -1703,14 +1625,14 @@ mod tests {
     #[test]
     fn truncated_codex_hint_resolves_one_matching_cwd_and_rejects_ambiguity() {
         let tmp = std::env::temp_dir().join(format!("muxel-codex-hint-{}", Uuid::new_v4()));
-        let day = tmp.join(".codex/sessions/2026/09/28");
+        let first = "019f95d7-db31-7db0-904d-9e08330e0000";
+        let second = "019f95d7-db31-7db0-904d-9e08330e0001";
+        let day = codex_sessions::directories(&tmp, first)[0].clone();
         let cwd = tmp.join("project");
         let other = tmp.join("other");
         std::fs::create_dir_all(&day).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        let first = "019f95d7-db31-7db0-904d-9e08330e0000";
-        let second = "019f95d7-db31-7db0-904d-9e08330e0001";
         let hint = format!("{}...", &first[..29]);
         let write_rollout = |id: &str, recorded_cwd: &Path| {
             let meta = serde_json::json!({

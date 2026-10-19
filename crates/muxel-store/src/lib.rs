@@ -11,8 +11,15 @@ use directories::ProjectDirs;
 use muxel_core::{Settings, Uuid, WindowGeom, Workspace, WorkspaceMeta, WorkspacesIndex};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 /// The muxel config directory (e.g. `~/.config/muxel` on Linux).
 pub fn config_dir() -> Option<PathBuf> {
+    #[cfg(feature = "test-support")]
+    if let Some(root) = test_support::root() {
+        return Some(root.join("config"));
+    }
     ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.config_dir().to_path_buf())
 }
 
@@ -163,6 +170,10 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// The muxel data directory (e.g. `~/.local/share/muxel` on Linux).
 pub fn data_dir() -> Option<PathBuf> {
+    #[cfg(feature = "test-support")]
+    if let Some(root) = test_support::root() {
+        return Some(root.join("data"));
+    }
     ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.data_dir().to_path_buf())
 }
 

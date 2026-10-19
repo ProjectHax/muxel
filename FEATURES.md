@@ -141,10 +141,14 @@ feature is added or changed, update the matching entry here in the same change**
   - **Host-minted** (Claude, Grok): `session_id_flag` + `resume_flag` — muxel
     launches with `--session-id` the first time and `--resume` on restart.
   - **Agent-minted** (Codex): only `resume_flag` (`resume`) — first launch is bare;
-    muxel captures the UUID Codex publishes for that pane, validates it against
-    `~/.codex/sessions` before restart, and relaunches as `codex resume <id>`. The immutable
+    muxel captures the UUID Codex publishes for that pane and stores its rollout path,
+    then checks that file before relaunching as `codex resume <id>`. A started pane
+    without a saved UUID starts a fresh conversation; restore never scans history
+    to guess which conversation belonged to it. The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
-    UUIDs resolve only when exactly one rollout matches the pane's directory. Multiple Codex
+    UUIDs resolve in their timestamp's local day directory, with one neighboring day
+    checked near a date boundary. Only matching filenames are opened to validate the
+    pane's directory. Multiple Codex
     panes can share a project without resuming one another's conversations.
   **Conversation switches stick** — an agent can swap its conversation inside a live
   pane (`/resume`, `/clear`, a fork) without restarting the PTY, and muxel rebinds the
@@ -161,12 +165,15 @@ feature is added or changed, update the matching entry here in the same change**
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
   starter binding. Recurring Codex rollout discovery and Claude hook validation run
   in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking, and unresolved results retry with backoff.
+  lookup across pop-out and docking. A failed or ambiguous Codex hint is cached until
+  that hint changes; Claude and Grok retry unresolved results with backoff.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   A saved conversation is abandoned only once muxel has confirmed it
   is really gone — a session store it couldn't read leaves the pane's resume id alone —
   and the pane then quietly starts fresh.
+  Remote Codex panes never check the local session store. Archived Codex sessions
+  require unarchiving in Codex before they can resume.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to
@@ -291,7 +298,8 @@ feature is added or changed, update the matching entry here in the same change**
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
   active work. Local Codex `/rename` values are read
-  from its session index by the pane's captured session UUID, so child commands
+  from its session index by the pane's captured session UUID. The index is checked
+  for changes and only new rows are read; truncating it rebuilds the names. Child commands
   such as `npm` cannot replace the session name or forge a title-derived state
   transition. Remote Codex panes retain the provider's structural title fallback.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers

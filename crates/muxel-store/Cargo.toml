@@ -7,6 +7,9 @@ authors.workspace = true
 repository.workspace = true
 description = "Persistence for muxel: load/save the workspace (projects + pane layouts)."
 
+[features]
+test-support = []
+
 [dependencies]
 muxel-core.workspace = true
 serde_json.workspace = true

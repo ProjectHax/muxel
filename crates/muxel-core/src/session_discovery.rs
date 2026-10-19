@@ -23,6 +23,7 @@ pub struct SessionDiscoveryKey {
     pub child_pid: Option<u32>,
     pub binding_generation: u64,
     pub binding: Option<String>,
+    pub binding_path: Option<PathBuf>,
     pub cwd: PathBuf,
     /// Canonical provider identity hint, excluding title activity/spinners.
     pub hint: Option<String>,
@@ -45,6 +46,8 @@ pub struct SessionDiscovery {
     in_flight: Option<SessionDiscoveryRequest>,
     misses: u32,
     retry_at: Option<Instant>,
+    /// A failed exact hint is immutable; do not keep searching for it each tick.
+    codex_miss: Option<String>,
 }
 
 /// Discovery belongs to a workspace pane, independent of which window owns its
@@ -120,6 +123,15 @@ impl SessionDiscovery {
         now: Instant,
     ) -> Option<SessionDiscoveryRequest> {
         self.observe(Some(&key));
+        if key.provider == SessionProvider::Codex
+            && self.codex_miss == key.hint
+            && key.hint.is_some()
+        {
+            return None;
+        }
+        if self.codex_miss != key.hint {
+            self.codex_miss = None;
+        }
         if self.in_flight.is_some() || self.retry_at.is_some_and(|at| now < at) {
             return None;
         }
@@ -134,8 +146,8 @@ impl SessionDiscovery {
     }
 
     /// Returns whether this result may be applied. `found` controls the next
-    /// poll: a Codex miss backs off 1, 2, 4, 8, 16, then 30 seconds. Claude and
-    /// Grok cap misses at two seconds so new in-process switches stay timely.
+    /// poll: a Codex miss is cached until its hint changes. Claude and Grok cap
+    /// misses at two seconds so new in-process switches stay timely.
     /// A hit polls in one second; a bound Codex hint stops polling altogether.
     pub fn finish(
         &mut self,
@@ -151,6 +163,9 @@ impl SessionDiscovery {
         self.observe(current);
         if current != Some(&request.key) || self.generation != request.generation {
             return false;
+        }
+        if request.key.provider == SessionProvider::Codex && !found {
+            self.codex_miss = request.key.hint.clone();
         }
         let delay = if found {
             self.misses = 0;
@@ -184,9 +199,27 @@ mod tests {
             child_pid: Some(41),
             binding_generation: 7,
             binding: None,
+            binding_path: None,
             cwd: PathBuf::from("project"),
             hint: Some("thread hint".to_string()),
         }
+    }
+
+    #[test]
+    fn b9_codex_missing_hint_is_cached_until_the_hint_changes() {
+        let key = key();
+        let now = Instant::now();
+        let mut discovery = SessionDiscovery::default();
+        let request = discovery.begin(key.clone(), now).unwrap();
+        assert!(discovery.finish(&request, Some(&key), now, false));
+        let later = now + Duration::from_secs(3600);
+        assert!(
+            discovery.begin(key.clone(), later).is_none(),
+            "unchanged missing hint was rescanned"
+        );
+        let mut changed = key;
+        changed.hint = Some("new hint".into());
+        assert!(discovery.begin(changed, later).is_some());
     }
 
     fn workspace(pane: Uuid) -> Workspace {
@@ -261,11 +294,12 @@ mod tests {
     }
 
     #[test]
-    fn discovery_coalesces_unchanged_requests_and_backs_off_missing_files() {
-        let key = key();
+    fn hook_discovery_coalesces_unchanged_requests_and_backs_off_missing_files() {
+        let mut key = key();
+        key.provider = SessionProvider::Claude;
         let mut discovery = SessionDiscovery::default();
         let mut now = Instant::now();
-        for delay in [1, 2, 4, 8, 16, 30, 30] {
+        for delay in [1, 2, 2, 2, 2] {
             let request = discovery.begin(key.clone(), now).unwrap();
             assert!(discovery.begin(key.clone(), now).is_none());
             assert!(discovery.finish(&request, Some(&key), now, false));
@@ -319,6 +353,11 @@ mod tests {
     }
 
     #[test]
+    fn stale_discovery_rejects_a_changed_binding_path() {
+        rejects_changed(|key| key.binding_path = Some(PathBuf::from("new-rollout.jsonl")));
+    }
+
+    #[test]
     fn stale_discovery_rejects_a_changed_cwd() {
         rejects_changed(|key| key.cwd = PathBuf::from("other-project"));
     }
@@ -341,10 +380,11 @@ mod tests {
 
     #[test]
     fn discovery_hit_resets_the_missing_file_backoff() {
-        let key = key();
+        let mut key = key();
+        key.provider = SessionProvider::Claude;
         let mut discovery = SessionDiscovery::default();
         let mut now = Instant::now();
-        for delay in [1, 2, 4] {
+        for delay in [1, 2, 2] {
             let request = discovery.begin(key.clone(), now).unwrap();
             assert!(discovery.finish(&request, Some(&key), now, false));
             now += Duration::from_secs(delay);
@@ -357,7 +397,8 @@ mod tests {
 
     #[test]
     fn changed_key_resets_a_completed_missing_file_backoff() {
-        let key = key();
+        let mut key = key();
+        key.provider = SessionProvider::Claude;
         let now = Instant::now();
         let mut discovery = SessionDiscovery::default();
         let request = discovery.begin(key.clone(), now).unwrap();

@@ -31,13 +31,14 @@ pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
-    AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
-    append_agent_instruction, claude_session_cwd, claude_session_path,
-    codex_developer_instructions_override, codex_latest_session_id, codex_session_exists,
-    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_matches_cwd,
-    codex_session_names, codex_terminal_title_override, file_link_instruction,
-    find_claude_session_path, memory_header, memory_instruction, memory_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args,
+    AgentPreset, CodexSession, CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE,
+    PresetKind, ResolvedLaunch, append_agent_instruction, claude_session_cwd, claude_session_path,
+    codex_developer_instructions_override, codex_latest_session_id, codex_resume_path,
+    codex_session_exists, codex_session_from_hint, codex_session_hint_from_title,
+    codex_session_id_from_hint, codex_session_matches_cwd, codex_session_names,
+    codex_terminal_title_override, file_link_instruction, find_claude_session_path, memory_header,
+    memory_instruction, memory_reference, resolve_launch, resolve_launch_for_session,
+    session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
@@ -572,6 +573,9 @@ pub struct Instance {
     /// on restart. `None` until first launch / for agents without resume support.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Validated provider transcript/rollout path for the saved session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_path: Option<PathBuf>,
     /// Whether this instance's session has been launched at least once, so a
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
@@ -609,6 +613,7 @@ impl Instance {
     /// A duplicated pane copies launch settings, not the source conversation.
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
+        self.session_path = None;
         self.session_started = false;
         self.auto_name = None;
     }
@@ -652,6 +657,7 @@ impl Instance {
             pinned: false,
             worktree_id: None,
             session_id: None,
+            session_path: None,
             session_started: false,
         }
     }
@@ -713,6 +719,7 @@ impl Instance {
             pinned: false,
             worktree_id: None,
             session_id: None,
+            session_path: None,
             session_started: false,
         }
     }
@@ -1380,6 +1387,7 @@ impl RemoteLayout {
                 if edits_only {
                     instance.tmux_session = None;
                     instance.session_id = None;
+                    instance.session_path = None;
                     instance.session_started = false;
                     instance.auto_submit = false;
                 }

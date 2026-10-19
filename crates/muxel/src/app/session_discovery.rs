@@ -13,16 +13,81 @@ use muxel_core::AgentPreset;
 use muxel_core::session_discovery::{
     SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use uuid::Uuid;
+
+// Explicit Import may search history. Restoration must never call this path.
+pub(super) fn capture_codex_session_id(home: &Path, cwd: &Path) -> Option<String> {
+    #[cfg(test)]
+    let injected = CODEX_LAUNCH_TEST_LOOKUP.lock().unwrap().clone();
+    #[cfg(test)]
+    if let Some(discover) = injected {
+        return discover(home, cwd);
+    }
+    muxel_core::codex_latest_session_id(home, cwd)
+}
+
+pub(super) fn resume_codex_session(
+    home: &Path,
+    id: &str,
+    path: Option<&Path>,
+) -> std::io::Result<Option<PathBuf>> {
+    #[cfg(test)]
+    let injected = CODEX_RESUME_TEST_LOOKUP.lock().unwrap().clone();
+    #[cfg(test)]
+    if let Some(discover) = injected {
+        return discover(home, id, path);
+    }
+    muxel_core::codex_resume_path(home, id, path)
+}
+
+#[cfg(test)]
+type CodexResumeTestLookup = std::sync::Arc<
+    dyn Fn(&Path, &str, Option<&Path>) -> std::io::Result<Option<PathBuf>> + Send + Sync,
+>;
+#[cfg(test)]
+static CODEX_RESUME_TEST_LOOKUP: std::sync::Mutex<Option<CodexResumeTestLookup>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(super) fn inject_codex_resume_lookup(discover: CodexResumeTestLookup) -> CodexLaunchTestGuard {
+    *CODEX_RESUME_TEST_LOOKUP.lock().unwrap() = Some(discover);
+    CodexLaunchTestGuard
+}
+
+#[cfg(test)]
+type CodexLaunchTestLookup = std::sync::Arc<dyn Fn(&Path, &Path) -> Option<String> + Send + Sync>;
+#[cfg(test)]
+static CODEX_LAUNCH_TEST_LOOKUP: std::sync::Mutex<Option<CodexLaunchTestLookup>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) struct CodexLaunchTestGuard;
+#[cfg(test)]
+impl Drop for CodexLaunchTestGuard {
+    fn drop(&mut self) {
+        *CODEX_LAUNCH_TEST_LOOKUP.lock().unwrap() = None;
+        *CODEX_RESUME_TEST_LOOKUP.lock().unwrap() = None;
+    }
+}
+#[cfg(test)]
+pub(super) fn inject_codex_launch_lookup(discover: CodexLaunchTestLookup) -> CodexLaunchTestGuard {
+    *CODEX_LAUNCH_TEST_LOOKUP.lock().unwrap() = Some(discover);
+    CodexLaunchTestGuard
+}
 
 struct SessionBindingUpdate {
     pane: Uuid,
     provider: SessionProvider,
     previous_id: Option<String>,
+    previous_path: Option<PathBuf>,
     previous_started: bool,
     previous_auto_name: Option<String>,
+}
+
+struct SessionCandidate {
+    id: String,
+    path: Option<PathBuf>,
 }
 
 impl MuxelApp {
@@ -101,6 +166,7 @@ impl MuxelApp {
             child_pid: view.child_pid(),
             binding_generation: self.session_discoveries.binding_generation(iid),
             binding: instance.session_id.clone(),
+            binding_path: instance.session_path.clone(),
             cwd: instance
                 .worktree_path
                 .as_ref()
@@ -148,8 +214,12 @@ impl MuxelApp {
                     for (request, candidate) in results {
                         let iid = request.key.pane;
                         let current = this.session_discovery_key(iid, cx);
-                        let unowned = candidate.as_deref().is_some_and(|id| {
-                            !session_id_bound_elsewhere(&this.workspace.instances, iid, id)
+                        let unowned = candidate.as_ref().is_some_and(|candidate| {
+                            !session_id_bound_elsewhere(
+                                &this.workspace.instances,
+                                iid,
+                                &candidate.id,
+                            )
                         });
                         let valid = this.session_discoveries.finish(
                             &request,
@@ -159,9 +229,9 @@ impl MuxelApp {
                         );
                         if valid
                             && unowned
-                            && let Some(session_id) = candidate
+                            && let Some(candidate) = candidate
                             && let Some(update) =
-                                this.stage_discovered_session(iid, request.key.provider, session_id)
+                                this.stage_discovered_session(iid, request.key.provider, candidate)
                         {
                             updates.push(update);
                         }
@@ -177,22 +247,30 @@ impl MuxelApp {
         &mut self,
         iid: Uuid,
         provider: SessionProvider,
-        session_id: String,
+        candidate: SessionCandidate,
     ) -> Option<SessionBindingUpdate> {
         let instance = self.workspace.instance_mut(iid)?;
-        if instance.session_id.as_deref() == Some(session_id.as_str()) {
+        let same_id = instance.session_id.as_deref() == Some(candidate.id.as_str());
+        let path = candidate
+            .path
+            .or_else(|| same_id.then(|| instance.session_path.clone()).flatten());
+        if same_id && instance.session_path == path {
             return None;
         }
         let update = SessionBindingUpdate {
             pane: iid,
             provider,
             previous_id: instance.session_id.clone(),
+            previous_path: instance.session_path.clone(),
             previous_started: instance.session_started,
             previous_auto_name: instance.auto_name.clone(),
         };
-        instance.session_id = Some(session_id);
+        instance.session_id = Some(candidate.id);
+        instance.session_path = path;
         instance.session_started = true;
-        instance.auto_name = None;
+        if !same_id {
+            instance.auto_name = None;
+        }
         self.bump_session_binding_generation(iid);
         Some(update)
     }
@@ -223,6 +301,7 @@ impl MuxelApp {
                     .instance_mut(update.pane)
                     .expect("discovery owner exists during synchronous persistence");
                 instance.session_id = update.previous_id;
+                instance.session_path = update.previous_path;
                 instance.session_started = update.previous_started;
                 instance.auto_name = update.previous_auto_name;
                 self.bump_session_binding_generation(update.pane);
@@ -237,7 +316,7 @@ fn discover_sessions(
     requests: Vec<SessionDiscoveryRequest>,
     home: &Path,
     data_dir: Option<&Path>,
-) -> Vec<(SessionDiscoveryRequest, Option<String>)> {
+) -> Vec<(SessionDiscoveryRequest, Option<SessionCandidate>)> {
     #[cfg(windows)]
     let mut grok_snapshot = None;
     requests
@@ -253,9 +332,14 @@ fn discover_sessions(
                     home,
                     &key.cwd,
                     Some(key.pane),
-                ),
+                )
+                .map(|session| SessionCandidate {
+                    id: session.id,
+                    path: Some(session.path),
+                }),
                 SessionProvider::Claude => data_dir.and_then(|data_dir| {
                     session_binding::claude_session_id_from_binding(data_dir, key.pane, home)
+                        .map(|id| SessionCandidate { id, path: None })
                 }),
                 SessionProvider::Grok => {
                     #[cfg(windows)]
@@ -265,6 +349,7 @@ fn discover_sessions(
                         });
                         key.child_pid
                             .and_then(|pid| active_grok_session_for_process(pid, active, parents))
+                            .map(|id| SessionCandidate { id, path: None })
                     }
                     #[cfg(not(windows))]
                     {
