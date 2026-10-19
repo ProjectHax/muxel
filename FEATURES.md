@@ -531,6 +531,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
+  Scheduled loops stay tracked across popout and redock. On Windows, Grok
+  conversation discovery follows the live terminal in either window.
+  Restart docks a popped-out terminal before replacing its process.
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
   receipt confirms writer admission with `pasted: true`.

@@ -53,8 +53,13 @@ use uuid::Uuid;
 
 mod control_api;
 mod libraries_ui;
+mod popout_lifecycle;
+#[cfg(all(test, windows))]
+mod popout_lifecycle_tests;
 mod session_discovery;
 mod tmux_install_modal;
+
+use popout_lifecycle::loop_heartbeat;
 
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
 /// TUIs (Claude/opencode/…) don't get squished narrow enough to overflow.
@@ -10975,35 +10980,13 @@ impl MuxelApp {
     /// Watch in-flight loop runs: close a finished `Exit` agent (idle after working,
     /// or past the safety cap); stop tracking ones that completed or vanished.
     fn process_running_loops(&mut self, cx: &mut Context<Self>) {
-        if self.running_loops.is_empty() {
-            return;
-        }
-        let mut untrack: Vec<Uuid> = Vec::new();
-        let mut close: Vec<Uuid> = Vec::new();
-        for iid in self.running_loops.keys().copied().collect::<Vec<_>>() {
-            // Pane gone (closed manually, or exited + auto-closed) → stop tracking.
-            if !self.terminals.contains_key(&iid) {
-                untrack.push(iid);
-                continue;
-            }
-            let status = self.last_status.get(&iid).copied();
-            let run = self.running_loops.get_mut(&iid).expect("present");
-            if status == Some(AgentStatus::Working) {
-                run.seen_working = true;
-            }
-            let finished = run.seen_working
-                && matches!(status, Some(AgentStatus::Idle) | Some(AgentStatus::Done));
-            let timed_out = run.started.elapsed() >= MAX_LOOP_RUNTIME;
-            if finished || timed_out {
-                untrack.push(iid);
-                if run.post_run == PostRunAction::Exit {
-                    close.push(iid);
-                }
-            }
-        }
-        for iid in untrack {
-            self.running_loops.remove(&iid);
-        }
+        let close = loop_heartbeat(
+            &mut self.running_loops,
+            &self.terminals,
+            &self.popouts,
+            PopOut::terminal_view,
+            |iid, _| self.last_status.get(&iid).copied(),
+        );
         for iid in close {
             self.close_instance_inner(iid, "loop post-run", cx);
         }
@@ -13513,6 +13496,17 @@ impl MuxelApp {
         }
         if let Some(view) = self.terminals.remove(&iid) {
             view.read(cx).session().kill();
+        }
+        if let Some(popout) = self.popouts.remove(&iid) {
+            if let PaneView::Terminal(view) = &popout.view {
+                view.read(cx).session().kill();
+            }
+            // Remove ownership before closing the window so its close callback
+            // cannot repeat teardown or retain an orphaned terminal.
+            let handle = popout.window;
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            });
         }
         // Editors just drop (their buffer is in memory); nothing to kill.
         self.editors.remove(&iid);
@@ -16743,6 +16737,23 @@ impl MuxelApp {
         }
     }
 
+    fn redock_for_restart(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        let Some(handle) = self
+            .popouts
+            .get(&iid)
+            .filter(|popout| popout.terminal_view().is_some())
+            .map(|popout| popout.window)
+        else {
+            return;
+        };
+        self.redock_popout(iid, cx);
+        // Window-closed observers update this entity synchronously. Closing
+        // after it has been returned to GPUI avoids a nested mutable borrow.
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        });
+    }
+
     /// Restart a terminal pane (toolbar Restart, palette, tab menu): stop its
     /// process *and* its tmux session — a plain respawn would just reattach to the
     /// old process — then relaunch, so `new-session -A` starts a fresh session and
@@ -16759,6 +16770,7 @@ impl MuxelApp {
         }
         let recorded_session = inst.tmux_session.clone();
         muxel_store::append_event_log(&format!("restart: \"{}\" [{iid}]", inst.display_name()));
+        self.redock_for_restart(iid, cx);
         self.terminal_launching.remove(&iid);
         self.failed_launches.remove(&iid);
         if let Some(view) = self.terminals.remove(&iid) {
@@ -16822,6 +16834,7 @@ impl MuxelApp {
                     );
                 }
                 // A project restore may have reattached the old session meanwhile.
+                this.redock_for_restart(iid, cx);
                 if let Some(view) = this.terminals.remove(&iid) {
                     view.read(cx).session().kill();
                 }
