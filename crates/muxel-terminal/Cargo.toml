@@ -30,3 +30,8 @@ windows = { version = "0.57", features = [
     "Win32_Foundation",
     "Win32_System_IO",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+# The PTY reader waits on the master plus a wake pipe through epoll / kqueue;
+# macOS's poll(2) does not support PTY devices.
+polling = "3"
