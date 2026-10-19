@@ -822,7 +822,8 @@ final class AppState: ObservableObject {
                 }
                 // Resolve the *live* session by uuid8 suffix so we kill the real one (which
                 // may carry desktop's host slug), not a phone-slug name that doesn't exist.
-                if current.kind == .terminal, let target = await liveSessionTarget(current, on: host) {
+                if current.kind == .terminal, !current.literalArgv,
+                   let target = await liveSessionTarget(current, on: host) {
                     _ = try? await conn.tmux(TmuxCommands.killSession(target.name),
                                             session: target.name, socket: target.socket)
                 }
@@ -850,7 +851,7 @@ final class AppState: ObservableObject {
                 // Keep the action's intended IDs, while taking each surviving
                 // target's current owner from the document inside this queue slot.
                 let current = fresh?.instances.filter { ids.contains($0.id) } ?? []
-                for inst in current where inst.kind == .terminal {
+                for inst in current where inst.kind == .terminal && !inst.literalArgv {
                     if let target = await liveSessionTarget(inst, on: host) {
                         _ = try? await conn.tmux(TmuxCommands.killSession(target.name),
                                                 session: target.name, socket: target.socket)
@@ -900,8 +901,9 @@ final class AppState: ObservableObject {
         let newId = UUID().uuidString.lowercased()
         var copy = instance
         copy.id = newId
-        copy.tmuxSession = TmuxSession.name(hostName: host.name, instanceId: newId)
-        copy.tmuxSocket = TmuxCommands.socketName
+        copy.tmuxSession = copy.literalArgv ? nil : TmuxSession.name(hostName: host.name, instanceId: newId)
+        copy.tmuxSocket = copy.literalArgv ? nil : TmuxCommands.socketName
+        if copy.literalArgv { copy.useTmux = false }
         // Desktop "Inherit" semantics: the duplicate shares the source's worktree
         // (a worktree can back several panes) but gets a fresh, not-yet-started
         // session so it doesn't collide on `--resume`.

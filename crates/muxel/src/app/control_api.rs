@@ -1076,10 +1076,10 @@ impl MuxelApp {
             return None;
         }
         Some(ClaimSite {
-            session: muxel_core::tmux::SessionTarget::new(
-                inst.tmux_session.clone()?,
-                inst.tmux_socket,
-            ),
+            session: {
+                let tmux = InstanceTmux::capture(inst)?;
+                muxel_core::tmux::SessionTarget::new(tmux.recorded_session?, tmux.socket)
+            },
             loc: self.repo_loc(inst.project_id)?,
         })
     }

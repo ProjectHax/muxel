@@ -72,6 +72,33 @@ mod upkeep;
 use popout_lifecycle::loop_heartbeat;
 use restart_guard::{PendingRestarts, RemoteRestartCompletion};
 
+/// Capture tmux eligibility before removing a pane's metadata. An absent
+/// recorded name still permits the legacy remote-name fallback; a literal pane
+/// has no tmux transport at all, even if a peer supplied a stale name.
+struct InstanceTmux {
+    instance_id: Uuid,
+    recorded_session: Option<String>,
+    socket: Option<Socket>,
+}
+
+impl InstanceTmux {
+    fn capture(instance: &Instance) -> Option<Self> {
+        (!instance.literal_argv).then(|| Self {
+            instance_id: instance.id,
+            recorded_session: instance.tmux_session.clone(),
+            socket: instance.tmux_socket,
+        })
+    }
+
+    fn on_host(&self, host_name: &str) -> SessionTarget {
+        SessionTarget::new(muxel_core::tmux::session_for(
+            self.recorded_session.as_deref(),
+            host_name,
+            self.instance_id,
+        ), self.socket)
+    }
+}
+
 /// Build the direct command before any resume/transport discovery. Peer metadata
 /// can contain old tmux/preset fields; none may change literal argv.
 fn literal_command_spec(instance: &Instance, project: Option<&Project>) -> Option<CommandSpec> {
@@ -107,8 +134,49 @@ fn literal_command_spec(instance: &Instance, project: Option<&Project>) -> Optio
 
 #[cfg(test)]
 mod literal_command_tests {
-    use super::literal_command_spec;
-    use muxel_core::{AgentPreset, EnvVar, InjectionMode, Instance, Project};
+    use super::{InstanceTmux, literal_command_spec};
+    use muxel_core::{AgentPreset, EnvVar, InjectionMode, Instance, Project, WorktreeCleanup};
+
+    #[test]
+    fn literal_cleanup_rejects_peer_tmux_metadata_but_keeps_worktree_cleanup() {
+        let mut instance = Instance::shell(uuid::Uuid::new_v4());
+        instance.literal_argv = true;
+        instance.use_tmux = true;
+        instance.worktree_id = Some(uuid::Uuid::new_v4());
+        instance.launch_dir = Some(std::env::temp_dir());
+        for recorded in [None, Some("peer-owned-session".to_string())] {
+            instance.tmux_session = recorded;
+            let captured = (
+                InstanceTmux::capture(&instance),
+                instance.worktree_cleanup(),
+            );
+            assert!(captured.0.is_none());
+            assert_eq!(
+                captured.1,
+                WorktreeCleanup::Registered(instance.worktree_id.unwrap())
+            );
+        }
+        instance.worktree_id = None;
+        assert_eq!(instance.worktree_cleanup(), WorktreeCleanup::None);
+    }
+
+    #[test]
+    fn nonliteral_cleanup_keeps_recorded_names_and_remote_name_fallback() {
+        let mut instance = Instance::shell(uuid::Uuid::new_v4());
+        let captured = InstanceTmux::capture(&instance).unwrap();
+        assert!(captured.recorded_session.is_none());
+        assert_eq!(
+            captured.on_host("remote-host").name,
+            muxel_core::tmux::session_name("remote-host", instance.id)
+        );
+        instance.tmux_session = Some("renamed-peer-session".into());
+        let captured = InstanceTmux::capture(&instance).unwrap();
+        assert_eq!(captured.on_host("different-host").name, "renamed-peer-session");
+        assert_eq!(
+            captured.recorded_session.as_deref(),
+            Some("renamed-peer-session")
+        );
+    }
 
     #[test]
     fn literal_opencode_keeps_passive_status_markers_without_injection() {
@@ -8102,6 +8170,7 @@ impl MuxelApp {
             .instances
             .iter()
             .filter_map(|i| {
+                let tmux = InstanceTmux::capture(i)?;
                 let project = self.workspace.project(i.project_id)?;
                 let host = project
                     .remote
@@ -8113,14 +8182,10 @@ impl MuxelApp {
                     // name the pane was launched with rather than skipping it, which
                     // would leave the session alive on the host forever.
                     Some(host) if host.default_use_tmux || i.use_tmux => {
-                        Some((i.project_id, i.tmux_target(&host.name), true))
+                        Some((i.project_id, tmux.on_host(&host.name), true))
                     }
                     Some(_) => None,
-                    None => Some((
-                        i.project_id,
-                        SessionTarget::new(i.tmux_session.clone()?, i.tmux_socket),
-                        false,
-                    )),
+                    None => Some((i.project_id, SessionTarget::new(tmux.recorded_session?, tmux.socket), false)),
                 }
             })
             .collect()
@@ -11060,11 +11125,11 @@ impl MuxelApp {
                     }
                 }
             }
-            let tmux_session = self.workspace.instance(iid).and_then(|i| {
-                i.tmux_session
-                    .as_ref()
-                    .map(|name| SessionTarget::new(name.clone(), i.tmux_socket))
-            });
+            let tmux_session = self
+                .workspace
+                .instance(iid)
+                .and_then(InstanceTmux::capture)
+                .and_then(|tmux| tmux.recorded_session.map(|name| SessionTarget::new(name, tmux.socket)));
             let is_claude = self.workspace.instance(iid).is_some_and(|instance| {
                 instance
                     .preset_id
@@ -11124,7 +11189,9 @@ impl MuxelApp {
                     at.elapsed() >= reattach_backoff(self.reconnecting.get(&iid).copied())
                 });
 
-            if should_recover_expired_session(is_claude, resume_error, exit_recover) {
+            if self.launch_permitted(iid, muxel_core::TerminalLaunchReason::Recovery)
+                && should_recover_expired_session(is_claude, resume_error, exit_recover)
+            {
                 to_recover.push((iid, title));
             } else if let Some(session) = tmux_session.filter(|_| tmux_lost) {
                 to_reattach.push((iid, title, session));
@@ -13902,8 +13969,7 @@ impl MuxelApp {
         &mut self,
         iid: Uuid,
         project_id: Uuid,
-        // The session name recorded on the instance, if it had one (`tmux_session`).
-        recorded_session: Option<SessionTarget>,
+        tmux: Option<InstanceTmux>,
         worktree_cleanup: muxel_core::WorktreeCleanup,
         cx: &mut Context<Self>,
     ) {
@@ -13932,25 +13998,23 @@ impl MuxelApp {
                     .map(|h| h.effective(&self.identities))
             })
             .filter(|host| !host.os.is_windows());
-        match remote_host {
+        match (tmux, remote_host) {
             // The same name the pane was launched with — a recomputed one would
             // leave the session it was actually running alive on the host forever.
             // A pane that never had a session confirms as already gone, so aiming
             // at one costs a single round trip and nothing else.
-            Some(host) => {
-                let session = recorded_session.unwrap_or_else(|| {
-                    SessionTarget::new(muxel_core::tmux::session_name(&host.name, iid), None)
-                });
+            (Some(tmux), Some(host)) => {
+                let session = tmux.on_host(&host.name);
                 self.reap_remote_session(project_id, iid, host, session, cx);
             }
             // A remote instance's session lives on the host, not here; killing the
             // recorded name locally would be a no-op at best.
-            None if !is_remote => {
-                if let Some(session) = recorded_session {
-                    integrations::kill_tmux_session(&session);
+            (Some(tmux), None) if !is_remote => {
+                if let Some(session) = tmux.recorded_session {
+                    integrations::kill_tmux_session(&SessionTarget::new(session, tmux.socket));
                 }
             }
-            None => {}
+            _ => {}
         }
         // Worktree disposed only when its last instance is gone.
         let root = self
@@ -14275,18 +14339,13 @@ impl MuxelApp {
         self.browsers.remove(&iid);
 
         // Tear down tmux (local or remote) + worktree (capture info before drop).
-        let info = self.workspace.instance(iid).map(|i| {
-            (
-                i.tmux_session
-                    .as_ref()
-                    .map(|name| SessionTarget::new(name.clone(), i.tmux_socket)),
-                i.worktree_cleanup(),
-                i.project_id,
-            )
-        });
+        let info = self
+            .workspace
+            .instance(iid)
+            .map(|i| (InstanceTmux::capture(i), i.worktree_cleanup(), i.project_id));
         self.workspace.remove_instance_meta(iid);
-        if let Some((local_session, worktree_cleanup, project_id)) = info {
-            self.teardown_closed_instance(iid, project_id, local_session, worktree_cleanup, cx);
+        if let Some((tmux, worktree_cleanup, project_id)) = info {
+            self.teardown_closed_instance(iid, project_id, tmux, worktree_cleanup, cx);
         }
         self.last_status.remove(&iid);
         self.failed_launches.remove(&iid);
@@ -16968,19 +17027,14 @@ impl MuxelApp {
             view.read(cx).session().kill();
         }
         // Tear down tmux (local or remote) + worktree, then drop the orphan meta.
-        let info = self.workspace.instance(iid).map(|i| {
-            (
-                i.tmux_session
-                    .as_ref()
-                    .map(|name| SessionTarget::new(name.clone(), i.tmux_socket)),
-                i.worktree_cleanup(),
-                i.project_id,
-            )
-        });
+        let info = self
+            .workspace
+            .instance(iid)
+            .map(|i| (InstanceTmux::capture(i), i.worktree_cleanup(), i.project_id));
         self.workspace.remove_instance_meta(iid);
-        if let Some((local_session, worktree_cleanup, project_id)) = info {
+        if let Some((tmux, worktree_cleanup, project_id)) = info {
             // Popout window closed deliberately → kill the remote session too.
-            self.teardown_closed_instance(iid, project_id, local_session, worktree_cleanup, cx);
+            self.teardown_closed_instance(iid, project_id, tmux, worktree_cleanup, cx);
         }
         self.last_status.remove(&iid);
         self.persist();
@@ -17694,6 +17748,9 @@ impl MuxelApp {
         inst.id = Uuid::new_v4();
         inst.tmux_session = None;
         inst.tmux_socket = None;
+        if inst.literal_argv {
+            inst.use_tmux = false;
+        }
         inst.pinned = false; // a duplicate starts unpinned
         // A pane owns one resumable conversation. Reusing the source session id
         // lets two live Claudes create branches in one transcript; after restart
