@@ -701,6 +701,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Key routing** — `Tab` / `Shift+Tab` go to the focused terminal rather than
   moving UI focus. `Shift+Enter` / `Alt+Enter` send `ESC CR` so agent TUIs
   (Grok, etc.) can insert a soft newline; plain `Enter` stays CR (submit).
+  `Alt/Option+Backspace` sends `ESC DEL` (delete word), `Ctrl+Backspace` sends
+  `Ctrl+W` (delete word) and `Cmd+Backspace` (macOS) sends `Ctrl+U` (delete to
+  line start), matching iTerm2's natural text editing and Warp.
 - **Agent-first plain Ctrl+letter** — muxel app shortcuts that are plain
   `Ctrl+A`…`Ctrl+Z` (no Shift) do **not** fire while a terminal is focused, so
   agents receive them as normal C0 chords (Claude `Ctrl+S` stash, shell
