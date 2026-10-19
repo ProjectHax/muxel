@@ -26,7 +26,7 @@ pub use present_flag::{mark_present_needed, take_present_needed};
 pub use profile::startup_event;
 pub use session::{
     CommandSpec, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY, PtyChunk,
-    PtyOutputQueueStats, PtyReceiver, TerminalSession,
+    PtyOutputQueueStats, PtyReceiver, TerminalSession, literal_program_for_spawn,
 };
 pub use view::{
     AgentStatus, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,

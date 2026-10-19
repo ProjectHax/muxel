@@ -18,6 +18,27 @@ use serde_json::{Value, json};
 /// What a request comes to: its reply, or why there is none.
 type CtlResult<T> = Result<T, ctl::Error>;
 
+mod approval;
+mod new;
+pub(super) use approval::PreparedCreation;
+#[cfg(test)]
+#[path = "control_api/new_tests.rs"]
+mod new_tests;
+
+/// Shared command permission for typing into an existing terminal. This is
+/// rechecked on every write, including panes created before the opt-in was revoked.
+fn control_program_writable(inst: &Instance, allow_shells: bool) -> Result<(), String> {
+    if !allow_shells && (inst.literal_argv || !readaloud::is_agent_program(inst.program.as_deref()))
+    {
+        let name = inst.display_name();
+        return Err(format!(
+            "typing into '{name}' requires command execution permission in Settings > \
+             Grok Bot > \"Also allow typing into shell panes\""
+        ));
+    }
+    Ok(())
+}
+
 /// A prompt (or answer) typed through `muxel ctl`: what it was, and when it was
 /// submitted, so `wait` knows which turn it is waiting for. Runtime-only.
 pub(super) struct ControlTurn {
@@ -34,6 +55,10 @@ enum Answer {
     Now(CtlResult<Value>),
     Later(Box<dyn FnOnce() -> CtlResult<Value> + Send>),
     Type(Box<Typing>),
+    Open {
+        project: String,
+        options: ctl::NewOptions,
+    },
 }
 
 /// What `send`, `answer` and `keys` type.
@@ -115,6 +140,7 @@ impl MuxelApp {
     /// Start or stop the control server to match the setting. Idempotent; called
     /// each tick (so a settings Cancel is honored too) and by the checkbox.
     pub(super) fn sync_control(&mut self, cx: &mut Context<Self>) {
+        self.sync_control_approvals(cx);
         let want = self.settings.control_enabled;
         if want && self.control.is_none() && !self.control_failed {
             let (tx, rx) = async_channel::unbounded();
@@ -293,6 +319,25 @@ impl MuxelApp {
                             })),
                         t("Allow outside tools to control muxel"),
                     ))
+                    .child(self.settings_label(&t("Outside terminal creation"), cx))
+                    .child(div().flex().gap_2().children([
+                        (ctl::CreationPolicy::Off, t("Off")),
+                        (ctl::CreationPolicy::Ask, t("Ask")),
+                        (ctl::CreationPolicy::Allow, t("Allow")),
+                    ].into_iter().map(|(policy, label)| {
+                        Button::new(SharedString::from(format!("grok-control-new-{policy:?}")))
+                            .ghost().label(label).selected(self.settings.control_allow_new == policy)
+                            .disabled(!enabled)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.settings.control_allow_new = policy;
+                                this.persist_settings();
+                                this.sync_control_approvals(cx);
+                                cx.notify();
+                            }))
+                    })))
+                    .child(hint(t(
+                        "Off by default, including upgrades. Ask requires a click for each request. Allow opens configured non-shell terminal presets; literal commands and shell presets always Ask and also require the shell/command permission below. Approvals expire after 120 seconds. Turning creation or outside control off refuses all pending requests. Outside control off also stops the control server. Existing panes, admitted launches and typing permissions are unchanged. Toolbar creation is unaffected.",
+                    )))
                     .child(check(
                         Checkbox::new("grok-control-shells")
                             .checked(self.settings.control_allow_shells)
@@ -302,7 +347,7 @@ impl MuxelApp {
                                 this.persist_settings();
                                 cx.notify();
                             })),
-                        t("Also allow typing into shell panes. Leave this off unless you want Grok Bot to run commands in your shells; it can always use your coding agents."),
+                        t("Also allow typing into shell panes. This permits writes to shell and raw-command panes. With terminal creation enabled, it also permits shell presets and all literal argv, including agent argv. Commands run as the host muxel process, outside the caller's sandbox. Configured non-literal agent presets do not need this command grant; presets are trusted configuration, not a sandbox."),
                     ))
                     .child(
                         div()
@@ -502,6 +547,9 @@ impl MuxelApp {
             Err(error) => ctl::Response::err(error),
         };
         match self.control_command(command, cx) {
+            Answer::Open { project, options } => {
+                self.admit_control_new(project, options, reply, cx);
+            }
             Answer::Now(result) => {
                 let _ = reply.send(respond(result));
             }
@@ -569,6 +617,25 @@ impl MuxelApp {
     }
 
     fn control_command(&mut self, command: Command, cx: &mut Context<Self>) -> Answer {
+        self.sync_control_approvals(cx);
+        if let Command::NewStatus { request_id } = &command {
+            return Answer::Now(self.control_approvals.status(*request_id));
+        }
+        if matches!(
+            &command,
+            Command::New { .. }
+                | Command::Send { .. }
+                | Command::Answer { .. }
+                | Command::Keys { .. }
+        ) && !self.settings.control_enabled
+        {
+            return Answer::Now(Err(ctl::creation_refusal(ErrorCode::ControlDisabled)));
+        }
+        if matches!(&command, Command::New { .. })
+            && self.settings.control_allow_new == ctl::CreationPolicy::Off
+        {
+            return Answer::Now(Err(ctl::creation_refusal(ErrorCode::CreationDisabled)));
+        }
         if self.current_workspace.is_none() {
             return Answer::Now(Err(
                 "no workspace is open in muxel yet: pick one in its workspace selector".into(),
@@ -578,6 +645,8 @@ impl MuxelApp {
         self.control_turns.retain(|id, _| live.contains(id));
         let now = now_ms();
         match command {
+            Command::New { project, options } => Answer::Open { project, options },
+            Command::NewStatus { .. } => unreachable!("handled before workspace lookup"),
             Command::Projects => Answer::Now(Ok(self.control_projects(cx))),
             Command::Panes { project } => {
                 Answer::Now(self.control_panes(project.as_deref(), now, cx))
@@ -621,6 +690,16 @@ impl MuxelApp {
                     .and_then(|iid| self.control_keys(iid, &keys, cx)),
             ),
         }
+    }
+
+    fn control_new_destination(&self, query: &str) -> Result<Uuid, String> {
+        let named: Vec<_> = self
+            .workspace
+            .projects
+            .iter()
+            .map(|p| (p.id, p.name.as_str()))
+            .collect();
+        ctl::resolve_project(query, &named, self.workspace.active_project)
     }
 
     // --- What is there ---------------------------------------------------------
@@ -743,8 +822,7 @@ impl MuxelApp {
             None => p.root_path.to_string_lossy().into_owned(),
         });
         let cwd = inst
-            .worktree_path
-            .as_ref()
+            .working_directory()
             .map(|p| p.to_string_lossy().into_owned())
             .or(root);
         AgentInfo {
@@ -956,16 +1034,7 @@ impl MuxelApp {
             )
             .into());
         }
-        if !readaloud::is_agent_program(inst.program.as_deref())
-            && !self.settings.control_allow_shells
-        {
-            return Err(format!(
-                "'{name}' is a shell, and muxel only lets outside tools type into coding \
-                 agents unless Settings > Grok Bot > \"Also allow typing into shell panes\" \
-                 is on"
-            )
-            .into());
-        }
+        control_program_writable(inst, self.settings.control_allow_shells)?;
         let refuse = |code, message: String| Err(ctl::Error::new(code, message));
         match self.control_state(inst, cx) {
             Some(AgentState::Exited) => {
@@ -1232,17 +1301,33 @@ impl MuxelApp {
                 })
             }
             Input::Keys(presses) => {
-                cx.spawn(async move |_this: WeakEntity<Self>, cx| {
+                cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     for (i, (bytes, submit)) in presses.into_iter().enumerate() {
                         if i > 0 {
                             cx.background_executor()
                                 .timer(Duration::from_millis(KEY_GAP_MS))
                                 .await;
                         }
-                        if submit {
-                            session.mark_turn_submitted();
+                        // Recheck each key after its delay. A restarted pane
+                        // must not receive input meant for its previous session.
+                        let wrote = this
+                            .update(cx, |app, cx| {
+                                let Ok(current_session) = app.control_writable(iid, cx) else {
+                                    return false;
+                                };
+                                if !Arc::ptr_eq(&session, &current_session) {
+                                    return false;
+                                }
+                                if submit {
+                                    session.mark_turn_submitted();
+                                }
+                                session.write_input(&bytes);
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !wrote {
+                            break;
                         }
-                        session.write_input(&bytes);
                     }
                 })
                 .detach();

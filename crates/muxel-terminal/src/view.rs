@@ -1006,9 +1006,9 @@ struct DrainTransport {
 
 impl TerminalLaunch {
     /// Spawn `spec` at `size` (`(cols, rows)`); if it can't be launched (e.g. the
-    /// agent isn't installed), fall back to a shell that prints the error. `Err` only
-    /// when even the fallback shell can't spawn (bogus `$SHELL` and no `/bin/bash`,
-    /// fd exhaustion, …).
+    /// agent isn't installed), fall back to a shell that prints the error. Literal
+    /// commands surface their error without substituting another program. Other
+    /// launches return `Err` only when even the fallback shell can't spawn.
     ///
     /// `size` should be the grid the pane will actually render at — see
     /// [`TerminalSession::size`]. Getting it right up front is what keeps a
@@ -1042,6 +1042,7 @@ impl TerminalLaunch {
                 rx,
                 launch_error: None,
             }),
+            Err(e) if spec.literal_argv => Err(e),
             Err(e) => {
                 // Capture the full error (incl. the OS code) for the dev console.
                 let launch_error = format!("{e:#}");
@@ -2087,6 +2088,28 @@ mod launch_identity_tests {
                 .any(|w| w == expected.as_bytes()),
             "fallback must have its own id and no requested transport env: {:?}",
             String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[cfg(test)]
+mod literal_launch_tests {
+    use super::TerminalLaunch;
+    use crate::session::CommandSpec;
+
+    #[test]
+    fn literal_failure_never_substitutes_a_fallback_program() {
+        let missing =
+            std::env::temp_dir().join(format!("muxel-missing-{}.exe", uuid::Uuid::new_v4()));
+        let fallback = CommandSpec::program(missing.display().to_string(), vec![]);
+        let literal =
+            CommandSpec::literal(missing.display().to_string(), vec!["opening brief".into()]);
+        let error = TerminalLaunch::spawn_with_fallback(literal, fallback, (80, 24), None)
+            .err()
+            .expect("literal launch must fail");
+        assert!(
+            !format!("{error:#}").contains("fallback shell"),
+            "{error:#}"
         );
     }
 }

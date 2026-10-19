@@ -72,6 +72,141 @@ mod upkeep;
 use popout_lifecycle::loop_heartbeat;
 use restart_guard::{PendingRestarts, RemoteRestartCompletion};
 
+/// Build the direct command before any resume/transport discovery. Peer metadata
+/// can contain old tmux/preset fields; none may change literal argv.
+fn literal_command_spec(instance: &Instance, project: Option<&Project>) -> Option<CommandSpec> {
+    if !instance.literal_argv {
+        return None;
+    }
+    let mut spec = CommandSpec::literal(
+        instance.program.clone().unwrap_or_default(),
+        instance.args.clone(),
+    );
+    if let Some(cwd) = instance
+        .working_directory()
+        .or_else(|| project.map(|p| p.root_path.as_path()))
+    {
+        spec = spec.with_cwd(cwd.display().to_string());
+    }
+    let configured = instance
+        .env
+        .iter()
+        .map(|v| (v.key.clone(), v.value.clone()))
+        .collect::<Vec<_>>();
+    (spec.env, spec.env_remove) = crate::session_binding::pane_env(
+        &configured,
+        Vec::new(),
+        instance.id,
+        crate::session_binding::PaneProcess::Program,
+    );
+    // These only inspect terminal output for status; they never change argv,
+    // environment or startup input, so literal commands keep the built-in cues.
+    let (working, blocked) = default_markers(instance.program.as_deref());
+    Some(spec.with_markers(working, blocked))
+}
+
+#[cfg(test)]
+mod literal_command_tests {
+    use super::literal_command_spec;
+    use muxel_core::{AgentPreset, EnvVar, InjectionMode, Instance, Project};
+
+    #[test]
+    fn literal_opencode_keeps_passive_status_markers_without_injection() {
+        let mut instance = Instance::from_preset(uuid::Uuid::new_v4(), &AgentPreset::opencode());
+        instance.literal_argv = true;
+        instance.args = vec!["opening brief".into(), "".into()];
+        instance.system_prompt = Some("never inject".into());
+        instance.injection = InjectionMode::TypeIn;
+        instance.auto_mode_presses = 2;
+        let spec = literal_command_spec(&instance, None).unwrap();
+        assert_eq!(spec.working_markers, ["esc interrupt"]);
+        assert_eq!(spec.blocked_markers, ["Permission required"]);
+        assert_eq!(spec.args, instance.args);
+        assert_eq!(
+            spec.env,
+            [(
+                muxel_core::control::INSTANCE_ID_ENV.to_string(),
+                instance.id.to_string()
+            )]
+        );
+        assert!(spec.startup_input.is_none());
+        assert_eq!(spec.auto_mode_presses, 0);
+        assert!(!spec.submit);
+    }
+
+    #[test]
+    fn stale_peer_transport_and_preset_metadata_never_wrap_a_literal_command() {
+        let project = Project::new("repo", std::env::current_dir().unwrap());
+        let mut instance = Instance::from_preset(project.id, &AgentPreset::codex());
+        instance.literal_argv = true;
+        instance.program = Some("native.exe".into());
+        instance.args = vec!["brief with spaces".into(), "".into()];
+        instance.launch_dir = Some(std::env::temp_dir());
+        instance.use_tmux = true;
+        instance.tmux_session = Some("stale-peer-session".into());
+        instance.system_prompt = Some("never inject".into());
+        instance.injection = InjectionMode::TypeIn;
+        instance.env = vec![EnvVar {
+            key: "CUSTOM".into(),
+            value: "value".into(),
+        }];
+        let spec = literal_command_spec(&instance, Some(&project)).unwrap();
+        assert!(spec.literal_argv);
+        assert_eq!(spec.program, "native.exe");
+        assert_eq!(spec.args, instance.args);
+        assert_eq!(
+            spec.cwd,
+            instance.launch_dir.map(|p| p.display().to_string())
+        );
+        assert!(
+            spec.env
+                .contains(&("CUSTOM".to_string(), "value".to_string()))
+        );
+        assert!(spec.env.contains(&(
+            muxel_core::control::INSTANCE_ID_ENV.to_string(),
+            instance.id.to_string()
+        )));
+        assert_eq!(spec.env.len(), 2);
+        assert!(spec.startup_input.is_none());
+        assert_eq!(spec.auto_mode_presses, 0);
+    }
+
+    #[test]
+    fn literal_command_owns_instance_id_even_when_inherited() {
+        const CHILD: &str = "MUXEL_LITERAL_ENV_TEST_CHILD";
+        const ID: &str = muxel_core::control::INSTANCE_ID_ENV;
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "app::literal_command_tests::literal_command_owns_instance_id_even_when_inherited", "--nocapture"])
+                .env(CHILD, "1").env(ID, "inherited-foreign-pane").output().unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert_eq!(std::env::var(ID).unwrap(), "inherited-foreign-pane");
+        let mut instance = Instance::shell(uuid::Uuid::new_v4());
+        instance.literal_argv = true;
+        instance.env.push(EnvVar {
+            key: ID.into(),
+            value: "configured-foreign-pane".into(),
+        });
+        let spec = literal_command_spec(&instance, None).unwrap();
+        let ids: Vec<_> = spec
+            .env
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(ID))
+            .collect();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].1, instance.id.to_string());
+        assert!(spec.env_remove.is_empty());
+    }
+}
+
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
 /// TUIs (Claude/opencode/…) don't get squished narrow enough to overflow.
 const MIN_PANE_WIDTH: Pixels = px(340.0);
@@ -1113,8 +1248,7 @@ fn resolve_agent_launch(
         };
         // Relative references keep project paths out of process argv.
         let cwd = instance
-            .worktree_path
-            .as_ref()
+            .working_directory()
             .map(|w| w.display().to_string());
         let instruction = memory_instruction(&memory_reference(&root, cwd.as_deref()));
         add_automatic(instruction, &mut instance);
@@ -1211,6 +1345,41 @@ mod launch_instruction_transport_tests {
             resolve_launch_for_session(&instance, true).startup_input,
             None
         );
+    }
+
+    #[test]
+    fn consumed_ctl_tasks_leave_no_startup_text_after_launch_instructions_are_assembled() {
+        let mut project = Project::new("repo", std::env::current_dir().unwrap());
+        project.memory_enabled = true;
+        for preset in [
+            AgentPreset::claude(),
+            AgentPreset::grok(),
+            AgentPreset::codex(),
+            AgentPreset::opencode(),
+        ] {
+            let mut instance = muxel_core::control::NewOptions {
+                prompt: Some("B5 one-shot task".into()),
+                ..Default::default()
+            }
+            .instance(&project, &[preset], 0)
+            .unwrap();
+            let first = resolve_agent_launch(&instance, Some(&project), false);
+            assert!(
+                first
+                    .startup_input
+                    .as_deref()
+                    .unwrap()
+                    .contains("B5 one-shot task")
+            );
+            assert!(first.submit);
+            assert!(instance.consume_runner_prompt());
+            let restored = serde_json::from_value(serde_json::to_value(instance).unwrap()).unwrap();
+            for resuming in [false, true] {
+                let launch = resolve_agent_launch(&restored, Some(&project), resuming);
+                assert_eq!(launch.startup_input, None);
+                assert!(!launch.submit);
+            }
+        }
     }
 
     #[test]
@@ -3672,6 +3841,9 @@ pub struct MuxelApp {
     control_failed: bool,
     /// Prompts typed through `muxel ctl`, per pane, for `show` and `wait`.
     control_turns: HashMap<Uuid, control_api::ControlTurn>,
+    /// Runtime-only click approvals; no connection waits for the human.
+    control_approvals: muxel_core::control::ApprovalQueue<control_api::PreparedCreation>,
+    control_approval_notified: Option<Uuid>,
 }
 
 /// One content-search match (file + 0-based line + the matched line text).
@@ -5798,6 +5970,8 @@ impl MuxelApp {
             control_task: None,
             control_failed: false,
             control_turns: HashMap::new(),
+            control_approvals: Default::default(),
+            control_approval_notified: None,
         };
 
         // Flush any coalesced auto-title before shutdown. On Unix, muxel also
@@ -6315,6 +6489,9 @@ impl MuxelApp {
         let _phase = ui_profile::phase("activation", "session-resume", Some(iid));
         let (preset, cwd, local) = {
             let inst = self.workspace.instance(iid)?;
+            if inst.literal_argv {
+                return None;
+            }
             let preset = inst
                 .preset_id
                 .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
@@ -6322,8 +6499,8 @@ impl MuxelApp {
             preset.resume_flag.as_ref()?;
             let project = self.workspace.project(inst.project_id);
             let cwd = inst
-                .worktree_path
-                .clone()
+                .working_directory()
+                .map(std::path::Path::to_path_buf)
                 .or_else(|| project.map(|project| project.root_path.clone()));
             let local = project.is_some_and(|project| project.remote.is_none());
             (preset.clone(), cwd, local)
@@ -6401,6 +6578,15 @@ impl MuxelApp {
 
     fn command_for(&mut self, instance_id: Uuid) -> Result<CommandSpec, String> {
         let _phase = ui_profile::phase("activation", "command-for", Some(instance_id));
+        // Literal commands bypass every transport, prompt and resume wrapper,
+        // including stale tmux metadata adopted from a shared layout.
+        if let Some(spec) = self
+            .workspace
+            .instance(instance_id)
+            .and_then(|inst| literal_command_spec(inst, self.workspace.project(inst.project_id)))
+        {
+            return Ok(spec);
+        }
         let unresolved = self.workspace.instance(instance_id).and_then(|instance| {
             let project = self.workspace.project(instance.project_id)?;
             (project.remote.is_none()
@@ -6471,6 +6657,7 @@ impl MuxelApp {
             .iter()
             .any(|arg| arg == "--settings" || arg.starts_with("--settings="));
         let local_claude = is_claude_program(agent_program.as_deref())
+            && inst.is_none_or(|i| !i.literal_argv)
             && project.is_some_and(|project| project.remote.is_none());
         // The hook finds its pane through `MUXEL_INSTANCE_ID`. Direct launches
         // get it below; new tmux sessions get it when tmux supports `-e`.
@@ -6506,7 +6693,7 @@ impl MuxelApp {
         // inside that remote string, so there is no local PTY cwd.
         let (mut spec, local_cwd, extra_env) = if let Some((host, rref)) = remote {
             let remote_cwd = inst
-                .and_then(|i| i.worktree_path.as_ref())
+                .and_then(Instance::working_directory)
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| rref.remote_root.clone());
             let control_path = pane_master.unwrap_or_else(|| {
@@ -6521,7 +6708,7 @@ impl MuxelApp {
             // project directory, even though the transcript itself still exists.
             let cwd = effective_local_cwd(
                 session_resume.as_ref().and_then(|(_, cwd)| cwd.as_deref()),
-                inst.and_then(|i| i.worktree_path.as_deref()),
+                inst.and_then(Instance::working_directory),
                 project.map(|p| p.root_path.as_path()),
             );
             // If this instance uses tmux, wrap the command in `tmux new-session -A`
@@ -6679,7 +6866,35 @@ impl MuxelApp {
 
     /// Spawn (or replace) the live terminal for an instance id.
     fn spawn_terminal(&mut self, instance_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminal_restarts.contains(instance_id) {
+        self.spawn_terminal_for(
+            instance_id,
+            muxel_core::TerminalLaunchReason::Recovery,
+            window,
+            cx,
+        );
+    }
+
+    fn launch_permitted(&self, iid: Uuid, reason: muxel_core::TerminalLaunchReason) -> bool {
+        self.workspace.instance(iid).is_some_and(|i| {
+            i.permits_launch(reason)
+                && (!i.literal_argv
+                    || self
+                        .workspace
+                        .project(i.project_id)
+                        .is_some_and(|p| !p.is_remote()))
+        })
+    }
+
+    fn spawn_terminal_for(
+        &mut self,
+        instance_id: Uuid,
+        reason: muxel_core::TerminalLaunchReason,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.terminal_restarts.contains(instance_id)
+            || !self.launch_permitted(instance_id, reason)
+        {
             return;
         }
         let _phase = ui_profile::phase("activation", "spawn-terminal-immediate", Some(instance_id));
@@ -6745,6 +6960,9 @@ impl MuxelApp {
     /// Whether `iid` runs a preset that can reopen its conversation (`resume_flag`).
     fn resume_capable(&self, iid: Uuid) -> bool {
         self.workspace.instance(iid).is_some_and(|inst| {
+            if inst.literal_argv {
+                return false;
+            }
             inst.preset_id
                 .and_then(|id| self.presets.iter().find(|preset| preset.id == id))
                 .or_else(|| {
@@ -6778,8 +6996,18 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
-        let token = self.reserve_terminal_spawn(instance_id, window, cx)?;
-        self.prepare_reserved_terminal_spawn(instance_id, token, cx)
+        let token = self.reserve_terminal_spawn(
+            instance_id,
+            muxel_core::TerminalLaunchReason::Restore,
+            window,
+            cx,
+        )?;
+        self.prepare_reserved_terminal_spawn(
+            instance_id,
+            token,
+            muxel_core::TerminalLaunchReason::Restore,
+            cx,
+        )
     }
 
     /// Claim one generation without doing command discovery or PTY work. This
@@ -6787,11 +7015,13 @@ impl MuxelApp {
     fn reserve_terminal_spawn(
         &mut self,
         instance_id: Uuid,
+        reason: muxel_core::TerminalLaunchReason,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<u64> {
         let _phase = ui_profile::phase("activation", "reserve-terminal", Some(instance_id));
-        if self.terminals.contains_key(&instance_id)
+        if !self.launch_permitted(instance_id, reason)
+            || self.terminals.contains_key(&instance_id)
             || self.failed_launches.contains_key(&instance_id)
             || self.terminal_launching.contains_key(&instance_id)
             || self.terminal_restarts.contains(instance_id)
@@ -6907,13 +7137,18 @@ impl MuxelApp {
         &mut self,
         instance_id: Uuid,
         token: u64,
+        reason: muxel_core::TerminalLaunchReason,
         cx: &mut Context<Self>,
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
         let _phase =
             ui_profile::phase("activation", "prepare-reserved-terminal", Some(instance_id));
-        if !launch_token_current(&self.terminal_launching, instance_id, token)
-            || self.workspace.instance(instance_id).is_none()
-        {
+        if !launch_token_current(&self.terminal_launching, instance_id, token) {
+            return None;
+        }
+        // A peer/workspace update can change metadata while the task yields.
+        // Recheck before discovery so a restore reservation cannot replay argv.
+        if !self.launch_permitted(instance_id, reason) {
+            self.terminal_launching.remove(&instance_id);
             return None;
         }
         let was_resume = self
@@ -6978,10 +7213,11 @@ impl MuxelApp {
     fn spawn_terminal_deferred(
         &mut self,
         instance_id: Uuid,
+        reason: muxel_core::TerminalLaunchReason,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(token) = self.reserve_terminal_spawn(instance_id, window, cx) else {
+        let Some(token) = self.reserve_terminal_spawn(instance_id, reason, window, cx) else {
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -6992,7 +7228,7 @@ impl MuxelApp {
                 .await;
             let Some((meta, spec, size)) = this
                 .update(cx, |this, cx| {
-                    this.prepare_reserved_terminal_spawn(instance_id, token, cx)
+                    this.prepare_reserved_terminal_spawn(instance_id, token, reason, cx)
                 })
                 .ok()
                 .flatten()
@@ -7156,10 +7392,8 @@ impl MuxelApp {
             .insert(instance_id, (Instant::now(), was_resume));
         let mut state_changed = false;
         if let Some(inst) = self.workspace.instance_mut(instance_id)
-            && inst.is_runner
-            && inst.auto_submit
+            && inst.consume_runner_prompt()
         {
-            inst.auto_submit = false;
             state_changed = true;
         }
         state_changed |= self.mark_terminal_session_started(instance_id);
@@ -7361,7 +7595,10 @@ impl MuxelApp {
             .unwrap_or_default()
             .into_iter()
             .any(|iid| {
-                !self.terminals.contains_key(&iid)
+                self.workspace.instance(iid).is_some_and(|i| {
+                    i.kind != InstanceKind::Terminal
+                        || i.permits_launch(muxel_core::TerminalLaunchReason::ProjectSelection)
+                }) && !self.terminals.contains_key(&iid)
                     && !self.editors.contains_key(&iid)
                     && !self.browsers.contains_key(&iid)
             });
@@ -8517,7 +8754,12 @@ impl MuxelApp {
                     self.terminal_launching.contains_key(&iid),
                 ) && !self.failed_launches.contains_key(&iid)
                 {
-                    self.spawn_terminal(iid, window, cx);
+                    self.spawn_terminal_for(
+                        iid,
+                        muxel_core::TerminalLaunchReason::ProjectSelection,
+                        window,
+                        cx,
+                    );
                 }
             }
             InstanceKind::Editor => {
@@ -10378,20 +10620,14 @@ impl MuxelApp {
         let Some(project) = self.workspace.project(pid).filter(|p| p.remote.is_none()) else {
             return;
         };
-        let unbound = |i: &Instance| {
-            i.kind == InstanceKind::Terminal
-                && i.tmux_session
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-        };
-        if !instances.iter().any(unbound) {
+        if !instances.iter().any(Instance::needs_peer_session) {
             return;
         }
         let sessions = integrations::list_local_tmux_sessions().unwrap_or_default();
-        for instance in instances.iter_mut().filter(|i| unbound(i)) {
+        for instance in instances.iter_mut().filter(|i| i.needs_peer_session()) {
             instance.use_tmux = true;
         }
-        let eligible = instances.iter_mut().filter(|i| unbound(i));
+        let eligible = instances.iter_mut().filter(|i| i.needs_peer_session());
         muxel_core::tmux::bind_session_owners(
             &project.name,
             eligible,
@@ -11916,10 +12152,36 @@ impl MuxelApp {
     fn place_and_spawn(
         &mut self,
         pid: Uuid,
+        instance: Instance,
+        placement: PlacementMode,
+        target: Option<Uuid>,
+        explicit_worktree: Option<WorktreeChoice>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.place_and_spawn_with_focus(
+            pid,
+            instance,
+            placement,
+            target,
+            explicit_worktree,
+            true,
+            window,
+            cx,
+        );
+    }
+
+    /// Outside control can place through the same spawn path without changing
+    /// selection or native focus. UI callers use `place_and_spawn` above.
+    #[allow(clippy::too_many_arguments)]
+    fn place_and_spawn_with_focus(
+        &mut self,
+        pid: Uuid,
         mut instance: Instance,
         placement: PlacementMode,
         target: Option<Uuid>,
         explicit_worktree: Option<WorktreeChoice>,
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -11939,7 +12201,11 @@ impl MuxelApp {
             // Keep that binding — and keep tmux on — instead of letting the toolbar
             // toggle re-decide and mint a second session beside the live one.
             let adopted = instance.tmux_session.is_some();
-            instance.use_tmux = adopted || (self.use_tmux && self.tmux_available);
+            instance.use_tmux =
+                !instance.literal_argv && (adopted || (self.use_tmux && self.tmux_available));
+            if instance.literal_argv {
+                instance.tmux_session = None;
+            }
 
             // Decide the worktree: explicit (duplicate/resume) wins; otherwise a new
             // tab OR split inherits the worktree of the pane it joins, if it has one;
@@ -11980,34 +12246,22 @@ impl MuxelApp {
             }
         }
 
-        match (placement, placed_target) {
-            (PlacementMode::Split(direction), Some(active)) => {
-                let ok = self
-                    .workspace
-                    .project_mut(pid)
-                    .is_some_and(|p| split(&mut p.layout, active, direction, iid));
-                if !ok {
-                    return;
-                }
-                self.workspace.add_instance(instance);
-            }
-            (PlacementMode::Tab, Some(active)) => {
-                let ok = self
-                    .workspace
-                    .project_mut(pid)
-                    .is_some_and(|p| add_tab(&mut p.layout, active, iid));
-                if !ok {
-                    return;
-                }
-                self.workspace.add_instance(instance);
-            }
-            (_, None) => {
-                self.workspace.add_instance(instance);
-                if let Some(project) = self.workspace.project_mut(pid) {
-                    project.layout = Some(PaneNode::leaf(iid));
-                }
-            }
+        let direction = match placement {
+            PlacementMode::Split(direction) => Some(direction),
+            PlacementMode::Tab => None,
+        };
+        if !self.workspace.project_mut(pid).is_some_and(|project| {
+            muxel_core::control::place_new_pane(
+                &mut project.layout,
+                placed_target,
+                iid,
+                direction,
+                !focus,
+            )
+        }) {
+            return;
         }
+        self.workspace.add_instance(instance);
         // Build the right live view for the pane's kind (mirrors the restore
         // dispatch in `spawn_project_terminals_now`).
         match kind {
@@ -12016,9 +12270,16 @@ impl MuxelApp {
                 let view = cx.new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
                 self.browsers.insert(iid, view);
             }
-            _ => self.spawn_terminal_deferred(iid, window, cx),
+            _ => self.spawn_terminal_deferred(
+                iid,
+                muxel_core::TerminalLaunchReason::NewPane,
+                window,
+                cx,
+            ),
         }
-        self.focus_instance(iid, window, cx);
+        if focus {
+            self.focus_instance(iid, window, cx);
+        }
         self.persist();
         cx.notify();
     }
@@ -12033,11 +12294,13 @@ impl MuxelApp {
     ) {
         match choice {
             WorktreeChoice::New => {
+                instance.launch_dir = None;
                 instance.use_worktree = true;
                 self.setup_worktree_into_registry(pid, instance);
             }
             WorktreeChoice::Inherit(src) => {
                 if let Some(s) = self.workspace.instance(src) {
+                    instance.launch_dir = None;
                     instance.use_worktree = s.use_worktree;
                     instance.worktree_path = s.worktree_path.clone();
                     instance.worktree_branch = s.worktree_branch.clone();
@@ -12046,6 +12309,7 @@ impl MuxelApp {
             }
             WorktreeChoice::Resume(wid) => {
                 if let Some(w) = self.workspace.worktree(wid) {
+                    instance.launch_dir = None;
                     instance.use_worktree = true;
                     instance.worktree_path = Some(w.path.clone());
                     instance.worktree_branch = Some(w.branch.clone());
@@ -12522,6 +12786,7 @@ impl MuxelApp {
     /// NOTE: every new modal/palette/menu flag MUST be added here (see CLAUDE.md).
     fn any_overlay_open(&self, cx: &App) -> bool {
         self.show_settings
+            || !self.control_approvals.is_empty()
             || self.show_search_palette
             || self.show_find_panel
             || self.show_update_modal
@@ -12735,8 +13000,8 @@ impl MuxelApp {
         };
         let pid = src.project_id;
         let dir = src
-            .worktree_path
-            .clone()
+            .working_directory()
+            .map(std::path::Path::to_path_buf)
             .or_else(|| self.workspace.project(pid).map(|p| p.root_path.clone()))
             .unwrap_or_default();
         self.open_diff_for_dir(pid, dir, Some(source_iid), window, cx);
@@ -13639,8 +13904,7 @@ impl MuxelApp {
         project_id: Uuid,
         // The session name recorded on the instance, if it had one (`tmux_session`).
         recorded_session: Option<SessionTarget>,
-        worktree_path: Option<PathBuf>,
-        worktree_id: Option<Uuid>,
+        worktree_cleanup: muxel_core::WorktreeCleanup,
         cx: &mut Context<Self>,
     ) {
         let is_remote = self
@@ -13693,11 +13957,16 @@ impl MuxelApp {
             .workspace
             .project(project_id)
             .map(|p| p.root_path.clone());
-        if let Some(wid) = worktree_id {
-            self.dispose_worktree_if_orphaned(wid, cx);
-        } else if let (Some(path), Some(root)) = (worktree_path, root) {
-            // Legacy instance (no worktree_id): old direct-removal behavior.
-            integrations::remove_worktree(&root, &path);
+        match worktree_cleanup {
+            muxel_core::WorktreeCleanup::Registered(wid) => {
+                self.dispose_worktree_if_orphaned(wid, cx)
+            }
+            muxel_core::WorktreeCleanup::Legacy(path) => {
+                if let Some(root) = root {
+                    integrations::remove_worktree(&root, &path);
+                }
+            }
+            muxel_core::WorktreeCleanup::None => {}
         }
     }
 
@@ -14011,21 +14280,13 @@ impl MuxelApp {
                 i.tmux_session
                     .as_ref()
                     .map(|name| SessionTarget::new(name.clone(), i.tmux_socket)),
-                i.worktree_path.clone(),
-                i.worktree_id,
+                i.worktree_cleanup(),
                 i.project_id,
             )
         });
         self.workspace.remove_instance_meta(iid);
-        if let Some((local_session, worktree_path, worktree_id, project_id)) = info {
-            self.teardown_closed_instance(
-                iid,
-                project_id,
-                local_session,
-                worktree_path,
-                worktree_id,
-                cx,
-            );
+        if let Some((local_session, worktree_cleanup, project_id)) = info {
+            self.teardown_closed_instance(iid, project_id, local_session, worktree_cleanup, cx);
         }
         self.last_status.remove(&iid);
         self.failed_launches.remove(&iid);
@@ -16712,22 +16973,14 @@ impl MuxelApp {
                 i.tmux_session
                     .as_ref()
                     .map(|name| SessionTarget::new(name.clone(), i.tmux_socket)),
-                i.worktree_path.clone(),
-                i.worktree_id,
+                i.worktree_cleanup(),
                 i.project_id,
             )
         });
         self.workspace.remove_instance_meta(iid);
-        if let Some((local_session, worktree_path, worktree_id, project_id)) = info {
+        if let Some((local_session, worktree_cleanup, project_id)) = info {
             // Popout window closed deliberately → kill the remote session too.
-            self.teardown_closed_instance(
-                iid,
-                project_id,
-                local_session,
-                worktree_path,
-                worktree_id,
-                cx,
-            );
+            self.teardown_closed_instance(iid, project_id, local_session, worktree_cleanup, cx);
         }
         self.last_status.remove(&iid);
         self.persist();
@@ -17231,7 +17484,7 @@ impl MuxelApp {
         };
         // Editors, diffs and browsers have no process (respawning would put a
         // shell over them).
-        if inst.kind != InstanceKind::Terminal {
+        if !inst.permits_launch(muxel_core::TerminalLaunchReason::Restart) {
             return;
         }
         let Some(restart) = self.terminal_restarts.begin(inst) else {
@@ -18215,8 +18468,7 @@ impl MuxelApp {
         let local = project.remote.is_none();
         let transcript = if local && is_claude_program(inst.program.as_deref()) {
             let cwd = inst
-                .worktree_path
-                .as_deref()
+                .working_directory()
                 .unwrap_or(project.root_path.as_path());
             home_dir()
                 .zip(inst.session_id.as_deref())
@@ -18397,7 +18649,7 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> bool {
         // A pane whose launch is still in flight is starting, not dead.
-        if self.workspace.instance(iid).map(|i| i.kind) != Some(InstanceKind::Terminal)
+        if !self.launch_permitted(iid, muxel_core::TerminalLaunchReason::EnsureRunning)
             || !needs_immediate_spawn(
                 self.is_running(iid, cx),
                 self.terminal_launching.contains_key(&iid),
@@ -18439,8 +18691,7 @@ impl MuxelApp {
                 p.instances()
                     .into_iter()
                     .filter(|iid| {
-                        self.workspace.instance(*iid).map(|i| i.kind)
-                            == Some(InstanceKind::Terminal)
+                        self.launch_permitted(*iid, muxel_core::TerminalLaunchReason::Wake)
                     })
                     .map(|iid| (p.id, iid))
                     .collect::<Vec<_>>()
@@ -19476,15 +19727,14 @@ impl MuxelApp {
             return;
         };
         let mut instance = Instance::from_preset(pid, &AgentPreset::shell());
-        // command_for uses worktree_path as the cwd (no worktree_id = plain cwd).
-        instance.worktree_path = Some(dir);
+        instance.launch_dir = Some(dir);
         let target = self.active_instance;
         self.place_and_spawn(
             pid,
             instance,
             PlacementMode::Split(SplitDirection::Horizontal),
             target,
-            None,
+            Some(WorktreeChoice::None),
             window,
             cx,
         );
@@ -19946,6 +20196,52 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    fn run_literal_again(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.workspace.instance(iid).is_some_and(|i| i.literal_argv)
+            || !self.launch_permitted(iid, muxel_core::TerminalLaunchReason::RunAgain)
+            || self.is_running(iid, cx)
+            || self.terminal_launching.contains_key(&iid)
+        {
+            return;
+        }
+        if let Some(view) = self.terminals.remove(&iid) {
+            view.read(cx).session().kill();
+        }
+        self.failed_launches.remove(&iid);
+        self.spawn_terminal_deferred(iid, muxel_core::TerminalLaunchReason::RunAgain, window, cx);
+        self.focus_instance(iid, window, cx);
+        cx.notify();
+    }
+
+    fn literal_stopped(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .child(t("Command stopped"))
+            .children(self.failed_launches.get(&iid).map(|err| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(err.clone())
+            }))
+            .child(
+                Button::new(format!("run-again-{iid}"))
+                    .label(t("Run again"))
+                    .disabled(
+                        !self.launch_permitted(iid, muxel_core::TerminalLaunchReason::RunAgain),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_literal_again(iid, window, cx)
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn terminal_starting(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
         // gpui-component defaults to ease-in-out, which visibly accelerates and
         // decelerates every 800 ms. Terminal startup wants a steady activity cue.
@@ -20049,6 +20345,24 @@ impl MuxelApp {
                         } else {
                             t("Restart to relaunch")
                         };
+                        let action = if self.workspace.instance(iid).is_some_and(|i| i.literal_argv)
+                        {
+                            Button::new(format!("run-again-{iid}"))
+                                .label(t("Run again"))
+                                .disabled(!self.launch_permitted(
+                                    iid,
+                                    muxel_core::TerminalLaunchReason::RunAgain,
+                                ))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.run_literal_again(iid, window, cx)
+                                }))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(hint)
+                                .into_any_element()
+                        };
                         div()
                             .size_full()
                             .flex()
@@ -20070,9 +20384,7 @@ impl MuxelApp {
                                     .bg(bg)
                                     .text_color(fg)
                                     .child(label)
-                                    .child(
-                                        div().text_color(cx.theme().muted_foreground).child(hint),
-                                    ),
+                                    .child(action),
                             )
                             .into_any_element()
                     } else if !v.has_visible_content() {
@@ -20108,6 +20420,10 @@ impl MuxelApp {
                         )
                         .child(bv.clone())
                         .into_any_element()
+                } else if self.workspace.instance(iid).is_some_and(|i| i.literal_argv)
+                    && !self.terminal_launching.contains_key(&iid)
+                {
+                    self.literal_stopped(iid, cx)
                 } else if let Some(err) = self.failed_launches.get(&iid) {
                     // The launch failed completely (fallback shell included):
                     // show the error in place; the toolbar Restart retries.
@@ -22946,6 +23262,12 @@ impl MuxelApp {
                         .map(|i| i.display_name().to_string())
                         .unwrap_or_default();
                     let loading = self.terminal_is_loading(iid, cx);
+                    let stopped = inst.is_some_and(|instance| {
+                        instance.is_stopped_literal(
+                            self.terminals.contains_key(&iid),
+                            self.terminal_launching.contains_key(&iid),
+                        )
+                    });
                     let (app_title, status) = if let Some(view) = self.terminals.get(&iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
@@ -23068,6 +23390,8 @@ impl MuxelApp {
                             )
                             .child(div().flex_none().child(if loading {
                                 status_tag(AgentStatus::Working, t("loading").to_string())
+                            } else if stopped {
+                                status_tag(AgentStatus::Idle, t("stopped").to_string())
                             } else {
                                 status_tag(
                                     status,
@@ -30667,6 +30991,7 @@ impl Render for MuxelApp {
                 (self.auto_message_popup.is_some() && self.auto_message_window_pid().is_none())
                     .then(|| self.render_auto_message_popup(cx)),
             )
+            .children(self.render_control_approval(cx))
             // Fullscreen with the sidebar hidden: a floating left-edge pill
             // brings it back without leaving fullscreen (F11's escape hatch).
             .children((window.is_fullscreen() && sidebar_hidden).then(|| {

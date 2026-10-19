@@ -5,6 +5,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+/// Bind peer terminal metadata without converting a literal command into a tmux
+/// command. Literal panes remain stopped until their explicit Run again action.
+pub fn bind_peer_sessions(
+    project: &str,
+    instances: &mut [crate::Instance],
+    sessions: &[RemoteSession],
+) {
+    for instance in instances.iter_mut().filter(|i| i.needs_peer_session()) {
+        let session = session_by_suffix(sessions, instance.id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| session_name(project, instance.id));
+        instance.tmux_session = Some(session);
+        instance.use_tmux = true;
+    }
+}
+
 /// A stable tmux session name for an instance, e.g. `muxel_myproj_1a2b3c4d`.
 pub fn session_name(project: &str, instance: Uuid) -> String {
     let slug: String = project

@@ -27,6 +27,7 @@ struct TerminalPaneView: View {
     @State private var retryTask: Task<Void, Never>?
 
     enum Status: Equatable {
+        case stopped
         case attaching
         case live
         case reconnecting(attempt: Int)
@@ -49,7 +50,7 @@ struct TerminalPaneView: View {
     private var dimmed: Bool {
         switch status {
         case .reconnecting, .unreachable: return session != nil
-        case .attaching, .live: return false
+        case .stopped, .attaching, .live: return false
         }
     }
 
@@ -79,6 +80,8 @@ struct TerminalPaneView: View {
 
     @ViewBuilder private var overlay: some View {
         switch status {
+        case .stopped:
+            CenteredState(spinner: false, title: "Command stopped. Run again on desktop.")
         case .attaching:
             if session == nil {
                 CenteredState(spinner: true, title: "attaching to \(host.name)…")
@@ -97,6 +100,7 @@ struct TerminalPaneView: View {
     }
 
     private func initialAttach() async {
+        guard !instance.literalArgv else { status = .stopped; return }
         status = .attaching
         if await resolve(announce: true) {
             status = .live
@@ -107,7 +111,7 @@ struct TerminalPaneView: View {
 
     /// Start (or continue) the backoff reconnect loop for a dropped live session.
     private func beginReconnect() {
-        guard retryTask == nil else { return }
+        guard !instance.literalArgv, retryTask == nil else { return }
         status = .reconnecting(attempt: 1)
         retryTask = Task { await reconnectLoop() }
     }
@@ -159,6 +163,7 @@ struct TerminalPaneView: View {
     private func resolve(announce: Bool) async -> Bool {
         guard !Task.isCancelled, state.selectedProject?.id == project.id,
               state.layout?.instances.contains(where: { $0.id == instance.id }) == true else { return false }
+        guard !instance.literalArgv else { status = .stopped; return false }
         if let live = state.terminals.existing(instance.id) {
             live.onFocusRequested = onFocus
             session = live
@@ -206,7 +211,7 @@ struct TerminalPaneView: View {
                     let resolved = AgentLaunch.resolveLaunch(inst)
                     let resumeArgs = preset.flatMap { AgentLaunch.sessionResumeArgs(preset: $0, instance: inst) } ?? []
                     command = TmuxCommands.newAttachedPTYCommand(
-                        session: name, cwd: inst.worktreePath ?? project.remoteRoot,
+                        session: name, cwd: inst.launchDir ?? inst.worktreePath ?? project.remoteRoot,
                         program: resolved.program, args: resumeArgs + resolved.args, socket: socket)
                     startupInput = resolved.startupInput
                     startupDelayMs = preset?.startupDelayMs ?? 0

@@ -55,7 +55,10 @@ impl MuxelApp {
     ) -> Option<SessionDiscoveryKey> {
         let iid = instance.id;
         let project = self.workspace.project(instance.project_id)?;
-        if project.remote.is_some() || self.terminal_launching.contains_key(&iid) {
+        if instance.literal_argv
+            || project.remote.is_some()
+            || self.terminal_launching.contains_key(&iid)
+        {
             return None;
         }
         let view = self.discovery_terminal(iid)?.read(cx);
@@ -102,10 +105,9 @@ impl MuxelApp {
             binding_generation: self.session_discoveries.binding_generation(iid),
             binding: instance.session_id.clone(),
             cwd: instance
-                .worktree_path
-                .as_ref()
+                .working_directory()
                 .unwrap_or(&project.root_path)
-                .clone(),
+                .to_path_buf(),
             hint,
         })
     }

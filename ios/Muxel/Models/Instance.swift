@@ -69,6 +69,7 @@ struct Instance: Codable, Equatable, Identifiable {
     var autoName: String?
     var program: String?
     var args: [String] = []
+    var literalArgv: Bool = false
     var systemPrompt: String?
     var injection: InjectionMode = .none
     var preset: String = ""
@@ -77,6 +78,7 @@ struct Instance: Codable, Equatable, Identifiable {
     var useTmux: Bool = false
     var useWorktree: Bool = false
     var tmuxSession: String?
+    var launchDir: String?
     var tmuxSocket: String?
     var worktreePath: String?
     var worktreeBranch: String?
@@ -101,6 +103,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case customName = "custom_name"
         case autoName = "auto_name"
         case program, args
+        case literalArgv = "literal_argv"
         case systemPrompt = "system_prompt"
         case injection, preset
         case presetId = "preset_id"
@@ -108,6 +111,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case useTmux = "use_tmux"
         case useWorktree = "use_worktree"
         case tmuxSession = "tmux_session"
+        case launchDir = "launch_dir"
         case tmuxSocket = "tmux_socket"
         case worktreePath = "worktree_path"
         case worktreeBranch = "worktree_branch"
@@ -144,6 +148,7 @@ struct Instance: Codable, Equatable, Identifiable {
         autoName = try c.decodeIfPresent(String.self, forKey: .autoName)
         program = try c.decodeIfPresent(String.self, forKey: .program)
         args = (try c.decodeIfPresent([String].self, forKey: .args)) ?? []
+        literalArgv = (try c.decodeIfPresent(Bool.self, forKey: .literalArgv)) ?? false
         systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt)
         injection = (try c.decodeIfPresent(InjectionMode.self, forKey: .injection)) ?? .none
         preset = (try c.decodeIfPresent(String.self, forKey: .preset)) ?? ""
@@ -152,6 +157,7 @@ struct Instance: Codable, Equatable, Identifiable {
         useTmux = (try c.decodeIfPresent(Bool.self, forKey: .useTmux)) ?? false
         useWorktree = (try c.decodeIfPresent(Bool.self, forKey: .useWorktree)) ?? false
         tmuxSession = try c.decodeIfPresent(String.self, forKey: .tmuxSession)
+        launchDir = try c.decodeIfPresent(String.self, forKey: .launchDir)
         tmuxSocket = try c.decodeIfPresent(String.self, forKey: .tmuxSocket)
         worktreePath = try c.decodeIfPresent(String.self, forKey: .worktreePath)
         worktreeBranch = try c.decodeIfPresent(String.self, forKey: .worktreeBranch)
@@ -177,6 +183,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(autoName, forKey: .autoName)
         try c.encode(program, forKey: .program)
         try c.encode(args, forKey: .args)
+        try c.encode(literalArgv, forKey: .literalArgv)
         try c.encode(systemPrompt, forKey: .systemPrompt)
         try c.encode(injection, forKey: .injection)
         try c.encode(preset, forKey: .preset)
@@ -185,6 +192,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(useTmux, forKey: .useTmux)
         try c.encode(useWorktree, forKey: .useWorktree)
         try c.encode(tmuxSession, forKey: .tmuxSession)
+        try c.encode(launchDir, forKey: .launchDir)
         try c.encode(tmuxSocket, forKey: .tmuxSocket)
         try c.encode(worktreePath, forKey: .worktreePath)
         try c.encode(worktreeBranch, forKey: .worktreeBranch)

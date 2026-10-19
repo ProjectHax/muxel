@@ -575,6 +575,9 @@ pub struct CommandSpec {
     pub program: String,
     /// Syntax for file arguments at launch, retained across transport wrappers.
     pub paste_shell: PasteShell,
+    /// Already resolved literal target. Never repeat PATH/PATHEXT lookup or use
+    /// a batch interpreter at the final spawn boundary.
+    pub literal_argv: bool,
     /// Logical agent program when `program` is a transport/wrapper such as ssh
     /// or tmux. Lifecycle title parsing keys off this, not the local child name.
     pub status_program: Option<String>,
@@ -614,6 +617,7 @@ impl CommandSpec {
         Self {
             paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             program,
+            literal_argv: false,
             status_program: None,
             args: Vec::new(),
             cwd: None,
@@ -635,6 +639,7 @@ impl CommandSpec {
             paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             status_program: Some(program.clone()),
             program,
+            literal_argv: false,
             args,
             cwd: None,
             env: Vec::new(),
@@ -645,6 +650,23 @@ impl CommandSpec {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+        }
+    }
+
+    pub fn literal(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            literal_argv: true,
+            submit: false,
+            ..Self::program(program, args)
+        }
+    }
+
+    fn program_for_spawn(&self) -> Result<String> {
+        if self.literal_argv {
+            validate_literal_program(&self.program)?;
+            Ok(self.program.clone())
+        } else {
+            Ok(resolve_program_for_spawn(&self.program))
         }
     }
 
@@ -1115,7 +1137,7 @@ impl TerminalSession {
         // returns the shim first and CreateProcessW fails with
         // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
         let phase = std::time::Instant::now();
-        let program = resolve_program_for_spawn(&spec.program);
+        let program = spec.program_for_spawn()?;
         if let Some(instance_id) = instance_id {
             crate::profile::startup_event(
                 instance_id,
@@ -2349,6 +2371,53 @@ fn push_mouse_report(
 /// (`.exe`/`.cmd`). npm puts a Unix `#!/bin/sh` shim at that name, so agents
 /// like Codex fail with os error 193 ("%1 is not a valid Win32 application").
 /// Prefer PATHEXT matches and skip shebang scripts; leave non-Windows alone.
+/// Resolve a literal launch without permitting a batch interpreter to reparse
+/// argv. Windows npm Codex wrappers resolve to their packaged native executable.
+pub fn literal_program_for_spawn(program: &str) -> anyhow::Result<String> {
+    #[cfg(windows)]
+    let path = std::path::Path::new(program);
+    #[cfg(windows)]
+    let resolved = if path.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("com"))
+    {
+        program.to_string()
+    } else {
+        resolve_program_for_spawn(program)
+    };
+    #[cfg(not(windows))]
+    let resolved = resolve_program_for_spawn(program);
+    #[cfg(windows)]
+    let resolved = {
+        // Resolution can return a relative PATH entry. Persist an absolute target
+        // so neither the PTY cwd nor a later PATH change can choose another file.
+        let path = std::path::absolute(&resolved)?;
+        path.to_string_lossy().into_owned()
+    };
+    validate_literal_program(&resolved)?;
+    Ok(resolved)
+}
+
+fn validate_literal_program(program: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        anyhow::ensure!(
+            !is_windows_batch_program(program),
+            "literal argv cannot run Windows batch script '{program}'; choose its native executable or use --preset"
+        );
+        let path = std::path::Path::new(program);
+        anyhow::ensure!(
+            path.is_absolute() && path.is_file(),
+            "literal executable '{program}' must be an existing absolute native executable"
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = program;
+    Ok(())
+}
+
 fn resolve_program_for_spawn(program: &str) -> String {
     #[cfg(not(windows))]
     {
@@ -4564,12 +4633,150 @@ mod bounded_output_pty_tests {
 // Windows PATH resolution for npm shims (CreateProcess cannot run #!/bin/sh).
 #[cfg(all(test, windows))]
 mod windows_spawn_resolve {
-    use super::{CommandSpec, PtyChunk, TerminalSession, resolve_program_for_spawn_windows};
+    use super::{
+        CommandSpec, PtyChunk, TerminalSession, literal_program_for_spawn,
+        resolve_program_for_spawn_windows,
+    };
     use std::io::Write;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn literal_launch_refuses_batch_scripts_before_spawning() {
+        for extension in ["cmd", "bat"] {
+            let path = std::env::temp_dir().join(format!(
+                "muxel-literal-{}.{}",
+                uuid::Uuid::new_v4(),
+                extension
+            ));
+            std::fs::write(&path, "@echo off\r\n").unwrap();
+            let error = literal_program_for_spawn(path.to_str().unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(path.to_str().unwrap()), "{error}");
+            assert!(
+                error.contains("native executable") && error.contains("--preset"),
+                "{error}"
+            );
+            let spec = CommandSpec::literal(path.display().to_string(), vec![]);
+            assert!(
+                spec.program_for_spawn().is_err(),
+                "final boundary allowed batch target"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn literal_executable_is_resolved_once_even_with_a_batch_sidecar() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("muxel-native-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("tool.exe");
+        std::fs::write(&exe, b"native fixture").unwrap();
+        std::fs::write(dir.join("tool.exe.cmd"), b"@echo off\r\n").unwrap();
+        let resolved = literal_program_for_spawn(exe.to_str().unwrap()).unwrap();
+        assert_eq!(std::path::Path::new(&resolved), exe);
+        let spec = CommandSpec::literal(&resolved, vec!["brief".into()]);
+        // Exercise the same final-boundary method used by TerminalSession::spawn.
+        // The ordinary resolver would prefer tool.exe.cmd on its second lookup.
+        assert_eq!(spec.program_for_spawn().unwrap(), resolved);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Invoked as a child of the real ConPTY launch test below. The libtest `--`
+    // separator accepts arbitrary filter tokens, letting this executable itself
+    // capture the original argv without a shell or another tool dependency.
+    #[test]
+    fn literal_argv_fixture() {
+        let Ok(path) = std::env::var("MUXEL_TEST_ARGV_CAPTURE") else {
+            return;
+        };
+        let args: Vec<_> = std::env::args()
+            .skip_while(|arg| arg != "--")
+            .skip(1)
+            .collect();
+        std::fs::write(path, serde_json::to_vec(&args).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn native_pty_preserves_literal_argv() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let capture =
+            std::env::temp_dir().join(format!("muxel-argv-{}.json", uuid::Uuid::new_v4()));
+        let payload: Vec<String> = [
+            "a brief with spaces",
+            "say \"hello\"",
+            "",
+            "--",
+            "--background",
+            "ampersand & pipe | percent % caret ^",
+            "unicode 🦀",
+            "trailing\\",
+            "white space\\\\",
+            "backslashes\\\\\"quote",
+            "line one\nline two",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut args: Vec<String> = [
+            "--exact",
+            "session::windows_spawn_resolve::literal_argv_fixture",
+            "--nocapture",
+            "--",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        args.extend(payload.clone());
+        let program =
+            literal_program_for_spawn(std::env::current_exe().unwrap().to_str().unwrap()).unwrap();
+        let mut spec = CommandSpec::literal(program, args);
+        spec.env.push((
+            "MUXEL_TEST_ARGV_CAPTURE".into(),
+            capture.display().to_string(),
+        ));
+        let (session, rx) =
+            TerminalSession::spawn(spec, 80, 24).expect("spawn native argv fixture");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut received: Option<Vec<String>> = None;
+        while Instant::now() < deadline {
+            // ConPTY can keep its output pipe open after the child writes its
+            // result. The contract here is argv delivery, not pipe teardown.
+            if let Ok(bytes) = std::fs::read(&capture)
+                && let Ok(args) = serde_json::from_slice(&bytes)
+            {
+                received = Some(args);
+                break;
+            }
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+                        session.write_input(b"\x1b[1;1R");
+                    }
+                }
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => {
+                    break;
+                }
+                Err(async_channel::TryRecvError::Empty) => {}
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session.kill();
+        drop(_guard);
+        let received = received
+            .or_else(|| {
+                std::fs::read(&capture)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            })
+            .expect("native child captured argv");
+        std::fs::remove_file(capture).unwrap();
+        assert_eq!(received, payload);
+    }
 
     #[test]
     fn prefers_cmd_over_shebang_shim() {
@@ -4653,6 +4860,8 @@ mod windows_spawn_resolve {
             std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
         }
         let resolved = resolve_program_for_spawn_windows("codex");
+        let literal = literal_program_for_spawn("codex")
+            .expect("packaged native Codex supports literal argv");
         unsafe {
             match prev {
                 Some(value) => std::env::set_var("PATH", value),
@@ -4665,6 +4874,7 @@ mod windows_spawn_resolve {
         }
 
         assert_eq!(std::path::PathBuf::from(resolved), native);
+        assert_eq!(std::path::PathBuf::from(literal), native);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
