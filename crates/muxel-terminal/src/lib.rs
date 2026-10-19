@@ -18,6 +18,7 @@ mod profile;
 mod replies;
 mod search;
 mod session;
+mod startup;
 mod view;
 
 pub use colors::TerminalPalette;

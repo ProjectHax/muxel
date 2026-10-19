@@ -958,6 +958,75 @@ pub struct TerminalView {
 /// cycle.
 pub type TerminalFocusObserver = fn(Uuid, bool, &mut Window, &mut App);
 
+fn with_startup_view<R>(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    action: impl FnOnce(&TerminalView) -> R,
+) -> Result<R, crate::startup::Stop> {
+    view.update(cx, |view, _| {
+        (!view.exited && Arc::ptr_eq(&view.session, session)).then(|| action(view))
+    })
+    .ok()
+    .flatten()
+    .ok_or(crate::startup::Stop::Interrupted)
+}
+
+fn claude_startup_ready(
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    blocked_markers: &[String],
+    empty: bool,
+) -> bool {
+    screen.claude_composer(empty)
+        && parse_agent_title(TitleProvider::Claude, title).and_then(|frame| frame.status)
+            != Some(AgentStatus::Working)
+        && provider_screen_status(TitleProvider::Claude, &screen.text).is_none()
+        && !blocked_markers
+            .iter()
+            .any(|marker| !marker.is_empty() && screen.text.contains(marker))
+}
+
+async fn wait_startup_composer(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    guard: &mut crate::startup::Guard,
+    armed_at: Instant,
+    empty: bool,
+) -> Result<(), crate::startup::Stop> {
+    loop {
+        let ready = with_startup_view(view, session, cx, |view| {
+            let screen = session.startup_screen();
+            let title = session.title();
+            guard.ready(
+                armed_at.elapsed(),
+                session.input_rev(),
+                claude_startup_ready(&screen, title.as_deref(), &view.blocked_markers, empty),
+            )
+        })??;
+        if ready {
+            return Ok(());
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+    }
+}
+
+fn write_startup_input(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    guard: &mut crate::startup::Guard,
+    armed_at: Instant,
+    write: impl FnOnce(&TerminalSession) -> std::io::Result<()>,
+) -> Result<(), crate::startup::Stop> {
+    with_startup_view(view, session, cx, |_| {
+        guard.write(armed_at.elapsed(), session.input_rev(), || write(session))
+    })?
+}
+
 /// Why the drain loop most recently notified GPUI to request a redraw.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalNotifyCause {
@@ -1224,13 +1293,9 @@ impl TerminalView {
         // ready, optionally send Shift+Tab a few times to reach auto-accept mode,
         // press Enter to confirm it, then type the prompt and press Enter.
         //
-        // "Ready" = the child has produced output AND has then been quiet for
-        // SETTLE_MS. This adapts to slow starters (e.g. opencode, whose first
-        // output — clearing the screen — comes early but whose input box only
-        // appears seconds later, once it stops emitting): we wait for the load
-        // output to actually stop, not a guessed delay. SETTLE_MS is generous so
-        // a brief pause mid-load isn't mistaken for ready. Capped by MAX_WAIT in
-        // case a UI never goes quiet.
+        // Claude can go quiet before mounting its input handler. Require its
+        // live composer and paste mode; a quiet boot, title or trust dialog is
+        // not ready. Other providers retain their output-settling policy.
         if let Some(input) = startup_input.as_ref() {
             profile::startup_event(
                 instance_id,
@@ -1253,71 +1318,162 @@ impl TerminalView {
             const SHIFT_TAB: &[u8] = b"\x1b[Z";
             let session = session.clone();
             let automation_program = startup_program.clone();
-            cx.spawn(async move |_view: WeakEntity<Self>, cx| {
-                let timer = |ms| cx.background_executor().timer(Duration::from_millis(ms));
-                // Wait for the agent's first output (it has started up).
-                let mut waited = 0u64;
-                while !session.has_output() && waited < MAX_WAIT_MS {
-                    timer(POLL_MS).await;
-                    waited += POLL_MS;
-                }
-                profile::startup_event(
-                    instance_id,
-                    &automation_program,
-                    "automation-first-output",
-                    startup_started.elapsed(),
-                    0,
-                );
-                if startup_delay_ms > 0 {
-                    // Preset-configured fixed delay after first output — for agents
-                    // that keep loading well past their first draw (e.g. opencode).
-                    timer(startup_delay_ms as u64).await;
-                } else {
-                    // Auto: wait until output goes quiet (UI finished drawing).
-                    while waited < MAX_WAIT_MS && session.idle_for().as_millis() < SETTLE_MS {
-                        timer(POLL_MS).await;
+            let claude = title_provider == TitleProvider::Claude;
+            let armed_at = Instant::now();
+            let mut guard = crate::startup::Guard::new(
+                session.input_rev(),
+                claude.then(|| Duration::from_millis(MAX_WAIT_MS + startup_delay_ms as u64)),
+            );
+            cx.spawn(async move |view: WeakEntity<Self>, cx| {
+                let result: Result<(), crate::startup::Stop> = async {
+                    // Wait for the agent's first output (it has started up).
+                    let mut waited = 0u64;
+                    loop {
+                        let has_output = with_startup_view(&view, &session, cx, |_| {
+                            guard.check(armed_at.elapsed(), session.input_rev())?;
+                            Ok::<_, crate::startup::Stop>(session.has_output())
+                        })??;
+                        if has_output || waited >= MAX_WAIT_MS {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(POLL_MS))
+                            .await;
                         waited += POLL_MS;
                     }
-                }
-                profile::startup_event(
-                    instance_id,
-                    &automation_program,
-                    "automation-settled",
-                    startup_started.elapsed(),
-                    0,
-                );
-                for _ in 0..auto_mode_presses {
-                    session.write_input(SHIFT_TAB);
-                    timer(KEY_GAP_MS).await;
-                }
-                // Confirm the mode switch with a single Enter.
-                if auto_mode_presses > 0 {
-                    session.write_input(b"\r");
-                    timer(KEY_GAP_MS).await;
-                }
-                if let Some(input) = startup_input {
-                    timer(PRE_TYPE_MS).await;
-                    session.paste(&input);
                     profile::startup_event(
                         instance_id,
                         &automation_program,
-                        "automation-pasted",
+                        "automation-first-output",
                         startup_started.elapsed(),
-                        input.len(),
+                        0,
                     );
-                    // On restore, leave the prompt typed but unsubmitted.
-                    if submit {
-                        timer(SUBMIT_DELAY_MS).await;
-                        session.mark_turn_submitted();
-                        session.write_input(b"\r");
+                    if startup_delay_ms > 0 {
+                        // Preset-configured fixed delay after first output — for agents
+                        // that keep loading well past their first draw (e.g. opencode).
+                        cx.background_executor()
+                            .timer(Duration::from_millis(startup_delay_ms as u64))
+                            .await;
+                    } else if !claude {
+                        // Auto: wait until output goes quiet (UI finished drawing).
+                        while waited < MAX_WAIT_MS && session.idle_for().as_millis() < SETTLE_MS {
+                            with_startup_view(&view, &session, cx, |_| {
+                                guard.check(armed_at.elapsed(), session.input_rev())
+                            })??;
+                            cx.background_executor()
+                                .timer(Duration::from_millis(POLL_MS))
+                                .await;
+                            waited += POLL_MS;
+                        }
+                    }
+                    if claude {
+                        wait_startup_composer(&view, &session, cx, &mut guard, armed_at, true)
+                            .await?;
+                    }
+                    profile::startup_event(
+                        instance_id,
+                        &automation_program,
+                        "automation-settled",
+                        startup_started.elapsed(),
+                        0,
+                    );
+                    for _ in 0..auto_mode_presses {
+                        write_startup_input(
+                            &view,
+                            &session,
+                            cx,
+                            &mut guard,
+                            armed_at,
+                            |session| session.try_write_input(SHIFT_TAB),
+                        )?;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(KEY_GAP_MS))
+                            .await;
+                    }
+                    // Confirm the mode switch with a single Enter.
+                    if auto_mode_presses > 0 {
+                        write_startup_input(
+                            &view,
+                            &session,
+                            cx,
+                            &mut guard,
+                            armed_at,
+                            |session| session.try_write_input(b"\r"),
+                        )?;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(KEY_GAP_MS))
+                            .await;
+                    }
+                    if let Some(input) = startup_input {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(PRE_TYPE_MS))
+                            .await;
+                        if claude {
+                            guard.reset_ready();
+                            wait_startup_composer(&view, &session, cx, &mut guard, armed_at, true)
+                                .await?;
+                        }
+                        write_startup_input(
+                            &view,
+                            &session,
+                            cx,
+                            &mut guard,
+                            armed_at,
+                            |session| session.try_paste(&input),
+                        )?;
                         profile::startup_event(
                             instance_id,
                             &automation_program,
-                            "automation-submitted",
+                            "automation-pasted",
                             startup_started.elapsed(),
-                            1,
+                            input.len(),
                         );
+                        // On restore, leave the prompt typed but unsubmitted.
+                        if submit {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(SUBMIT_DELAY_MS))
+                                .await;
+                            if claude {
+                                guard.reset_ready();
+                                wait_startup_composer(
+                                    &view, &session, cx, &mut guard, armed_at, false,
+                                )
+                                .await?;
+                            }
+                            write_startup_input(
+                                &view,
+                                &session,
+                                cx,
+                                &mut guard,
+                                armed_at,
+                                |session| session.try_submit_input(b"\r"),
+                            )?;
+                            profile::startup_event(
+                                instance_id,
+                                &automation_program,
+                                "automation-submitted",
+                                startup_started.elapsed(),
+                                1,
+                            );
+                        }
                     }
+                    Ok(())
+                }
+                .await;
+                if let Err(reason) = result {
+                    let phase = match reason {
+                        crate::startup::Stop::Interrupted => "automation-interrupted",
+                        crate::startup::Stop::NotReady => "automation-not-ready",
+                        crate::startup::Stop::WriteFailed => "automation-write-failed",
+                    };
+                    profile::startup_event(
+                        instance_id,
+                        &automation_program,
+                        phase,
+                        startup_started.elapsed(),
+                        0,
+                    );
+                    log::warn!("terminal startup automation stopped: {reason:?}");
                 }
             })
             .detach();
@@ -2149,6 +2305,55 @@ mod launch_tests {
             .expect("spawn cat");
         assert!(launch.launch_error().is_none());
         launch.session.kill();
+    }
+}
+
+#[cfg(test)]
+mod startup_readiness_tests {
+    use super::claude_startup_ready;
+    use crate::startup::Screen;
+
+    #[test]
+    fn native_slash_completion_is_ready_for_submit_but_not_an_empty_startup() {
+        // The controlled native reproduction's completion menu has no permission
+        // footer. Its occupied composer must admit the first CR, never a retry.
+        let screen = Screen {
+            text: "Claude Code v2.1.304\n  ❯ /b12-ready  Reply exactly B12_READY. Do not use tools,\n                 read or write files, or call other agents…\n────────────────────────────────────────\n❯\u{a0}/b12-ready\n────────────────────────────────────────\n  Friday 0%\n  ⏵⏵ auto mode on (shift+tab to cycle)".into(),
+            cursor_column: 12, cursor_row: 4, cursor_visible: true, bracketed_paste: true,
+        };
+        assert!(claude_startup_ready(
+            &screen,
+            Some("✳ Claude Code"),
+            &[],
+            false
+        ));
+        assert!(!claude_startup_ready(&screen, None, &[], true));
+        assert!(!claude_startup_ready(
+            &screen,
+            Some("◐ Claude Code"),
+            &[],
+            false
+        ));
+        assert!(!claude_startup_ready(
+            &screen,
+            None,
+            &["manual approval".into(), "auto mode on".into()],
+            false
+        ));
+    }
+
+    #[test]
+    fn permission_chrome_vetoes_an_old_composer_even_with_idle_title() {
+        let screen = Screen {
+            text: "────────────────\n❯ task\n────────────────\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel".into(),
+            cursor_column: 6, cursor_row: 1, cursor_visible: true, bracketed_paste: true,
+        };
+        assert!(!claude_startup_ready(
+            &screen,
+            Some("✳ Claude Code"),
+            &[],
+            false
+        ));
     }
 }
 

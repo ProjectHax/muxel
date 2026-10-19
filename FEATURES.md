@@ -441,6 +441,10 @@ feature is added or changed, update the matching entry here in the same change**
   sends auto-mode Shift+Tab presses, and respects the agent's startup delay (so
   opencode and Grok work). The pane is **visible but not focused** and never switches your
   active project — a loop firing on a timer can't interrupt what you're typing.
+- **Claude startup input** — typed startup tasks wait for Claude's editable
+  composer and bracketed-paste mode, including after trust or startup screens.
+  Input stops if the pane is replaced, someone types, the writer fails, or
+  readiness times out; it never retries a submitted task automatically.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
   copy.

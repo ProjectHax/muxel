@@ -1634,6 +1634,16 @@ impl TerminalSession {
         self.turn_submitted.load(Ordering::Relaxed)
     }
 
+    /// Record a submit only after its CR was admitted to the writer. This does
+    /// not confirm that the child consumed it.
+    pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
+        self.try_write_input(data)?;
+        if !data.is_empty() {
+            self.mark_turn_submitted();
+        }
+        Ok(())
+    }
+
     /// Paste text into the PTY, honoring bracketed-paste mode (so the program
     /// receives it as a paste, not as typed keystrokes). Shared by the keyboard
     /// shortcut and the mouse copy/paste modes.
@@ -1988,6 +1998,11 @@ impl TerminalSession {
     /// The visible screen as text (one row per line, newline-separated). Used for
     /// marker-based agent-status detection (e.g. scanning for "esc to interrupt").
     pub(crate) fn visible_text(&self) -> String {
+        self.startup_screen().text
+    }
+
+    /// Capture input geometry and modes with the same grid generation.
+    pub(crate) fn startup_screen(&self) -> crate::startup::Screen {
         use alacritty_terminal::index::{Column, Line, Point as GridPoint};
         self.with_term(|term| {
             let grid = term.grid();
@@ -2006,7 +2021,14 @@ impl TerminalSession {
                 }
                 s.push('\n');
             }
-            s
+            let cursor = grid.cursor.point;
+            crate::startup::Screen {
+                text: s,
+                cursor_column: cursor.column.0,
+                cursor_row: cursor.line.0,
+                cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR),
+                bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
+            }
         })
     }
 
@@ -5743,6 +5765,77 @@ mod tests {
             session.is_idle_foreground(),
             "the direct child should be the foreground process group"
         );
+        session.kill();
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::{CommandSpec, TerminalSession};
+    use crate::startup::Guard;
+    use std::{sync::atomic::Ordering, time::Duration};
+
+    fn spawn() -> std::sync::Arc<TerminalSession> {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        TerminalSession::spawn(spec, 40, 12).expect("spawn").0
+    }
+
+    #[test]
+    fn quiet_control_output_waits_for_the_actual_claude_composer() {
+        let session = spawn();
+        session.process_probe_output(b"\x1b[2J\x1b[H");
+        let mut guard = Guard::new(0, Some(Duration::from_secs(30)));
+        assert!(session.has_output());
+        assert!(
+            !guard
+                .ready(
+                    Duration::from_millis(2500),
+                    0,
+                    session.startup_screen().claude_composer(true)
+                )
+                .unwrap()
+        );
+        let frame = format!(
+            "\x1b[2J\x1b[HClaude Code\r\n{}\r\n❯ Try a task\r\n{}\r\nmode\x1b[3;3H\x1b[?25h\x1b[?2004h",
+            "─".repeat(30),
+            "─".repeat(30)
+        );
+        session.process_probe_output(frame.as_bytes());
+        assert!(session.startup_screen().claude_composer(true));
+        assert!(
+            !guard
+                .ready(
+                    Duration::from_millis(7000),
+                    0,
+                    session.startup_screen().claude_composer(true)
+                )
+                .unwrap()
+        );
+        assert!(
+            guard
+                .ready(
+                    Duration::from_millis(7100),
+                    0,
+                    session.startup_screen().claude_composer(true)
+                )
+                .unwrap()
+        );
+        session.process_probe_output(b"\x1b[3;3H/b12-ready\x1b[K");
+        assert!(!session.startup_screen().claude_composer(true));
+        assert!(session.startup_screen().claude_composer(false));
+        session.kill();
+    }
+
+    #[test]
+    fn failed_submit_admission_does_not_mark_a_turn_submitted() {
+        let session = spawn();
+        session.input_closed.store(true, Ordering::Release);
+        assert!(session.try_submit_input(b"\r").is_err());
+        assert!(!session.has_submitted_turn());
         session.kill();
     }
 }
