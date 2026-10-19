@@ -8,15 +8,17 @@ import Citadel
 private actor LayoutTransactionConnection: SSHConnection {
     private var document: RemoteLayout
     private var pauseNextRead: Bool
+    private var writeFailuresRemaining: Int
     private var releaseRead: CheckedContinuation<Void, Never>?
     private let onPaused: () -> Void
     private let onOverlappingRead: () -> Void
     private(set) var commands: [String] = []
 
-    init(_ document: RemoteLayout, pauseFirstRead: Bool = true,
+    init(_ document: RemoteLayout, pauseFirstRead: Bool = true, failWrites: Int = 0,
          onPaused: @escaping () -> Void = {}, onOverlappingRead: @escaping () -> Void = {}) {
         self.document = document
         self.pauseNextRead = pauseFirstRead
+        self.writeFailuresRemaining = failWrites
         self.onPaused = onPaused
         self.onOverlappingRead = onOverlappingRead
     }
@@ -40,6 +42,10 @@ private actor LayoutTransactionConnection: SSHConnection {
             return snapshot
         }
         if command.hasPrefix("cat > ") {
+            if writeFailuresRemaining > 0 {
+                writeFailuresRemaining -= 1
+                throw SSHError.command("layout write failed")
+            }
             // Strip the production writer's heredoc header, delimiter and trailing
             // newline, then retain the actual encoded layout for the next read.
             let json = command.components(separatedBy: "\n").dropFirst().dropLast(2).joined(separator: "\n")
@@ -229,5 +235,121 @@ final class LayoutTransactionTests: XCTestCase {
         let saved = await conn.snapshot()
         XCTAssertEqual(Set(saved.instances.map(\.id)), Set([b.id, added.id]))
         XCTAssertFalse(saved.layout?.allTabs.contains(a.id) ?? false)
+    }
+
+    func testOptimisticLaunchWithFailedAppendCannotAuthorizePTYStart() async throws {
+        let (state, project, _, _, layout) = fixture()
+        let paused = expectation(description: "launch append captured persisted document")
+        let premature = expectation(description: "known-owner binding completed before launch save")
+        premature.isInverted = true
+        let conn = LayoutTransactionConnection(layout, failWrites: 1, onPaused: { paused.fulfill() })
+        state.connectionFactory = { _, _ in conn }
+
+        await state.launch(preset: Preset(name: "Shell", program: nil), customCommand: nil, into: project)
+        let launchedId = try XCTUnwrap(state.lastLaunched)
+        let optimistic = try XCTUnwrap(state.layout?.instances.first { $0.id == launchedId })
+        let target = TmuxCommands.SessionTarget(name: try XCTUnwrap(optimistic.tmuxSession),
+                                               socket: try XCTUnwrap(optimistic.tmuxSocket))
+        await fulfillment(of: [paused], timeout: 1)
+        var released = false
+        let submitted = expectation(description: "binding submitted on optimistic known owner")
+        let binding = Task { @MainActor in
+            submitted.fulfill()
+            let permitted = try await state.bindTmuxTarget(target, instance: optimistic, in: project)
+            if !released { premature.fulfill() }
+            return permitted
+        }
+        await fulfillment(of: [submitted], timeout: 1)
+        await fulfillment(of: [premature], timeout: 0.1)
+        released = true
+        await conn.resumeRead()
+        let permitted = try await binding.value
+
+        XCTAssertFalse(permitted, "TerminalPaneView must not cross its binding guard to create a PTY")
+        XCTAssertNil(state.terminals.existing(launchedId))
+        XCTAssertNotNil(state.notice, "the append failure remains visible")
+        let saved = await conn.snapshot()
+        XCTAssertFalse(saved.instances.contains { $0.id == launchedId })
+        let commands = await conn.commands
+        XCTAssertEqual(commands.filter { $0.hasPrefix("f=") }.count, 2,
+                       "append and binding each read once")
+        XCTAssertEqual(commands.filter { $0.hasPrefix("cat > ") }.count, 1,
+                       "binding cannot recreate the pane after its append failed")
+        XCTAssertFalse(commands.contains { $0.contains("new-session") || $0.contains("attach-session") })
+    }
+
+    func testUnchangedPersistedOwnerWaitsForEarlierTransactionWithoutWriting() async throws {
+        let (state, project, _, b, layout) = fixture()
+        var persisted = layout
+        persisted.instances[0].tmuxSession = "muxel_host_aaaaaaaa"
+        persisted.instances[0].tmuxSocket = "mxl-profile"
+        let instance = persisted.instances[0]
+        state.layout = persisted
+        let paused = expectation(description: "earlier rename captured persisted document")
+        let premature = expectation(description: "unchanged-owner binding bypassed earlier transaction")
+        premature.isInverted = true
+        let conn = LayoutTransactionConnection(persisted, onPaused: { paused.fulfill() })
+        state.connectionFactory = { _, _ in conn }
+        let rename = Task { await state.rename(b, to: "Renamed", in: project) }
+        await fulfillment(of: [paused], timeout: 1)
+        var released = false
+        let submitted = expectation(description: "unchanged-owner binding submitted")
+        let binding = Task { @MainActor in
+            submitted.fulfill()
+            let permitted = try await state.bindTmuxTarget(.init(name: "muxel_host_aaaaaaaa", socket: "mxl-profile"),
+                                                          instance: instance, in: project)
+            if !released { premature.fulfill() }
+            return permitted
+        }
+        await fulfillment(of: [submitted], timeout: 1)
+        await fulfillment(of: [premature], timeout: 0.1)
+        released = true
+        await conn.resumeRead()
+        await rename.value
+        let permitted = try await binding.value
+
+        XCTAssertTrue(permitted)
+        let commands = await conn.commands
+        XCTAssertEqual(commands.filter { $0.hasPrefix("f=") }.count, 2)
+        XCTAssertEqual(commands.filter { $0.hasPrefix("cat > ") }.count, 1,
+                       "only rename writes; unchanged binding confirms its single read")
+        let saved = await conn.snapshot()
+        XCTAssertEqual(saved.instances.first { $0.id == b.id }?.customName, "Renamed")
+        XCTAssertEqual(saved.instances.first { $0.id == instance.id }?.tmuxSocket, "mxl-profile")
+    }
+
+    func testUnchangedOwnerCannotAuthorizeRemovedInstance() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var stale = a
+        stale.tmuxSession = "muxel_host_aaaaaaaa"
+        stale.tmuxSocket = "mxl-profile"
+        var persisted = layout
+        persisted.removeInstance(id: a.id, now: 2)
+        let conn = LayoutTransactionConnection(persisted, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+
+        let permitted = try await state.bindTmuxTarget(.init(name: "muxel_host_aaaaaaaa", socket: "mxl-profile"),
+                                                      instance: stale, in: project)
+
+        XCTAssertFalse(permitted)
+        let commands = await conn.commands
+        XCTAssertEqual(commands.filter { $0.hasPrefix("f=") }.count, 1)
+        XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") })
+    }
+
+    func testBindingWriteFailureThrowsInsteadOfAuthorizingFoundMember() async {
+        let (state, project, a, _, layout) = fixture()
+        let conn = LayoutTransactionConnection(layout, pauseFirstRead: false, failWrites: 1)
+        state.connectionFactory = { _, _ in conn }
+        do {
+            _ = try await state.bindTmuxTarget(.init(name: "muxel_host_aaaaaaaa", socket: "mxl-profile"),
+                                              instance: a, in: project)
+            XCTFail("failed owner persistence must not authorize attachment")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("layout write failed"))
+        }
+        let saved = await conn.snapshot()
+        XCTAssertNil(saved.instances.first { $0.id == a.id }?.tmuxSocket)
+        XCTAssertNil(state.terminals.existing(a.id))
     }
 }

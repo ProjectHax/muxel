@@ -250,6 +250,9 @@ by that host's project layouts, retaining server ownership when names overlap.
 Phone layout changes share one awaited read/modify/write queue, including owner
 binding, launch, close and rename, so overlapping actions preserve each other's
 saved changes.
+Attachment waits for that queue and verifies the instance exists in the saved
+layout, even when its tmux owner already matches. A failed launch save therefore
+cannot start an agent from an optimistic pane alone.
 
 Future: APNs push via a remote watcher daemon (instant background alerts + live
 status-bar updates); tmux **control mode** (`-C`); interactive split resize + tab

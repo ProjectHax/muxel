@@ -57,12 +57,14 @@ mod libraries_ui;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
+#[cfg(all(test, windows))]
+mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
 mod tmux_install_modal;
 
 use popout_lifecycle::loop_heartbeat;
-use restart_guard::PendingRestarts;
+use restart_guard::{PendingRestarts, RemoteRestartCompletion};
 
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
 /// TUIs (Claude/opencode/…) don't get squished narrow enough to overflow.
@@ -16993,6 +16995,7 @@ impl MuxelApp {
         let Some(restart) = self.terminal_restarts.begin(inst) else {
             return;
         };
+        let project = inst.project_id;
         let recorded_session = inst
             .tmux_session
             .as_ref()
@@ -17039,7 +17042,7 @@ impl MuxelApp {
         let host_name = host.name.clone();
         let label = session.to_string();
         let workspace = self.current_workspace;
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let (resolving_host, resolving_path, resolving_password) =
                 (host.clone(), control_path.clone(), password.clone());
             let pending = muxel_core::tmux::ClosedSession {
@@ -17095,51 +17098,96 @@ impl MuxelApp {
                 }
                 Err(error) => Err(error),
             };
-            let completed = this.update_in(cx, |this, window, cx| {
-                if this.current_workspace != workspace
-                    || !this.terminal_restarts.finish(iid, restart)
-                    || this.workspace.instance(iid).is_none()
-                {
-                    return; // closed while the kill was in flight
-                }
-                // Say so rather than letting it pass as a restart: the respawn below
-                // is `new-session -A`, so a session that survived is *reattached* —
-                // the same agent, looking like a restart that did nothing.
-                if let Err(e) = killed {
-                    this.add_event(
-                        NotifKind::Error,
-                        tf(
-                            "Couldn't restart on “{host}”",
-                            &[("host", &host_name.to_string())],
-                        ),
-                        tf(
-                            "{session} is still running, so the pane reattached to it: {err}",
-                            &[("session", &label), ("err", &format!("{e}"))],
-                        ),
-                    );
-                }
-                // A project restore may have reattached the old session meanwhile.
-                this.redock_for_restart(iid, cx);
-                if let Some(view) = this.terminals.remove(&iid) {
-                    view.read(cx).session().kill();
-                }
-                this.spawn_terminal(iid, window, cx);
-                if this.active_instance == Some(iid) {
-                    this.focus_instance(iid, window, cx);
-                }
-                cx.notify();
-            });
-            if completed.is_err() {
-                // The pane may now belong to another window. Release admission
-                // even if the original window vanished while SSH was pending.
-                let _ = this.update(cx, |this, _| {
-                    this.terminal_restarts.finish(iid, restart);
-                });
-            }
+            Self::complete_remote_restart(
+                &this,
+                RemoteRestartCompletion {
+                    instance: iid,
+                    project,
+                    workspace,
+                    token: restart,
+                    host: host_name,
+                    session: label,
+                    killed,
+                },
+                cx,
+            );
         })
         .detach();
         self.focus_instance(iid, window, cx);
         cx.notify();
+    }
+
+    /// Finish in the window owning the project now, including a project redocked
+    /// while SSH was pending. An old window never owns completion admission.
+    fn complete_remote_restart(
+        this: &WeakEntity<Self>,
+        completion: RemoteRestartCompletion,
+        cx: &mut impl AppContext,
+    ) {
+        let RemoteRestartCompletion {
+            instance: iid,
+            project,
+            workspace,
+            token: restart,
+            host: host_name,
+            session: label,
+            killed,
+        } = completion;
+        let completed = Self::in_project_or_main(this, Some(project), cx, |this, window, cx| {
+            if this.current_workspace != workspace
+                || !this.terminal_restarts.finish(iid, restart)
+                || this.workspace.instance(iid).is_none()
+            {
+                return; // closed while the kill was in flight
+            }
+            // Say so rather than letting it pass as a restart: the respawn below
+            // is `new-session -A`, so a session that survived is *reattached* —
+            // the same agent, looking like a restart that did nothing.
+            if let Err(e) = killed {
+                this.add_event(
+                    NotifKind::Error,
+                    tf(
+                        "Couldn't restart on “{host}”",
+                        &[("host", &host_name.to_string())],
+                    ),
+                    tf(
+                        "{session} is still running, so the pane reattached to it: {err}",
+                        &[("session", &label), ("err", &format!("{e}"))],
+                    ),
+                );
+            }
+            // A project restore may have reattached the old session meanwhile.
+            this.redock_for_restart(iid, cx);
+            if let Some(view) = this.terminals.remove(&iid) {
+                view.read(cx).session().kill();
+            }
+            this.spawn_terminal(iid, window, cx);
+            if this.active_instance == Some(iid) {
+                this.focus_instance(iid, window, cx);
+            }
+            cx.notify();
+        });
+        if completed.is_none() {
+            // The old restore entry may already have been consumed while the
+            // restart held admission. Release only this generation and retry in
+            // whichever window now shows the project.
+            let project = this
+                .update(cx, |this, _| {
+                    if this.current_workspace != workspace
+                        || !this.terminal_restarts.finish(iid, restart)
+                    {
+                        return None;
+                    }
+                    this.workspace
+                        .instance(iid)
+                        .map(|instance| instance.project_id)
+                })
+                .ok()
+                .flatten();
+            if let Some(project) = project {
+                Self::reactivate_project(this, project, cx);
+            }
+        }
     }
 
     /// Duplicate an instance's launch spec into a new pane split beside it.

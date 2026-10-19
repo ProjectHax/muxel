@@ -14,6 +14,16 @@ struct Restart {
 #[derive(Default)]
 pub(super) struct PendingRestarts(HashMap<Uuid, Restart>);
 
+pub(super) struct RemoteRestartCompletion {
+    pub instance: Uuid,
+    pub project: Uuid,
+    pub workspace: Option<Uuid>,
+    pub token: Uuid,
+    pub host: String,
+    pub session: String,
+    pub killed: anyhow::Result<()>,
+}
+
 impl PendingRestarts {
     pub fn begin(&mut self, instance: &Instance) -> Option<Uuid> {
         let Entry::Vacant(entry) = self.0.entry(instance.id) else {

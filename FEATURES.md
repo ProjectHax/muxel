@@ -923,10 +923,12 @@ feature is added or changed, update the matching entry here in the same change**
   A legacy close saves its selected server before the first kill and keeps that
   owner through lost replies, retries and reconnect cleanup. Only one restart
   per pane can resolve and stop a session at a time; stale completions from a
-  closed pane or a previous workspace cannot overwrite its new owner. The iOS
-  companion serializes all layout changes with ownership binding and discards
-  stale publication after a project switch. Its host status sweep includes
-  recorded named sockets and uses the same session as attachment.
+  closed pane or a previous workspace cannot overwrite its new owner. A pending
+  restart follows its project back to the main window if its original window
+  closes. The iOS companion serializes all layout changes with ownership binding,
+  verifies saved pane membership before attachment even for an unchanged owner,
+  and discards stale publication after a project switch. Its host status sweep
+  includes recorded named sockets and uses the same session as attachment.
 - **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
   speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
   layout sync, the memory file, project scan, remote git, and the connection test

@@ -1143,12 +1143,11 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Persist the resolved owner before attachment so subsequent close/restart
-    /// operations use that same server even if another gains the same name.
+    /// Confirm saved membership and the resolved owner before attachment so close
+    /// and restart use that server even if another gains the same name.
     func bindTmuxTarget(_ target: TmuxCommands.SessionTarget, instance: Instance,
                         in project: RemoteProject) async throws -> Bool {
         guard selectedProject?.id == project.id, let host = host(for: project) else { return false }
-        if instance.tmuxSession == target.name, instance.tmuxSocket == target.socket { return true }
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, Error>) in
             enqueueLayoutWrite { [self] in
                 do {
@@ -1160,17 +1159,24 @@ final class AppState: ObservableObject {
                     guard selectedProject?.id == project.id else {
                         continuation.resume(returning: false); return
                     }
+                    // A new pane already has its intended owner in the optimistic
+                    // UI. Await its append and verify durable membership before
+                    // allowing a PTY, even when that owner appears unchanged.
+                    var memberFound = false
                     let written = try await RemoteLayoutStore.mutate(
                         conn, root: project.remoteRoot, seedIfMissing: false, transform: { layout in
                             guard let idx = layout.instances.firstIndex(where: { $0.id == instance.id }) else { return false }
+                            memberFound = true
+                            if layout.instances[idx].tmuxSession == target.name,
+                               layout.instances[idx].tmuxSocket == target.socket { return false }
                             layout.instances[idx].tmuxSession = target.name
                             layout.instances[idx].tmuxSocket = target.socket
                             return true
                         })
-                    guard selectedProject?.id == project.id, let written else {
+                    guard selectedProject?.id == project.id, memberFound else {
                         continuation.resume(returning: false); return
                     }
-                    publishLayout(written, for: project)
+                    if let written { publishLayout(written, for: project) }
                     continuation.resume(returning: true)
                 } catch {
                     continuation.resume(throwing: error)
