@@ -58,8 +58,10 @@ current title without a completion edge.
   interval: the hook's own timestamp (for an older muxel's hook, its record's
   write time); Grok's registration time through the last instant it can stand
   for (a time written in whole seconds, to the end of that second); or, for a
-  Grok row without one, anywhere from the start of the previous registry read
-  (the epoch, on muxel's first read) to the return of this one. A two-second
+  Grok row without one, anywhere from the start of this pane's previous accepted
+  registry observation in the same launch and process (the epoch when unknown)
+  to the return of this read. Unrelated panes and unresolved polls cannot advance
+  that lower bound. A two-second
   slack allows for delayed reports and reads; it is not a bound on either delay.
   Around the interval lies an ambiguity window, from its start less the slack
   to whichever is later: when muxel learned of the switch, or the interval's
@@ -153,6 +155,12 @@ current title without a completion edge.
   claim owner. A record the hook writes meanwhile waits at the shared path;
   a newer mismatching claim or one whose binding failed to save is retained
   and validated before the next shared record.
+- An accepted Grok identity is retained separately from durable workspace
+  metadata. A real identity change invalidates the live terminal before saving,
+  so a failed save cannot leave an old Exit-policy loop owning the replacement.
+  Metadata still rolls back on failure; retrying the same accepted identity only
+  retries persistence. A new launch or child process starts with no prior Grok
+  observation.
 - A submission counts only in the binding it was made in, so the Enter that
   picks a conversation in `/resume` doesn't arm the resumed conversation's
   completion, including when the resumed UUID is the first identity observed.

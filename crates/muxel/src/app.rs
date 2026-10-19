@@ -4007,10 +4007,10 @@ pub struct MuxelApp {
     remote_layout_poll_inflight: bool,
     /// Coalescing/backoff and stale-result guards for background provider scans.
     session_discoveries: muxel_core::session_discovery::SessionDiscoveries,
-    /// The last Grok refresh's registry read: a switch it didn't see, to a row
-    /// with no registration time of its own, happened after it began.
+    /// Accepted Grok identity and observation time belong to one pane launch.
+    /// Keep live identity even when a workspace write is rolled back.
     #[cfg(windows)]
-    grok_registry_read: Option<GrokRegistryRead>,
+    grok_observations: HashMap<Uuid, session_discovery::GrokObservation>,
     /// Per pane, the PTY launch and nonce of the last Claude hook record read.
     claude_hook_seen: HashMap<Uuid, (Uuid, Uuid)>,
     /// Full persisted settings (source of truth for config not mirrored above).
@@ -6321,7 +6321,7 @@ impl MuxelApp {
             remote_layout_poll_inflight: false,
             session_discoveries: Default::default(),
             #[cfg(windows)]
-            grok_registry_read: None,
+            grok_observations: HashMap::new(),
             claude_hook_seen: HashMap::new(),
             theme: settings.theme.clone(),
             theme_mode: settings.theme_mode.clone(),

@@ -16,6 +16,7 @@ use muxel_core::AgentPreset;
 use muxel_core::session_discovery::{
     SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Instant, SystemTime};
 use uuid::Uuid;
@@ -47,6 +48,32 @@ impl DiscoveryCandidate {
 struct DiscoveryBatch {
     results: Vec<(SessionDiscoveryRequest, DiscoveryCandidate)>,
     grok_read: Option<(SystemTime, SystemTime)>,
+}
+
+#[cfg(windows)]
+pub(super) struct GrokObservation {
+    launch: Instant,
+    child_pid: Option<u32>,
+    session_id: Option<String>,
+    read: GrokRegistryRead,
+}
+
+#[cfg(windows)]
+impl GrokObservation {
+    fn new(key: &SessionDiscoveryKey, read: GrokRegistryRead) -> Self {
+        Self {
+            launch: key.launch,
+            child_pid: key.child_pid,
+            session_id: key.binding.clone(),
+            read,
+        }
+    }
+
+    fn matches(&self, key: &SessionDiscoveryKey) -> bool {
+        key.provider == SessionProvider::Grok
+            && self.launch == key.launch
+            && self.child_pid == key.child_pid
+    }
 }
 
 struct ClaudeCommit {
@@ -142,6 +169,17 @@ impl MuxelApp {
 
     pub(super) fn sync_provider_session_ids(&mut self, cx: &mut Context<Self>) {
         let Some(home) = home_dir() else { return };
+        #[cfg(windows)]
+        if !self.grok_observations.is_empty() {
+            let panes: std::collections::HashSet<_> = self
+                .workspace
+                .instances
+                .iter()
+                .map(|instance| instance.id)
+                .collect();
+            self.grok_observations
+                .retain(|pane, _| panes.contains(pane));
+        }
         let data_dir = muxel_store::data_dir();
         let now = Instant::now();
         let keys: Vec<_> = self
@@ -168,11 +206,15 @@ impl MuxelApp {
             let home = home.clone();
             let data_dir = data_dir.clone();
             #[cfg(windows)]
-            let previous_grok_read = self
-                .grok_registry_read
-                .map(|read| (read.started, read.finished));
+            let previous_grok_reads = requests
+                .iter()
+                .filter_map(|request| {
+                    self.grok_read_for(&request.key)
+                        .map(|read| (request.key.pane, (read.started, read.finished)))
+                })
+                .collect();
             #[cfg(not(windows))]
-            let previous_grok_read = None;
+            let previous_grok_reads = HashMap::new();
             cx.spawn(async move |this, cx| {
                 let (batch, data_dir) = cx
                     .background_executor()
@@ -181,20 +223,12 @@ impl MuxelApp {
                             requests,
                             &home,
                             data_dir.as_deref(),
-                            previous_grok_read,
+                            previous_grok_reads,
                         );
                         (batch, data_dir)
                     })
                     .await;
                 let _ = this.update(cx, |this, cx| {
-                    #[cfg(windows)]
-                    if let Some((started, finished)) = batch.grok_read
-                        && this
-                            .grok_registry_read
-                            .is_none_or(|old| finished >= old.finished)
-                    {
-                        this.grok_registry_read = Some(GrokRegistryRead { started, finished });
-                    }
                     #[cfg(not(windows))]
                     let _ = batch.grok_read;
                     let mut updates = Vec::new();
@@ -213,6 +247,16 @@ impl MuxelApp {
                         if !valid {
                             // Stale workers never claim or acknowledge a receipt.
                             continue;
+                        }
+                        #[cfg(windows)]
+                        if request.key.provider == SessionProvider::Grok
+                            && unowned
+                            && let Some((started, finished)) = batch.grok_read
+                        {
+                            this.record_grok_read(
+                                &request.key,
+                                GrokRegistryRead { started, finished },
+                            );
                         }
                         let update = match candidate {
                             DiscoveryCandidate::Claude { snapshot, binding } => {
@@ -233,12 +277,25 @@ impl MuxelApp {
                             DiscoveryCandidate::Session {
                                 session_id,
                                 switched,
-                            } if unowned => this
-                                .stage_discovered_session(iid, session_id, false)
-                                .map(|mut update| {
-                                    update.switched = switched;
-                                    update
-                                }),
+                            } if unowned => {
+                                #[cfg(windows)]
+                                if request.key.provider == SessionProvider::Grok {
+                                    this.stage_grok_session(
+                                        &request.key,
+                                        session_id,
+                                        switched
+                                            .expect("Grok result carries its observation interval"),
+                                        cx,
+                                    )
+                                } else {
+                                    this.stage_discovered_session(iid, session_id, false)
+                                }
+                                #[cfg(not(windows))]
+                                {
+                                    let _ = switched;
+                                    this.stage_discovered_session(iid, session_id, false)
+                                }
+                            }
                             _ => None,
                         };
                         if let Some(update) = update {
@@ -250,6 +307,52 @@ impl MuxelApp {
             })
             .detach();
         }
+    }
+
+    #[cfg(windows)]
+    fn grok_read_for(&self, key: &SessionDiscoveryKey) -> Option<GrokRegistryRead> {
+        self.grok_observations
+            .get(&key.pane)
+            .filter(|observation| observation.matches(key))
+            .map(|observation| observation.read)
+    }
+
+    #[cfg(windows)]
+    fn record_grok_read(&mut self, key: &SessionDiscoveryKey, read: GrokRegistryRead) {
+        let observation = self
+            .grok_observations
+            .entry(key.pane)
+            .or_insert_with(|| GrokObservation::new(key, read));
+        if !observation.matches(key) {
+            *observation = GrokObservation::new(key, read);
+        } else if read.finished >= observation.read.finished {
+            observation.read = read;
+        }
+    }
+
+    #[cfg(windows)]
+    fn stage_grok_session(
+        &mut self,
+        key: &SessionDiscoveryKey,
+        session_id: String,
+        interval: (SystemTime, SystemTime),
+        cx: &App,
+    ) -> Option<SessionBindingUpdate> {
+        // Called only for an accepted worker result after its read is recorded.
+        // Durable metadata can still say A after a failed save of live B.
+        let observation = self
+            .grok_observations
+            .get_mut(&key.pane)
+            .filter(|observation| observation.matches(key))?;
+        let changed = observation.session_id.as_deref() != Some(session_id.as_str());
+        if changed {
+            observation.session_id = Some(session_id.clone());
+        }
+        if changed && let Some(view) = self.discovery_terminal(key.pane) {
+            view.read(cx).provider_switched(interval.0, interval.1);
+        }
+        // Retrying persistence must not create another runtime boundary.
+        self.stage_discovered_session(key.pane, session_id, false)
     }
 
     fn stage_discovered_claude(
@@ -359,10 +462,10 @@ fn discover_sessions(
     requests: Vec<SessionDiscoveryRequest>,
     home: &Path,
     data_dir: Option<&Path>,
-    previous_grok_read: Option<(SystemTime, SystemTime)>,
+    previous_grok_reads: HashMap<Uuid, (SystemTime, SystemTime)>,
 ) -> DiscoveryBatch {
     #[cfg(not(windows))]
-    let _ = previous_grok_read;
+    let _ = previous_grok_reads;
     #[cfg(windows)]
     let mut grok_snapshot = None;
     let results = requests
@@ -406,7 +509,9 @@ fn discover_sessions(
                             };
                             (read, active, process_parent_map())
                         });
-                        let previous = previous_grok_read
+                        let previous = previous_grok_reads
+                            .get(&key.pane)
+                            .copied()
                             .map(|(started, finished)| GrokRegistryRead { started, finished });
                         key.child_pid
                             .and_then(|pid| active_grok_session_for_process(pid, active, parents))
@@ -456,6 +561,252 @@ fn claim_validated_claude_record(
         return None;
     }
     Some(record)
+}
+
+#[cfg(all(test, windows))]
+mod grok_regressions {
+    use super::super::{
+        AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopRun, MuxelApp,
+        PostRunAction, grok_switch_interval, popout_lifecycle_tests::with_app,
+    };
+    use gpui::{AppContext as _, Context, Window};
+    use muxel_core::{Instance, Project};
+    use muxel_terminal::{
+        CommandSpec, TerminalLaunch, TerminalRuntimeSnapshot, TerminalSession,
+        TerminalStatusCoverage, TerminalStatusReason, TerminalView,
+    };
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime};
+    use uuid::Uuid;
+
+    struct StopChild(Arc<TerminalSession>);
+    impl Drop for StopChild {
+        fn drop(&mut self) {
+            self.0.kill();
+        }
+    }
+
+    fn pane(
+        app: &mut MuxelApp,
+        window: &mut Window,
+        cx: &mut Context<MuxelApp>,
+    ) -> (Uuid, Arc<TerminalSession>) {
+        let cwd = muxel_store::data_dir()
+            .unwrap()
+            .join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&cwd).unwrap();
+        let project = app.workspace.add_project(Project::new("Grok fixture", cwd));
+        let mut instance = Instance::shell(project);
+        instance.program = Some("grok.exe".into());
+        instance.session_id = Some(Uuid::new_v4().to_string());
+        instance.session_started = true;
+        let id = instance.id;
+        app.workspace.add_instance(instance);
+        let launch = TerminalLaunch::spawn(
+            CommandSpec::program(
+                "cmd.exe",
+                vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+            ),
+            (80, 24),
+        )
+        .unwrap();
+        let view = cx.new(|cx| TerminalView::new(launch, id, Instant::now(), window, cx));
+        let session = view.read(cx).session().clone();
+        app.terminals.insert(id, view);
+        app.terminal_launches.insert(id, (Instant::now(), false));
+        (id, session)
+    }
+
+    #[test]
+    fn dtz5_grok_failed_save_abandons_the_old_exit_loop_and_dedupes_retries() {
+        with_app(|cx, window| {
+            window
+                .update(cx, |app, window, cx| {
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let (id, session) = pane(app, window, cx);
+                    let _stop = StopChild(session.clone());
+                    let old = app
+                        .workspace
+                        .instance(id)
+                        .unwrap()
+                        .session_id
+                        .clone()
+                        .unwrap();
+                    session.process_probe_output(format!("\x1b]0;{old} | Ready\x07").as_bytes());
+                    session.mark_turn_submitted();
+                    let revision = session.binding_revision();
+                    let cached_done = TerminalRuntimeSnapshot {
+                        status: AgentStatus::Done,
+                        attributable: true,
+                        reason: TerminalStatusReason::Quiet,
+                        coverage: TerminalStatusCoverage::ProviderVisible,
+                        launch_id: session.id,
+                        binding_rev: revision,
+                        snapshot_seq: 1,
+                        input_rev: 0,
+                        draft_latched: false,
+                        completion_ready: true,
+                    };
+                    let mut run = LoopRun {
+                        loop_id: Uuid::new_v4(),
+                        launch: Some(session.id),
+                        seen_working: true,
+                        started: Instant::now(),
+                        post_run: PostRunAction::Exit,
+                    };
+                    let doc =
+                        muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                    std::fs::create_dir_all(&doc).unwrap();
+                    let new = Uuid::new_v4().to_string();
+                    let accept =
+                        |app: &mut MuxelApp, cx: &mut Context<MuxelApp>, identity: &str| {
+                            let key = app.session_discovery_key(id, cx).unwrap();
+                            let now = SystemTime::now();
+                            app.record_grok_read(
+                                &key,
+                                GrokRegistryRead {
+                                    started: now,
+                                    finished: now,
+                                },
+                            );
+                            let update = app
+                                .stage_grok_session(&key, identity.to_owned(), (now, now), cx)
+                                .unwrap();
+                            assert_eq!(
+                                app.workspace.instance(id).unwrap().session_id.as_deref(),
+                                Some(identity)
+                            );
+                            app.finish_discovered_sessions(vec![update], cx);
+                        };
+                    accept(app, cx, &new);
+                    assert_eq!(
+                        app.workspace.instance(id).unwrap().session_id.as_deref(),
+                        Some(old.as_str()),
+                        "fixture must fail the real workspace save"
+                    );
+                    assert_eq!(
+                        run.cleanup(
+                            cached_done,
+                            session.binding_revision(),
+                            session.first_submission_binding(),
+                            Duration::ZERO
+                        ),
+                        LoopCleanup::Abandon,
+                        "failed persistence left A's Exit loop owning B"
+                    );
+                    let observed = session.binding_revision();
+                    assert_ne!(observed, revision);
+                    accept(app, cx, &new);
+                    assert_eq!(
+                        session.binding_revision(),
+                        observed,
+                        "retrying the same live identity invalidated it again"
+                    );
+                    assert_eq!(
+                        app.workspace.instance(id).unwrap().session_id.as_deref(),
+                        Some(old.as_str())
+                    );
+                    std::fs::remove_dir(&doc).unwrap();
+                    accept(app, cx, &new);
+                    assert_eq!(
+                        app.workspace.instance(id).unwrap().session_id.as_deref(),
+                        Some(new.as_str())
+                    );
+                    assert_eq!(
+                        session.binding_revision(),
+                        observed,
+                        "successful save repeated the accepted switch"
+                    );
+                    accept(app, cx, &Uuid::new_v4().to_string());
+                    assert_ne!(
+                        session.binding_revision(),
+                        observed,
+                        "a later genuine switch was suppressed"
+                    );
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn dtz5_overlapping_grok_panes_keep_the_target_legacy_title_and_read_bound() {
+        with_app(|cx, window| {
+            window
+                .update(cx, |app, window, cx| {
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let (target, session) = pane(app, window, cx);
+                    let _stop_target = StopChild(session.clone());
+                    let (other, other_session) = pane(app, window, cx);
+                    let _stop_other = StopChild(other_session);
+                    let key = app.session_discovery_key(target, cx).unwrap();
+                    let foreign = app.session_discovery_key(other, cx).unwrap();
+                    // The target worker reads A, then stalls. B's title arrives
+                    // before an unrelated pane completes a later registry read.
+                    let old_read = GrokRegistryRead {
+                        started: SystemTime::now(),
+                        finished: SystemTime::now(),
+                    };
+                    let title = "Current Grok B | Ready";
+                    session.process_probe_output(format!("\x1b]0;{title}\x07").as_bytes());
+                    assert_eq!(session.title().as_deref(), Some(title));
+                    let title_at = SystemTime::now();
+                    let cap = Instant::now() + Duration::from_secs(10);
+                    while SystemTime::now()
+                        .duration_since(title_at)
+                        .unwrap_or_default()
+                        < Duration::from_secs(3)
+                    {
+                        assert!(
+                            Instant::now() < cap,
+                            "wall clock did not advance past title slack"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let foreign_read = GrokRegistryRead {
+                        started: SystemTime::now(),
+                        finished: SystemTime::now(),
+                    };
+                    app.record_grok_read(&foreign, foreign_read);
+                    // The target's old A result completes after the other pane.
+                    app.record_grok_read(&key, old_read);
+                    let previous = app.grok_read_for(&key);
+                    let read = GrokRegistryRead {
+                        started: SystemTime::now(),
+                        finished: SystemTime::now(),
+                    };
+                    let new = GrokActiveSession {
+                        pid: key.child_pid.unwrap(),
+                        session_id: Uuid::new_v4().to_string(),
+                        opened_at: chrono::DateTime::UNIX_EPOCH,
+                    };
+                    let interval = grok_switch_interval(&new, previous, read);
+                    app.record_grok_read(&key, read);
+                    let update = app
+                        .stage_grok_session(&key, new.session_id, interval, cx)
+                        .unwrap();
+                    app.finish_discovered_sessions(vec![update], cx);
+                    assert_eq!(
+                        session.title().as_deref(),
+                        Some(title),
+                        "a different pane's newer read cleared the target's current title"
+                    );
+                    assert_eq!(interval.0, old_read.started);
+                    let mut replaced = key.clone();
+                    replaced.launch += Duration::from_secs(1);
+                    assert!(
+                        app.grok_read_for(&replaced).is_none(),
+                        "another launch reused the observation"
+                    );
+                    replaced = key;
+                    replaced.child_pid = replaced.child_pid.map(|pid| pid + 1);
+                    assert!(
+                        app.grok_read_for(&replaced).is_none(),
+                        "another process reused the observation"
+                    );
+                })
+                .unwrap();
+        });
+    }
 }
 
 #[cfg(test)]
@@ -537,7 +888,7 @@ mod tests {
             let (home, data, request) =
                 (self.home.clone(), self.data.clone(), self.request.clone());
             let mut batch = std::thread::spawn(move || {
-                discover_sessions(vec![request], &home, Some(&data), None)
+                discover_sessions(vec![request], &home, Some(&data), Default::default())
             })
             .join()
             .unwrap();

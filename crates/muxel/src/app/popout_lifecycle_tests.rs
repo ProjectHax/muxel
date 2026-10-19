@@ -55,7 +55,7 @@ impl Drop for StopChild {
     }
 }
 
-fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
+pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../.wip/lifecycle-tests")
         .join(Uuid::new_v4().to_string());

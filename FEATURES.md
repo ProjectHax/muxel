@@ -315,6 +315,9 @@ feature is added or changed, update the matching entry here in the same change**
   evidence arrives, and the Enter that picked the conversation doesn't count as
   a turn in it. During uncertainty, `ctl` treats the pane as Working: ordinary
   sends are refused and `wait` keeps waiting; `send --force` retains its override.
+  A Grok conversation switch releases old loop ownership even if saving fails.
+  Each pane uses its own discovery history, so another pane's refresh cannot
+  discard its valid current title.
   The snapshot carries a launch id and
   provider-binding, input and sequence revisions; without provider hooks its coverage remains
   explicitly limited to visible terminal evidence.
