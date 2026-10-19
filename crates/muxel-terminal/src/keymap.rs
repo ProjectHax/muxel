@@ -68,6 +68,7 @@ pub fn key_to_bytes(
             }
             return Some(b"\r".to_vec());
         }
+        "backspace" => return Some(backspace_bytes(mods)),
         _ => {}
     }
 
@@ -103,7 +104,6 @@ pub fn key_to_bytes(
     }
 
     match key {
-        "backspace" => return Some(b"\x7f".to_vec()),
         "escape" => return Some(b"\x1b".to_vec()),
         "home" => {
             if modifier_code > 1 {
@@ -164,6 +164,19 @@ pub fn key_to_bytes(
     None
 }
 
+fn backspace_bytes(mods: &KeyModifiers) -> Vec<u8> {
+    if mods.platform {
+        return vec![0x15];
+    }
+    if mods.control {
+        return vec![0x17];
+    }
+    if mods.alt {
+        return b"\x1b\x7f".to_vec();
+    }
+    vec![0x7f]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +233,55 @@ mod tests {
         assert_eq!(
             key_to_bytes("v", None, &mods(false, false, true), false),
             Some(vec![0x16])
+        );
+    }
+
+    #[test]
+    fn backspace_plain_is_del() {
+        assert_eq!(
+            key_to_bytes("backspace", None, &mods(false, false, false), false),
+            Some(vec![0x7f])
+        );
+    }
+
+    #[test]
+    fn alt_backspace_is_esc_del() {
+        assert_eq!(
+            key_to_bytes("backspace", None, &mods(false, true, false), false),
+            Some(b"\x1b\x7f".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_backspace_is_ctrl_w() {
+        assert_eq!(
+            key_to_bytes("backspace", None, &mods(false, false, true), false),
+            Some(vec![0x17])
+        );
+    }
+
+    #[test]
+    fn platform_backspace_is_ctrl_u() {
+        let cmd = KeyModifiers {
+            platform: true,
+            ..KeyModifiers::default()
+        };
+        assert_eq!(
+            key_to_bytes("backspace", None, &cmd, false),
+            Some(vec![0x15])
+        );
+    }
+
+    #[test]
+    fn modified_backspace_ignores_key_char() {
+        assert_eq!(
+            key_to_bytes(
+                "backspace",
+                Some("\u{7f}"),
+                &mods(false, true, false),
+                false
+            ),
+            Some(b"\x1b\x7f".to_vec())
         );
     }
 
