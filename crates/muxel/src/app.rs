@@ -6666,7 +6666,7 @@ impl MuxelApp {
                 .background_executor()
                 .spawn(async move { integrations::list_remote_tmux_sessions(&loc) })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let landed = Self::in_project_or_main(&this, Some(pid), cx, |this, window, cx| {
                 if !launch_token_current(&this.terminal_launching, iid, token) {
                     return;
                 }
@@ -6692,6 +6692,9 @@ impl MuxelApp {
                 this.persist();
                 this.spawn_terminal_deferred(iid, window, cx);
             });
+            if landed.is_none() {
+                Self::release_unlanded_launch(&this, iid, token, cx);
+            }
         })
         .detach();
         true
