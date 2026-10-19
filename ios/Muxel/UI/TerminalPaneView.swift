@@ -146,6 +146,7 @@ struct TerminalPaneView: View {
     /// prompt) on the first/manual attempt but stays quiet during silent backoff.
     @discardableResult
     private func resolve(announce: Bool) async -> Bool {
+        guard !Task.isCancelled, state.selectedProject?.id == project.id else { return false }
         if let live = state.terminals.existing(instance.id) {
             live.onFocusRequested = onFocus
             session = live
@@ -207,7 +208,8 @@ struct TerminalPaneView: View {
                 startupSubmit = resolved.submit
                 if resumeCapable { resumeSessionId = inst.sessionId }
             }
-            try await state.bindTmuxTarget(.init(name: sessionName, socket: socket), instance: instance, in: project)
+            guard try await state.bindTmuxTarget(.init(name: sessionName, socket: socket), instance: instance, in: project),
+                  !Task.isCancelled, state.selectedProject?.id == project.id else { return false }
             let s = state.terminals.session(
                 for: instance.id, hostId: host.id, connection: conn, command: command)
             s.onFocusRequested = onFocus
@@ -236,6 +238,7 @@ struct TerminalPaneView: View {
             }
             return true
         } catch {
+            guard !Task.isCancelled, state.selectedProject?.id == project.id else { return false }
             lastError = error.localizedDescription
             // A changed host key needs the trust-prompt sheet, not just inline text.
             if announce { state.surface(error, host: host) }

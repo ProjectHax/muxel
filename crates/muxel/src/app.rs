@@ -13438,6 +13438,12 @@ impl MuxelApp {
         if let Some(p) = self.workspace.project_mut(project_id) {
             p.remember_closed_session(session.clone(), iid);
         }
+        let workspace = self.current_workspace;
+        let mut closed = muxel_core::tmux::ClosedSession {
+            name: session.name,
+            socket: session.socket,
+            instance: iid,
+        };
         let control_path = Self::commands_control_path(host.id);
         let password = (host.auth == SshAuth::Password)
             .then(|| self.remote_password(&host))
@@ -13446,16 +13452,66 @@ impl MuxelApp {
             // Immediately, then backing off — a momentary network stall is usually
             // over in seconds.
             let mut err = None;
+            let mut owner_saved = false;
             for (attempt, wait) in RETRY_REMOTE_KILL_SECS.iter().enumerate() {
                 if attempt > 0 {
                     cx.background_executor()
                         .timer(Duration::from_secs(*wait))
                         .await;
                 }
+                if closed.socket.is_none() {
+                    let (host, control_path, password, pending) = (
+                        host.clone(),
+                        control_path.clone(),
+                        password.clone(),
+                        closed.clone(),
+                    );
+                    match cx
+                        .background_executor()
+                        .spawn(async move {
+                            integrations::resolve_remote_tmux_close(
+                                &host,
+                                &control_path,
+                                password.as_deref(),
+                                &pending,
+                            )
+                        })
+                        .await
+                    {
+                        Ok(resolved) => closed = resolved,
+                        Err(error) => {
+                            err = Some(format!("{error}"));
+                            continue;
+                        }
+                    }
+                }
+                if !owner_saved {
+                    let saved = this
+                        .update(cx, |this, _| {
+                            if this.current_workspace != workspace {
+                                return false;
+                            }
+                            if let Some(project) = this.workspace.project_mut(project_id) {
+                                project.remember_closed_session(closed.target(), iid);
+                                this.try_persist()
+                            } else {
+                                true // The project was removed; no ledger can retry it later.
+                            }
+                        })
+                        .unwrap_or(false);
+                    if !saved {
+                        err = Some(
+                            "couldn't save the resolved tmux session owner before teardown"
+                                .to_string(),
+                        );
+                        break;
+                    }
+                    owner_saved = true;
+                }
                 let (host, control_path, session, password) = (
                     host.clone(),
                     control_path.clone(),
-                    session.clone(),
+                    closed.target(),
                     password.clone(),
                 );
                 let res = cx
@@ -13477,22 +13533,28 @@ impl MuxelApp {
                     Err(e) => err = Some(format!("{e}")),
                 }
             }
-            let _ = this.update(cx, |this, cx| match err {
-                None => this.finish_closed_session(project_id, iid, &session),
-                Some(msg) => {
-                    // Not an error dialog: the session is remembered, the pane stays
-                    // closed, and the next connect to the host finishes the job.
-                    muxel_store::append_event_log(&format!(
-                        "close: “{session}” not confirmed dead on “{}” — {msg}",
-                        host.name
-                    ));
-                    this.dev_log.push(DevLogEntry {
-                        time: chrono::Local::now().format("%H:%M:%S").to_string(),
-                        kind: NotifKind::Error,
-                        title: t("Remote session").to_string(),
-                        detail: format!("{session}: {msg}"),
-                    });
-                    cx.notify();
+            let session = closed.target();
+            let _ = this.update(cx, |this, cx| {
+                if this.current_workspace != workspace {
+                    return;
+                }
+                match err {
+                    None => this.finish_closed_session(project_id, iid, &session),
+                    Some(msg) => {
+                        // Not an error dialog: the session is remembered, the pane stays
+                        // closed, and the next connect to the host finishes the job.
+                        muxel_store::append_event_log(&format!(
+                            "close: “{session}” not confirmed dead on “{}” — {msg}",
+                            host.name
+                        ));
+                        this.dev_log.push(DevLogEntry {
+                            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                            kind: NotifKind::Error,
+                            title: t("Remote session").to_string(),
+                            detail: format!("{session}: {msg}"),
+                        });
+                        cx.notify();
+                    }
                 }
             });
         })
@@ -13509,6 +13571,10 @@ impl MuxelApp {
     /// a pane closed while its ssh was still connecting can start it on the host
     /// after the kill has run.
     fn finish_closed_session(&mut self, project_id: Uuid, iid: Uuid, session: &SessionTarget) {
+        debug_assert!(
+            session.socket.is_some(),
+            "completed closes retain their owner"
+        );
         let reaped = self.reaped_sessions.entry(project_id).or_default();
         if !reaped.iter().any(|c| c.instance == iid) {
             reaped.push(muxel_core::tmux::ClosedSession {
@@ -13567,10 +13633,11 @@ impl MuxelApp {
             .closed_sessions_of(pid)
             .iter()
             .map(|c| {
+                let c = c.resolve_owner(sessions, Socket::Private);
                 (
                     c.instance,
                     c.target(),
-                    muxel_core::tmux::live_closed_session(sessions, c).map(|s| s.target()),
+                    muxel_core::tmux::live_closed_session(sessions, &c).map(|s| s.target()),
                 )
             })
             .collect();
@@ -16927,8 +16994,14 @@ impl MuxelApp {
             .remote_host_for_instance(iid)
             .filter(|host| !host.os.is_windows());
         let Some(host) = remote_host else {
-            if let Some(session) = recorded_session {
-                integrations::kill_tmux_session(&session);
+            if let Some(mut session) = recorded_session {
+                session.socket = Some(integrations::local_tmux_socket(&session));
+                if let Some(instance) = self.workspace.instance_mut(iid) {
+                    instance.tmux_socket = session.socket;
+                }
+                if self.try_persist() {
+                    integrations::kill_tmux_session(&session);
+                }
             }
             self.spawn_terminal(iid, window, cx);
             self.focus_instance(iid, window, cx);
@@ -16946,20 +17019,62 @@ impl MuxelApp {
             .flatten();
         let host_name = host.name.clone();
         let label = session.to_string();
+        let workspace = self.current_workspace;
         cx.spawn_in(window, async move |this, cx| {
-            let killed = cx
+            let (resolving_host, resolving_path, resolving_password) =
+                (host.clone(), control_path.clone(), password.clone());
+            let pending = muxel_core::tmux::ClosedSession {
+                name: session.name,
+                socket: session.socket,
+                instance: iid,
+            };
+            let resolved = cx
                 .background_executor()
                 .spawn(async move {
-                    integrations::kill_remote_tmux(
-                        &host,
-                        &control_path,
-                        password.as_deref(),
-                        &session,
+                    integrations::resolve_remote_tmux_close(
+                        &resolving_host,
+                        &resolving_path,
+                        resolving_password.as_deref(),
+                        &pending,
                     )
                 })
                 .await;
+            let killed = match resolved {
+                Ok(closed) => {
+                    let saved = this
+                        .update(cx, |this, _| {
+                            if this.current_workspace != workspace {
+                                return false;
+                            }
+                            let Some(instance) = this.workspace.instance_mut(iid) else {
+                                return false;
+                            };
+                            instance.tmux_session = Some(closed.name.clone());
+                            instance.tmux_socket = closed.socket;
+                            this.try_persist()
+                        })
+                        .unwrap_or(false);
+                    if saved {
+                        cx.background_executor()
+                            .spawn(async move {
+                                integrations::kill_remote_tmux(
+                                    &host,
+                                    &control_path,
+                                    password.as_deref(),
+                                    &closed.target(),
+                                )
+                            })
+                            .await
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "couldn't save the tmux session owner before restart"
+                        ))
+                    }
+                }
+                Err(error) => Err(error),
+            };
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.workspace.instance(iid).is_none() {
+                if this.current_workspace != workspace || this.workspace.instance(iid).is_none() {
                     return; // closed while the kill was in flight
                 }
                 // Say so rather than letting it pass as a restart: the respawn below

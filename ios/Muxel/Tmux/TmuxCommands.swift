@@ -127,9 +127,14 @@ enum TmuxCommands {
     }
 
     static func resolveTarget(_ instance: Instance, in targets: [SessionTarget]) -> SessionTarget? {
-        let eligible = targets.filter { instance.tmuxSocket == nil || $0.socket == instance.tmuxSocket }
-        return eligible.first { $0.name == instance.tmuxSession }
-            ?? eligible.first { TmuxSession.session($0.name, matchesInstanceId: instance.id) }
+        resolveTarget(instance, in: targets, name: { $0.name }, socket: { $0.socket })
+    }
+
+    static func resolveTarget<Row>(_ instance: Instance, in rows: [Row],
+                                   name: (Row) -> String, socket: (Row) -> String?) -> Row? {
+        let eligible = rows.filter { instance.tmuxSocket == nil || socket($0) == instance.tmuxSocket }
+        return eligible.first { name($0) == instance.tmuxSession }
+            ?? eligible.first { TmuxSession.session(name($0), matchesInstanceId: instance.id) }
     }
 
     // MARK: Lifecycle

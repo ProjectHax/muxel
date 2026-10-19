@@ -26,6 +26,21 @@ final class LiveGridStatusTests: XCTestCase {
         XCTAssertEqual(out.first?.running, true)
     }
 
+    func testPollingUsesTheSameExactSessionAsAttachment() {
+        var instance = shell()
+        instance.tmuxSession = "muxel_current_aaaaaaaa"
+        instance.tmuxSocket = "default"
+        let rows = [
+            PaneRow(session: "muxel_old_aaaaaaaa", exited: true, bell: true, idle: 100, socket: "default"),
+            PaneRow(session: "muxel_current_aaaaaaaa", exited: false, bell: false, idle: 100, socket: "default"),
+        ]
+        let targets = rows.map { TmuxCommands.SessionTarget(name: $0.session, socket: $0.socket!) }
+        XCTAssertEqual(TmuxCommands.resolveTarget(instance, in: targets)?.name, instance.tmuxSession)
+        let out = PollService().classify(rows: rows, instances: [instance])
+        XCTAssertEqual(out.first?.status, .idle)
+        XCTAssertEqual(out.first?.running, true)
+    }
+
     func testBlockedMarkerOnLiveScreen() {
         let p = PollService()
         let screen = LiveScreen(text: "Do you want to proceed?", idle: 5, bell: false)

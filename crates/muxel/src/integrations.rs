@@ -1652,6 +1652,23 @@ pub fn kill_tmux_session(session: &SessionTarget) {
         .output();
 }
 
+/// Resolve a legacy close without mutating either server. The caller must save
+/// this owner before its first kill and retain it across failures and retries.
+pub fn resolve_remote_tmux_close(
+    host: &RemoteHost,
+    control_path: &str,
+    password: Option<&str>,
+    closed: &muxel_core::tmux::ClosedSession,
+) -> Result<muxel_core::tmux::ClosedSession> {
+    if closed.socket.is_some() {
+        return Ok(closed.clone());
+    }
+    let out = ssh_run(host, control_path, password, &ssh::list_sessions_command())?;
+    let sessions = ssh::parse_session_listings(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| anyhow::anyhow!("couldn't determine the tmux session's server"))?;
+    Ok(closed.resolve_owner(&sessions, Socket::Private))
+}
+
 /// Kill a tmux session on a remote host over SSH, and **confirm it is gone**
 /// (over the host's commands master, which outlives any pane's connection).
 ///
@@ -1666,6 +1683,9 @@ pub fn kill_remote_tmux(
     password: Option<&str>,
     session: &SessionTarget,
 ) -> Result<()> {
+    if session.socket.is_none() {
+        bail!("resolve and save the tmux session owner before teardown");
+    }
     let out = ssh_run(
         host,
         control_path,

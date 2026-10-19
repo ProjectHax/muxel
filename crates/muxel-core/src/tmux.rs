@@ -403,6 +403,19 @@ impl ClosedSession {
         SessionTarget::new(self.name.clone(), self.socket)
     }
 
+    /// Bind a legacy close before its first mutation. Keep this result in both
+    /// ledgers and across retries, even when the chosen session disappears.
+    pub fn resolve_owner(&self, sessions: &[RemoteSession], new_socket: Socket) -> Self {
+        let mut resolved = self.clone();
+        if let Some(live) = live_closed_session(sessions, self) {
+            resolved.name = live.name.clone();
+            resolved.socket = Some(live.socket);
+        } else {
+            resolved.socket = resolved.socket.or(Some(new_socket));
+        }
+        resolved
+    }
+
     /// Whether `session` is the one this close was meant to reap.
     pub fn matches(&self, session: &RemoteSession) -> bool {
         self.socket.is_none_or(|socket| socket == session.socket)
@@ -421,7 +434,10 @@ pub fn live_closed_session<'a>(
     sessions: &'a [RemoteSession],
     closed: &ClosedSession,
 ) -> Option<&'a RemoteSession> {
-    sessions.iter().find(|s| closed.matches(s))
+    sessions
+        .iter()
+        .find(|s| closed.matches(s) && s.name == closed.name)
+        .or_else(|| sessions.iter().find(|s| closed.matches(s)))
 }
 
 /// The tmux session an instance uses: the name **recorded on the instance** wins;
@@ -964,6 +980,92 @@ mod tests {
             instance: Uuid::nil(),
         };
         assert_eq!(live_closed_session(&found, &closed), Some(&found[0]));
+    }
+
+    #[test]
+    fn legacy_close_retains_its_owner_after_a_lost_reply_and_workspace_reload() {
+        let mut sessions = parse_sessions_on("work|/p|claude|\n", Socket::Private);
+        sessions.extend(parse_sessions_on("work|/p|zsh|\n", Socket::Default));
+        let pending = ClosedSession {
+            name: "work".into(),
+            socket: None,
+            instance: Uuid::new_v4(),
+        };
+        let resolved = pending.resolve_owner(&sessions, Socket::Private);
+        let mut project = crate::Project::new("p", "/p");
+        project.remember_closed_session(resolved.target(), pending.instance);
+        let saved = serde_json::to_string(&project).unwrap();
+        let restored: crate::Project = serde_json::from_str(&saved).unwrap();
+        // The kill landed on mxl, but its reply was lost. Only default:work remains.
+        let retry = restored.closed_sessions[0].resolve_owner(&sessions[1..], Socket::Private);
+        assert_eq!(retry.target(), sessions[0].target());
+        assert!(live_closed_session(&sessions[1..], &retry).is_none());
+        let command = crate::ssh::kill_and_confirm_command(&retry.target());
+        assert_eq!(
+            command.matches("has-session").count(),
+            1,
+            "no new owner discovery: {command}"
+        );
+        assert!(command.contains("; set -- -L mxl;"));
+    }
+
+    #[test]
+    fn confirmed_legacy_close_does_not_reap_a_namesake_on_reconnect() {
+        let name = "muxel_p_12345678";
+        let mut sessions = parse_sessions_on(&format!("{name}|/p|claude|\n"), Socket::Private);
+        sessions.extend(parse_sessions_on(
+            &format!("{name}|/p|zsh|\n"),
+            Socket::Default,
+        ));
+        let legacy = ClosedSession {
+            name: name.into(),
+            socket: None,
+            instance: Uuid::nil(),
+        };
+        // This resolved record is retained in the in-memory confirmed-close ledger.
+        let reaped = legacy.resolve_owner(&sessions, Socket::Private);
+        assert!(live_closed_session(&sessions[1..], &reaped).is_none());
+        assert_eq!(
+            reaped.resolve_owner(&sessions[1..], Socket::Private),
+            reaped
+        );
+        assert_eq!(
+            orphan_sessions(&sessions[1..], "/p", &[], &[reaped]),
+            sessions[1..]
+        );
+    }
+
+    #[test]
+    fn an_absent_legacy_close_still_remembers_one_owner() {
+        let legacy = ClosedSession {
+            name: "work".into(),
+            socket: None,
+            instance: Uuid::nil(),
+        };
+        let reaped = legacy.resolve_owner(&[], Socket::Private);
+        assert_eq!(reaped.socket, Some(Socket::Private));
+        let later = parse_sessions_on("work|/p|zsh|\n", Socket::Default);
+        assert!(live_closed_session(&later, &reaped).is_none());
+        assert_eq!(reaped.resolve_owner(&later, Socket::Private), reaped);
+    }
+
+    #[test]
+    fn a_legacy_close_prefers_its_exact_name_before_a_uuid_suffix() {
+        let id = Uuid::parse_str("12345678-0000-4000-8000-000000000000").unwrap();
+        let mut sessions = parse_sessions_on("muxel_old_12345678|/p|claude|\n", Socket::Private);
+        sessions.extend(parse_sessions_on(
+            "muxel_new_12345678|/p|zsh|\n",
+            Socket::Default,
+        ));
+        let legacy = ClosedSession {
+            name: "muxel_new_12345678".into(),
+            socket: None,
+            instance: id,
+        };
+        assert_eq!(
+            legacy.resolve_owner(&sessions, Socket::Private).target(),
+            sessions[1].target()
+        );
     }
 
     /// The whole point: sessions still running in this project that nothing owns.

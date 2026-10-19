@@ -87,10 +87,8 @@ final class PollService {
                   liveScreens: [String: LiveScreen] = [:]) -> [InstanceStatus] {
         var out: [InstanceStatus] = []
         for inst in instances where inst.kind == .terminal {
-            guard let row = rows.first(where: {
-                (inst.tmuxSocket == nil || inst.tmuxSocket == $0.socket)
-                    && ($0.session == inst.tmuxSession || TmuxSession.session($0.session, matchesInstanceId: inst.id))
-            }) else {
+            guard let row = TmuxCommands.resolveTarget(inst, in: rows,
+                                                       name: { $0.session }, socket: { $0.socket }) else {
                 out.append(InstanceStatus(instanceId: inst.id, status: .idle, running: false))
                 continue
             }

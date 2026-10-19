@@ -1068,18 +1068,36 @@ final class AppState: ObservableObject {
     /// Persist the resolved owner before attachment so subsequent close/restart
     /// operations use that same server even if another gains the same name.
     func bindTmuxTarget(_ target: TmuxCommands.SessionTarget, instance: Instance,
-                        in project: RemoteProject) async throws {
-        guard let host = host(for: project) else { return }
-        if instance.tmuxSession == target.name, instance.tmuxSocket == target.socket { return }
-        let conn = connection(for: host)
-        if let written = try await RemoteLayoutStore.mutate(
-            conn, root: project.remoteRoot, seedIfMissing: false, transform: { layout in
-                guard let idx = layout.instances.firstIndex(where: { $0.id == instance.id }) else { return false }
-                layout.instances[idx].tmuxSession = target.name
-                layout.instances[idx].tmuxSocket = target.socket
-                return true
-            }) {
-            layout = written
+                        in project: RemoteProject) async throws -> Bool {
+        guard selectedProject?.id == project.id, let host = host(for: project) else { return false }
+        if instance.tmuxSession == target.name, instance.tmuxSocket == target.socket { return true }
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, Error>) in
+            enqueueLayoutWrite { [self] in
+                do {
+                    guard selectedProject?.id == project.id else {
+                        continuation.resume(returning: false); return
+                    }
+                    let conn = connection(for: host)
+                    try await conn.connect()
+                    guard selectedProject?.id == project.id else {
+                        continuation.resume(returning: false); return
+                    }
+                    let written = try await RemoteLayoutStore.mutate(
+                        conn, root: project.remoteRoot, seedIfMissing: false, transform: { layout in
+                            guard let idx = layout.instances.firstIndex(where: { $0.id == instance.id }) else { return false }
+                            layout.instances[idx].tmuxSession = target.name
+                            layout.instances[idx].tmuxSocket = target.socket
+                            return true
+                        })
+                    guard selectedProject?.id == project.id, let written else {
+                        continuation.resume(returning: false); return
+                    }
+                    layout = written
+                    continuation.resume(returning: true)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 
