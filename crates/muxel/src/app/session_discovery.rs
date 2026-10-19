@@ -9,10 +9,10 @@ use super::{
 use super::{active_grok_session_for_process, process_parent_map, read_grok_active_sessions};
 use crate::{session_binding, ui_profile};
 use gpui::{App, Context};
-use muxel_core::AgentPreset;
 use muxel_core::session_discovery::{
     SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
+use muxel_core::{AgentPreset, CodexHintMiss};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use uuid::Uuid;
@@ -211,7 +211,7 @@ impl MuxelApp {
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     let mut updates = Vec::new();
-                    for (request, candidate) in results {
+                    for (request, candidate, miss) in results {
                         let iid = request.key.pane;
                         let current = this.session_discovery_key(iid, cx);
                         let unowned = candidate.as_ref().is_some_and(|candidate| {
@@ -221,11 +221,12 @@ impl MuxelApp {
                                 &candidate.id,
                             )
                         });
-                        let valid = this.session_discoveries.finish(
+                        let valid = this.session_discoveries.finish_with_codex_miss(
                             &request,
                             current.as_ref(),
                             Instant::now(),
                             unowned,
+                            miss,
                         );
                         if valid
                             && unowned
@@ -316,7 +317,11 @@ fn discover_sessions(
     requests: Vec<SessionDiscoveryRequest>,
     home: &Path,
     data_dir: Option<&Path>,
-) -> Vec<(SessionDiscoveryRequest, Option<SessionCandidate>)> {
+) -> Vec<(
+    SessionDiscoveryRequest,
+    Option<SessionCandidate>,
+    Option<CodexHintMiss>,
+)> {
     #[cfg(windows)]
     let mut grok_snapshot = None;
     requests
@@ -324,19 +329,37 @@ fn discover_sessions(
         .map(|request| {
             let key = &request.key;
             let started = Instant::now();
+            let mut miss = None;
             let candidate = match key.provider {
-                SessionProvider::Codex => validated_codex_session_id(
-                    &AgentPreset::codex(),
-                    key.binding.as_deref(),
-                    key.hint.as_deref(),
-                    home,
-                    &key.cwd,
-                    Some(key.pane),
-                )
-                .map(|session| SessionCandidate {
-                    id: session.id,
-                    path: Some(session.path),
-                }),
+                SessionProvider::Codex => {
+                    let hint = key.hint.as_deref().unwrap_or_default();
+                    let stamp = CodexHintMiss::capture(home, hint, started);
+                    if let Some(cached) = request
+                        .codex_miss
+                        .as_ref()
+                        .filter(|cached| cached.reusable_for(&stamp))
+                    {
+                        miss = Some(cached.clone());
+                        None
+                    } else {
+                        let candidate = validated_codex_session_id(
+                            &AgentPreset::codex(),
+                            key.binding.as_deref(),
+                            key.hint.as_deref(),
+                            home,
+                            &key.cwd,
+                            Some(key.pane),
+                        )
+                        .map(|session| SessionCandidate {
+                            id: session.id,
+                            path: Some(session.path),
+                        });
+                        if candidate.is_none() {
+                            miss = Some(stamp);
+                        }
+                        candidate
+                    }
+                }
                 SessionProvider::Claude => data_dir.and_then(|data_dir| {
                     session_binding::claude_session_id_from_binding(data_dir, key.pane, home)
                         .map(|id| SessionCandidate { id, path: None })
@@ -368,7 +391,87 @@ fn discover_sessions(
                     ui_profile::SessionLookupOutcome::Unresolved
                 },
             );
-            (request, candidate)
+            (request, candidate, miss)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod w8lm_tests {
+    use super::discover_sessions;
+    use muxel_core::session_discovery::{SessionDiscoveries, SessionDiscoveryKey, SessionProvider};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    fn key(root: &std::path::Path) -> SessionDiscoveryKey {
+        SessionDiscoveryKey {
+            pane: Uuid::new_v4(),
+            provider: SessionProvider::Codex,
+            launch: Instant::now(),
+            child_pid: Some(1),
+            binding_generation: 0,
+            binding: None,
+            binding_path: None,
+            cwd: root.join("project"),
+            hint: Some("01a1543c-9700-7000-8000-000000000001".into()),
+        }
+    }
+
+    fn write(root: &std::path::Path, key: &SessionDiscoveryKey, subagent: bool) -> PathBuf {
+        std::fs::create_dir_all(&key.cwd).unwrap();
+        let day = root.join(".codex/sessions/2026/10/19");
+        std::fs::create_dir_all(&day).unwrap();
+        let id = key.hint.as_ref().unwrap();
+        let path = day.join(format!("rollout-{id}.jsonl"));
+        let source = if subagent {
+            serde_json::json!({"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}})
+        } else {
+            serde_json::json!("cli")
+        };
+        std::fs::write(&path,serde_json::json!({"type":"session_meta","payload":{"id":id,"session_id":id,"source":source,"cwd":key.cwd}}).to_string()).unwrap();
+        path
+    }
+
+    #[test]
+    fn w8lm_worker_captures_a_rollout_that_appears_after_a_cached_miss() {
+        let root = std::env::temp_dir().join(format!("muxel-w8lm-worker-{}", Uuid::new_v4()));
+        let key = key(&root);
+        let now = Instant::now();
+        let mut discovery = SessionDiscoveries::default();
+        for seconds in [0, 1] {
+            let at = now + Duration::from_secs(seconds);
+            let request = discovery.begin(key.clone(), at).unwrap();
+            let (request, candidate, miss) =
+                discover_sessions(vec![request], &root, None).pop().unwrap();
+            assert!(candidate.is_none());
+            assert!(miss.is_some());
+            assert!(discovery.finish_with_codex_miss(&request, Some(&key), at, false, miss));
+        }
+        let path = write(&root, &key, false);
+        let request = discovery
+            .begin(key.clone(), now + Duration::from_secs(2))
+            .unwrap();
+        assert!(request.codex_miss.is_some());
+        let (_, candidate, miss) = discover_sessions(vec![request], &root, None).pop().unwrap();
+        let candidate = candidate.expect("new day directory must invalidate the miss");
+        assert_eq!(candidate.id, key.hint.unwrap());
+        assert_eq!(candidate.path, Some(path));
+        assert!(miss.is_none());
+    }
+
+    #[test]
+    fn w8lm_worker_rejects_a_subagent_without_changing_the_existing_binding() {
+        let root = std::env::temp_dir().join(format!("muxel-w8lm-subagent-{}", Uuid::new_v4()));
+        let mut key = key(&root);
+        key.binding = Some(Uuid::new_v4().to_string());
+        write(&root, &key, true);
+        let old = key.binding.clone();
+        let request = SessionDiscoveries::default()
+            .begin(key, Instant::now())
+            .unwrap();
+        let (request, candidate, _) = discover_sessions(vec![request], &root, None).pop().unwrap();
+        assert!(candidate.is_none());
+        assert_eq!(request.key.binding, old);
+    }
 }

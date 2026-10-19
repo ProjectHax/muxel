@@ -148,7 +148,8 @@ feature is added or changed, update the matching entry here in the same change**
     `thread-id` title field preserves that binding across conversation renames; shortened
     UUIDs resolve in their timestamp's local day directory, with one neighboring day
     checked near a date boundary. Only matching filenames are opened to validate the
-    pane's directory. Multiple Codex
+    pane's directory and top-level thread identity; subagent rollouts never rebind
+    a pane. Multiple Codex
     panes can share a project without resuming one another's conversations.
   **Conversation switches stick** — an agent can swap its conversation inside a live
   pane (`/resume`, `/clear`, a fork) without restarting the PTY, and muxel rebinds the
@@ -165,8 +166,9 @@ feature is added or changed, update the matching entry here in the same change**
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
   starter binding. Recurring Codex rollout discovery and Claude hook validation run
   in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking. A failed or ambiguous Codex hint is cached until
-  that hint changes; Claude and Grok retry unresolved results with backoff.
+  lookup across pop-out and docking. A failed or ambiguous Codex hint retries when
+  its day directory changes, its launch/directory/binding changes, or after 30
+  seconds. Claude and Grok retry unresolved results with backoff.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   A saved conversation is abandoned only once muxel has confirmed it

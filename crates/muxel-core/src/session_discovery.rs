@@ -1,6 +1,6 @@
 //! Pure scheduling and result guards for provider session discovery.
 
-use crate::Workspace;
+use crate::{CodexHintMiss, Workspace};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -32,6 +32,7 @@ pub struct SessionDiscoveryKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionDiscoveryRequest {
     pub key: SessionDiscoveryKey,
+    pub codex_miss: Option<CodexHintMiss>,
     generation: u64,
     sequence: u64,
 }
@@ -46,8 +47,7 @@ pub struct SessionDiscovery {
     in_flight: Option<SessionDiscoveryRequest>,
     misses: u32,
     retry_at: Option<Instant>,
-    /// A failed exact hint is immutable; do not keep searching for it each tick.
-    codex_miss: Option<String>,
+    codex_miss: Option<CodexHintMiss>,
 }
 
 /// Discovery belongs to a workspace pane, independent of which window owns its
@@ -105,6 +105,24 @@ impl SessionDiscoveries {
             .get_mut(&request.key.pane)
             .is_some_and(|state| state.finish(request, current, now, found))
     }
+
+    pub fn finish_with_codex_miss(
+        &mut self,
+        request: &SessionDiscoveryRequest,
+        current: Option<&SessionDiscoveryKey>,
+        now: Instant,
+        found: bool,
+        miss: Option<CodexHintMiss>,
+    ) -> bool {
+        let Some(state) = self.panes.get_mut(&request.key.pane) else {
+            return false;
+        };
+        if !state.finish(request, current, now, found) {
+            return false;
+        }
+        state.codex_miss = miss;
+        true
+    }
 }
 
 impl SessionDiscovery {
@@ -114,6 +132,7 @@ impl SessionDiscovery {
             self.generation = self.generation.wrapping_add(1);
             self.misses = 0;
             self.retry_at = None;
+            self.codex_miss = None;
         }
     }
 
@@ -123,21 +142,13 @@ impl SessionDiscovery {
         now: Instant,
     ) -> Option<SessionDiscoveryRequest> {
         self.observe(Some(&key));
-        if key.provider == SessionProvider::Codex
-            && self.codex_miss == key.hint
-            && key.hint.is_some()
-        {
-            return None;
-        }
-        if self.codex_miss != key.hint {
-            self.codex_miss = None;
-        }
         if self.in_flight.is_some() || self.retry_at.is_some_and(|at| now < at) {
             return None;
         }
         self.sequence = self.sequence.wrapping_add(1);
         let request = SessionDiscoveryRequest {
             key,
+            codex_miss: self.codex_miss.clone(),
             generation: self.generation,
             sequence: self.sequence,
         };
@@ -146,8 +157,9 @@ impl SessionDiscovery {
     }
 
     /// Returns whether this result may be applied. `found` controls the next
-    /// poll: a Codex miss is cached until its hint changes. Claude and Grok cap
-    /// misses at two seconds so new in-process switches stay timely.
+    /// poll: Codex checks directory stamps once a second in the worker; an
+    /// unchanged miss avoids enumeration for at most 30 seconds. Claude and Grok
+    /// cap misses at two seconds so new in-process switches stay timely.
     /// A hit polls in one second; a bound Codex hint stops polling altogether.
     pub fn finish(
         &mut self,
@@ -164,10 +176,7 @@ impl SessionDiscovery {
         if current != Some(&request.key) || self.generation != request.generation {
             return false;
         }
-        if request.key.provider == SessionProvider::Codex && !found {
-            self.codex_miss = request.key.hint.clone();
-        }
-        let delay = if found {
+        let delay = if found || request.key.provider == SessionProvider::Codex {
             self.misses = 0;
             Duration::from_secs(1)
         } else {
@@ -206,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn b9_codex_missing_hint_is_cached_until_the_hint_changes() {
+    fn b9_codex_missing_hint_keeps_bounded_availability_checks_running() {
         let key = key();
         let now = Instant::now();
         let mut discovery = SessionDiscovery::default();
@@ -214,12 +223,48 @@ mod tests {
         assert!(discovery.finish(&request, Some(&key), now, false));
         let later = now + Duration::from_secs(3600);
         assert!(
-            discovery.begin(key.clone(), later).is_none(),
-            "unchanged missing hint was rescanned"
+            discovery.begin(key.clone(), later).is_some(),
+            "unchanged missing hint never retried"
         );
-        let mut changed = key;
-        changed.hint = Some("new hint".into());
-        assert!(discovery.begin(changed, later).is_some());
+    }
+
+    #[test]
+    fn w8lm_codex_miss_is_invalidated_by_launch_cwd_or_binding_changes() {
+        for change in ["launch", "cwd", "binding"] {
+            let mut key = key();
+            let now = Instant::now();
+            let mut discoveries = SessionDiscoveries::default();
+            let request = discoveries.begin(key.clone(), now).unwrap();
+            let miss =
+                crate::CodexHintMiss::capture(std::path::Path::new("unused"), "invalid hint", now);
+            assert!(discoveries.finish_with_codex_miss(
+                &request,
+                Some(&key),
+                now,
+                false,
+                Some(miss)
+            ));
+            let later = now + Duration::from_secs(1);
+            let cached = discoveries.begin(key.clone(), later).unwrap();
+            assert!(cached.codex_miss.is_some());
+            assert!(discoveries.finish_with_codex_miss(
+                &cached,
+                Some(&key),
+                later,
+                false,
+                cached.codex_miss.clone()
+            ));
+            match change {
+                "launch" => key.launch += Duration::from_secs(1),
+                "cwd" => key.cwd = PathBuf::from("changed"),
+                "binding" => key.binding_generation += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                discoveries.begin(key, later).unwrap().codex_miss.is_none(),
+                "{change}"
+            );
+        }
     }
 
     fn workspace(pane: Uuid) -> Workspace {

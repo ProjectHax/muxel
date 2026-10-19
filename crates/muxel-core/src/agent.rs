@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 mod codex_sessions;
 pub use codex_sessions::{
-    CodexSession, CodexSessionNames, codex_resume_path, codex_session_from_hint,
+    CodexHintMiss, CodexSession, CodexSessionNames, codex_resume_path, codex_session_from_hint,
 };
 
 #[cfg(test)]
@@ -953,7 +953,7 @@ fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
     false
 }
 
-/// First `session_meta` line in a Codex rollout → `(session_id, cwd)`.
+/// First top-level `session_meta` line → `(thread id, cwd)`.
 fn codex_session_meta(path: &Path) -> Option<(String, String)> {
     use std::io::{BufRead, BufReader};
     #[cfg(test)]
@@ -966,9 +966,20 @@ fn codex_session_meta(path: &Path) -> Option<(String, String)> {
             continue;
         }
         let payload = v.get("payload")?;
+        // A subagent shares its parent's session_id but owns a different thread.
+        // Neither its thread nor its parent's id describes this terminal pane.
+        if payload
+            .get("parent_thread_id")
+            .is_some_and(|parent| !parent.is_null())
+            || payload.get("source").is_some_and(|source| {
+                source.as_str() == Some("subagent") || source.get("subagent").is_some()
+            })
+        {
+            return None;
+        }
         let id = payload
-            .get("session_id")
-            .or_else(|| payload.get("id"))?
+            .get("id")
+            .or_else(|| payload.get("session_id"))?
             .as_str()?
             .to_string();
         let cwd = payload.get("cwd")?.as_str()?.to_string();

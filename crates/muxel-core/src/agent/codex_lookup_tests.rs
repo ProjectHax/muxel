@@ -34,15 +34,32 @@ pub(super) fn record_read(offset: u64, bytes: usize) {
 
 #[test]
 fn b9_codex_hint_resolution_never_enumerates_other_days() {
+    use chrono::TimeZone;
     let root = std::env::temp_dir().join(format!("muxel-codex-bounded-{}", Uuid::new_v4()));
     let cwd = root.join("project");
-    let day = root.join(".codex/sessions/2026/10/19");
+    // Center the timestamp in the overlap of the local and UTC calendar days.
+    // A fixed UTC noon is already the next day on UTC+13/UTC+14 hosts.
+    let noon = chrono::Utc
+        .with_ymd_and_hms(2026, 10, 19, 12, 0, 0)
+        .unwrap();
+    let offset = noon
+        .with_timezone(&chrono::Local)
+        .offset()
+        .local_minus_utc();
+    let created = noon - chrono::Duration::seconds(i64::from(offset) / 2);
+    let local = created.with_timezone(&chrono::Local);
+    assert_eq!(local.date_naive(), created.date_naive());
+    let day = root
+        .join(".codex/sessions")
+        .join(local.format("%Y/%m/%d").to_string());
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&day).unwrap();
     for unrelated in ["2025/01/01", "2026/10/18", "2026/09/30"] {
         std::fs::create_dir_all(root.join(".codex/sessions").join(unrelated)).unwrap();
     }
-    let id = "01a1543c-9700-7000-8000-000000000001";
+    let id =
+        Uuid::from_u128(((created.timestamp_millis() as u128) << 80) | (7 << 76) | (2 << 62) | 1)
+            .to_string();
     let path = day.join(format!("rollout-2026-10-19T05-56-59-{id}.jsonl"));
     std::fs::write(
         &path,
@@ -55,7 +72,7 @@ fn b9_codex_hint_resolution_never_enumerates_other_days() {
     OPERATIONS.with_borrow_mut(Vec::clear);
     assert_eq!(
         codex_session_id_from_hint(&root, &format!("{}...", &id[..29]), &cwd).as_deref(),
-        Some(id)
+        Some(id.as_str())
     );
     let operations = OPERATIONS.with_borrow_mut(std::mem::take);
     let directories: Vec<_> = operations
@@ -248,4 +265,173 @@ fn b9_midnight_hint_checks_only_its_day_and_one_neighbor() {
             Operation::Open(path)
         ]
     );
+}
+
+fn w8lm_rollout(root: &Path, id: &str, payload: serde_json::Value) -> PathBuf {
+    let day = super::codex_sessions::directories(root, id).remove(0);
+    std::fs::create_dir_all(&day).unwrap();
+    let path = day.join(format!("rollout-{id}.jsonl"));
+    std::fs::write(
+        &path,
+        serde_json::json!({"type":"session_meta","payload":payload}).to_string(),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn w8lm_codex_metadata_uses_thread_id_and_rejects_subagents() {
+    let id = "01a1543c-9700-7000-8000-000000000001";
+    let parent = "01a1543c-9700-7000-8000-000000000002";
+    for (label, payload, accepted) in [
+        (
+            "top-level",
+            serde_json::json!({"id":id,"session_id":parent,"source":"cli"}),
+            true,
+        ),
+        (
+            "subagent",
+            serde_json::json!({"id":id,"session_id":parent,"source":{"subagent":{"thread_spawn":{"parent_thread_id":parent}}}}),
+            false,
+        ),
+        (
+            "parent-field",
+            serde_json::json!({"id":id,"parent_thread_id":parent,"source":"exec"}),
+            false,
+        ),
+        ("legacy", serde_json::json!({"session_id":id}), true),
+    ] {
+        let root = std::env::temp_dir().join(format!("muxel-w8lm-{label}-{}", Uuid::new_v4()));
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut payload = payload;
+        payload["cwd"] = serde_json::json!(cwd);
+        w8lm_rollout(&root, id, payload);
+        assert_eq!(
+            codex_session_id_from_hint(&root, id, &cwd),
+            accepted.then(|| id.to_string()),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn w8lm_codex_capture_retries_after_a_missing_rollout_appears() {
+    use crate::session_discovery::{SessionDiscovery, SessionDiscoveryKey, SessionProvider};
+    use std::time::{Duration, Instant};
+    let root = std::env::temp_dir().join(format!("muxel-w8lm-appears-{}", Uuid::new_v4()));
+    let cwd = root.join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let id = "01a1543c-9700-7000-8000-000000000001";
+    let now = Instant::now();
+    let key = SessionDiscoveryKey {
+        pane: Uuid::new_v4(),
+        provider: SessionProvider::Codex,
+        launch: now,
+        child_pid: Some(1),
+        binding_generation: 0,
+        binding: None,
+        binding_path: None,
+        cwd: cwd.clone(),
+        hint: Some(id.into()),
+    };
+    let mut discovery = SessionDiscovery::default();
+    let first = discovery.begin(key.clone(), now).unwrap();
+    assert!(codex_session_id_from_hint(&root, id, &cwd).is_none());
+    assert!(discovery.finish(&first, Some(&key), now, false));
+    w8lm_rollout(
+        &root,
+        id,
+        serde_json::json!({"id":id,"cwd":cwd,"source":"cli"}),
+    );
+    let second = discovery
+        .begin(key.clone(), now + Duration::from_secs(2))
+        .expect("newly available rollout must be retried");
+    assert_eq!(
+        codex_session_id_from_hint(&root, id, &cwd).as_deref(),
+        Some(id)
+    );
+    assert!(discovery.finish(&second, Some(&key), now + Duration::from_secs(2), true));
+}
+
+#[test]
+fn w8lm_codex_index_replacement_and_truncate_regrow_discard_old_names() {
+    for replace in [false, true] {
+        let root = std::env::temp_dir().join(format!("muxel-w8lm-index-{}", Uuid::new_v4()));
+        let path = root.join(".codex/session_index.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"id\":\"old\",\"thread_name\":\"Old\"}\n").unwrap();
+        let mut index = CodexSessionNames::default();
+        assert!(index.refresh(&root).unwrap());
+        if replace {
+            std::fs::rename(&path, path.with_extension("old")).unwrap();
+        }
+        std::fs::write(&path,b"{\"id\":\"first\",\"thread_name\":\"Replacement first row\"}\n{\"id\":\"last\",\"thread_name\":\"Replacement last row\"}\n").unwrap();
+        assert!(index.refresh(&root).unwrap());
+        assert!(!index.names().contains_key("old"), "replace={replace}");
+        assert_eq!(
+            index.names().get("first").map(String::as_str),
+            Some("Replacement first row")
+        );
+        assert_eq!(index.names().len(), 2);
+        assert!(!index.refresh(&root).unwrap());
+    }
+}
+
+#[test]
+fn w8lm_codex_index_regrow_with_the_same_beginning_rechecks_old_tail() {
+    let root = std::env::temp_dir().join(format!("muxel-w8lm-index-tail-{}", Uuid::new_v4()));
+    let path = root.join(".codex/session_index.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let prefix = (0..20)
+        .map(|i| format!("{{\"id\":\"{i}\",\"thread_name\":\"Unchanged prefix {i}\"}}\n"))
+        .collect::<String>();
+    std::fs::write(
+        &path,
+        format!("{prefix}{{\"id\":\"old\",\"thread_name\":\"Old\"}}\n"),
+    )
+    .unwrap();
+    let mut index = CodexSessionNames::default();
+    index.refresh(&root).unwrap();
+    std::fs::write(
+        &path,
+        format!("{prefix}{{\"id\":\"new\",\"thread_name\":\"New longer replacement suffix\"}}\n"),
+    )
+    .unwrap();
+    assert!(index.refresh(&root).unwrap());
+    assert!(!index.names().contains_key("old"));
+    assert_eq!(
+        index.names().get("new").map(String::as_str),
+        Some("New longer replacement suffix")
+    );
+    assert_eq!(index.names().len(), 21);
+}
+
+#[test]
+fn w8lm_codex_miss_checks_only_day_stamps_and_expires_after_thirty_seconds() {
+    use super::CodexHintMiss;
+    use std::time::{Duration, Instant};
+    let root = std::env::temp_dir().join(format!("muxel-w8lm-cache-{}", Uuid::new_v4()));
+    let id = "01a1543c-9700-7000-8000-000000000001";
+    let now = Instant::now();
+    let miss = CodexHintMiss::capture(&root, id, now);
+    OPERATIONS.with_borrow_mut(Vec::clear);
+    let unchanged = CodexHintMiss::capture(&root, id, now + Duration::from_secs(29));
+    assert!(miss.reusable_for(&unchanged));
+    assert!(OPERATIONS.with_borrow(|ops| ops.iter().all(|op| matches!(op, Operation::Stat(_)))));
+    assert!(!miss.reusable_for(&CodexHintMiss::capture(
+        &root,
+        id,
+        now + Duration::from_secs(30)
+    )));
+    w8lm_rollout(
+        &root,
+        id,
+        serde_json::json!({"id":id,"cwd":root,"source":"cli"}),
+    );
+    assert!(!miss.reusable_for(&CodexHintMiss::capture(
+        &root,
+        id,
+        now + Duration::from_secs(1)
+    )));
 }

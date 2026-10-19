@@ -5,13 +5,47 @@ use chrono::{DateTime, FixedOffset, Local, NaiveDate, Timelike, Utc};
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexSession {
     pub id: String,
     pub path: PathBuf,
+}
+
+/// A failed bounded lookup may be reused while its day directories are unchanged.
+/// Capture/check these stamps on the background executor, never in a UI update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexHintMiss {
+    directories: Vec<(PathBuf, Option<SystemTime>)>,
+    scanned_at: Instant,
+}
+
+impl CodexHintMiss {
+    /// Capture before enumerating so a concurrent file creation forces a retry.
+    pub fn capture(home: &Path, hint: &str, now: Instant) -> Self {
+        Self {
+            directories: directories(home, hint)
+                .into_iter()
+                .map(|path| {
+                    let modified = stat(&path)
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok());
+                    (path, modified)
+                })
+                .collect(),
+            scanned_at: now,
+        }
+    }
+
+    pub fn reusable_for(&self, current: &Self) -> bool {
+        self.directories == current.directories
+            && current
+                .scanned_at
+                .saturating_duration_since(self.scanned_at)
+                < Duration::from_secs(30)
+    }
 }
 
 fn creation_time(hint: &str) -> Option<DateTime<Utc>> {
@@ -191,7 +225,10 @@ pub fn codex_resume_path(
 #[derive(Default)]
 pub struct CodexSessionNames {
     path: Option<PathBuf>,
-    stamp: Option<(u64, Option<SystemTime>)>,
+    stamp: Option<(u64, Option<SystemTime>, Option<SystemTime>)>,
+    prefix: Vec<u8>,
+    tail: Vec<u8>,
+    file: Option<std::fs::File>,
     offset: u64,
     pending: Vec<u8>,
     names: HashMap<String, String>,
@@ -207,7 +244,8 @@ impl CodexSessionNames {
     }
 
     /// Read only a changed suffix. Retain a partial final row until its newline
-    /// arrives, and reset when the file shrinks or is rewritten at the same size.
+    /// arrives. Check a bounded prefix before continuing after growth so rotation
+    /// or truncate-and-regrow cannot retain names from a different file prefix.
     pub fn refresh(&mut self, home: &Path) -> io::Result<bool> {
         let path = home.join(".codex/session_index.jsonl");
         let metadata = match stat(&path) {
@@ -218,25 +256,69 @@ impl CodexSessionNames {
             }
             Err(error) => return Err(error),
         };
-        let stamp = (metadata.len(), metadata.modified().ok());
+        let stamp = (
+            metadata.len(),
+            metadata.modified().ok(),
+            metadata.created().ok(),
+        );
         if self.path.as_ref() == Some(&path) && self.stamp == Some(stamp) {
             return Ok(false);
         }
-        let reset = self.path.as_ref() != Some(&path)
-            || metadata.len() < self.offset
-            || self
-                .stamp
-                .is_some_and(|old| old.0 == stamp.0 && old.1 != stamp.1);
-        let offset = if reset { 0 } else { self.offset };
         #[cfg(test)]
         super::codex_lookup_tests::record_open(&path);
         let mut file = std::fs::File::open(&path)?;
+        let metadata = file.metadata()?;
+        let stamp = (
+            metadata.len(),
+            metadata.modified().ok(),
+            metadata.created().ok(),
+        );
+        let mut prefix = vec![0; metadata.len().min(256) as usize];
+        file.read_exact(&mut prefix)?;
+        #[cfg(test)]
+        super::codex_lookup_tests::record_read(0, prefix.len());
+        // A retained handle follows the old file through rotation. Compare its
+        // current metadata, which also follows ordinary appends, with the path.
+        let replaced = self.file.as_ref().is_some_and(|old| match old.metadata() {
+            Ok(old) => (old.len(), old.modified().ok(), old.created().ok()) != stamp,
+            Err(_) => true,
+        });
+        let mut old_tail = vec![0; self.tail.len()];
+        let tail_matches = if self.offset <= metadata.len() && !old_tail.is_empty() {
+            file.seek(SeekFrom::Start(self.offset - old_tail.len() as u64))?;
+            file.read_exact(&mut old_tail)?;
+            #[cfg(test)]
+            super::codex_lookup_tests::record_read(
+                self.offset - old_tail.len() as u64,
+                old_tail.len(),
+            );
+            old_tail == self.tail
+        } else {
+            self.tail.is_empty()
+        };
+        let reset = replaced
+            || !tail_matches
+            || self.path.as_ref() != Some(&path)
+            || metadata.len() < self.offset
+            || self
+                .stamp
+                .is_some_and(|old| old.2 != stamp.2 || (old.0 == stamp.0 && old.1 != stamp.1))
+            || !prefix.starts_with(&self.prefix);
+        let offset = if reset { 0 } else { self.offset };
         file.seek(SeekFrom::Start(offset))?;
         let mut appended = Vec::new();
-        file.take(metadata.len().saturating_sub(offset))
+        (&mut file)
+            .take(metadata.len().saturating_sub(offset))
             .read_to_end(&mut appended)?;
         #[cfg(test)]
         super::codex_lookup_tests::record_read(offset, appended.len());
+        // Finish all fallible reads before changing the cached names.
+        let tail_len = metadata.len().min(256) as usize;
+        let mut tail = vec![0; tail_len];
+        file.seek(SeekFrom::Start(metadata.len() - tail_len as u64))?;
+        file.read_exact(&mut tail)?;
+        #[cfg(test)]
+        super::codex_lookup_tests::record_read(metadata.len() - tail_len as u64, tail_len);
         let mut changed = reset && !self.names.is_empty();
         if reset {
             self.names.clear();
@@ -267,6 +349,9 @@ impl CodexSessionNames {
         self.offset = offset + appended.len() as u64;
         self.path = Some(path);
         self.stamp = Some(stamp);
+        self.prefix = prefix;
+        self.tail = tail;
+        self.file = Some(file);
         Ok(changed)
     }
 }
@@ -279,6 +364,10 @@ mod tests {
     #[test]
     fn day_lookup_has_one_day_normally_and_one_neighbor_at_boundaries() {
         let cases = [
+            (
+                "2026-10-20T01:56:59+13:00",
+                vec!["2026-10-20", "2026-10-19"],
+            ),
             ("2026-10-19T05:56:59-07:00", vec!["2026-10-19"]),
             (
                 "2026-10-19T00:02:00-07:00",
