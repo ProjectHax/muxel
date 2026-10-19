@@ -175,7 +175,7 @@ fn b9_compression_moves_only_probe_the_exact_saved_path_and_its_sibling() {
 }
 
 #[test]
-fn b9_codex_name_index_reads_only_changes_and_resets_after_truncation() {
+fn b9_codex_name_index_rereads_changed_files_and_resets_after_truncation() {
     use std::io::Write;
     let root = std::env::temp_dir().join(format!("muxel-codex-incremental-{}", Uuid::new_v4()));
     let path = root.join(".codex/session_index.jsonl");
@@ -201,8 +201,8 @@ fn b9_codex_name_index_reads_only_changes_and_resets_after_truncation() {
     assert_eq!(index.names().get("a").map(String::as_str), Some("Renamed"));
     assert!(
         OPERATIONS.with_borrow(|operations| operations.contains(&Operation::Read {
-            offset: first.len() as u64,
-            bytes: appended.len()
+            offset: 0,
+            bytes: first.len() + appended.len()
         }))
     );
     file.write_all(b"{\"id\":\"b\",\"thread_name\":\"Par")
@@ -277,6 +277,271 @@ fn w8lm_rollout(root: &Path, id: &str, payload: serde_json::Value) -> PathBuf {
     )
     .unwrap();
     path
+}
+
+fn r2_key(root: &Path) -> crate::session_discovery::SessionDiscoveryKey {
+    crate::session_discovery::SessionDiscoveryKey {
+        pane: Uuid::new_v4(),
+        provider: crate::session_discovery::SessionProvider::Codex,
+        launch: std::time::Instant::now(),
+        child_pid: Some(1),
+        binding_generation: 0,
+        binding: None,
+        binding_path: None,
+        cwd: root.join("project"),
+        hint: Some("01a1543c-9700-7000-8000-000000000001".into()),
+    }
+}
+
+fn r2_churn(day: &Path, tick: u64) {
+    let before = std::fs::metadata(day).unwrap().modified().unwrap();
+    std::fs::write(day.join(format!("unrelated-{tick}")), "").unwrap();
+    // Windows may defer directory timestamps. Set this owned fixture's stamp
+    // explicitly so the operation-count test always exercises invalidation.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.access_mode(0x100).custom_flags(0x0200_0000);
+    }
+    options
+        .open(day)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_800_000_000 + tick),
+        ))
+        .unwrap();
+    let after = std::fs::metadata(day).unwrap().modified().unwrap();
+    assert_ne!(before, after, "fixture must change the day directory stamp");
+}
+
+#[test]
+fn b9_r2_codex_sibling_rejection_stops_io_until_ownership_changes() {
+    use crate::session_discovery::{CodexLookupEvidence, SessionDiscoveries};
+    use crate::{AgentPreset, Instance, Project, Workspace};
+    use std::time::Duration;
+    for change in ["generation", "released", "removed"] {
+        let root = std::env::temp_dir().join(format!("muxel-r2-owner-{}", Uuid::new_v4()));
+        let key = r2_key(&root);
+        let id = key.hint.as_deref().unwrap();
+        let path = w8lm_rollout(&root, id, serde_json::json!({"id":id,"cwd":key.cwd}));
+        let day = path.parent().unwrap();
+        let project = Project::new("project", &key.cwd);
+        let mut target = Instance::from_preset(project.id, &AgentPreset::codex());
+        target.id = key.pane;
+        target.session_id = None;
+        let mut owner = Instance::from_preset(project.id, &AgentPreset::codex());
+        owner.session_id = Some(id.into());
+        let owner_id = owner.id;
+        let mut workspace = Workspace {
+            projects: vec![project],
+            instances: vec![target, owner],
+            ..Workspace::default()
+        };
+        let mut discovery = SessionDiscoveries::default();
+        let now = key.launch;
+        OPERATIONS.with_borrow_mut(Vec::clear);
+        let mut attempts = 0;
+        for tick in 0..=60 {
+            r2_churn(day, tick);
+            discovery.reconcile(&workspace);
+            let at = now + Duration::from_secs(tick);
+            if let Some(request) = discovery.begin(key.clone(), at) {
+                attempts += 1;
+                let candidate = super::codex_session_from_hint(&root, id, &key.cwd).unwrap();
+                let owner = workspace
+                    .instances
+                    .iter()
+                    .find(|row| {
+                        row.id != key.pane && row.session_id.as_deref() == Some(&candidate.id)
+                    })
+                    .unwrap();
+                assert!(discovery.finish_with_codex_evidence(
+                    &request,
+                    Some(&key),
+                    at,
+                    false,
+                    CodexLookupEvidence {
+                        miss: None,
+                        rejected_owner: Some((owner.id, candidate.id))
+                    }
+                ));
+            }
+        }
+        assert_eq!(attempts, 1, "unchanged sibling rejection retried: {change}");
+        assert_eq!(
+            OPERATIONS.with_borrow(|ops| ops
+                .iter()
+                .filter(|op| matches!(op, Operation::Open(_)))
+                .count()),
+            1
+        );
+        match change {
+            "generation" => discovery.binding_changed(owner_id),
+            "released" => workspace.instance_mut(owner_id).unwrap().session_id = None,
+            "removed" => workspace.instances.retain(|row| row.id != owner_id),
+            _ => unreachable!(),
+        }
+        discovery.reconcile(&workspace);
+        let at = now + Duration::from_secs(61);
+        let request = discovery
+            .begin(key.clone(), at)
+            .expect("ownership change did not revalidate");
+        let candidate = super::codex_session_from_hint(&root, id, &key.cwd).unwrap();
+        let blocker = workspace
+            .instances
+            .iter()
+            .find(|row| row.id != key.pane && row.session_id.as_deref() == Some(&candidate.id))
+            .map(|row| (row.id, candidate.id.clone()));
+        assert!(discovery.finish_with_codex_evidence(
+            &request,
+            Some(&key),
+            at,
+            blocker.is_none(),
+            CodexLookupEvidence {
+                miss: None,
+                rejected_owner: blocker
+            }
+        ));
+        if change == "generation" {
+            assert!(
+                discovery
+                    .begin(key.clone(), at + Duration::from_secs(1))
+                    .is_none()
+            );
+            workspace.instance_mut(owner_id).unwrap().session_id = None;
+            discovery.reconcile(&workspace);
+            let at = at + Duration::from_secs(1);
+            let request = discovery.begin(key.clone(), at).unwrap();
+            let candidate = super::codex_session_from_hint(&root, id, &key.cwd).unwrap();
+            assert_eq!(candidate.path, path);
+            assert!(discovery.finish_with_codex_evidence(
+                &request,
+                Some(&key),
+                at,
+                true,
+                CodexLookupEvidence::default()
+            ));
+        }
+        assert_eq!(
+            OPERATIONS.with_borrow(|ops| ops
+                .iter()
+                .filter(|op| matches!(op, Operation::Open(_)))
+                .count()),
+            if change == "generation" { 3 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn b9_r2_codex_churning_day_respects_backoff_and_captures_later_rollout() {
+    use super::CodexHintMiss;
+    use crate::session_discovery::SessionDiscoveries;
+    use std::time::Duration;
+    for (appears, expected) in [
+        (20, vec![0, 1, 3, 7, 15, 31]),
+        (100, vec![0, 1, 3, 7, 15, 31, 61, 91, 121]),
+    ] {
+        let root = std::env::temp_dir().join(format!("muxel-r2-churn-{}", Uuid::new_v4()));
+        let key = r2_key(&root);
+        let id = key.hint.as_deref().unwrap();
+        let directories = super::codex_sessions::directories(&root, id);
+        let day = &directories[0];
+        std::fs::create_dir_all(day).unwrap();
+        let now = key.launch;
+        let mut discovery = SessionDiscoveries::default();
+        let mut attempts = Vec::new();
+        let mut captured = false;
+        OPERATIONS.with_borrow_mut(Vec::clear);
+        for tick in 0..=121 {
+            r2_churn(day, tick);
+            if tick == appears {
+                w8lm_rollout(&root, id, serde_json::json!({"id":id,"cwd":key.cwd}));
+            }
+            let at = now + Duration::from_secs(tick);
+            let Some(request) = discovery.begin(key.clone(), at) else {
+                continue;
+            };
+            attempts.push(tick);
+            let stamp = CodexHintMiss::capture(&root, id, at);
+            let candidate = if request
+                .codex_miss
+                .as_ref()
+                .is_some_and(|miss| miss.reusable_for(&stamp))
+            {
+                None
+            } else {
+                super::codex_session_from_hint(&root, id, &key.cwd)
+            };
+            let found = candidate.is_some();
+            assert!(discovery.finish_with_codex_miss(
+                &request,
+                Some(&key),
+                at,
+                found,
+                (!found).then_some(stamp)
+            ));
+            if let Some(candidate) = candidate {
+                assert_eq!(candidate.id, id);
+                captured = true;
+                break;
+            }
+        }
+        assert!(captured, "available rollout was never captured");
+        assert_eq!(
+            attempts, expected,
+            "directory churn bypassed exponential backoff"
+        );
+        let operations = OPERATIONS.with_borrow_mut(std::mem::take);
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|op| matches!(op, Operation::Directory(_)))
+                .count(),
+            directories.len() * expected.len()
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|op| matches!(op, Operation::Open(_)))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn b9_r2_codex_index_middle_rewrite_with_unchanged_samples_is_visible() {
+    let root = std::env::temp_dir().join(format!("muxel-r2-index-middle-{}", Uuid::new_v4()));
+    let path = root.join(".codex/session_index.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let old = (0..40)
+        .map(|i| format!("{{\"id\":\"{i}\",\"thread_name\":\"Name-{i:02}\"}}\n"))
+        .collect::<String>();
+    std::fs::write(&path, &old).unwrap();
+    let mut index = CodexSessionNames::default();
+    index.refresh(&root).unwrap();
+    let rewritten =
+        old.replace("Name-20", "Edit-20") + "{\"id\":\"new\",\"thread_name\":\"Appended\"}\n";
+    assert_eq!(&old.as_bytes()[..256], &rewritten.as_bytes()[..256]);
+    assert_eq!(
+        &old.as_bytes()[old.len() - 256..],
+        &rewritten.as_bytes()[old.len() - 256..old.len()]
+    );
+    std::fs::write(&path, &rewritten).unwrap();
+    OPERATIONS.with_borrow_mut(Vec::clear);
+    assert!(index.refresh(&root).unwrap());
+    assert_eq!(index.names().get("20").map(String::as_str), Some("Edit-20"));
+    assert_eq!(
+        index.names().get("new").map(String::as_str),
+        Some("Appended")
+    );
+    assert!(OPERATIONS.with_borrow(|ops| ops.contains(&Operation::Read {
+        offset: 0,
+        bytes: rewritten.len()
+    })));
 }
 
 #[test]

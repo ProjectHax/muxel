@@ -3,7 +3,7 @@
 use super::{codex_session_meta, is_codex_thread_id_hint, paths_loosely_equal};
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, Timelike, Utc};
 use std::collections::HashMap;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
@@ -225,12 +225,7 @@ pub fn codex_resume_path(
 #[derive(Default)]
 pub struct CodexSessionNames {
     path: Option<PathBuf>,
-    stamp: Option<(u64, Option<SystemTime>, Option<SystemTime>)>,
-    prefix: Vec<u8>,
-    tail: Vec<u8>,
-    file: Option<std::fs::File>,
-    offset: u64,
-    pending: Vec<u8>,
+    stamp: Option<(u64, Option<SystemTime>)>,
     names: HashMap<String, String>,
 }
 
@@ -243,9 +238,9 @@ impl CodexSessionNames {
         &self.names
     }
 
-    /// Read only a changed suffix. Retain a partial final row until its newline
-    /// arrives. Check a bounded prefix before continuing after growth so rotation
-    /// or truncate-and-regrow cannot retain names from a different file prefix.
+    /// Unchanged indexes take one stat. Reread a changed file in full on the
+    /// worker, including earlier rows that may have been rewritten in place.
+    /// Ignore an incomplete final row until its newline arrives.
     pub fn refresh(&mut self, home: &Path) -> io::Result<bool> {
         let path = home.join(".codex/session_index.jsonl");
         let metadata = match stat(&path) {
@@ -256,102 +251,40 @@ impl CodexSessionNames {
             }
             Err(error) => return Err(error),
         };
-        let stamp = (
-            metadata.len(),
-            metadata.modified().ok(),
-            metadata.created().ok(),
-        );
+        let stamp = (metadata.len(), metadata.modified().ok());
         if self.path.as_ref() == Some(&path) && self.stamp == Some(stamp) {
             return Ok(false);
         }
         #[cfg(test)]
         super::codex_lookup_tests::record_open(&path);
-        let mut file = std::fs::File::open(&path)?;
+        let file = std::fs::File::open(&path)?;
         let metadata = file.metadata()?;
-        let stamp = (
-            metadata.len(),
-            metadata.modified().ok(),
-            metadata.created().ok(),
-        );
-        let mut prefix = vec![0; metadata.len().min(256) as usize];
-        file.read_exact(&mut prefix)?;
+        let stamp = (metadata.len(), metadata.modified().ok());
+        let mut bytes = Vec::new();
+        file.take(metadata.len()).read_to_end(&mut bytes)?;
         #[cfg(test)]
-        super::codex_lookup_tests::record_read(0, prefix.len());
-        // A retained handle follows the old file through rotation. Compare its
-        // current metadata, which also follows ordinary appends, with the path.
-        let replaced = self.file.as_ref().is_some_and(|old| match old.metadata() {
-            Ok(old) => (old.len(), old.modified().ok(), old.created().ok()) != stamp,
-            Err(_) => true,
-        });
-        let mut old_tail = vec![0; self.tail.len()];
-        let tail_matches = if self.offset <= metadata.len() && !old_tail.is_empty() {
-            file.seek(SeekFrom::Start(self.offset - old_tail.len() as u64))?;
-            file.read_exact(&mut old_tail)?;
-            #[cfg(test)]
-            super::codex_lookup_tests::record_read(
-                self.offset - old_tail.len() as u64,
-                old_tail.len(),
-            );
-            old_tail == self.tail
-        } else {
-            self.tail.is_empty()
-        };
-        let reset = replaced
-            || !tail_matches
-            || self.path.as_ref() != Some(&path)
-            || metadata.len() < self.offset
-            || self
-                .stamp
-                .is_some_and(|old| old.2 != stamp.2 || (old.0 == stamp.0 && old.1 != stamp.1))
-            || !prefix.starts_with(&self.prefix);
-        let offset = if reset { 0 } else { self.offset };
-        file.seek(SeekFrom::Start(offset))?;
-        let mut appended = Vec::new();
-        (&mut file)
-            .take(metadata.len().saturating_sub(offset))
-            .read_to_end(&mut appended)?;
-        #[cfg(test)]
-        super::codex_lookup_tests::record_read(offset, appended.len());
-        // Finish all fallible reads before changing the cached names.
-        let tail_len = metadata.len().min(256) as usize;
-        let mut tail = vec![0; tail_len];
-        file.seek(SeekFrom::Start(metadata.len() - tail_len as u64))?;
-        file.read_exact(&mut tail)?;
-        #[cfg(test)]
-        super::codex_lookup_tests::record_read(metadata.len() - tail_len as u64, tail_len);
-        let mut changed = reset && !self.names.is_empty();
-        if reset {
-            self.names.clear();
-            self.pending.clear();
-        }
-        self.pending.extend_from_slice(&appended);
-        let mut consumed = 0;
-        for (index, byte) in self.pending.iter().enumerate() {
-            if *byte != b'\n' {
+        super::codex_lookup_tests::record_read(0, bytes.len());
+        let mut names = HashMap::new();
+        for row in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if row.last() != Some(&b'\n') {
                 continue;
             }
-            if let Ok(value) =
-                serde_json::from_slice::<serde_json::Value>(&self.pending[consumed..index])
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(row)
                 && let Some(id) = value.get("id").and_then(serde_json::Value::as_str)
                 && let Some(name) = value
                     .get("thread_name")
                     .and_then(serde_json::Value::as_str)
                     .map(str::trim)
                     .filter(|name| !name.is_empty())
-                && self.names.get(id).map(String::as_str) != Some(name)
             {
-                self.names.insert(id.to_string(), name.to_string());
-                changed = true;
+                names.insert(id.to_string(), name.to_string());
             }
-            consumed = index + 1;
         }
-        self.pending.drain(..consumed);
-        self.offset = offset + appended.len() as u64;
+        // Retain the last good map if opening or reading the changed file fails.
+        let changed = self.names != names;
+        self.names = names;
         self.path = Some(path);
         self.stamp = Some(stamp);
-        self.prefix = prefix;
-        self.tail = tail;
-        self.file = Some(file);
         Ok(changed)
     }
 }

@@ -3,14 +3,14 @@
 
 use super::{
     MuxelApp, PaneView, home_dir, is_claude_program, is_codex_program, is_grok_program,
-    session_id_bound_elsewhere, validated_codex_session_id,
+    validated_codex_session_id,
 };
 #[cfg(windows)]
 use super::{active_grok_session_for_process, process_parent_map, read_grok_active_sessions};
 use crate::{session_binding, ui_profile};
 use gpui::{App, Context};
 use muxel_core::session_discovery::{
-    SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
+    CodexLookupEvidence, SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
 use muxel_core::{AgentPreset, CodexHintMiss};
 use std::path::{Path, PathBuf};
@@ -214,19 +214,29 @@ impl MuxelApp {
                     for (request, candidate, miss) in results {
                         let iid = request.key.pane;
                         let current = this.session_discovery_key(iid, cx);
-                        let unowned = candidate.as_ref().is_some_and(|candidate| {
-                            !session_id_bound_elsewhere(
-                                &this.workspace.instances,
-                                iid,
-                                &candidate.id,
-                            )
+                        // Earlier results in this batch may already have
+                        // acquired this conversation. Check the live workspace.
+                        let rejected_owner = candidate.as_ref().and_then(|candidate| {
+                            this.workspace
+                                .instances
+                                .iter()
+                                .find(|instance| {
+                                    instance.id != iid
+                                        && instance.session_id.as_deref()
+                                            == Some(candidate.id.as_str())
+                                })
+                                .map(|instance| (instance.id, candidate.id.clone()))
                         });
-                        let valid = this.session_discoveries.finish_with_codex_miss(
+                        let unowned = candidate.is_some() && rejected_owner.is_none();
+                        let valid = this.session_discoveries.finish_with_codex_evidence(
                             &request,
                             current.as_ref(),
                             Instant::now(),
                             unowned,
-                            miss,
+                            CodexLookupEvidence {
+                                miss,
+                                rejected_owner,
+                            },
                         );
                         if valid
                             && unowned
@@ -450,7 +460,7 @@ mod w8lm_tests {
         }
         let path = write(&root, &key, false);
         let request = discovery
-            .begin(key.clone(), now + Duration::from_secs(2))
+            .begin(key.clone(), now + Duration::from_secs(3))
             .unwrap();
         assert!(request.codex_miss.is_some());
         let (_, candidate, miss) = discover_sessions(vec![request], &root, None).pop().unwrap();

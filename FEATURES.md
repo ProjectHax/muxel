@@ -166,9 +166,12 @@ feature is added or changed, update the matching entry here in the same change**
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
   starter binding. Recurring Codex rollout discovery and Claude hook validation run
   in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking. A failed or ambiguous Codex hint retries when
-  its day directory changes, its launch/directory/binding changes, or after 30
-  seconds. Claude and Grok retry unresolved results with backoff.
+  lookup across pop-out and docking. Failed Codex hints retry with a delay that
+  grows from one to thirty seconds, even while the day directory changes.
+  A sibling-owned hint waits until that ownership or binding changes. Launch,
+  directory, hint or binding changes reset the delay. The name index is reread
+  in full on a worker when its size or modification time changes; unchanged
+  indexes take one stat. Claude and Grok retry unresolved results with backoff.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   A saved conversation is abandoned only once muxel has confirmed it

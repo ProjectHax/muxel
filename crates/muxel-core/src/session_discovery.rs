@@ -37,6 +37,19 @@ pub struct SessionDiscoveryRequest {
     sequence: u64,
 }
 
+#[derive(Default)]
+pub struct CodexLookupEvidence {
+    pub miss: Option<CodexHintMiss>,
+    pub rejected_owner: Option<(Uuid, String)>,
+}
+
+#[derive(Debug)]
+struct CodexOwnershipRejection {
+    owner: Uuid,
+    session_id: String,
+    binding_generation: u64,
+}
+
 /// A pane keeps its obsolete worker until it finishes, so rapid identity
 /// changes cannot pile up scans. Only a matching completion releases it.
 #[derive(Debug, Default)]
@@ -48,6 +61,7 @@ pub struct SessionDiscovery {
     misses: u32,
     retry_at: Option<Instant>,
     codex_miss: Option<CodexHintMiss>,
+    codex_owner: Option<CodexOwnershipRejection>,
 }
 
 /// Discovery belongs to a workspace pane, independent of which window owns its
@@ -56,6 +70,7 @@ pub struct SessionDiscovery {
 pub struct SessionDiscoveries {
     panes: HashMap<Uuid, SessionDiscovery>,
     binding_generations: HashMap<Uuid, u64>,
+    bindings: HashMap<Uuid, String>,
 }
 
 impl SessionDiscoveries {
@@ -64,6 +79,16 @@ impl SessionDiscoveries {
         self.panes.retain(|pane, _| panes.contains(pane));
         self.binding_generations
             .retain(|pane, _| panes.contains(pane));
+        self.bindings.retain(|pane, _| panes.contains(pane));
+        for instance in &workspace.instances {
+            if let Some(id) = &instance.session_id {
+                if self.bindings.get(&instance.id) != Some(id) {
+                    self.bindings.insert(instance.id, id.clone());
+                }
+            } else {
+                self.bindings.remove(&instance.id);
+            }
+        }
     }
 
     pub fn binding_generation(&self, pane: Uuid) -> u64 {
@@ -91,7 +116,27 @@ impl SessionDiscoveries {
         key: SessionDiscoveryKey,
         now: Instant,
     ) -> Option<SessionDiscoveryRequest> {
-        self.panes.entry(key.pane).or_default().begin(key, now)
+        let state = self.panes.entry(key.pane).or_default();
+        state.observe(Some(&key));
+        if let Some(owner) = &state.codex_owner {
+            if self.bindings.get(&owner.owner) == Some(&owner.session_id)
+                && self
+                    .binding_generations
+                    .get(&owner.owner)
+                    .copied()
+                    .unwrap_or(0)
+                    == owner.binding_generation
+            {
+                return None;
+            }
+            // Ownership changed. Revalidate immediately, even when the previous
+            // failed lookup had reached its maximum retry delay.
+            state.codex_owner = None;
+            state.codex_miss = None;
+            state.misses = 0;
+            state.retry_at = None;
+        }
+        state.begin(key, now)
     }
 
     pub fn finish(
@@ -114,13 +159,43 @@ impl SessionDiscoveries {
         found: bool,
         miss: Option<CodexHintMiss>,
     ) -> bool {
+        self.finish_with_codex_evidence(
+            request,
+            current,
+            now,
+            found,
+            CodexLookupEvidence {
+                miss,
+                rejected_owner: None,
+            },
+        )
+    }
+
+    pub fn finish_with_codex_evidence(
+        &mut self,
+        request: &SessionDiscoveryRequest,
+        current: Option<&SessionDiscoveryKey>,
+        now: Instant,
+        found: bool,
+        evidence: CodexLookupEvidence,
+    ) -> bool {
+        let owner = evidence
+            .rejected_owner
+            .map(|(owner, session_id)| CodexOwnershipRejection {
+                owner,
+                session_id,
+                binding_generation: self.binding_generation(owner),
+            });
         let Some(state) = self.panes.get_mut(&request.key.pane) else {
             return false;
         };
         if !state.finish(request, current, now, found) {
             return false;
         }
-        state.codex_miss = miss;
+        state.codex_miss = evidence.miss;
+        if !found && request.key.provider == SessionProvider::Codex {
+            state.codex_owner = owner;
+        }
         true
     }
 }
@@ -133,6 +208,7 @@ impl SessionDiscovery {
             self.misses = 0;
             self.retry_at = None;
             self.codex_miss = None;
+            self.codex_owner = None;
         }
     }
 
@@ -157,8 +233,8 @@ impl SessionDiscovery {
     }
 
     /// Returns whether this result may be applied. `found` controls the next
-    /// poll: Codex checks directory stamps once a second in the worker; an
-    /// unchanged miss avoids enumeration for at most 30 seconds. Claude and Grok
+    /// poll: Codex misses back off from one to thirty seconds, independently of
+    /// directory stamp changes. Claude and Grok
     /// cap misses at two seconds so new in-process switches stay timely.
     /// A hit polls in one second; a bound Codex hint stops polling altogether.
     pub fn finish(
@@ -176,7 +252,8 @@ impl SessionDiscovery {
         if current != Some(&request.key) || self.generation != request.generation {
             return false;
         }
-        let delay = if found || request.key.provider == SessionProvider::Codex {
+        self.codex_owner = None;
+        let delay = if found {
             self.misses = 0;
             Duration::from_secs(1)
         } else {
@@ -230,7 +307,7 @@ mod tests {
 
     #[test]
     fn w8lm_codex_miss_is_invalidated_by_launch_cwd_or_binding_changes() {
-        for change in ["launch", "cwd", "binding"] {
+        for change in ["launch", "cwd", "binding", "hint"] {
             let mut key = key();
             let now = Instant::now();
             let mut discoveries = SessionDiscoveries::default();
@@ -258,6 +335,7 @@ mod tests {
                 "launch" => key.launch += Duration::from_secs(1),
                 "cwd" => key.cwd = PathBuf::from("changed"),
                 "binding" => key.binding_generation += 1,
+                "hint" => key.hint = Some("another hint".into()),
                 _ => unreachable!(),
             }
             assert!(
@@ -275,6 +353,47 @@ mod tests {
             projects: vec![project],
             instances: vec![instance],
             ..Workspace::default()
+        }
+    }
+
+    #[test]
+    fn b9_r2_codex_ownership_cache_resets_when_the_target_context_changes() {
+        use super::CodexLookupEvidence;
+        for change in ["launch", "cwd", "binding", "hint"] {
+            let mut key = key();
+            let mut workspace = workspace(key.pane);
+            let mut owner = workspace.instances[0].clone();
+            owner.id = Uuid::new_v4();
+            owner.session_id = Some("owned hint".into());
+            let owner_id = owner.id;
+            workspace.instances.push(owner);
+            let mut discoveries = SessionDiscoveries::default();
+            discoveries.reconcile(&workspace);
+            let now = Instant::now();
+            let request = discoveries.begin(key.clone(), now).unwrap();
+            assert!(discoveries.finish_with_codex_evidence(
+                &request,
+                Some(&key),
+                now,
+                false,
+                CodexLookupEvidence {
+                    miss: None,
+                    rejected_owner: Some((owner_id, "owned hint".into()))
+                }
+            ));
+            assert!(
+                discoveries
+                    .begin(key.clone(), now + Duration::from_secs(60))
+                    .is_none()
+            );
+            match change {
+                "launch" => key.launch += Duration::from_secs(1),
+                "cwd" => key.cwd = PathBuf::from("changed"),
+                "binding" => key.binding_generation += 1,
+                "hint" => key.hint = Some("another hint".into()),
+                _ => unreachable!(),
+            }
+            assert!(discoveries.begin(key, now).is_some(), "{change}");
         }
     }
 
