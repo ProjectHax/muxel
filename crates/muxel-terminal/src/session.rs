@@ -2696,13 +2696,16 @@ fn cancel_finished_child_input(writer: &JoinHandle<()>) {
 
 /// Lets teardown wake a PTY reader parked on a silent child.
 ///
-/// On Unix the reader polls the PTY together with a pipe whose write end the
-/// output queue holds; dropping the last receiver or the session drops that
-/// end, which wakes the poll with no PTY bytes. Without it, a descendant that
-/// ignores SIGHUP can keep the slave open and silent after its pane closes,
-/// pinning the reader thread, its PTY descriptors and the unreaped child until
-/// the descendant writes or exits. Windows needs no wake: dropping the session
-/// closes the pseudoconsole, which ends the reader's pipe.
+/// On Unix the reader waits on the PTY together with a pipe whose write end
+/// the output queue holds; dropping the last receiver or the session drops
+/// that end, which wakes the wait with no PTY bytes. Without it, a descendant
+/// that ignores SIGHUP can keep the slave open and silent after its pane
+/// closes, pinning the reader thread, its PTY descriptors and the unreaped
+/// child until the descendant writes or exits. The wait goes through the
+/// `polling` crate (epoll on Linux, kqueue on macOS) rather than `poll(2)`,
+/// which macOS does not support on devices such as PTYs. Windows needs no
+/// wake: dropping the session closes the pseudoconsole, which ends the
+/// reader's pipe.
 struct ReaderWake {
     #[cfg(unix)]
     pty: std::os::fd::OwnedFd,
@@ -2710,15 +2713,24 @@ struct ReaderWake {
     wake: std::io::PipeReader,
     #[cfg(unix)]
     queue: Arc<OutputQueueState>,
+    #[cfg(unix)]
+    poller: polling::Poller,
 }
 
-/// Pause between attempts when `poll` itself fails on a Unix PTY reader.
+/// Pause between attempts when the wait itself fails on a Unix PTY reader.
 #[cfg(unix)]
 const READER_POLL_RETRY: Duration = Duration::from_millis(50);
+
+/// Poller keys for the reader's two sources.
+#[cfg(unix)]
+const READER_PTY_KEY: usize = 0;
+#[cfg(unix)]
+const READER_WAKE_KEY: usize = 1;
 
 impl ReaderWake {
     #[cfg(unix)]
     fn new(master: &dyn MasterPty, queue: &Arc<OutputQueueState>) -> Result<Self> {
+        use polling::{Event, PollMode, Poller};
         let fd = master.as_raw_fd().context("pty master has no descriptor")?;
         // SAFETY: `master` owns `fd` and outlives this call. The clone is a
         // separate descriptor for the same PTY, owned by the reader thread.
@@ -2726,11 +2738,24 @@ impl ReaderWake {
             .try_clone_to_owned()
             .context("clone pty descriptor for polling")?;
         let (wake, wake_tx) = std::io::pipe().context("create pty reader wake pipe")?;
+        let poller = Poller::new().context("create pty reader poller")?;
+        // SAFETY: both sources live in this struct, whose Drop deletes them
+        // from the poller before their descriptors close. Level mode reports
+        // the PTY on every wait while it has output, with no re-arming.
+        unsafe { poller.add_with_mode(&pty, Event::readable(READER_PTY_KEY), PollMode::Level) }
+            .context("watch pty descriptor")?;
+        if let Err(error) = unsafe {
+            poller.add_with_mode(&wake, Event::readable(READER_WAKE_KEY), PollMode::Level)
+        } {
+            let _ = poller.delete(&pty);
+            return Err(error).context("watch pty reader wake pipe");
+        }
         queue.install_reader_wake(wake_tx);
         Ok(Self {
             pty,
             wake,
             queue: queue.clone(),
+            poller,
         })
     }
 
@@ -2742,53 +2767,57 @@ impl ReaderWake {
     /// Wait until the PTY has output, EOF, or an error to read. False once
     /// the last receiver or the session has dropped.
     ///
-    /// EINTR is retried at once. EFAULT and EINVAL cannot occur for this
-    /// two-entry array, which leaves ENOMEM. Falling through to the read would
-    /// block where teardown cannot wake it, so a failed poll is retried after
-    /// a short pause, checking between attempts whether the stream has closed.
+    /// Nothing is ever written to the wake pipe, so any event on it means its
+    /// write end closed. Falling through to the read would block where
+    /// teardown cannot wake it, so a failed wait is retried after a short
+    /// pause, checking between attempts whether the stream has closed.
     #[cfg(unix)]
     fn wait_for_output(&self) -> bool {
-        use std::os::fd::AsRawFd;
+        let mut events = polling::Events::new();
         let mut warned = false;
-        let mut fds = [
-            libc::pollfd {
-                fd: self.pty.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: self.wake.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
         loop {
-            // SAFETY: `fds` is a live array of two initialized `pollfd`
-            // entries whose descriptors stay open for the whole call.
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-            if ready >= 0 {
-                // Nothing is ever written to the wake pipe, so any event on
-                // it means its write end closed.
-                return fds[1].revents == 0;
+            events.clear();
+            match self.poller.wait(&mut events, None) {
+                Ok(_) => {
+                    let mut output = false;
+                    for event in events.iter() {
+                        match event.key {
+                            READER_WAKE_KEY => return false,
+                            READER_PTY_KEY => output = true,
+                            _ => {}
+                        }
+                    }
+                    if output {
+                        return true;
+                    }
+                    // A spurious wake with no events: wait again.
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    if self.queue.is_closed() {
+                        return false;
+                    }
+                    if !warned {
+                        log::warn!("pty reader wait failed (retrying): {error}");
+                        warned = true;
+                    }
+                    std::thread::sleep(READER_POLL_RETRY);
+                }
             }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            if self.queue.is_closed() {
-                return false;
-            }
-            if !warned {
-                log::warn!("pty reader poll failed (retrying): {error}");
-                warned = true;
-            }
-            std::thread::sleep(READER_POLL_RETRY);
         }
     }
 
     #[cfg(not(unix))]
     fn wait_for_output(&self) -> bool {
         true
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReaderWake {
+    fn drop(&mut self) {
+        let _ = self.poller.delete(&self.pty);
+        let _ = self.poller.delete(&self.wake);
     }
 }
 
@@ -3124,10 +3153,10 @@ mod content_damage_tests {
     /// Descriptor use must not grow with the number of spawned-and-dropped
     /// sessions.
     ///
-    /// A live session costs six: the PTY master, the reader thread's dup and
-    /// its polling dup, both ends of the reader's wake pipe, and the writer
-    /// thread's dup. The thread-owned ones are only released when those
-    /// threads exit, which happens because dropping the session kills the child
+    /// A live session costs seven: the PTY master, the reader thread's dup,
+    /// its polling dup and poller, both ends of the reader's wake pipe, and
+    /// the writer thread's dup. The thread-owned ones are only released when
+    /// those threads exit, which happens because dropping the session kills the child
     /// (reader sees EOF) and drops the writer channel's `Sender`. Anything that
     /// keeps an `Arc<TerminalSession>` alive past its pane therefore leaks
     /// descriptors until the process hits EMFILE — which is exactly what a
@@ -4068,6 +4097,8 @@ mod bounded_output_pty_tests {
     #[test]
     fn real_pty_saturation_preserves_records_and_exit_order() {
         let (session, rx, mut transport_output) = spawn_fixture_to_start();
+        // Only the Windows branch below takes the session out early.
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut session = Some(session);
         wait_for_saturation(&rx);
 
@@ -4896,7 +4927,7 @@ mod tests {
 
     /// A shell whose background descendant ignores SIGHUP and keeps the PTY
     /// slave open without writing. Returns the shell's and descendant's pids.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn spawn_with_silent_descendant() -> (Arc<TerminalSession>, PtyReceiver, u32, libc::pid_t) {
         let script = "(trap '' HUP; exec sleep 30) & echo \"descendant:$!\"; wait";
         let (session, rx) = TerminalSession::spawn(
@@ -4925,18 +4956,28 @@ mod tests {
         (session, rx, shell, descendant)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn kill_descendant(descendant: libc::pid_t) {
         // SAFETY: `kill` takes plain values; this is the exact pid the shell
         // reported for the descendant this test started.
         unsafe { libc::kill(descendant, libc::SIGKILL) };
     }
 
+    /// Whether `pid` has been reaped: signal 0 only probes for existence,
+    /// and a zombie still answers until its parent waits on it.
+    #[cfg(unix)]
+    fn process_reaped(pid: u32) -> bool {
+        // SAFETY: signal 0 delivers nothing; the pid is a child this test
+        // started and the only thread reaping it is the session's reader.
+        let missing = unsafe { libc::kill(pid as libc::pid_t, 0) } != 0;
+        missing && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
     /// A descendant that ignores SIGHUP can keep the PTY slave open, and
     /// silent, after its pane closes. Closing the pane must still wake the
     /// reader with no output arriving, so it reaps the shell rather than stay
     /// parked on the PTY until the descendant writes or exits.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn closed_pane_releases_reader_while_a_silent_descendant_holds_the_pty() {
         let (session, rx, shell, descendant) = spawn_with_silent_descendant();
@@ -4946,12 +4987,11 @@ mod tests {
         // reader left the PTY although nothing more was written to it.
         drop(rx);
         drop(session);
-        let proc_dir = format!("/proc/{shell}");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while std::path::Path::new(&proc_dir).exists() && Instant::now() < deadline {
+        while !process_reaped(shell) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
-        let reaped = !std::path::Path::new(&proc_dir).exists();
+        let reaped = process_reaped(shell);
         kill_descendant(descendant);
         assert!(
             reaped,
@@ -4963,7 +5003,7 @@ mod tests {
     /// kept. The reader must stop waiting for output no terminal will render,
     /// reap the shell, and end the stream with Exit and then `Closed`, so a
     /// receiver that keeps draining is not left waiting on it.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn dropped_session_ends_the_stream_while_a_silent_descendant_holds_the_pty() {
         let (session, rx, shell, descendant) = spawn_with_silent_descendant();
@@ -4983,7 +5023,7 @@ mod tests {
             }
         };
         // The reader reaps before it sends Exit and closes the stream.
-        let reaped = !std::path::Path::new(&format!("/proc/{shell}")).exists();
+        let reaped = process_reaped(shell);
         kill_descendant(descendant);
         assert!(
             closed,
@@ -4995,7 +5035,7 @@ mod tests {
 
     /// Spawn `sh -c script` with `$MUXEL_HUP_MARKER` naming a fresh marker
     /// file, and wait for the script to print `ready`.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn spawn_hangup_script(
         script: &str,
         label: &str,
@@ -5014,7 +5054,7 @@ mod tests {
     }
 
     /// Read output until `needle` appears.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn read_until(rx: &PtyReceiver, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut seen = Vec::new();
@@ -5032,7 +5072,7 @@ mod tests {
     /// writes `saved` to a marker file before exiting. It ignores later HUPs:
     /// dropping the session closes the PTY master, and the kernel's own
     /// hangup that follows is outside muxel's control.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn spawn_with_slow_hangup_cleanup(
         order: &str,
     ) -> (Arc<TerminalSession>, PtyReceiver, std::path::PathBuf) {
@@ -5041,7 +5081,7 @@ mod tests {
         spawn_hangup_script(script, order)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn marker_saved(marker: &std::path::Path, within: Duration) -> bool {
         let deadline = Instant::now() + within;
         loop {
@@ -5058,7 +5098,7 @@ mod tests {
     /// Dropping the session ends the stream without waiting on the child,
     /// but the child keeps its SIGHUP cleanup: it is not SIGKILLed while its
     /// handler is still saving.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn dropped_session_leaves_the_child_its_hangup_cleanup() {
         let (session, rx, marker) = spawn_with_slow_hangup_cleanup("session");
@@ -5091,7 +5131,7 @@ mod tests {
 
     /// Dropping the receiver first stops the reader and hangs up the child;
     /// the child still gets to finish its SIGHUP cleanup.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn dropped_receiver_leaves_the_child_its_hangup_cleanup() {
         let (session, rx, marker) = spawn_with_slow_hangup_cleanup("receiver");
@@ -5111,7 +5151,7 @@ mod tests {
     /// and wakes the reader. The reader must not send a second SIGHUP. This
     /// child restores the default action while it saves, so a second HUP
     /// kills it before the marker is written.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn retained_session_close_sends_one_hangup() {
         let script = "trap 'trap - HUP; echo saving; sleep 1; echo saved > \"$MUXEL_HUP_MARKER\"; exit 0' HUP; \
