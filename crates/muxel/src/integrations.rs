@@ -238,10 +238,11 @@ pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::
     // `tmux` is not on sshd's bare default PATH when it came from Homebrew — see
     // `ssh::tmux_path_prelude`. Unresolved, this reads as "no sessions on the host"
     // and every running agent there stays stranded.
-    let out = remote_ssh_command(c, ssh::list_sessions_command())
+    let sockets = local_tmux_sockets();
+    let out = remote_ssh_command(c, ssh::list_sessions_command_on(&sockets))
         .output()
         .ok()?;
-    ssh::parse_session_listings(&String::from_utf8_lossy(&out.stdout))
+    ssh::parse_session_listings_on(&String::from_utf8_lossy(&out.stdout), &sockets)
 }
 
 /// Every tmux session on this machine, as [`list_remote_tmux_sessions`] reports a
@@ -1305,7 +1306,7 @@ pub fn git_diff(dir: &Path) -> String {
 /// [`restore_tmux_exit_empty`] puts it back when muxel quits.
 ///
 /// The server is this profile's own: `mxl` for the regular profile, or the
-/// isolated root's named socket. A recorded default owner is left alone.
+/// isolated root's named socket.
 pub fn ensure_tmux_server(socket: Socket) {
     let root = local_tmux_root();
     let socket = SessionTarget::new("", Some(socket))
@@ -1450,6 +1451,13 @@ pub fn profile_tmux_target(session: &SessionTarget) -> SessionTarget {
     session.for_profile(local_tmux_root().as_deref())
 }
 
+pub fn profile_tmux_socket() -> Socket {
+    local_tmux_root()
+        .as_deref()
+        .map(Socket::isolated)
+        .unwrap_or(Socket::Private)
+}
+
 /// Whether the local server on `socket` has session `session`.
 fn local_tmux_has_session(socket: Socket, session: &str) -> bool {
     tmux_on(socket)
@@ -1585,9 +1593,10 @@ fn tmux_at(
 }
 
 fn tmux_command_at(loc: &RepoLoc, session: &SessionTarget, args: &[String]) -> Option<Command> {
+    let session = profile_tmux_target(session);
     let mut cmd = match loc {
         RepoLoc::Local(_) => {
-            let mut cmd = tmux_on(local_tmux_socket(session));
+            let mut cmd = tmux_on(local_tmux_socket(&session));
             cmd.args(args);
             cmd
         }
@@ -1595,7 +1604,7 @@ fn tmux_command_at(loc: &RepoLoc, session: &SessionTarget, args: &[String]) -> O
             if c.host.os.is_windows() {
                 return None;
             }
-            remote_ssh_command(c, ssh::session_tmux_command(session, args))
+            remote_ssh_command(c, ssh::session_tmux_command(&session, args))
         }
     };
     cmd.stdin(Stdio::null());
@@ -1653,11 +1662,12 @@ pub fn unset_tmux_option_if(
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let lifecycle = GitEnv::production();
+    let session = profile_tmux_target(session);
     let args = muxel_core::tmux::unset_option_if_args(&session.name, option, pattern)
         .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim cleanup safely"))?;
     let cmd = match loc {
         RepoLoc::Local(_) => {
-            let socket = bounded_tmux_socket(session, deadline, &lifecycle, |socket| {
+            let socket = bounded_tmux_socket(&session, deadline, &lifecycle, |socket| {
                 let mut cmd = tmux_on(socket);
                 cmd.args(muxel_core::tmux::has_session_args(&session.name));
                 cmd
@@ -1666,7 +1676,7 @@ pub fn unset_tmux_option_if(
             cmd.args(args);
             cmd
         }
-        RepoLoc::Remote(_) => tmux_command_at(loc, session, &args)
+        RepoLoc::Remote(_) => tmux_command_at(loc, &session, &args)
             .ok_or_else(|| anyhow::anyhow!("tmux is unavailable"))?,
     };
     run_claim_cleanup(cmd, deadline, &lifecycle)
@@ -1733,13 +1743,21 @@ pub fn resolve_remote_tmux_close(
     password: Option<&str>,
     closed: &muxel_core::tmux::ClosedSession,
 ) -> Result<muxel_core::tmux::ClosedSession> {
+    let mut closed = closed.clone();
+    closed.socket = profile_tmux_target(&closed.target()).socket;
     if closed.socket.is_some() {
-        return Ok(closed.clone());
+        return Ok(closed);
     }
-    let out = ssh_run(host, control_path, password, &ssh::list_sessions_command())?;
-    let sessions = ssh::parse_session_listings(&String::from_utf8_lossy(&out.stdout))
+    let sockets = local_tmux_sockets();
+    let out = ssh_run(
+        host,
+        control_path,
+        password,
+        &ssh::list_sessions_command_on(&sockets),
+    )?;
+    let sessions = ssh::parse_session_listings_on(&String::from_utf8_lossy(&out.stdout), &sockets)
         .ok_or_else(|| anyhow::anyhow!("couldn't determine the tmux session's server"))?;
-    Ok(closed.resolve_owner(&sessions, Socket::Private))
+    Ok(closed.resolve_owner(&sessions, profile_tmux_socket()))
 }
 
 /// Kill a tmux session on a remote host over SSH, and **confirm it is gone**
@@ -1756,6 +1774,7 @@ pub fn kill_remote_tmux(
     password: Option<&str>,
     session: &SessionTarget,
 ) -> Result<()> {
+    let session = profile_tmux_target(session);
     if session.socket.is_none() {
         bail!("resolve and save the tmux session owner before teardown");
     }
@@ -1763,7 +1782,7 @@ pub fn kill_remote_tmux(
         host,
         control_path,
         password,
-        &ssh::kill_and_confirm_command(session),
+        &ssh::kill_and_confirm_command(&session),
     )?;
     match out.status.code() {
         Some(0) => Ok(()),
@@ -1786,11 +1805,12 @@ pub fn claim_tmux_window_size(
     session: &SessionTarget,
     tag: &str,
 ) -> Result<()> {
+    let session = profile_tmux_target(session);
     let out = ssh_run(
         host,
         control_path,
         password,
-        &ssh::claim_window_size_command(session, tag),
+        &ssh::claim_window_size_command(&session, tag),
     )?;
     // ssh reports its own failures as 255; anything else is the command's answer.
     if out.status.code() == Some(255) {
@@ -1808,7 +1828,7 @@ pub fn kill_remote_tmux_detached(
     password: Option<&str>,
     session: &SessionTarget,
 ) {
-    let remote_cmd = ssh::kill_command(session);
+    let remote_cmd = ssh::kill_command(&profile_tmux_target(session));
     let mut argv = ssh::connection_args(host, control_path);
     if password.is_none() {
         argv.push("-o".into());

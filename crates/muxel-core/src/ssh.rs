@@ -1600,6 +1600,7 @@ mod tests {
             let selection = match socket {
                 Socket::Private => "; set -- -L mxl;",
                 Socket::Default => "; set --;",
+                Socket::Isolated(_) => unreachable!("BOTH contains only real-profile sockets"),
             };
             assert!(cmd.contains(selection), "{cmd}");
             assert_eq!(cmd.matches("kill-session").count(), 1, "{cmd}");
@@ -1651,6 +1652,62 @@ mod tests {
                     !cmd.contains("tmux -L mxl"),
                     "all commands use the selected argv: {cmd}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_ssh_discovery_launch_claims_and_teardown_never_probe_global_servers() {
+        let root = std::path::Path::new("/isolated-ssh");
+        let socket = Socket::isolated(root);
+        let label = String::from(socket);
+        let sockets = [socket];
+        let listing = list_sessions_command_on(&sockets);
+        assert_eq!(listing.matches(":muxel-listed:").count(), 1);
+        let parsed =
+            parse_session_listings_on("work|/w|claude|\n:muxel-listed:0\n", &sockets).unwrap();
+        assert_eq!(parsed[0].socket, socket);
+        assert!(
+            parse_session_listings_on(":muxel-listed:0\n:muxel-listed:0\n", &sockets).is_none()
+        );
+        let h = host();
+        for prior in [
+            None,
+            Some(Socket::Private),
+            Some(Socket::Default),
+            Some(Socket::Isolated(1)),
+        ] {
+            let target = crate::tmux::SessionTarget::new("work", prior).for_profile(Some(root));
+            let spec = SshSpec {
+                host: &h,
+                control_path: "/s",
+                remote_cwd: Some("/w"),
+                program: Some("claude"),
+                args: &[],
+                use_tmux: true,
+                tmux_session: Some(&target.name),
+                tmux_socket: target.socket,
+                tmux_client_tag: Some("ab12"),
+            };
+            let cleanup = crate::tmux::unset_option_if_args("work", "@claim", "owner").unwrap();
+            for cmd in [
+                listing.clone(),
+                ssh_args(&spec).pop().unwrap(),
+                session_tmux_command(&target, &crate::tmux::show_option_args("work", "@claim")),
+                session_tmux_command(
+                    &target,
+                    &crate::tmux::set_option_args("work", "@claim", "owner"),
+                ),
+                session_tmux_command(&target, &cleanup),
+                claim_window_size_command(&target, "ab12"),
+                kill_command(&target),
+                kill_and_confirm_command(&target),
+            ] {
+                assert!(cmd.contains(&format!("-L {label}")), "{cmd}");
+                assert!(!cmd.contains("tmux -L mxl "), "global mxl: {cmd}");
+                assert!(!cmd.contains("set --;"), "default selection: {cmd}");
+                assert!(!cmd.contains("if ! tmux"), "legacy discovery: {cmd}");
+                assert!(!cmd.contains("; tmux has-session"), "default probe: {cmd}");
             }
         }
     }

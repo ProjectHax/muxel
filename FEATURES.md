@@ -1096,8 +1096,9 @@ feature is added or changed, update the matching entry here in the same change**
   Local tmux panes require tmux 3.2+ to pass the root and endpoint per session;
   older versions show an upgrade error without launching a fallback shell.
   Restarting the pane after upgrading tmux checks support again.
-  Each isolated root uses its own local tmux socket for discovery, reattachment
-  and cleanup. The regular profile keeps the `mxl` socket and reattaches legacy
+  Each isolated root uses its own tmux socket locally and over SSH. Discovery,
+  reattachment, claims, restart, close and quit stay on that socket, including
+  when older or peer metadata names another server. The regular profile keeps the `mxl` socket and reattaches legacy
   default-socket sessions. Version and help exit without initializing a profile.
   Relative paths and `--user-data-dir=DIR` work; empty, repeated or malformed
   forms are refused before startup. The flag can also precede Linux browser-helper

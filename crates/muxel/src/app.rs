@@ -28,7 +28,7 @@ use muxel_core::library::resolve::{SnippetStep, snippet_send_action};
 use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
-use muxel_core::tmux::{SessionTarget, Socket};
+use muxel_core::tmux::SessionTarget;
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity, InjectionMode, Instance,
@@ -6010,7 +6010,7 @@ impl MuxelApp {
         // The session recorded on the instance wins — it is what the iOS app
         // launches from, and what a previous run left running on the host. See
         // `tmux::session_for`.
-        let session = inst.map(|i| i.tmux_target(&host.name));
+        let session = inst.map(|i| integrations::profile_tmux_target(&i.tmux_target(&host.name)));
         let tag = Self::tmux_client_tag(host);
         let ssh_argv = muxel_core::ssh::ssh_args(&muxel_core::ssh::SshSpec {
             host,
@@ -6260,8 +6260,11 @@ impl MuxelApp {
             let project = self.workspace.project(instance.project_id)?;
             (project.remote.is_none()
                 && instance.tmux_session.is_some()
-                && instance.tmux_socket.is_none())
-            .then(|| instance.tmux_target(&project.name))
+                && (instance.tmux_socket.is_none()
+                    || integrations::profile_tmux_target(&instance.tmux_target(&project.name))
+                        .socket
+                        != instance.tmux_socket))
+                .then(|| instance.tmux_target(&project.name))
         });
         if let Some(target) = unresolved {
             let socket = integrations::local_tmux_socket(&target);
@@ -6678,10 +6681,12 @@ impl MuxelApp {
             return false;
         };
         let pid = instance.project_id;
-        let Some(host) = self
-            .remote_host_for_instance(iid)
-            .filter(|host| host.use_tmux(instance.use_tmux) && instance.tmux_socket.is_none())
-        else {
+        let Some(host) = self.remote_host_for_instance(iid).filter(|host| {
+            host.use_tmux(instance.use_tmux)
+                && (instance.tmux_socket.is_none()
+                    || integrations::profile_tmux_target(&instance.tmux_target(&host.name)).socket
+                        != instance.tmux_socket)
+        }) else {
             return false;
         };
         let Some(loc) = self.repo_loc(pid) else {
@@ -6728,7 +6733,7 @@ impl MuxelApp {
                     &host.name,
                     [instance],
                     &sessions,
-                    Socket::Private,
+                    integrations::profile_tmux_socket(),
                 );
                 this.persist();
                 this.spawn_terminal_deferred(iid, window, cx);
@@ -7312,7 +7317,7 @@ impl MuxelApp {
                                         &host.name,
                                         instances,
                                         &sessions,
-                                        Socket::Private,
+                                        integrations::profile_tmux_socket(),
                                     );
                                     this.persist();
                                 }
@@ -10205,7 +10210,12 @@ impl MuxelApp {
             instance.use_tmux = true;
         }
         let eligible = instances.iter_mut().filter(|i| unbound(i));
-        muxel_core::tmux::bind_session_owners(&project.name, eligible, &sessions, Socket::Private);
+        muxel_core::tmux::bind_session_owners(
+            &project.name,
+            eligible,
+            &sessions,
+            integrations::profile_tmux_socket(),
+        );
     }
 
     /// Adopt the exact Claude conversation selected by an in-process `/resume`.
@@ -11762,7 +11772,7 @@ impl MuxelApp {
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
                 instance.tmux_session = Some(muxel_core::tmux::session_name(&project_name, iid));
-                instance.tmux_socket = Some(Socket::Private);
+                instance.tmux_socket = Some(integrations::profile_tmux_socket());
             }
             if !adopted
                 && instance.tmux_session.is_none()
@@ -11771,7 +11781,7 @@ impl MuxelApp {
                     .filter(|host| host.use_tmux(instance.use_tmux))
             {
                 instance.tmux_session = Some(muxel_core::tmux::session_name(&host.name, iid));
-                instance.tmux_socket = Some(Socket::Private);
+                instance.tmux_socket = Some(integrations::profile_tmux_socket());
             }
         }
 
@@ -13697,7 +13707,7 @@ impl MuxelApp {
             .closed_sessions_of(pid)
             .iter()
             .map(|c| {
-                let c = c.resolve_owner(sessions, Socket::Private);
+                let c = c.resolve_owner(sessions, integrations::profile_tmux_socket());
                 (
                     c.instance,
                     c.target(),
@@ -17264,7 +17274,7 @@ impl MuxelApp {
                 .map(|p| p.name.clone())
                 .unwrap_or_default();
             inst.tmux_session = Some(muxel_core::tmux::session_name(&project_name, inst.id));
-            inst.tmux_socket = Some(Socket::Private);
+            inst.tmux_socket = Some(integrations::profile_tmux_socket());
         }
         if inst.tmux_session.is_none()
             && let Some(host) = self
@@ -17272,7 +17282,7 @@ impl MuxelApp {
                 .filter(|host| host.use_tmux(inst.use_tmux))
         {
             inst.tmux_session = Some(muxel_core::tmux::session_name(&host.name, inst.id));
-            inst.tmux_socket = Some(Socket::Private);
+            inst.tmux_socket = Some(integrations::profile_tmux_socket());
         }
         let new_iid = inst.id;
         // Insert the copy as a tab right after the original.
