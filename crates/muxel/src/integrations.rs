@@ -1637,9 +1637,7 @@ fn run_tmux_until(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = lifecycle
-        .spawn(&mut cmd)
-        .context("starting tmux command")?;
+    let child = lifecycle.spawn(&mut cmd).context("starting tmux command")?;
     let (child, status) = lifecycle.wait_until(child, deadline);
     lifecycle.reap(child);
     Ok(status)
