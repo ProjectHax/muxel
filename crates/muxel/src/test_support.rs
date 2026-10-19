@@ -135,6 +135,10 @@ pub fn git_out(dir: &Path, args: &[&str]) -> String {
             "user.email=muxel-test@example.invalid",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
         ])
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
