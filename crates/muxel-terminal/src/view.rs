@@ -889,6 +889,7 @@ fn coalesce_pending(
 pub struct TerminalView {
     instance_id: Uuid,
     session: Arc<TerminalSession>,
+    startup_turn: Option<muxel_core::control::StartupTurn>,
     focus_handle: FocusHandle,
     palette: TerminalPalette,
     font_family: SharedString,
@@ -978,13 +979,15 @@ fn claude_startup_ready(
     blocked_markers: &[String],
     empty: bool,
 ) -> bool {
-    screen.claude_composer(empty)
-        && parse_agent_title(TitleProvider::Claude, title).and_then(|frame| frame.status)
-            != Some(AgentStatus::Working)
-        && provider_screen_status(TitleProvider::Claude, &screen.text).is_none()
+    let Some(context) = screen.claude_composer_context(empty) else {
+        return false;
+    };
+    parse_agent_title(TitleProvider::Claude, title).and_then(|frame| frame.status)
+        != Some(AgentStatus::Working)
+        && provider_screen_status(TitleProvider::Claude, &context).is_none()
         && !blocked_markers
             .iter()
-            .any(|marker| !marker.is_empty() && screen.text.contains(marker))
+            .any(|marker| !marker.is_empty() && context.contains(marker))
 }
 
 async fn wait_startup_composer(
@@ -1020,10 +1023,19 @@ fn write_startup_input(
     cx: &mut AsyncApp,
     guard: &mut crate::startup::Guard,
     armed_at: Instant,
+    submit: bool,
     write: impl FnOnce(&TerminalSession) -> std::io::Result<()>,
 ) -> Result<(), crate::startup::Stop> {
     with_startup_view(view, session, cx, |_| {
-        guard.write(armed_at.elapsed(), session.input_rev(), || write(session))
+        guard.write(armed_at.elapsed(), session.input_rev(), || write(session))?;
+        if submit {
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            guard.submitted(at);
+        }
+        Ok(())
     })?
 }
 
@@ -1048,6 +1060,9 @@ pub struct TerminalFocusProfile {
 
 impl Drop for TerminalView {
     fn drop(&mut self) {
+        if let Some(startup) = &self.startup_turn {
+            startup.cancel();
+        }
         profile::pane_closed(self.instance_id);
     }
 }
@@ -1076,8 +1091,9 @@ struct DrainTransport {
 impl TerminalLaunch {
     /// Spawn `spec` at `size` (`(cols, rows)`); if it can't be launched (e.g. the
     /// agent isn't installed), fall back to a shell that prints the error. Literal
-    /// commands surface their error without substituting another program. Other
-    /// launches return `Err` only when even the fallback shell can't spawn.
+    /// commands and outside-created panes surface their error without replacing
+    /// the program. Other launches return `Err` only when even the fallback shell
+    /// can't spawn.
     ///
     /// `size` should be the grid the pane will actually render at — see
     /// [`TerminalSession::size`]. Getting it right up front is what keeps a
@@ -1111,7 +1127,7 @@ impl TerminalLaunch {
                 rx,
                 launch_error: None,
             }),
-            Err(e) if spec.literal_argv => Err(e),
+            Err(e) if spec.literal_argv || !spec.allow_shell_fallback => Err(e),
             Err(e) => {
                 // Capture the full error (incl. the OS code) for the dev console.
                 let launch_error = format!("{e:#}");
@@ -1249,6 +1265,10 @@ impl TerminalView {
             launch_error,
         } = launch;
         let startup_input = spec.startup_input.clone();
+        let startup_owner = spec.startup_turn.clone();
+        let startup_turn = startup_owner
+            .as_ref()
+            .map(muxel_core::control::StartupTurnOwner::signal);
         let auto_mode_presses = spec.auto_mode_presses;
         let startup_delay_ms = spec.startup_delay_ms;
         let submit = spec.submit;
@@ -1323,7 +1343,8 @@ impl TerminalView {
             let mut guard = crate::startup::Guard::new(
                 session.input_rev(),
                 claude.then(|| Duration::from_millis(MAX_WAIT_MS + startup_delay_ms as u64)),
-            );
+            )
+            .with_control_turn(startup_owner.clone());
             cx.spawn(async move |view: WeakEntity<Self>, cx| {
                 let result: Result<(), crate::startup::Stop> = async {
                     // Wait for the agent's first output (it has started up).
@@ -1384,6 +1405,7 @@ impl TerminalView {
                             cx,
                             &mut guard,
                             armed_at,
+                            false,
                             |session| session.try_write_input(SHIFT_TAB),
                         )?;
                         cx.background_executor()
@@ -1398,6 +1420,7 @@ impl TerminalView {
                             cx,
                             &mut guard,
                             armed_at,
+                            false,
                             |session| session.try_write_input(b"\r"),
                         )?;
                         cx.background_executor()
@@ -1419,6 +1442,7 @@ impl TerminalView {
                             cx,
                             &mut guard,
                             armed_at,
+                            false,
                             |session| session.try_paste(&input),
                         )?;
                         profile::startup_event(
@@ -1446,6 +1470,7 @@ impl TerminalView {
                                 cx,
                                 &mut guard,
                                 armed_at,
+                                true,
                                 |session| session.try_submit_input(b"\r"),
                             )?;
                             profile::startup_event(
@@ -1615,6 +1640,7 @@ impl TerminalView {
         Self {
             instance_id,
             session,
+            startup_turn,
             focus_handle,
             palette: TerminalPalette::default(),
             font_family: SharedString::default(),
@@ -2138,6 +2164,68 @@ mod launch_identity_tests {
     use uuid::Uuid;
 
     #[test]
+    fn outside_startup_launch_failure_refuses_a_real_fallback_and_cancels_its_task() {
+        use muxel_core::control::{StartupTurn, StartupTurnState};
+        for allow_fallback in [true, false] {
+            let marker = std::env::temp_dir().join(format!("muxel-fallback-{}", Uuid::new_v4()));
+            #[cfg(windows)]
+            let fallback = CommandSpec::program(
+                "powershell.exe",
+                vec![
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    format!(
+                        "[System.IO.File]::WriteAllText('{}', 'fallback')",
+                        marker.display().to_string().replace('\'', "''")
+                    ),
+                ],
+            );
+            #[cfg(not(windows))]
+            let fallback = CommandSpec::program(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    "printf fallback > \"$1\"".into(),
+                    "muxel-test".into(),
+                    marker.display().to_string(),
+                ],
+            );
+            let signal = StartupTurn::default();
+            let mut requested = CommandSpec::program(
+                std::env::temp_dir()
+                    .join(format!("muxel-missing-{}.exe", Uuid::new_v4()))
+                    .display()
+                    .to_string(),
+                vec![],
+            );
+            requested.allow_shell_fallback = allow_fallback;
+            if !allow_fallback {
+                requested.startup_turn = signal.claim();
+            }
+            let result = TerminalLaunch::spawn_with_fallback(requested, fallback, (80, 24), None);
+            if allow_fallback {
+                let launch = result.expect("ordinary UI preset retains its fallback");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while !marker.is_file() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                launch.session.kill();
+                assert!(marker.is_file(), "the injected fallback must really run");
+                std::fs::remove_file(&marker).unwrap();
+            } else {
+                assert!(
+                    result.is_err(),
+                    "outside-approved program failure must surface"
+                );
+                assert!(!marker.exists(), "no replacement shell may execute");
+                assert_eq!(signal.state(), StartupTurnState::Cancelled);
+            }
+        }
+    }
+
+    #[test]
     fn failed_launch_fallback_has_own_identity() {
         const CHILD: &str = "MUXEL_FALLBACK_ID_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -2312,6 +2400,32 @@ mod launch_tests {
 mod startup_readiness_tests {
     use super::claude_startup_ready;
     use crate::startup::Screen;
+
+    #[test]
+    fn quoted_permission_text_in_the_draft_does_not_block_its_own_submit() {
+        for (draft, cursor_row) in [
+            ("❯ Explain the wording Do you want to proceed", 2),
+            (
+                "❯ Explain the wording\n  Do you want to proceed\n  and this second line",
+                4,
+            ),
+        ] {
+            let mut screen = Screen {
+                text: format!("Claude Code\n────────────────\n{draft}\n────────────────\nmode"),
+                cursor_column: 22,
+                cursor_row,
+                cursor_visible: true,
+                bracketed_paste: true,
+            };
+            let markers = vec!["Do you want to proceed".into()];
+            assert!(claude_startup_ready(&screen, None, &markers, false));
+            assert!(!claude_startup_ready(&screen, None, &markers, true));
+            // A real permission question outside the composer still vetoes CR.
+            screen.text.insert_str(0, "Do you want to proceed\n");
+            screen.cursor_row += 1;
+            assert!(!claude_startup_ready(&screen, None, &markers, false));
+        }
+    }
 
     #[test]
     fn native_slash_completion_is_ready_for_submit_but_not_an_empty_startup() {

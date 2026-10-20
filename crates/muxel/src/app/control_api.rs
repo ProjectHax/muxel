@@ -39,14 +39,75 @@ fn control_program_writable(inst: &Instance, allow_shells: bool) -> Result<(), S
     Ok(())
 }
 
-/// A prompt (or answer) typed through `muxel ctl`: what it was, and when it was
-/// submitted, so `wait` knows which turn it is waiting for. Runtime-only.
+/// A task queued by outside creation, or a prompt/answer typed through `ctl`.
+/// Runtime-only ownership tells `wait` when submission is still pending and
+/// which submitted turn it is waiting for.
 pub(super) struct ControlTurn {
     prompt: Option<String>,
     sent_at: i64,
     /// How long `wait` expects the agent to take to show it started
     /// (`REPLY_GRACE_MS` for a prompt, `ANSWER_GRACE_MS` for an answer).
     grace_ms: i64,
+    startup: Option<ctl::StartupTurn>,
+}
+
+impl ControlTurn {
+    fn startup(prompt: String) -> Self {
+        Self {
+            prompt: Some(prompt),
+            sent_at: 0,
+            grace_ms: ctl::REPLY_GRACE_MS,
+            startup: Some(ctl::StartupTurn::default()),
+        }
+    }
+
+    fn awaiting_reply(
+        &self,
+        status: Option<AgentState>,
+        activity: &muxel_core::AgentActivity,
+        now: i64,
+    ) -> bool {
+        match &self.startup {
+            Some(startup) => startup.awaiting_reply(status, activity, now),
+            None => ctl::awaiting_reply(Some(self.sent_at), self.grace_ms, status, activity, now),
+        }
+    }
+}
+
+impl Drop for ControlTurn {
+    fn drop(&mut self) {
+        if let Some(startup) = &self.startup {
+            startup.cancel();
+        }
+    }
+}
+
+/// Apply outside creation's launch policy after all program/transport wrappers.
+/// A missing startup owner must not silently become ordinary runner automation.
+pub(super) fn control_launch_spec(
+    instance: Option<&Instance>,
+    turn: Option<&ControlTurn>,
+    owner: Option<ctl::StartupTurnOwner>,
+    mut spec: CommandSpec,
+) -> CommandSpec {
+    spec.allow_shell_fallback &= !instance.is_some_and(|instance| instance.control_created);
+    let owner = owner.filter(ctl::StartupTurnOwner::is_pending);
+    if owner.is_none()
+        && instance.is_some_and(|instance| {
+            instance.control_created && instance.control_prompt && instance.system_prompt.is_some()
+        })
+    {
+        if let Some(startup) = turn.and_then(|turn| turn.startup.as_ref()) {
+            startup.cancel();
+        }
+        // Runtime ownership cannot survive a workspace/app restart. A task
+        // cancelled before installation must not replay from saved metadata.
+        spec.startup_input = None;
+        spec.auto_mode_presses = 0;
+        spec.submit = false;
+    }
+    spec.startup_turn = owner;
+    spec
 }
 
 /// A reply ready now, work to finish off the UI thread first, or typing to do
@@ -845,15 +906,10 @@ impl MuxelApp {
                     .get(&inst.id)
                     .map(|view| view.read(cx).session().id),
             ),
-            awaiting_reply: ctl::awaiting_reply(
-                self.control_turns.get(&inst.id).map(|turn| turn.sent_at),
-                self.control_turns
-                    .get(&inst.id)
-                    .map_or(ctl::REPLY_GRACE_MS, |turn| turn.grace_ms),
-                status,
-                &inst.activity,
-                now,
-            ),
+            awaiting_reply: self
+                .control_turns
+                .get(&inst.id)
+                .is_some_and(|turn| turn.awaiting_reply(status, &inst.activity, now)),
             focused: self.active_instance == Some(inst.id),
             pane,
             worktree_branch: inst.worktree_branch.clone(),
@@ -1346,12 +1402,33 @@ impl MuxelApp {
             prompt: None,
             sent_at,
             grace_ms: turn.grace_ms,
+            startup: None,
         });
+        if let Some(startup) = entry.startup.take() {
+            startup.cancel();
+        }
         entry.sent_at = sent_at;
         entry.grace_ms = turn.grace_ms;
         if turn.prompt.is_some() {
             entry.prompt = turn.prompt;
         }
+    }
+
+    pub(super) fn cancel_control_startup(&self, iid: Uuid) {
+        if let Some(startup) = self
+            .control_turns
+            .get(&iid)
+            .and_then(|turn| turn.startup.as_ref())
+        {
+            startup.cancel();
+        }
+    }
+
+    pub(super) fn claim_control_startup(&self, iid: Uuid) -> Option<ctl::StartupTurnOwner> {
+        self.control_turns
+            .get(&iid)
+            .and_then(|turn| turn.startup.as_ref())?
+            .claim()
     }
 }
 

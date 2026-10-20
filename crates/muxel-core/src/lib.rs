@@ -577,6 +577,10 @@ pub struct Instance {
     /// `injection` remains TypeIn for the exact typed user task.
     #[serde(default)]
     pub control_prompt: bool,
+    /// Outside creation must never substitute an unapproved fallback shell.
+    /// Retain the launch policy across restore and restart.
+    #[serde(default)]
+    pub control_created: bool,
     /// Press Enter to submit after typing the startup prompt. New instances set
     /// this true; a runner clears it after its first launch so reopening the app
     /// re-types the prompt but does NOT auto-submit it (defaults false for
@@ -708,6 +712,8 @@ impl Instance {
         self.session_id = None;
         self.session_started = false;
         self.auto_name = None;
+        // Duplication is a new local UI action, not the outside launch approval.
+        self.control_created = false;
     }
 
     /// A plain shell instance.
@@ -755,6 +761,7 @@ impl Instance {
             is_runner: false,
             control_prompt: false,
             instruction_injection: None,
+            control_created: false,
             // New instances submit their startup prompt; persisted ones default
             // to false (so restored runners re-type without auto-submitting).
             auto_submit: true,
@@ -824,6 +831,7 @@ impl Instance {
             control_prompt: false,
             instruction_injection: None,
             auto_submit: false,
+            control_created: false,
             pinned: false,
             worktree_id: None,
             session_id: None,

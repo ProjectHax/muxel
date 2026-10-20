@@ -14,6 +14,7 @@ pub(crate) struct Guard {
     deadline: Option<Duration>,
     ready_since: Option<Duration>,
     stopped: Option<Stop>,
+    control_turn: Option<muxel_core::control::StartupTurnOwner>,
 }
 
 impl Guard {
@@ -23,6 +24,21 @@ impl Guard {
             deadline,
             ready_since: None,
             stopped: None,
+            control_turn: None,
+        }
+    }
+
+    pub(crate) fn with_control_turn(
+        mut self,
+        owner: Option<muxel_core::control::StartupTurnOwner>,
+    ) -> Self {
+        self.control_turn = owner;
+        self
+    }
+
+    pub(crate) fn submitted(&self, at: i64) {
+        if let Some(owner) = &self.control_turn {
+            owner.submitted(at);
         }
     }
 
@@ -30,7 +46,12 @@ impl Guard {
         if let Some(reason) = self.stopped {
             return Err(reason);
         }
-        let reason = if revision != self.expected_revision {
+        let reason = if self
+            .control_turn
+            .as_ref()
+            .is_some_and(|owner| !owner.is_pending())
+            || revision != self.expected_revision
+        {
             Some(Stop::Interrupted)
         } else if self.deadline.is_some_and(|deadline| elapsed >= deadline) {
             Some(Stop::NotReady)
@@ -80,6 +101,14 @@ impl Guard {
     }
 }
 
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.control_turn {
+            owner.cancel();
+        }
+    }
+}
+
 pub(crate) struct Screen {
     pub text: String,
     pub cursor_column: usize,
@@ -92,49 +121,58 @@ impl Screen {
     /// The cursor must belong to the live input region between two rules. A menu
     /// choice or a quoted prompt elsewhere in the viewport is not a composer.
     /// `empty` uses cursor position, allowing Claude's placeholder text to remain.
+    #[cfg(test)]
     pub(crate) fn claude_composer(&self, empty: bool) -> bool {
+        self.composer_rows(empty).is_some()
+    }
+
+    /// Permission chrome belongs outside the live composer. A task quoting a
+    /// permission question must not be mistaken for that question after paste.
+    pub(crate) fn claude_composer_context(&self, empty: bool) -> Option<String> {
+        let composer = self.composer_rows(empty)?;
+        Some(
+            self.text
+                .lines()
+                .enumerate()
+                .filter(|(index, _)| !composer.contains(index))
+                .map(|(_, row)| row)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    fn composer_rows(&self, empty: bool) -> Option<std::ops::Range<usize>> {
         if !self.bracketed_paste || !self.cursor_visible {
-            return false;
+            return None;
         }
         let Ok(cursor) = usize::try_from(self.cursor_row) else {
-            return false;
+            return None;
         };
         let rows: Vec<_> = self.text.lines().collect();
         if cursor >= rows.len() {
-            return false;
+            return None;
         }
         let rule = |row: &str| {
             let row = row.trim();
             row.chars().count() >= 8 && row.chars().all(|ch| ch == '─' || ch == '━')
         };
-        let Some(top) = rows[..cursor].iter().rposition(|row| rule(row)) else {
-            return false;
-        };
-        let Some(bottom) = rows[cursor + 1..]
+        let top = rows[..cursor].iter().rposition(|row| rule(row))?;
+        let bottom = rows[cursor + 1..]
             .iter()
             .position(|row| rule(row))
-            .map(|offset| cursor + 1 + offset)
-        else {
-            return false;
-        };
+            .map(|offset| cursor + 1 + offset)?;
         // The final framed region belongs to the composer, not an earlier turn.
         if rows[bottom + 1..].iter().any(|row| rule(row)) {
-            return false;
+            return None;
         }
         let prompt = rows[top + 1];
         let prefix = prompt.chars().take_while(|ch| ch.is_whitespace()).count();
-        let Some(after) = prompt.trim_start().strip_prefix('❯') else {
-            return false;
-        };
+        let after = prompt.trim_start().strip_prefix('❯')?;
         if !after.starts_with(char::is_whitespace) {
-            return false;
+            return None;
         }
         let cursor_at_start = cursor == top + 1 && self.cursor_column == prefix + 2;
-        if empty {
-            cursor_at_start
-        } else {
-            !cursor_at_start
-        }
+        (cursor_at_start == empty).then_some(top + 1..bottom)
     }
 }
 
@@ -153,6 +191,52 @@ mod tests {
             cursor_visible: true,
             bracketed_paste: true,
         }
+    }
+
+    #[test]
+    fn startup_control_turn_tracks_guarded_paste_submit_and_every_stop_tail() {
+        use muxel_core::control::{StartupTurn, StartupTurnState};
+        let turn = StartupTurn::default();
+        let mut guard = Guard::new(0, None).with_control_turn(turn.claim());
+        guard.write(ms(1), 0, || Ok(())).unwrap();
+        assert_eq!(turn.state(), StartupTurnState::Pending);
+        guard.write(ms(2), 1, || Ok(())).unwrap();
+        guard.submitted(123);
+        drop(guard);
+        assert_eq!(turn.state(), StartupTurnState::Submitted(123));
+
+        for stop in [
+            None,
+            Some(Stop::Interrupted),
+            Some(Stop::NotReady),
+            Some(Stop::WriteFailed),
+        ] {
+            let turn = StartupTurn::default();
+            let owner = turn.claim().unwrap();
+            let extra_command_clone = owner.clone();
+            let mut guard = Guard::new(0, Some(ms(10))).with_control_turn(Some(owner));
+            match stop {
+                None => {} // no-input, submit=false, or future dropped before execution
+                Some(Stop::Interrupted) => {
+                    assert_eq!(guard.check(ms(1), 1), Err(Stop::Interrupted))
+                }
+                Some(Stop::NotReady) => assert_eq!(guard.check(ms(10), 0), Err(Stop::NotReady)),
+                Some(Stop::WriteFailed) => assert_eq!(
+                    guard.write(ms(1), 0, || Err(io::Error::other("closed"))),
+                    Err(Stop::WriteFailed)
+                ),
+            }
+            drop(guard);
+            assert_eq!(turn.state(), StartupTurnState::Cancelled);
+            assert!(!extra_command_clone.is_pending());
+        }
+        let turn = StartupTurn::default();
+        let mut guard = Guard::new(0, None).with_control_turn(turn.claim());
+        turn.cancel();
+        assert_eq!(
+            guard.write(ms(1), 0, || panic!("cancelled automation must not write")),
+            Err(Stop::Interrupted)
+        );
     }
     #[test]
     fn quiet_boot_does_not_authorize_input_and_deadline_never_falls_through() {

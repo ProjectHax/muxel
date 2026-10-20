@@ -73,6 +73,7 @@ final class InteropTests: XCTestCase {
         instance.sessionStarted = true
         instance.autoName = "Generated title"
         instance.customName = "Manual title"
+        instance.controlCreated = true
 
         instance.resetConversationForDuplicate()
 
@@ -80,6 +81,17 @@ final class InteropTests: XCTestCase {
         XCTAssertFalse(instance.sessionStarted)
         XCTAssertNil(instance.autoName)
         XCTAssertEqual(instance.customName, "Manual title")
+        XCTAssertFalse(instance.controlCreated)
+    }
+
+    func testOutsideCreationOriginRoundTripsAndDefaultsForOlderDocuments() throws {
+        var instance = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
+        instance.controlCreated = true
+        let encoded = try MuxelJSON.encoder.encode(instance)
+        let decoded = try MuxelJSON.decoder.decode(Instance.self, from: encoded)
+        XCTAssertTrue(decoded.controlCreated)
+        let legacy = Data(#"{"id":"aaaa","project_id":"p","title":"Claude"}"#.utf8)
+        XCTAssertFalse(try MuxelJSON.decoder.decode(Instance.self, from: legacy).controlCreated)
     }
 
     func testPaneNodeRoundTrips() throws {

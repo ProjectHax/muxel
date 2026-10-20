@@ -186,6 +186,7 @@ impl NewOptions {
                 Instance::from_preset(project.id, &preset)
             }
         };
+        instance.control_created = true;
         instance.custom_name = self.name.clone();
         instance.launch_dir = Some(
             self.cwd

@@ -3,7 +3,7 @@
 //! window identity and the final methods that would focus, persist and spawn.
 
 use super::super::{ConfirmAction, PlacementMode, WorktreeChoice};
-use super::{CtlResult, control_program_writable};
+use super::{ControlTurn, CtlResult, control_launch_spec, control_program_writable};
 use muxel_core::control::{self as ctl, CreationPolicy, ErrorCode};
 use muxel_core::readaloud;
 use muxel_core::{AgentPreset, Instance, PaneNode, Project, Settings, SplitDirection, Workspace};
@@ -68,6 +68,8 @@ struct MuxelApp {
     placements: usize,
     persists: usize,
     launches: usize,
+    control_turns: std::collections::HashMap<Uuid, ControlTurn>,
+    reject_placement: bool,
 }
 
 impl MuxelApp {
@@ -103,6 +105,8 @@ impl MuxelApp {
             placements: 0,
             persists: 0,
             launches: 0,
+            control_turns: Default::default(),
+            reject_placement: false,
         }
     }
 
@@ -140,6 +144,15 @@ impl MuxelApp {
         _: &mut Context<Self>,
     ) {
         self.placements += 1;
+        if self.reject_placement {
+            return;
+        }
+        if instance.control_prompt {
+            assert!(
+                self.control_turns.contains_key(&instance.id),
+                "publish pending before placement"
+            );
+        }
         assert!(matches!(worktree, Some(WorktreeChoice::None)));
         let direction = match placement {
             PlacementMode::Tab => None,
@@ -174,6 +187,7 @@ impl MuxelApp {
             "selections": self.selections, "placements": self.placements,
             "persists": self.persists, "launches": self.launches,
             "activations": window.activations,
+            "control_turns": self.control_turns.len(),
         })
     }
 
@@ -247,6 +261,112 @@ fn control_new_parameters_validate_before_mutation_and_preserve_allow_policy() {
 }
 
 const COMMAND_SETTING: &str = "Also allow typing into shell panes";
+
+#[test]
+fn control_new_startup_wait_is_pending_before_placement_until_actual_submission() {
+    let mut app = MuxelApp::fixture();
+    let result = app
+        .open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                prompt: Some("task".into()),
+                ..Default::default()
+            },
+            &mut Window::default(),
+        )
+        .unwrap();
+    let iid: Uuid = serde_json::from_value(result["uuid"].clone()).unwrap();
+    let instance = app.workspace.instance(iid).unwrap();
+    assert!(instance.control_created);
+    let turn = app.control_turns.get(&iid).unwrap();
+    let activity = muxel_core::AgentActivity::default();
+    assert!(turn.awaiting_reply(Some(ctl::AgentState::Idle), &activity, 90_000));
+    let owner = turn.startup.as_ref().unwrap().claim().unwrap();
+    let spec = control_launch_spec(
+        Some(instance),
+        Some(turn),
+        Some(owner),
+        CommandSpec::program("codex", vec![]).with_startup_input("task"),
+    );
+    assert!(!spec.allow_shell_fallback);
+    spec.startup_turn.as_ref().unwrap().submitted(90_001);
+    assert!(turn.awaiting_reply(Some(ctl::AgentState::Idle), &activity, 90_002));
+    let completed = muxel_core::AgentActivity {
+        completed_at: Some(90_003),
+        ..Default::default()
+    };
+    assert!(!turn.awaiting_reply(Some(ctl::AgentState::Done), &completed, 90_004));
+}
+
+#[test]
+fn control_new_failed_placement_rolls_back_pending_and_plain_creation_has_no_task() {
+    let mut app = MuxelApp::fixture();
+    app.reject_placement = true;
+    assert!(
+        app.open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                prompt: Some("task".into()),
+                ..Default::default()
+            },
+            &mut Window::default()
+        )
+        .is_err()
+    );
+    assert!(app.control_turns.is_empty());
+    app.reject_placement = false;
+    let reply = app
+        .open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                ..Default::default()
+            },
+            &mut Window::default(),
+        )
+        .unwrap();
+    let iid: Uuid = serde_json::from_value(reply["uuid"].clone()).unwrap();
+    assert!(app.workspace.instance(iid).unwrap().control_created);
+    assert!(app.control_turns.is_empty());
+}
+
+#[test]
+fn control_new_startup_lost_owner_suppresses_input_and_controller_drop_cancels_live_owner() {
+    let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+    instance.control_prompt = true;
+    instance.system_prompt = Some("task".into());
+    let turn = ControlTurn::startup("task".into());
+    let signal = turn.startup.as_ref().unwrap().clone();
+    let owner = signal.claim().unwrap();
+    let ordinary = CommandSpec::program("codex", vec![])
+        .with_startup_input("task")
+        .with_auto_mode(2);
+    assert!(
+        control_launch_spec(Some(&instance), None, None, ordinary.clone()).allow_shell_fallback
+    );
+    instance.control_created = true;
+    let restored = control_launch_spec(Some(&instance), None, None, ordinary.clone());
+    assert!(
+        restored.startup_input.is_none(),
+        "cancelled startup must not replay after losing runtime state"
+    );
+    assert!(!restored.submit);
+    let cancelled = control_launch_spec(Some(&instance), Some(&turn), None, ordinary);
+    assert!(cancelled.startup_input.is_none());
+    assert_eq!(cancelled.auto_mode_presses, 0);
+    assert!(!cancelled.submit);
+    assert!(!owner.is_pending());
+    // Consumed tasks must not suppress a later fresh conversation's automatic
+    // instructions merely because their old control-turn record still exists.
+    instance.system_prompt = None;
+    let ordinary = CommandSpec::program("codex", vec![]).with_startup_input("new rules");
+    let spec = control_launch_spec(Some(&instance), Some(&turn), None, ordinary);
+    assert_eq!(spec.startup_input.as_deref(), Some("new rules"));
+    let next = ControlTurn::startup("next".into());
+    let next_owner = next.startup.as_ref().unwrap().claim().unwrap();
+    drop(next);
+    assert!(!next_owner.is_pending());
+}
+
 const CREATION_SETTING: &str = "Outside terminal creation";
 
 #[test]

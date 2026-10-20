@@ -511,7 +511,7 @@ fn restore_startup_holds_admission(
     let holding = |iid: Uuid| {
         launching
             .get(&iid)
-            .is_some_and(|&launch| launch_holds_admission(launch, now))
+            .is_some_and(|launch| launch_holds_admission(launch, now))
     };
     if queued().any(holding) {
         return true;
@@ -531,14 +531,15 @@ const TERMINAL_LAUNCH_DEADLINE: Duration = Duration::from_secs(20);
 
 /// A pane's launch in flight: the token that owns it, and when its worker was
 /// dispatched (when it was reserved, until then).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct LaunchTicket {
     token: u64,
     since: Instant,
+    startup: Option<muxel_core::control::StartupTurnOwner>,
 }
 
 /// Whether a running launch still holds restore admission at `now`.
-fn launch_holds_admission(launch: LaunchTicket, now: Instant) -> bool {
+fn launch_holds_admission(launch: &LaunchTicket, now: Instant) -> bool {
     now.saturating_duration_since(launch.since) < TERMINAL_LAUNCH_DEADLINE
 }
 
@@ -6997,10 +6998,18 @@ impl MuxelApp {
             .filter(|v| !v.is_empty())
             .unwrap_or(def_blocked);
         let startup_delay = preset.map(|p| p.startup_delay_ms).unwrap_or(0);
-        Ok(spec
-            .with_status_program(agent_program)
-            .with_startup_delay(startup_delay)
-            .with_markers(working, blocked))
+        let owner = match self.terminal_launching.get(&instance_id) {
+            Some(ticket) => ticket.startup.clone(),
+            None => self.claim_control_startup(instance_id),
+        };
+        Ok(control_api::control_launch_spec(
+            inst,
+            self.control_turns.get(&instance_id),
+            owner,
+            spec.with_status_program(agent_program)
+                .with_startup_delay(startup_delay)
+                .with_markers(working, blocked),
+        ))
     }
 
     /// Preparation refusals never reach TerminalLaunch's fallback-shell path.
@@ -7062,9 +7071,13 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.terminal_restarts.contains(instance_id)
-            || !self.launch_permitted(instance_id, reason)
-        {
+        if self.terminal_restarts.contains(instance_id) {
+            return;
+        }
+        if reason != muxel_core::TerminalLaunchReason::NewPane {
+            self.cancel_control_startup(instance_id);
+        }
+        if !self.launch_permitted(instance_id, reason) {
             return;
         }
         let _phase = ui_profile::phase("activation", "spawn-terminal-immediate", Some(instance_id));
@@ -7190,14 +7203,27 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> Option<u64> {
         let _phase = ui_profile::phase("activation", "reserve-terminal", Some(instance_id));
+        // A queued restart owns this pane's launch and startup lease until its
+        // confirmed teardown completes. Merely requesting a launch cannot cancel it.
+        if self.terminal_restarts.contains(instance_id) {
+            return None;
+        }
         if !self.launch_permitted(instance_id, reason)
             || self.terminals.contains_key(&instance_id)
             || self.failed_launches.contains_key(&instance_id)
             || self.terminal_launching.contains_key(&instance_id)
-            || self.terminal_restarts.contains(instance_id)
         {
+            if !self.terminal_launching.contains_key(&instance_id)
+                && !self.terminals.contains_key(&instance_id)
+            {
+                self.cancel_control_startup(instance_id);
+            }
             return None;
         }
+        if reason != muxel_core::TerminalLaunchReason::NewPane {
+            self.cancel_control_startup(instance_id);
+        }
+        let startup = self.claim_control_startup(instance_id);
         self.next_terminal_launch_token = self.next_terminal_launch_token.wrapping_add(1);
         let token = self.next_terminal_launch_token;
         self.terminal_launching.insert(
@@ -7205,6 +7231,7 @@ impl MuxelApp {
             LaunchTicket {
                 token,
                 since: Instant::now(),
+                startup,
             },
         );
         self.reset_terminal_runtime(instance_id);
@@ -9045,6 +9072,7 @@ impl MuxelApp {
         self.workspace_lock = Some(lock);
 
         self.failed_launches.clear();
+        self.control_turns.clear();
         // Invalidate background launches from the old workspace before ids from
         // the new document can be admitted.
         self.terminal_launching.clear();
@@ -31537,8 +31565,50 @@ mod restore_wave_policy_tests {
     fn launches(tokens: &[(Uuid, u64)], since: Instant) -> HashMap<Uuid, LaunchTicket> {
         tokens
             .iter()
-            .map(|&(iid, token)| (iid, LaunchTicket { token, since }))
+            .map(|&(iid, token)| {
+                (
+                    iid,
+                    LaunchTicket {
+                        token,
+                        since,
+                        startup: None,
+                    },
+                )
+            })
             .collect()
+    }
+
+    #[test]
+    fn control_new_reservation_owns_startup_through_worker_and_rejects_stale_release() {
+        use muxel_core::control::{StartupTurn, StartupTurnState};
+        let iid = Uuid::new_v4();
+        let old = StartupTurn::default();
+        let mut tickets = HashMap::from([(
+            iid,
+            LaunchTicket {
+                token: 1,
+                since: Instant::now(),
+                startup: old.claim(),
+            },
+        )]);
+        let command = tickets[&iid].startup.clone();
+        assert!(release_launch_token(&mut tickets, iid, 1));
+        assert_eq!(old.state(), StartupTurnState::Pending);
+        drop(command); // stale/unlanded worker result
+        assert_eq!(old.state(), StartupTurnState::Cancelled);
+        let current = StartupTurn::default();
+        tickets.insert(
+            iid,
+            LaunchTicket {
+                token: 2,
+                since: Instant::now(),
+                startup: current.claim(),
+            },
+        );
+        assert!(!release_launch_token(&mut tickets, iid, 1));
+        assert_eq!(current.state(), StartupTurnState::Pending);
+        tickets.clear(); // abandoned before command preparation
+        assert_eq!(current.state(), StartupTurnState::Cancelled);
     }
 
     fn startup(
@@ -31868,6 +31938,7 @@ mod restore_wave_policy_tests {
             LaunchTicket {
                 token: 8,
                 since: deadline,
+                startup: None,
             },
         );
         assert!(!launch_token_current(&launching, a, 7));

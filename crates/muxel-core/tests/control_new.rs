@@ -10,6 +10,42 @@ fn words(args: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn outside_creation_origin_survives_restore_and_local_duplicates_get_ui_policy() {
+    let project = Project::new("repo", std::env::current_dir().unwrap());
+    let preset = AgentPreset::codex();
+    for options in [
+        NewOptions::default(),
+        NewOptions {
+            prompt: Some("task".into()),
+            ..Default::default()
+        },
+        NewOptions {
+            argv: Some(words(&["native.exe", "brief"])),
+            ..Default::default()
+        },
+    ] {
+        let instance = options
+            .instance(&project, std::slice::from_ref(&preset), 0)
+            .unwrap();
+        assert!(instance.control_created);
+        let mut restored: Instance =
+            serde_json::from_value(serde_json::to_value(instance).unwrap()).unwrap();
+        assert!(restored.control_created);
+        restored.reset_conversation_for_duplicate();
+        assert!(!restored.control_created);
+    }
+    let ui = Instance::from_preset(project.id, &preset);
+    assert!(!ui.control_created);
+    let mut legacy = serde_json::to_value(ui).unwrap();
+    legacy.as_object_mut().unwrap().remove("control_created");
+    assert!(
+        !serde_json::from_value::<Instance>(legacy)
+            .unwrap()
+            .control_created
+    );
+}
+
+#[test]
 fn new_parameters_parse_round_trip_and_validate_json_values() {
     let CliCommand::Request(command) = parse_cli(&words(&[
         "new",

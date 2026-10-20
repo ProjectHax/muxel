@@ -146,6 +146,8 @@ feature is added or changed, update the matching entry here in the same change**
   to a shell showing the underlying error instead of crashing. If even the
   fallback shell can't start, the pane shows the failure in place (the toolbar
   Restart retries) and the error lands in the NOTIFICATIONS feed.
+  Outside-created panes show the requested program's launch failure directly;
+  their approved command is never replaced with a shell.
 - **Session resume** — resume-capable agents reopen their prior conversation after
   a muxel restart. Two shapes, both configurable per preset:
   - **Host-minted** (Claude, Grok): `session_id_flag` + `resume_flag` — muxel
@@ -443,6 +445,9 @@ feature is added or changed, update the matching entry here in the same change**
   active project — a loop firing on a timer can't interrupt what you're typing.
 - **Claude startup input** — typed startup tasks wait for Claude's editable
   composer and bracketed-paste mode, including after trust or startup screens.
+  Permission text inside the pasted task does not block its submission.
+  `ctl wait` keeps a newly created task pending through startup and paste, then
+  starts the reply grace period when its submit Enter is admitted.
   Input stops if the pane is replaced, someone types, the writer fails, or
   readiness times out; it never retries a submitted task automatically.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
@@ -668,7 +673,8 @@ feature is added or changed, update the matching entry here in the same change**
   and panes classified as shells.
   Configured non-literal agents remain controllable while outside control is on;
   disabling all outside control is a separate setting. Delayed Enter and keys
-  recheck current permission before writing. Revocation does not stop processes
+  recheck the shell-input grant and terminal/session availability before writing.
+  Revocation does not stop processes
   or undo input already delivered.
   `send` waits for its delayed Enter and withholds it if local input changes or
   the pane closes or restarts. A withheld send fails and attempts to release only
@@ -696,7 +702,7 @@ feature is added or changed, update the matching entry here in the same change**
   computer, including shells, receive `MUXEL_INSTANCE_ID` set to the pane's id,
   which `muxel ctl` takes as AGENT. An agent or script inside a pane
   can check its own status or read its own screen without guessing at its name.
-  If a requested command cannot start, its local fallback shell receives the same
+  If a local UI command cannot start, its fallback shell receives the same
   pane id without copying the failed command's transport variables.
   A pane kept in tmux gets it when muxel creates its session, from tmux 3.2 on
   (which can hand a new session's program a variable). On older tmux it goes

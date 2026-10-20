@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 mod new;
 pub use new::{NewOptions, NewPlacement, place_new_pane};
+mod startup;
+pub use startup::{StartupTurn, StartupTurnOwner, StartupTurnState};
 mod approval;
 pub use approval::{
     APPROVAL_ARM_DELAY_MS, APPROVAL_TIMEOUT_MS, ApprovalQueue, CreationDecision, CreationPolicy,
@@ -1446,7 +1448,7 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   shell-classified panes. Configured non-literal agents remain controllable while
   outside control is enabled. Disabling all outside control is a separate setting. Revocation
   does not stop the process or undo input already delivered; queued Enter/keys
-  recheck permission before each write.
+  recheck the shell-input grant and terminal/session availability before each write.
   The JSON reply contains `id` (short), `uuid` (full), `project`, `project_id`,
   `cwd`, `program` and `args`. Without `--prompt`, presets and defaults keep toolbar
   system-prompt injection (including TypeIn), resume and hooks; raw argv bypasses those and tmux.

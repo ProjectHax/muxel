@@ -90,6 +90,7 @@ struct Instance: Codable, Equatable, Identifiable {
     var autoContinueMessage: String?
     var isRunner: Bool = false
     var controlPrompt: Bool = false
+    var controlCreated: Bool = false
     var autoSubmit: Bool = false
     var pinned: Bool = false
     var worktreeId: String?
@@ -122,6 +123,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case autoContinueMessage = "auto_continue_message"
         case isRunner = "is_runner"
         case controlPrompt = "control_prompt"
+        case controlCreated = "control_created"
         case autoSubmit = "auto_submit"
         case pinned
         case worktreeId = "worktree_id"
@@ -170,6 +172,7 @@ struct Instance: Codable, Equatable, Identifiable {
         autoContinueMessage = try c.decodeIfPresent(String.self, forKey: .autoContinueMessage)
         isRunner = (try c.decodeIfPresent(Bool.self, forKey: .isRunner)) ?? false
         controlPrompt = (try c.decodeIfPresent(Bool.self, forKey: .controlPrompt)) ?? false
+        controlCreated = (try c.decodeIfPresent(Bool.self, forKey: .controlCreated)) ?? false
         autoSubmit = (try c.decodeIfPresent(Bool.self, forKey: .autoSubmit)) ?? false
         pinned = (try c.decodeIfPresent(Bool.self, forKey: .pinned)) ?? false
         worktreeId = try c.decodeIfPresent(String.self, forKey: .worktreeId)
@@ -207,6 +210,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(autoContinueMessage, forKey: .autoContinueMessage)
         try c.encode(isRunner, forKey: .isRunner)
         try c.encode(controlPrompt, forKey: .controlPrompt)
+        try c.encode(controlCreated, forKey: .controlCreated)
         try c.encode(autoSubmit, forKey: .autoSubmit)
         try c.encode(pinned, forKey: .pinned)
         try c.encode(worktreeId, forKey: .worktreeId)
@@ -232,5 +236,6 @@ struct Instance: Codable, Equatable, Identifiable {
         sessionId = nil
         sessionStarted = false
         autoName = nil
+        controlCreated = false
     }
 }

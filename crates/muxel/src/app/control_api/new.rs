@@ -150,6 +150,12 @@ impl MuxelApp {
             ctl::NewPlacement::Right => PlacementMode::Split(SplitDirection::Horizontal),
             ctl::NewPlacement::Down => PlacementMode::Split(SplitDirection::Vertical),
         };
+        // Placement may reserve or even launch immediately. Publish pending work
+        // in the same UI transaction, before either path can consume the task.
+        if let Some(prompt) = options.prompt.as_ref() {
+            self.control_turns
+                .insert(iid, ControlTurn::startup(prompt.clone()));
+        }
         if options.background {
             self.place_and_spawn_with_focus(
                 pid,
@@ -175,6 +181,7 @@ impl MuxelApp {
             window.activate_window();
         }
         if self.workspace.instance(iid).is_none() {
+            self.control_turns.remove(&iid);
             return Err("the target pane is no longer in the project's layout".into());
         }
         Ok(result)

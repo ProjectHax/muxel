@@ -578,6 +578,9 @@ pub struct CommandSpec {
     /// Already resolved literal target. Never repeat PATH/PATHEXT lookup or use
     /// a batch interpreter at the final spawn boundary.
     pub literal_argv: bool,
+    /// False for outside-created panes: a failed approved program must surface
+    /// its launch error instead of installing a writable default shell.
+    pub allow_shell_fallback: bool,
     /// Logical agent program when `program` is a transport/wrapper such as ssh
     /// or tmux. Lifecycle title parsing keys off this, not the local child name.
     pub status_program: Option<String>,
@@ -590,6 +593,8 @@ pub struct CommandSpec {
     /// Text to type into the terminal shortly after start (system-prompt
     /// "type-in" injection). Handled by the view, not the session.
     pub startup_input: Option<String>,
+    /// Runtime lease for the first task created through outside control.
+    pub startup_turn: Option<muxel_core::control::StartupTurnOwner>,
     /// Shift+Tab presses to send at startup before typing (runner auto mode).
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input` (false = leave it in
@@ -619,12 +624,14 @@ impl CommandSpec {
             program,
             literal_argv: false,
             status_program: None,
+            allow_shell_fallback: true,
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
             env_remove: Vec::new(),
             startup_input: None,
             auto_mode_presses: 0,
+            startup_turn: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -641,11 +648,13 @@ impl CommandSpec {
             program,
             literal_argv: false,
             args,
+            allow_shell_fallback: true,
             cwd: None,
             env: Vec::new(),
             env_remove: Vec::new(),
             startup_input: None,
             auto_mode_presses: 0,
+            startup_turn: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -657,6 +666,7 @@ impl CommandSpec {
         Self {
             literal_argv: true,
             submit: false,
+            allow_shell_fallback: false,
             ..Self::program(program, args)
         }
     }
