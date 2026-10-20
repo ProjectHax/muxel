@@ -409,6 +409,8 @@ fn control_new_startup_wait_is_pending_before_placement_until_actual_submission(
         CommandSpec::program("codex", vec![]).with_startup_input("task"),
     );
     assert!(!spec.allow_shell_fallback);
+    spec.startup_turn.as_ref().unwrap().enter_admitted(90_001);
+    assert!(turn.awaiting_reply(Some(ctl::AgentState::Idle), &activity, 120_000));
     spec.startup_turn.as_ref().unwrap().submitted(90_001);
     assert!(turn.awaiting_reply(Some(ctl::AgentState::Idle), &activity, 90_002));
     let completed = muxel_core::AgentActivity {
@@ -416,6 +418,30 @@ fn control_new_startup_wait_is_pending_before_placement_until_actual_submission(
         ..Default::default()
     };
     assert!(!turn.awaiting_reply(Some(ctl::AgentState::Done), &completed, 90_004));
+}
+
+#[test]
+fn control_new_submission_failure_is_visible_without_claiming_terminal_exit() {
+    let mut app = MuxelApp::fixture();
+    let result = app
+        .open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                prompt: Some("task".into()),
+                ..Default::default()
+            },
+            &mut Window::default(),
+        )
+        .unwrap();
+    let iid: Uuid = serde_json::from_value(result["uuid"].clone()).unwrap();
+    let turn = app.control_turns.get(&iid).unwrap();
+    let owner = turn.startup.as_ref().unwrap().claim().unwrap();
+    owner.enter_admitted(10);
+    owner.fail(ctl::StartupFailure::NotAccepted);
+    drop(owner);
+    assert!(!turn.awaiting_reply(Some(ctl::AgentState::Idle), &Default::default(), 50_000));
+    assert!(turn.startup_error().unwrap().contains("not confirmed"));
+    assert!(app.workspace.instance(iid).is_some());
 }
 
 #[test]

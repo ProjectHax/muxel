@@ -6,7 +6,47 @@ use std::{io, time::Duration};
 pub(crate) enum Stop {
     Interrupted,
     NotReady,
+    NotAccepted,
+    UnsupportedProvider,
     WriteFailed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AcceptanceAction {
+    Observe,
+    RetryEnter,
+    Accepted,
+    Failed,
+}
+
+#[derive(Default)]
+pub(crate) struct Acceptance {
+    considered_retry: bool,
+}
+
+impl Acceptance {
+    /// A positive provider receipt wins. Missing evidence never becomes success,
+    /// and the one retry requires a provider-specific retained-editor proof.
+    pub(crate) fn observe(
+        &mut self,
+        elapsed: Duration,
+        accepted: bool,
+        retryable: bool,
+    ) -> AcceptanceAction {
+        if accepted {
+            return AcceptanceAction::Accepted;
+        }
+        if elapsed >= Duration::from_secs(10) {
+            return AcceptanceAction::Failed;
+        }
+        if elapsed >= Duration::from_secs(5) && !self.considered_retry {
+            self.considered_retry = true;
+            if retryable {
+                return AcceptanceAction::RetryEnter;
+            }
+        }
+        AcceptanceAction::Observe
+    }
 }
 
 pub(crate) struct Guard {
@@ -42,6 +82,30 @@ impl Guard {
         }
     }
 
+    pub(crate) fn enter_admitted(&mut self, at: i64) {
+        // Readiness has its own deadline; acceptance gets a separate bounded
+        // observation window after the actual Enter, even after a slow boot.
+        self.deadline = None;
+        if let Some(owner) = &self.control_turn {
+            owner.enter_admitted(at);
+        }
+    }
+
+    pub(crate) fn fail(&mut self, reason: Stop) {
+        self.stopped = Some(reason);
+        if let Some(owner) = &self.control_turn {
+            use muxel_core::control::StartupFailure;
+            let failure = match reason {
+                Stop::NotReady => StartupFailure::NotReady,
+                Stop::NotAccepted => StartupFailure::NotAccepted,
+                Stop::WriteFailed => StartupFailure::WriteFailed,
+                Stop::UnsupportedProvider => StartupFailure::UnsupportedProvider,
+                Stop::Interrupted => return,
+            };
+            owner.fail(failure);
+        }
+    }
+
     pub(crate) fn check(&mut self, elapsed: Duration, revision: u64) -> Result<(), Stop> {
         if let Some(reason) = self.stopped {
             return Err(reason);
@@ -59,7 +123,7 @@ impl Guard {
             None
         };
         if let Some(reason) = reason {
-            self.stopped = Some(reason);
+            self.fail(reason);
             return Err(reason);
         }
         Ok(())
@@ -93,7 +157,7 @@ impl Guard {
     ) -> Result<(), Stop> {
         self.check(elapsed, revision)?;
         if write().is_err() {
-            self.stopped = Some(Stop::WriteFailed);
+            self.fail(Stop::WriteFailed);
             return Err(Stop::WriteFailed);
         }
         self.expected_revision = self.expected_revision.wrapping_add(1);
@@ -118,6 +182,158 @@ pub(crate) struct Screen {
 }
 
 impl Screen {
+    /// Codex's unframed editor. Its cursor, final prompt and shortcut footer must
+    /// agree. A trust/choice menu also uses `›`, but has no composer footer.
+    pub(crate) fn codex_composer_context(&self, empty: bool) -> Option<String> {
+        if !self.bracketed_paste {
+            return None;
+        }
+        self.unframed_composer('›', "? for shortcuts", empty)
+    }
+
+    /// Retry only a completely visible single-row ASCII task with its cursor at
+    /// the exact end. Reflow, tabs, newlines and Unicode cell widths cannot be
+    /// reconstructed losslessly from this snapshot, so ambiguity refuses retry.
+    pub(crate) fn codex_exact_retry_draft(&self, input: &str) -> bool {
+        if input.is_empty()
+            || !input.is_ascii()
+            || input.trim() != input
+            || input.chars().any(char::is_control)
+            || self.codex_composer_context(false).is_none()
+        {
+            return false;
+        }
+        let rows: Vec<_> = self.text.lines().collect();
+        let Some(top) = rows
+            .iter()
+            .rposition(|row| row.trim_start().starts_with('›'))
+        else {
+            return false;
+        };
+        if usize::try_from(self.cursor_row).ok() != Some(top)
+            || !rows.get(top + 1).is_some_and(|row| row.trim().is_empty())
+        {
+            return false;
+        }
+        let Some(shortcuts) = rows
+            .iter()
+            .rposition(|row| row.trim_start().starts_with("? for shortcuts"))
+        else {
+            return false;
+        };
+        let Some(status) = rows[..shortcuts]
+            .iter()
+            .rposition(|row| !row.trim().is_empty())
+        else {
+            return false;
+        };
+        // A known model/cwd footer is the only nonblank row permitted after
+        // this one-row draft. A blank line can also be part of a longer draft;
+        // it does not establish that the rest of the editor is empty.
+        if status <= top
+            || !rows[status].trim_start().starts_with("GPT-")
+            || !rows[status].contains(" · ")
+            || rows[top + 1..status]
+                .iter()
+                .any(|row| !row.trim().is_empty())
+        {
+            return false;
+        }
+        let prefix = rows[top]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count()
+            + 2;
+        let end = prefix + input.len();
+        self.cursor_column == end
+            && rows[top]
+                .chars()
+                .skip(prefix)
+                .take(input.len())
+                .collect::<String>()
+                == input
+            && rows[top].chars().skip(end).all(char::is_whitespace)
+    }
+
+    fn unframed_composer(&self, prompt: char, footer: &str, empty: bool) -> Option<String> {
+        if !self.cursor_visible {
+            return None;
+        }
+        let cursor = usize::try_from(self.cursor_row).ok()?;
+        let rows: Vec<_> = self.text.lines().collect();
+        let bottom = rows.iter().rposition(|row| row.contains(footer))?;
+        let top = rows[..bottom].iter().rposition(|row| {
+            row.trim_start()
+                .strip_prefix(prompt)
+                .is_some_and(|after| after.is_empty() || after.starts_with(char::is_whitespace))
+        })?;
+        if cursor < top || cursor >= bottom {
+            return None;
+        }
+        let end = bottom;
+        let prefix = rows[top]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count();
+        if (cursor == top && self.cursor_column == prefix + 2) != empty {
+            return None;
+        }
+        Some(
+            rows[..top]
+                .iter()
+                .chain(rows[end..].iter())
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    pub(crate) fn codex_draft_matches(&self, input: &str) -> bool {
+        if input.len() > self.text.len() || self.codex_composer_context(false).is_none() {
+            return false;
+        }
+        let rows: Vec<_> = self.text.lines().collect();
+        let Some(top) = rows
+            .iter()
+            .rposition(|row| row.trim_start().starts_with('›'))
+        else {
+            return false;
+        };
+        let cursor = usize::try_from(self.cursor_row).unwrap_or(top);
+        if cursor < top || cursor >= rows.len() {
+            return false;
+        }
+        let text = std::iter::once(rows[top].trim_start().trim_start_matches('›').trim())
+            .chain(rows[top + 1..=cursor].iter().map(|row| row.trim()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        normalized(&text) == normalized(input)
+    }
+
+    pub(crate) fn claude_draft_matches(&self, input: &str) -> bool {
+        if input.len() > self.text.len() {
+            return false;
+        }
+        let Some(region) = self.composer_rows(false) else {
+            return false;
+        };
+        let rows: Vec<_> = self.text.lines().collect();
+        let text = std::iter::once(
+            rows[region.start]
+                .trim_start()
+                .trim_start_matches('❯')
+                .trim(),
+        )
+        .chain(
+            rows[region.start + 1..region.end]
+                .iter()
+                .map(|row| row.trim()),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+        normalized(&text) == normalized(input)
+    }
+
     /// The cursor must belong to the live input region between two rules. A menu
     /// choice or a quoted prompt elsewhere in the viewport is not a composer.
     /// `empty` uses cursor position, allowing Claude's placeholder text to remain.
@@ -176,6 +392,10 @@ impl Screen {
     }
 }
 
+pub(crate) fn normalized(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Guard, Screen, Stop};
@@ -201,6 +421,8 @@ mod tests {
         guard.write(ms(1), 0, || Ok(())).unwrap();
         assert_eq!(turn.state(), StartupTurnState::Pending);
         guard.write(ms(2), 1, || Ok(())).unwrap();
+        guard.enter_admitted(123);
+        assert_eq!(turn.state(), StartupTurnState::AwaitingAcceptance(123));
         guard.submitted(123);
         drop(guard);
         assert_eq!(turn.state(), StartupTurnState::Submitted(123));
@@ -209,6 +431,8 @@ mod tests {
             None,
             Some(Stop::Interrupted),
             Some(Stop::NotReady),
+            Some(Stop::NotAccepted),
+            Some(Stop::UnsupportedProvider),
             Some(Stop::WriteFailed),
         ] {
             let turn = StartupTurn::default();
@@ -221,13 +445,31 @@ mod tests {
                     assert_eq!(guard.check(ms(1), 1), Err(Stop::Interrupted))
                 }
                 Some(Stop::NotReady) => assert_eq!(guard.check(ms(10), 0), Err(Stop::NotReady)),
+                Some(reason @ (Stop::NotAccepted | Stop::UnsupportedProvider)) => {
+                    guard.fail(reason)
+                }
                 Some(Stop::WriteFailed) => assert_eq!(
                     guard.write(ms(1), 0, || Err(io::Error::other("closed"))),
                     Err(Stop::WriteFailed)
                 ),
             }
             drop(guard);
-            assert_eq!(turn.state(), StartupTurnState::Cancelled);
+            let expected = match stop {
+                Some(Stop::NotReady) => {
+                    StartupTurnState::Failed(muxel_core::control::StartupFailure::NotReady)
+                }
+                Some(Stop::WriteFailed) => {
+                    StartupTurnState::Failed(muxel_core::control::StartupFailure::WriteFailed)
+                }
+                Some(Stop::NotAccepted) => {
+                    StartupTurnState::Failed(muxel_core::control::StartupFailure::NotAccepted)
+                }
+                Some(Stop::UnsupportedProvider) => StartupTurnState::Failed(
+                    muxel_core::control::StartupFailure::UnsupportedProvider,
+                ),
+                _ => StartupTurnState::Cancelled,
+            };
+            assert_eq!(turn.state(), expected);
             assert!(!extra_command_clone.is_pending());
         }
         let turn = StartupTurn::default();
@@ -255,6 +497,55 @@ mod tests {
             Err(Stop::NotReady)
         );
         assert_eq!(writes.get(), 0);
+    }
+
+    #[test]
+    fn enter_without_a_provider_receipt_can_only_retry_once_then_fail() {
+        use super::{Acceptance, AcceptanceAction::*};
+        let mut acceptance = Acceptance::default();
+        assert_eq!(acceptance.observe(ms(4999), false, true), Observe);
+        assert_eq!(acceptance.observe(ms(5000), false, true), RetryEnter);
+        assert_eq!(acceptance.observe(ms(5100), false, true), Observe);
+        assert_eq!(acceptance.observe(ms(9999), false, true), Observe);
+        assert_eq!(acceptance.observe(ms(10_000), false, true), Failed);
+        let mut unsupported_retry = Acceptance::default();
+        assert_eq!(unsupported_retry.observe(ms(5000), false, false), Observe);
+        assert_eq!(unsupported_retry.observe(ms(6000), false, true), Observe);
+        assert_eq!(unsupported_retry.observe(ms(10_000), false, false), Failed);
+        let mut accepted = Acceptance::default();
+        assert_eq!(accepted.observe(ms(5000), true, true), Accepted);
+    }
+
+    #[test]
+    fn codex_requires_a_live_editor_and_never_treats_folder_trust_as_input() {
+        let trust = screen(
+            "Folder access\nTrust this folder?\n› 1. Trust and continue\n  2. Quit\nenter continue · esc quit",
+            2,
+            2,
+        );
+        assert!(trust.codex_composer_context(true).is_none());
+        let mut ready = screen(
+            "OpenAI Codex\n› Ask Codex to do anything\n\n  GPT-6-Sol · scratch\n  ? for shortcuts",
+            1,
+            2,
+        );
+        assert!(ready.codex_composer_context(true).is_some());
+        ready.text =
+            "OpenAI Codex\n› Answer exactly\n  B8_OK\n\n  GPT-6-Sol · scratch\n  ? for shortcuts"
+                .into();
+        ready.cursor_row = 2;
+        ready.cursor_column = 7;
+        assert!(ready.codex_composer_context(false).is_some());
+        assert!(ready.codex_draft_matches("Answer exactly B8_OK"));
+        assert!(!ready.codex_draft_matches("A different task"));
+        ready.cursor_visible = false;
+        assert!(!ready.codex_draft_matches("Answer exactly B8_OK"));
+        let residual_menu = screen(
+            "OpenAI Codex\n› task\n\n  GPT-6-Sol · scratch\n  ? for shortcuts\n› 1. menu",
+            1,
+            6,
+        );
+        assert!(!residual_menu.codex_draft_matches("task"));
     }
     #[test]
     fn external_input_before_paste_or_after_our_paste_stops_automation() {

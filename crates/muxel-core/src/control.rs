@@ -19,7 +19,7 @@ use uuid::Uuid;
 mod new;
 pub use new::{NewOptions, NewPlacement, place_new_pane};
 mod startup;
-pub use startup::{StartupTurn, StartupTurnOwner, StartupTurnState};
+pub use startup::{StartupFailure, StartupTurn, StartupTurnOwner, StartupTurnState};
 mod approval;
 pub use approval::{
     APPROVAL_ARM_DELAY_MS, APPROVAL_TIMEOUT_MS, ApprovalQueue, CreationDecision, CreationPolicy,
@@ -372,6 +372,10 @@ pub struct AgentInfo {
     pub launch_id: Option<Uuid>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
+    /// A startup task that failed before provider acceptance. The terminal itself
+    /// may still be running, for example at a folder-trust menu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_error: Option<String>,
     /// The pane the user has focused.
     pub focused: bool,
     /// The pane (tab group) it is a tab of, numbered in layout order from 1.
@@ -894,6 +898,8 @@ pub fn awaiting_reply(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitOutcome {
+    /// The startup task never obtained provider-owned acceptance.
+    SubmissionFailed,
     /// The turn ended; the reply is ready.
     Finished,
     /// The agent is asking something (see `question`).
@@ -1490,8 +1496,17 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   writer, not confirmation of agent delivery. A lost reply does not make a
   retry safe; inspect the agent before typing again.
 - `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
-  ends (or it blocks on a question, or exits), then print what `show` prints plus
-  `wait.outcome`: finished, blocked, exited, not_running or timed_out. Default
+  ends (or it blocks on a question, or exits), then print what `show` prints.
+  Startup tasks stay pending until fresh provider-owned acceptance, not merely
+  our Enter. Codex may receive one extra Enter only while its exact task remains
+  on one exact ASCII row in its live idle editor, with no new user row. Wrapped
+  or ambiguous drafts get no retry; task text is never pasted again. A missing acceptance
+  within ten seconds, failed readiness or unsupported provider sets
+  `agent.startup_error` in show (or `startup_error` in status). Inspect the pane
+  before sending another task; do not repeat creation. Muse and other providers
+  without a verified startup protocol receive no task input.
+  The `wait.outcome` values are finished, blocked, exited, not_running,
+  submission_failed or timed_out. Default
   timeout 600 seconds.
 - `muxel ctl answer AGENT OPTION` - pick numbered option OPTION of the question
   the agent is blocked on.
@@ -1826,6 +1841,7 @@ mod tests {
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
+            startup_error: None,
             focused: false,
             pane: Some(1),
             worktree_branch: None,

@@ -443,13 +443,23 @@ feature is added or changed, update the matching entry here in the same change**
   sends auto-mode Shift+Tab presses, and respects the agent's startup delay (so
   opencode and Grok work). The pane is **visible but not focused** and never switches your
   active project — a loop firing on a timer can't interrupt what you're typing.
-- **Claude startup input** — typed startup tasks wait for Claude's editable
-  composer and bracketed-paste mode, including after trust or startup screens.
-  Permission text inside the pasted task does not block its submission.
+- **Provider startup input** — typed startup tasks wait for Claude's editable
+  composer and bracketed-paste mode, Codex's live editor and Ready title, or
+  Grok's semantic idle state after its configured startup delay.
+  Codex folder-trust menus receive no task input; readiness failure leaves the
+  provider running and reports `startup_error` through `ctl status` and `show`.
+  Permission text inside Claude's pasted task does not block its submission.
   `ctl wait` keeps a newly created task pending through startup and paste, then
-  starts the reply grace period when its submit Enter is admitted.
+  confirms submission only from a fresh provider turn or rendered user row.
+  Enter admission alone stays pending. Codex can receive one extra Enter after
+  five seconds only if the exact task is visible on one ASCII editor row with
+  its cursor at the end and no new user row; ambiguous reflow gets no retry. Task text
+  is never pasted twice. Grok and Claude do not inherit that retry. After ten
+  seconds without acceptance, `ctl wait` reports `submission_failed`, with an
+  explanation in `startup_error`. Providers without a verified input/acceptance
+  protocol (including Muse) refuse controller startup tasks without typing.
   Input stops if the pane is replaced, someone types, the writer fails, or
-  readiness times out; it never retries a submitted task automatically.
+  readiness times out; it never replays a submitted task automatically.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
   copy.

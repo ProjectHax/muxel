@@ -1,7 +1,7 @@
 //! Runtime ownership of the first task supplied by outside pane creation.
 //!
 //! Creation precedes PTY admission. Keep that interval distinct from the reply
-//! grace period, which starts only when Enter is admitted to the writer.
+//! grace period. Enter admission is not provider acceptance.
 
 use super::{AgentState, REPLY_GRACE_MS, awaiting_reply};
 use crate::AgentActivity;
@@ -10,8 +10,41 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartupTurnState {
     Pending,
+    AwaitingAcceptance(i64),
     Submitted(i64),
+    Failed(StartupFailure),
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupFailure {
+    NotReady,
+    NotAccepted,
+    WriteFailed,
+    UnsupportedProvider,
+}
+
+impl StartupFailure {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotReady => {
+                "Startup task was not sent: the provider's editable composer did not become ready."
+            }
+            Self::NotAccepted => {
+                "Startup task submission was not confirmed by the provider after at most one Enter retry. Inspect the pane before sending another task."
+            }
+            Self::WriteFailed => "Startup task could not be written to its terminal.",
+            Self::UnsupportedProvider => {
+                "Startup task was not sent: this provider has no verified input and acceptance protocol. Open the pane and submit the task directly."
+            }
+        }
+    }
+}
+
+impl StartupTurnState {
+    fn is_pending(self) -> bool {
+        matches!(self, Self::Pending | Self::AwaitingAcceptance(_))
+    }
 }
 
 #[derive(Debug)]
@@ -45,7 +78,7 @@ impl StartupTurn {
 
     pub fn cancel(&self) {
         let mut tracked = self.lock();
-        if tracked.state == StartupTurnState::Pending {
+        if tracked.state.is_pending() {
             tracked.state = StartupTurnState::Cancelled;
         }
     }
@@ -56,7 +89,7 @@ impl StartupTurn {
     pub fn claim(&self) -> Option<StartupTurnOwner> {
         let mut tracked = self.lock();
         if tracked.claimed || tracked.state != StartupTurnState::Pending {
-            if tracked.state == StartupTurnState::Pending {
+            if tracked.state.is_pending() {
                 tracked.state = StartupTurnState::Cancelled;
             }
             return None;
@@ -72,7 +105,7 @@ impl StartupTurn {
         now: i64,
     ) -> bool {
         match self.state() {
-            StartupTurnState::Pending => matches!(
+            StartupTurnState::Pending | StartupTurnState::AwaitingAcceptance(_) => matches!(
                 state,
                 Some(
                     AgentState::Starting
@@ -85,7 +118,14 @@ impl StartupTurn {
             StartupTurnState::Submitted(at) => {
                 awaiting_reply(Some(at), REPLY_GRACE_MS, state, activity, now)
             }
-            StartupTurnState::Cancelled => false,
+            StartupTurnState::Cancelled | StartupTurnState::Failed(_) => false,
+        }
+    }
+
+    pub fn failure(&self) -> Option<StartupFailure> {
+        match self.state() {
+            StartupTurnState::Failed(reason) => Some(reason),
+            _ => None,
         }
     }
 }
@@ -109,26 +149,46 @@ impl StartupTurnOwner {
     }
 
     pub fn is_pending(&self) -> bool {
-        self.0.0.state() == StartupTurnState::Pending
+        self.0.0.state().is_pending()
     }
 
     pub fn cancel(&self) {
         self.0.0.cancel();
     }
 
-    /// Call immediately after the final CR has been admitted, on the UI thread
-    /// that also admits controller cancellation/replacement and startup writes.
-    pub fn submitted(&self, at: i64) {
+    /// A successful writer admission only starts the bounded acceptance check.
+    pub fn enter_admitted(&self, at: i64) {
         let mut tracked = self.0.0.lock();
         if tracked.state == StartupTurnState::Pending {
-            tracked.state = StartupTurnState::Submitted(at);
+            tracked.state = StartupTurnState::AwaitingAcceptance(at);
+        }
+    }
+
+    /// Fresh provider-owned turn evidence, observed by this launch's automation.
+    /// Keep the first Enter timestamp so a fast reply predating this observation
+    /// still belongs to the submitted task.
+    pub fn submitted(&self, at: i64) {
+        let mut tracked = self.0.0.lock();
+        if tracked.state.is_pending() {
+            let entered = match tracked.state {
+                StartupTurnState::AwaitingAcceptance(entered) => entered,
+                _ => at,
+            };
+            tracked.state = StartupTurnState::Submitted(entered);
+        }
+    }
+
+    pub fn fail(&self, reason: StartupFailure) {
+        let mut tracked = self.0.0.lock();
+        if tracked.state.is_pending() {
+            tracked.state = StartupTurnState::Failed(reason);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{StartupTurn, StartupTurnState};
+    use super::{StartupFailure, StartupTurn, StartupTurnState};
     use crate::AgentActivity;
     use crate::control::{AgentState, WaitOutcome, wait_outcome};
 
@@ -146,8 +206,12 @@ mod tests {
             assert!(awaiting);
             assert_eq!(wait_outcome(Some(state), awaiting), None);
         }
-        // Pasting does not settle ownership. Only admitted Enter starts grace.
+        // Pasting and our Enter do not settle ownership.
         assert_eq!(turn.state(), StartupTurnState::Pending);
+        owner.enter_admitted(90_001);
+        assert_eq!(turn.state(), StartupTurnState::AwaitingAcceptance(90_001));
+        assert!(turn.awaiting_reply(Some(AgentState::Idle), &activity, 120_000));
+        // Even after the ordinary grace, our CR cannot finish an unaccepted task.
         owner.submitted(90_001);
         assert!(turn.awaiting_reply(Some(AgentState::Idle), &activity, 90_002));
         activity.completed_at = Some(90_010);
@@ -157,6 +221,35 @@ mod tests {
             wait_outcome(Some(AgentState::Done), awaiting),
             Some(WaitOutcome::Finished)
         );
+    }
+
+    #[test]
+    fn fast_reply_before_acceptance_poll_still_belongs_to_first_enter() {
+        let turn = StartupTurn::default();
+        let owner = turn.claim().unwrap();
+        owner.enter_admitted(10);
+        owner.enter_admitted(20);
+        let activity = AgentActivity {
+            completed_at: Some(25),
+            ..Default::default()
+        };
+        owner.submitted(30);
+        assert_eq!(turn.state(), StartupTurnState::Submitted(10));
+        assert!(!turn.awaiting_reply(Some(AgentState::Done), &activity, 31));
+    }
+
+    #[test]
+    fn acceptance_failure_survives_owner_drop_and_late_provider_evidence() {
+        let turn = StartupTurn::default();
+        let owner = turn.claim().unwrap();
+        owner.enter_admitted(10);
+        owner.enter_admitted(20); // The one retry does not replace the first CR.
+        owner.fail(StartupFailure::NotAccepted);
+        owner.submitted(30);
+        drop(owner);
+        assert_eq!(turn.failure(), Some(StartupFailure::NotAccepted));
+        assert!(!turn.awaiting_reply(Some(AgentState::Idle), &AgentActivity::default(), 40));
+        assert!(turn.claim().is_none());
     }
 
     #[test]

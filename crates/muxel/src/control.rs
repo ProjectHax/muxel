@@ -596,6 +596,9 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
             return Err(format!("'{agent}' is not a terminal pane").into());
         }
         let awaiting = info["awaiting_reply"].as_bool().unwrap_or(false);
+        if info["startup_error"].is_string() {
+            break WaitOutcome::SubmissionFailed;
+        }
         if let Some(outcome) = control::wait_outcome(state, awaiting) {
             break outcome;
         }

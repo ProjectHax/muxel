@@ -52,6 +52,13 @@ pub(super) struct ControlTurn {
 }
 
 impl ControlTurn {
+    fn startup_error(&self) -> Option<String> {
+        self.startup
+            .as_ref()
+            .and_then(ctl::StartupTurn::failure)
+            .map(|failure| failure.message().to_owned())
+    }
+
     fn startup(prompt: String) -> Self {
         Self {
             prompt: Some(prompt),
@@ -910,6 +917,10 @@ impl MuxelApp {
                 .control_turns
                 .get(&inst.id)
                 .is_some_and(|turn| turn.awaiting_reply(status, &inst.activity, now)),
+            startup_error: self
+                .control_turns
+                .get(&inst.id)
+                .and_then(ControlTurn::startup_error),
             focused: self.active_instance == Some(inst.id),
             pane,
             worktree_branch: inst.worktree_branch.clone(),
