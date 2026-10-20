@@ -8,7 +8,7 @@ use super::{
 };
 use super::{
     MuxelApp, home_dir, is_claude_program, is_codex_program, is_grok_program,
-    session_id_bound_elsewhere, validated_codex_session_id,
+    validated_codex_session_id,
 };
 use crate::{session_binding, ui_profile};
 use gpui::{App, Context};
@@ -16,7 +16,7 @@ use muxel_core::AgentPreset;
 use muxel_core::session_discovery::{
     SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Instant, SystemTime};
 use uuid::Uuid;
@@ -89,6 +89,52 @@ struct SessionBindingUpdate {
     previous_auto_name: Option<String>,
     switched: Option<(SystemTime, SystemTime)>,
     claude: Option<ClaudeCommit>,
+}
+
+/// A pane can reserve its saved ID and an accepted ID whose save is pending.
+/// Construct once per batch, then update claims as each result is staged.
+#[derive(Default)]
+struct SessionOwnership {
+    identities: HashMap<String, HashSet<Uuid>>,
+    positions: HashMap<Uuid, usize>,
+}
+
+impl SessionOwnership {
+    fn claim(&mut self, pane: Uuid, id: &str) {
+        if let Some(owners) = self.identities.get_mut(id) {
+            owners.insert(pane);
+        } else {
+            self.identities.insert(id.to_owned(), HashSet::from([pane]));
+        }
+    }
+
+    fn bound_elsewhere(&self, pane: Uuid, id: &str) -> bool {
+        self.identities
+            .get(id)
+            .is_some_and(|owners| owners.len() > 1 || !owners.contains(&pane))
+    }
+
+    fn replace(&mut self, pane: Uuid, old: [Option<&str>; 2], new: [Option<&str>; 2]) {
+        for id in old
+            .into_iter()
+            .flatten()
+            .filter(|id| !new.contains(&Some(id)))
+        {
+            if let Some(owners) = self.identities.get_mut(id) {
+                owners.remove(&pane);
+                if owners.is_empty() {
+                    self.identities.remove(id);
+                }
+            }
+        }
+        for id in new
+            .into_iter()
+            .flatten()
+            .filter(|id| !old.contains(&Some(id)))
+        {
+            self.claim(pane, id);
+        }
+    }
 }
 
 impl MuxelApp {
@@ -229,84 +275,201 @@ impl MuxelApp {
                     })
                     .await;
                 let _ = this.update(cx, |this, cx| {
-                    #[cfg(not(windows))]
-                    let _ = batch.grok_read;
-                    let mut updates = Vec::new();
-                    for (request, candidate) in batch.results {
-                        let iid = request.key.pane;
-                        let current = this.session_discovery_key(iid, cx);
-                        let unowned = candidate.session_id().is_some_and(|id| {
-                            !session_id_bound_elsewhere(&this.workspace.instances, iid, id)
-                        });
-                        let valid = this.session_discoveries.finish(
-                            &request,
-                            current.as_ref(),
-                            Instant::now(),
-                            unowned,
-                        );
-                        if !valid {
-                            // Stale workers never claim or acknowledge a receipt.
-                            continue;
-                        }
-                        #[cfg(windows)]
-                        if request.key.provider == SessionProvider::Grok
-                            && unowned
-                            && let Some((started, finished)) = batch.grok_read
-                        {
-                            this.record_grok_read(
-                                &request.key,
-                                GrokRegistryRead { started, finished },
-                            );
-                        }
-                        let update = match candidate {
-                            DiscoveryCandidate::Claude { snapshot, binding } => {
-                                // Only this UI owner and prelaunch recovery may claim/ack.
-                                // A newer receipt must wait for its own validation.
-                                let Some(record) = data_dir.as_deref().and_then(|data_dir| {
-                                    claim_validated_claude_record(data_dir, iid, &snapshot)
-                                }) else {
-                                    continue;
-                                };
-                                if unowned {
-                                    this.stage_discovered_claude(iid, record, binding, cx)
-                                } else {
-                                    session_binding::acknowledge_claude_binding(record);
-                                    None
-                                }
-                            }
-                            DiscoveryCandidate::Session {
-                                session_id,
-                                switched,
-                            } if unowned => {
-                                #[cfg(windows)]
-                                if request.key.provider == SessionProvider::Grok {
-                                    this.stage_grok_session(
-                                        &request.key,
-                                        session_id,
-                                        switched
-                                            .expect("Grok result carries its observation interval"),
-                                        cx,
-                                    )
-                                } else {
-                                    this.stage_discovered_session(iid, session_id, false)
-                                }
-                                #[cfg(not(windows))]
-                                {
-                                    let _ = switched;
-                                    this.stage_discovered_session(iid, session_id, false)
-                                }
-                            }
-                            _ => None,
-                        };
-                        if let Some(update) = update {
-                            updates.push(update);
-                        }
-                    }
-                    this.finish_discovered_sessions(updates, cx);
+                    this.apply_discovery_batch(batch, data_dir.as_deref(), cx);
                 });
             })
             .detach();
         }
+    }
+
+    fn apply_discovery_batch(
+        &mut self,
+        batch: DiscoveryBatch,
+        data_dir: Option<&Path>,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(not(windows))]
+        let _ = batch.grok_read;
+        let mut ownership = self.session_ownership(cx);
+        let mut updates = Vec::new();
+        for (request, candidate) in batch.results {
+            let iid = request.key.pane;
+            let current = self.session_discovery_key(iid, cx);
+            let unowned = candidate
+                .session_id()
+                .is_some_and(|id| !ownership.bound_elsewhere(iid, id));
+            let valid = self.session_discoveries.finish(
+                &request,
+                current.as_ref(),
+                Instant::now(),
+                unowned,
+            );
+            if !valid {
+                // Stale workers never claim or acknowledge a receipt.
+                continue;
+            }
+            let previous_id = current.as_ref().and_then(|key| key.binding.as_deref());
+            #[cfg(windows)]
+            let previous_grok = current
+                .as_ref()
+                .filter(|key| key.provider == SessionProvider::Grok)
+                .and_then(|_| self.live_grok_session_id(iid, cx))
+                .map(str::to_owned);
+            #[cfg(not(windows))]
+            let previous_grok: Option<String> = None;
+            #[cfg(windows)]
+            if request.key.provider == SessionProvider::Grok
+                && unowned
+                && let Some((started, finished)) = batch.grok_read
+            {
+                self.record_grok_read(&request.key, GrokRegistryRead { started, finished });
+            }
+            let update = match candidate {
+                DiscoveryCandidate::Claude { snapshot, binding } => {
+                    // Only this UI owner and prelaunch recovery may claim/ack.
+                    // A newer receipt must wait for its own validation.
+                    let Some(record) = data_dir.and_then(|data_dir| {
+                        claim_validated_claude_record(data_dir, iid, &snapshot)
+                    }) else {
+                        continue;
+                    };
+                    if unowned {
+                        self.stage_discovered_claude(iid, record, binding, cx)
+                    } else {
+                        session_binding::acknowledge_claude_binding(record);
+                        None
+                    }
+                }
+                DiscoveryCandidate::Session {
+                    session_id,
+                    switched,
+                } if unowned => {
+                    #[cfg(windows)]
+                    if request.key.provider == SessionProvider::Grok {
+                        self.stage_grok_session(
+                            &request.key,
+                            session_id,
+                            switched.expect("Grok result carries its observation interval"),
+                            cx,
+                        )
+                    } else {
+                        self.stage_discovered_session(iid, session_id, false)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = switched;
+                        self.stage_discovered_session(iid, session_id, false)
+                    }
+                }
+                _ => None,
+            };
+            let current_id = ownership
+                .positions
+                .get(&iid)
+                .and_then(|index| self.workspace.instances.get(*index))
+                .and_then(|instance| instance.session_id.as_deref());
+            #[cfg(windows)]
+            let current_grok = current
+                .as_ref()
+                .filter(|key| key.provider == SessionProvider::Grok)
+                .and_then(|_| self.live_grok_session_id(iid, cx));
+            #[cfg(not(windows))]
+            let current_grok = None;
+            ownership.replace(
+                iid,
+                [previous_id, previous_grok.as_deref()],
+                [current_id, current_grok],
+            );
+            if let Some(update) = update {
+                updates.push(update);
+            }
+        }
+        self.finish_discovered_sessions(updates, cx);
+    }
+
+    fn session_ownership(&self, cx: &App) -> SessionOwnership {
+        let mut ownership = SessionOwnership::default();
+        #[cfg(windows)]
+        let local_projects: HashSet<_> = self
+            .workspace
+            .projects
+            .iter()
+            .filter(|project| project.remote.is_none())
+            .map(|project| project.id)
+            .collect();
+        #[cfg(not(windows))]
+        let _ = cx;
+        for (index, instance) in self.workspace.instances.iter().enumerate() {
+            ownership.positions.entry(instance.id).or_insert(index);
+            if let Some(id) = &instance.session_id {
+                ownership.claim(instance.id, id);
+            }
+            #[cfg(windows)]
+            if instance.kind == muxel_core::InstanceKind::Terminal
+                && is_grok_program(instance.program.as_deref())
+                && instance.tmux_session.is_none()
+                && local_projects.contains(&instance.project_id)
+                && let Some(id) = self.live_grok_session_id(instance.id, cx)
+            {
+                ownership.claim(instance.id, id);
+            }
+        }
+        ownership
+    }
+
+    #[cfg(windows)]
+    fn live_grok_session_id(&self, iid: Uuid, cx: &App) -> Option<&str> {
+        let observation = self.grok_observations.get(&iid)?;
+        if self.terminal_launches.get(&iid)?.0 != observation.launch {
+            return None;
+        }
+        let pid = self.discovery_terminal(iid)?.read(cx).child_pid()?;
+        if observation.child_pid != Some(pid) {
+            return None;
+        }
+        observation.session_id.as_deref()
+    }
+
+    #[cfg(windows)]
+    pub(super) fn reconcile_grok_before_restart(
+        &mut self,
+        iid: Uuid,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let Some(instance) = self.workspace.instance(iid) else {
+            return Ok(());
+        };
+        if instance.kind != muxel_core::InstanceKind::Terminal
+            || !is_grok_program(instance.program.as_deref())
+            || instance.tmux_session.is_some()
+            || self
+                .workspace
+                .project(instance.project_id)
+                .is_none_or(|project| project.remote.is_some())
+        {
+            return Ok(());
+        }
+        let Some(identity) = self.live_grok_session_id(iid, cx).map(str::to_owned) else {
+            return Ok(());
+        };
+        if instance.session_id.as_deref() == Some(identity.as_str()) {
+            return Ok(());
+        }
+        if self.session_ownership(cx).bound_elsewhere(iid, &identity) {
+            anyhow::bail!(
+                crate::i18n::t("Another pane owns the current conversation.").to_string()
+            );
+        }
+        let Some(update) = self.stage_discovered_session(iid, identity, false) else {
+            return Ok(());
+        };
+        if !self.finish_discovered_sessions(vec![update], cx) {
+            anyhow::bail!(
+                crate::i18n::t("Could not save the current conversation before restart.")
+                    .to_string()
+            );
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -424,9 +587,9 @@ impl MuxelApp {
         &mut self,
         updates: Vec<SessionBindingUpdate>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if updates.is_empty() {
-            return;
+            return true;
         }
         if self.try_persist() {
             for update in updates {
@@ -441,6 +604,7 @@ impl MuxelApp {
                 }
             }
             cx.notify();
+            true
         } else {
             for update in updates {
                 let instance = self
@@ -454,6 +618,7 @@ impl MuxelApp {
                 // Claimed Claude files are intentionally not acknowledged, and
                 // their nonce is not remembered until the save succeeds.
             }
+            false
         }
     }
 }
@@ -569,8 +734,9 @@ mod grok_regressions {
         AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopRun, MuxelApp,
         PostRunAction, grok_switch_interval, popout_lifecycle_tests::with_app,
     };
-    use gpui::{AppContext as _, Context, Window};
-    use muxel_core::{Instance, Project};
+    use super::{DiscoveryBatch, DiscoveryCandidate};
+    use gpui::{AppContext as _, Context, TestAppContext, Window, WindowHandle};
+    use muxel_core::{AgentPreset, InjectionMode, Instance, Project};
     use muxel_terminal::{
         CommandSpec, TerminalLaunch, TerminalRuntimeSnapshot, TerminalSession,
         TerminalStatusCoverage, TerminalStatusReason, TerminalView,
@@ -578,11 +744,66 @@ mod grok_regressions {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
     use uuid::Uuid;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
 
     struct StopChild(Arc<TerminalSession>);
     impl Drop for StopChild {
         fn drop(&mut self) {
             self.0.kill();
+        }
+    }
+
+    struct ChildHandle(HANDLE);
+    impl ChildHandle {
+        fn new(session: &TerminalSession) -> Self {
+            // SAFETY: this is the PTY created by this fixture. Retain the handle
+            // before Restart so PID reuse cannot satisfy a liveness assertion.
+            Self(unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    false,
+                    session.child_pid().unwrap(),
+                )
+                .unwrap()
+            })
+        }
+
+        fn running(&self) -> bool {
+            // SAFETY: the retained handle stays open until this guard drops.
+            let status = unsafe { WaitForSingleObject(self.0, 0) };
+            if status == WAIT_TIMEOUT {
+                true
+            } else {
+                assert_eq!(status, WAIT_OBJECT_0);
+                false
+            }
+        }
+    }
+    impl Drop for ChildHandle {
+        fn drop(&mut self) {
+            // SAFETY: this guard exclusively owns the retained process handle.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn checked_update<R>(
+        window: WindowHandle<MuxelApp>,
+        cx: &mut TestAppContext,
+        run: impl FnOnce(&mut MuxelApp, &mut Window, &mut Context<MuxelApp>) -> R,
+    ) -> R {
+        // Restore GPUI's app lease before reporting a failed assertion. Owned
+        // PTY guards still unwind inside the callback before cleanup runs.
+        let result = window
+            .update(cx, |app, window, cx| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(app, window, cx)))
+            })
+            .unwrap();
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
         }
     }
 
@@ -615,6 +836,277 @@ mod grok_regressions {
         app.terminals.insert(id, view);
         app.terminal_launches.insert(id, (Instant::now(), false));
         (id, session)
+    }
+
+    fn complete_grok(app: &mut MuxelApp, id: Uuid, identity: &str, cx: &mut Context<MuxelApp>) {
+        let key = app.session_discovery_key(id, cx).unwrap();
+        let request = app.session_discoveries.begin(key, Instant::now()).unwrap();
+        let now = SystemTime::now();
+        app.apply_discovery_batch(
+            DiscoveryBatch {
+                results: vec![(
+                    request,
+                    DiscoveryCandidate::Session {
+                        session_id: identity.into(),
+                        switched: Some((now, now)),
+                    },
+                )],
+                grok_read: Some((now, now)),
+            },
+            muxel_store::data_dir().as_deref(),
+            cx,
+        );
+    }
+
+    #[test]
+    fn gasq_restart_preserves_unsaved_grok_and_then_resumes_its_accepted_identity() {
+        with_app(|cx, window| {
+            let (old_process, replacement, report, identity) = checked_update(
+                window,
+                cx,
+                |app, window, cx| {
+                    app.current_workspace = Some(Uuid::new_v4());
+                    app.use_tmux = false;
+                    app.use_worktree = false;
+                    let (id, session) = pane(app, window, cx);
+                    let _stop_old = StopChild(session.clone());
+                    let old_process = ChildHandle::new(&session);
+                    let root = muxel_store::data_dir()
+                        .unwrap()
+                        .join("restart-grok-fixture");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let program = root.join("grok.cmd");
+                    let report = root.join("resume.txt");
+                    std::fs::write(
+                        &program,
+                        "@echo off\r\n> \"%~dp0resume.txt\" echo %~1\r\n>> \"%~dp0resume.txt\" echo %~2\r\nmore >nul\r\n",
+                    )
+                    .unwrap();
+                    let mut preset = AgentPreset::grok();
+                    // The store's canonical test root has a Windows verbatim
+                    // prefix. cmd cannot execute a batch file under that prefix.
+                    let program = program.to_string_lossy();
+                    preset.program =
+                        Some(program.strip_prefix(r"\\?\").unwrap_or(&program).to_owned());
+                    preset.injection = InjectionMode::None;
+                    let instance = app.workspace.instance_mut(id).unwrap();
+                    instance.preset_id = Some(preset.id);
+                    instance.preset = preset.name.clone();
+                    instance.program = preset.program.clone();
+                    instance.injection = InjectionMode::None;
+                    app.presets.push(preset);
+                    let old = app.workspace.instance(id).unwrap().session_id.clone();
+                    let doc =
+                        muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                    std::fs::create_dir_all(&doc).unwrap();
+                    let identity = Uuid::new_v4().to_string();
+                    complete_grok(app, id, &identity, cx);
+                    assert_eq!(app.workspace.instance(id).unwrap().session_id, old);
+                    let revision = session.binding_revision();
+                    app.restart_agent(id, window, cx);
+                    let current = app.terminal_view(id).unwrap().read(cx).session().clone();
+                    let _stop_current = StopChild(current.clone());
+                    assert_eq!(
+                        current.id, session.id,
+                        "failed-save Restart replaced the accepted live pane"
+                    );
+                    assert!(
+                        old_process.running(),
+                        "failed-save Restart killed the accepted conversation"
+                    );
+                    assert_eq!(session.binding_revision(), revision);
+                    assert_eq!(app.workspace.instance(id).unwrap().session_id, old);
+                    assert!(
+                        !report.exists(),
+                        "refused Restart still launched its fixture"
+                    );
+                    std::fs::remove_dir(&doc).unwrap();
+                    app.restart_agent(id, window, cx);
+                    let replacement =
+                        StopChild(app.terminal_view(id).unwrap().read(cx).session().clone());
+                    assert_ne!(replacement.0.id, session.id);
+                    assert_eq!(
+                        app.workspace.instance(id).unwrap().session_id.as_deref(),
+                        Some(identity.as_str())
+                    );
+                    let saved = muxel_store::load_workspace_from(&doc).unwrap();
+                    assert_eq!(
+                        saved.instance(id).unwrap().session_id.as_deref(),
+                        Some(identity.as_str())
+                    );
+                    (old_process, replacement, report, identity)
+                },
+            );
+            let cap = Instant::now() + Duration::from_secs(10);
+            let mut cursor_reply = Instant::now() - Duration::from_secs(1);
+            loop {
+                let selected = std::fs::read_to_string(&report).unwrap_or_default();
+                if !old_process.running()
+                    && selected.lines().collect::<Vec<_>>() == ["--resume", identity.as_str()]
+                {
+                    break;
+                }
+                // Headless ConPTY can wait for a cursor-position response before
+                // starting cmd. Supply the same reply as the batch-runner test
+                // without pumping the app's provider-registry polling tasks.
+                if selected.is_empty() && cursor_reply.elapsed() >= Duration::from_millis(100) {
+                    replacement.0.write_input(b"\x1b[1;1R");
+                    cursor_reply = Instant::now();
+                }
+                assert!(
+                    Instant::now() < cap,
+                    "Restart fixture did not select the accepted identity at {}: {selected:?}",
+                    report.display()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(replacement.0.child_pid().is_some());
+        });
+    }
+
+    #[test]
+    fn gasq_sibling_guard_reserves_matching_unsaved_grok_identity() {
+        for change in ["matching", "launch", "pid", "removed"] {
+            with_app(|cx, window| {
+                checked_update(window, cx, |app, window, cx| {
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let (owner, owner_session) = pane(app, window, cx);
+                    let _stop_owner = StopChild(owner_session.clone());
+                    let (other, other_session) = pane(app, window, cx);
+                    let _stop_other = StopChild(other_session.clone());
+                    let old_owner = app.workspace.instance(owner).unwrap().session_id.clone();
+                    let old_other = app.workspace.instance(other).unwrap().session_id.clone();
+                    let doc =
+                        muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                    std::fs::create_dir_all(&doc).unwrap();
+                    let identity = Uuid::new_v4().to_string();
+                    complete_grok(app, owner, &identity, cx);
+                    assert_eq!(app.workspace.instance(owner).unwrap().session_id, old_owner);
+                    let revision = owner_session.binding_revision();
+                    std::fs::remove_dir(&doc).unwrap();
+                    match change {
+                        "matching" => {}
+                        "launch" => {
+                            app.terminal_launches.get_mut(&owner).unwrap().0 +=
+                                Duration::from_secs(1)
+                        }
+                        "pid" => app.grok_observations.get_mut(&owner).unwrap().child_pid = Some(0),
+                        "removed" => app.workspace.instances.retain(|row| row.id != owner),
+                        _ => unreachable!(),
+                    }
+                    complete_grok(app, other, &identity, cx);
+                    if change != "matching" {
+                        assert_eq!(
+                            app.workspace.instance(other).unwrap().session_id.as_deref(),
+                            Some(identity.as_str()),
+                            "stale {change} observation blocked admission"
+                        );
+                        return;
+                    }
+                    assert_eq!(
+                        app.workspace.instance(other).unwrap().session_id,
+                        old_other,
+                        "sibling adopted an accepted but unsaved Grok identity"
+                    );
+                    assert!(
+                        !app.grok_observations.contains_key(&other),
+                        "rejected candidate advanced its read bound"
+                    );
+                    complete_grok(app, owner, &identity, cx);
+                    assert_eq!(
+                        app.workspace.instance(owner).unwrap().session_id.as_deref(),
+                        Some(identity.as_str())
+                    );
+                    assert_eq!(
+                        owner_session.binding_revision(),
+                        revision,
+                        "save retry repeated the accepted switch"
+                    );
+                    let saved = muxel_store::load_workspace_from(&doc).unwrap();
+                    assert_eq!(
+                        saved
+                            .instances
+                            .iter()
+                            .filter(|row| row.session_id.as_deref() == Some(identity.as_str()))
+                            .count(),
+                        1
+                    );
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn gasq_batch_releases_unsaved_identity_when_owner_switches_back_without_metadata_change() {
+        with_app(|cx, window| {
+            checked_update(window, cx, |app, window, cx| {
+                app.current_workspace = Some(Uuid::new_v4());
+                let (owner, owner_session) = pane(app, window, cx);
+                let _stop_owner = StopChild(owner_session.clone());
+                let (other, other_session) = pane(app, window, cx);
+                let _stop_other = StopChild(other_session);
+                let original = app
+                    .workspace
+                    .instance(owner)
+                    .unwrap()
+                    .session_id
+                    .clone()
+                    .unwrap();
+                let doc = muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                std::fs::create_dir_all(&doc).unwrap();
+                let accepted = Uuid::new_v4().to_string();
+                complete_grok(app, owner, &accepted, cx);
+                assert_eq!(
+                    app.workspace.instance(owner).unwrap().session_id.as_deref(),
+                    Some(original.as_str())
+                );
+                let revision = owner_session.binding_revision();
+                std::fs::remove_dir(&doc).unwrap();
+                let owner_key = app.session_discovery_key(owner, cx).unwrap();
+                let other_key = app.session_discovery_key(other, cx).unwrap();
+                let now = Instant::now();
+                let owner_request = app.session_discoveries.begin(owner_key, now).unwrap();
+                let other_request = app.session_discoveries.begin(other_key, now).unwrap();
+                let read = SystemTime::now();
+                app.apply_discovery_batch(
+                    DiscoveryBatch {
+                        results: vec![
+                            (
+                                owner_request,
+                                DiscoveryCandidate::Session {
+                                    session_id: original.clone(),
+                                    switched: Some((read, read)),
+                                },
+                            ),
+                            (
+                                other_request,
+                                DiscoveryCandidate::Session {
+                                    session_id: accepted.clone(),
+                                    switched: Some((read, read)),
+                                },
+                            ),
+                        ],
+                        grok_read: Some((read, read)),
+                    },
+                    muxel_store::data_dir().as_deref(),
+                    cx,
+                );
+                assert_ne!(owner_session.binding_revision(), revision);
+                assert_eq!(
+                    app.workspace.instance(owner).unwrap().session_id.as_deref(),
+                    Some(original.as_str())
+                );
+                assert_eq!(
+                    app.grok_observations[&owner].session_id.as_deref(),
+                    Some(original.as_str())
+                );
+                assert_eq!(
+                    app.workspace.instance(other).unwrap().session_id.as_deref(),
+                    Some(accepted.as_str()),
+                    "unchanged metadata left the old live identity reserved for the rest of the batch"
+                );
+            });
+        });
     }
 
     #[test]
@@ -811,13 +1303,38 @@ mod grok_regressions {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiscoveryCandidate, claim_validated_claude_record, discover_sessions};
+    use super::{
+        DiscoveryCandidate, SessionOwnership, claim_validated_claude_record, discover_sessions,
+    };
     use crate::session_binding;
     use muxel_core::session_discovery::{SessionDiscovery, SessionDiscoveryKey, SessionProvider};
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime};
     use uuid::Uuid;
+
+    #[test]
+    fn gasq_ownership_index_preserves_duplicate_owners_and_both_pending_claims() {
+        let owner = Uuid::new_v4();
+        let sibling = Uuid::new_v4();
+        let mut ownership = SessionOwnership::default();
+        ownership.claim(owner, "saved");
+        ownership.claim(owner, "accepted");
+        ownership.claim(sibling, "accepted");
+        assert!(ownership.bound_elsewhere(owner, "accepted"));
+        assert!(ownership.bound_elsewhere(sibling, "accepted"));
+        ownership.replace(
+            owner,
+            [Some("saved"), Some("accepted")],
+            [Some("saved"), Some("next")],
+        );
+        assert!(!ownership.bound_elsewhere(sibling, "accepted"));
+        assert!(ownership.bound_elsewhere(owner, "accepted"));
+        assert!(ownership.bound_elsewhere(sibling, "saved"));
+        assert!(ownership.bound_elsewhere(sibling, "next"));
+        ownership.replace(sibling, [Some("accepted"), Some("accepted")], [None, None]);
+        assert!(!ownership.bound_elsewhere(owner, "accepted"));
+    }
 
     struct ClaudeFixture {
         home: PathBuf,

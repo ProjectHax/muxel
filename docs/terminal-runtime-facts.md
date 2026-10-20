@@ -160,7 +160,13 @@ current title without a completion edge.
   so a failed save cannot leave an old Exit-policy loop owning the replacement.
   Metadata still rolls back on failure; retrying the same accepted identity only
   retries persistence. A new launch or child process starts with no prior Grok
-  observation.
+  observation. An accepted identity also reserves the conversation against
+  sibling discovery while its metadata save is pending. The ownership snapshot
+  checks the current pane, launch and child PID and updates claims as each result
+  in a batch is staged, including a switch back that leaves metadata unchanged.
+  Before Restart stops the process or redocks the pane, it saves the accepted
+  identity for the resume command. A failed save refuses Restart and leaves the
+  current process and window owner intact.
 - A submission counts only in the binding it was made in, so the Enter that
   picks a conversation in `/resume` doesn't arm the resumed conversation's
   completion, including when the resumed UUID is the first identity observed.

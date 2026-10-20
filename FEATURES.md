@@ -77,7 +77,9 @@ feature is added or changed, update the matching entry here in the same change**
   palette's *Restart agent*) stops the pane's process *and* its tmux session,
   local or remote, then relaunches in place in a fresh session. A resume-capable
   agent comes back on its saved conversation, so an updated harness binary takes
-  effect without losing it; a shell or other program starts over.
+  effect without losing it; a shell or other program starts over. On Windows,
+  a Grok restart first saves any newly discovered conversation. If that save
+  fails, the pane keeps running and reports the error.
 - **Tab cycling** — keyboard shortcuts cycle to the next/previous tab.
 
 ## Pop-out windows
@@ -166,6 +168,8 @@ feature is added or changed, update the matching entry here in the same change**
   lookup across pop-out and docking, and unresolved results retry with backoff.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
+  On Windows, an accepted Grok conversation stays reserved to its pane even
+  while its metadata save is pending.
   A saved conversation is abandoned only once muxel has confirmed it
   is really gone — a session store it couldn't read leaves the pane's resume id alone —
   and the pane then quietly starts fresh. Before a local Claude relaunch, pending hook

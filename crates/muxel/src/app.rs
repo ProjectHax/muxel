@@ -17709,6 +17709,16 @@ impl MuxelApp {
     /// a resume-capable agent comes back on its saved conversation (e.g. to pick
     /// up an updated harness binary). Other programs (shells, …) start over.
     fn restart_agent(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(windows)]
+        if let Err(error) = self.reconcile_grok_before_restart(iid, cx) {
+            self.add_event(
+                NotifKind::Error,
+                t("Couldn't restart this conversation"),
+                format!("{error:#}"),
+            );
+            cx.notify();
+            return;
+        }
         let Some(inst) = self.workspace.instance(iid) else {
             return;
         };
