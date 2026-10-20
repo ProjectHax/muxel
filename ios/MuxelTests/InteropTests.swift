@@ -3,6 +3,63 @@ import XCTest
 
 final class InteropTests: XCTestCase {
 
+    func testRecordedNamedSocketRoundTripsWithoutDroppingOtherPanes() throws {
+        let json = """
+        {"version":1,"updated_at":1,"remote_root":"/srv/app","layout":null,"worktrees":[],"instances":[
+          {"id":"aaaaaaaa-0000-0000-0000-000000000000","project_id":"p","title":"named","tmux_socket":"mxl-profile"},
+          {"id":"bbbbbbbb-0000-0000-0000-000000000000","project_id":"p","title":"legacy"}
+        ]}
+        """
+        let layout = try MuxelJSON.decoder.decode(RemoteLayout.self, from: Data(json.utf8))
+        XCTAssertEqual(layout.instances.count, 2)
+        XCTAssertEqual(layout.instances[0].tmuxSocket, "mxl-profile")
+        XCTAssertNil(layout.instances[1].tmuxSocket)
+        let restored = try MuxelJSON.decoder.decode(RemoteLayout.self, from: MuxelJSON.encoder.encode(layout))
+        XCTAssertEqual(restored, layout)
+        XCTAssertEqual(TmuxCommands.selectSocket("s", socket: restored.instances[0].tmuxSocket), "set -- -L 'mxl-profile'")
+    }
+
+    func testDefaultRespawnMigratesOnlyWhenBothExactNamesAreAbsent() {
+        var instance = Instance(id: "aaaaaaaa-0000-0000-0000-000000000000", projectId: "p", title: "pane", program: nil, args: [])
+        instance.tmuxSession = "owned"
+        instance.tmuxSocket = "default"
+        let absent = TmuxCommands.targetForNewSession(instance, name: "owned", confirmedTargets: [])
+        XCTAssertEqual(absent.target.socket, "mxl")
+        XCTAssertEqual(absent.migration?.recordedSession, "owned")
+        for socket in ["default", "mxl"] {
+            let present = TmuxCommands.targetForNewSession(instance, name: "owned", confirmedTargets: [.init(name: "owned", socket: socket)])
+            XCTAssertEqual(present.target.socket, "default")
+            XCTAssertNil(present.migration)
+        }
+        instance.tmuxSocket = "mxl-profile"
+        let named = TmuxCommands.targetForNewSession(instance, name: "owned", confirmedTargets: [])
+        XCTAssertEqual(named.target.socket, "mxl-profile")
+        XCTAssertNil(named.migration)
+    }
+
+    func testMigrationProbeRequiresCompleteSuccessfulOrKnownAbsentReplies() throws {
+        let empty = "no server running on /tmp/mxl\n:muxel-listed:1\nerror connecting to /tmp/default (No such file or directory)\n:muxel-listed:1\n"
+        XCTAssertTrue(try TmuxCommands.parseConfirmedTargets(empty).isEmpty)
+        let collision = "mxl\towned\n:muxel-listed:0\n:muxel-listed:0\n"
+        XCTAssertEqual(try TmuxCommands.parseConfirmedTargets(collision), [.init(name: "owned", socket: "mxl")])
+        let spaced = try TmuxCommands.parseConfirmedTargets(":muxel-listed:0\ndefault\towned \n:muxel-listed:0\n")
+        XCTAssertEqual(spaced, [.init(name: "owned ", socket: "default")])
+        var instance = Instance(id: "aaaaaaaa-0000-0000-0000-000000000000", projectId: "p", title: "pane", program: nil, args: [])
+        instance.tmuxSession = "owned "
+        instance.tmuxSocket = "default"
+        XCTAssertEqual(TmuxCommands.resolveTarget(instance, in: spaced)?.name, "owned ")
+        XCTAssertNil(TmuxCommands.targetForNewSession(instance, name: "owned ", confirmedTargets: spaced).migration)
+        for bad in [
+            ":muxel-listed:0\n",
+            ":muxel-listed:0\nerror connecting to /tmp/default (Permission denied)\n:muxel-listed:1\n",
+            "broken row\n:muxel-listed:0\n:muxel-listed:0\n",
+            "no server running on /tmp/mxl\n:muxel-listed:unknown\n:muxel-listed:0\n"
+        ] {
+            XCTAssertThrowsError(try TmuxCommands.parseConfirmedTargets(bad))
+        }
+        XCTAssertEqual(TmuxCommands.confirmedTargetsCommand().components(separatedBy: ":muxel-listed:").count - 1, 2)
+    }
+
     func testRemoteLayoutDecodesDesktopShape() throws {
         let json = """
         {

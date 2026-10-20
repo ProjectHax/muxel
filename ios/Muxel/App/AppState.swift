@@ -1,6 +1,14 @@
 import Foundation
 import SwiftUI
 
+/// A migration carries the exact binding observed while its probes ran. Ordinary
+/// attachment has no permission to replace a durable owner.
+struct TmuxAttachmentPlan<Attachment> {
+    let target: TmuxCommands.SessionTarget
+    let attachment: Attachment
+    var defaultMigration: TmuxCommands.DefaultMigration? = nil
+}
+
 /// The app's observable state: the device-local host/project store, the active
 /// project's live `RemoteLayout` read from the remote, per-instance status, and one
 /// pooled SSH connection per host. Owns the foreground poll loop.
@@ -1149,12 +1157,23 @@ final class AppState: ObservableObject {
         instanceId: String, in project: RemoteProject,
         prepare: @MainActor (Instance) async throws -> (target: TmuxCommands.SessionTarget, attachment: Attachment)
     ) async throws -> Attachment? {
+        try await prepareTmuxAttachmentPlan(instanceId: instanceId, in: project) { current in
+            let prepared = try await prepare(current)
+            return TmuxAttachmentPlan(target: prepared.target, attachment: prepared.attachment)
+        }
+    }
+
+    func prepareTmuxAttachmentPlan<Attachment>(
+        instanceId: String, in project: RemoteProject,
+        prepare: @MainActor (Instance) async throws -> TmuxAttachmentPlan<Attachment>
+    ) async throws -> Attachment? {
         for _ in 0..<2 {
             guard !Task.isCancelled, selectedProject?.id == project.id,
                   let current = layout?.instances.first(where: { $0.id == instanceId }) else { return nil }
             let prepared = try await prepare(current)
             guard !Task.isCancelled, selectedProject?.id == project.id else { return nil }
-            if try await bindTmuxTarget(prepared.target, instance: current, in: project) {
+            if try await bindTmuxTarget(prepared.target, instance: current, in: project,
+                                        defaultMigration: prepared.defaultMigration) {
                 guard !Task.isCancelled, selectedProject?.id == project.id,
                       let bound = layout?.instances.first(where: { $0.id == instanceId }),
                       bound.tmuxSocket == prepared.target.socket,
@@ -1168,7 +1187,8 @@ final class AppState: ObservableObject {
     /// Confirm saved membership and the resolved owner before attachment so close
     /// and restart use that server even if another gains the same name.
     func bindTmuxTarget(_ target: TmuxCommands.SessionTarget, instance: Instance,
-                        in project: RemoteProject) async throws -> Bool {
+                        in project: RemoteProject,
+                        defaultMigration: TmuxCommands.DefaultMigration? = nil) async throws -> Bool {
         guard selectedProject?.id == project.id, let host = host(for: project) else { return false }
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, Error>) in
             enqueueLayoutWrite { [self] in
@@ -1195,7 +1215,11 @@ final class AppState: ObservableObject {
                             // its session name has not been backfilled yet. A
                             // legacy name without a socket still needs discovery.
                             if let socket = saved.tmuxSocket {
-                                guard socket == target.socket else { return false }
+                                let migrating = socket == "default" && target.socket == TmuxCommands.socketName
+                                    && defaultMigration?.recordedSession == saved.tmuxSession
+                                    && defaultMigration?.sessionName == target.name
+                                    && defaultMigration != nil
+                                guard socket == target.socket || migrating else { return false }
                                 if let name = saved.tmuxSession, !name.isEmpty,
                                    name != target.name { return false }
                             }

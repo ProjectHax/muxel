@@ -108,6 +108,80 @@ enum TmuxCommands {
         var socket: String
     }
 
+    struct DefaultMigration: Equatable {
+        let recordedSession: String?
+        let sessionName: String
+    }
+
+    enum ProbeError: LocalizedError {
+        case incomplete
+        var errorDescription: String? { "Couldn't confirm both tmux servers. Reconnect and try again." }
+    }
+
+    /// Default migration needs both complete replies. Ordinary best-effort
+    /// discovery cannot distinguish an empty server from a permission failure.
+    static func confirmedTargetsCommand() -> String {
+        "export LC_ALL=C; " + [socketName, "default"].map { server in
+            commandLine(["list-sessions", "-F", "\(server)\t#{session_name}"], session: "", socket: server)
+                + " 2>&1; echo \":muxel-listed:$?\""
+        }.joined(separator: "; ")
+    }
+
+    static func parseConfirmedTargets(_ output: String) throws -> [SessionTarget] {
+        let servers = [socketName, "default"]
+        var answered = 0
+        var listing: [String] = []
+        var targets: [SessionTarget] = []
+        for raw in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw)
+            guard line.hasPrefix(":muxel-listed:") else {
+                listing.append(line); continue
+            }
+            guard answered < servers.count,
+                  let status = UInt8(line.dropFirst(":muxel-listed:".count)) else { throw ProbeError.incomplete }
+            let text = listing.joined(separator: "\n")
+            if status == 0 {
+                let rows = parseTargets(text)
+                guard rows.count == listing.filter({ !$0.isEmpty }).count,
+                      rows.allSatisfy({ $0.socket == servers[answered] }) else { throw ProbeError.incomplete }
+                targets += rows
+            } else if !confirmedNoServer(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                throw ProbeError.incomplete
+            }
+            answered += 1
+            listing = []
+        }
+        guard answered == servers.count,
+              listing.allSatisfy({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            throw ProbeError.incomplete
+        }
+        return targets
+    }
+
+    private static func confirmedNoServer(_ message: String) -> Bool {
+        guard !message.contains("\n") else { return false }
+        let absent = "no server running on "
+        if message.hasPrefix(absent) { return message.count > absent.count }
+        let connecting = "error connecting to "
+        guard message.hasPrefix(connecting) else { return false }
+        return [" (No such file or directory)", " (Connection refused)"].contains { suffix in
+            message.hasSuffix(suffix) && message.count > connecting.count + suffix.count
+        }
+    }
+
+    /// Called only after checked inventory. A Private namesake is a collision,
+    /// never an invitation to attach to somebody else's session.
+    static func targetForNewSession(_ instance: Instance, name: String, confirmedTargets: [SessionTarget])
+        -> (target: SessionTarget, migration: DefaultMigration?) {
+        let owner = instance.tmuxSocket ?? socketName
+        if owner == "default",
+           !confirmedTargets.contains(where: { $0.name == name && ($0.socket == "default" || $0.socket == socketName) }) {
+            return (.init(name: name, socket: socketName),
+                    DefaultMigration(recordedSession: instance.tmuxSession, sessionName: name))
+        }
+        return (.init(name: name, socket: owner), nil)
+    }
+
     /// Keep server identity beside every name, including duplicate names.
     static func listTargetsCommand(socket: String? = nil) -> String {
         let servers = socket.map { [$0] } ?? [socketName, "default"]

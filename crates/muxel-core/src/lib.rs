@@ -628,7 +628,7 @@ impl Instance {
     pub fn tmux_target(&self, slug: &str) -> tmux::SessionTarget {
         tmux::SessionTarget::new(
             tmux::session_for(self.tmux_session.as_deref(), slug, self.id),
-            self.tmux_socket,
+            self.tmux_socket.clone(),
         )
     }
 
@@ -1518,7 +1518,7 @@ pub fn merge_peer_instances(
                         || instance.tmux_session == mine.tmux_session)
                 {
                     instance.tmux_session = mine.tmux_session.clone();
-                    instance.tmux_socket = mine.tmux_socket;
+                    instance.tmux_socket = mine.tmux_socket.clone();
                 }
             }
             instance
@@ -1553,7 +1553,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
             .tmux_session
             .as_ref()
             .filter(|s| !s.is_empty())
-            .map(|s| (inst.project_id, inst.tmux_socket, s.clone()));
+            .map(|s| (inst.project_id, inst.tmux_socket.clone(), s.clone()));
         // A tmux session is claimed by exactly one instance per project.
         if claim.is_some_and(|c| !seen_sessions.insert(c)) {
             unlink.push(inst.id);
@@ -3616,6 +3616,54 @@ mod remote_layout_tests {
         legacy.tmux_socket = None;
         let merged = merge_peer_instances(&ws.instances, vec![legacy], a.project_id);
         assert_eq!(merged[0].tmux_target("p"), a.tmux_target("p"));
+    }
+
+    #[test]
+    fn unfamiliar_socket_owners_preserve_every_peer_pane() {
+        let mut ws = Workspace::default();
+        let mut project = remote_project("/srv/app");
+        let instances: Vec<_> = ["mxl", "default", "mxl-profile", "", "owner '名; $()"]
+            .into_iter()
+            .map(|name| {
+                let mut instance = Instance::shell(project.id);
+                instance.tmux_session = Some("same-name".into());
+                instance.tmux_socket = Some(tmux::Socket::try_from(name.to_string()).unwrap());
+                instance
+            })
+            .collect();
+        let ids: Vec<_> = instances.iter().map(|i| i.id).collect();
+        project.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: ids.clone(),
+            active: 0,
+        }));
+        ws.instances = instances.clone();
+        ws.projects = vec![project.clone()];
+        let doc = RemoteLayout::capture(&project, &ws, 42);
+        let parsed = RemoteLayout::parse(&doc.to_json(), "/srv/app").unwrap();
+        assert_eq!(parsed.instances.len(), instances.len());
+        assert_eq!(parsed.layout.as_ref().unwrap().collect_instances(), ids);
+        for expected in &instances {
+            let actual = parsed
+                .instances
+                .iter()
+                .find(|i| i.id == expected.id)
+                .unwrap();
+            assert_eq!(actual.tmux_target("p"), expected.tmux_target("p"));
+        }
+        assert_eq!(
+            RemoteLayout::parse(&parsed.to_json(), "/srv/app")
+                .unwrap()
+                .content_key(),
+            doc.content_key()
+        );
+        ws.instances = merge_peer_instances(&instances, parsed.instances, project.id);
+        dedupe_instances(&mut ws);
+        assert_eq!(
+            ws.instances.len(),
+            instances.len(),
+            "different owners must not collapse namesakes"
+        );
     }
 
     #[test]

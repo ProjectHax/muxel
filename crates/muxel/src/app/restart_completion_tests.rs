@@ -223,3 +223,95 @@ fn stale_remote_restart_completion_leaves_new_generation_pending() {
         });
     });
 }
+
+#[test]
+fn local_restart_failed_owner_save_never_kills_or_respawns() {
+    with_app(|cx, main| {
+        main.update(cx, |app, window, cx| {
+            let root = muxel_store::data_dir().unwrap().join("project");
+            std::fs::create_dir_all(&root).unwrap();
+            let project = app.workspace.add_project(Project::new("local", &root));
+            let mut instance = Instance::shell(project);
+            instance.tmux_session = Some("must-not-be-killed".into());
+            instance.tmux_socket = Some(muxel_core::tmux::Socket::Private);
+            let iid = instance.id;
+            app.workspace.add_instance(instance);
+            app.workspace.project_mut(project).unwrap().layout = Some(PaneNode::leaf(iid));
+            app.workspace.active_project = Some(project);
+            app.current_workspace = Some(Uuid::new_v4());
+            // A directory at the destination makes the actual atomic save fail.
+            let path = muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+
+            app.restart_agent(iid, window, cx);
+
+            assert!(!app.terminal_restarts.contains(iid));
+            assert!(app.terminals.is_empty());
+            assert!(app.terminal_launching.is_empty());
+            assert!(app.terminal_launches.is_empty());
+            assert!(
+                app.failed_launches[&iid]
+                    .contains("couldn't save the tmux session owner before restart")
+            );
+            assert!(
+                app.reserve_terminal_spawn(iid, window, cx).is_none(),
+                "automatic restore cannot retry a failed restart"
+            );
+        })
+        .unwrap();
+    });
+}
+
+#[test]
+fn failed_restart_completion_does_not_reattach_the_old_agent() {
+    with_app(|cx, main| {
+        let (mut completion, secondary) = pending_secondary_restart(cx, main);
+        let iid = completion.instance;
+        close_secondary_while_pending(cx, main, secondary, &completion);
+        completion.killed = Err(anyhow::anyhow!("owner save failed"));
+        let app = main.entity(cx).unwrap();
+        MuxelApp::complete_remote_restart(&app.downgrade(), completion, cx);
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(!app.terminal_restarts.contains(iid));
+            assert!(app.terminals.is_empty());
+            assert!(app.terminal_launching.is_empty());
+            assert!(app.failed_launches[&iid].contains("owner save failed"));
+        });
+    });
+}
+
+#[test]
+fn failed_migration_save_keeps_the_expected_default_owner_and_restart_lease() {
+    with_app(|cx, main| {
+        main.update(cx, |app, _, _| {
+            let project = app
+                .workspace
+                .add_project(Project::new("migration", muxel_store::data_dir().unwrap()));
+            let mut instance = Instance::shell(project);
+            instance.tmux_session = Some("owned".into());
+            instance.tmux_socket = Some(muxel_core::tmux::Socket::Default);
+            let iid = instance.id;
+            let token = app.terminal_restarts.begin(&instance).unwrap();
+            app.workspace.add_instance(instance);
+            app.current_workspace = Some(Uuid::new_v4());
+            std::fs::create_dir_all(
+                muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap(),
+            )
+            .unwrap();
+            let old = muxel_core::tmux::SessionTarget::new(
+                "owned",
+                Some(muxel_core::tmux::Socket::Default),
+            );
+            let next = muxel_core::tmux::SessionTarget::new(
+                "owned",
+                Some(muxel_core::tmux::Socket::Private),
+            );
+            assert!(app.save_restart_migration(iid, token, &old, &next).is_err());
+            assert_eq!(app.workspace.instance(iid).unwrap().tmux_socket, old.socket);
+            assert!(app.terminal_restarts.current(iid, token));
+            assert!(app.terminals.is_empty());
+        })
+        .unwrap();
+    });
+}
