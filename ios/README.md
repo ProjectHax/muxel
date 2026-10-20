@@ -96,6 +96,7 @@ the matching Swift port and the `RemoteLayout` version handling.
 |---|---|---|
 | tmux session name `muxel_<host-slug>_<uuid8>` | `crates/muxel-core/src/tmux.rs` | `Tmux/TmuxSession.swift` |
 | muxel's own tmux server `tmux -L mxl`; a session found there, else on the default server, else new on muxel's | `tmux.rs` (`SOCKET_NAME`, `Socket::locate`), `ssh.rs` (`select_tmux_socket`) | `Tmux/TmuxCommands.swift` (`socketName`, `selectSocket`) |
+| Optional `Instance.tmux_socket` (`mxl`, `default`, or a recorded named server) preserves server ownership through discovery, attachment, polling and cleanup; a missing legacy owner is resolved before mutation | `tmux.rs` (`SessionTarget`), `lib.rs` (`Instance`), `ssh.rs` (`select_session_socket`) | `Models/Instance.swift`, `Tmux/TmuxCommands.swift` (`SessionTarget`, `resolveTarget`), `Interop/PollService.swift` |
 | `tmux new-session -A -d -s … -c … -- prog args` | `tmux.rs` | `Tmux/TmuxCommands.swift` |
 | `tmux start-server ';' set -s exit-empty off` before the first session | `tmux.rs` (`start_server_args`) | `Tmux/TmuxCommands.swift` (`startServer`) |
 | `set-environment -g -u MUXEL_INSTANCE_ID ';'` ahead of every `new-session` | `tmux.rs` (`launch_session_args_with_env`), `ssh.rs` | `Tmux/TmuxCommands.swift` (`clearInstanceId`) |
@@ -244,6 +245,14 @@ prompt (CliFlag / TypeIn injection), model, and session resume (`--session-id` �
 pane's screen text feeds the ported `classify` + markers, so working/blocked is real
 while a pane is open. **Cross-project status**: the sidebar shows running/needs-input
 badges for every connected project (one batched `list-panes -a` sweep per host).
+Each sweep queries the legacy `mxl`/default servers and every named socket recorded
+by that host's project layouts, retaining server ownership when names overlap.
+Phone layout changes share one awaited read/modify/write queue, including owner
+binding, launch, close and rename, so overlapping actions preserve each other's
+saved changes.
+Attachment waits for that queue and verifies the instance exists in the saved
+layout, even when its tmux owner already matches. A failed launch save therefore
+cannot start an agent from an optimistic pane alone.
 
 Future: APNs push via a remote watcher daemon (instant background alerts + live
 status-bar updates); tmux **control mode** (`-C`); interactive split resize + tab

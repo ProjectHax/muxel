@@ -21,7 +21,9 @@ final class MockSSHConnection: SSHConnection {
     static func defaultResponder(_ cmd: String) -> String {
         if cmd.contains("capture-pane") { return "claude> ready\n$ " }
         if cmd.contains("display-message") { return "0\t0\t\(Int(Date().timeIntervalSince1970) - 30)" }
-        if cmd.contains("list-sessions") { return "muxel_demo_abcdef12\n" }
+        if cmd.contains("list-sessions") {
+            return cmd.contains("\t") ? "mxl\tmuxel_demo_abcdef12\n" : "muxel_demo_abcdef12\n"
+        }
         // Project discovery: a `find` for `.muxel/workspace.json` markers.
         if cmd.hasPrefix("find ") {
             return "/srv/app/.muxel/workspace.json\n/home/dev/web/.muxel/workspace.json\n"

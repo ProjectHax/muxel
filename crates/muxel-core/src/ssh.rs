@@ -469,13 +469,20 @@ const SELECTED_TMUX: &str = "tmux \"$@\"";
 /// `-L mxl` into two words, and rather than a function, because a pane has to
 /// `exec` tmux itself. Must follow [`tmux_path_prelude`].
 pub fn select_tmux_socket(session: &str) -> String {
-    let target = sh_quote(&format!("={session}"));
+    select_session_socket(&crate::tmux::SessionTarget::from(session))
+}
+
+pub fn select_session_socket(session: &crate::tmux::SessionTarget) -> String {
+    let target = sh_quote(&format!("={}", session.name));
     let point_at = |socket: Socket| {
         std::iter::once("set --")
             .chain(socket.args().iter().copied())
             .collect::<Vec<_>>()
             .join(" ")
     };
+    if let Some(socket) = session.socket {
+        return point_at(socket);
+    }
     format!(
         "if ! {} has-session -t {target} 2>/dev/null \
          && {} has-session -t {target} 2>/dev/null; then {}; else {}; fi",
@@ -487,11 +494,11 @@ pub fn select_tmux_socket(session: &str) -> String {
 }
 
 /// A remote command line running `tmux <args>` on the server holding `session`.
-pub fn session_tmux_command(session: &str, args: &[String]) -> String {
+pub fn session_tmux_command(session: &crate::tmux::SessionTarget, args: &[String]) -> String {
     let mut cmd = format!(
         "{}; {}; {SELECTED_TMUX}",
         tmux_path_prelude(),
-        select_tmux_socket(session)
+        select_session_socket(session)
     );
     for a in args {
         cmd.push(' ');
@@ -510,12 +517,16 @@ const LISTING_END: &str = ":muxel-listed:";
 /// [`parse_session_listings`] can tell a server that isn't running from one that
 /// couldn't be asked. One round trip for both.
 pub fn list_sessions_command() -> String {
+    list_sessions_command_on(&Socket::BOTH)
+}
+
+pub fn list_sessions_command_on(sockets: &[Socket]) -> String {
     let args: Vec<String> = crate::tmux::list_sessions_args()
         .iter()
         .map(|a| sh_quote(a))
         .collect();
     let mut cmd = tmux_path_prelude();
-    for socket in Socket::BOTH {
+    for &socket in sockets {
         cmd.push_str(&format!(
             "; {} {} 2>&1; echo \"{LISTING_END}$?\"",
             tmux_on(socket),
@@ -532,7 +543,14 @@ pub fn list_sessions_command() -> String {
 /// would let a closed pane's unconfirmed kill be forgotten (see
 /// [`crate::tmux::ClosedSession`]).
 pub fn parse_session_listings(out: &str) -> Option<Vec<crate::tmux::RemoteSession>> {
-    let mut panes = String::new();
+    parse_session_listings_on(out, &Socket::BOTH)
+}
+
+pub fn parse_session_listings_on(
+    out: &str,
+    sockets: &[Socket],
+) -> Option<Vec<crate::tmux::RemoteSession>> {
+    let mut panes = Vec::new();
     let mut listing = String::new();
     let mut answered = 0;
     for line in out.lines() {
@@ -541,15 +559,16 @@ pub fn parse_session_listings(out: &str) -> Option<Vec<crate::tmux::RemoteSessio
             listing.push('\n');
             continue;
         };
+        let &socket = sockets.get(answered)?;
         if status.trim() == "0" {
-            panes.push_str(&listing);
+            panes.extend(crate::tmux::parse_sessions_on(&listing, socket));
         } else if !crate::tmux::no_server(&listing) {
             return None;
         }
         listing.clear();
         answered += 1;
     }
-    (answered == Socket::BOTH.len()).then(|| crate::tmux::parse_sessions(&panes))
+    (answered == sockets.len() && listing.trim().is_empty()).then_some(panes)
 }
 
 /// Exit codes for [`kill_and_confirm_command`], chosen above the range a shell
@@ -559,16 +578,11 @@ pub const TMUX_MISSING: i32 = 92;
 
 /// A remote command line that kills tmux session `session` on both of the host's
 /// servers, ignoring the answer — for quit-time cleanup, which can't wait for one.
-/// Both, because a pane from before muxel had its own server still has its session
-/// on the default one. The `=` target is exact-match, as in
+/// The selected owner only, resolving legacy name-only bindings first. The `=`
+/// target is exact-match, as in
 /// [`crate::tmux::kill_session_args`].
-pub fn kill_command(session: &str) -> String {
-    let target = sh_quote(&format!("={session}"));
-    let mut cmd = tmux_path_prelude();
-    for socket in Socket::BOTH {
-        cmd.push_str(&format!("; {} kill-session -t {target}", tmux_on(socket)));
-    }
-    cmd
+pub fn kill_command(session: &crate::tmux::SessionTarget) -> String {
+    session_tmux_command(session, &crate::tmux::kill_session_args(&session.name))
 }
 
 /// A remote command line that kills tmux session `session` and then **says whether
@@ -580,30 +594,25 @@ pub fn kill_command(session: &str) -> String {
 /// when the session was never there (fine) and when nothing ran at all (not fine),
 /// so a caller that only looks at the kill cannot tell a finished teardown from a
 /// silently dropped one — and a dropped one leaves the agent running on the host.
-/// `has-session` is the question actually being asked — of both servers, as in
+/// `has-session` is the question actually being asked — of the selected owner, as in
 /// [`kill_command`].
 ///
 /// `tmux` is separately checked with `command -v`, because an unfindable `tmux`
 /// makes `has-session` fail too, which would otherwise read as "the session is
 /// gone". The `=` target is exact-match, as in [`crate::tmux::kill_session_args`].
-pub fn kill_and_confirm_command(session: &str) -> String {
-    let target = sh_quote(&format!("={session}"));
+pub fn kill_and_confirm_command(session: &crate::tmux::SessionTarget) -> String {
+    let target = sh_quote(&format!("={}", session.name));
     let mut steps = vec![
         tmux_path_prelude(),
         format!("command -v tmux >/dev/null 2>&1 || exit {TMUX_MISSING}"),
+        select_session_socket(session),
     ];
-    for socket in Socket::BOTH {
-        steps.push(format!(
-            "{} kill-session -t {target} >/dev/null 2>&1",
-            tmux_on(socket)
-        ));
-    }
-    for socket in Socket::BOTH {
-        steps.push(format!(
-            "{} has-session -t {target} >/dev/null 2>&1 && exit {TMUX_STILL_ALIVE}",
-            tmux_on(socket)
-        ));
-    }
+    steps.push(format!(
+        "{SELECTED_TMUX} kill-session -t {target} >/dev/null 2>&1"
+    ));
+    steps.push(format!(
+        "{SELECTED_TMUX} has-session -t {target} >/dev/null 2>&1 && exit {TMUX_STILL_ALIVE}"
+    ));
     steps.push("exit 0".to_string());
     steps.join("; ")
 }
@@ -620,6 +629,8 @@ pub struct SshSpec<'a> {
     /// Run inside a persistent tmux session on the remote host.
     pub use_tmux: bool,
     pub tmux_session: Option<&'a str>,
+    /// A discovered or persisted owner. `None` resolves legacy name-only panes.
+    pub tmux_socket: Option<Socket>,
     /// This machine's tag for its tmux client (see [`tmux_client_option`]). With
     /// one, a client joining a session that already has a client attaches without
     /// taking the window size and records its name, so
@@ -668,9 +679,9 @@ fn exec_tmux(targs: &[String], program: Option<&str>, tail: &[String]) -> String
 /// user is at this machine. A no-op when the client never recorded itself (tmux
 /// older than 3.2) or is no longer attached to the session, since its tty name may
 /// have passed to someone else's client.
-pub fn claim_window_size_command(session: &str, tag: &str) -> String {
-    let pane = sh_quote(&format!("={session}:"));
-    let target = sh_quote(&format!("={session}"));
+pub fn claim_window_size_command(session: &crate::tmux::SessionTarget, tag: &str) -> String {
+    let pane = sh_quote(&format!("={}:", session.name));
+    let target = sh_quote(&format!("={}", session.name));
     let option = sh_quote(&tmux_client_option(tag));
     format!(
         "{}; {}; c=$({SELECTED_TMUX} show-options -qv -t {pane} {option}) \
@@ -680,7 +691,7 @@ pub fn claim_window_size_command(session: &str, tag: &str) -> String {
          && {SELECTED_TMUX} refresh-client -t \"$c\" -f '!ignore-size' ';' \
          set-option -q -t {pane} {option} \"$c\"",
         tmux_path_prelude(),
-        select_tmux_socket(session)
+        select_session_socket(session)
     )
 }
 
@@ -821,6 +832,7 @@ fn remote_command(spec: &SshSpec) -> String {
         // is cleared from the server before creating a session. A local control id
         // does not identify the remote program, so no id is passed to it.
         let session = spec.tmux_session.unwrap_or("muxel");
+        let target = crate::tmux::SessionTarget::new(session, spec.tmux_socket);
         let targs = crate::tmux::launch_session_args_with_env(
             session,
             spec.remote_cwd,
@@ -839,20 +851,21 @@ fn remote_command(spec: &SshSpec) -> String {
         // Every `tmux` word below is resolved against the augmented PATH — sshd's bare
         // default doesn't have Homebrew's on it. See `tmux_path_prelude`.
         //
-        // The server started is muxel's own (`tmux::SOCKET_NAME`). The pane then
-        // attaches on whichever server holds its session: muxel's own, unless the
-        // session is still running on the default server from before muxel had
-        // one. See `select_tmux_socket`.
+        // Choose the owner before starting or attaching anything. A known socket
+        // stays fixed; a legacy pane resolves its existing server once.
         let mut cmd = tmux_path_prelude();
         cmd.push_str("; ");
-        cmd.push_str(&tmux_on(Socket::Private));
+        cmd.push_str(&select_session_socket(&target));
+        cmd.push_str("; ");
+        // Keep owned servers alive between sessions, without changing the user's
+        // default server's exit-empty policy when reattaching a legacy pane.
+        cmd.push_str("if [ \"$#\" -gt 0 ]; then ");
+        cmd.push_str(SELECTED_TMUX);
         for a in crate::tmux::start_server_args() {
             cmd.push(' ');
             cmd.push_str(&sh_quote(&a));
         }
-        cmd.push_str("; ");
-        cmd.push_str(&select_tmux_socket(session));
-        cmd.push_str("; ");
+        cmd.push_str("; fi; ");
         // Attaching makes a client the window's latest, and under tmux's default
         // `window-size latest` the window takes its size — so a pane reconnecting
         // on an unattended laptop resized the session under whoever was using it
@@ -969,6 +982,7 @@ mod tests {
                 args: &[],
                 use_tmux,
                 tmux_session: session,
+                tmux_socket: None,
                 tmux_client_tag: None,
             });
             assert!(
@@ -1004,6 +1018,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_socket: None,
             tmux_client_tag: None,
         });
         assert!(cmd.starts_with("powershell.exe -NoLogo -NoExit -EncodedCommand "));
@@ -1023,6 +1038,7 @@ mod tests {
             args: &["--model".to_string(), "be terse".to_string()],
             use_tmux: false,
             tmux_session: None,
+            tmux_socket: None,
             tmux_client_tag: None,
         });
         assert!(!cmd.contains("-NoExit"), "{cmd}");
@@ -1046,6 +1062,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_socket: None,
             tmux_client_tag: None,
         });
         assert!(!cmd.contains("-NoProfile"), "{cmd}");
@@ -1063,6 +1080,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_socket: None,
             tmux_client_tag: None,
         });
         // A bare `cd` does not change drive on Windows.
@@ -1076,6 +1094,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_socket: None,
             tmux_client_tag: None,
         });
         assert!(prog.starts_with("cmd.exe /C "), "{prog}");
@@ -1093,6 +1112,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_socket: None,
             tmux_client_tag: None,
         });
         assert_eq!(cmd, "cd /srv/app && exec ${SHELL:-/bin/sh} -l");
@@ -1119,7 +1139,10 @@ mod tests {
     /// the difference between a closed remote agent and one still burning tokens.
     #[test]
     fn kill_and_confirm_asks_has_session_after_killing() {
-        let cmd = kill_and_confirm_command("muxel_app_1a2b3c4d");
+        let cmd = kill_and_confirm_command(&crate::tmux::SessionTarget::new(
+            "muxel_app_1a2b3c4d",
+            Some(Socket::Private),
+        ));
         assert!(
             cmd.starts_with(&tmux_path_prelude()),
             "tmux must be findable first: {cmd}"
@@ -1143,19 +1166,25 @@ mod tests {
     /// session name is never able to run anything of its own.
     #[test]
     fn kill_and_confirm_targets_one_session_exactly() {
-        let cmd = kill_and_confirm_command("muxel_p_1");
-        // The kill and the confirmation, on each of the two servers.
+        let cmd = kill_and_confirm_command(&crate::tmux::SessionTarget::new(
+            "muxel_p_1",
+            Some(Socket::Default),
+        ));
+        // The kill and the confirmation, on the selected server.
         assert_eq!(
             cmd.matches("-t '=muxel_p_1' ").count(),
-            4,
+            2,
             "both the kill and the confirmation name the same exact target: {cmd}"
         );
         // A session name is data, never a second command: it arrives single-quoted,
         // with its own quotes escaped, so the shell reads it as one word.
-        let hostile = kill_and_confirm_command("x'; rm -rf ~; '");
+        let hostile = kill_and_confirm_command(&crate::tmux::SessionTarget::new(
+            "x'; rm -rf ~; '",
+            Some(Socket::Private),
+        ));
         assert_eq!(
             hostile.matches(r"-t '=x'\''; rm -rf ~; '\''' ").count(),
-            4,
+            2,
             "hostile name is quoted whole: {hostile}"
         );
         let hostile = select_tmux_socket("x'; rm -rf ~; '");
@@ -1374,6 +1403,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_socket: None,
             tmux_client_tag: None,
         };
         let v = ssh_args(&spec);
@@ -1400,6 +1430,7 @@ mod tests {
             args: &args,
             use_tmux: false,
             tmux_session: None,
+            tmux_socket: None,
             tmux_client_tag: None,
         };
         let v = ssh_args(&spec);
@@ -1422,6 +1453,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_socket: None,
             tmux_client_tag: None,
         };
         assert_eq!(
@@ -1441,6 +1473,7 @@ mod tests {
             args: &[],
             use_tmux: true,
             tmux_session: Some("muxel-abc123"),
+            tmux_socket: None,
             tmux_client_tag: None,
         };
         // `-u` leads the attaching client: the remote host's login shell may hand
@@ -1450,10 +1483,10 @@ mod tests {
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
             &format!(
-                "{}; tmux -L mxl start-server ';' set -s exit-empty off; \
-                 if ! tmux -L mxl has-session -t '=muxel-abc123' 2>/dev/null \
+                "{}; if ! tmux -L mxl has-session -t '=muxel-abc123' 2>/dev/null \
                  && tmux has-session -t '=muxel-abc123' 2>/dev/null; \
                  then set --; else set -- -L mxl; fi; \
+                 if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off; fi; \
                  exec tmux \"$@\" -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s muxel-abc123 -c /srv/app \
                  -- \"${{SHELL:-/bin/sh}}\" -ilc 'exec claude'",
@@ -1475,13 +1508,26 @@ mod tests {
              then set --; else set -- -L mxl; fi"
         );
         assert_eq!(
-            session_tmux_command("muxel_app_1", &crate::tmux::kill_session_args("x")),
+            session_tmux_command(&"muxel_app_1".into(), &crate::tmux::kill_session_args("x")),
             format!(
                 "{}; {}; tmux \"$@\" kill-session -t '=x'",
                 tmux_path_prelude(),
                 select_tmux_socket("muxel_app_1")
             )
         );
+    }
+
+    #[test]
+    fn same_named_sessions_on_two_sockets_remain_distinct() {
+        let sessions = parse_session_listings(
+            "work|/private|claude|\n:muxel-listed:0\nwork|/default|zsh|\n:muxel-listed:0\n",
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].path, "/private");
+        assert_eq!(sessions[1].path, "/default");
+        assert_eq!(sessions[0].socket, Socket::Private);
+        assert_eq!(sessions[1].socket, Socket::Default);
     }
 
     /// Both servers are listed in one round trip, muxel's own first, and only a
@@ -1526,10 +1572,10 @@ mod tests {
             ),
             Some(vec![])
         );
-        // The same session on both servers is listed once, as muxel's own.
+        // Same-named sessions on independent servers remain distinct.
         assert_eq!(
             names("s|/a|claude|\n:muxel-listed:0\ns|/b|zsh|\n:muxel-listed:0\n"),
-            Some(vec!["s".to_string()])
+            Some(vec!["s".to_string(), "s".to_string()])
         );
         // A server that couldn't be asked is not "no sessions": a closed pane's
         // unconfirmed kill would be forgotten.
@@ -1545,26 +1591,67 @@ mod tests {
         assert_eq!(names(""), None);
     }
 
-    /// Closing a pane from before muxel had its own server must reach the session
-    /// where it is still running, and the confirmation must ask both servers.
+    /// A known owner never probes or mutates a same-named session on another server.
     #[test]
-    fn a_remote_session_is_killed_on_both_servers() {
-        assert_eq!(
-            kill_command("muxel_app_1"),
-            format!(
-                "{}; tmux -L mxl kill-session -t '=muxel_app_1'; \
-                 tmux kill-session -t '=muxel_app_1'",
-                tmux_path_prelude()
-            )
-        );
-        let cmd = kill_and_confirm_command("muxel_app_1");
-        for check in [
-            "tmux -L mxl kill-session -t '=muxel_app_1' >/dev/null 2>&1",
-            "tmux kill-session -t '=muxel_app_1' >/dev/null 2>&1",
-            "tmux -L mxl has-session -t '=muxel_app_1' >/dev/null 2>&1 && exit 91",
-            "; tmux has-session -t '=muxel_app_1' >/dev/null 2>&1 && exit 91",
-        ] {
-            assert!(cmd.contains(check), "missing {check:?}: {cmd}");
+    fn a_remote_session_is_killed_and_confirmed_only_on_its_owner() {
+        for socket in Socket::BOTH {
+            let target = crate::tmux::SessionTarget::new("work", Some(socket));
+            let cmd = kill_and_confirm_command(&target);
+            let selection = match socket {
+                Socket::Private => "; set -- -L mxl;",
+                Socket::Default => "; set --;",
+            };
+            assert!(cmd.contains(selection), "{cmd}");
+            assert_eq!(cmd.matches("kill-session").count(), 1, "{cmd}");
+            assert_eq!(cmd.matches("has-session").count(), 1, "{cmd}");
+            assert!(cmd.contains("tmux \"$@\" kill-session -t '=work'"));
+            assert!(cmd.contains("tmux \"$@\" has-session -t '=work'"));
+            assert_eq!(kill_command(&target).matches("kill-session").count(), 1);
+        }
+    }
+
+    #[test]
+    fn legacy_teardown_resolves_once_before_a_single_kill() {
+        let cmd = kill_and_confirm_command(&"work".into());
+        assert!(cmd.find("has-session").unwrap() < cmd.find("kill-session").unwrap());
+        assert_eq!(cmd.matches("kill-session").count(), 1);
+        assert_eq!(cmd.matches("set --").count(), 2);
+        assert!(cmd.contains("tmux \"$@\" has-session -t '=work'"));
+    }
+
+    #[test]
+    fn a_known_remote_owner_is_used_for_launch_and_window_claims() {
+        let h = host();
+        for socket in Socket::BOTH {
+            let target = crate::tmux::SessionTarget::new("work", Some(socket));
+            let spec = SshSpec {
+                host: &h,
+                control_path: "/s",
+                remote_cwd: Some("/w"),
+                program: Some("claude"),
+                args: &[],
+                use_tmux: true,
+                tmux_session: Some(&target.name),
+                tmux_socket: target.socket,
+                tmux_client_tag: Some("ab12"),
+            };
+            for cmd in [
+                ssh_args(&spec).pop().unwrap(),
+                claim_window_size_command(&target, "ab12"),
+            ] {
+                assert!(
+                    cmd.contains(&format!("; {};", select_session_socket(&target))),
+                    "{cmd}"
+                );
+                assert!(
+                    !cmd.contains("has-session"),
+                    "known owner never probes: {cmd}"
+                );
+                assert!(
+                    !cmd.contains("tmux -L mxl"),
+                    "all commands use the selected argv: {cmd}"
+                );
+            }
         }
     }
 
@@ -1585,6 +1672,7 @@ mod tests {
                 args: &[],
                 use_tmux: true,
                 tmux_session: Some("s"),
+                tmux_socket: None,
                 tmux_client_tag: None,
             };
             let cmd = ssh_args(&spec).last().unwrap().clone();
@@ -1593,7 +1681,7 @@ mod tests {
             // Every tmux invocation is behind it — nothing names tmux before the PATH
             // it will be looked up on is set.
             assert!(!prelude.contains("tmux "), "got: {prelude}");
-            assert!(rest.starts_with("tmux "), "got: {rest}");
+            assert!(rest.starts_with(&select_tmux_socket("s")), "got: {rest}");
         }
         // The prefix that makes a Homebrew Mac work at all, and the `$HOME` dirs the
         // remote shell (not muxel) must expand.
@@ -1622,6 +1710,7 @@ mod tests {
             args: &args,
             use_tmux: true,
             tmux_session: Some("s"),
+            tmux_socket: None,
             tmux_client_tag: None,
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
@@ -1649,6 +1738,7 @@ mod tests {
             args: &[],
             use_tmux: true,
             tmux_session: Some("s"),
+            tmux_socket: None,
             tmux_client_tag: None,
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
@@ -1674,12 +1764,13 @@ mod tests {
             args: &[],
             use_tmux: true,
             tmux_session: Some("muxel_sro_client_abc123"),
+            tmux_socket: Some(Socket::Private),
             tmux_client_tag: None,
         };
         let cmd = ssh_args(&spec).last().unwrap().clone();
-        // Only that one process may start a server. The `has-session` probes after
-        // it name the session but start nothing; they only ask.
-        let server = "; tmux -L mxl start-server ';' set -s exit-empty off; ";
+        // Only this project-less tmux process may start the owned server.
+        let server =
+            "; if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off; fi; ";
         let (before, pane) = cmd.split_once(server).expect("server starts first");
         assert!(
             !before.contains("sro_client"),
@@ -1711,6 +1802,7 @@ mod tests {
             args: &[],
             use_tmux: true,
             tmux_session: Some("s"),
+            tmux_socket: None,
             tmux_client_tag: tag,
         };
         let plain = ssh_args(&spec(None)).last().unwrap().clone();
@@ -1719,17 +1811,17 @@ mod tests {
 
         // The server still starts first, from a command line naming no session, and
         // the session's server is chosen before anything asks it a question.
-        let select = select_tmux_socket("s");
         let (server, rest) = tagged
-            .split_once(&format!("; {select}; if "))
+            .split_once("; if tmux \"$@\" list-commands")
             .expect("the flag probe follows");
-        assert!(plain.starts_with(&format!("{server}; {select}; exec tmux \"$@\" ")));
+        assert!(server.contains(&select_tmux_socket("s")));
+        assert!(plain.starts_with(&format!("{server}; exec tmux \"$@\" ")));
         // tmux 3.2+ and someone already attached: attach flagged, then record this
         // client's name on the session.
         assert_eq!(
             rest,
             format!(
-                "tmux \"$@\" list-commands new-session 2>/dev/null | grep -q 'f flags' \
+                " new-session 2>/dev/null | grep -q 'f flags' \
                  && tmux \"$@\" list-clients -t '=s' 2>/dev/null | grep -q .; then \
                  exec tmux \"$@\" -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s s -c /srv/app \
@@ -1747,7 +1839,7 @@ mod tests {
 
     #[test]
     fn claiming_the_window_size_clears_only_this_machines_client() {
-        let cmd = claim_window_size_command("muxel_app_1", "ab12");
+        let cmd = claim_window_size_command(&"muxel_app_1".into(), "ab12");
         let (prelude, rest) = cmd.split_once("; ").unwrap();
         assert_eq!(prelude, tmux_path_prelude());
         // On whichever server holds the session.
@@ -1791,6 +1883,7 @@ mod tests {
                 args: &[],
                 use_tmux: true,
                 tmux_session: Some("s"),
+                tmux_socket: None,
                 tmux_client_tag: tag,
             };
             let cmd = ssh_args(&spec).last().unwrap().clone();
@@ -1821,6 +1914,7 @@ mod tests {
             args: &[],
             use_tmux: false,
             tmux_session: None,
+            tmux_socket: None,
             tmux_client_tag: None,
         };
         assert_eq!(

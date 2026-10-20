@@ -57,7 +57,7 @@ struct Turn {
 /// and so where its claim is kept.
 struct ClaimSite {
     loc: integrations::RepoLoc,
-    session: String,
+    session: muxel_core::tmux::SessionTarget,
 }
 
 /// Typing into an agent, already checked against the agent's own state.
@@ -1000,8 +1000,17 @@ impl MuxelApp {
     /// Where `inst`'s claim lives: its tmux session, on this machine or its host.
     /// `None` without tmux — a plain PTY is this muxel's alone.
     fn control_claim_site(&self, inst: &Instance) -> Option<ClaimSite> {
+        if self
+            .remote_host_for_instance(inst.id)
+            .is_some_and(|host| !host.use_tmux(inst.use_tmux))
+        {
+            return None;
+        }
         Some(ClaimSite {
-            session: inst.tmux_session.clone()?,
+            session: muxel_core::tmux::SessionTarget::new(
+                inst.tmux_session.clone()?,
+                inst.tmux_socket,
+            ),
             loc: self.repo_loc(inst.project_id)?,
         })
     }

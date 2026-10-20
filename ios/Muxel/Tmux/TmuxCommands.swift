@@ -73,7 +73,10 @@ enum TmuxCommands {
     /// must produce the same text. Positional parameters, because zsh won't split a
     /// variable holding `-L mxl` into two words, and a PTY command has to `exec` tmux
     /// itself. Must follow `pathPrelude`.
-    static func selectSocket(_ session: String) -> String {
+    static func selectSocket(_ session: String, socket: String? = nil) -> String {
+        if let socket {
+            return socket == "default" ? "set --" : "set -- -L \(Shell.quote(socket))"
+        }
         let target = Shell.quote("=\(session)")
         return "if ! tmux -L \(socketName) has-session -t \(target) 2>/dev/null "
             + "&& tmux has-session -t \(target) 2>/dev/null; "
@@ -87,17 +90,51 @@ enum TmuxCommands {
     }
 
     /// `tmux <args…>` on the server holding `session` (`selectSocket`).
-    static func commandLine(_ args: [String], session: String) -> String {
-        "\(pathPrelude); \(selectSocket(session)); tmux \"$@\" " + Shell.command(args)
+    static func commandLine(_ args: [String], session: String, socket: String? = nil) -> String {
+        "\(pathPrelude); \(selectSocket(session, socket: socket)); tmux \"$@\" " + Shell.command(args)
     }
 
     /// `tmux <args…>` on both servers, muxel's own first: listings, which must find a
-    /// pane from before muxel had its own server, and kills, which must reach it. A
+    /// pane from before muxel had its own server. For read-only discovery only. A
     /// server that isn't running contributes nothing; the line fails only when there is
     /// no tmux to run at all.
     static func commandLineOnBothServers(_ args: [String]) -> String {
         "\(pathPrelude); { " + Shell.command(["tmux"] + socketArgs + args) + "; "
             + Shell.command(["tmux"] + args) + "; } 2>/dev/null; command -v tmux >/dev/null"
+    }
+
+    struct SessionTarget: Equatable {
+        var name: String
+        var socket: String
+    }
+
+    /// Keep server identity beside every name, including duplicate names.
+    static func listTargetsCommand(socket: String? = nil) -> String {
+        let servers = socket.map { [$0] } ?? [socketName, "default"]
+        let commands = servers.map { server in
+            commandLine(["list-sessions", "-F", "\(server)\t#{session_name}"],
+                        session: "", socket: server) + " 2>/dev/null"
+        }
+        return commands.joined(separator: "; ") + "; command -v tmux >/dev/null"
+    }
+
+    static func parseTargets(_ output: String) -> [SessionTarget] {
+        output.split(separator: "\n").compactMap { line in
+            let fields = line.split(separator: "\t", maxSplits: 1)
+            guard fields.count == 2 else { return nil }
+            return SessionTarget(name: String(fields[1]), socket: String(fields[0]))
+        }
+    }
+
+    static func resolveTarget(_ instance: Instance, in targets: [SessionTarget]) -> SessionTarget? {
+        resolveTarget(instance, in: targets, name: { $0.name }, socket: { $0.socket })
+    }
+
+    static func resolveTarget<Row>(_ instance: Instance, in rows: [Row],
+                                   name: (Row) -> String, socket: (Row) -> String?) -> Row? {
+        let eligible = rows.filter { instance.tmuxSocket == nil || socket($0) == instance.tmuxSocket }
+        return eligible.first { name($0) == instance.tmuxSession }
+            ?? eligible.first { TmuxSession.session(name($0), matchesInstanceId: instance.id) }
     }
 
     // MARK: Lifecycle
@@ -215,8 +252,8 @@ enum TmuxCommands {
     /// sized from the start. `clear;` wipes the login banner + echoed command so they
     /// don't bleed through under tmux's redraw. On the server holding the session
     /// (`selectSocket`).
-    static func attachPTYCommand(session: String) -> String {
-        "\(pathPrelude); \(selectSocket(session)); clear; "
+    static func attachPTYCommand(session: String, socket: String? = nil) -> String {
+        "\(pathPrelude); \(selectSocket(session, socket: socket)); clear; "
             + "exec tmux \"$@\" attach-session -t \(Shell.quote("=\(session)"))"
     }
 
@@ -226,10 +263,10 @@ enum TmuxCommands {
     /// they get one, exactly like desktop's `ssh -t`. `program == nil` → default shell.
     /// Clears a stale pane id from the server first (`clearInstanceId`). A new session
     /// goes on muxel's own server; `-A` reattaches one wherever it runs (`selectSocket`).
-    static func newAttachedPTYCommand(session: String, cwd: String, program: String?, args: [String]) -> String {
+    static func newAttachedPTYCommand(session: String, cwd: String, program: String?, args: [String], socket: String? = nil) -> String {
         // `clear;` wipes the login banner + echoed command before tmux takes over.
         var cmd =
-            "\(pathPrelude); \(selectSocket(session)); clear; exec tmux \"$@\" \(clearInstanceId) "
+            "\(pathPrelude); \(selectSocket(session, socket: socket)); clear; exec tmux \"$@\" \(clearInstanceId) "
             + "new-session -A -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
@@ -271,9 +308,9 @@ enum TmuxCommands {
     /// classifies every project on the host — the batched replacement for a
     /// `list-sessions` + N per-session `paneStatus` reads. `list-panes -a` needs no
     /// target; a host with no running server exits non-zero (treat as empty).
-    static func allPaneStatuses() -> [String] {
+    static func allPaneStatuses(socket: String? = nil) -> [String] {
         ["list-panes", "-a", "-F",
-         "#{session_name}\t#{pane_dead}\t#{window_bell_flag}\t#{window_activity}"]
+         "#{session_name}\t#{pane_dead}\t#{window_bell_flag}\t#{window_activity}" + (socket.map { "\t\($0)" } ?? "")]
     }
 
     /// Clear a window's bell flag once we've acted on it (attend equivalent).

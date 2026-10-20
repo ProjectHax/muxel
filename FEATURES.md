@@ -915,6 +915,22 @@ feature is added or changed, update the matching entry here in the same change**
   close is still remembered for the rest of the run, so a connect that listed the
   host's sessions a moment before the kill landed can't bring the pane back either.
   Unconfirmed closes are listed in the developer log.
+  Discovery and import retain the session's socket as well as its name. Attach,
+  restart, close and quit use that owner, leaving a same-named session on another
+  socket alone. Older panes resolve their owner before teardown. Claim cleanup
+  includes any socket discovery in its two-second deadline and reaps timed-out
+  commands before returning.
+  A legacy close saves its selected server before the first kill and keeps that
+  owner through lost replies, retries and reconnect cleanup. Only one restart
+  per pane can resolve and stop a session at a time; stale completions from a
+  closed pane or a previous workspace cannot overwrite its new owner. A pending
+  restart follows its project back to the main window if its original window
+  closes. The iOS companion serializes all layout changes with ownership binding,
+  verifies saved pane membership before attachment even for an unchanged owner,
+  preserves an already saved owner when a stale attachment disagrees, and rebuilds
+  that attachment once from the refreshed layout. It discards stale publication
+  after a project switch. Its host status sweep
+  includes recorded named sockets and uses the same session as attachment.
 - **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
   speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
   layout sync, the memory file, project scan, remote git, and the connection test
