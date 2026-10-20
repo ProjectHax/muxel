@@ -3154,10 +3154,7 @@ mod loop_cleanup_tests {
         }
     }
 
-    fn session() -> (
-        std::sync::Arc<TerminalSession>,
-        async_channel::Receiver<muxel_terminal::PtyChunk>,
-    ) {
+    fn session() -> (std::sync::Arc<TerminalSession>, muxel_terminal::PtyReceiver) {
         #[cfg(windows)]
         let spec = CommandSpec::program(
             "cmd.exe",

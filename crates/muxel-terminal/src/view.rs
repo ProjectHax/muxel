@@ -4024,10 +4024,7 @@ mod provider_switch_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
 
-    fn fixture() -> (
-        Arc<TerminalSession>,
-        async_channel::Receiver<crate::session::PtyChunk>,
-    ) {
+    fn fixture() -> (Arc<TerminalSession>, crate::session::PtyReceiver) {
         #[cfg(windows)]
         let spec = CommandSpec::program(
             "cmd.exe",
