@@ -589,8 +589,11 @@ feature is added or changed, update the matching entry here in the same change**
   `prompt_unsupported`. `--cwd`
   accepts an existing absolute directory, including a linked worktree outside
   the project root; it defaults to the root. `--name` names the tab, `--split
-  right|down` creates a pane, and `--background` preserves the selected tab,
-  focus, project and window. The JSON reply identifies the pane and launch.
+  right|down` creates a pane. Creation preserves the selected tab, focus,
+  project and window by default, without raising the window. `--focus` selects
+  the new pane and activates its window. `--background` remains accepted as a
+  compatibility no-op. JSON uses `focus` (default false); the legacy `background`
+  field is accepted and ignored. The JSON reply identifies the pane and launch.
   ALL outside creation requires both "Allow outside tools to control muxel" and
   the separate **Outside terminal creation** policy in Settings → Grok Bot.
   It defaults to **Off**. **Ask** requires a click for each request; **Allow**

@@ -22,7 +22,11 @@ pub struct NewOptions {
     pub cwd: Option<PathBuf>,
     pub name: Option<String>,
     pub placement: NewPlacement,
+    /// Legacy wire field. The host uses `focus`; CLI serialization mirrors the
+    /// requested behavior here so older hosts also preserve focus by default.
     pub background: bool,
+    #[serde(default)]
+    pub focus: bool,
     pub preset: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -226,7 +230,8 @@ pub(super) fn parse(args: &[String]) -> Result<CliCommand, String> {
             "--prompt" => options.prompt = Some(value()?),
             "--from" => options.from = Some(value()?),
             "--no-wait" => options.no_wait = true,
-            "--background" => options.background = true,
+            "--focus" => options.focus = true,
+            "--background" => {} // accepted for existing callers; background is the default
             "--tab" | "--split" => {
                 if placement_seen {
                     return Err("choose either --tab or --split once".into());
@@ -245,6 +250,7 @@ pub(super) fn parse(args: &[String]) -> Result<CliCommand, String> {
             _ => return Err(format!("unexpected argument '{arg}'")),
         }
     }
+    options.background = !options.focus;
     options.validate()?;
     Ok(CliCommand::Request(Command::New {
         project: project.clone(),

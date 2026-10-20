@@ -277,7 +277,8 @@ fn new_preserves_literal_argv_in_protocol() {
     assert_eq!(json["cmd"], "new");
     assert_eq!(json["project"], "repo");
     assert_eq!(json["argv"], serde_json::json!(&args[3..]));
-    assert_eq!(json["background"], false);
+    assert_eq!(json["background"], true);
+    assert_eq!(json["focus"], false);
     assert_eq!(
         serde_json::from_value::<muxel_core::control::Command>(json).unwrap(),
         command
@@ -312,7 +313,13 @@ fn new_defaults_and_explicit_options_round_trip() {
         panic!()
     };
     assert_eq!(project, "active");
-    assert_eq!(options, NewOptions::default());
+    assert_eq!(
+        options,
+        NewOptions {
+            background: true,
+            ..Default::default()
+        }
+    );
     let cwd = std::env::current_dir().unwrap();
     let args = vec![
         "new".into(),
@@ -346,6 +353,46 @@ fn new_defaults_and_explicit_options_round_trip() {
             options: NewOptions::default()
         }
     );
+}
+
+#[test]
+fn new_preserves_focus_by_default_and_focus_wins_over_legacy_background() {
+    for (flags, focus) in [
+        (vec![], false),
+        (vec!["--background"], false),
+        (vec!["--focus"], true),
+        (vec!["--background", "--focus"], true),
+        (vec!["--focus", "--background"], true),
+    ] {
+        let mut args = words(&["new", "repo"]);
+        args.extend(words(&flags));
+        let CliCommand::Request(muxel_core::control::Command::New { options, .. }) =
+            parse_cli(&args).unwrap()
+        else {
+            panic!("expected new");
+        };
+        assert_eq!(options.focus, focus);
+        // Older hosts only know background. The CLI can still express the same
+        // choice without introducing a protocol requirement for a UI preference.
+        assert_eq!(options.background, !focus);
+        let restored: NewOptions =
+            serde_json::from_value(serde_json::to_value(&options).unwrap()).unwrap();
+        assert_eq!(restored, options);
+    }
+    for background in [false, true] {
+        let options: NewOptions =
+            serde_json::from_value(serde_json::json!({"background":background})).unwrap();
+        assert!(!options.focus, "legacy JSON defaults to preserving focus");
+        let options: NewOptions =
+            serde_json::from_value(serde_json::json!({"background":background,"focus":true}))
+                .unwrap();
+        assert!(options.focus);
+    }
+    let skill = muxel_core::control::skill("muxel");
+    for help in [muxel_core::control::USAGE, skill.as_str()] {
+        assert!(help.contains("--focus"));
+        assert!(help.contains("--background"));
+    }
 }
 
 #[test]

@@ -1049,9 +1049,10 @@ usage: muxel ctl <command> [args]
   projects                       list projects
   panes [PROJECT]                pane layout and agents (all projects, or one)
   new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
-              [--background] [--prompt TEXT] [--from LABEL] [--no-wait]
+              [--focus] [--prompt TEXT] [--from LABEL] [--no-wait]
               [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
-                                 open a pane; --prompt - reads stdin
+                                 open in background; --focus selects and raises;
+                                 --background is a compatibility no-op; --prompt - reads stdin
   new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
   show AGENT [--full]            last prompt, last reply, pending question
@@ -1374,7 +1375,7 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
 - `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
-  [--background] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
+  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
   project's active group (a new tab by default). PROJECT resolves as for `panes`.
   DIR must be an existing absolute directory; it defaults to the project root
   and may be a linked worktree or another directory. A preset matches its name
@@ -1400,7 +1401,11 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   once and its text is discarded after first launch. Restart, restore and resume neither
   re-type nor resubmit it, including launches without a resumable conversation.
   Prompts for literal, shell and browser launches receive
-  `prompt_unsupported`. `--background` preserves focus, project and window.
+  `prompt_unsupported`. Creation preserves the selected tab, focus, project and
+  window by default, without raising the window. `--focus` selects the new pane
+  and activates its window. `--background` is accepted as a compatibility no-op,
+  including alongside `--focus`. JSON callers use `focus` (default false);
+  the legacy `background` field remains accepted and does not control focus.
   Every `new` request requires outside control plus Settings > Grok Bot >
   Outside terminal creation set to Ask or Allow. Ask requires a click for every
   request; Allow permits configured non-shell terminal presets. All literal argv,

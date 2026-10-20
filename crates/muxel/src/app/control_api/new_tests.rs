@@ -165,6 +165,9 @@ impl MuxelApp {
             direction,
             !focus,
         ));
+        if focus {
+            self.active_instance = Some(instance.id);
+        }
         self.workspace.instances.push(instance);
         self.persists += 1;
         self.launches += 1;
@@ -261,6 +264,123 @@ fn control_new_parameters_validate_before_mutation_and_preserve_allow_policy() {
 }
 
 const COMMAND_SETTING: &str = "Also allow typing into shell panes";
+
+fn target_project(app: &mut MuxelApp, empty: bool) -> (Uuid, Option<Uuid>) {
+    let mut project = Project::new("other", std::env::current_dir().unwrap());
+    let existing = (!empty).then(|| Instance::shell(project.id));
+    let selected = existing.as_ref().map(|instance| instance.id);
+    if let Some(existing) = existing {
+        project.layout = Some(PaneNode::leaf(existing.id));
+        app.workspace.instances.push(existing);
+    }
+    let pid = project.id;
+    app.workspace.projects.push(project);
+    (pid, selected)
+}
+
+#[test]
+fn control_new_default_preserves_project_tab_and_focus_without_window_activation() {
+    for background in [false, true] {
+        for placement in [
+            ctl::NewPlacement::Tab,
+            ctl::NewPlacement::Right,
+            ctl::NewPlacement::Down,
+        ] {
+            for empty in [false, true] {
+                let mut app = MuxelApp::fixture();
+                let active = app.active_instance;
+                let project = app.workspace.active_project;
+                let current_layout = app.workspace.projects[0].layout.clone();
+                let (pid, selected) = target_project(&mut app, empty);
+                let mut window = Window::default();
+                let result = app
+                    .control_new(
+                        pid,
+                        ctl::NewOptions {
+                            preset: Some("Codex".into()),
+                            background,
+                            placement,
+                            ..Default::default()
+                        },
+                        true,
+                        &mut window,
+                        &mut Context(PhantomData),
+                    )
+                    .unwrap();
+                let iid: Uuid = serde_json::from_value(result["uuid"].clone()).unwrap();
+                assert!(app.workspace.instance(iid).is_some());
+                assert_eq!(app.active_instance, active);
+                assert_eq!(app.workspace.active_project, project);
+                assert_eq!(app.workspace.projects[0].layout, current_layout);
+                assert_eq!(app.selections, 0);
+                assert_eq!(window.activations, 0);
+                if let Some(selected) = selected {
+                    let PaneNode::Leaf(leaf) = app
+                        .workspace
+                        .project(pid)
+                        .unwrap()
+                        .layout
+                        .as_ref()
+                        .unwrap()
+                        .leaf_containing(selected)
+                        .unwrap()
+                    else {
+                        panic!("expected leaf");
+                    };
+                    assert_eq!(leaf.tabs[leaf.active], selected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn control_new_focus_selects_the_new_pane_project_and_activates_its_window() {
+    for background in [false, true] {
+        for placement in [
+            ctl::NewPlacement::Tab,
+            ctl::NewPlacement::Right,
+            ctl::NewPlacement::Down,
+        ] {
+            let mut app = MuxelApp::fixture();
+            let (pid, _) = target_project(&mut app, false);
+            let mut window = Window::default();
+            let result = app
+                .control_new(
+                    pid,
+                    ctl::NewOptions {
+                        preset: Some("Codex".into()),
+                        focus: true,
+                        background,
+                        placement,
+                        ..Default::default()
+                    },
+                    true,
+                    &mut window,
+                    &mut Context(PhantomData),
+                )
+                .unwrap();
+            let iid: Uuid = serde_json::from_value(result["uuid"].clone()).unwrap();
+            assert_eq!(app.active_instance, Some(iid));
+            assert_eq!(app.workspace.active_project, Some(pid));
+            assert_eq!(app.selections, 1);
+            assert_eq!(window.activations, 1);
+            let PaneNode::Leaf(leaf) = app
+                .workspace
+                .project(pid)
+                .unwrap()
+                .layout
+                .as_ref()
+                .unwrap()
+                .leaf_containing(iid)
+                .unwrap()
+            else {
+                panic!("expected leaf");
+            };
+            assert_eq!(leaf.tabs[leaf.active], iid);
+        }
+    }
+}
 
 #[test]
 fn control_new_startup_wait_is_pending_before_placement_until_actual_submission() {

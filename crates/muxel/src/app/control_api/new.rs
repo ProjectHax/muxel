@@ -156,7 +156,7 @@ impl MuxelApp {
             self.control_turns
                 .insert(iid, ControlTurn::startup(prompt.clone()));
         }
-        if options.background {
+        if !options.focus {
             self.place_and_spawn_with_focus(
                 pid,
                 instance,
