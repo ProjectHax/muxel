@@ -17,6 +17,7 @@
 //! remote logs reload when one of the project's agents finishes a turn — which is
 //! when agents append — so there is no SSH polling.
 
+use super::upkeep::{BACKGROUND_CHECK, LogCheck, LogState, RETRY_AFTER_FAILURE, plan_log_check};
 use super::*;
 use crate::accomplishments_view::{
     AccomplishmentsOverview, OverviewProject, OverviewSnapshot, day_heading, entry_row,
@@ -25,48 +26,6 @@ use crate::accomplishments_view::{
 
 /// How often open views check their local log files for changes.
 const LOCAL_POLL: Duration = Duration::from_secs(2);
-/// How often the background pass looks for logs due for maintenance.
-const BACKGROUND_CHECK: Duration = Duration::from_secs(60);
-/// How long a project whose log failed to load waits before the pass retries it.
-const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(30 * 60);
-
-/// What a poll does with one project's log.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LogCheck {
-    /// Leave it: loading now, backing off after a failure, or its host isn't
-    /// reachable yet.
-    Skip,
-    /// Load it — which maintains (stamps, dedupes, prunes) the file.
-    Maintain,
-    /// Already maintained today and local: reload only if its file stamp moved.
-    Stat,
-}
-
-/// What a poll knows about one project's log.
-#[derive(Clone, Copy, Debug, Default)]
-struct LogState {
-    /// Local day (seconds at its start) the log was last maintained.
-    maintained_day: Option<i64>,
-    loading: bool,
-    backing_off: bool,
-    /// Local projects always; remote ones once their host was reached this session.
-    reachable: bool,
-    local: bool,
-}
-
-/// Decide a poll's action for one log. `today` is the local day's start.
-fn plan_log_check(today: i64, log: LogState) -> LogCheck {
-    if log.loading || log.backing_off || !log.reachable {
-        LogCheck::Skip
-    } else if log.maintained_day != Some(today) {
-        LogCheck::Maintain
-    } else if log.local {
-        LogCheck::Stat
-    } else {
-        LogCheck::Skip
-    }
-}
-
 impl MuxelApp {
     /// The main window, for overview actions that navigate it from a pop-out.
     pub(crate) fn main_window_handle(&self) -> Option<AnyWindowHandle> {
@@ -226,6 +185,8 @@ impl MuxelApp {
                     || (self.remote_synced.contains(&pid)
                         && !self.remote_connect_failed.contains_key(&pid)),
                 local,
+                // Remote logs refresh on agent turns while a view shows them.
+                changed_remotely: false,
             };
             match plan_log_check(today, log) {
                 LogCheck::Maintain => due.push(pid),
@@ -888,71 +849,5 @@ impl MuxelApp {
             .child(list)
             .child(add_form)
             .into_any_element()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{LogCheck, LogState, plan_log_check};
-
-    const TODAY: i64 = 1_800_057_600;
-    const DAY: i64 = 86_400;
-
-    fn local() -> LogState {
-        LogState {
-            reachable: true,
-            local: true,
-            ..LogState::default()
-        }
-    }
-
-    #[test]
-    fn a_log_not_maintained_today_is_maintained() {
-        // Never (app start) and yesterday (a day rollover) alike.
-        assert_eq!(plan_log_check(TODAY, local()), LogCheck::Maintain);
-        let yesterday = LogState {
-            maintained_day: Some(TODAY - DAY),
-            ..local()
-        };
-        assert_eq!(plan_log_check(TODAY, yesterday), LogCheck::Maintain);
-    }
-
-    #[test]
-    fn a_maintained_local_log_is_only_statted() {
-        let done = LogState {
-            maintained_day: Some(TODAY),
-            ..local()
-        };
-        assert_eq!(plan_log_check(TODAY, done), LogCheck::Stat);
-        let remote = LogState {
-            local: false,
-            ..done
-        };
-        assert_eq!(
-            plan_log_check(TODAY, remote),
-            LogCheck::Skip,
-            "no SSH polling"
-        );
-    }
-
-    #[test]
-    fn busy_failing_or_unreachable_logs_are_left_alone() {
-        for log in [
-            LogState {
-                loading: true,
-                ..local()
-            },
-            LogState {
-                backing_off: true,
-                ..local()
-            },
-            LogState {
-                reachable: false,
-                local: false,
-                ..local()
-            },
-        ] {
-            assert_eq!(plan_log_check(TODAY, log), LogCheck::Skip, "{log:?}");
-        }
     }
 }

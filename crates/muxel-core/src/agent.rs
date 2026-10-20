@@ -1119,9 +1119,10 @@ prior lessons, decisions, and gotchas relevant to what you're doing (each entry 
 `##` section with a `tags=` line, so one grep finds it), then read that section. \
 Whenever you learn something durable — a fix, a convention, a pitfall, an important \
 detail — record it by adding a new `## Short Title` section with a concise note (a \
-few keywords help future greps). muxel timestamps, orders (most-recently-used \
-first), de-dupes, and prunes the file automatically, so don't renumber, reorder, or \
-delete other entries, and don't repeat what's already there."
+few keywords help future greps). muxel timestamps, orders (newest first), and \
+prunes the file automatically (un-pinned entries expire 30 days after they're \
+added), so don't renumber, reorder, or delete other entries, and don't repeat what's \
+already there."
     )
 }
 

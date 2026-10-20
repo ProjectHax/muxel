@@ -259,18 +259,23 @@ feature is added or changed, update the matching entry here in the same change**
   Settings → Projects); a memory button on the project row opens the manager. Plain
   shells are skipped.
 - **Self-maintaining memory** — each fact is one `##` section carrying a machine
-  meta line (id, dates, tags). muxel keeps the file **most-relevant-first** (recently
-  used entries and 📌 pinned ones rise to the top), **timestamps** every entry,
-  **auto-purges** un-pinned entries unused for 30 days, and **caps** it at 40
-  un-pinned entries (evicting the least-recently-used) — so it stays small and
-  greppable and never needs hand-pruning. A legacy flat `MEMORY.md` is imported, not
-  lost, on first open.
+  meta line (id, dates, tags). muxel maintains the file **on its own**, with or
+  without the memory panel open: a section an agent adds is stamped within about a
+  minute of being written (local projects; remote ones within ~10 minutes of an
+  agent's turn ending, or at the daily pass), and every memory-enabled project is
+  maintained once a day. It keeps the file **newest-first** (📌 pinned entries on
+  top) and **auto-purges** un-pinned entries 30 days after they were added; a safety
+  cap of 200 un-pinned entries evicts the oldest first, never an arbitrary pick among
+  same-day entries. A file that can't be read is reported, never treated as empty,
+  so nothing is saved over it. A legacy flat `MEMORY.md` is imported, not lost, on
+  first open.
 - **Memory panel** — the project row's memory button toggles a docked, resizable
   second-sidebar panel (like the file browser, sharing its slot; width persists per
   workspace): search/grep the entries, add one (title + note + tags), pin/unpin
   (pinned entries are exempt from purge and cap), delete (with confirm), or open the
-  raw `MEMORY.md` in the editor. Entries load and persist over SSH for remote
-  projects too.
+  raw `MEMORY.md` in the editor. Each change is applied to the file as it is on disk
+  when saved, so sections agents added while the panel was open are kept. Entries
+  load and persist over SSH for remote projects too.
 - **Accomplishment log** — opt-in per project (sidebar right-click or Settings →
   Projects): agents are told to append one line to `.muxel/ACCOMPLISHMENTS.md` each
   time they finish a feature, fix, refactor, or perf/docs/test improvement —

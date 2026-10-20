@@ -66,6 +66,7 @@ mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
 mod tmux_install_modal;
+mod upkeep;
 
 use popout_lifecycle::loop_heartbeat;
 use restart_guard::{PendingRestarts, RemoteRestartCompletion};
@@ -3302,6 +3303,10 @@ pub struct MuxelApp {
     memory_tags_input: Entity<InputState>,
     /// Id of the entry showing an inline "delete?" confirm, if any.
     memory_confirm_delete: Option<Uuid>,
+    /// Why the shown project's memory couldn't be loaded, if it couldn't.
+    memory_load_error: Option<String>,
+    /// Background maintenance of every project's shared memory (see `upkeep`).
+    memory_upkeep: upkeep::Upkeep,
     /// Accomplishment-log panel (`.muxel/ACCOMPLISHMENTS.md`), docked in the same
     /// slot as the file browser and memory panels.
     show_accomplishments: bool,
@@ -5623,6 +5628,8 @@ impl MuxelApp {
             memory_note_input,
             memory_tags_input,
             memory_confirm_delete: None,
+            memory_load_error: None,
+            memory_upkeep: upkeep::Upkeep::default(),
             show_accomplishments: false,
             accomplishments_pid: None,
             accomplishments_search,
@@ -8644,6 +8651,7 @@ impl MuxelApp {
         self.last_status.clear();
         // The log cache is per project; open overviews reload for the new set.
         self.accomplishment_logs.clear();
+        self.memory_upkeep = upkeep::Upkeep::default();
         self.accomplishments_maintained.clear();
         self.accomplishments_retry_at.clear();
         self.accomplishments_checked_at = None;
@@ -10992,8 +11000,10 @@ impl MuxelApp {
         for iid in to_read_aloud {
             self.enqueue_read_aloud(iid, cx);
         }
+        self.note_memory_turns(&turns_finished);
         self.refresh_accomplishments_after_turns(turns_finished, cx);
         self.poll_accomplishments(cx);
+        self.poll_memory(cx);
 
         let popout_activity = self.sync_popout_activity(now_epoch, cx);
         activity_changed |= popout_activity.persist;
@@ -14324,6 +14334,10 @@ impl MuxelApp {
         // The docked panels share one slot.
         self.show_file_browser = false;
         self.show_accomplishments = false;
+        if self.memory_pid != Some(pid) {
+            self.memory_entries.clear();
+            self.memory_load_error = None;
+        }
         self.memory_pid = Some(pid);
         self.memory_confirm_delete = None;
         for input in [
@@ -14334,67 +14348,7 @@ impl MuxelApp {
         ] {
             input.update(cx, |s, cx| s.set_value("", window, cx));
         }
-        self.reload_memory(window, cx);
-        cx.notify();
-    }
-
-    /// Load the project's memory off-thread, run maintenance (order/purge/cap),
-    /// persist the maintained result if it changed, and show it.
-    fn reload_memory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pid) = self.memory_pid else { return };
-        let Some(loc) = self.repo_loc(pid) else {
-            return;
-        };
-        let now = now_secs();
-        cx.spawn_in(window, async move |this, cx| {
-            let (kept, save_err) = cx
-                .background_executor()
-                .spawn(async move {
-                    let entries = integrations::load_memory(&loc);
-                    let before: Vec<Uuid> = entries.iter().map(|e| e.id).collect();
-                    let m = memory::maintain(entries, now);
-                    let after: Vec<Uuid> = m.kept.iter().map(|e| e.id).collect();
-                    // Only write back when maintenance actually changed the set/order.
-                    let save_err = if m.removed > 0 || before != after {
-                        integrations::save_memory(&loc, &m.kept)
-                            .err()
-                            .map(|e| format!("{e:#}"))
-                    } else {
-                        None
-                    };
-                    (m.kept, save_err)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.memory_entries = kept;
-                match save_err {
-                    Some(e) => this.report_save_error(SaveTarget::Memory, e),
-                    None => this.clear_save_error(SaveTarget::Memory),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Re-order/purge/cap the in-memory entries and persist them off-thread.
-    fn maintain_and_persist_memory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let es = std::mem::take(&mut self.memory_entries);
-        self.memory_entries = memory::maintain(es, now_secs()).kept;
-        if let Some(loc) = self.memory_pid.and_then(|pid| self.repo_loc(pid)) {
-            let entries = self.memory_entries.clone();
-            cx.spawn_in(window, async move |this, cx| {
-                let result = cx
-                    .background_executor()
-                    .spawn(async move { integrations::save_memory(&loc, &entries) })
-                    .await;
-                let _ = this.update(cx, |this, _cx| match result {
-                    Ok(()) => this.clear_save_error(SaveTarget::Memory),
-                    Err(e) => this.report_save_error(SaveTarget::Memory, format!("{e:#}")),
-                });
-            })
-            .detach();
-        }
+        self.maintain_project_memory(pid, cx);
         cx.notify();
     }
 
@@ -14413,8 +14367,7 @@ impl MuxelApp {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        self.memory_entries
-            .push(MemoryEntry::new(title, note, tags, now_secs()));
+        let entry = MemoryEntry::new(title, note, tags, now_secs());
         for input in [
             &self.memory_title_input,
             &self.memory_note_input,
@@ -14422,20 +14375,16 @@ impl MuxelApp {
         ] {
             input.update(cx, |s, cx| s.set_value("", window, cx));
         }
-        self.maintain_and_persist_memory(window, cx);
+        self.apply_memory_edit(memory::Edit::Add(entry), cx);
     }
 
-    fn toggle_memory_pin(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(e) = self.memory_entries.iter_mut().find(|e| e.id == id) {
-            e.pinned = !e.pinned;
-        }
-        self.maintain_and_persist_memory(window, cx);
+    fn toggle_memory_pin(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        self.apply_memory_edit(memory::Edit::TogglePin(id), cx);
     }
 
-    fn delete_memory_entry(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        self.memory_entries.retain(|e| e.id != id);
+    fn delete_memory_entry(&mut self, id: Uuid, cx: &mut Context<Self>) {
         self.memory_confirm_delete = None;
-        self.maintain_and_persist_memory(window, cx);
+        self.apply_memory_edit(memory::Edit::Delete(id), cx);
     }
 
     /// Toggle shared project memory; on enable, create the `.muxel/MEMORY.md` +
@@ -14450,6 +14399,7 @@ impl MuxelApp {
         if enabled {
             self.memory_ensured.remove(&pid);
             self.ensure_project_memory(pid, cx);
+            self.memory_upkeep.check_soon();
         }
         self.persist();
         cx.notify();
@@ -15329,7 +15279,18 @@ impl MuxelApp {
             .flex_col()
             .gap_2();
 
-        if self.memory_entries.is_empty() {
+        if let Some(err) = &self.memory_load_error {
+            list = list.child(
+                div()
+                    .py_2()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(tf(
+                        "Couldn't load project memory: {error}",
+                        &[("error", err)],
+                    )),
+            );
+        } else if self.memory_entries.is_empty() {
             list = list.child(div().py_2().text_xs().text_color(muted).child(t(
                 "No memories yet — add one below. Agents also add entries as they work here.",
             )));
@@ -15358,9 +15319,9 @@ impl MuxelApp {
                         } else {
                             t("Pin (keep, exempt from purge)")
                         })
-                        .on_click(cx.listener(move |this, _e, window, cx| {
-                            this.toggle_memory_pin(id, window, cx)
-                        })),
+                        .on_click(
+                            cx.listener(move |this, _e, _w, cx| this.toggle_memory_pin(id, cx)),
+                        ),
                 );
                 if confirming {
                     actions = actions
@@ -15371,8 +15332,8 @@ impl MuxelApp {
                                 .xsmall()
                                 .icon(IconName::Check)
                                 .tooltip(t("Confirm delete"))
-                                .on_click(cx.listener(move |this, _e, window, cx| {
-                                    this.delete_memory_entry(id, window, cx)
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    this.delete_memory_entry(id, cx)
                                 })),
                         )
                         .child(

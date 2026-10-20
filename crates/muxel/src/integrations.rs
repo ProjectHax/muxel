@@ -424,17 +424,42 @@ fn muxel_file_abs(loc: &RepoLoc, file: &str) -> String {
     }
 }
 
-/// Read and parse a project's memory file into entries. Missing/empty/unreadable →
-/// an empty list (the file is optional and created on first save). Works local or
-/// remote.
-pub fn load_memory(loc: &RepoLoc) -> Vec<MemoryEntry> {
-    let text = match loc {
-        RepoLoc::Local(root) => {
-            std::fs::read_to_string(root.join(MEMORY_DIR).join(MEMORY_FILE)).unwrap_or_default()
-        }
-        RepoLoc::Remote(_) => read_remote_file(loc, &memory_abs(loc)).unwrap_or_default(),
+/// Load a project's memory, maintained (new sections stamped, ordered, purged; see
+/// [`memory::maintain`]). `now` is unix seconds. A missing file is an empty memory;
+/// a file that can't be read — or a host that can't be reached — is an error, never
+/// an empty list, so nothing is ever saved over entries that merely failed to load.
+///
+/// Agents add sections while muxel may be rewriting the file, so muxel writes only
+/// when maintenance changes something, re-reading just before it writes so a
+/// section added in between is kept.
+pub fn maintain_memory(loc: &RepoLoc, now: i64) -> Result<Vec<MemoryEntry>> {
+    let text = read_muxel_text(loc, MEMORY_FILE)?;
+    let m = memory::maintain(memory::parse_document(&text), now);
+    if !m.changed {
+        return Ok(m.kept);
+    }
+    let fresh = read_muxel_text(loc, MEMORY_FILE)?;
+    let m = if fresh == text {
+        m
+    } else {
+        memory::maintain(memory::parse_document(&fresh), now)
     };
-    memory::parse_document(&text)
+    if m.changed {
+        write_memory_text(loc, &memory::render_document(&m.kept))?;
+    }
+    Ok(m.kept)
+}
+
+/// Apply a panel edit to the memory as it is on disk *now* — not to the copy the
+/// panel showed, which may predate an agent's new section — then write the
+/// maintained result and return it.
+pub fn edit_memory(loc: &RepoLoc, now: i64, edit: &memory::Edit) -> Result<Vec<MemoryEntry>> {
+    let text = read_muxel_text(loc, MEMORY_FILE)?;
+    let mut entries = memory::maintain(memory::parse_document(&text), now).kept;
+    edit.apply(&mut entries);
+    let kept = memory::maintain(entries, now).kept;
+    write_memory_text(loc, &memory::render_document(&kept))?;
+    Ok(kept)
 }
 
 /// Whether the project already has a `.muxel/MEMORY.md` — i.e. shared memory is
@@ -456,28 +481,31 @@ pub fn memory_file_exists(loc: &RepoLoc) -> bool {
     }
 }
 
-/// Render `entries` to the project's `.muxel/MEMORY.md` (overwriting). Ensures the
-/// `.muxel/` dir exists and is git-ignored first. Works local or remote.
-pub fn save_memory(loc: &RepoLoc, entries: &[MemoryEntry]) -> Result<()> {
-    let text = memory::render_document(entries);
+/// Overwrite the project's `.muxel/MEMORY.md` with `text`, creating `.muxel/`
+/// (git-ignored) first if needed. Works local or remote.
+fn write_memory_text(loc: &RepoLoc, text: &str) -> Result<()> {
     ensure_memory_file(loc)?; // dir + .gitignore (+ seed if absent)
+    let path = memory_abs(loc);
     match loc {
-        RepoLoc::Local(root) => {
-            let file = root.join(MEMORY_DIR).join(MEMORY_FILE);
-            std::fs::write(&file, text).with_context(|| format!("writing {}", file.display()))
-        }
-        RepoLoc::Remote(_) => write_remote_file(loc, &memory_abs(loc), &text),
+        RepoLoc::Local(_) => std::fs::write(&path, text).with_context(|| format!("writing {path}")),
+        RepoLoc::Remote(_) => write_remote_file(loc, &path, text),
     }
 }
 
-/// A project's accomplishment log as text. A missing file reads as empty (the log
-/// simply has nothing yet); an unreadable one, or a host that can't be reached, is
-/// an error, so a view can say it couldn't load rather than show "nothing done".
+/// A project's accomplishment log as text (see [`read_muxel_text`]).
 fn read_accomplishments_text(loc: &RepoLoc) -> Result<String> {
-    let path = muxel_file_abs(loc, ACCOMPLISHMENTS_FILE);
+    read_muxel_text(loc, ACCOMPLISHMENTS_FILE)
+}
+
+/// One of a project's `.muxel/` files as text. A missing file reads as empty (it
+/// simply has nothing yet); an unreadable one, or a host that can't be reached, is
+/// an error, so a caller can say it couldn't load rather than show — or save over
+/// — nothing.
+fn read_muxel_text(loc: &RepoLoc, file: &str) -> Result<String> {
+    let path = muxel_file_abs(loc, file);
     match loc {
         RepoLoc::Local(_) => match std::fs::read(&path) {
-            // Lossy: one badly encoded append must not hide the rest of the log.
+            // Lossy: one badly encoded append must not hide the rest of the file.
             Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
             Err(e) => Err(e).with_context(|| format!("reading {path}")),
@@ -3042,6 +3070,75 @@ mod tests {
         let gi2 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gi2.matches(".muxel/").count(), 1, "no duplicate ignore");
         assert_eq!(std::fs::read_to_string(&mem).unwrap(), "kept user notes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The shared-memory failure modes found in real projects: agent sections never
+    /// stamped (so they never aged out), a panel edit saving over sections added
+    /// since it loaded, and a failed read treated as an empty memory.
+    #[test]
+    fn local_memory_is_stamped_kept_and_never_saved_over() {
+        use muxel_core::memory::{Edit, MemoryEntry};
+        use std::io::Write as _;
+
+        const DAY: i64 = 86_400;
+        let now = 1_800_057_600 + 3600;
+        let root = std::env::temp_dir().join("muxel-it-memory-upkeep");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let loc = RepoLoc::Local(root.clone());
+        let file = root.join(MEMORY_DIR).join(MEMORY_FILE);
+
+        assert!(
+            maintain_memory(&loc, now).unwrap().is_empty(),
+            "no file: empty"
+        );
+        ensure_memory_file(&loc).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        writeln!(f, "\n## Agent lesson\nuse the private socket").unwrap();
+        drop(f);
+
+        // Stamped on disk the first time muxel maintains it, then left alone.
+        let kept = maintain_memory(&loc, now).unwrap();
+        assert_eq!(kept.len(), 1);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("created=2027-01-16; accessed=2027-01-16"),
+            "{text}"
+        );
+        maintain_memory(&loc, now).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text, "stable");
+
+        // An agent adds a section after the panel loaded; pinning from the panel
+        // must not erase it.
+        let lesson = kept[0].id;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(b"\n## Second lesson\nadded while the panel was open\n")
+            .unwrap();
+        let after = edit_memory(&loc, now, &Edit::TogglePin(lesson)).unwrap();
+        let titles: Vec<_> = after.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles, ["Agent lesson", "Second lesson"]);
+        assert!(after[0].pinned);
+
+        // It ages out 30 days on; the pinned one stays.
+        let later = maintain_memory(&loc, now + 31 * DAY).unwrap();
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].title, "Agent lesson");
+
+        // An unreadable memory is an error — and an edit then writes nothing.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap(); // a directory can't be read as text
+        assert!(maintain_memory(&loc, now).is_err());
+        let add = Edit::Add(MemoryEntry::new("x", "y", Vec::new(), now));
+        assert!(edit_memory(&loc, now, &add).is_err());
+        assert!(file.is_dir(), "nothing was saved over it");
 
         let _ = std::fs::remove_dir_all(&root);
     }
