@@ -626,6 +626,13 @@ impl Instance {
         Self::from_preset(project_id, &AgentPreset::shell())
     }
 
+    pub fn tmux_target(&self, slug: &str) -> tmux::SessionTarget {
+        tmux::SessionTarget::new(
+            tmux::session_for(self.tmux_session.as_deref(), slug, self.id),
+            self.tmux_socket,
+        )
+    }
+
     /// Create an instance from a preset.
     pub fn from_preset(project_id: Uuid, preset: &AgentPreset) -> Self {
         Self {
@@ -1024,10 +1031,11 @@ impl Project {
     /// Capped, oldest first: a host that is never reachable again would otherwise
     /// grow the ledger without bound, and an entry that old has long stopped
     /// protecting anything — its instance is gone from the workspace.
-    pub fn remember_closed_session(&mut self, session: String, instance: Uuid) {
+    pub fn remember_closed_session(&mut self, session: tmux::SessionTarget, instance: Uuid) {
         self.closed_sessions.retain(|c| c.instance != instance);
         self.closed_sessions.push(tmux::ClosedSession {
-            name: session,
+            name: session.name,
+            socket: session.socket,
             instance,
         });
         let over = self
@@ -1492,6 +1500,15 @@ pub fn merge_peer_instances(
                 instance.auto_name = mine.auto_name.clone();
                 instance.grid = mine.grid;
                 instance.activity = mine.activity.clone();
+                // Older peers cannot write socket ownership. Preserve an already
+                // resolved binding when their layout still describes that pane.
+                if instance.tmux_socket.is_none()
+                    && (instance.tmux_session.is_none()
+                        || instance.tmux_session == mine.tmux_session)
+                {
+                    instance.tmux_session = mine.tmux_session.clone();
+                    instance.tmux_socket = mine.tmux_socket;
+                }
             }
             instance
         })
@@ -1510,7 +1527,7 @@ pub fn merge_peer_instances(
 pub fn dedupe_instances(workspace: &mut Workspace) {
     use std::collections::HashSet;
     let mut seen_ids: HashSet<Uuid> = HashSet::new();
-    let mut seen_sessions: HashSet<(Uuid, String)> = HashSet::new();
+    let mut seen_sessions: HashSet<(Uuid, Option<tmux::Socket>, String)> = HashSet::new();
     let mut kept: Vec<Instance> = Vec::with_capacity(workspace.instances.len());
     // Instances dropped as duplicates, whose panes must also leave the layout. An
     // instance repeated under the *same* id is not in here: the copy we keep still
@@ -1525,7 +1542,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
             .tmux_session
             .as_ref()
             .filter(|s| !s.is_empty())
-            .map(|s| (inst.project_id, s.clone()));
+            .map(|s| (inst.project_id, inst.tmux_socket, s.clone()));
         // A tmux session is claimed by exactly one instance per project.
         if claim.is_some_and(|c| !seen_sessions.insert(c)) {
             unlink.push(inst.id);
@@ -3121,7 +3138,7 @@ mod closed_session_tests {
         let ids: Vec<Uuid> = (0..MAX_CLOSED_SESSIONS + 10)
             .map(|n| {
                 let iid = Uuid::new_v4();
-                p.remember_closed_session(format!("muxel_app_{n}"), iid);
+                p.remember_closed_session(format!("muxel_app_{n}").into(), iid);
                 iid
             })
             .collect();
@@ -3366,6 +3383,7 @@ mod remote_layout_tests {
 
         // A machine binding the pane's tmux session and conversation: content, not edit.
         ws.instances[1].tmux_session = Some("muxel_proj_1a2b3c4d".into());
+        ws.instances[1].tmux_socket = Some(tmux::Socket::Default);
         ws.instances[1].session_id = Some(Uuid::new_v4().to_string());
         ws.instances[1].session_started = true;
         let bound = RemoteLayout::capture(&proj, &ws, 1);
@@ -3514,6 +3532,7 @@ mod remote_layout_tests {
         a.grid = Some((120, 40));
         a.activity.last_state = Some(AgentActivityState::Working);
         a.tmux_session = Some("muxel_studio_1a2b3c4d".into());
+        a.tmux_socket = Some(tmux::Socket::Default);
         let b = Instance::shell(proj.id);
         proj.layout = Some(PaneNode::Split {
             direction: SplitDirection::Horizontal,
@@ -3558,6 +3577,25 @@ mod remote_layout_tests {
         assert_eq!(a2.grid, Some((120, 40)));
         assert_eq!(a2.activity.last_state, Some(AgentActivityState::Working));
         assert_eq!(a2.tmux_session, a.tmux_session);
+        assert_eq!(a2.tmux_socket, a.tmux_socket);
+    }
+
+    #[test]
+    fn namesakes_on_different_sockets_survive_dedupe_and_old_peer_sync() {
+        let mut ws = Workspace::default();
+        let mut a = Instance::shell(Uuid::new_v4());
+        a.tmux_session = Some("work".into());
+        a.tmux_socket = Some(tmux::Socket::Private);
+        let mut b = a.clone();
+        b.id = Uuid::new_v4();
+        b.tmux_socket = Some(tmux::Socket::Default);
+        ws.instances = vec![a.clone(), b];
+        dedupe_instances(&mut ws);
+        assert_eq!(ws.instances.len(), 2);
+        let mut legacy = a.clone();
+        legacy.tmux_socket = None;
+        let merged = merge_peer_instances(&ws.instances, vec![legacy], a.project_id);
+        assert_eq!(merged[0].tmux_target("p"), a.tmux_target("p"));
     }
 
     #[test]

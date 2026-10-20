@@ -95,12 +95,26 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(
             TmuxCommands.attachPTYCommand(session: "s"),
             "\(TmuxCommands.pathPrelude); \(select); clear; exec tmux \"$@\" attach-session -t '=s'")
-        // Listings and kills reach both servers, muxel's own first, and fail only for a
-        // host with no tmux (a server that isn't running lists nothing).
-        XCTAssertEqual(
-            TmuxCommands.commandLineOnBothServers(TmuxCommands.killSession("s")),
-            "\(TmuxCommands.pathPrelude); { 'tmux' '-L' 'mxl' 'kill-session' '-t' '=s'; "
-                + "'tmux' 'kill-session' '-t' '=s'; } 2>/dev/null; command -v tmux >/dev/null")
+        for socket in ["mxl", "default"] {
+            let cmd = TmuxCommands.commandLine(TmuxCommands.killSession("s"), session: "s", socket: socket)
+            XCTAssertFalse(cmd.contains("has-session"))
+            XCTAssertEqual(cmd.components(separatedBy: "kill-session").count - 1, 1)
+            XCTAssertTrue(cmd.contains("; \(TmuxCommands.selectSocket("s", socket: socket)); tmux \"$@\""))
+        }
+    }
+
+    func testSocketOwnerSurvivesRoundTripAndDuplicateNames() throws {
+        let raw = #"{"id":"abcdef12-0000-4000-8000-000000000000","project_id":"p","title":"work","tmux_session":"work","tmux_socket":"default"}"#
+        let instance = try JSONDecoder().decode(Instance.self, from: Data(raw.utf8))
+        let restored = try JSONDecoder().decode(Instance.self, from: JSONEncoder().encode(instance))
+        XCTAssertEqual(restored.tmuxSocket, "default")
+        let targets = TmuxCommands.parseTargets("mxl\twork\ndefault\twork\n")
+        XCTAssertEqual(targets.count, 2)
+        XCTAssertEqual(TmuxCommands.resolveTarget(restored, in: targets), targets[1])
+        XCTAssertNil(TmuxCommands.resolveTarget(restored, in: [targets[0]]))
+        let cmd = TmuxCommands.attachPTYCommand(session: "work", socket: restored.tmuxSocket)
+        XCTAssertFalse(cmd.contains("has-session"))
+        XCTAssertFalse(cmd.contains("-L"))
     }
 
     // sshd runs an exec channel's command with its bare default PATH and no profile, so a

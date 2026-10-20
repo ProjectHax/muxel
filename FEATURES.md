@@ -90,6 +90,8 @@ feature is added or changed, update the matching entry here in the same change**
   that pane's stale finished or needs-input card.
 - **Close terminates** — closing a pop-out window kills its terminal (with a
   confirmation). Editors and browser panes just close.
+- **Workspace changes** — switching workspaces closes the previous workspace's
+  pop-out and per-monitor project windows without interrupting the switch.
 
 ## Agents
 
@@ -551,6 +553,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
+  Scheduled loops stay tracked across popout and redock. On Windows, Grok
+  conversation discovery follows the live terminal in either window.
+  Restart docks a popped-out terminal before replacing its process.
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
   receipt confirms writer admission with `pasted: true`.
@@ -634,6 +639,20 @@ feature is added or changed, update the matching entry here in the same change**
 ## Terminal
 
 - **alacritty-based emulator** — full VTE terminal with truecolor support.
+- **Bounded output backpressure** — each pane's reader-to-UI queue admits at most
+  256 KiB / 64 chunks. A noisy child pauses at that boundary and resumes as the
+  pane drains. While the pane is open (its session lives and the pane keeps
+  reading), terminal bytes and the final exit event stay in order and none are
+  dropped to protect memory. The UI separately holds one bounded drain batch
+  while parsing it. Closing a pane never waits on its queue, and output not yet
+  shown is discarded. Failed Windows launches also release output backpressure
+  before closing their terminal. On macOS and Linux muxel sends the program one
+  SIGHUP.
+  If the pane was still reading the program's terminal when it closed, muxel
+  kills a program still running about five seconds after that SIGHUP. A program
+  that had already closed its terminal is not force-killed, as before. The
+  operating system's own hangup when the pane's terminal closes is separate and
+  outside muxel's control, so a program is not guaranteed those five seconds.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
@@ -916,6 +935,22 @@ feature is added or changed, update the matching entry here in the same change**
   close is still remembered for the rest of the run, so a connect that listed the
   host's sessions a moment before the kill landed can't bring the pane back either.
   Unconfirmed closes are listed in the developer log.
+  Discovery and import retain the session's socket as well as its name. Attach,
+  restart, close and quit use that owner, leaving a same-named session on another
+  socket alone. Older panes resolve their owner before teardown. Claim cleanup
+  includes any socket discovery in its two-second deadline and reaps timed-out
+  commands before returning.
+  A legacy close saves its selected server before the first kill and keeps that
+  owner through lost replies, retries and reconnect cleanup. Only one restart
+  per pane can resolve and stop a session at a time; stale completions from a
+  closed pane or a previous workspace cannot overwrite its new owner. A pending
+  restart follows its project back to the main window if its original window
+  closes. The iOS companion serializes all layout changes with ownership binding,
+  verifies saved pane membership before attachment even for an unchanged owner,
+  preserves an already saved owner when a stale attachment disagrees, and rebuilds
+  that attachment once from the refreshed layout. It discards stale publication
+  after a project switch. Its host status sweep
+  includes recorded named sockets and uses the same session as attachment.
 - **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
   speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
   layout sync, the memory file, project scan, remote git, and the connection test
