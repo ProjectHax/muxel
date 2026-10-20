@@ -7,16 +7,18 @@ use super::{
 };
 #[cfg(windows)]
 use super::{active_grok_session_for_process, process_parent_map, read_grok_active_sessions};
-use crate::{integrations, session_binding, ui_profile};
+use crate::{session_binding, ui_profile};
 use gpui::{App, Context};
 use muxel_core::session_discovery::{
     CodexLookupEvidence, SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
 use muxel_core::tmux::Socket;
 use muxel_core::{AgentPreset, CodexHintMiss};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 // Explicit Import may search history. Restoration must never call this path.
@@ -103,15 +105,18 @@ fn inject_codex_tmux_title_reader(reader: CodexTmuxTitleTestReader) -> CodexTmux
     CodexTmuxTitleTestGuard
 }
 
-/// This runs only on the discovery worker. The recorded socket prevents a
-/// namesake session on the other server from supplying the wrong title.
-fn codex_tmux_title(session: &str, socket: Option<Socket>) -> Option<String> {
-    #[cfg(test)]
-    if let Some(reader) = CODEX_TMUX_TITLE_TEST_READER.lock().unwrap().clone() {
-        return reader(session, socket);
-    }
-    let socket = socket.unwrap_or_else(|| integrations::local_tmux_socket(session));
-    let output = Command::new("tmux")
+enum TmuxTitleProbe {
+    Found(String),
+    Failed,
+    TimedOut,
+}
+
+/// A title probe has the same two-second deadline as tmux claim cleanup. Read
+/// its bounded output concurrently so a long or stalled title cannot fill a
+/// pipe and hold the discovery batch.
+fn tmux_title_on(session: &str, socket: Socket) -> TmuxTitleProbe {
+    let mut command = Command::new("tmux");
+    command
         .args(socket.args())
         .args([
             "display-message",
@@ -121,12 +126,76 @@ fn codex_tmux_title(session: &str, socket: Option<Socket>) -> Option<String> {
             "#{pane_title}",
         ])
         .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return TmuxTitleProbe::Failed;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return TmuxTitleProbe::Failed;
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.take(4097).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return TmuxTitleProbe::TimedOut;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return TmuxTitleProbe::Failed;
+            }
+        }
+    };
+    if !status.success() {
+        return TmuxTitleProbe::Failed;
+    }
+    match receiver.recv_timeout(Duration::from_millis(250)) {
+        Ok(Ok(bytes)) if bytes.len() <= 4096 => {
+            TmuxTitleProbe::Found(String::from_utf8_lossy(&bytes).trim().to_string())
+        }
+        _ => TmuxTitleProbe::Failed,
+    }
+}
+
+/// This runs only on the discovery worker. The recorded socket prevents a
+/// namesake session on the other server from supplying the wrong title.
+fn codex_tmux_title(session: &str, socket: Option<Socket>) -> Option<String> {
+    #[cfg(test)]
+    if let Some(reader) = CODEX_TMUX_TITLE_TEST_READER.lock().unwrap().clone() {
+        return reader(session, socket);
+    }
+    if let Some(socket) = socket {
+        return match tmux_title_on(session, socket) {
+            TmuxTitleProbe::Found(title) => Some(title),
+            _ => None,
+        };
+    }
+    // Legacy panes did not record their socket. Query the private server first
+    // and only try the default server when that probe fails. A timeout is
+    // inconclusive and must not select a namesake elsewhere.
+    match tmux_title_on(session, Socket::Private) {
+        TmuxTitleProbe::Found(title) => Some(title),
+        TmuxTitleProbe::Failed => match tmux_title_on(session, Socket::Default) {
+            TmuxTitleProbe::Found(title) => Some(title),
+            _ => None,
+        },
+        TmuxTitleProbe::TimedOut => None,
+    }
 }
 
 fn codex_tmux_capture_session(
@@ -285,7 +354,7 @@ impl MuxelApp {
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     let mut updates = Vec::new();
-                    for (request, candidate, miss) in results {
+                    for (request, candidate, miss, observed_hint) in results {
                         let iid = request.key.pane;
                         let current = this.session_discovery_key(iid, cx);
                         // Earlier results in this batch may already have
@@ -310,6 +379,7 @@ impl MuxelApp {
                             CodexLookupEvidence {
                                 miss,
                                 rejected_owner,
+                                observed_hint,
                             },
                         );
                         if valid
@@ -397,15 +467,18 @@ impl MuxelApp {
     }
 }
 
+type DiscoveryResult = (
+    SessionDiscoveryRequest,
+    Option<SessionCandidate>,
+    Option<CodexHintMiss>,
+    Option<String>,
+);
+
 fn discover_sessions(
     requests: Vec<SessionDiscoveryRequest>,
     home: &Path,
     data_dir: Option<&Path>,
-) -> Vec<(
-    SessionDiscoveryRequest,
-    Option<SessionCandidate>,
-    Option<CodexHintMiss>,
-)> {
+) -> Vec<DiscoveryResult> {
     #[cfg(windows)]
     let mut grok_snapshot = None;
     requests
@@ -414,6 +487,7 @@ fn discover_sessions(
             let key = &request.key;
             let started = Instant::now();
             let mut miss = None;
+            let mut observed_hint = None;
             let candidate = match key.provider {
                 SessionProvider::Codex => {
                     let hint = key.hint.clone().or_else(|| {
@@ -427,14 +501,25 @@ fn discover_sessions(
                                 )
                             })
                     });
+                    observed_hint = hint.clone();
                     hint.and_then(|hint| {
+                        if let Some((cached_hint, cached_id)) = &request.codex_rejected_hint
+                            && *cached_hint == hint
+                        {
+                            // A sibling still owns this exact title. Read the
+                            // title again next time, but do not rescan a rollout
+                            // that was already validated for this hint.
+                            return Some(SessionCandidate {
+                                id: cached_id.clone(),
+                                path: None,
+                            });
+                        }
                         let stamp = CodexHintMiss::capture(home, &hint, started);
-                        if let Some(cached) = key.hint.as_ref().and(
-                            request
-                                .codex_miss
-                                .as_ref()
-                                .filter(|cached| cached.reusable_for(&stamp)),
-                        ) {
+                        if let Some(cached) = request
+                            .codex_miss
+                            .as_ref()
+                            .filter(|cached| cached.reusable_for(&stamp))
+                        {
                             miss = Some(cached.clone());
                             return None;
                         }
@@ -487,7 +572,7 @@ fn discover_sessions(
                     ui_profile::SessionLookupOutcome::Unresolved
                 },
             );
-            (request, candidate, miss)
+            (request, candidate, miss, observed_hint)
         })
         .collect()
 }
@@ -495,11 +580,14 @@ fn discover_sessions(
 #[cfg(test)]
 mod w8lm_tests {
     use super::{codex_tmux_capture_session, discover_sessions, inject_codex_tmux_title_reader};
-    use muxel_core::session_discovery::{SessionDiscoveries, SessionDiscoveryKey, SessionProvider};
+    use muxel_core::session_discovery::{
+        CodexLookupEvidence, SessionDiscoveries, SessionDiscoveryKey, SessionProvider,
+    };
     use muxel_core::tmux::Socket;
-    use muxel_core::{AgentPreset, Instance};
+    use muxel_core::{AgentPreset, Instance, Project, Workspace};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use uuid::Uuid;
 
@@ -543,7 +631,7 @@ mod w8lm_tests {
         for seconds in [0, 1] {
             let at = now + Duration::from_secs(seconds);
             let request = discovery.begin(key.clone(), at).unwrap();
-            let (request, candidate, miss) =
+            let (request, candidate, miss, _) =
                 discover_sessions(vec![request], &root, None).pop().unwrap();
             assert!(candidate.is_none());
             assert!(miss.is_some());
@@ -554,7 +642,7 @@ mod w8lm_tests {
             .begin(key.clone(), now + Duration::from_secs(3))
             .unwrap();
         assert!(request.codex_miss.is_some());
-        let (_, candidate, miss) = discover_sessions(vec![request], &root, None).pop().unwrap();
+        let (_, candidate, miss, _) = discover_sessions(vec![request], &root, None).pop().unwrap();
         let candidate = candidate.expect("new day directory must invalidate the miss");
         assert_eq!(candidate.id, key.hint.unwrap());
         assert_eq!(candidate.path, Some(path));
@@ -571,7 +659,8 @@ mod w8lm_tests {
         let request = SessionDiscoveries::default()
             .begin(key, Instant::now())
             .unwrap();
-        let (request, candidate, _) = discover_sessions(vec![request], &root, None).pop().unwrap();
+        let (request, candidate, _, _) =
+            discover_sessions(vec![request], &root, None).pop().unwrap();
         assert!(candidate.is_none());
         assert_eq!(request.key.binding, old);
     }
@@ -599,7 +688,7 @@ mod w8lm_tests {
         let now = Instant::now();
         let mut discovery = SessionDiscoveries::default();
         let request = discovery.begin(key.clone(), now).unwrap();
-        let (request, candidate, miss) =
+        let (request, candidate, miss, _) =
             discover_sessions(vec![request], &root, None).pop().unwrap();
         let candidate = candidate.expect("tmux title must resolve the rollout");
         assert_eq!(candidate.path, Some(path));
@@ -607,6 +696,94 @@ mod w8lm_tests {
         assert!(discovery.finish_with_codex_miss(&request, Some(&key), now, true, miss));
         instance.session_id = Some(candidate.id);
         assert!(codex_tmux_capture_session(&instance, None).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sibling_owned_tmux_title_keeps_polling_until_a_new_hint_is_unowned() {
+        let root = std::env::temp_dir().join(format!("muxel-tmux-rebind-{}", Uuid::new_v4()));
+        let mut key = key(&root);
+        let owned_id = key.hint.clone().unwrap();
+        let owned_path = write(&root, &key, false);
+        let new_id = "01a1543c-9700-7000-8000-000000000002";
+        key.hint = Some(new_id.into());
+        let new_path = write(&root, &key, false);
+        key.hint = None;
+        key.tmux_session = Some("muxel_switching".into());
+        key.tmux_socket = Some(Socket::Private);
+
+        let project = Project::new("capture", key.cwd.clone());
+        let mut owner = Instance::from_preset(project.id, &AgentPreset::codex());
+        owner.session_id = Some(owned_id.clone());
+        let owner_id = owner.id;
+        let mut target = Instance::from_preset(project.id, &AgentPreset::codex());
+        target.id = key.pane;
+        target.use_tmux = true;
+        target.session_started = true;
+        target.tmux_session = key.tmux_session.clone();
+        target.tmux_socket = key.tmux_socket;
+        let workspace = Workspace {
+            projects: vec![project],
+            instances: vec![owner, target],
+            ..Workspace::default()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let owned_title = owned_id.clone();
+        let _reader = inject_codex_tmux_title_reader(Arc::new(move |session, socket| {
+            assert_eq!(session, "muxel_switching");
+            assert_eq!(socket, Some(Socket::Private));
+            let id = if observed.fetch_add(1, Ordering::Relaxed) < 2 {
+                &owned_title
+            } else {
+                new_id
+            };
+            Some(format!("{id} | Ready"))
+        }));
+        let now = Instant::now();
+        let mut discoveries = SessionDiscoveries::default();
+        discoveries.reconcile(&workspace);
+        for seconds in [0, 1] {
+            let at = now + Duration::from_secs(seconds);
+            let request = discoveries.begin(key.clone(), at).unwrap();
+            let (request, candidate, miss, observed_hint) =
+                discover_sessions(vec![request], &root, None).pop().unwrap();
+            assert_eq!(candidate.unwrap().id, owned_id);
+            assert!(miss.is_none());
+            assert!(discoveries.finish_with_codex_evidence(
+                &request,
+                Some(&key),
+                at,
+                false,
+                CodexLookupEvidence {
+                    miss,
+                    rejected_owner: Some((owner_id, owned_id.clone())),
+                    observed_hint,
+                }
+            ));
+            if seconds == 0 {
+                std::fs::remove_file(&owned_path).unwrap();
+            }
+        }
+        let at = now + Duration::from_secs(3);
+        let request = discoveries.begin(key.clone(), at).unwrap();
+        let (request, candidate, miss, observed_hint) =
+            discover_sessions(vec![request], &root, None).pop().unwrap();
+        let candidate = candidate.expect("new title should be validated and captured");
+        assert_eq!(candidate.id, new_id);
+        assert_eq!(candidate.path, Some(new_path));
+        assert!(discoveries.finish_with_codex_evidence(
+            &request,
+            Some(&key),
+            at,
+            true,
+            CodexLookupEvidence {
+                miss,
+                rejected_owner: None,
+                observed_hint,
+            }
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

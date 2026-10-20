@@ -176,6 +176,33 @@ fn codex_store_error_keeps_the_saved_resume_identity() {
 }
 
 #[test]
+fn inconclusive_codex_resume_survives_unrelated_early_exit_recovery() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let id = "01a1543c-9700-7000-8000-000000000001";
+        let _lookup = inject_codex_resume_lookup(Arc::new(|_, _, _| Ok(CodexResumePath::Unknown)));
+        let document = window
+            .update(cx, |app, _, _| {
+                app.workspace.instance_mut(pane).unwrap().session_id = Some(id.into());
+                let (args, _) = app.session_resume_for(pane).unwrap();
+                assert_eq!(args, vec!["resume", id]);
+                // This is the decision used by tick after a direct resume exits
+                // nonzero within ten seconds for an unrelated reason.
+                assert!(!app.should_recover_expired_resume(pane, false, true));
+                assert!(app.should_recover_expired_resume(pane, true, false));
+                app.persist();
+                muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap()
+            })
+            .unwrap();
+        let saved = muxel_store::load_workspace_from(&document).unwrap();
+        assert_eq!(
+            saved.instance(pane).unwrap().session_id.as_deref(),
+            Some(id)
+        );
+    });
+}
+
+#[test]
 fn inconclusive_codex_lookups_keep_the_saved_resume_identity() {
     with_app(|cx, window| {
         let pane = codex_pane(cx, window);

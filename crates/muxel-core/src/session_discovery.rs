@@ -37,6 +37,9 @@ pub struct SessionDiscoveryKey {
 pub struct SessionDiscoveryRequest {
     pub key: SessionDiscoveryKey,
     pub codex_miss: Option<CodexHintMiss>,
+    /// A sibling-owned tmux title still gets polled. If the title has not
+    /// changed, the worker can reuse the validated identity without a walk.
+    pub codex_rejected_hint: Option<(String, String)>,
     generation: u64,
     sequence: u64,
 }
@@ -45,12 +48,14 @@ pub struct SessionDiscoveryRequest {
 pub struct CodexLookupEvidence {
     pub miss: Option<CodexHintMiss>,
     pub rejected_owner: Option<(Uuid, String)>,
+    pub observed_hint: Option<String>,
 }
 
 #[derive(Debug)]
 struct CodexOwnershipRejection {
     owner: Uuid,
     session_id: String,
+    observed_hint: Option<String>,
     binding_generation: u64,
 }
 
@@ -123,22 +128,23 @@ impl SessionDiscoveries {
         let state = self.panes.entry(key.pane).or_default();
         state.observe(Some(&key));
         if let Some(owner) = &state.codex_owner {
-            if self.bindings.get(&owner.owner) == Some(&owner.session_id)
+            let still_owned = self.bindings.get(&owner.owner) == Some(&owner.session_id)
                 && self
                     .binding_generations
                     .get(&owner.owner)
                     .copied()
                     .unwrap_or(0)
-                    == owner.binding_generation
-            {
-                return None;
+                    == owner.binding_generation;
+            if still_owned {
+                key.tmux_session.as_ref()?;
+            } else {
+                // Ownership changed. Revalidate immediately, even when the
+                // previous failed lookup had reached its maximum retry delay.
+                state.codex_owner = None;
+                state.codex_miss = None;
+                state.misses = 0;
+                state.retry_at = None;
             }
-            // Ownership changed. Revalidate immediately, even when the previous
-            // failed lookup had reached its maximum retry delay.
-            state.codex_owner = None;
-            state.codex_miss = None;
-            state.misses = 0;
-            state.retry_at = None;
         }
         state.begin(key, now)
     }
@@ -171,6 +177,7 @@ impl SessionDiscoveries {
             CodexLookupEvidence {
                 miss,
                 rejected_owner: None,
+                observed_hint: None,
             },
         )
     }
@@ -188,6 +195,7 @@ impl SessionDiscoveries {
             .map(|(owner, session_id)| CodexOwnershipRejection {
                 owner,
                 session_id,
+                observed_hint: evidence.observed_hint,
                 binding_generation: self.binding_generation(owner),
             });
         let Some(state) = self.panes.get_mut(&request.key.pane) else {
@@ -229,6 +237,12 @@ impl SessionDiscovery {
         let request = SessionDiscoveryRequest {
             key,
             codex_miss: self.codex_miss.clone(),
+            codex_rejected_hint: self.codex_owner.as_ref().and_then(|owner| {
+                owner
+                    .observed_hint
+                    .as_ref()
+                    .map(|hint| (hint.clone(), owner.session_id.clone()))
+            }),
             generation: self.generation,
             sequence: self.sequence,
         };
@@ -384,7 +398,8 @@ mod tests {
                 false,
                 CodexLookupEvidence {
                     miss: None,
-                    rejected_owner: Some((owner_id, "owned hint".into()))
+                    rejected_owner: Some((owner_id, "owned hint".into())),
+                    observed_hint: key.hint.clone(),
                 }
             ));
             assert!(

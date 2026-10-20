@@ -181,6 +181,37 @@ fn b9_compression_moves_only_probe_the_exact_saved_path_and_its_sibling() {
 }
 
 #[test]
+fn non_file_saved_codex_path_still_checks_its_compression_sibling() {
+    let root = std::env::temp_dir().join(format!("muxel-codex-nonfile-{}", Uuid::new_v4()));
+    let id = "01a1543c-9700-7000-8000-000000000001";
+    let path = root
+        .join(".codex/sessions/2026/10/19")
+        .join(format!("rollout-{id}.jsonl"));
+    let sibling = path.with_extension("jsonl.zst");
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(&sibling, "compressed rollout").unwrap();
+    OPERATIONS.with_borrow_mut(Vec::clear);
+    assert_eq!(
+        codex_resume_path(&root, id, Some(&path)).unwrap(),
+        CodexResumePath::Found(sibling.clone())
+    );
+    assert_eq!(
+        OPERATIONS.with_borrow_mut(std::mem::take),
+        vec![
+            Operation::Stat(path.clone()),
+            Operation::Stat(sibling.clone())
+        ]
+    );
+    std::fs::remove_file(&sibling).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    assert_eq!(
+        codex_resume_path(&root, id, Some(&path)).unwrap(),
+        CodexResumePath::Missing
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn b9_codex_name_index_rereads_changed_files_and_resets_after_truncation() {
     use std::io::Write;
     let root = std::env::temp_dir().join(format!("muxel-codex-incremental-{}", Uuid::new_v4()));
@@ -373,7 +404,8 @@ fn b9_r2_codex_sibling_rejection_stops_io_until_ownership_changes() {
                     false,
                     CodexLookupEvidence {
                         miss: None,
-                        rejected_owner: Some((owner.id, candidate.id))
+                        rejected_owner: Some((owner.id, candidate.id)),
+                        observed_hint: key.hint.clone(),
                     }
                 ));
             }
@@ -410,7 +442,8 @@ fn b9_r2_codex_sibling_rejection_stops_io_until_ownership_changes() {
             blocker.is_none(),
             CodexLookupEvidence {
                 miss: None,
-                rejected_owner: blocker
+                rejected_owner: blocker,
+                observed_hint: key.hint.clone(),
             }
         ));
         if change == "generation" {
@@ -693,6 +726,11 @@ fn w8lm_codex_miss_checks_only_day_stamps_and_expires_after_thirty_seconds() {
     OPERATIONS.with_borrow_mut(Vec::clear);
     let unchanged = CodexHintMiss::capture(&root, id, now + Duration::from_secs(29));
     assert!(miss.reusable_for(&unchanged));
+    assert!(!miss.reusable_for(&CodexHintMiss::capture(
+        &root,
+        "01a1543c-9700-7000-8000-000000000002",
+        now + Duration::from_secs(1)
+    )));
     assert!(OPERATIONS.with_borrow(|ops| ops.iter().all(|op| matches!(op, Operation::Stat(_)))));
     assert!(!miss.reusable_for(&CodexHintMiss::capture(
         &root,

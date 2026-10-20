@@ -17,7 +17,7 @@ pub struct CodexSession {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CodexResumePath {
     Found(PathBuf),
-    /// The exact previously captured rollout and its compression sibling are gone.
+    /// Neither the exact saved path nor its compression sibling is a usable file.
     Missing,
     /// A dated search or untrusted path cannot establish that the rollout is gone.
     Unknown,
@@ -27,6 +27,7 @@ pub enum CodexResumePath {
 /// Capture/check these stamps on the background executor, never in a UI update.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexHintMiss {
+    hint: String,
     directories: Vec<(PathBuf, Option<SystemTime>)>,
     scanned_at: Instant,
 }
@@ -35,6 +36,7 @@ impl CodexHintMiss {
     /// Capture before enumerating so a concurrent file creation forces a retry.
     pub fn capture(home: &Path, hint: &str, now: Instant) -> Self {
         Self {
+            hint: hint.to_string(),
             directories: directories(home, hint)
                 .into_iter()
                 .map(|path| {
@@ -49,7 +51,8 @@ impl CodexHintMiss {
     }
 
     pub fn reusable_for(&self, current: &Self) -> bool {
-        self.directories == current.directories
+        self.hint == current.hint
+            && self.directories == current.directories
             && current
                 .scanned_at
                 .saturating_duration_since(self.scanned_at)
@@ -191,30 +194,25 @@ pub fn codex_resume_path(
         {
             return Ok(CodexResumePath::Unknown);
         }
-        return match stat(path) {
-            Ok(metadata) => Ok(if metadata.is_file() {
-                CodexResumePath::Found(path.to_path_buf())
-            } else {
-                CodexResumePath::Missing
-            }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let sibling = match path.extension().and_then(|extension| extension.to_str()) {
-                    Some("jsonl") => path.with_extension("jsonl.zst"),
-                    Some("zst") => path.with_extension(""),
-                    _ => return Ok(CodexResumePath::Unknown),
-                };
-                match stat(&sibling) {
-                    Ok(metadata) => Ok(if metadata.is_file() {
-                        CodexResumePath::Found(sibling)
-                    } else {
-                        CodexResumePath::Missing
-                    }),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        Ok(CodexResumePath::Missing)
-                    }
-                    Err(error) => Err(error),
-                }
+        match stat(path) {
+            Ok(metadata) if metadata.is_file() => {
+                return Ok(CodexResumePath::Found(path.to_path_buf()));
             }
+            // A directory at the saved filename does not rule out a valid
+            // compression sibling. Both exact paths must be checked.
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let sibling = match path.extension().and_then(|extension| extension.to_str()) {
+            Some("jsonl") => path.with_extension("jsonl.zst"),
+            Some("zst") => path.with_extension(""),
+            _ => return Ok(CodexResumePath::Unknown),
+        };
+        return match stat(&sibling) {
+            Ok(metadata) if metadata.is_file() => Ok(CodexResumePath::Found(sibling)),
+            Ok(_) => Ok(CodexResumePath::Missing),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CodexResumePath::Missing),
             Err(error) => Err(error),
         };
     }
