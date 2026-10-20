@@ -93,27 +93,31 @@ Unit tests can't see the UI, so for anything visual:
 
   ```sh
   s=$(mktemp -d)
-  HOME="$s" XDG_CONFIG_HOME="$s/config" XDG_DATA_HOME="$s/data" \
-    ./target/debug/muxel >/dev/null 2>&1 & pid=$!
+  ./target/debug/muxel --user-data-dir "$s" >/dev/null 2>&1 & pid=$!
   sleep 5
   if kill -0 $pid 2>/dev/null; then echo ok; kill $pid; else wait $pid; echo "exited early: $?"; fi
   rm -rf "$s"
   ```
 
-  **Isolation must override `HOME`, not just the `XDG_*` vars.** The `directories`
-  crate honours `XDG_*` only on Linux; on macOS it ignores them and uses
-  `~/Library/Application Support/dev.muxel.muxel` — the real workspace, possibly
-  with the user's own muxel running on it. It does follow `$HOME`, so setting both
-  covers Linux and macOS. The script backgrounds and kills the process rather than
-  using `timeout`, which macOS doesn't ship.
+  `--user-data-dir DIR` puts settings in `DIR/config` and state in `DIR/data` on
+  Windows, macOS and Linux. Panes inherit `MUXEL_USER_DATA_DIR`; from outside,
+  use `muxel --user-data-dir "$s" ctl …`. Preset environment variables cannot
+  replace the isolated root or control policy. Browser website data persists
+  beneath the root on Windows. AppImage cleanup must preserve the selected root
+  even beneath or alongside its mount; isolated macOS/Linux browser views use
+  nonpersistent storage that ends with each view. Isolated ctl refuses a foreign
+  `MUXEL_CONTROL`. Linux helper failures refuse links, presets and restored
+  browser panes without opening the system browser. Local tmux panes require
+  tmux 3.2+ for per-session isolation;
+  older versions show an upgrade error without launching a fallback shell.
+  Retrying the pane after upgrading tmux probes support again.
 
 - **Interactive** — `scripts/dev.sh` runs muxel against an isolated sandbox
   (`.muxel-dev/`) so testing never touches the real workspace. A fresh workspace shows
   the first-run welcome dialog; accepted-terms / window geometry / layout live
   under the sandbox's data dir. Args go to cargo (`--release`); anything after `--`
-  goes to muxel. On Linux it isolates with `XDG_*`; on macOS (where those are
-  ignored) it builds first, then runs only the binary with `HOME` set to
-  `.muxel-dev/home` — so agents in its panes start without your login/config.
+  goes to muxel. It passes `--user-data-dir .muxel-dev` on every OS (Windows via
+  Git Bash). Agent login/config and project-local files retain their usual paths.
 - State each visual behavior that needs a human's eyes — the harness can build and
   smoke-test, but can't see colors/layout.
 

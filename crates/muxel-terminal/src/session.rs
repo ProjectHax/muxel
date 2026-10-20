@@ -22,6 +22,7 @@ use parking_lot::{Condvar, Mutex};
 #[cfg(unix)]
 use portable_pty::Child;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -2590,11 +2591,11 @@ fn apply_spec_env(builder: &mut CommandBuilder, spec: &CommandSpec) {
 /// shell/agent muxel spawns gets a clean system environment. No-op unless muxel
 /// itself is running from an AppImage (`$APPIMAGE` set).
 fn sanitize_appimage_env(builder: &mut CommandBuilder) {
-    let Some(appimage) = std::env::var("APPIMAGE").ok() else {
+    let Some(appimage) = std::env::var_os("APPIMAGE") else {
         return;
     };
-    let appdir = std::env::var("APPDIR").unwrap_or_default();
-    let vars: Vec<(String, String)> = std::env::vars().collect();
+    let appdir = std::env::var_os("APPDIR").unwrap_or_default();
+    let vars: Vec<_> = std::env::vars_os().collect();
     let (drop, overrides) = appimage_env_fixups(&vars, &appimage, &appdir);
     for k in drop {
         builder.env_remove(&k);
@@ -2613,11 +2614,13 @@ fn sanitize_appimage_env(builder: &mut CommandBuilder) {
 ///   stripped (dropped if nothing's left).
 /// - any other variable whose value is the AppImage binary or points into the
 ///   mount (e.g. a poisoned `MAKE`) is dropped.
+/// - a selected profile root is authoritative application context, not runtime
+///   leakage, even when it shares the mount's path prefix.
 fn appimage_env_fixups(
-    vars: &[(String, String)],
-    appimage: &str,
-    appdir: &str,
-) -> (Vec<String>, Vec<(String, String)>) {
+    vars: &[(OsString, OsString)],
+    appimage: &OsStr,
+    appdir: &OsStr,
+) -> (Vec<OsString>, Vec<(OsString, OsString)>) {
     const MARKERS: [&str; 4] = ["APPDIR", "APPIMAGE", "ARGV0", "OWD"];
     const PATH_LISTS: [&str; 5] = [
         "PATH",
@@ -2626,26 +2629,53 @@ fn appimage_env_fixups(
         "PERLLIB",
         "XDG_DATA_DIRS",
     ];
-    let in_mount = |s: &str| !appdir.is_empty() && s.starts_with(appdir);
+    let in_mount =
+        |value: &[u8]| !appdir.is_empty() && value.starts_with(appdir.as_encoded_bytes());
     let mut drop = Vec::new();
     let mut overrides = Vec::new();
     for (k, v) in vars {
-        if MARKERS.contains(&k.as_str()) {
+        let profile_root = k.to_str().is_some_and(|key| {
+            if cfg!(windows) {
+                key.eq_ignore_ascii_case("MUXEL_USER_DATA_DIR")
+            } else {
+                key == "MUXEL_USER_DATA_DIR"
+            }
+        });
+        if profile_root && !v.is_empty() {
+            continue;
+        }
+        if k.to_str().is_some_and(|key| MARKERS.contains(&key)) {
             drop.push(k.clone());
-        } else if PATH_LISTS.contains(&k.as_str()) {
-            let kept: Vec<&str> = v
-                .split(':')
-                .filter(|e| !e.is_empty() && !in_mount(e))
+        } else if k.to_str().is_some_and(|key| PATH_LISTS.contains(&key)) {
+            let kept: Vec<&[u8]> = v
+                .as_encoded_bytes()
+                .split(|byte| *byte == b':')
+                .filter(|entry| !entry.is_empty() && !in_mount(entry))
                 .collect();
-            let orig = v.split(':').filter(|e| !e.is_empty()).count();
+            let orig = v
+                .as_encoded_bytes()
+                .split(|byte| *byte == b':')
+                .filter(|entry| !entry.is_empty())
+                .count();
             if kept.len() != orig {
                 if kept.is_empty() {
                     drop.push(k.clone());
                 } else {
-                    overrides.push((k.clone(), kept.join(":")));
+                    let mut cleaned = OsString::new();
+                    for (index, entry) in kept.into_iter().enumerate() {
+                        if index > 0 {
+                            cleaned.push(":");
+                        }
+                        // SAFETY: these bytes came from this process's OsStr
+                        // encoding and were split only at ASCII ':'. ASCII is
+                        // self-synchronizing in that encoding, so each segment
+                        // remains a valid encoded OsStr, including non-Unicode.
+                        cleaned.push(unsafe { OsStr::from_encoded_bytes_unchecked(entry) });
+                    }
+                    overrides.push((k.clone(), cleaned));
                 }
             }
-        } else if v == appimage || in_mount(v) {
+        } else if v == appimage || in_mount(v.as_encoded_bytes()) {
             drop.push(k.clone());
         }
     }
@@ -3200,8 +3230,10 @@ mod content_damage_tests {
 #[cfg(test)]
 mod wheel_report_tests {
     use super::{
-        CommandSpec, appimage_env_fixups, apply_spec_env, push_mouse_report, push_wheel_report,
+        CommandSpec, PtyChunk, TerminalSession, appimage_env_fixups, apply_spec_env,
+        push_mouse_report, push_wheel_report,
     };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_removed_variable_is_gone_whether_inherited_or_set() {
@@ -3222,7 +3254,7 @@ mod wheel_report_tests {
     fn appimage_env_fixups_strip_leakage_keep_the_rest() {
         let appimage = "/home/u/Apps/muxel-linux-x86_64.AppImage";
         let appdir = "/tmp/.mount_muxelXYZ";
-        let s = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let s = |k: &str, v: &str| (k.into(), v.into());
         let vars = vec![
             s("APPIMAGE", appimage),
             s("APPDIR", appdir),
@@ -3233,8 +3265,9 @@ mod wheel_report_tests {
             s("LD_LIBRARY_PATH", &format!("{appdir}/usr/lib")), // wholly poisoned
             s("HOME", "/home/u"), // keep
             s("EDITOR", "vim"),  // keep
+            s("muxel_user_data_dir", &format!("{appdir}/profile")),
         ];
-        let (drop, overrides) = appimage_env_fixups(&vars, appimage, appdir);
+        let (drop, overrides) = appimage_env_fixups(&vars, appimage.as_ref(), appdir.as_ref());
 
         for k in [
             "APPIMAGE",
@@ -3244,20 +3277,229 @@ mod wheel_report_tests {
             "MAKE",
             "LD_LIBRARY_PATH",
         ] {
-            assert!(drop.contains(&k.to_string()), "should drop {k}");
+            assert!(drop.contains(&k.into()), "should drop {k}");
         }
         // PATH keeps only the system entries.
         assert_eq!(
             overrides
                 .iter()
                 .find(|(k, _)| k == "PATH")
-                .map(|(_, v)| v.as_str()),
-            Some("/usr/bin:/bin")
+                .map(|(_, v)| v.as_os_str()),
+            Some("/usr/bin:/bin".as_ref())
         );
         // Untouched, legitimate vars stay.
         for k in ["HOME", "EDITOR"] {
-            assert!(!drop.contains(&k.to_string()));
+            assert!(!drop.contains(&k.into()));
             assert!(!overrides.iter().any(|(o, _)| o == k));
+        }
+        // This spelling is the authoritative root only on Windows.
+        assert_eq!(drop.contains(&"muxel_user_data_dir".into()), !cfg!(windows));
+    }
+
+    #[cfg(any(windows, unix))]
+    fn non_unicode_os_string() -> std::ffi::OsString {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt as _;
+            std::ffi::OsString::from_wide(&[b'x' as u16, 0xd800])
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            std::ffi::OsString::from_vec(vec![b'x', 0xff])
+        }
+    }
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn appimage_fixups_preserve_non_unicode_keys_values_and_path_segments() {
+        use std::ffi::OsString;
+        let raw = non_unicode_os_string();
+        let mut mount = OsString::from("/tmp/.mount_");
+        mount.push(&raw);
+        let mut poisoned = mount.clone();
+        poisoned.push("/bin");
+        let mut kept = OsString::from("/outside/");
+        kept.push(&raw);
+        let mut path = poisoned.clone();
+        path.push(":");
+        path.push(&kept);
+        path.push(":/bin");
+        let mut expected_path = kept.clone();
+        expected_path.push(":/bin");
+        let image = OsString::from("/opt/muxel.AppImage");
+        let vars = vec![
+            ("APPIMAGE".into(), image.clone()),
+            ("APPDIR".into(), mount.clone()),
+            ("PATH".into(), path),
+            ("MAKE".into(), poisoned),
+            ("MUXEL_USER_DATA_DIR".into(), kept.clone()),
+            (raw.clone(), raw.clone()),
+        ];
+        let mut builder = portable_pty::CommandBuilder::new("unused");
+        for (key, value) in &vars {
+            builder.env(key, value);
+        }
+        let (drop, overrides) = appimage_env_fixups(&vars, &image, &mount);
+        for key in drop {
+            builder.env_remove(key);
+        }
+        for (key, value) in overrides {
+            builder.env(key, value);
+        }
+        for key in ["APPIMAGE", "APPDIR", "MAKE"] {
+            assert!(builder.get_env(key).is_none());
+        }
+        assert_eq!(builder.get_env("PATH"), Some(expected_path.as_os_str()));
+        assert_eq!(
+            builder.get_env("MUXEL_USER_DATA_DIR"),
+            Some(kept.as_os_str())
+        );
+        assert_eq!(builder.get_env(&raw), Some(raw.as_os_str()));
+    }
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn appimage_selected_roots_survive_actual_pty_construction() {
+        let temp = std::env::temp_dir();
+        let scratch = temp.join(format!("muxel-appimage-profile-{}", uuid::Uuid::new_v4()));
+        assert_eq!(scratch.parent(), Some(temp.as_path()));
+        std::fs::create_dir(&scratch).unwrap();
+        let mount = scratch.join("muxel-app");
+        std::fs::create_dir(&mount).unwrap();
+        let keys = if cfg!(windows) {
+            vec![
+                "MUXEL_USER_DATA_DIR",
+                "muxel_user_data_dir",
+                "MuXeL_UsEr_DaTa_DiR",
+            ]
+        } else {
+            vec!["MUXEL_USER_DATA_DIR"]
+        };
+        let mut failures = Vec::new();
+        for case in [
+            "outside",
+            "inside",
+            "prefix-sibling",
+            "non-unicode",
+            "unselected",
+        ] {
+            let root = appimage_test_root(&scratch, case);
+            if let Some(root) = &root {
+                assert!(root.is_absolute());
+                if case == "non-unicode" {
+                    assert!(root.to_str().is_none());
+                } else {
+                    std::fs::create_dir_all(root).unwrap();
+                    // Both inside and prefix-sibling roots are valid writable
+                    // fixture directories, not an assumption about mount modes.
+                    std::fs::write(root.join("writable-profile-marker"), "fixture").unwrap();
+                }
+            }
+            for key in &keys {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "session::wheel_report_tests::appimage_profile_root_child_probe",
+                        "--nocapture",
+                    ])
+                    .env("MUXEL_APPIMAGE_PROBE_STAGE", "launch")
+                    .env("MUXEL_APPIMAGE_TEST_SCRATCH", &scratch)
+                    .env("MUXEL_APPIMAGE_TEST_CASE", case)
+                    .env_remove("MUXEL_USER_DATA_DIR")
+                    .env("APPIMAGE", scratch.join("muxel.AppImage"))
+                    .env("APPDIR", &mount);
+                if let Some(root) = &root {
+                    command.env(key, root);
+                }
+                let output = command.output().unwrap();
+                println!(
+                    "APPIMAGE_PROFILE_CASE={case} KEY={key} PASSED={}",
+                    output.status.success()
+                );
+                if !output.status.success() {
+                    failures.push(format!(
+                        "case={case}, key={key}: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+        }
+        assert_eq!(scratch.parent(), Some(temp.as_path()));
+        std::fs::remove_dir_all(&scratch).unwrap();
+        assert!(!scratch.exists());
+        println!("APPIMAGE_PROFILE_FIXTURE_CLEANED={}", scratch.display());
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[cfg(any(windows, unix))]
+    fn appimage_test_root(scratch: &std::path::Path, case: &str) -> Option<std::path::PathBuf> {
+        match case {
+            "outside" => Some(scratch.join("outside-profile")),
+            "inside" => Some(scratch.join("muxel-app").join("profile")),
+            "prefix-sibling" => Some(scratch.join("muxel-app-profile")),
+            "non-unicode" => Some(scratch.join(non_unicode_os_string())),
+            "unselected" => None,
+            _ => panic!("unknown AppImage fixture case"),
+        }
+    }
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn appimage_profile_root_child_probe() {
+        let Ok(stage) = std::env::var("MUXEL_APPIMAGE_PROBE_STAGE") else {
+            return;
+        };
+        let scratch = std::env::var_os("MUXEL_APPIMAGE_TEST_SCRATCH").unwrap();
+        let case = std::env::var("MUXEL_APPIMAGE_TEST_CASE").unwrap();
+        let root = appimage_test_root(std::path::Path::new(&scratch), &case)
+            .map(std::path::PathBuf::into_os_string);
+        assert_eq!(
+            std::env::var_os("MUXEL_USER_DATA_DIR"),
+            root,
+            "exact selected root must survive {stage}: {case}"
+        );
+        if stage == "observe" {
+            assert!(std::env::var_os("APPIMAGE").is_none());
+            assert!(std::env::var_os("APPDIR").is_none());
+            println!("APPIMAGE_PROFILE_ROOT_CHILD_OK");
+            return;
+        }
+        let mut spec = CommandSpec::program(
+            std::env::current_exe().unwrap().to_str().unwrap(),
+            vec![
+                "--exact".into(),
+                "session::wheel_report_tests::appimage_profile_root_child_probe".into(),
+                "--nocapture".into(),
+            ],
+        );
+        spec.env
+            .push(("MUXEL_APPIMAGE_PROBE_STAGE".into(), "observe".into()));
+        let (_session, rx) = TerminalSession::spawn(spec, 100, 30).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut output = Vec::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "child timed out: {}",
+                String::from_utf8_lossy(&output)
+            );
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => output.extend(bytes),
+                Ok(PtyChunk::Exit {
+                    code, read_error, ..
+                }) => {
+                    assert_eq!(code, Some(0), "{}", String::from_utf8_lossy(&output));
+                    assert!(read_error.is_none());
+                    assert!(
+                        String::from_utf8_lossy(&output).contains("APPIMAGE_PROFILE_ROOT_CHILD_OK")
+                    );
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
         }
     }
 

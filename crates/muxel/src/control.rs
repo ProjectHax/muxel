@@ -2,10 +2,13 @@
 //!
 //! While Settings → Grok Bot → "Allow outside tools to control muxel" is on, the
 //! app listens on `127.0.0.1:<random port>` and writes the port and a fresh random
-//! token to `<data dir>/control.json`, readable only by its owner. `muxel ctl …` —
-//! this same binary, run with those arguments — reads that file, connects, sends
-//! one JSON request line and prints the reply. Knowing the token is the whole of
-//! the authorization, so only the user running muxel (and what they run) gets in.
+//! token to `<data dir>/control.json`. Unix creates the file with mode 0600;
+//! Windows inherits the parent directory's ACL, so the user data directory must
+//! be private to the intended OS account. `--user-data-dir` does not impose an
+//! owner-only ACL. `muxel ctl …` — this same binary, run with those arguments —
+//! reads that file, connects, sends one JSON request line and prints the reply.
+//! Knowing the token is the whole of the authorization; anyone able to read it
+//! can exercise the enabled control authority.
 //!
 //! The protocol and the decisions in it live in `muxel_core::control`; the app
 //! answers requests in `app/control_api.rs`. This file is only sockets and files.
@@ -188,7 +191,9 @@ fn same_secret(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Write the endpoint file atomically, readable only by its owner.
+/// Write the endpoint file atomically. Unix creates mode 0600; Windows inherits
+/// the parent ACL, so the user data directory must be private to the intended
+/// account.
 fn write_endpoint(path: &Path, endpoint: &Endpoint) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     let _ = std::fs::remove_file(&tmp);
@@ -363,14 +368,36 @@ pub fn exe_path() -> String {
         .unwrap_or_else(|| "muxel".to_string())
 }
 
-/// Where the running app's endpoint file is: `$MUXEL_CONTROL` when set — for an
-/// agent whose environment gives it a different home or `XDG_DATA_HOME` than the
-/// app has — else `control.json` in muxel's data directory.
-fn endpoint_path() -> Option<PathBuf> {
-    std::env::var_os("MUXEL_CONTROL")
+/// Names the running app's endpoint file, for a `muxel ctl` whose environment
+/// gives it a different home or `XDG_DATA_HOME` than the app has.
+/// Without an isolated root it overrides the platform endpoint. With a root it
+/// must name that root's endpoint; GUI runs clear it before starting panes.
+pub const CONTROL_ENV: &str = "MUXEL_CONTROL";
+
+/// An isolated root never routes control to a foreign endpoint.
+fn endpoint_path() -> Result<Option<PathBuf>, String> {
+    let default = muxel_store::data_dir().map(|dir| dir.join(control::ENDPOINT_FILE));
+    let supplied = std::env::var_os(CONTROL_ENV)
         .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| Some(muxel_store::data_dir()?.join(control::ENDPOINT_FILE)))
+        .map(PathBuf::from);
+    let isolated =
+        std::env::var_os(muxel_store::USER_DATA_DIR_ENV).is_some_and(|root| !root.is_empty());
+    let (default, supplied) = if isolated {
+        (
+            default.map(normalize_endpoint_path),
+            supplied.map(normalize_endpoint_path),
+        )
+    } else {
+        (default, supplied)
+    };
+    muxel_core::isolated_root::select_control_endpoint(default, isolated, supplied)
+        .map_err(|error| error.to_string())
+}
+
+fn normalize_endpoint_path(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path)
+        .or_else(|_| std::path::absolute(&path))
+        .unwrap_or(path)
 }
 
 /// Whether the muxel that wrote the endpoint file is still running. A killed app
@@ -414,7 +441,7 @@ fn process_alive(pid: u32) -> bool {
 /// One request to the running app. Only failures before the request is sent are
 /// known to have done nothing, and only those get a code here.
 fn request(command: Command) -> Result<Value, control::Error> {
-    let path = endpoint_path()
+    let path = endpoint_path()?
         .ok_or_else(|| control::Error::new(ErrorCode::HostUnavailable, "no data directory"))?;
     request_at(&path, command)
 }

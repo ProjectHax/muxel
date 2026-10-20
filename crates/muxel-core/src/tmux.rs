@@ -52,6 +52,8 @@ pub enum Socket {
     /// running and is nowhere else — a pane from an earlier muxel, or a session the
     /// user imported.
     Default,
+    /// An isolated profile's server, locally or over SSH. No legacy fallback.
+    Isolated(u64),
 }
 
 impl From<Socket> for String {
@@ -59,6 +61,7 @@ impl From<Socket> for String {
         match socket {
             Socket::Private => SOCKET_NAME.to_string(),
             Socket::Default => "default".to_string(),
+            Socket::Isolated(hash) => format!("mxl-{hash:016x}"),
         }
     }
 }
@@ -70,7 +73,12 @@ impl TryFrom<String> for Socket {
         match name.as_str() {
             SOCKET_NAME => Ok(Self::Private),
             "default" => Ok(Self::Default),
-            _ => Err("unrecognized tmux socket".to_string()),
+            _ => name
+                .strip_prefix("mxl-")
+                .filter(|hash| hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                .and_then(|hash| u64::from_str_radix(hash, 16).ok())
+                .map(Self::Isolated)
+                .ok_or_else(|| "unrecognized tmux socket".to_string()),
         }
     }
 }
@@ -89,6 +97,17 @@ impl SessionTarget {
             name: name.into(),
             socket,
         }
+    }
+
+    /// An explicit profile root always owns its own socket, regardless of older
+    /// or peer metadata. The regular profile retains its recorded owner.
+    pub fn for_profile(&self, root: Option<&std::path::Path>) -> Self {
+        Self::new(
+            self.name.clone(),
+            root.filter(|root| !root.as_os_str().is_empty())
+                .map(Socket::isolated)
+                .or(self.socket),
+        )
     }
 }
 
@@ -119,16 +138,52 @@ impl Socket {
 
     /// The client flags selecting this server. Like `-u`, they go before the first
     /// command of a `tmux …` argv.
-    pub fn args(self) -> &'static [&'static str] {
+    pub fn args(self) -> Vec<String> {
         match self {
-            Socket::Private => &["-L", SOCKET_NAME],
-            Socket::Default => &[],
+            Socket::Private => vec!["-L".into(), SOCKET_NAME.into()],
+            Socket::Default => vec![],
+            Socket::Isolated(hash) => vec!["-L".into(), format!("mxl-{hash:016x}")],
+        }
+    }
+
+    /// Stable per-root name without putting the profile path in process argv.
+    pub fn isolated(root: &std::path::Path) -> Self {
+        // FNV-1a is specified here rather than DefaultHasher, whose output may
+        // change with Rust releases and strand existing sessions after upgrades.
+        let hash = root
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+        Self::Isolated(hash)
+    }
+
+    /// Servers this profile's discovery, existence checks and cleanup may touch,
+    /// on this machine or its SSH hosts.
+    pub fn local(root: Option<&std::path::Path>) -> Vec<Self> {
+        match root.filter(|root| !root.as_os_str().is_empty()) {
+            Some(root) => vec![Self::isolated(root)],
+            None => Self::BOTH.to_vec(),
+        }
+    }
+
+    /// Isolated profiles do not probe either real-profile socket, even when the
+    /// requested session is absent. Regular profiles retain legacy reattachment.
+    pub fn locate_local(
+        root: Option<&std::path::Path>,
+        has_session: impl FnMut(Self) -> bool,
+    ) -> Self {
+        match root.filter(|root| !root.as_os_str().is_empty()) {
+            Some(root) => Self::isolated(root),
+            None => Self::locate(has_session),
         }
     }
 
     /// The argv for `tmux …` running `args` on this server.
     pub fn argv(self, args: Vec<String>) -> Vec<String> {
-        let mut v: Vec<String> = self.args().iter().map(|a| a.to_string()).collect();
+        let mut v = self.args();
         v.extend(args);
         v
     }
@@ -231,6 +286,9 @@ pub fn bind_session_owners<'a>(
         }
     }
     for instance in instances {
+        if matches!(new_socket, Socket::Isolated(_)) {
+            instance.tmux_socket = Some(new_socket);
+        }
         let suffix = instance.id.simple().to_string();
         let found = instance
             .tmux_session
@@ -407,7 +465,10 @@ impl ClosedSession {
     /// ledgers and across retries, even when the chosen session disappears.
     pub fn resolve_owner(&self, sessions: &[RemoteSession], new_socket: Socket) -> Self {
         let mut resolved = self.clone();
-        if let Some(live) = live_closed_session(sessions, self) {
+        if matches!(new_socket, Socket::Isolated(_)) {
+            resolved.socket = Some(new_socket);
+        }
+        if let Some(live) = live_closed_session(sessions, &resolved) {
             resolved.name = live.name.clone();
             resolved.socket = Some(live.socket);
         } else {
@@ -596,9 +657,16 @@ pub fn launch_session_args_with_env(
     }
     let mut new = new_session_args(session, cwd, program, args);
     // With `new-session`'s other options: after `-A -s NAME`, before `--`.
-    let options = env
-        .iter()
-        .flat_map(|(name, value)| ["-e".to_string(), format!("{name}={value}")]);
+    let options = env.iter().flat_map(|(name, value)| {
+        let mut setting = format!("{name}={value}");
+        // tmux's argv parser treats a trailing semicolon as a command separator,
+        // even inside a single argument. Escape it for tmux, which removes this
+        // one backslash before setting the session environment.
+        if setting.ends_with(';') {
+            setting.insert(setting.len() - 1, '\\');
+        }
+        ["-e".to_string(), setting]
+    });
     new.splice(4..4, options);
     v.extend(new);
     v
@@ -843,6 +911,7 @@ mod tests {
             Socket::locate(|s| match s {
                 Socket::Private => private,
                 Socket::Default => default,
+                Socket::Isolated(_) => panic!("legacy lookup probed an isolated socket"),
             })
         };
         assert_eq!(on(true, false), Socket::Private);
@@ -869,6 +938,44 @@ mod tests {
             true
         });
         assert_eq!(asked, [Socket::Private]);
+    }
+
+    #[test]
+    fn isolated_local_sockets_never_probe_list_or_kill_regular_profile_sessions() {
+        use std::path::Path;
+        assert_eq!(Socket::local(None), Socket::BOTH);
+        assert_eq!(Socket::local(Some(Path::new(""))), Socket::BOTH);
+        let one = Path::new("/profile-one");
+        let two = Path::new("/profile-two");
+        let socket = Socket::isolated(one);
+        assert_ne!(socket, Socket::isolated(two));
+        assert_eq!(Socket::local(Some(one)), [socket]);
+        assert_eq!(
+            Socket::locate_local(Some(one), |_| panic!("foreign socket probe")),
+            socket
+        );
+        let mut probes = Vec::new();
+        assert_eq!(
+            Socket::locate_local(None, |socket| {
+                probes.push(socket);
+                socket == Socket::Default
+            }),
+            Socket::Default
+        );
+        assert_eq!(probes, Socket::BOTH);
+        for args in [
+            start_server_args(),
+            restore_exit_empty_args(),
+            list_sessions_args(),
+            has_session_args("same"),
+            kill_session_args("same"),
+        ] {
+            let args = socket.argv(args);
+            assert_eq!(&args[..2], socket.args());
+            assert_eq!(args[0], "-L");
+            assert_ne!(args[1], SOCKET_NAME);
+            assert!(!args[1].contains("profile-one"));
+        }
     }
 
     #[test]
@@ -942,6 +1049,51 @@ mod tests {
         instance.tmux_socket = None;
         bind_session_owners("p", [&mut instance], &found, Socket::Private);
         assert_eq!(instance.tmux_target("p"), found[0].target());
+    }
+
+    #[test]
+    fn an_isolated_profile_overrides_foreign_owners_and_roundtrips_its_socket() {
+        let root = std::path::Path::new("/isolated-test");
+        let socket = Socket::isolated(root);
+        let encoded = serde_json::to_string(&socket).unwrap();
+        assert_eq!(serde_json::from_str::<Socket>(&encoded).unwrap(), socket);
+        for invalid in [
+            "mxl-0",
+            "mxl-zzzzzzzzzzzzzzzz",
+            "mxl-0000000000000000; echo bad",
+        ] {
+            assert!(Socket::try_from(invalid.to_string()).is_err());
+        }
+        for prior in [
+            None,
+            Some(Socket::Private),
+            Some(Socket::Default),
+            Some(Socket::Isolated(1)),
+        ] {
+            let target = SessionTarget::new("work", prior);
+            assert_eq!(
+                target.for_profile(Some(root)),
+                SessionTarget::new("work", Some(socket))
+            );
+            assert_eq!(target.for_profile(None), target);
+            assert_eq!(target.for_profile(Some(std::path::Path::new(""))), target);
+            let mut instance = crate::Instance::shell(Uuid::new_v4());
+            instance.tmux_session = Some("work".into());
+            instance.tmux_socket = prior;
+            let mut found = parse_sessions_on("work|/real|claude|\n", Socket::Private);
+            found.extend(parse_sessions_on("work|/isolated|zsh|\n", socket));
+            bind_session_owners("p", [&mut instance], &found, socket);
+            assert_eq!(instance.tmux_target("p"), found[1].target());
+            let closed = ClosedSession {
+                name: "work".into(),
+                socket: prior,
+                instance: instance.id,
+            };
+            assert_eq!(
+                closed.resolve_owner(&found, socket).target(),
+                found[1].target()
+            );
+        }
     }
 
     #[test]
@@ -1222,6 +1374,27 @@ mod tests {
         assert_eq!(
             launch_session_args_with_env("s", None, None, &[], &[], &[]),
             launch_session_args("s", None, None, &[])
+        );
+    }
+
+    #[test]
+    fn session_environment_escapes_trailing_semicolons() {
+        let env = vec![
+            ("ROOT".into(), "/isolated;".into()),
+            ("BACKSLASH".into(), r"/isolated\;".into()),
+            ("MIDDLE".into(), "/isolated;other".into()),
+        ];
+        let args = launch_session_args_with_env("s", None, None, &[], &env, &[]);
+        assert_eq!(
+            &args[10..],
+            [
+                "-e",
+                r"ROOT=/isolated\;",
+                "-e",
+                r"BACKSLASH=/isolated\\;",
+                "-e",
+                "MIDDLE=/isolated;other"
+            ]
         );
     }
 

@@ -1109,6 +1109,36 @@ feature is added or changed, update the matching entry here in the same change**
   (even a crash), so no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
+- **Separate user data dir** — `muxel --user-data-dir DIR` puts settings in
+  `DIR/config`, state and the control endpoint in `DIR/data`, and credentials in
+  a separate keychain service on Windows, macOS and Linux. This separates Muxel
+  profiles for testing or a second instance; it is not a security sandbox.
+  `DIR` holds the control bearer token, workspace and settings and must be private
+  to the intended OS account. On Windows, these files inherit `DIR`'s ACL;
+  `--user-data-dir` does not impose an owner-only ACL.
+  Outside tools pass the same flag before `ctl`, and panes
+  inherit the root even when a preset sets empty or foreign profile variables.
+  AppImage cleanup retains the selected root even when its path shares the
+  runtime mount's prefix.
+  An isolated run refuses a foreign `MUXEL_CONTROL` endpoint. Browser website
+  data persists under `DIR/data/webview2` on Windows; isolated macOS and Linux
+  browser views use nonpersistent storage, discarded when each view closes.
+  If Linux's browser helper cannot start, links, browser presets and restored
+  browser panes report failure instead of opening the system browser.
+  Local tmux panes require tmux 3.2+ to pass the root and endpoint per session;
+  older versions show an upgrade error without launching a fallback shell.
+  Restarting the pane after upgrading tmux checks support again.
+  Each isolated root uses its own tmux socket locally and over SSH. Discovery,
+  reattachment, claims, restart, close and quit stay on that socket, including
+  when older or peer metadata names another server. The regular profile keeps the `mxl` socket and reattaches legacy
+  default-socket sessions. Version and help exit without initializing a profile.
+  Relative paths and `--user-data-dir=DIR` work; empty, repeated or malformed
+  forms are refused before startup. The flag can also precede Linux browser-helper
+  commands. Child agents still use their normal
+  login/config and project files; profiler paths retain their usual locations.
+  Credentials are not migrated from the default profile; if a root cannot be
+  resolved when first used, its fallback keychain name may differ from a later
+  resolved name.
 
 ## Settings & theming
 
