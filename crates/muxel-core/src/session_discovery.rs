@@ -49,6 +49,9 @@ pub struct CodexLookupEvidence {
     pub miss: Option<CodexHintMiss>,
     pub rejected_owner: Option<(Uuid, String)>,
     pub observed_hint: Option<String>,
+    /// A previously validated sibling-owned hint was reused without a rollout
+    /// read. It can never be adopted as a new binding.
+    pub cached_rejection: bool,
 }
 
 #[derive(Debug)]
@@ -178,6 +181,7 @@ impl SessionDiscoveries {
                 miss,
                 rejected_owner: None,
                 observed_hint: None,
+                cached_rejection: false,
             },
         )
     }
@@ -198,6 +202,7 @@ impl SessionDiscoveries {
                 observed_hint: evidence.observed_hint,
                 binding_generation: self.binding_generation(owner),
             });
+        let revalidate_released_owner = evidence.cached_rejection && owner.is_none();
         let Some(state) = self.panes.get_mut(&request.key.pane) else {
             return false;
         };
@@ -207,6 +212,14 @@ impl SessionDiscoveries {
         state.codex_miss = evidence.miss;
         if !found && request.key.provider == SessionProvider::Codex {
             state.codex_owner = owner;
+        }
+        if revalidate_released_owner {
+            // The cached ID was not checked on disk in this request. When its
+            // sibling releases it mid-flight, the next poll must validate it
+            // afresh before the target may bind it.
+            state.codex_miss = None;
+            state.misses = 0;
+            state.retry_at = None;
         }
         true
     }
@@ -400,6 +413,7 @@ mod tests {
                     miss: None,
                     rejected_owner: Some((owner_id, "owned hint".into())),
                     observed_hint: key.hint.clone(),
+                    cached_rejection: false,
                 }
             ));
             assert!(

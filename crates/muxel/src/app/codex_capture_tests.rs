@@ -3,10 +3,12 @@ use super::session_discovery::{inject_codex_launch_lookup, inject_codex_resume_l
 use crate::theme;
 use gpui::{TestAppContext, WindowHandle};
 use muxel_core::{AgentPreset, CodexResumePath, Instance, Project, RemoteRef};
+use muxel_terminal::{CommandSpec, TerminalLaunch};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 use uuid::Uuid;
 
 struct TempRoot(PathBuf);
@@ -199,6 +201,63 @@ fn inconclusive_codex_resume_survives_unrelated_early_exit_recovery() {
             saved.instance(pane).unwrap().session_id.as_deref(),
             Some(id)
         );
+    });
+}
+
+#[test]
+fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let id = "01a1543c-9700-7000-8000-000000000001";
+        let _lookup = inject_codex_resume_lookup(Arc::new(|_, _, _| Ok(CodexResumePath::Unknown)));
+        let document = window
+            .update(cx, |app, window, cx| {
+                app.workspace.instance_mut(pane).unwrap().session_id = Some(id.into());
+                let (meta, spec, size) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                assert!(meta.was_resume);
+                assert!(spec.args.iter().any(|arg| arg == "resume"));
+                #[cfg(windows)]
+                let command = CommandSpec::program("cmd.exe", vec!["/C".into(), "exit 37".into()]);
+                #[cfg(not(windows))]
+                let command = CommandSpec::program("/bin/sh", vec!["-c".into(), "exit 37".into()]);
+                let launch = TerminalLaunch::spawn_for_instance(command, size, pane).unwrap();
+                app.finish_terminal_spawn(meta, Ok(launch), window, cx);
+                muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap()
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            let exited = window
+                .update(cx, |app, _, cx| {
+                    app.terminals.get(&pane).unwrap().read(cx).exited()
+                })
+                .unwrap();
+            if exited {
+                break;
+            }
+            assert!(Instant::now() < deadline, "test child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        window
+            .update(cx, |app, window, cx| app.tick(window, cx))
+            .unwrap();
+        let saved = muxel_store::load_workspace_from(&document).unwrap();
+        assert_eq!(
+            saved.instance(pane).unwrap().session_id.as_deref(),
+            Some(id)
+        );
+        window
+            .update(cx, |app, _, cx| {
+                let view = app.terminals.get(&pane).unwrap().read(cx);
+                assert!(view.exited());
+                assert_eq!(view.exit_code(), Some(37));
+                assert_eq!(
+                    app.workspace.instance(pane).unwrap().session_id.as_deref(),
+                    Some(id)
+                );
+            })
+            .unwrap();
     });
 }
 

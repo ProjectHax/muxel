@@ -406,6 +406,7 @@ fn b9_r2_codex_sibling_rejection_stops_io_until_ownership_changes() {
                         miss: None,
                         rejected_owner: Some((owner.id, candidate.id)),
                         observed_hint: key.hint.clone(),
+                        cached_rejection: false,
                     }
                 ));
             }
@@ -444,6 +445,7 @@ fn b9_r2_codex_sibling_rejection_stops_io_until_ownership_changes() {
                 miss: None,
                 rejected_owner: blocker,
                 observed_hint: key.hint.clone(),
+                cached_rejection: false,
             }
         ));
         if change == "generation" {

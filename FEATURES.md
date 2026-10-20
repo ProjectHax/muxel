@@ -171,16 +171,19 @@ feature is added or changed, update the matching entry here in the same change**
   in the background, alongside Grok's process lookup. Each pane keeps one pending
   lookup across pop-out and docking. Failed Codex hints retry with a delay that
   grows from one to thirty seconds, even while the day directory changes.
-  A sibling-owned hint waits until that ownership or binding changes. Launch,
+  A sibling-owned tmux title is reread under backoff so a later unowned title
+  can bind; its rollout validation is cached only while the same sibling owns
+  it. Other sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
   indexes take one stat. Claude and Grok retry unresolved results with backoff.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
-  A saved Codex conversation is abandoned only when its validated saved rollout
-  path and compression sibling are gone. An invalid path, unreadable store, or dated
-  lookup miss keeps the id and attempts resume; if the rollout is truly gone, Codex
-  shows its missing-session error in the pane.
+  A saved Codex conversation is abandoned when its validated saved rollout
+  path and compression sibling are both absent or non-files, or when Codex itself
+  reports that the exact resumed ID is missing soon after launch. An invalid path,
+  unreadable store, dated lookup miss, or unrelated early exit keeps the id and
+  attempts resume.
   Remote Codex panes never check the local session store. Archived Codex sessions
   require unarchiving in Codex before they can resume.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
