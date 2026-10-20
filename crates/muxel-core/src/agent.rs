@@ -1077,6 +1077,8 @@ pub(crate) fn paths_loosely_equal(a: &Path, b: &Path) -> bool {
 pub const MEMORY_DIR: &str = ".muxel";
 /// The shared per-project agent memory file, inside [`MEMORY_DIR`].
 pub const MEMORY_FILE: &str = "MEMORY.md";
+/// The per-project accomplishment log agents append to, inside [`MEMORY_DIR`].
+pub const ACCOMPLISHMENTS_FILE: &str = "ACCOMPLISHMENTS.md";
 
 /// How to refer to a project's `.muxel/MEMORY.md` from inside an agent's system
 /// prompt, given the project `root` and the `cwd` the agent will run in.
@@ -1090,8 +1092,14 @@ pub const MEMORY_FILE: &str = "MEMORY.md";
 /// Falls back to the absolute path when the memory file isn't under the cwd (an
 /// instance running in a worktree), where a relative path simply wouldn't resolve.
 pub fn memory_reference(root: &str, cwd: Option<&str>) -> String {
+    muxel_file_reference(root, cwd, MEMORY_FILE)
+}
+
+/// [`memory_reference`] for any `file` in a project's [`MEMORY_DIR`]: relative to
+/// the agent's cwd when that's the project root, absolute otherwise.
+pub fn muxel_file_reference(root: &str, cwd: Option<&str>, file: &str) -> String {
     let trimmed = root.trim_end_matches('/');
-    let relative = format!("{MEMORY_DIR}/{MEMORY_FILE}");
+    let relative = format!("{MEMORY_DIR}/{file}");
     match cwd {
         Some(cwd) if cwd.trim_end_matches('/') != trimmed => {
             format!("{trimmed}/{relative}")
@@ -1115,6 +1123,38 @@ few keywords help future greps). muxel timestamps, orders (most-recently-used \
 first), de-dupes, and prunes the file automatically, so don't renumber, reorder, or \
 delete other entries, and don't repeat what's already there."
     )
+}
+
+/// The system-prompt snippet appended when a project has its accomplishment log
+/// enabled. `path` refers to the project's `.muxel/ACCOMPLISHMENTS.md` (see
+/// [`muxel_file_reference`]); `agent` is the short name muxel fills into the line
+/// template (see [`crate::accomplishments::agent_label`]).
+///
+/// The agent is told to append with a shell command and never open the file: the
+/// log only ever grows by a line, so reading it would spend tokens on nothing the
+/// agent needs, and it's the one write path that needs no prior read in agents
+/// (Claude Code's Edit/Write tools refuse to touch a file they haven't read).
+/// Corrections are appends too — a line reusing the entry's `#KEY`, which muxel
+/// folds into the original — so updating an entry costs at most a `grep`.
+pub fn accomplishments_instruction(path: &str, agent: &str) -> String {
+    format!(
+        "Muxel keeps a log of work finished in this project at `{path}`. Don't read it. \
+Each time you complete a meaningful outcome (a feature added, a bug fixed, a \
+refactor, or a perf, docs or test improvement), append one line without opening the \
+file: `echo '- YYYY-MM-DD | TYPE | SUMMARY | {agent} | #KEY' >> {path}` (in \
+PowerShell: `Add-Content {path} '...'`). Use today's date; TYPE is one of feature, \
+fix, refactor, perf, docs, test, chore; SUMMARY is one plain sentence without `|`; \
+KEY is a short kebab-case name you choose for the result. If a logged result later \
+changes (more got fixed, part was reverted, it was renamed), append a corrected line \
+with the same #KEY and muxel replaces the old entry; if you no longer know the key, \
+grep the file for it rather than reading it. Log finished results only (not plans, \
+attempts, or intermediate steps), and each result once."
+    )
+}
+
+/// Seed contents written when a project's `ACCOMPLISHMENTS.md` is first created.
+pub fn accomplishments_header() -> &'static str {
+    crate::accomplishments::document_header()
 }
 
 /// System-prompt guidance for file citations muxel can open directly.
@@ -2097,6 +2137,36 @@ mod tests {
         assert!(
             !s.contains("sro_client"),
             "project name leaked into the agent's argv: {s}"
+        );
+    }
+
+    #[test]
+    fn accomplishments_instruction_says_append_never_read() {
+        let s = accomplishments_instruction(".muxel/ACCOMPLISHMENTS.md", "claude");
+        assert!(s.contains("Don't read it"));
+        assert!(s.contains(">> .muxel/ACCOMPLISHMENTS.md"));
+        assert!(
+            s.contains("| claude | #KEY'"),
+            "muxel fills in the agent: {s}"
+        );
+        assert!(s.contains("same #KEY"), "says how to correct an entry: {s}");
+        // The line template parses as the format the log model reads.
+        let line = "- 2026-10-20 | fix | Fixed it | claude | #fixed-it";
+        let e = crate::accomplishments::parse_line(line).expect("parses");
+        assert_eq!(e.agent.as_deref(), Some("claude"));
+        assert_eq!(e.key.as_deref(), Some("fixed-it"));
+    }
+
+    #[test]
+    fn accomplishments_reference_follows_the_memory_rules() {
+        let root = "/home/me/Projects/sro_client";
+        let rel = muxel_file_reference(root, Some(root), ACCOMPLISHMENTS_FILE);
+        assert_eq!(rel, ".muxel/ACCOMPLISHMENTS.md");
+        let s = accomplishments_instruction(&rel, "codex");
+        assert!(!s.contains("sro_client"), "project name leaked: {s}");
+        assert_eq!(
+            muxel_file_reference(root, Some("/srv/worktrees/x"), ACCOMPLISHMENTS_FILE),
+            "/home/me/Projects/sro_client/.muxel/ACCOMPLISHMENTS.md"
         );
     }
 }

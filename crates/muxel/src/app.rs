@@ -3,6 +3,7 @@
 //! renders the active project's pane tree. Live terminals are kept in
 //! `terminals`, keyed by instance id.
 
+use crate::accomplishments_view;
 use crate::editor::{
     DiskChange, DiskStamp, EditorConfig, EditorView, ExternalChange, read_disk_change,
 };
@@ -22,6 +23,7 @@ use gpui_component::spinner::Spinner;
 use gpui_component::tag::Tag;
 use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
+use muxel_core::accomplishments::{self, Accomplishment};
 use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
 use muxel_core::library::menu::menu_list_max_height;
 use muxel_core::library::resolve::{SnippetStep, snippet_send_action};
@@ -31,14 +33,15 @@ use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
-    AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity, InjectionMode, Instance,
-    InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project,
-    RemoteHost, RemoteLayout, RemoteOs, RemoteRef, ResolvedLaunch, Runner, SavedAgent, Snippet,
-    SplitDirection, SshAuth, StartupAgent, Workspace, WorkspaceMeta, WorkspacesIndex, Worktree,
-    add_tab, add_tab_at, agent_activity_label, append_agent_instruction,
-    codex_developer_instructions_override, file_link_instruction, focus_in_direction,
-    memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
-    move_pane_beside, move_tab_to, remove, resolve_launch_for_session, saved_agent, set_active_tab,
+    ACCOMPLISHMENTS_FILE, AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity,
+    InjectionMode, Instance, InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode,
+    PostRunAction, Project, RemoteHost, RemoteLayout, RemoteOs, RemoteRef, ResolvedLaunch, Runner,
+    SavedAgent, Snippet, SplitDirection, SshAuth, StartupAgent, Workspace, WorkspaceMeta,
+    WorkspacesIndex, Worktree, accomplishments_instruction, add_tab, add_tab_at,
+    agent_activity_label, append_agent_instruction, codex_developer_instructions_override,
+    file_link_instruction, focus_in_direction, memory_instruction, memory_reference,
+    migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside, move_tab_to,
+    muxel_file_reference, remove, resolve_launch_for_session, saved_agent, set_active_tab,
     set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
     sync_agent_injection_modes, sync_codex_approval_args,
 };
@@ -52,6 +55,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod accomplishments_ui;
 mod control_api;
 mod libraries_ui;
 mod popout_lifecycle;
@@ -1113,6 +1117,23 @@ fn resolve_agent_launch(
         let instruction = memory_instruction(&memory_reference(&root, cwd.as_deref()));
         add_automatic(instruction, &mut instance);
     }
+    if !resuming
+        && let Some(project) = project
+        && project.accomplishments_enabled
+        && instance.injection != InjectionMode::None
+    {
+        let root = match &project.remote {
+            Some(remote) => remote.remote_root.clone(),
+            None => project.root_path.display().to_string(),
+        };
+        let cwd = instance
+            .worktree_path
+            .as_ref()
+            .map(|w| w.display().to_string());
+        let path = muxel_file_reference(&root, cwd.as_deref(), ACCOMPLISHMENTS_FILE);
+        let agent = accomplishments::agent_label(instance.program.as_deref(), &instance.preset);
+        add_automatic(accomplishments_instruction(&path, &agent), &mut instance);
+    }
     let mut resolved = resolve_launch_for_session(&instance, resuming);
     if !codex_instructions.is_empty() {
         resolved.args.push("--config".to_string());
@@ -1216,6 +1237,38 @@ mod launch_instruction_transport_tests {
         let instructions = control.startup_input.expect("TypeIn positive control");
         assert!(instructions.contains("MEMORY.md"));
         assert!(instructions.contains("file:"));
+    }
+
+    #[test]
+    fn accomplishment_log_instruction_follows_the_project_toggle() {
+        let mut project = Project::new("repo", "/tmp/repo");
+        let pane = Instance::from_preset(project.id, &AgentPreset::opencode());
+        let off = resolve_agent_launch(&pane, Some(&project), false);
+        assert!(
+            !off.startup_input
+                .unwrap_or_default()
+                .contains("ACCOMPLISHMENTS.md"),
+            "opt-in: nothing until the project enables it"
+        );
+
+        project.accomplishments_enabled = true;
+        let on = resolve_agent_launch(&pane, Some(&project), false);
+        let instructions = on.startup_input.expect("TypeIn delivers the bundle");
+        assert!(instructions.contains(">> .muxel/ACCOMPLISHMENTS.md"));
+        assert!(
+            instructions.contains("| opencode | #KEY'"),
+            "agent filled in"
+        );
+
+        // A resumed conversation already has it; Muse takes no instructions.
+        let resumed = resolve_agent_launch(&pane, Some(&project), true);
+        assert!(resumed.startup_input.is_none());
+        let muse = Instance::from_preset(project.id, &AgentPreset::muse());
+        assert!(
+            resolve_agent_launch(&muse, Some(&project), false)
+                .args
+                .is_empty()
+        );
     }
 }
 
@@ -3249,6 +3302,38 @@ pub struct MuxelApp {
     memory_tags_input: Entity<InputState>,
     /// Id of the entry showing an inline "delete?" confirm, if any.
     memory_confirm_delete: Option<Uuid>,
+    /// Accomplishment-log panel (`.muxel/ACCOMPLISHMENTS.md`), docked in the same
+    /// slot as the file browser and memory panels.
+    show_accomplishments: bool,
+    accomplishments_pid: Option<Uuid>,
+    accomplishments_search: Entity<InputState>,
+    /// Quick-add box: `fix: what was done`.
+    accomplishments_add_input: Entity<InputState>,
+    /// The entry showing an inline "delete?" confirm, if any.
+    accomplishments_confirm_delete: Option<Accomplishment>,
+    /// Loaded logs per project, shared by the panel and the overviews. Runtime-only.
+    accomplishment_logs: HashMap<Uuid, accomplishments_view::ProjectLog>,
+    /// Bumped on every change to `accomplishment_logs` (or what the overview shows
+    /// of it), so overviews rebuild their snapshot only when there's news.
+    accomplishments_generation: u64,
+    /// Projects whose log is loading now, and those that changed again meanwhile
+    /// (reloaded once the current load lands, so the change isn't lost).
+    accomplishments_loading: HashSet<Uuid>,
+    accomplishments_stale: HashSet<Uuid>,
+    /// When open views last polled their local log files for changes.
+    accomplishments_polled_at: Option<Instant>,
+    /// When the background maintenance pass last ran (`None` = run on next tick).
+    accomplishments_checked_at: Option<Instant>,
+    /// Local day each project's log was last maintained (pruned), and when a
+    /// project whose load failed may be retried.
+    accomplishments_maintained: HashMap<Uuid, i64>,
+    accomplishments_retry_at: HashMap<Uuid, Instant>,
+    /// The all-projects overview in place of the pane area (like the dashboard).
+    show_accomplishments_overview: bool,
+    /// Its view, created on first open and kept (its search/filters with it).
+    accomplishments_overview: Option<Entity<accomplishments_view::AccomplishmentsOverview>>,
+    /// The popped-out overview window, if open.
+    accomplishments_window: Option<WindowHandle<gpui_component::Root>>,
     /// Whether the settings page is shown.
     show_settings: bool,
     /// Settings-page widgets + selection state.
@@ -3320,6 +3405,8 @@ pub struct MuxelApp {
     split_resize_notify_task: Option<Task<()>>,
     /// Projects whose `.muxel/MEMORY.md` we've ensured this session (once each).
     memory_ensured: HashSet<Uuid>,
+    /// Projects whose `.muxel/ACCOMPLISHMENTS.md` we've ensured this session.
+    accomplishments_ensured: HashSet<Uuid>,
     /// Remote projects whose layout we've reconciled with the host this session
     /// (the connect-time pull/push decision runs once each, like `memory_ensured`).
     remote_synced: HashSet<Uuid>,
@@ -3624,6 +3711,9 @@ enum PaletteCommand {
     ToggleDashboard,
     OpenSettings,
     OpenMemory,
+    OpenAccomplishments,
+    ShowAllAccomplishments,
+    PopOutAccomplishments,
     ReadAloud,
     ReadAloudRestart,
     ReadAloudStop,
@@ -4271,6 +4361,7 @@ enum SaveTarget {
     Settings,
     WorkspaceIndex,
     Memory,
+    Accomplishments,
     LayoutBackup,
 }
 
@@ -4281,6 +4372,7 @@ impl SaveTarget {
             Self::Settings => t("Couldn't save settings"),
             Self::WorkspaceIndex => t("Couldn't save workspace list"),
             Self::Memory => t("Couldn't save project memory"),
+            Self::Accomplishments => t("Couldn't save the accomplishment log"),
             Self::LayoutBackup => t("Layout backup failed"),
         }
     }
@@ -5425,6 +5517,30 @@ impl MuxelApp {
             cx.new(|cx| InputState::new(window, cx).placeholder(t("Note (one line)")));
         let memory_tags_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t("tags (comma-separated)")));
+        let accomplishments_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("Search accomplishments…")));
+        cx.subscribe_in(
+            &accomplishments_search,
+            window,
+            |_this, _input, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        let accomplishments_add_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("Log one: fix: what was done")));
+        cx.subscribe_in(
+            &accomplishments_add_input,
+            window,
+            |this, _input, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    this.add_accomplishment(window, cx);
+                }
+            },
+        )
+        .detach();
 
         let runners = settings.runners.clone();
         let snippets = settings.snippets.clone();
@@ -5507,6 +5623,22 @@ impl MuxelApp {
             memory_note_input,
             memory_tags_input,
             memory_confirm_delete: None,
+            show_accomplishments: false,
+            accomplishments_pid: None,
+            accomplishments_search,
+            accomplishments_add_input,
+            accomplishments_confirm_delete: None,
+            accomplishment_logs: HashMap::new(),
+            accomplishments_generation: 0,
+            accomplishments_loading: HashSet::new(),
+            accomplishments_stale: HashSet::new(),
+            accomplishments_polled_at: None,
+            accomplishments_checked_at: None,
+            accomplishments_maintained: HashMap::new(),
+            accomplishments_retry_at: HashMap::new(),
+            show_accomplishments_overview: false,
+            accomplishments_overview: None,
+            accomplishments_window: None,
             show_settings: false,
             settings_ui,
             rename: None,
@@ -5618,6 +5750,7 @@ impl MuxelApp {
             save_errors: HashMap::new(),
             split_resize_notify_task: None,
             memory_ensured: HashSet::new(),
+            accomplishments_ensured: HashSet::new(),
             remote_synced: HashSet::new(),
             remote_connecting: HashSet::new(),
             host_connects: HostConnects::default(),
@@ -5690,6 +5823,11 @@ impl MuxelApp {
                             gpui::AnyWindowHandle::from(h).window_id() == window_id
                         }) {
                             this.dev_console_window = None;
+                        }
+                        if this.accomplishments_window.is_some_and(|h| {
+                            gpui::AnyWindowHandle::from(h).window_id() == window_id
+                        }) {
+                            this.accomplishments_window = None;
                         }
                     });
                 }
@@ -6453,6 +6591,16 @@ impl MuxelApp {
             spec.env
                 .push(("MUXEL_MEMORY_DIR".into(), dir.display().to_string()));
         }
+        if let Some(p) = project
+            && p.accomplishments_enabled
+            && p.remote.is_none()
+        {
+            let file = p.root_path.join(MEMORY_DIR).join(ACCOMPLISHMENTS_FILE);
+            spec.env.push((
+                "MUXEL_ACCOMPLISHMENTS_FILE".into(),
+                file.display().to_string(),
+            ));
+        }
 
         // Status markers: the preset's overrides per field, else the program's
         // built-in defaults (empty → bell/activity heuristic).
@@ -7141,6 +7289,14 @@ impl MuxelApp {
             && self.memory_ensured.insert(pid)
         {
             self.ensure_project_memory(pid, cx);
+        }
+        if self
+            .workspace
+            .project(pid)
+            .is_some_and(|p| p.accomplishments_enabled)
+            && self.accomplishments_ensured.insert(pid)
+        {
+            self.ensure_project_accomplishments(pid, cx);
         }
         let is_remote = self.workspace.project(pid).is_some_and(|p| p.is_remote());
         // The first time we reach a layout-synced project this session, reconcile its
@@ -8486,6 +8642,13 @@ impl MuxelApp {
             }
         }
         self.last_status.clear();
+        // The log cache is per project; open overviews reload for the new set.
+        self.accomplishment_logs.clear();
+        self.accomplishments_maintained.clear();
+        self.accomplishments_retry_at.clear();
+        self.accomplishments_checked_at = None;
+        self.accomplishments_generation += 1;
+        self.show_accomplishments = false;
         self.maximized = None;
         self.workspace = Workspace::default();
         self.active_instance = None;
@@ -9144,7 +9307,16 @@ impl MuxelApp {
 
     fn toggle_dashboard(&mut self, cx: &mut Context<Self>) {
         self.show_dashboard = !self.show_dashboard;
+        if self.show_dashboard {
+            self.show_accomplishments_overview = false;
+        }
         cx.notify();
+    }
+
+    /// Whether the main window's pane area is replaced by a full-size view (the
+    /// dashboard or the accomplishments overview), so no pane content is on screen.
+    fn main_view_replaced(&self) -> bool {
+        self.show_dashboard || self.show_accomplishments_overview
     }
 
     /// The project shown by `window` when it's a popped-out project window;
@@ -10057,6 +10229,7 @@ impl MuxelApp {
             worktrees,
             updated_at,
             memory_enabled,
+            accomplishments_enabled,
             ..
         } = remote;
         let mut instances = muxel_core::merge_peer_instances(&local, instances, pid);
@@ -10101,6 +10274,9 @@ impl MuxelApp {
             p.layout_updated_at = Some(updated_at);
             if let Some(enabled) = memory_enabled {
                 p.memory_enabled = enabled;
+            }
+            if let Some(enabled) = accomplishments_enabled {
+                p.accomplishments_enabled = enabled;
             }
         }
         self.seed_adopted_layout(pid, remote_key);
@@ -10447,6 +10623,9 @@ impl MuxelApp {
         let mut status_notify_generation = None;
         let mut status_transition_count = 0;
         let mut activity_changed = false;
+        // Projects where an agent just finished a turn — when agents append to the
+        // accomplishment log.
+        let mut turns_finished: Vec<Uuid> = Vec::new();
         let now_epoch = chrono::Utc::now().timestamp_millis();
         for Snap {
             iid,
@@ -10475,6 +10654,12 @@ impl MuxelApp {
                 .and_then(|instance| instance.activity.current_state());
             let previous = self.last_status.insert(iid, status);
             let changed = previous != Some(status);
+            if changed
+                && previous == Some(AgentStatus::Working)
+                && let Some(instance) = self.workspace.instance(iid)
+            {
+                turns_finished.push(instance.project_id);
+            }
             if changed {
                 if status_notify_generation.is_none() {
                     status_notify_generation = ui_profile::begin_status_dirty();
@@ -10807,6 +10992,8 @@ impl MuxelApp {
         for iid in to_read_aloud {
             self.enqueue_read_aloud(iid, cx);
         }
+        self.refresh_accomplishments_after_turns(turns_finished, cx);
+        self.poll_accomplishments(cx);
 
         let popout_activity = self.sync_popout_activity(now_epoch, cx);
         activity_changed |= popout_activity.persist;
@@ -12297,7 +12484,7 @@ impl MuxelApp {
     /// Browser instances whose pane content is actually on screen: the shown tab
     /// of each leaf in the active project (respecting maximize + dashboard).
     fn visible_browser_ids(&self) -> Vec<Uuid> {
-        if self.browsers.is_empty() || self.show_dashboard {
+        if self.browsers.is_empty() || self.main_view_replaced() {
             return Vec::new();
         }
         let Some(project) = self.workspace.active() else {
@@ -12787,7 +12974,10 @@ impl MuxelApp {
         // Only meaningful with an active project to open the memory for.
         if self.workspace.active_project.is_some() {
             cmds.push(OpenMemory);
+            cmds.push(OpenAccomplishments);
         }
+        cmds.push(ShowAllAccomplishments);
+        cmds.push(PopOutAccomplishments);
         cmds.extend((0..self.runners.len()).map(RunRunner));
         // Snippets target the focused pane, so only offer them when one is a live
         // terminal ready to receive typed text.
@@ -12814,6 +13004,13 @@ impl MuxelApp {
             PaletteCommand::ToggleDashboard => t("Toggle dashboard (all agents)").into(),
             PaletteCommand::OpenSettings => t("Open settings").into(),
             PaletteCommand::OpenMemory => t("Open project memory (.muxel/MEMORY.md)").into(),
+            PaletteCommand::OpenAccomplishments => t("Open project accomplishments").into(),
+            PaletteCommand::ShowAllAccomplishments => {
+                t("Show accomplishments (all projects)").into()
+            }
+            PaletteCommand::PopOutAccomplishments => {
+                t("Pop out accomplishments (all projects)").into()
+            }
             PaletteCommand::ReadAloud => match self
                 .read_aloud_target()
                 .map_or(ReadState::Idle, |iid| self.readings.state(iid))
@@ -12860,6 +13057,17 @@ impl MuxelApp {
                     self.open_memory_panel(pid, window, cx);
                 }
             }
+            PaletteCommand::OpenAccomplishments => {
+                if let Some(pid) = self.workspace.active_project {
+                    self.open_accomplishments_panel(pid, window, cx);
+                }
+            }
+            PaletteCommand::ShowAllAccomplishments => {
+                if !self.show_accomplishments_overview {
+                    self.toggle_accomplishments_overview(window, cx);
+                }
+            }
+            PaletteCommand::PopOutAccomplishments => self.pop_out_accomplishments(cx),
             PaletteCommand::ReadAloud => self.toggle_read_aloud(cx),
             PaletteCommand::ReadAloudRestart => match self.read_aloud_target() {
                 Some(iid) => self.restart_reading(iid, cx),
@@ -14113,7 +14321,9 @@ impl MuxelApp {
     /// is already open must leave it open, not close it.
     fn open_memory_panel(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.show_memory = true;
-        self.show_file_browser = false; // the two docked panels share the slot
+        // The docked panels share one slot.
+        self.show_file_browser = false;
+        self.show_accomplishments = false;
         self.memory_pid = Some(pid);
         self.memory_confirm_delete = None;
         for input in [
@@ -14569,6 +14779,7 @@ impl MuxelApp {
             mut worktrees,
             updated_at,
             memory_enabled,
+            accomplishments_enabled,
             ..
         } = remote;
         // Shared memory is the host's state, not this machine's: the memory file
@@ -14578,6 +14789,12 @@ impl MuxelApp {
             && let Some(project) = self.workspace.project_mut(pid)
         {
             project.memory_enabled = enabled;
+        }
+        // The accomplishment log is shared the same way (one file on the host).
+        if let Some(enabled) = accomplishments_enabled
+            && let Some(project) = self.workspace.project_mut(pid)
+        {
+            project.accomplishments_enabled = enabled;
         }
         // What this machine observed of each pane (program title, grid, activity) is
         // its own; a structural pull must not replace it with the peer's.
@@ -15587,7 +15804,7 @@ impl MuxelApp {
         let Some(pid) = self.workspace.instance(max).map(|i| i.project_id) else {
             return false;
         };
-        let shown = (self.workspace.active_project == Some(pid) && !self.show_dashboard)
+        let shown = (self.workspace.active_project == Some(pid) && !self.main_view_replaced())
             || self.secondary_windows.iter().any(|s| s.pid == pid);
         shown
             && self
@@ -19049,6 +19266,13 @@ impl MuxelApp {
         }
     }
 
+    fn set_accomplishments_panel_width(&mut self, width: f32, _cx: &mut Context<Self>) {
+        if self.workspace.accomplishments_panel_width != Some(width) {
+            self.workspace.accomplishments_panel_width = Some(width);
+            self.persist();
+        }
+    }
+
     /// Toggle the file-browser sidebar for project `pid` (hides if already shown
     /// for that project; otherwise selects it + loads its file list in the
     /// background so a large repo doesn't freeze the UI).
@@ -19071,7 +19295,9 @@ impl MuxelApp {
             return;
         }
         self.show_file_browser = true;
-        self.show_memory = false; // the two docked panels share the slot
+        // The docked panels share one slot.
+        self.show_memory = false;
+        self.show_accomplishments = false;
         // `select_project` re-points the open browser at `pid` (see its tail).
         self.select_project(pid, window, cx);
     }
@@ -22052,6 +22278,7 @@ impl MuxelApp {
             let name: SharedString = project.name.clone().into();
             let has_startup = !project.startup.is_empty();
             let memory_on = project.memory_enabled;
+            let accomplishments_on = project.accomplishments_enabled;
             let is_repo = self.project_branches.get(&pid).is_some_and(|b| b.is_some());
             let is_local = project.remote.is_none();
             let remote_host_id = project.remote.as_ref().map(|r| r.host_id);
@@ -22192,6 +22419,25 @@ impl MuxelApp {
                                     })),
                             )
                     }))
+                    .children(accomplishments_on.then(|| {
+                        div()
+                            .flex_none()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new(SharedString::from(format!("accomplishments-{ix}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::CircleCheck)
+                                    .selected(
+                                        self.show_accomplishments
+                                            && self.accomplishments_pid == Some(pid),
+                                    )
+                                    .tooltip(t("Accomplishments"))
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
+                                        this.toggle_accomplishments_panel(pid, window, cx)
+                                    })),
+                            )
+                    }))
                     .child(
                         div()
                             .flex_none()
@@ -22303,6 +22549,32 @@ impl MuxelApp {
                                             &entity,
                                             move |this, _, _window, cx| {
                                                 this.toggle_project_memory(pid, cx)
+                                            },
+                                        ),
+                                    ),
+                                )
+                                .item(
+                                    PopupMenuItem::new(t("Open accomplishments"))
+                                        .icon(IconName::CircleCheck)
+                                        .on_click(window.listener_for(
+                                            &entity,
+                                            move |this, _, window, cx| {
+                                                this.open_accomplishments_panel(pid, window, cx)
+                                            },
+                                        )),
+                                )
+                                .item(
+                                    PopupMenuItem::new(if accomplishments_on {
+                                        t("Disable accomplishment log")
+                                    } else {
+                                        t("Enable accomplishment log")
+                                    })
+                                    .icon(IconName::File)
+                                    .on_click(
+                                        window.listener_for(
+                                            &entity,
+                                            move |this, _, _window, cx| {
+                                                this.toggle_project_accomplishments(pid, cx)
                                             },
                                         ),
                                     ),
@@ -23524,6 +23796,24 @@ impl MuxelApp {
                                 cx.listener(|this, _ev, _window, cx| this.toggle_dashboard(cx)),
                             ),
                     ))
+                    .children(
+                        self.workspace
+                            .projects
+                            .iter()
+                            .any(|p| p.accomplishments_enabled)
+                            .then(|| {
+                                nodrag(
+                                    Button::new("accomplishments-overview")
+                                        .ghost()
+                                        .icon(IconName::CircleCheck)
+                                        .selected(self.show_accomplishments_overview)
+                                        .tooltip(t("Accomplishments (all projects)"))
+                                        .on_click(cx.listener(|this, _ev, window, cx| {
+                                            this.toggle_accomplishments_overview(window, cx)
+                                        })),
+                                )
+                            }),
+                    )
                     .child(nodrag(
                         Button::new("settings")
                             .ghost()
@@ -29628,12 +29918,74 @@ impl MuxelApp {
                 .into_any_element(),
         };
 
-        div()
-            .flex()
-            .flex_row()
+        // Global (all projects): how much accomplishment-log history to keep.
+        let days = accomplishments::clamp_retention(self.settings.accomplishment_retention_days);
+        let retention = v_flex()
+            .gap_1()
+            .child(self.settings_label(&t("Accomplishment log history (all projects)"), cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("acc-days-dec")
+                            .ghost()
+                            .label("−")
+                            .disabled(days <= 1)
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.adjust_accomplishment_retention(-1, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w(rems(6.0))
+                            .text_center()
+                            .child(tf("{days} days", &[("days", &days.to_string())])),
+                    )
+                    .child(
+                        Button::new("acc-days-inc")
+                            .ghost()
+                            .label("+")
+                            .disabled(days >= accomplishments::MAX_RETENTION_DAYS)
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.adjust_accomplishment_retention(1, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("acc-days-reset")
+                            .ghost()
+                            .small()
+                            .label(t("Default"))
+                            .disabled(days == accomplishments::DEFAULT_RETENTION_DAYS)
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.set_accomplishment_retention(
+                                    accomplishments::DEFAULT_RETENTION_DAYS,
+                                    cx,
+                                )
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t(
+                        "Older entries are pruned from each project's .muxel/ACCOMPLISHMENTS.md.",
+                    )),
+            );
+
+        v_flex()
             .gap_4()
-            .child(list)
-            .child(div().flex_1().min_w_0().child(editor))
+            .child(retention)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_4()
+                    .child(list)
+                    .child(div().flex_1().min_w_0().child(editor)),
+            )
             .into_any_element()
     }
 
@@ -29692,6 +30044,18 @@ impl MuxelApp {
                         this.toggle_project_memory(pid, cx)
                     })),
                 &t("Shared agent memory — agents read + append lessons in .muxel/MEMORY.md across runs"),
+            ))
+            .child(self.check_row(
+                Checkbox::new("proj-accomplishments")
+                    .checked(
+                        self.workspace
+                            .project(pid)
+                            .is_some_and(|p| p.accomplishments_enabled),
+                    )
+                    .on_click(cx.listener(move |this, _c: &bool, _w, cx| {
+                        this.toggle_project_accomplishments(pid, cx)
+                    })),
+                &t("Accomplishment log — agents append each finished feature or fix to .muxel/ACCOMPLISHMENTS.md (they never read it)"),
             ))
             .child(
                 div()
@@ -29943,6 +30307,10 @@ impl Render for MuxelApp {
         });
         let main_content: AnyElement = if self.show_dashboard {
             self.render_dashboard(cx)
+        } else if self.show_accomplishments_overview
+            && let Some(overview) = &self.accomplishments_overview
+        {
+            overview.clone().into_any_element()
         } else if let Some((fpid, msg)) = failed_remote {
             self.render_remote_connect_failed(fpid, &msg, cx)
         } else if let Some(leaf) = maximized_here {
@@ -30041,6 +30409,37 @@ impl Render for MuxelApp {
                     }
                 })
                 .into_any_element()
+        } else if self.show_accomplishments {
+            let acc_half = (f32::from(window.viewport_size().width) * 0.5).max(360.0);
+            let acc_saved = self
+                .workspace
+                .accomplishments_panel_width
+                .unwrap_or(300.0)
+                .clamp(220.0, acc_half);
+            let acc_key = SharedString::from(format!(
+                "acc-split-{}",
+                self.current_workspace
+                    .map(|p| p.simple().to_string())
+                    .unwrap_or_default()
+            ));
+            h_resizable(acc_key)
+                .child(
+                    resizable_panel()
+                        .fixed_size(px(acc_saved))
+                        .size_range(px(220.0)..px(acc_half))
+                        .child(self.render_accomplishments_panel(cx)),
+                )
+                .child(resizable_panel().child(main_column))
+                .on_resize(|state, _window, cx| {
+                    let width = state.read(cx).sizes().first().map(|p| f32::from(*p));
+                    if let Some(width) = width
+                        && let Some(app) =
+                            cx.try_global::<MuxelHandle>().and_then(|h| h.0.upgrade())
+                    {
+                        app.update(cx, |app, cx| app.set_accomplishments_panel_width(width, cx));
+                    }
+                })
+                .into_any_element()
         } else {
             main_column.into_any_element()
         };
@@ -30049,6 +30448,8 @@ impl Render for MuxelApp {
                 180.0
             } else if self.show_memory {
                 200.0
+            } else if self.show_accomplishments {
+                220.0
             } else {
                 0.0
             };

@@ -2,6 +2,7 @@
 //! the pane layout tree. No UI, no I/O; everything here is serializable and
 //! unit-tested so the GPUI app and persistence layer can build on it.
 
+pub mod accomplishments;
 mod agent;
 mod appimage;
 pub mod audio;
@@ -31,12 +32,13 @@ pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
-    AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
-    append_agent_instruction, claude_session_cwd, claude_session_path,
-    codex_developer_instructions_override, codex_latest_session_id, codex_session_exists,
-    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_matches_cwd,
-    codex_session_names, codex_terminal_title_override, file_link_instruction,
-    find_claude_session_path, memory_header, memory_instruction, memory_reference, resolve_launch,
+    ACCOMPLISHMENTS_FILE, AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind,
+    ResolvedLaunch, accomplishments_header, accomplishments_instruction, append_agent_instruction,
+    claude_session_cwd, claude_session_path, codex_developer_instructions_override,
+    codex_latest_session_id, codex_session_exists, codex_session_hint_from_title,
+    codex_session_id_from_hint, codex_session_matches_cwd, codex_session_names,
+    codex_terminal_title_override, file_link_instruction, find_claude_session_path, memory_header,
+    memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
     resolve_launch_for_session, session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
@@ -971,6 +973,10 @@ pub struct Project {
     /// at a `.muxel/MEMORY.md` file they read + append lessons to across runs.
     #[serde(default)]
     pub memory_enabled: bool,
+    /// Inject the accomplishment-log instruction into this project's agents, so they
+    /// append each finished feature/fix/… to `.muxel/ACCOMPLISHMENTS.md`.
+    #[serde(default)]
+    pub accomplishments_enabled: bool,
     /// Unix-seconds version stamp for this project's pane layout, advanced when the
     /// layout/instances change. Drives newer-wins sync of a remote project's layout
     /// to/from `<remote_root>/.muxel/workspace.json`. `None` until first change/sync.
@@ -1007,6 +1013,7 @@ impl Project {
             startup: Vec::new(),
             remote: None,
             memory_enabled: false,
+            accomplishments_enabled: false,
             layout_updated_at: None,
             closed_sessions: Vec::new(),
         }
@@ -1115,6 +1122,9 @@ pub struct Workspace {
     /// Persisted memory-panel sidebar width in pixels (None = default).
     #[serde(default)]
     pub memory_panel_width: Option<f32>,
+    /// Persisted accomplishments-panel sidebar width in pixels (None = default).
+    #[serde(default)]
+    pub accomplishments_panel_width: Option<f32>,
     /// Persisted git-diff panel width in pixels (None = default).
     #[serde(default)]
     pub gitdiff_panel_width: Option<f32>,
@@ -1298,6 +1308,11 @@ pub struct RemoteLayout {
     /// memory off for everyone.
     #[serde(default)]
     pub memory_enabled: Option<bool>,
+    /// Whether the project's accomplishment log (`.muxel/ACCOMPLISHMENTS.md`) is on.
+    /// Shared state for the same reason as [`Self::memory_enabled`]: every agent on
+    /// the host appends to the one file. `None` = a doc from before the field.
+    #[serde(default)]
+    pub accomplishments_enabled: Option<bool>,
 }
 
 impl RemoteLayout {
@@ -1338,6 +1353,7 @@ impl RemoteLayout {
             instances,
             worktrees,
             memory_enabled: Some(project.memory_enabled),
+            accomplishments_enabled: Some(project.accomplishments_enabled),
         }
     }
 
@@ -1416,6 +1432,7 @@ impl RemoteLayout {
             // In the key, so flipping the toggle counts as a change and is pushed to
             // the host rather than sitting on one machine.
             "memory_enabled": self.memory_enabled,
+            "accomplishments_enabled": self.accomplishments_enabled,
         })
         .to_string()
     }
@@ -2326,6 +2343,10 @@ pub struct Settings {
     /// Shared runners the user confirmed, with the content they confirmed.
     #[serde(default)]
     pub shared_runner_confirmations: Vec<library::SharedRunnerConfirmation>,
+    /// Days of accomplishment-log history kept per project (today counts as one);
+    /// older entries are pruned from `.muxel/ACCOMPLISHMENTS.md`.
+    #[serde(default = "default_accomplishment_retention_days")]
+    pub accomplishment_retention_days: u32,
 }
 
 fn default_stt_model() -> String {
@@ -2357,6 +2378,9 @@ fn default_tts_provider_model() -> String {
 }
 fn default_tts_rate() -> f32 {
     1.0
+}
+fn default_accomplishment_retention_days() -> u32 {
+    accomplishments::DEFAULT_RETENTION_DAYS
 }
 
 fn default_editor_font_size() -> f32 {
@@ -2617,6 +2641,7 @@ impl Default for Settings {
             libraries: Vec::new(),
             shared_loops: Vec::new(),
             shared_runner_confirmations: Vec::new(),
+            accomplishment_retention_days: default_accomplishment_retention_days(),
         }
     }
 }
@@ -2887,6 +2912,7 @@ mod settings_tests {
         assert_eq!(s.read_aloud_auto, ReadAloudAuto::Off);
         assert!(!s.read_aloud_announce);
         assert_eq!(s.tts_rate, 1.0);
+        assert_eq!(s.accomplishment_retention_days, 14);
         assert!(s.tts_system_voice.is_empty());
         assert_eq!(s.speak_options(), readaloud::SpeakOptions::default());
         // Saved choices come back.

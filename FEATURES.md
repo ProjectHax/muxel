@@ -271,6 +271,33 @@ feature is added or changed, update the matching entry here in the same change**
   (pinned entries are exempt from purge and cap), delete (with confirm), or open the
   raw `MEMORY.md` in the editor. Entries load and persist over SSH for remote
   projects too.
+- **Accomplishment log** — opt-in per project (sidebar right-click or Settings →
+  Projects): agents are told to append one line to `.muxel/ACCOMPLISHMENTS.md` each
+  time they finish a feature, fix, refactor, or perf/docs/test improvement —
+  `- date | type | summary | agent | #key` — with a shell append, **never reading the
+  file**, so logging costs agents almost nothing. **Entries can be corrected**: if a
+  result later changes (more got fixed, part was reverted), the agent appends a
+  line with the same `#key` (grepping for it if needed, still not reading the file)
+  and muxel folds it into the original, which keeps its date and shows "updated"
+  with the correction's day. muxel fills in the agent's name, stamps undated lines,
+  keys unkeyed ones (so any entry can be corrected), drops duplicates, and prunes
+  entries whose last change is older than the history window
+  (**14 days** by default, 1–90 in Settings → Projects) **on its own**: a background
+  pass maintains every log-enabled project once a day (at startup and after each day
+  rollover), with or without a view open, and changing the window re-prunes them
+  all. Remote projects are maintained once their host is connected (pruning never
+  opens a connection by itself). muxel rewrites the file only when something
+  actually changes. Works for local and remote SSH projects; local agents also get
+  the path in `MUXEL_ACCOMPLISHMENTS_FILE`.
+- **Accomplishments panel** — a check button on the project row opens a docked,
+  resizable panel (sharing the file-browser/memory slot) listing the log by day,
+  newest first, with colored type tags, per-type totals, search, delete, and a
+  quick-add box (`fix: what was done`). It updates live while open: local logs are
+  watched by file stamp, and remote ones refresh when an agent finishes a turn.
+- **All-projects accomplishments** — the title-bar check button (or the palette's
+  "Show accomplishments") swaps the pane area for an overview of every log-enabled
+  project, grouped by day and then project, with type and project filters and
+  search. It can **pop out** into its own window, to keep on another monitor.
 
 ## Agent status
 

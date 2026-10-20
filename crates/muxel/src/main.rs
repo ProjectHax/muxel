@@ -7,6 +7,7 @@
 // logs stay visible during development.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accomplishments_view;
 mod app;
 mod browser;
 #[cfg(target_os = "linux")]

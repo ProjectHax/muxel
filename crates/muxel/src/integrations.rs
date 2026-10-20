@@ -5,12 +5,14 @@ use crate::i18n::{t, tf};
 #[cfg(test)]
 use crate::test_support::{GitStopReason, GitTimingReceipt, GitTimings};
 use anyhow::{Context, Result, bail};
+use muxel_core::accomplishments::{self, Accomplishment};
 use muxel_core::library::GitFailure;
 use muxel_core::library::resync::LocalChanges;
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::{
-    MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth, memory_header, remote_ops, ssh,
+    ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth,
+    accomplishments_header, memory_header, remote_ops, ssh,
 };
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -353,27 +355,44 @@ fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
 /// create `<root>/.muxel/`, seed `MEMORY.md` if absent, and add `.muxel/` to the
 /// repo's `.gitignore` if not already there. Works for a local or remote `loc`.
 pub fn ensure_memory_file(loc: &RepoLoc) -> Result<()> {
+    ensure_muxel_file(loc, MEMORY_FILE, memory_header(), "ensure memory failed")
+}
+
+/// [`ensure_memory_file`] for the project's `.muxel/ACCOMPLISHMENTS.md`.
+pub fn ensure_accomplishments_file(loc: &RepoLoc) -> Result<()> {
+    ensure_muxel_file(
+        loc,
+        ACCOMPLISHMENTS_FILE,
+        accomplishments_header(),
+        "ensure accomplishments failed",
+    )
+}
+
+/// Create `<root>/.muxel/`, seed `<file>` in it with `header` if absent, and make
+/// sure `.muxel/` is git-ignored. `failed` is the error when a remote host says
+/// nothing about why it couldn't.
+fn ensure_muxel_file(loc: &RepoLoc, file: &str, header: &str, failed: &str) -> Result<()> {
     let ignore_line = format!("{MEMORY_DIR}/");
     match loc {
         RepoLoc::Local(root) => {
             let dir = root.join(MEMORY_DIR);
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            let file = dir.join(MEMORY_FILE);
+            let file = dir.join(file);
             if !file.exists() {
-                std::fs::write(&file, memory_header())
+                std::fs::write(&file, header)
                     .with_context(|| format!("writing {}", file.display()))?;
             }
             ensure_gitignored(root, &ignore_line)
         }
         RepoLoc::Remote(c) => {
             let root = c.remote_path.trim_end_matches('/');
-            let file = format!("{MEMORY_DIR}/{MEMORY_FILE}");
+            let file = format!("{MEMORY_DIR}/{file}");
             let cmd = remote_ops::ensure_seeded_file(
                 c.host.os,
                 root,
                 MEMORY_DIR,
                 &file,
-                memory_header(),
+                header,
                 &ignore_line,
             );
             let out = remote_ssh_command(c, cmd)
@@ -382,14 +401,7 @@ pub fn ensure_memory_file(loc: &RepoLoc) -> Result<()> {
             if !out.status.success() {
                 let msg = String::from_utf8_lossy(&out.stderr);
                 let msg = msg.trim();
-                bail!(
-                    "{}",
-                    if msg.is_empty() {
-                        "ensure memory failed"
-                    } else {
-                        msg
-                    }
-                );
+                bail!("{}", if msg.is_empty() { failed } else { msg });
             }
             Ok(())
         }
@@ -398,14 +410,15 @@ pub fn ensure_memory_file(loc: &RepoLoc) -> Result<()> {
 
 /// Absolute path of a project's `.muxel/MEMORY.md`, local or remote.
 fn memory_abs(loc: &RepoLoc) -> String {
+    muxel_file_abs(loc, MEMORY_FILE)
+}
+
+/// Absolute path of `file` in a project's `.muxel/`, local or remote.
+fn muxel_file_abs(loc: &RepoLoc, file: &str) -> String {
     match loc {
-        RepoLoc::Local(root) => root
-            .join(MEMORY_DIR)
-            .join(MEMORY_FILE)
-            .display()
-            .to_string(),
+        RepoLoc::Local(root) => root.join(MEMORY_DIR).join(file).display().to_string(),
         RepoLoc::Remote(c) => format!(
-            "{}/{MEMORY_DIR}/{MEMORY_FILE}",
+            "{}/{MEMORY_DIR}/{file}",
             c.remote_path.trim_end_matches('/')
         ),
     }
@@ -455,6 +468,78 @@ pub fn save_memory(loc: &RepoLoc, entries: &[MemoryEntry]) -> Result<()> {
         }
         RepoLoc::Remote(_) => write_remote_file(loc, &memory_abs(loc), &text),
     }
+}
+
+/// A project's accomplishment log as text. A missing file reads as empty (the log
+/// simply has nothing yet); an unreadable one, or a host that can't be reached, is
+/// an error, so a view can say it couldn't load rather than show "nothing done".
+fn read_accomplishments_text(loc: &RepoLoc) -> Result<String> {
+    let path = muxel_file_abs(loc, ACCOMPLISHMENTS_FILE);
+    match loc {
+        RepoLoc::Local(_) => match std::fs::read(&path) {
+            // Lossy: one badly encoded append must not hide the rest of the log.
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e).with_context(|| format!("reading {path}")),
+        },
+        RepoLoc::Remote(_) => {
+            read_remote_file(loc, &path).with_context(|| format!("couldn't read {path}"))
+        }
+    }
+}
+
+/// Overwrite the accomplishment log with `text`, creating `.muxel/` (git-ignored)
+/// first if needed.
+fn write_accomplishments_text(loc: &RepoLoc, text: &str) -> Result<()> {
+    ensure_accomplishments_file(loc)?;
+    let path = muxel_file_abs(loc, ACCOMPLISHMENTS_FILE);
+    match loc {
+        RepoLoc::Local(_) => std::fs::write(&path, text).with_context(|| format!("writing {path}")),
+        RepoLoc::Remote(_) => write_remote_file(loc, &path, text),
+    }
+}
+
+/// Load a project's accomplishment log, maintained (stamped, deduped, pruned to
+/// `retention_days`; `now` is local wall-clock seconds), oldest first.
+///
+/// Agents append to this file while muxel may be rewriting it, so muxel writes only
+/// when maintenance changes something (about once a day, when an entry ages out),
+/// and re-reads just before writing so a line appended in between is kept.
+pub fn maintain_accomplishments(
+    loc: &RepoLoc,
+    now: i64,
+    retention_days: u32,
+) -> Result<Vec<Accomplishment>> {
+    let text = read_accomplishments_text(loc)?;
+    if accomplishments::plan_rewrite(&text, now, retention_days).is_none() {
+        return Ok(accomplishments::parse_document(&text));
+    }
+    let fresh = read_accomplishments_text(loc)?;
+    match accomplishments::plan_rewrite(&fresh, now, retention_days) {
+        Some(doc) => {
+            write_accomplishments_text(loc, &doc)?;
+            Ok(accomplishments::parse_document(&doc))
+        }
+        None => Ok(accomplishments::parse_document(&fresh)),
+    }
+}
+
+/// Apply a user edit (add/delete from the panel) to the log as it is on disk *now*
+/// — not to the copy the panel showed, which may predate an agent's append — then
+/// write the maintained result and return it.
+pub fn edit_accomplishments(
+    loc: &RepoLoc,
+    now: i64,
+    retention_days: u32,
+    edit: impl FnOnce(&mut Vec<Accomplishment>),
+) -> Result<Vec<Accomplishment>> {
+    let text = read_accomplishments_text(loc)?;
+    let mut entries =
+        accomplishments::maintain(accomplishments::parse_document(&text), now, retention_days).kept;
+    edit(&mut entries);
+    let kept = accomplishments::maintain(entries, now, retention_days).kept;
+    write_accomplishments_text(loc, &accomplishments::render_document(&kept))?;
+    Ok(kept)
 }
 
 /// Filename of a remote project's synced pane layout, under `<root>/.muxel/`.
@@ -2957,6 +3042,121 @@ mod tests {
         let gi2 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gi2.matches(".muxel/").count(), 1, "no duplicate ignore");
         assert_eq!(std::fs::read_to_string(&mem).unwrap(), "kept user notes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_accomplishments_maintain_only_rewrites_when_needed() {
+        use muxel_core::accomplishments::{Accomplishment, AccomplishmentKind};
+        use std::io::Write as _;
+
+        const DAY: i64 = 86_400;
+        let now = 1_800_057_600 + 3600; // 2027-01-16, local wall clock
+        let root = std::env::temp_dir().join("muxel-it-accomplishments");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let loc = RepoLoc::Local(root.clone());
+        let file = root.join(MEMORY_DIR).join(ACCOMPLISHMENTS_FILE);
+
+        // No file yet: an empty log, not an error, and nothing is created.
+        assert!(maintain_accomplishments(&loc, now, 14).unwrap().is_empty());
+        assert!(!file.exists());
+
+        ensure_accomplishments_file(&loc).expect("seed");
+        let gi = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(gi.lines().any(|l| l.trim() == ".muxel/"), "gitignored");
+
+        // Agents append: one dated and current, one stale, one undated.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        writeln!(f, "- 2027-01-15 | fix | Fixed the race | claude").unwrap();
+        writeln!(f, "- 2026-12-01 | feature | Ancient history | codex").unwrap();
+        writeln!(f, "- docs | Wrote the guide | amp").unwrap();
+        drop(f);
+
+        let kept = maintain_accomplishments(&loc, now, 14).unwrap();
+        let summaries: Vec<_> = kept.iter().map(|e| e.summary.as_str()).collect();
+        assert_eq!(summaries, ["Fixed the race", "Wrote the guide"]);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("Ancient history"), "pruned on disk");
+        assert!(
+            text.contains("- 2027-01-16 | docs | Wrote the guide | amp"),
+            "stamped"
+        );
+
+        // Clean now: a second load leaves the file byte-for-byte alone.
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        maintain_accomplishments(&loc, now, 14).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+
+        // A panel edit applies to what's on disk, keeping a line appended since.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(b"- 2027-01-16 | perf | Faster startup | claude\n")
+            .unwrap();
+        let after = edit_accomplishments(&loc, now, 14, |es| {
+            es.retain(|e| e.summary != "Fixed the race");
+            es.push(Accomplishment::new(
+                AccomplishmentKind::Test,
+                "Added tests",
+                None,
+                now,
+            ));
+        })
+        .unwrap();
+        let summaries: Vec<_> = after.iter().map(|e| e.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            ["Wrote the guide", "Faster startup", "Added tests"]
+        );
+
+        // An agent corrects an entry by appending a line with its key — muxel
+        // folds it into the original on the next load, without the agent reading.
+        let key = after
+            .iter()
+            .find(|e| e.summary == "Faster startup")
+            .and_then(|e| e.key.clone())
+            .expect("muxel keys every entry");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(
+                format!("- 2027-01-16 | perf | Faster startup and shutdown | claude | #{key}\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let corrected = maintain_accomplishments(&loc, now, 14).unwrap();
+        let summaries: Vec<_> = corrected.iter().map(|e| e.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            [
+                "Wrote the guide",
+                "Faster startup and shutdown",
+                "Added tests"
+            ]
+        );
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            text.matches(&format!("#{key}")).count(),
+            1,
+            "folded on disk"
+        );
+
+        // A shorter window prunes more on the next load.
+        assert_eq!(
+            maintain_accomplishments(&loc, now + DAY, 1).unwrap().len(),
+            0
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

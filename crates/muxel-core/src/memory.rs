@@ -20,7 +20,7 @@ use uuid::Uuid;
 pub const PURGE_AFTER_DAYS: i64 = 30;
 /// Max un-pinned entries kept; the least-recently-accessed excess is evicted.
 pub const MAX_ENTRIES: usize = 40;
-const DAY_SECS: i64 = 86_400;
+pub(crate) const DAY_SECS: i64 = 86_400;
 
 /// One remembered fact — a `##` section in `MEMORY.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,7 +363,7 @@ pub fn fmt_date(secs: i64) -> String {
 }
 
 /// Parse a `YYYY-MM-DD` date to unix seconds (UTC midnight), or 0 if malformed.
-fn parse_date(s: &str) -> i64 {
+pub(crate) fn parse_date(s: &str) -> i64 {
     // Also accept a bare unix-seconds integer (forward/back compatible).
     if let Ok(secs) = s.parse::<i64>() {
         return secs;
