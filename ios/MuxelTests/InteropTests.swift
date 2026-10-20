@@ -19,22 +19,64 @@ final class InteropTests: XCTestCase {
         XCTAssertEqual(TmuxCommands.selectSocket("s", socket: restored.instances[0].tmuxSocket), "set -- -L 'mxl-profile'")
     }
 
-    func testDefaultRespawnMigratesOnlyWhenBothExactNamesAreAbsent() {
+    func testDefaultRespawnMigratesOnlyWhenBothExactNamesAreAbsent() throws {
         var instance = Instance(id: "aaaaaaaa-0000-0000-0000-000000000000", projectId: "p", title: "pane", program: nil, args: [])
         instance.tmuxSession = "owned"
         instance.tmuxSocket = "default"
-        let absent = TmuxCommands.targetForNewSession(instance, name: "owned", confirmedTargets: [])
+        let absent = try TmuxCommands.targetForNewSession(instance, name: "owned", confirmedTargets: [])
         XCTAssertEqual(absent.target.socket, "mxl")
         XCTAssertEqual(absent.migration?.recordedSession, "owned")
-        for socket in ["default", "mxl"] {
-            let present = TmuxCommands.targetForNewSession(instance, name: "owned", confirmedTargets: [.init(name: "owned", socket: socket)])
+        let liveCases: [[TmuxCommands.SessionTarget]] = [
+            [.init(name: "owned", socket: "default")],
+            [.init(name: "owned", socket: "default"), .init(name: "owned", socket: "mxl")]
+        ]
+        for targets in liveCases {
+            let present = try TmuxCommands.targetForNewSession(instance, name: "owned", confirmedTargets: targets)
             XCTAssertEqual(present.target.socket, "default")
             XCTAssertNil(present.migration)
         }
-        instance.tmuxSocket = "mxl-profile"
-        let named = TmuxCommands.targetForNewSession(instance, name: "owned", confirmedTargets: [])
-        XCTAssertEqual(named.target.socket, "mxl-profile")
-        XCTAssertNil(named.migration)
+        for socket in ["mxl", "mxl-profile"] {
+            instance.tmuxSocket = socket
+            let existing = try TmuxCommands.targetForNewSession(instance, name: "owned", confirmedTargets: [])
+            XCTAssertEqual(existing.target.socket, socket)
+            XCTAssertNil(existing.migration)
+        }
+    }
+
+    func testPeerMigrationDoesNotAuthorizeAStaleDefaultClientOrItsRetry() throws {
+        var firstPeer = Instance(id: "aaaaaaaa-0000-0000-0000-000000000000", projectId: "p",
+                                 title: "pane", program: nil, args: [])
+        firstPeer.tmuxSession = "owned|with|pipes "
+        firstPeer.tmuxSocket = "default"
+        let stalePeer = firstPeer
+
+        // Both peers began with Default. The first completes teardown while
+        // neither server holds the name, then saves and starts on Private.
+        let firstPlan = try TmuxCommands.targetForNewSession(firstPeer, name: firstPeer.tmuxSession!, confirmedTargets: [])
+        firstPeer.tmuxSocket = firstPlan.target.socket
+        let inventory = try TmuxCommands.parseConfirmedTargets("mxl\towned|with|pipes \n:muxel-listed:0\n:muxel-listed:0\n")
+        XCTAssertNil(TmuxCommands.resolveTarget(stalePeer, in: inventory))
+
+        // The second peer cannot distinguish that replacement from an unrelated
+        // namesake. Neither an immediate retry nor restoring its stale metadata
+        // may recreate Default or adopt Private from inventory alone.
+        let restored = try MuxelJSON.decoder.decode(Instance.self, from: MuxelJSON.encoder.encode(stalePeer))
+        for snapshot in [stalePeer, stalePeer, restored] {
+            XCTAssertThrowsError(try TmuxCommands.targetForNewSession(snapshot, name: snapshot.tmuxSession!, confirmedTargets: inventory)) {
+                XCTAssertEqual($0 as? TmuxCommands.ProbeError, .ownershipRefreshRequired)
+            }
+            XCTAssertEqual(snapshot.tmuxSocket, "default")
+            XCTAssertEqual(snapshot.tmuxSession, "owned|with|pipes ")
+        }
+
+        // An authoritative refresh of this same pane supplies the binding that
+        // inventory could not. It can then attach to the recorded Private owner.
+        let refreshed = try MuxelJSON.decoder.decode(Instance.self, from: MuxelJSON.encoder.encode(firstPeer))
+        XCTAssertEqual(refreshed.id, stalePeer.id)
+        XCTAssertEqual(TmuxCommands.resolveTarget(refreshed, in: inventory), firstPlan.target)
+        let refreshedPlan = try TmuxCommands.targetForNewSession(refreshed, name: refreshed.tmuxSession!, confirmedTargets: inventory)
+        XCTAssertEqual(refreshedPlan.target, firstPlan.target)
+        XCTAssertNil(refreshedPlan.migration)
     }
 
     func testMigrationProbeRequiresCompleteSuccessfulOrKnownAbsentReplies() throws {
@@ -48,7 +90,7 @@ final class InteropTests: XCTestCase {
         instance.tmuxSession = "owned "
         instance.tmuxSocket = "default"
         XCTAssertEqual(TmuxCommands.resolveTarget(instance, in: spaced)?.name, "owned ")
-        XCTAssertNil(TmuxCommands.targetForNewSession(instance, name: "owned ", confirmedTargets: spaced).migration)
+        XCTAssertNil(try TmuxCommands.targetForNewSession(instance, name: "owned ", confirmedTargets: spaced).migration)
         for bad in [
             ":muxel-listed:0\n",
             ":muxel-listed:0\nerror connecting to /tmp/default (Permission denied)\n:muxel-listed:1\n",

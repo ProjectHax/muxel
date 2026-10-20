@@ -123,18 +123,19 @@ impl SessionTarget {
     /// A recorded default owner can move only after both its session and an
     /// exact-name private collision have been confirmed absent. The caller's
     /// probe must check this target's exact name on the supplied server.
+    /// `None` means an absent Default has a Private namesake: stop and refresh
+    /// saved ownership rather than creating on Default or adopting that name.
     pub fn for_respawn<E>(
         &self,
         mut probe: impl FnMut(&Socket) -> Result<bool, E>,
-    ) -> Result<Self, E> {
-        if self.socket == Some(Socket::Default)
-            && !probe(&Socket::Default)?
-            && !probe(&Socket::Private)?
-        {
-            Ok(Self::new(self.name.clone(), Some(Socket::Private)))
-        } else {
-            Ok(self.clone())
+    ) -> Result<Option<Self>, E> {
+        if self.socket != Some(Socket::Default) || probe(&Socket::Default)? {
+            return Ok(Some(self.clone()));
         }
+        if probe(&Socket::Private)? {
+            return Ok(None);
+        }
+        Ok(Some(Self::new(self.name.clone(), Some(Socket::Private))))
     }
 }
 
@@ -539,6 +540,22 @@ impl ClosedSession {
         resolved
     }
 
+    /// A missing row confirms absence only for a server the inventory queried.
+    /// Unqueried recorded owners need a direct, owner-pinned kill/confirmation.
+    pub fn retry_after_inventory(
+        &self,
+        sessions: &[RemoteSession],
+        listed_sockets: &[Socket],
+    ) -> Option<SessionTarget> {
+        if let Some(live) = live_closed_session(sessions, self) {
+            return Some(live.target());
+        }
+        match self.socket.as_ref() {
+            Some(socket) if listed_sockets.contains(socket) => None,
+            _ => Some(self.target()),
+        }
+    }
+
     /// Whether `session` is the one this close was meant to reap.
     pub fn matches(&self, session: &RemoteSession) -> bool {
         self.socket
@@ -552,9 +569,10 @@ impl ClosedSession {
 
 /// The session a remembered close still has running on the host, if any.
 ///
-/// `None` means the kill landed (or the session was never there) and the entry can
-/// be forgotten. `Some` carries the session under **its own** name, which is what a
-/// retry must target — a derived name can have drifted since the pane launched.
+/// `None` means only that these rows contain no match; it does not prove the
+/// recorded server was queried. Reconnect uses [`ClosedSession::retry_after_inventory`]
+/// before forgetting a close. `Some` carries the session under its own name,
+/// which may have drifted since the pane launched.
 pub fn live_closed_session<'a>(
     sessions: &'a [RemoteSession],
     closed: &ClosedSession,
@@ -1057,18 +1075,13 @@ mod tests {
     fn respawn_migrates_only_after_two_confirmed_absences() {
         let target = SessionTarget::new("exact recorded name", Some(Socket::Default));
         for (default, private, expected, probes) in [
-            (true, false, Socket::Default, vec![Socket::Default]),
-            (true, true, Socket::Default, vec![Socket::Default]),
-            (
-                false,
-                true,
-                Socket::Default,
-                vec![Socket::Default, Socket::Private],
-            ),
+            (true, false, Some(Socket::Default), vec![Socket::Default]),
+            (true, true, Some(Socket::Default), vec![Socket::Default]),
+            (false, true, None, vec![Socket::Default, Socket::Private]),
             (
                 false,
                 false,
-                Socket::Private,
+                Some(Socket::Private),
                 vec![Socket::Default, Socket::Private],
             ),
         ] {
@@ -1083,7 +1096,10 @@ mod tests {
                     })
                 })
                 .unwrap();
-            assert_eq!(resolved, SessionTarget::new(&target.name, Some(expected)));
+            assert_eq!(
+                resolved,
+                expected.map(|socket| SessionTarget::new(&target.name, Some(socket)))
+            );
             assert_eq!(asked, probes);
         }
         // The probe failed, rather than proving either server absent.
@@ -1118,8 +1134,64 @@ mod tests {
         ] {
             let target = SessionTarget::new("work", socket);
             let result = target.for_respawn::<()>(|_| panic!("only Default may migrate"));
-            assert_eq!(result, Ok(target));
+            assert_eq!(result, Ok(Some(target)));
         }
+    }
+
+    #[test]
+    fn peer_restarts_cannot_recreate_default_after_private_migration() {
+        let mut first = crate::Instance::shell(Uuid::new_v4());
+        first.tmux_session = Some("owned".into());
+        first.tmux_socket = Some(Socket::Default);
+        // Independent clients admitted their restart while both knew Default.
+        let second = first.clone();
+        let stale_saved = serde_json::to_string(&second).unwrap();
+        let mut running = HashSet::from([Socket::Default]);
+
+        assert!(running.remove(&Socket::Default));
+        let next = first
+            .tmux_target("host")
+            .for_respawn::<()>(|socket| Ok(running.contains(socket)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.socket, Some(Socket::Private));
+        first.tmux_socket = next.socket;
+        assert!(running.insert(Socket::Private));
+
+        // B's delayed teardown succeeds because Default is already gone. Its
+        // local generation is still valid, but A's replacement must stop it.
+        assert!(!running.remove(&Socket::Default));
+        let second_plan = second
+            .tmux_target("host")
+            .for_respawn::<()>(|socket| Ok(running.contains(socket)))
+            .unwrap();
+        assert_eq!(second_plan, None, "no Default create or Private adoption");
+        assert_eq!(serde_json::to_string(&second).unwrap(), stale_saved);
+        assert_eq!(running, HashSet::from([Socket::Private]));
+
+        // Ordinary retry or app restart with stale saved ownership cannot
+        // bypass the refusal. Inventory alone never proves a new binding.
+        let mut reloaded: crate::Instance = serde_json::from_str(&stale_saved).unwrap();
+        assert!(
+            reloaded
+                .tmux_target("host")
+                .for_respawn::<()>(|socket| Ok(running.contains(socket)))
+                .unwrap()
+                .is_none()
+        );
+        // A separately refreshed, same-pane binding can attach to A's agent.
+        assert_eq!(reloaded.id, first.id);
+        reloaded.tmux_socket = first.tmux_socket.clone();
+        assert_eq!(
+            reloaded
+                .tmux_target("host")
+                .for_respawn::<()>(|_| panic!("recorded Private is already authoritative"))
+                .unwrap()
+                .unwrap()
+                .socket,
+            Some(Socket::Private)
+        );
+        assert_eq!(running.len(), 1);
     }
 
     #[test]
@@ -1209,6 +1281,7 @@ mod tests {
                         .iter()
                         .any(|row| &row.socket == socket && row.name == target.name))
                 })
+                .unwrap()
                 .unwrap();
             assert_eq!(
                 prepared, target,
@@ -1374,6 +1447,40 @@ mod tests {
             "no new owner discovery: {command}"
         );
         assert!(command.contains("; set -- -L mxl;"));
+    }
+
+    #[test]
+    fn reconnect_retries_named_owner_after_persisted_failed_close() {
+        let socket = Socket::Named("mxl-profile".into());
+        let live = parse_sessions_on("owned|/p|claude|\n", socket.clone());
+        let iid = Uuid::new_v4();
+        let mut project = crate::Project::new("p", "/p");
+        project.remember_closed_session(live[0].target(), iid);
+        // The SSH close failed; its durable ledger is all a restarted client has.
+        let saved = serde_json::to_string(&project).unwrap();
+        let restored: crate::Project = serde_json::from_str(&saved).unwrap();
+        let mut discovery = parse_sessions_on("owned|/p|zsh|\n", Socket::Private);
+        discovery.extend(parse_sessions_on("owned|/p|vim|\n", Socket::Default));
+        let pending = restored.closed_sessions[0].resolve_owner(&discovery, Socket::Private);
+        assert_eq!(pending.socket, Some(socket.clone()));
+        let retry = pending.retry_after_inventory(&discovery, &Socket::BOTH);
+        assert_eq!(retry, Some(live[0].target()), "unqueried is not gone");
+        assert_eq!(restored.closed_sessions.len(), 1);
+        let command = crate::ssh::kill_and_confirm_command(&retry.unwrap());
+        assert!(command.contains("mxl-profile"));
+        assert_eq!(command.matches("has-session").count(), 1);
+        assert!(pending.retry_after_inventory(&[], &Socket::BOTH).is_some());
+        let unresolved = ClosedSession {
+            socket: None,
+            ..pending.clone()
+        };
+        assert!(
+            unresolved
+                .retry_after_inventory(&[], &Socket::BOTH)
+                .is_some()
+        );
+        // A complete inventory of the recorded owner may confirm its absence.
+        assert!(pending.retry_after_inventory(&[], &[socket]).is_none());
     }
 
     #[test]

@@ -199,7 +199,7 @@ struct TerminalPaneView: View {
                         ? current.tmuxSession!
                         : TmuxSession.name(hostName: host.name, instanceId: current.id)
                     sessionName = name
-                    let prepared = TmuxCommands.targetForNewSession(current, name: name, confirmedTargets: targets)
+                    let prepared = try TmuxCommands.targetForNewSession(current, name: name, confirmedTargets: targets)
                     socket = prepared.target.socket
                     migration = prepared.migration
 

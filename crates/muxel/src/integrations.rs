@@ -1616,8 +1616,19 @@ pub fn local_tmux_launch_target(
     session: &SessionTarget,
     deadline: Instant,
 ) -> Result<SessionTarget> {
-    resolve_local_tmux_owner(session, deadline)?
-        .for_respawn(|socket| local_tmux_has_session_confirmed(socket, &session.name, deadline))
+    let resolved = resolve_local_tmux_owner(session, deadline)?;
+    confirmed_tmux_respawn_target(&resolved, |socket| {
+        local_tmux_has_session_confirmed(socket, &session.name, deadline)
+    })
+}
+
+pub(crate) fn confirmed_tmux_respawn_target(
+    session: &SessionTarget,
+    probe: impl FnMut(&Socket) -> Result<bool>,
+) -> Result<SessionTarget> {
+    session.for_respawn(probe)?.with_context(|| {
+        t("That session name is in use on another tmux server. Refresh the project layout before retrying this pane.")
+    })
 }
 
 fn local_tmux_has_session_confirmed(
@@ -1745,7 +1756,7 @@ pub fn remote_tmux_launch_target(
     {
         bail!("tmux session “{session}” is still running");
     }
-    resolved.for_respawn::<anyhow::Error>(|socket| {
+    confirmed_tmux_respawn_target(&resolved, |socket| {
         Ok(sessions
             .iter()
             .any(|row| &row.socket == socket && row.name == resolved.name))
@@ -2022,7 +2033,7 @@ pub fn kill_tmux_session_confirmed(
     if local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
         bail!("tmux session “{session}” is still running");
     }
-    session.for_respawn(|other| {
+    confirmed_tmux_respawn_target(session, |other| {
         if other == socket {
             Ok(false) // The owned session was just confirmed gone.
         } else {

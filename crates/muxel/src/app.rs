@@ -14000,11 +14000,10 @@ impl MuxelApp {
     /// Connect-time half of [`Self::reap_remote_session`]: reconcile a project's
     /// remembered closes against what is actually running on its host.
     ///
-    /// The host's session list is the authority muxel lacked at close time. A close
-    /// with nothing left running is finished, whatever became of its kill. One with a
-    /// session still there gets another kill — aimed at the name the session actually
-    /// has, which a derived name may no longer match (a renamed host, a session a
-    /// peer created under its own slug).
+    /// A complete inventory can finish a close only on servers it actually
+    /// queried. Recorded named owners are retried directly because discovery
+    /// lists only mxl/default. A listed live session gets another kill under its
+    /// actual name, which may have drifted since launch.
     ///
     /// A close confirmed earlier this run is checked again too: the list may predate
     /// its kill (then this kill just confirms it), or its session may have come back.
@@ -14024,7 +14023,7 @@ impl MuxelApp {
                 (
                     c.instance,
                     c.target(),
-                    muxel_core::tmux::live_closed_session(sessions, &c).map(|s| s.target()),
+                    c.retry_after_inventory(sessions, &Socket::BOTH),
                 )
             })
             .collect();

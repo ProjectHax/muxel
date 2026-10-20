@@ -1204,9 +1204,13 @@ feature is added or changed, update the matching entry here in the same change**
   reattaches to it there (closing the pane still stops it), and its next session
   starts on muxel's own after both servers confirm the old session is gone and
   `mxl` has no session of that exact name. A namesake on `mxl` is left alone and
-  the pane keeps its default-server binding. An imported session also stays on
-  its recorded owner while running. Desktop and phone save an allowed migration
+  the pane keeps its default-server binding but stops until the project layout
+  supplies refreshed ownership; retry cannot recreate a second agent on Default.
+  An imported session also stays on its recorded owner while running.
+  Desktop and phone save an allowed migration
   before launching; a failed probe or save cannot authorize it.
+  Reconnecting also retries pending closes on their recorded named servers;
+  absence from the standard-server inventory does not forget an unconfirmed close.
   Such a `pkill` reaches only that pane's tmux client: the session and the agent keep
   running, and muxel **reattaches the pane automatically** — you see it blink, not die.
   Local and remote alike (SSH panes and the iOS companion do the same), since a host

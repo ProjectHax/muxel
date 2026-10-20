@@ -113,9 +113,18 @@ enum TmuxCommands {
         let sessionName: String
     }
 
-    enum ProbeError: LocalizedError {
+    enum ProbeError: LocalizedError, Equatable {
         case incomplete
-        var errorDescription: String? { "Couldn't confirm both tmux servers. Reconnect and try again." }
+        case ownershipRefreshRequired
+
+        var errorDescription: String? {
+            switch self {
+            case .incomplete:
+                return "Couldn't confirm both tmux servers. Reconnect and try again."
+            case .ownershipRefreshRequired:
+                return "That session name is in use on another tmux server. Refresh the project layout before reconnecting."
+            }
+        }
     }
 
     /// Default migration needs both complete replies. Ordinary best-effort
@@ -169,13 +178,16 @@ enum TmuxCommands {
         }
     }
 
-    /// Called only after checked inventory. A Private namesake is a collision,
-    /// never an invitation to attach to somebody else's session.
+    /// Called only after checked inventory. A Private namesake stops the plan
+    /// until saved ownership is refreshed; inventory alone cannot identify it.
     static func targetForNewSession(_ instance: Instance, name: String, confirmedTargets: [SessionTarget])
-        -> (target: SessionTarget, migration: DefaultMigration?) {
+        throws -> (target: SessionTarget, migration: DefaultMigration?) {
         let owner = instance.tmuxSocket ?? socketName
         if owner == "default",
-           !confirmedTargets.contains(where: { $0.name == name && ($0.socket == "default" || $0.socket == socketName) }) {
+           !confirmedTargets.contains(where: { $0.name == name && $0.socket == "default" }) {
+            guard !confirmedTargets.contains(where: { $0.name == name && $0.socket == socketName }) else {
+                throw ProbeError.ownershipRefreshRequired
+            }
             return (.init(name: name, socket: socketName),
                     DefaultMigration(recordedSession: instance.tmuxSession, sessionName: name))
         }

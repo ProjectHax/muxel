@@ -282,6 +282,44 @@ fn failed_restart_completion_does_not_reattach_the_old_agent() {
 }
 
 #[test]
+fn peer_migration_collision_stops_restart_without_changing_owner() {
+    use muxel_core::tmux::{SessionTarget, Socket};
+
+    with_app(|cx, main| {
+        let (mut completion, secondary) = pending_secondary_restart(cx, main);
+        let iid = completion.instance;
+        let target = SessionTarget::new("owned", Some(Socket::Default));
+        let app = main.entity(cx).unwrap();
+        app.update(cx, |app, _| {
+            let instance = app.workspace.instance_mut(iid).unwrap();
+            instance.tmux_session = Some(target.name.clone());
+            instance.tmux_socket = target.socket.clone();
+            assert!(app.terminal_restarts.current(iid, completion.token));
+        });
+        // The first peer has already replaced Default on Private. Exercise the
+        // production conversion from checked inventory to restart failure.
+        completion.killed = crate::integrations::confirmed_tmux_respawn_target(&target, |socket| {
+            Ok(socket == &Socket::Private)
+        })
+        .map(|_| ());
+        assert!(completion.killed.is_err());
+        close_secondary_while_pending(cx, main, secondary, &completion);
+        MuxelApp::complete_remote_restart(&app.downgrade(), completion, cx);
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(!app.terminal_restarts.contains(iid));
+            assert!(app.terminals.is_empty());
+            assert!(app.terminal_launching.is_empty());
+            assert!(app.terminal_launches.is_empty());
+            let instance = app.workspace.instance(iid).unwrap();
+            assert_eq!(instance.tmux_socket, Some(Socket::Default));
+            assert_eq!(instance.tmux_session.as_deref(), Some("owned"));
+            assert!(app.failed_launches[&iid].contains("Refresh"));
+        });
+    });
+}
+
+#[test]
 fn failed_migration_save_keeps_the_expected_default_owner_and_restart_lease() {
     with_app(|cx, main| {
         main.update(cx, |app, _, _| {

@@ -1795,6 +1795,7 @@ mod tests {
                 .for_respawn::<()>(|socket| Ok(default_rows
                     .iter()
                     .any(|row| &row.socket == socket && row.name == target.name)))
+                .unwrap()
                 .unwrap(),
             target
         );

@@ -431,7 +431,7 @@ final class LayoutTransactionTests: XCTestCase {
         let conn = LayoutTransactionConnection(saved, pauseFirstRead: false)
         state.connectionFactory = { _, _ in conn }
         let attachment = try await state.prepareTmuxAttachmentPlan(instanceId: a.id, in: project) { current in
-            let prepared = TmuxCommands.targetForNewSession(current, name: "owned", confirmedTargets: [])
+            let prepared = try TmuxCommands.targetForNewSession(current, name: "owned", confirmedTargets: [])
             return TmuxAttachmentPlan(target: prepared.target, attachment: "new-session", defaultMigration: prepared.migration)
         }
         XCTAssertEqual(attachment, "new-session")
@@ -439,6 +439,70 @@ final class LayoutTransactionTests: XCTestCase {
         XCTAssertEqual(persisted.instances[0].tmuxSocket, "mxl")
         let commands = await conn.commands
         XCTAssertEqual(commands.filter { $0.hasPrefix("cat > ") }.count, 1)
+    }
+
+    func testPrivateNamesakeRefusesStaleDefaultAttachmentWithoutSavingOrStartingPTY() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var saved = layout
+        saved.instances[0].tmuxSession = "owned"
+        saved.instances[0].tmuxSocket = "default"
+        state.layout = saved
+        // A peer has started its Private replacement before this client's saved
+        // layout has learned the new owner. An unrelated namesake looks identical.
+        let conn = LayoutTransactionConnection(saved, pauseFirstRead: false,
+            listedTargets: "mxl\towned\n:muxel-listed:0\n:muxel-listed:0\n")
+        state.connectionFactory = { _, _ in conn }
+
+        for _ in 0..<2 {
+            var attachment: String?
+            do {
+                attachment = try await state.prepareTmuxAttachmentPlan(instanceId: a.id, in: project) { current in
+                    let targets = try TmuxCommands.parseConfirmedTargets(try await conn.run(TmuxCommands.confirmedTargetsCommand()))
+                    let prepared = try TmuxCommands.targetForNewSession(current, name: "owned", confirmedTargets: targets)
+                    return TmuxAttachmentPlan(target: prepared.target, attachment: "forbidden", defaultMigration: prepared.migration)
+                }
+                XCTFail("a Private namesake must not authorize either owner, including on retry")
+            } catch {
+                XCTAssertEqual(error as? TmuxCommands.ProbeError, .ownershipRefreshRequired)
+            }
+            XCTAssertNil(attachment)
+        }
+
+        XCTAssertEqual(state.layout, saved)
+        let persisted = await conn.snapshot()
+        XCTAssertEqual(persisted, saved)
+        XCTAssertNil(state.terminals.existing(a.id))
+        let commands = await conn.commands
+        XCTAssertEqual(commands.count, 2, "only the two checked inventories run; no binding transaction starts")
+        XCTAssertTrue(commands.allSatisfy { $0 == TmuxCommands.confirmedTargetsCommand() })
+        XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") || $0.contains("new-session") || $0.contains("attach-session") || $0.contains("kill-session") })
+    }
+
+    func testRefreshedSamePanePrivateOwnerCanAuthorizeAttachmentWithoutWriting() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var refreshed = layout
+        refreshed.instances[0].tmuxSession = "owned"
+        refreshed.instances[0].tmuxSocket = "mxl"
+        // Both the refreshed UI and durable document identify the same pane's
+        // owner. Inventory alone was insufficient in the collision regression.
+        state.layout = refreshed
+        let conn = LayoutTransactionConnection(refreshed, pauseFirstRead: false,
+            listedTargets: "mxl\towned\n")
+        state.connectionFactory = { _, _ in conn }
+        let attachment = try await state.prepareTmuxAttachmentPlan(instanceId: a.id, in: project) { current in
+            let targets = TmuxCommands.parseTargets(try await conn.run(TmuxCommands.listTargetsCommand(socket: current.tmuxSocket)))
+            let live = try XCTUnwrap(TmuxCommands.resolveTarget(current, in: targets))
+            return TmuxAttachmentPlan(target: live,
+                attachment: TmuxCommands.attachPTYCommand(session: live.name, socket: live.socket))
+        }
+
+        XCTAssertEqual(attachment, TmuxCommands.attachPTYCommand(session: "owned", socket: "mxl"))
+        XCTAssertEqual(state.layout, refreshed)
+        let persisted = await conn.snapshot()
+        XCTAssertEqual(persisted, refreshed)
+        let commands = await conn.commands
+        XCTAssertEqual(commands.filter { $0.hasPrefix("f=") }.count, 1, "confirm the refreshed owner from durable membership")
+        XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") })
     }
 
     func testDefaultMigrationCannotOverwritePeerRebinding() async throws {
@@ -454,7 +518,7 @@ final class LayoutTransactionTests: XCTestCase {
         var preparations = 0
         let attachment = try await state.prepareTmuxAttachmentPlan(instanceId: a.id, in: project) { current in
             preparations += 1
-            let prepared = TmuxCommands.targetForNewSession(current, name: "owned", confirmedTargets: [])
+            let prepared = try TmuxCommands.targetForNewSession(current, name: "owned", confirmedTargets: [])
             return TmuxAttachmentPlan(target: prepared.target, attachment: prepared.target.socket, defaultMigration: prepared.migration)
         }
         XCTAssertEqual(preparations, 2)
@@ -475,7 +539,7 @@ final class LayoutTransactionTests: XCTestCase {
         state.connectionFactory = { _, _ in conn }
         do {
             _ = try await state.prepareTmuxAttachmentPlan(instanceId: a.id, in: project) { current in
-                let prepared = TmuxCommands.targetForNewSession(current, name: "owned", confirmedTargets: [])
+                let prepared = try TmuxCommands.targetForNewSession(current, name: "owned", confirmedTargets: [])
                 return TmuxAttachmentPlan(target: prepared.target, attachment: "forbidden", defaultMigration: prepared.migration)
             }
             XCTFail("a failed owner save must decline the PTY plan")
