@@ -5355,9 +5355,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dropped_session_leaves_the_child_its_hangup_cleanup() {
-        let (session, rx, marker) = spawn_with_slow_hangup_cleanup("session");
+        // Hold cleanup until this observer has checked stream closure. A timed
+        // save can finish while synchronous PTY destruction is still returning.
+        let script = "trap 'trap \"\" HUP; \
+                      while [ ! -f \"${MUXEL_HUP_MARKER}.release\" ]; do sleep 0.02; done; \
+                      echo saved > \"$MUXEL_HUP_MARKER\"; exit 0' HUP; \
+                      echo ready; while :; do sleep 0.1; done";
+        let (session, rx, marker) = spawn_hangup_script(script, "session");
+        let mut release = marker.clone().into_os_string();
+        release.push(".release");
+        let release = std::path::PathBuf::from(release);
+        for path in [&marker, &release] {
+            let _ = std::fs::remove_file(path);
+            assert!(!path.exists(), "stale cleanup fixture: {path:?}");
+        }
 
-        drop(session);
+        // Move the final owner so dropping it cannot delay the observer.
+        let drop_worker = std::thread::spawn(move || drop(session));
         let deadline = Instant::now() + Duration::from_secs(3);
         let closed = loop {
             match rx.try_recv() {
@@ -5369,13 +5383,19 @@ mod tests {
                 Err(async_channel::TryRecvError::Empty) => break false,
             }
         };
-        let saved_before_close = marker.exists();
+        let saved_before_release = marker.exists();
+        // Release even after a timeout. Keep the pre-release closure result:
+        // cleanup completing afterward must not turn a failure into a pass.
+        std::fs::write(&release, "").expect("release the child's cleanup");
         let saved = marker_saved(&marker, Duration::from_secs(4));
+        let drop_result = drop_worker.join();
         let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&release);
+        assert!(drop_result.is_ok(), "session destructor panicked");
         assert!(closed, "the stream stayed open after its session dropped");
         assert!(
-            !saved_before_close,
-            "the stream waited for the child's cleanup before closing"
+            !saved_before_release,
+            "the child's cleanup ran before the observer released it"
         );
         assert!(
             saved,
