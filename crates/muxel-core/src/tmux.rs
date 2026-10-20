@@ -11,14 +11,17 @@ pub fn bind_peer_sessions(
     project: &str,
     instances: &mut [crate::Instance],
     sessions: &[RemoteSession],
+    new_socket: Socket,
 ) {
     for instance in instances.iter_mut().filter(|i| i.needs_peer_session()) {
-        let session = session_by_suffix(sessions, instance.id)
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| session_name(project, instance.id));
-        instance.tmux_session = Some(session);
         instance.use_tmux = true;
     }
+    bind_session_owners(
+        project,
+        instances.iter_mut().filter(|i| i.needs_peer_session()),
+        sessions,
+        new_socket,
+    );
 }
 
 /// A stable tmux session name for an instance, e.g. `muxel_myproj_1a2b3c4d`.

@@ -566,11 +566,12 @@ fn peer_layout_preserves_literal_launch_and_never_binds_it_to_tmux() {
     let mut adopted = muxel_core::merge_peer_instances(&[], peer, adopted_project);
     let sessions = [muxel_core::tmux::RemoteSession {
         name: muxel_core::tmux::session_name("peer", literal.id),
+        socket: muxel_core::tmux::Socket::Private,
         path: String::new(),
         command: "codex".into(),
         title: String::new(),
     }];
-    muxel_core::tmux::bind_peer_sessions(&project.name, &mut adopted, &sessions);
+    muxel_core::tmux::bind_peer_sessions(&project.name, &mut adopted, &sessions, Socket::Private);
     let raw = adopted.iter().find(|i| i.id == literal.id).unwrap();
     assert!(raw.literal_argv);
     assert_eq!(raw.project_id, adopted_project);
@@ -578,9 +579,11 @@ fn peer_layout_preserves_literal_launch_and_never_binds_it_to_tmux() {
     assert_eq!(raw.args, literal.args);
     assert!(!raw.use_tmux);
     assert!(raw.tmux_session.is_none());
+    assert!(raw.tmux_socket.is_none());
     let normal = adopted.iter().find(|i| i.id == normal.id).unwrap();
     assert!(normal.use_tmux);
     assert!(normal.tmux_session.is_some());
+    assert_eq!(normal.tmux_socket, Some(muxel_core::tmux::Socket::Private));
 }
 
 #[test]
