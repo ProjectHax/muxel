@@ -805,7 +805,9 @@ mod tests {
             let mut cmd = Command::new("sh");
             cmd.args([
                 "-c",
-                "printf '%s\\n' \"$1\" >> \"$2\"; sleep \"$3\"",
+                // `exec`, so stopping the voice kills the sleep itself rather
+                // than leaving it running after its shell.
+                "printf '%s\\n' \"$1\" >> \"$2\"; exec sleep \"$3\"",
                 "sh",
                 text,
                 &log.display().to_string(),
@@ -846,11 +848,29 @@ mod tests {
         let reader = {
             let (stop, position, log) = (stop.clone(), position.clone(), log.clone());
             std::thread::spawn(move || {
-                speak_pieces_with(&pieces(), 0, &stop, &position, &voice(&log, 0.6))
+                // The second piece takes far longer than the test waits, so the
+                // pause lands part-way through it however slowly this machine
+                // starts processes; stopping kills it, so nothing waits that long.
+                let (quick, slow) = (voice(&log, 0.0), voice(&log, 30.0));
+                let speak = move |text: &str| {
+                    if text == "two." {
+                        slow(text)
+                    } else {
+                        quick(text)
+                    }
+                };
+                speak_pieces_with(&pieces(), 0, &stop, &position, &speak)
             })
         };
-        // Pause part-way through the second piece.
-        std::thread::sleep(Duration::from_millis(900));
+        // Pause part-way through the second piece: once it has started.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while heard(&log).len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second piece never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         stop.store(true, Ordering::Relaxed);
         reader.join().unwrap();
         let paused_at = position.load(Ordering::Relaxed);
