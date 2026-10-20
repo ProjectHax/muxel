@@ -256,7 +256,7 @@ mod tests {
     fn encoded_command_round_trips_non_ascii_and_quotes() {
         for s in [
             "echo 'héllo'",
-            "Set-Location -LiteralPath 'C:\\Users\\Ryan\\Проект'",
+            "Set-Location -LiteralPath 'C:\\Users\\Me\\Проект'",
             "Write-Output '日本語'",
             "$ErrorActionPreference='Stop'; exit 0",
         ] {

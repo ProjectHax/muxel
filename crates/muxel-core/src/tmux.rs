@@ -889,8 +889,8 @@ mod tests {
     fn a_recorded_session_wins_over_a_recomputed_one() {
         let id = Uuid::from_u128(0x1a2b3c4d_0000_0000_0000_000000000000);
         assert_eq!(
-            session_for(Some("muxel_sro_client_1a2b3c4d"), "rhel", id),
-            "muxel_sro_client_1a2b3c4d"
+            session_for(Some("muxel_webapp_1a2b3c4d"), "rhel", id),
+            "muxel_webapp_1a2b3c4d"
         );
     }
 
@@ -906,11 +906,11 @@ mod tests {
 
     fn sessions() -> Vec<RemoteSession> {
         parse_sessions(concat!(
-            "muxel_sro_client_90f9def0|/home/ryan/Projects/sro_client|claude\n",
-            "muxel_sro_client_d0d464c4|/home/ryan/Projects/sro_client|claude\n",
-            "muxel_rhel_ae15cabf|/home/ryan/Projects/Bot/Manager|claude\n",
-            "muxel_codem_6b80c97f|/home/ryan/Projects/codem|claude\n",
-            "work|/home/ryan|zsh\n",
+            "muxel_webapp_90f9def0|/home/me/Projects/webapp|claude\n",
+            "muxel_webapp_d0d464c4|/home/me/Projects/webapp|claude\n",
+            "muxel_rhel_ae15cabf|/home/me/Projects/work/api|claude\n",
+            "muxel_notes_6b80c97f|/home/me/Projects/notes|claude\n",
+            "work|/home/me|zsh\n",
         ))
     }
 
@@ -1071,11 +1071,11 @@ mod tests {
     /// The whole point: sessions still running in this project that nothing owns.
     #[test]
     fn orphans_are_this_projects_unowned_muxel_sessions() {
-        let owned = vec!["muxel_sro_client_d0d464c4".into()];
-        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/sro_client", &owned, &[]);
+        let owned = vec!["muxel_webapp_d0d464c4".into()];
+        let orphans = orphan_sessions(&sessions(), "/home/me/Projects/webapp", &owned, &[]);
         assert_eq!(
             orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["muxel_sro_client_90f9def0"],
+            ["muxel_webapp_90f9def0"],
             "an owned session, another project's, and a non-muxel session are all left alone"
         );
         assert_eq!(orphans[0].command, "claude");
@@ -1085,7 +1085,7 @@ mod tests {
     /// started in — the path decides, not the slug.
     #[test]
     fn a_host_named_session_is_attributed_by_its_path() {
-        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/Bot/Manager", &[], &[]);
+        let orphans = orphan_sessions(&sessions(), "/home/me/Projects/work/api", &[], &[]);
         assert_eq!(
             orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["muxel_rhel_ae15cabf"]
@@ -1097,10 +1097,10 @@ mod tests {
     #[test]
     fn the_project_tree_includes_worktrees_but_not_prefix_siblings() {
         let s = parse_sessions(concat!(
-            "muxel_p_00000001|/home/ryan/Projects/app/.worktrees/feat|claude\n",
-            "muxel_p_00000002|/home/ryan/Projects/app-other|claude\n",
+            "muxel_p_00000001|/home/me/Projects/app/.worktrees/feat|claude\n",
+            "muxel_p_00000002|/home/me/Projects/app-other|claude\n",
         ));
-        let orphans = orphan_sessions(&s, "/home/ryan/Projects/app", &[], &[]);
+        let orphans = orphan_sessions(&s, "/home/me/Projects/app", &[], &[]);
         assert_eq!(
             orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["muxel_p_00000001"]
@@ -1110,8 +1110,8 @@ mod tests {
     /// muxel adopts only its own sessions — never the user's own tmux.
     #[test]
     fn a_users_own_session_is_never_adopted() {
-        let s = parse_sessions("work|/home/ryan/Projects/app|vim\n");
-        assert!(orphan_sessions(&s, "/home/ryan/Projects/app", &[], &[]).is_empty());
+        let s = parse_sessions("work|/home/me/Projects/app|vim\n");
+        assert!(orphan_sessions(&s, "/home/me/Projects/app", &[], &[]).is_empty());
     }
 
     fn closed(name: &str, id: Uuid) -> ClosedSession {
@@ -1127,11 +1127,11 @@ mod tests {
     #[test]
     fn a_session_whose_close_is_unconfirmed_is_never_adopted_back() {
         let id = Uuid::parse_str("90f9def0-0000-4000-8000-000000000000").unwrap();
-        let c = [closed("muxel_sro_client_90f9def0", id)];
-        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/sro_client", &[], &c);
+        let c = [closed("muxel_webapp_90f9def0", id)];
+        let orphans = orphan_sessions(&sessions(), "/home/me/Projects/webapp", &[], &c);
         assert_eq!(
             orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["muxel_sro_client_d0d464c4"],
+            ["muxel_webapp_d0d464c4"],
             "only the session nobody closed comes back"
         );
     }
@@ -1147,9 +1147,7 @@ mod tests {
             Some("muxel_rhel_ae15cabf"),
             "a retry must target the name the session actually has"
         );
-        assert!(
-            orphan_sessions(&sessions(), "/home/ryan/Projects/Bot/Manager", &[], &[c]).is_empty()
-        );
+        assert!(orphan_sessions(&sessions(), "/home/me/Projects/work/api", &[], &[c]).is_empty());
     }
 
     /// Once the host no longer lists it, the close is finished and forgettable.
@@ -1163,7 +1161,7 @@ mod tests {
     #[test]
     fn a_close_never_matches_a_users_own_session() {
         let id = Uuid::parse_str("00000001-0000-4000-8000-000000000000").unwrap();
-        let s = parse_sessions("work_00000001|/home/ryan|vim\n");
+        let s = parse_sessions("work_00000001|/home/me|vim\n");
         assert!(live_closed_session(&s, &closed("muxel_p_00000001", id)).is_none());
     }
 

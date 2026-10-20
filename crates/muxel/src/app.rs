@@ -30770,8 +30770,8 @@ mod shell_title_tests {
     #[test]
     fn strips_user_host_prefix() {
         assert_eq!(
-            shell_dir_title("ryan@zen-rhel:~/Projects/Bot/phBot"),
-            "~/Projects/Bot/phBot"
+            shell_dir_title("me@devbox:~/Projects/work/tool"),
+            "~/Projects/work/tool"
         );
         // No `user@host` prefix → unchanged (bare path or a running command).
         assert_eq!(shell_dir_title("~/Projects"), "~/Projects");

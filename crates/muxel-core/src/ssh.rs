@@ -1343,7 +1343,7 @@ mod tests {
     #[test]
     fn connection_args_full_options() {
         let mut h = host();
-        h.user = "ryan".into();
+        h.user = "me".into();
         h.port = Some(2222);
         h.auth = SshAuth::Key;
         h.identity_file = Some(PathBuf::from("/home/dev/.ssh/id_ed25519"));
@@ -1362,7 +1362,7 @@ mod tests {
         assert!(a.contains(&"ServerAliveInterval=30".to_string()));
         assert!(a.contains(&"ServerAliveCountMax=3".to_string()));
         assert!(a.contains(&"Compression=yes".to_string()));
-        assert_eq!(target(&h), "ryan@example.com");
+        assert_eq!(target(&h), "me@example.com");
     }
 
     #[test]
@@ -1759,11 +1759,11 @@ mod tests {
         let spec = SshSpec {
             host: &h,
             control_path: "/s",
-            remote_cwd: Some("/srv/sro_client"),
+            remote_cwd: Some("/srv/webapp"),
             program: Some("claude"),
             args: &[],
             use_tmux: true,
-            tmux_session: Some("muxel_sro_client_abc123"),
+            tmux_session: Some("muxel_webapp_abc123"),
             tmux_socket: Some(Socket::Private),
             tmux_client_tag: None,
         };
@@ -1773,12 +1773,12 @@ mod tests {
             "; if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off; fi; ";
         let (before, pane) = cmd.split_once(server).expect("server starts first");
         assert!(
-            !before.contains("sro_client"),
+            !before.contains("webapp"),
             "the server's command line must not name the project: {before}"
         );
         // …nor muxel: a `pkill -f muxel` on the host must not match it either.
         assert!(!format!("{before}{server}").contains("muxel"), "{cmd}");
-        assert!(pane.contains("muxel_sro_client_abc123"));
+        assert!(pane.contains("muxel_webapp_abc123"));
     }
 
     /// The bug this guards: attaching makes a client the window's latest, so a pane
@@ -1938,8 +1938,8 @@ It is also possible that a host key has just been changed.
 The fingerprint for the ED25519 key sent by the remote host is
 SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s.
 Please contact your system administrator.
-Add correct host key in /Users/ryan/.ssh/known_hosts to get rid of this message.
-Offending ECDSA key in /Users/ryan/.ssh/known_hosts:42
+Add correct host key in /Users/me/.ssh/known_hosts to get rid of this message.
+Offending ECDSA key in /Users/me/.ssh/known_hosts:42
 Host key for example.com has changed and you have requested strict checking.
 Host key verification failed.";
 
@@ -1956,7 +1956,7 @@ Host key verification failed.";
         assert_eq!(c.offending_key_type.as_deref(), Some("ECDSA"));
         assert_eq!(
             c.known_hosts_file.as_deref(),
-            Some("/Users/ryan/.ssh/known_hosts")
+            Some("/Users/me/.ssh/known_hosts")
         );
         assert_eq!(c.known_hosts_line, Some(42));
     }
@@ -1988,7 +1988,7 @@ Host key verification failed.";
             "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
              @       WARNING: POSSIBLE DNS SPOOFING DETECTED!          @\n\
              @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
-             Offending key for IP in /Users/ryan/.ssh/known_hosts:7\n\
+             Offending key for IP in /Users/me/.ssh/known_hosts:7\n\
              {CHANGED_FULL}"
         );
         let c = HostKeyChange::parse(&stderr).expect("classified");
@@ -2011,14 +2011,14 @@ Host key verification failed.";
     fn host_key_change_keeps_windows_paths() {
         let stderr = CHANGED_FULL
             .replace(
-                "/Users/ryan/.ssh/known_hosts",
-                r"C:\Users\ryan\.ssh\known_hosts",
+                "/Users/me/.ssh/known_hosts",
+                r"C:\Users\me\.ssh\known_hosts",
             )
             .replace(":42", ":7");
         let c = HostKeyChange::parse(&stderr).expect("classified");
         assert_eq!(
             c.known_hosts_file.as_deref(),
-            Some(r"C:\Users\ryan\.ssh\known_hosts")
+            Some(r"C:\Users\me\.ssh\known_hosts")
         );
         assert_eq!(c.known_hosts_line, Some(7));
     }

@@ -1840,22 +1840,19 @@ mod tests {
         use std::path::Path;
         let p = super::claude_session_path(
             Path::new("/home/u"),
-            Path::new("/home/ryan/Projects/muxel"),
+            Path::new("/home/me/Projects/muxel"),
             "abc-123",
         );
         assert_eq!(
             p,
-            Path::new("/home/u/.claude/projects/-home-ryan-Projects-muxel/abc-123.jsonl")
+            Path::new("/home/u/.claude/projects/-home-me-Projects-muxel/abc-123.jsonl")
         );
         // A worktree path: '/' and '.' both collapse to '-' (so '/.' becomes '--').
-        let w = super::claude_session_path(
-            Path::new("/h"),
-            Path::new("/home/ryan/.local/share/x"),
-            "id",
-        );
+        let w =
+            super::claude_session_path(Path::new("/h"), Path::new("/home/me/.local/share/x"), "id");
         assert_eq!(
             w,
-            Path::new("/h/.claude/projects/-home-ryan--local-share-x/id.jsonl")
+            Path::new("/h/.claude/projects/-home-me--local-share-x/id.jsonl")
         );
     }
 
@@ -2132,10 +2129,10 @@ mod tests {
     /// its own included — four at once, indistinguishable from four crashes.
     #[test]
     fn memory_instruction_keeps_the_project_name_out_of_argv() {
-        let root = "/home/me/Projects/sro_client";
+        let root = "/home/me/Projects/webapp";
         let s = memory_instruction(&memory_reference(root, Some(root)));
         assert!(
-            !s.contains("sro_client"),
+            !s.contains("webapp"),
             "project name leaked into the agent's argv: {s}"
         );
     }
@@ -2159,14 +2156,14 @@ mod tests {
 
     #[test]
     fn accomplishments_reference_follows_the_memory_rules() {
-        let root = "/home/me/Projects/sro_client";
+        let root = "/home/me/Projects/webapp";
         let rel = muxel_file_reference(root, Some(root), ACCOMPLISHMENTS_FILE);
         assert_eq!(rel, ".muxel/ACCOMPLISHMENTS.md");
         let s = accomplishments_instruction(&rel, "codex");
-        assert!(!s.contains("sro_client"), "project name leaked: {s}");
+        assert!(!s.contains("webapp"), "project name leaked: {s}");
         assert_eq!(
             muxel_file_reference(root, Some("/srv/worktrees/x"), ACCOMPLISHMENTS_FILE),
-            "/home/me/Projects/sro_client/.muxel/ACCOMPLISHMENTS.md"
+            "/home/me/Projects/webapp/.muxel/ACCOMPLISHMENTS.md"
         );
     }
 }

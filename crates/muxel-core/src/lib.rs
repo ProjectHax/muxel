@@ -3891,7 +3891,7 @@ mod identity_tests {
             "id": "11111111-1111-4111-8111-111111111111",
             "name": "dev",
             "hostname": "example.com",
-            "user": "ryan",
+            "user": "me",
             "auth": "Agent",
             "default_use_tmux": true
         }"#;

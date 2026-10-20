@@ -32,9 +32,9 @@ fn a_second_instance_on_the_same_session_is_dropped_from_both_the_list_and_the_l
     let mut proj = project_with(&[]);
     let pid = proj.id;
 
-    let first = instance(pid, Some("muxel_sro_client_90f9def0"));
-    let dup = instance(pid, Some("muxel_sro_client_90f9def0"));
-    let other = instance(pid, Some("muxel_sro_client_d0d464c4"));
+    let first = instance(pid, Some("muxel_webapp_90f9def0"));
+    let dup = instance(pid, Some("muxel_webapp_90f9def0"));
+    let other = instance(pid, Some("muxel_webapp_d0d464c4"));
     proj.layout = Some(PaneNode::Leaf(LeafData {
         pane_id: Uuid::new_v4(),
         tabs: vec![first.id, dup.id, other.id],
