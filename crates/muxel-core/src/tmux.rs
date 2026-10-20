@@ -581,7 +581,7 @@ pub fn live_closed_session<'a>(
 /// Ported to Swift as the `instance.tmuxSession ?? TmuxSession.name(…)` resolution
 /// in `TerminalPaneView` — keep both in step.
 pub fn session_for(recorded: Option<&str>, slug: &str, instance: Uuid) -> String {
-    match recorded.map(str::trim).filter(|s| !s.is_empty()) {
+    match recorded.filter(|s| !s.is_empty()) {
         Some(recorded) => recorded.to_string(),
         None => session_name(slug, instance),
     }
@@ -1188,6 +1188,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recorded_session_names_remain_exact_before_migration() {
+        let mut instance = crate::Instance::shell(Uuid::new_v4());
+        instance.tmux_socket = Some(Socket::Default);
+        for name in [" owned|with|pipes ", "   "] {
+            instance.tmux_session = Some(name.into());
+            let target = instance.tmux_target("host");
+            assert_eq!(
+                target.name, name,
+                "a recorded name is an identity, not user input to trim"
+            );
+            let rows = crate::ssh::parse_session_listings_for_migration(&format!(
+                ":muxel-listed:0\n{name}\n:muxel-listed:0\n"
+            ))
+            .unwrap();
+            let prepared = target
+                .for_respawn::<()>(|socket| {
+                    Ok(rows
+                        .iter()
+                        .any(|row| &row.socket == socket && row.name == target.name))
+                })
+                .unwrap();
+            assert_eq!(
+                prepared, target,
+                "the live Default owner must survive launch preparation"
+            );
+        }
+    }
+
     /// With nothing recorded — the common remote case, where tmux comes from the
     /// host's default rather than the instance — both clients derive the same name.
     #[test]
@@ -1195,7 +1224,6 @@ mod tests {
         let id = Uuid::from_u128(0x1a2b3c4d_0000_0000_0000_000000000000);
         assert_eq!(session_for(None, "rhel", id), "muxel_rhel_1a2b3c4d");
         assert_eq!(session_for(Some(""), "rhel", id), "muxel_rhel_1a2b3c4d");
-        assert_eq!(session_for(Some("   "), "rhel", id), "muxel_rhel_1a2b3c4d");
     }
 
     fn sessions() -> Vec<RemoteSession> {
