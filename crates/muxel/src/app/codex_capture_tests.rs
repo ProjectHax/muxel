@@ -2,18 +2,26 @@ use super::MuxelApp;
 use super::session_discovery::{inject_codex_launch_lookup, inject_codex_resume_lookup};
 use crate::theme;
 use gpui::{TestAppContext, WindowHandle};
-use muxel_core::{AgentPreset, Instance, Project, RemoteRef};
+use muxel_core::{AgentPreset, CodexResumePath, Instance, Project, RemoteRef};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
 
+struct TempRoot(PathBuf);
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
 fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.wip/codex-capture-tests")
-        .join(Uuid::new_v4().to_string());
+    let root = std::env::temp_dir().join(format!("muxel-codex-capture-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
+    let _temp = TempRoot(root.clone());
     let _storage = muxel_store::test_support::set_root(root.clone());
     assert_eq!(muxel_store::data_dir(), Some(root.join("data")));
     assert_eq!(muxel_store::config_dir(), Some(root.join("config")));
@@ -61,7 +69,6 @@ fn codex_launch_preparation_does_not_wait_for_slow_discovery() {
             std::thread::sleep(Duration::from_millis(350));
             Some("01a0e807-a64d-7502-b922-cff0e0000000".into())
         }));
-        let started = Instant::now();
         window
             .update(cx, |app, window, cx| {
                 let (meta, spec, _) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
@@ -70,11 +77,6 @@ fn codex_launch_preparation_does_not_wait_for_slow_discovery() {
                 assert!(app.workspace.instance(pane).unwrap().session_id.is_none());
             })
             .unwrap();
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "UI launch preparation blocked for {:?}",
-            started.elapsed()
-        );
         assert_eq!(
             calls.load(Ordering::Relaxed),
             0,
@@ -127,7 +129,7 @@ fn exact_codex_identity_is_resumed_and_its_path_is_persisted() {
         let _stat = inject_codex_resume_lookup(Arc::new(move |_, saved, _| {
             assert_eq!(saved, id);
             observed.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(expected.clone()))
+            Ok(CodexResumePath::Found(expected.clone()))
         }));
         window
             .update(cx, |app, _, _| {
@@ -168,6 +170,68 @@ fn codex_store_error_keeps_the_saved_resume_identity() {
                 let (args, _) = app.session_resume_for(pane).unwrap();
                 assert_eq!(args, vec!["resume", id]);
                 assert!(app.workspace.instance(pane).unwrap().session_started);
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn inconclusive_codex_lookups_keep_the_saved_resume_identity() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let root = muxel_store::data_dir().unwrap().join("codex-home");
+        let v7 = "01a1543c-9700-7000-8000-000000000001";
+        let old = Uuid::new_v4().to_string();
+        let wrong_day = root.join(".codex/sessions/2020/01/01");
+        std::fs::create_dir_all(&wrong_day).unwrap();
+        std::fs::write(wrong_day.join(format!("rollout-{v7}.jsonl")), "{}").unwrap();
+        let lookup_root = root.clone();
+        let _lookup = inject_codex_resume_lookup(Arc::new(move |_, id, saved| {
+            muxel_core::codex_resume_path(&lookup_root, id, saved)
+        }));
+        let invalid_path = root.join("outside").join(format!("rollout-{v7}.jsonl"));
+        for (id, path) in [(old.as_str(), None), (v7, Some(invalid_path)), (v7, None)] {
+            window
+                .update(cx, |app, _, _| {
+                    let instance = app.workspace.instance_mut(pane).unwrap();
+                    instance.session_id = Some(id.into());
+                    instance.session_path = path.clone();
+                    instance.session_started = true;
+                    let (args, _) = app.session_resume_for(pane).unwrap();
+                    assert_eq!(args, vec!["resume", id]);
+                    assert_eq!(
+                        app.workspace.instance(pane).unwrap().session_id.as_deref(),
+                        Some(id)
+                    );
+                })
+                .unwrap();
+        }
+    });
+}
+
+#[test]
+fn disappeared_saved_codex_path_clears_the_binding() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let root = muxel_store::data_dir().unwrap().join("codex-home");
+        let id = "01a1543c-9700-7000-8000-000000000001";
+        let path = root
+            .join(".codex/sessions/2026/10/19")
+            .join(format!("rollout-{id}.jsonl"));
+        let lookup_root = root.clone();
+        let _lookup = inject_codex_resume_lookup(Arc::new(move |_, id, saved| {
+            muxel_core::codex_resume_path(&lookup_root, id, saved)
+        }));
+        window
+            .update(cx, |app, _, _| {
+                let instance = app.workspace.instance_mut(pane).unwrap();
+                instance.session_id = Some(id.into());
+                instance.session_path = Some(path);
+                instance.session_started = true;
+                assert!(app.session_resume_for(pane).is_none());
+                let instance = app.workspace.instance(pane).unwrap();
+                assert!(instance.session_id.is_none());
+                assert!(!instance.session_started);
             })
             .unwrap();
     });

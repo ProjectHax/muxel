@@ -14,6 +14,15 @@ pub struct CodexSession {
     pub path: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodexResumePath {
+    Found(PathBuf),
+    /// The exact previously captured rollout and its compression sibling are gone.
+    Missing,
+    /// A dated search or untrusted path cannot establish that the rollout is gone.
+    Unknown,
+}
+
 /// A failed bounded lookup may be reused while its day directories are unchanged.
 /// Capture/check these stamps on the background executor, never in a UI update.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,9 +178,9 @@ pub fn codex_resume_path(
     home: &Path,
     id: &str,
     saved: Option<&Path>,
-) -> io::Result<Option<PathBuf>> {
+) -> io::Result<CodexResumePath> {
     let Ok(id) = Uuid::parse_str(id) else {
-        return Ok(None);
+        return Ok(CodexResumePath::Unknown);
     };
     if let Some(path) = saved {
         if !path.starts_with(home.join(".codex/sessions"))
@@ -180,19 +189,29 @@ pub fn codex_resume_path(
                 .any(|component| matches!(component, Component::ParentDir))
             || filename_id(path) != Some(id)
         {
-            return Ok(None);
+            return Ok(CodexResumePath::Unknown);
         }
         return match stat(path) {
-            Ok(metadata) => Ok(metadata.is_file().then(|| path.to_path_buf())),
+            Ok(metadata) => Ok(if metadata.is_file() {
+                CodexResumePath::Found(path.to_path_buf())
+            } else {
+                CodexResumePath::Missing
+            }),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let sibling = match path.extension().and_then(|extension| extension.to_str()) {
                     Some("jsonl") => path.with_extension("jsonl.zst"),
                     Some("zst") => path.with_extension(""),
-                    _ => return Ok(None),
+                    _ => return Ok(CodexResumePath::Unknown),
                 };
                 match stat(&sibling) {
-                    Ok(metadata) => Ok(metadata.is_file().then_some(sibling)),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Ok(metadata) => Ok(if metadata.is_file() {
+                        CodexResumePath::Found(sibling)
+                    } else {
+                        CodexResumePath::Missing
+                    }),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        Ok(CodexResumePath::Missing)
+                    }
                     Err(error) => Err(error),
                 }
             }
@@ -215,11 +234,11 @@ pub fn codex_resume_path(
                 if !stat(&path)?.is_file() {
                     continue;
                 }
-                return Ok(Some(path));
+                return Ok(CodexResumePath::Found(path));
             }
         }
     }
-    Ok(None)
+    Ok(CodexResumePath::Unknown)
 }
 
 #[derive(Default)]

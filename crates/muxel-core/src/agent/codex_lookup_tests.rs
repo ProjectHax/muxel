@@ -1,4 +1,4 @@
-use super::{CodexSessionNames, codex_resume_path, codex_session_id_from_hint};
+use super::{CodexResumePath, CodexSessionNames, codex_resume_path, codex_session_id_from_hint};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -108,7 +108,7 @@ fn b9_stored_codex_path_is_one_stat_without_enumeration_or_content_reads() {
     OPERATIONS.with_borrow_mut(Vec::clear);
     assert_eq!(
         codex_resume_path(&root, id, Some(&path)).unwrap(),
-        Some(path.clone())
+        CodexResumePath::Found(path.clone())
     );
     assert_eq!(
         OPERATIONS.with_borrow_mut(std::mem::take),
@@ -116,7 +116,7 @@ fn b9_stored_codex_path_is_one_stat_without_enumeration_or_content_reads() {
     );
     assert_eq!(
         codex_resume_path(&root, "01a1543c-9700-7000-8000-000000000002", Some(&path)).unwrap(),
-        None
+        CodexResumePath::Unknown
     );
     assert!(OPERATIONS.with_borrow(Vec::is_empty));
 }
@@ -131,9 +131,15 @@ fn b9_archived_codex_path_is_not_resumable_and_is_never_scanned() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "{}").unwrap();
     OPERATIONS.with_borrow_mut(Vec::clear);
-    assert_eq!(codex_resume_path(&root, id, Some(&path)).unwrap(), None);
+    assert_eq!(
+        codex_resume_path(&root, id, Some(&path)).unwrap(),
+        CodexResumePath::Unknown
+    );
     assert!(OPERATIONS.with_borrow(Vec::is_empty));
-    assert_eq!(codex_resume_path(&root, id, None).unwrap(), None);
+    assert_eq!(
+        codex_resume_path(&root, id, None).unwrap(),
+        CodexResumePath::Unknown
+    );
     assert!(OPERATIONS.with_borrow(|operations| operations.iter().all(|operation| {
         matches!(operation, Operation::Directory(directory) if directory.starts_with(root.join(".codex/sessions")))
     })));
@@ -152,7 +158,7 @@ fn b9_compression_moves_only_probe_the_exact_saved_path_and_its_sibling() {
     OPERATIONS.with_borrow_mut(Vec::clear);
     assert_eq!(
         codex_resume_path(&root, id, Some(&path)).unwrap(),
-        Some(compressed.clone())
+        CodexResumePath::Found(compressed.clone())
     );
     assert_eq!(
         OPERATIONS.with_borrow_mut(std::mem::take),
@@ -166,7 +172,7 @@ fn b9_compression_moves_only_probe_the_exact_saved_path_and_its_sibling() {
     std::fs::write(&plain, "{}").unwrap();
     assert_eq!(
         codex_resume_path(&root, id, Some(&compressed)).unwrap(),
-        Some(plain.clone())
+        CodexResumePath::Found(plain.clone())
     );
     assert_eq!(
         OPERATIONS.with_borrow_mut(std::mem::take),
@@ -290,6 +296,8 @@ fn r2_key(root: &Path) -> crate::session_discovery::SessionDiscoveryKey {
         binding_path: None,
         cwd: root.join("project"),
         hint: Some("01a1543c-9700-7000-8000-000000000001".into()),
+        tmux_session: None,
+        tmux_socket: None,
     }
 }
 
@@ -599,6 +607,8 @@ fn w8lm_codex_capture_retries_after_a_missing_rollout_appears() {
         binding_path: None,
         cwd: cwd.clone(),
         hint: Some(id.into()),
+        tmux_session: None,
+        tmux_socket: None,
     };
     let mut discovery = SessionDiscovery::default();
     let first = discovery.begin(key.clone(), now).unwrap();

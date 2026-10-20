@@ -6197,12 +6197,13 @@ impl MuxelApp {
                     id,
                     inst.session_path.as_deref(),
                 ) {
-                    Ok(Some(path)) => inst.session_path = Some(path),
-                    Ok(None) => {
+                    Ok(muxel_core::CodexResumePath::Found(path)) => inst.session_path = Some(path),
+                    Ok(muxel_core::CodexResumePath::Missing) => {
                         inst.session_id = None;
                         inst.session_path = None;
                         inst.session_started = false;
                     }
+                    Ok(muxel_core::CodexResumePath::Unknown) => {}
                     // An unreadable store does not prove an exact identity expired.
                     Err(error) => {
                         log::warn!("could not check Codex rollout before resume: {error}")
@@ -11588,6 +11589,7 @@ impl MuxelApp {
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
                 instance.tmux_session = Some(muxel_core::tmux::session_name(&project_name, iid));
+                instance.tmux_socket = Some(muxel_core::tmux::Socket::Private);
             }
         }
 
@@ -16850,6 +16852,7 @@ impl MuxelApp {
         let pid = inst.project_id;
         inst.id = Uuid::new_v4();
         inst.tmux_session = None;
+        inst.tmux_socket = None;
         inst.pinned = false; // a duplicate starts unpinned
         // A pane owns one resumable conversation. Reusing the source session id
         // lets two live Claudes create branches in one transcript; after restart
@@ -16865,6 +16868,7 @@ impl MuxelApp {
                 .map(|p| p.name.clone())
                 .unwrap_or_default();
             inst.tmux_session = Some(muxel_core::tmux::session_name(&project_name, inst.id));
+            inst.tmux_socket = Some(muxel_core::tmux::Socket::Private);
         }
         let new_iid = inst.id;
         // Insert the copy as a tab right after the original.

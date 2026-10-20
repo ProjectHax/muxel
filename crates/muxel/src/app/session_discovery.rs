@@ -7,21 +7,23 @@ use super::{
 };
 #[cfg(windows)]
 use super::{active_grok_session_for_process, process_parent_map, read_grok_active_sessions};
-use crate::{session_binding, ui_profile};
+use crate::{integrations, session_binding, ui_profile};
 use gpui::{App, Context};
 use muxel_core::session_discovery::{
     CodexLookupEvidence, SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
+use muxel_core::tmux::Socket;
 use muxel_core::{AgentPreset, CodexHintMiss};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 use uuid::Uuid;
 
 // Explicit Import may search history. Restoration must never call this path.
 pub(super) fn capture_codex_session_id(home: &Path, cwd: &Path) -> Option<String> {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     let injected = CODEX_LAUNCH_TEST_LOOKUP.lock().unwrap().clone();
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     if let Some(discover) = injected {
         return discover(home, cwd);
     }
@@ -32,48 +34,111 @@ pub(super) fn resume_codex_session(
     home: &Path,
     id: &str,
     path: Option<&Path>,
-) -> std::io::Result<Option<PathBuf>> {
-    #[cfg(test)]
+) -> std::io::Result<muxel_core::CodexResumePath> {
+    #[cfg(all(test, windows))]
     let injected = CODEX_RESUME_TEST_LOOKUP.lock().unwrap().clone();
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     if let Some(discover) = injected {
         return discover(home, id, path);
     }
     muxel_core::codex_resume_path(home, id, path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 type CodexResumeTestLookup = std::sync::Arc<
-    dyn Fn(&Path, &str, Option<&Path>) -> std::io::Result<Option<PathBuf>> + Send + Sync,
+    dyn Fn(&Path, &str, Option<&Path>) -> std::io::Result<muxel_core::CodexResumePath>
+        + Send
+        + Sync,
 >;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 static CODEX_RESUME_TEST_LOOKUP: std::sync::Mutex<Option<CodexResumeTestLookup>> =
     std::sync::Mutex::new(None);
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(super) fn inject_codex_resume_lookup(discover: CodexResumeTestLookup) -> CodexLaunchTestGuard {
     *CODEX_RESUME_TEST_LOOKUP.lock().unwrap() = Some(discover);
     CodexLaunchTestGuard
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 type CodexLaunchTestLookup = std::sync::Arc<dyn Fn(&Path, &Path) -> Option<String> + Send + Sync>;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 static CODEX_LAUNCH_TEST_LOOKUP: std::sync::Mutex<Option<CodexLaunchTestLookup>> =
     std::sync::Mutex::new(None);
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(super) struct CodexLaunchTestGuard;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 impl Drop for CodexLaunchTestGuard {
     fn drop(&mut self) {
         *CODEX_LAUNCH_TEST_LOOKUP.lock().unwrap() = None;
         *CODEX_RESUME_TEST_LOOKUP.lock().unwrap() = None;
     }
 }
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(super) fn inject_codex_launch_lookup(discover: CodexLaunchTestLookup) -> CodexLaunchTestGuard {
     *CODEX_LAUNCH_TEST_LOOKUP.lock().unwrap() = Some(discover);
     CodexLaunchTestGuard
+}
+
+#[cfg(test)]
+type CodexTmuxTitleTestReader =
+    std::sync::Arc<dyn Fn(&str, Option<Socket>) -> Option<String> + Send + Sync>;
+#[cfg(test)]
+static CODEX_TMUX_TITLE_TEST_READER: std::sync::Mutex<Option<CodexTmuxTitleTestReader>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+struct CodexTmuxTitleTestGuard;
+
+#[cfg(test)]
+impl Drop for CodexTmuxTitleTestGuard {
+    fn drop(&mut self) {
+        *CODEX_TMUX_TITLE_TEST_READER.lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+fn inject_codex_tmux_title_reader(reader: CodexTmuxTitleTestReader) -> CodexTmuxTitleTestGuard {
+    *CODEX_TMUX_TITLE_TEST_READER.lock().unwrap() = Some(reader);
+    CodexTmuxTitleTestGuard
+}
+
+/// This runs only on the discovery worker. The recorded socket prevents a
+/// namesake session on the other server from supplying the wrong title.
+fn codex_tmux_title(session: &str, socket: Option<Socket>) -> Option<String> {
+    #[cfg(test)]
+    if let Some(reader) = CODEX_TMUX_TITLE_TEST_READER.lock().unwrap().clone() {
+        return reader(session, socket);
+    }
+    let socket = socket.unwrap_or_else(|| integrations::local_tmux_socket(session));
+    let output = Command::new("tmux")
+        .args(socket.args())
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &format!("={session}:"),
+            "#{pane_title}",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn codex_tmux_capture_session(
+    instance: &muxel_core::Instance,
+    osc_hint: Option<&str>,
+) -> Option<String> {
+    (osc_hint.is_none()
+        && instance.use_tmux
+        && instance.session_started
+        && instance.session_id.is_none())
+    .then(|| instance.tmux_session.clone())
+    .flatten()
 }
 
 struct SessionBindingUpdate {
@@ -135,27 +200,34 @@ impl MuxelApp {
                     .iter()
                     .find(|preset| preset.name == instance.preset)
             });
-        let (provider, hint) = if let Some(preset) =
+        let (provider, hint, tmux_session) = if let Some(preset) =
             preset.filter(|preset| is_codex_program(preset.program.as_deref()))
         {
-            let hint = muxel_core::codex_session_hint_from_title(preset, &view.session_id_hint()?)?;
-            let prefix = hint.strip_suffix("...").unwrap_or(&hint);
-            if instance
-                .session_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with(prefix))
-            {
+            let hint = view
+                .session_id_hint()
+                .and_then(|title| muxel_core::codex_session_hint_from_title(preset, &title));
+            let tmux_session = codex_tmux_capture_session(instance, hint.as_deref());
+            if hint.is_none() && tmux_session.is_none() {
                 return None;
             }
-            (SessionProvider::Codex, Some(hint))
+            if hint.as_ref().is_some_and(|hint| {
+                let prefix = hint.strip_suffix("...").unwrap_or(hint);
+                instance
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(prefix))
+            }) {
+                return None;
+            }
+            (SessionProvider::Codex, hint, tmux_session)
         } else if is_claude_program(instance.program.as_deref()) {
-            (SessionProvider::Claude, None)
+            (SessionProvider::Claude, None, None)
         } else if cfg!(windows)
             && is_grok_program(instance.program.as_deref())
             && instance.tmux_session.is_none()
             && view.child_pid().is_some()
         {
-            (SessionProvider::Grok, None)
+            (SessionProvider::Grok, None, None)
         } else {
             return None;
         };
@@ -173,6 +245,8 @@ impl MuxelApp {
                 .unwrap_or(&project.root_path)
                 .clone(),
             hint,
+            tmux_socket: tmux_session.as_ref().and(instance.tmux_socket),
+            tmux_session,
         })
     }
 
@@ -342,20 +416,32 @@ fn discover_sessions(
             let mut miss = None;
             let candidate = match key.provider {
                 SessionProvider::Codex => {
-                    let hint = key.hint.as_deref().unwrap_or_default();
-                    let stamp = CodexHintMiss::capture(home, hint, started);
-                    if let Some(cached) = request
-                        .codex_miss
-                        .as_ref()
-                        .filter(|cached| cached.reusable_for(&stamp))
-                    {
-                        miss = Some(cached.clone());
-                        None
-                    } else {
+                    let hint = key.hint.clone().or_else(|| {
+                        key.tmux_session
+                            .as_deref()
+                            .and_then(|session| codex_tmux_title(session, key.tmux_socket))
+                            .and_then(|title| {
+                                muxel_core::codex_session_hint_from_title(
+                                    &AgentPreset::codex(),
+                                    &title,
+                                )
+                            })
+                    });
+                    hint.and_then(|hint| {
+                        let stamp = CodexHintMiss::capture(home, &hint, started);
+                        if let Some(cached) = key.hint.as_ref().and(
+                            request
+                                .codex_miss
+                                .as_ref()
+                                .filter(|cached| cached.reusable_for(&stamp)),
+                        ) {
+                            miss = Some(cached.clone());
+                            return None;
+                        }
                         let candidate = validated_codex_session_id(
                             &AgentPreset::codex(),
                             key.binding.as_deref(),
-                            key.hint.as_deref(),
+                            Some(&hint),
                             home,
                             &key.cwd,
                             Some(key.pane),
@@ -368,7 +454,7 @@ fn discover_sessions(
                             miss = Some(stamp);
                         }
                         candidate
-                    }
+                    })
                 }
                 SessionProvider::Claude => data_dir.and_then(|data_dir| {
                     session_binding::claude_session_id_from_binding(data_dir, key.pane, home)
@@ -408,9 +494,12 @@ fn discover_sessions(
 
 #[cfg(test)]
 mod w8lm_tests {
-    use super::discover_sessions;
+    use super::{codex_tmux_capture_session, discover_sessions, inject_codex_tmux_title_reader};
     use muxel_core::session_discovery::{SessionDiscoveries, SessionDiscoveryKey, SessionProvider};
+    use muxel_core::tmux::Socket;
+    use muxel_core::{AgentPreset, Instance};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
 
@@ -425,6 +514,8 @@ mod w8lm_tests {
             binding_path: None,
             cwd: root.join("project"),
             hint: Some("01a1543c-9700-7000-8000-000000000001".into()),
+            tmux_session: None,
+            tmux_socket: None,
         }
     }
 
@@ -483,5 +574,39 @@ mod w8lm_tests {
         let (request, candidate, _) = discover_sessions(vec![request], &root, None).pop().unwrap();
         assert!(candidate.is_none());
         assert_eq!(request.key.binding, old);
+    }
+
+    #[test]
+    fn tmux_codex_capture_reads_its_recorded_socket_then_stops_when_bound() {
+        let root = std::env::temp_dir().join(format!("muxel-tmux-codex-{}", Uuid::new_v4()));
+        let mut key = key(&root);
+        let id = key.hint.clone().unwrap();
+        let path = write(&root, &key, false);
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
+        instance.use_tmux = true;
+        instance.session_started = true;
+        instance.tmux_session = Some("muxel_test_owned".into());
+        instance.tmux_socket = Some(Socket::Default);
+        key.hint = None;
+        key.tmux_session = codex_tmux_capture_session(&instance, key.hint.as_deref());
+        key.tmux_socket = instance.tmux_socket;
+        assert_eq!(key.tmux_session.as_deref(), Some("muxel_test_owned"));
+        let _reader = inject_codex_tmux_title_reader(Arc::new(move |session, socket| {
+            assert_eq!(session, "muxel_test_owned");
+            assert_eq!(socket, Some(Socket::Default));
+            Some(format!("{id} | Ready"))
+        }));
+        let now = Instant::now();
+        let mut discovery = SessionDiscoveries::default();
+        let request = discovery.begin(key.clone(), now).unwrap();
+        let (request, candidate, miss) =
+            discover_sessions(vec![request], &root, None).pop().unwrap();
+        let candidate = candidate.expect("tmux title must resolve the rollout");
+        assert_eq!(candidate.path, Some(path));
+        assert!(miss.is_none());
+        assert!(discovery.finish_with_codex_miss(&request, Some(&key), now, true, miss));
+        instance.session_id = Some(candidate.id);
+        assert!(codex_tmux_capture_session(&instance, None).is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

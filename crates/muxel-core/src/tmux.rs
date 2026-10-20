@@ -41,7 +41,8 @@ const SESSION_PREFIX: &str = "muxel_";
 pub const SOCKET_NAME: &str = "mxl";
 
 /// Which tmux server a command talks to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub enum Socket {
     /// muxel's own server ([`SOCKET_NAME`]). Every session muxel creates goes here.
     Private,
@@ -50,6 +51,27 @@ pub enum Socket {
     /// running and is nowhere else — a pane from an earlier muxel, or a session the
     /// user imported.
     Default,
+}
+
+impl From<Socket> for String {
+    fn from(socket: Socket) -> Self {
+        match socket {
+            Socket::Private => SOCKET_NAME.to_string(),
+            Socket::Default => "default".to_string(),
+        }
+    }
+}
+
+impl TryFrom<String> for Socket {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        match name.as_str() {
+            SOCKET_NAME => Ok(Self::Private),
+            "default" => Ok(Self::Default),
+            _ => Err("unrecognized tmux socket".to_string()),
+        }
+    }
 }
 
 impl Socket {

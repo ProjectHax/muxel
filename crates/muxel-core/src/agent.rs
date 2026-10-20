@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 mod codex_sessions;
 pub use codex_sessions::{
-    CodexHintMiss, CodexSession, CodexSessionNames, codex_resume_path, codex_session_from_hint,
+    CodexHintMiss, CodexResumePath, CodexSession, CodexSessionNames, codex_resume_path,
+    codex_session_from_hint,
 };
 
 #[cfg(test)]
@@ -770,24 +771,6 @@ pub fn claude_session_cwd(transcript: &Path) -> std::io::Result<Option<PathBuf>>
         line.clear();
     }
     Ok(latest)
-}
-
-/// Whether a Codex rollout filename under `~/.codex/sessions` carries
-/// `session_id`. Used to decide if a stored id is still resumable before
-/// `codex resume <id>` without opening rollout contents on the activation path.
-pub fn codex_session_exists(home: &Path, session_id: &str) -> bool {
-    codex_resume_path(home, session_id, None)
-        .ok()
-        .flatten()
-        .is_some()
-}
-
-/// Whether Codex has an exact rollout whose session id and recorded cwd both
-/// match this pane. Used when a later provider-owned terminal title reports an
-/// in-process `/resume` switch: existence alone is not enough when sibling panes
-/// share one directory.
-pub fn codex_session_matches_cwd(home: &Path, session_id: &str, cwd: &Path) -> bool {
-    codex_session_from_hint(home, session_id, cwd).is_some()
 }
 
 /// Latest saved display name for each Codex session id.
@@ -1598,38 +1581,6 @@ mod tests {
             codex_latest_session_id(&tmp, &cwd).as_deref(),
             Some("id-new")
         );
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn codex_session_exists_uses_filename_only() {
-        use std::io::Write;
-
-        let tmp = std::env::temp_dir().join(format!("muxel-codex-exists-{}", Uuid::new_v4()));
-        let present_id = "01a1543c-9700-7000-8000-000000000001".to_string();
-        let compressed_id = "01a1543c-9700-7000-8000-000000000002".to_string();
-        let content_only_id = "01a1543c-9700-7000-8000-000000000003".to_string();
-        let day = codex_sessions::directories(&tmp, &present_id)[0].clone();
-        std::fs::create_dir_all(&day).unwrap();
-        let path = day.join(format!("rollout-2026-09-04T00-00-00-{present_id}.jsonl"));
-        let mut f = std::fs::File::create(path).unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"session_meta","payload":{{"session_id":"{content_only_id}","cwd":"ignored"}}}}"#
-        )
-        .unwrap();
-        std::fs::write(
-            day.join(format!(
-                "rollout-2026-09-04T00-00-01-{compressed_id}.jsonl.zst"
-            )),
-            "contents need not be readable as a rollout",
-        )
-        .unwrap();
-
-        assert!(codex_session_exists(&tmp, &present_id));
-        assert!(codex_session_exists(&tmp, &compressed_id.to_uppercase()));
-        assert!(!codex_session_exists(&tmp, &content_only_id));
-        assert!(!codex_session_exists(&tmp, "not-a-session-uuid"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

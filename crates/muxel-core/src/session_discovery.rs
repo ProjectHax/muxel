@@ -1,5 +1,6 @@
 //! Pure scheduling and result guards for provider session discovery.
 
+use crate::tmux::Socket;
 use crate::{CodexHintMiss, Workspace};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -27,6 +28,9 @@ pub struct SessionDiscoveryKey {
     pub cwd: PathBuf,
     /// Canonical provider identity hint, excluding title activity/spinners.
     pub hint: Option<String>,
+    /// Local tmux owner for a Codex pane whose OSC title cannot reach the view.
+    pub tmux_session: Option<String>,
+    pub tmux_socket: Option<Socket>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -288,6 +292,8 @@ mod tests {
             binding_path: None,
             cwd: PathBuf::from("project"),
             hint: Some("thread hint".to_string()),
+            tmux_session: None,
+            tmux_socket: None,
         }
     }
 

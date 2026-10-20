@@ -31,14 +31,14 @@ pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
-    AgentPreset, CodexHintMiss, CodexSession, CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR,
-    MEMORY_FILE, PresetKind, ResolvedLaunch, append_agent_instruction, claude_session_cwd,
-    claude_session_path, codex_developer_instructions_override, codex_latest_session_id,
-    codex_resume_path, codex_session_exists, codex_session_from_hint,
-    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_matches_cwd,
-    codex_session_names, codex_terminal_title_override, file_link_instruction,
-    find_claude_session_path, memory_header, memory_instruction, memory_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args,
+    AgentPreset, CodexHintMiss, CodexResumePath, CodexSession, CodexSessionNames, EnvVar,
+    InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch, append_agent_instruction,
+    claude_session_cwd, claude_session_path, codex_developer_instructions_override,
+    codex_latest_session_id, codex_resume_path, codex_session_from_hint,
+    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
+    codex_terminal_title_override, file_link_instruction, find_claude_session_path, memory_header,
+    memory_instruction, memory_reference, resolve_launch, resolve_launch_for_session,
+    session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
@@ -528,6 +528,9 @@ pub struct Instance {
     /// tmux session name, once created.
     #[serde(default)]
     pub tmux_session: Option<String>,
+    /// The server that owns the session. Absent only for older saved panes.
+    #[serde(default)]
+    pub tmux_socket: Option<tmux::Socket>,
     /// The grid `(cols, rows)` this pane last rendered at, so it can respawn at the
     /// size it will actually be laid out at instead of the 80×24 default.
     ///
@@ -645,6 +648,7 @@ impl Instance {
             use_tmux: false,
             use_worktree: false,
             tmux_session: None,
+            tmux_socket: None,
             grid: None,
             worktree_path: None,
             worktree_branch: None,
@@ -709,6 +713,7 @@ impl Instance {
             use_tmux: false,
             use_worktree: false,
             tmux_session: None,
+            tmux_socket: None,
             grid: None,
             worktree_path: None,
             worktree_branch: None,
@@ -1386,6 +1391,7 @@ impl RemoteLayout {
                 instance.activity = AgentActivity::default();
                 if edits_only {
                     instance.tmux_session = None;
+                    instance.tmux_socket = None;
                     instance.session_id = None;
                     instance.session_path = None;
                     instance.session_started = false;
