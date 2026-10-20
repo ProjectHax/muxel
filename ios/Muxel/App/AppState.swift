@@ -1153,13 +1153,14 @@ final class AppState: ObservableObject {
     ) async throws -> Attachment? {
         for _ in 0..<2 {
             guard !Task.isCancelled, selectedProject?.id == project.id,
-                  let current = layout?.instances.first(where: { $0.id == instanceId }) else { return nil }
+                  let current = layout?.instances.first(where: { $0.id == instanceId }),
+                  !current.literalArgv else { return nil }
             let prepared = try await prepare(current)
             guard !Task.isCancelled, selectedProject?.id == project.id else { return nil }
             if try await bindTmuxTarget(prepared.target, instance: current, in: project) {
                 guard !Task.isCancelled, selectedProject?.id == project.id,
                       let bound = layout?.instances.first(where: { $0.id == instanceId }),
-                      bound.tmuxSocket == prepared.target.socket,
+                      !bound.literalArgv, bound.tmuxSocket == prepared.target.socket,
                       bound.tmuxSession == prepared.target.name else { return nil }
                 return prepared.attachment
             }
@@ -1193,6 +1194,7 @@ final class AppState: ObservableObject {
                             observed = layout
                             guard let idx = layout.instances.firstIndex(where: { $0.id == instance.id }) else { return false }
                             let saved = layout.instances[idx]
+                            guard !saved.literalArgv else { return false }
                             // A resolved server is authoritative, including when
                             // its session name has not been backfilled yet. A
                             // legacy name without a socket still needs discovery.

@@ -91,11 +91,14 @@ impl InstanceTmux {
     }
 
     fn on_host(&self, host_name: &str) -> SessionTarget {
-        SessionTarget::new(muxel_core::tmux::session_for(
-            self.recorded_session.as_deref(),
-            host_name,
-            self.instance_id,
-        ), self.socket)
+        SessionTarget::new(
+            muxel_core::tmux::session_for(
+                self.recorded_session.as_deref(),
+                host_name,
+                self.instance_id,
+            ),
+            self.socket,
+        )
     }
 }
 
@@ -134,7 +137,7 @@ fn literal_command_spec(instance: &Instance, project: Option<&Project>) -> Optio
 
 #[cfg(test)]
 mod literal_command_tests {
-    use super::{InstanceTmux, literal_command_spec};
+    use super::{InstanceTmux, Socket, literal_command_spec};
     use muxel_core::{AgentPreset, EnvVar, InjectionMode, Instance, Project, WorktreeCleanup};
 
     #[test]
@@ -142,6 +145,7 @@ mod literal_command_tests {
         let mut instance = Instance::shell(uuid::Uuid::new_v4());
         instance.literal_argv = true;
         instance.use_tmux = true;
+        instance.tmux_socket = Some(Socket::Default);
         instance.worktree_id = Some(uuid::Uuid::new_v4());
         instance.launch_dir = Some(std::env::temp_dir());
         for recorded in [None, Some("peer-owned-session".to_string())] {
@@ -170,8 +174,16 @@ mod literal_command_tests {
             muxel_core::tmux::session_name("remote-host", instance.id)
         );
         instance.tmux_session = Some("renamed-peer-session".into());
+        instance.tmux_socket = Some(Socket::Default);
         let captured = InstanceTmux::capture(&instance).unwrap();
-        assert_eq!(captured.on_host("different-host").name, "renamed-peer-session");
+        assert_eq!(
+            captured.on_host("different-host").socket,
+            Some(Socket::Default)
+        );
+        assert_eq!(
+            captured.on_host("different-host").name,
+            "renamed-peer-session"
+        );
         assert_eq!(
             captured.recorded_session.as_deref(),
             Some("renamed-peer-session")
@@ -7284,6 +7296,7 @@ impl MuxelApp {
                     LaunchTicket {
                         token,
                         since: Instant::now(),
+                        startup: None,
                     },
                 );
                 token
@@ -8314,7 +8327,11 @@ impl MuxelApp {
                         Some((i.project_id, tmux.on_host(&host.name), true))
                     }
                     Some(_) => None,
-                    None => Some((i.project_id, SessionTarget::new(tmux.recorded_session?, tmux.socket), false)),
+                    None => Some((
+                        i.project_id,
+                        SessionTarget::new(tmux.recorded_session?, tmux.socket),
+                        false,
+                    )),
                 }
             })
             .collect()
@@ -11259,7 +11276,10 @@ impl MuxelApp {
                 .workspace
                 .instance(iid)
                 .and_then(InstanceTmux::capture)
-                .and_then(|tmux| tmux.recorded_session.map(|name| SessionTarget::new(name, tmux.socket)));
+                .and_then(|tmux| {
+                    tmux.recorded_session
+                        .map(|name| SessionTarget::new(name, tmux.socket))
+                });
             let is_claude = self.workspace.instance(iid).is_some_and(|instance| {
                 instance
                     .preset_id
@@ -12402,6 +12422,7 @@ impl MuxelApp {
                 !instance.literal_argv && (adopted || (self.use_tmux && self.tmux_available));
             if instance.literal_argv {
                 instance.tmux_session = None;
+                instance.tmux_socket = None;
             }
 
             // Decide the worktree: explicit (duplicate/resume) wins; otherwise a new
@@ -12433,6 +12454,7 @@ impl MuxelApp {
                 instance.tmux_socket = Some(integrations::profile_tmux_socket());
             }
             if !adopted
+                && !instance.literal_argv
                 && instance.tmux_session.is_none()
                 && let Some(host) = self
                     .remote_host_for_project(pid)
@@ -17898,7 +17920,8 @@ impl MuxelApp {
             inst.tmux_session = Some(muxel_core::tmux::session_name(&project_name, inst.id));
             inst.tmux_socket = Some(integrations::profile_tmux_socket());
         }
-        if inst.tmux_session.is_none()
+        if !inst.literal_argv
+            && inst.tmux_session.is_none()
             && let Some(host) = self
                 .remote_host_for_project(pid)
                 .filter(|host| host.use_tmux(inst.use_tmux))

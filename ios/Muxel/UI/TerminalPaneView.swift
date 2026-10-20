@@ -45,6 +45,25 @@ struct TerminalPaneView: View {
         let resumeSessionId: String?
     }
 
+    private var currentInstance: Instance? {
+        guard state.selectedProject?.id == project.id else { return nil }
+        return state.layout?.instances.first { $0.id == instance.id }
+    }
+
+    /// A peer may replace the captured pane metadata while attachment is awaiting
+    /// SSH. Literal commands stay stopped on the phone, including an old grid.
+    @discardableResult
+    private func stopIfLiteral() -> Bool {
+        guard currentInstance?.literalArgv == true else { return false }
+        retryTask?.cancel()
+        retryTask = nil
+        state.terminals.disconnect(instance.id)
+        session = nil
+        state.clearDead(instance.id)
+        status = .stopped
+        return true
+    }
+
     /// The terminal is dimmed (and non-interactive) whenever an overlay covers it but a
     /// prior session's frozen grid is still worth showing underneath.
     private var dimmed: Bool {
@@ -75,6 +94,9 @@ struct TerminalPaneView: View {
         .onChange(of: state.deadPanes.contains(instance.id)) { dead in
             if dead { beginReconnect() }
         }
+        .onChange(of: currentInstance?.literalArgv) { literal in
+            if literal == true { stopIfLiteral() }
+        }
         .onDisappear { retryTask?.cancel(); retryTask = nil }
     }
 
@@ -100,18 +122,18 @@ struct TerminalPaneView: View {
     }
 
     private func initialAttach() async {
-        guard !instance.literalArgv else { status = .stopped; return }
+        guard !stopIfLiteral() else { return }
         status = .attaching
         if await resolve(announce: true) {
             status = .live
-        } else if session == nil {
+        } else if status != .stopped, session == nil {
             status = .unreachable(lastError ?? "Couldn't reach \(host.name).")
         }
     }
 
     /// Start (or continue) the backoff reconnect loop for a dropped live session.
     private func beginReconnect() {
-        guard !instance.literalArgv, retryTask == nil else { return }
+        guard !stopIfLiteral(), retryTask == nil else { return }
         status = .reconnecting(attempt: 1)
         retryTask = Task { await reconnectLoop() }
     }
@@ -120,6 +142,7 @@ struct TerminalPaneView: View {
         let delaysSecs: [UInt64] = [1, 2, 4, 8, 15]
         for (i, secs) in delaysSecs.enumerated() {
             if Task.isCancelled { retryTask = nil; return }
+            if stopIfLiteral() { return }
             status = .reconnecting(attempt: i + 1)
             try? await Task.sleep(nanoseconds: secs * 1_000_000_000)
             if Task.isCancelled { retryTask = nil; return }
@@ -131,6 +154,7 @@ struct TerminalPaneView: View {
                 retryTask = nil
                 return
             }
+            if status == .stopped { retryTask = nil; return }
         }
         // Exhausted — settle into unreachable; clearing the dead flag stops it from
         // immediately re-triggering the loop. The user can Try again from the overlay.
@@ -142,12 +166,14 @@ struct TerminalPaneView: View {
     private func retryNow() {
         retryTask?.cancel()
         retryTask = nil
+        guard !stopIfLiteral() else { return }
         Task {
+            guard !stopIfLiteral() else { return }
             status = .reconnecting(attempt: 1)
             if await resolve(announce: true) {
                 state.clearDead(instance.id)
                 status = .live
-            } else {
+            } else if status != .stopped {
                 beginReconnect()
             }
         }
@@ -163,7 +189,7 @@ struct TerminalPaneView: View {
     private func resolve(announce: Bool) async -> Bool {
         guard !Task.isCancelled, state.selectedProject?.id == project.id,
               state.layout?.instances.contains(where: { $0.id == instance.id }) == true else { return false }
-        guard !instance.literalArgv else { status = .stopped; return false }
+        guard !stopIfLiteral() else { return false }
         if let live = state.terminals.existing(instance.id) {
             live.onFocusRequested = onFocus
             session = live
@@ -223,10 +249,11 @@ struct TerminalPaneView: View {
                                                    creating: creating, startupInput: startupInput,
                                                    startupDelayMs: startupDelayMs, startupSubmit: startupSubmit,
                                                    resumeSessionId: resumeSessionId))
-            }) else { return false }
+            }) else { stopIfLiteral(); return false }
             guard !Task.isCancelled, state.selectedProject?.id == project.id,
                   let accepted = state.layout?.instances.first(where: { $0.id == instance.id }),
-                  accepted.tmuxSocket == plan.socket, accepted.tmuxSession == plan.sessionName else { return false }
+                  !accepted.literalArgv, accepted.tmuxSocket == plan.socket,
+                  accepted.tmuxSession == plan.sessionName else { stopIfLiteral(); return false }
             // Prewarm only the accepted owner, from a project-less command line,
             // so the server does not retain a project's argv. Best-effort: another
             // client may already have started it.
@@ -235,7 +262,8 @@ struct TerminalPaneView: View {
             }
             guard !Task.isCancelled, state.selectedProject?.id == project.id,
                   let current = state.layout?.instances.first(where: { $0.id == instance.id }),
-                  current.tmuxSocket == plan.socket, current.tmuxSession == plan.sessionName else { return false }
+                  !current.literalArgv, current.tmuxSocket == plan.socket,
+                  current.tmuxSession == plan.sessionName else { stopIfLiteral(); return false }
             let s = state.terminals.session(
                 for: instance.id, hostId: host.id, connection: conn, command: plan.command)
             s.onFocusRequested = onFocus
@@ -265,6 +293,7 @@ struct TerminalPaneView: View {
             return true
         } catch {
             guard !Task.isCancelled, state.selectedProject?.id == project.id else { return false }
+            guard !stopIfLiteral() else { return false }
             lastError = error.localizedDescription
             // A changed host key needs the trust-prompt sheet, not just inline text.
             if announce { state.surface(error, host: host) }

@@ -422,6 +422,49 @@ final class LayoutTransactionTests: XCTestCase {
         XCTAssertTrue(commands.isEmpty)
     }
 
+    func testFreshLiteralPaneDoesNotPrepareOrBindTmuxAttachment() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var literal = layout
+        literal.instances[0].literalArgv = true
+        state.layout = literal
+        let conn = LayoutTransactionConnection(literal, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+        var preparations = 0
+
+        let command = try await state.prepareTmuxAttachment(instanceId: a.id, in: project) { _ in
+            preparations += 1
+            return (target: TmuxCommands.SessionTarget(name: "muxel_host_aaaaaaaa", socket: "mxl"), attachment: "literal")
+        }
+
+        XCTAssertNil(command)
+        XCTAssertEqual(preparations, 0)
+        let commands = await conn.commands
+        XCTAssertTrue(commands.isEmpty)
+    }
+
+    func testDurableLiteralConversionStopsAttachmentBeforeRetryOrOwnerWrite() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var persisted = layout
+        persisted.instances[0].literalArgv = true
+        let conn = LayoutTransactionConnection(persisted, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+        var preparations = 0
+
+        let command = try await state.prepareTmuxAttachment(instanceId: a.id, in: project) { _ in
+            preparations += 1
+            return (target: TmuxCommands.SessionTarget(name: "muxel_host_aaaaaaaa", socket: "default"), attachment: "stale")
+        }
+
+        XCTAssertNil(command, "a literal conversion must decline the stale plan before saving its owner")
+        XCTAssertEqual(preparations, 1, "the refreshed literal member must stop before another preparation")
+        XCTAssertEqual(state.layout, persisted)
+        let saved = await conn.snapshot()
+        XCTAssertEqual(saved, persisted)
+        let commands = await conn.commands
+        XCTAssertEqual(commands.filter { $0.hasPrefix("f=") }.count, 1)
+        XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") })
+    }
+
     func testCloseOfAlreadyRemovedInstanceDoesNotKillNamesake() async {
         let (state, project, a, _, layout) = fixture()
         var persisted = layout

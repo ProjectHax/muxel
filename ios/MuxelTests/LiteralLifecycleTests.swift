@@ -21,7 +21,7 @@ final class LiteralLifecycleTests: XCTestCase {
                 let json = command[command.index(after: start)..<end.lowerBound]
                 layout = try! MuxelJSON.decoder.decode(RemoteLayout.self, from: Data(json.utf8))
             }
-            if command.contains("list-sessions") { return sessions.joined(separator: "\n") }
+            if command.contains("list-sessions") { return sessions.map { "mxl\t\($0)" }.joined(separator: "\n") }
             return ""
         }
 
@@ -51,6 +51,7 @@ final class LiteralLifecycleTests: XCTestCase {
         let remote = Remote(layout, sessions: instances.map {
             TmuxSession.name(hostName: "different-desktop", instanceId: $0.id)
         })
+        state.selectedProject = project
         state.layout = layout
         state.connectionFactory = { _, _ in remote.connection }
         return remote
@@ -73,6 +74,7 @@ final class LiteralLifecycleTests: XCTestCase {
         XCTAssertEqual(copy.worktreeId, original.worktreeId)
         XCTAssertEqual(copy.worktreePath, original.worktreePath)
         XCTAssertNil(copy.tmuxSession)
+        XCTAssertNil(copy.tmuxSocket)
         XCTAssertFalse(copy.useTmux)
         XCTAssertFalse(remote.commands.contains { $0.contains("kill-session") || $0.contains("new-session") })
         XCTAssertEqual(remote.layout.instances.first { $0.id == original.id }, original)
@@ -90,6 +92,7 @@ final class LiteralLifecycleTests: XCTestCase {
         XCTAssertFalse(copy.literalArgv)
         XCTAssertTrue(copy.useTmux)
         XCTAssertEqual(copy.tmuxSession, TmuxSession.name(hostName: host.name, instanceId: copy.id))
+        XCTAssertEqual(copy.tmuxSocket, TmuxCommands.socketName)
     }
 
     func testCloseLiteralRemovesLayoutWithoutProbingOrKillingMatchingSession() async {
