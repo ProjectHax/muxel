@@ -33,7 +33,8 @@ impl MuxelApp {
     }
 
     fn accomplishments_overview_open(&self) -> bool {
-        self.show_accomplishments_overview || self.accomplishments_window.is_some()
+        self.main_view == super::hotbar::MainView::Accomplishments
+            || self.accomplishments_window.is_some()
     }
 
     fn accomplishment_projects(&self) -> impl Iterator<Item = &Project> {
@@ -373,23 +374,27 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.show_accomplishments_overview {
-            self.close_accomplishments_overview(cx);
-            return;
-        }
+        self.toggle_main_view(super::hotbar::MainView::Accomplishments, window, cx);
+    }
+
+    /// Create the embedded overview's view the first time it's shown.
+    pub(super) fn ensure_accomplishments_overview(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.accomplishments_overview.is_none() {
             let app = cx.weak_entity();
             let snapshot = self.accomplishments_snapshot();
             self.accomplishments_overview =
                 Some(cx.new(|cx| AccomplishmentsOverview::new(app, snapshot, false, window, cx)));
         }
-        self.show_accomplishments_overview = true;
-        self.show_dashboard = false;
-        self.refresh_all_accomplishments(cx);
     }
 
     pub(crate) fn close_accomplishments_overview(&mut self, cx: &mut Context<Self>) {
-        self.show_accomplishments_overview = false;
+        if self.main_view == super::hotbar::MainView::Accomplishments {
+            self.main_view = super::hotbar::MainView::Panes;
+        }
         cx.notify();
     }
 
@@ -759,9 +764,7 @@ impl MuxelApp {
                     .icon(IconName::Maximize)
                     .tooltip(t("Show all projects"))
                     .on_click(cx.listener(|this, _e, window, cx| {
-                        if !this.show_accomplishments_overview {
-                            this.toggle_accomplishments_overview(window, cx);
-                        }
+                        this.set_main_view(super::hotbar::MainView::Accomplishments, window, cx)
                     })),
             )
             .child(

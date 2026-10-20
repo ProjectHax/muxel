@@ -57,6 +57,7 @@ use uuid::Uuid;
 
 mod accomplishments_ui;
 mod control_api;
+mod hotbar;
 mod libraries_ui;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
@@ -3238,8 +3239,9 @@ pub struct MuxelApp {
     use_worktree: bool,
     /// Whether the OS window is focused (affects notifications + focus reporting).
     window_active: bool,
-    /// Whether to show the cross-project dashboard instead of the pane tree.
-    show_dashboard: bool,
+    /// What fills the pane area: the panes, or a full view from the hotbar
+    /// (the dashboard among them).
+    main_view: hotbar::MainView,
     /// Whether the project sidebar is collapsed **in the main window**.
     sidebar_collapsed: bool,
     /// Popped-out project windows whose sidebar the user has pulled back out.
@@ -3333,9 +3335,8 @@ pub struct MuxelApp {
     /// project whose load failed may be retried.
     accomplishments_maintained: HashMap<Uuid, i64>,
     accomplishments_retry_at: HashMap<Uuid, Instant>,
-    /// The all-projects overview in place of the pane area (like the dashboard).
-    show_accomplishments_overview: bool,
-    /// Its view, created on first open and kept (its search/filters with it).
+    /// The all-projects overview's view (shown as `MainView::Accomplishments`),
+    /// created on first open and kept (its search/filters with it).
     accomplishments_overview: Option<Entity<accomplishments_view::AccomplishmentsOverview>>,
     /// The popped-out overview window, if open.
     accomplishments_window: Option<WindowHandle<gpui_component::Root>>,
@@ -5609,7 +5610,7 @@ impl MuxelApp {
             use_tmux: settings.default_use_tmux,
             use_worktree: settings.default_use_worktree,
             window_active: true,
-            show_dashboard: false,
+            main_view: hotbar::MainView::Panes,
             sidebar_collapsed: false,
             secondary_sidebar_shown: HashSet::new(),
             fullscreen_sidebar_revealed: false,
@@ -5643,7 +5644,6 @@ impl MuxelApp {
             accomplishments_checked_at: None,
             accomplishments_maintained: HashMap::new(),
             accomplishments_retry_at: HashMap::new(),
-            show_accomplishments_overview: false,
             accomplishments_overview: None,
             accomplishments_window: None,
             show_settings: false,
@@ -9160,10 +9160,12 @@ impl MuxelApp {
             self.focus_instance_with_attendance(iid, attend_first_pane, window, cx);
         }
         self.ensure_project_terminals_deferred(pid, window, cx);
-        // Keep the file browser pointed at the project being shown.
-        if self.show_file_browser {
+        // Keep the file browser, and a per-project hotbar view, pointed at the
+        // project being shown.
+        if self.show_file_browser || self.main_view == hotbar::MainView::Files {
             self.load_file_browser(pid, cx);
         }
+        self.main_view_follow_project(pid, window, cx);
         {
             let _phase = ui_profile::phase("workspace", "persist-selection", None);
             self.persist();
@@ -9354,17 +9356,14 @@ impl MuxelApp {
     }
 
     fn toggle_dashboard(&mut self, cx: &mut Context<Self>) {
-        self.show_dashboard = !self.show_dashboard;
-        if self.show_dashboard {
-            self.show_accomplishments_overview = false;
-        }
+        self.main_view = self.main_view.toggled(hotbar::MainView::Dashboard);
         cx.notify();
     }
 
-    /// Whether the main window's pane area is replaced by a full-size view (the
-    /// dashboard or the accomplishments overview), so no pane content is on screen.
+    /// Whether the main window's pane area is replaced by a full view (one of the
+    /// hotbar's), so no pane content is on screen.
     fn main_view_replaced(&self) -> bool {
-        self.show_dashboard || self.show_accomplishments_overview
+        self.main_view != hotbar::MainView::Panes
     }
 
     /// The project shown by `window` when it's a popped-out project window;
@@ -9977,9 +9976,10 @@ impl MuxelApp {
     /// so they run on the background executor and post results back. Remote
     /// project branches are handled separately by `poll_remote_branches`.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
-        // Keep the git-diff panel current while it's open (covers edits and
-        // active-project switches; the calls self-guard re-entrancy).
-        if self.show_git_diff {
+        // Keep the git-diff panel current while it's open, docked or as the
+        // Changes view (covers edits and active-project switches; the calls
+        // self-guard re-entrancy).
+        if self.show_git_diff || self.main_view == hotbar::MainView::Changes {
             match self.git_diff_tab {
                 GitDiffTab::Files => self.refresh_git_diff_panel(cx),
                 GitDiffTab::Worktrees => self.refresh_git_diff_worktrees(cx),
@@ -13131,9 +13131,7 @@ impl MuxelApp {
                 }
             }
             PaletteCommand::ShowAllAccomplishments => {
-                if !self.show_accomplishments_overview {
-                    self.toggle_accomplishments_overview(window, cx);
-                }
+                self.set_main_view(hotbar::MainView::Accomplishments, window, cx)
             }
             PaletteCommand::PopOutAccomplishments => self.pop_out_accomplishments(cx),
             PaletteCommand::ReadAloud => self.toggle_read_aloud(cx),
@@ -14392,6 +14390,12 @@ impl MuxelApp {
         // The docked panels share one slot.
         self.show_file_browser = false;
         self.show_accomplishments = false;
+        self.point_memory_at(pid, window, cx);
+    }
+
+    /// Show `pid`'s memory in the memory panel (docked, or the hotbar's Memory
+    /// view) and load it.
+    fn point_memory_at(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if self.memory_pid != Some(pid) {
             self.memory_entries.clear();
             self.memory_load_error = None;
@@ -15532,7 +15536,11 @@ impl MuxelApp {
                             .icon(IconName::Close)
                             .tooltip(t("Close memory panel"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.show_memory = false;
+                                if this.main_view == hotbar::MainView::Memory {
+                                    this.main_view = hotbar::MainView::Panes;
+                                } else {
+                                    this.show_memory = false;
+                                }
                                 cx.notify();
                             })),
                     ),
@@ -19786,7 +19794,11 @@ impl MuxelApp {
                             .icon(IconName::Close)
                             .tooltip(t("Close file browser"))
                             .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.show_file_browser = false;
+                                if this.main_view == hotbar::MainView::Files {
+                                    this.main_view = hotbar::MainView::Panes;
+                                } else {
+                                    this.show_file_browser = false;
+                                }
                                 cx.notify();
                             })),
                     ),
@@ -21433,7 +21445,7 @@ impl MuxelApp {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _ev, window, cx| {
-                                this.show_dashboard = false;
+                                this.main_view = hotbar::MainView::Panes;
                                 this.select_project(pid, window, cx);
                                 this.focus_instance(iid, window, cx);
                             }),
@@ -23807,7 +23819,7 @@ impl MuxelApp {
                         Button::new("dashboard")
                             .ghost()
                             .icon(IconName::LayoutDashboard)
-                            .selected(self.show_dashboard)
+                            .selected(self.main_view == hotbar::MainView::Dashboard)
                             .tooltip(t("Dashboard"))
                             .on_click(
                                 cx.listener(|this, _ev, _window, cx| this.toggle_dashboard(cx)),
@@ -23823,7 +23835,9 @@ impl MuxelApp {
                                     Button::new("accomplishments-overview")
                                         .ghost()
                                         .icon(IconName::CircleCheck)
-                                        .selected(self.show_accomplishments_overview)
+                                        .selected(
+                                            self.main_view == hotbar::MainView::Accomplishments,
+                                        )
                                         .tooltip(t("Accomplishments (all projects)"))
                                         .on_click(cx.listener(|this, _ev, window, cx| {
                                             this.toggle_accomplishments_overview(window, cx)
@@ -27367,7 +27381,7 @@ impl MuxelApp {
         let n = self.broadcast_targets().len();
         div()
             .absolute()
-            .bottom(px(16.0))
+            .bottom(px(16.0 + hotbar::HOTBAR_HEIGHT))
             .left_0()
             .right_0()
             .flex()
@@ -27462,7 +27476,7 @@ impl MuxelApp {
         let mic_settings = mic && crate::integrations::HAS_MICROPHONE_SETTINGS;
         div()
             .absolute()
-            .bottom(px(16.0))
+            .bottom(px(16.0 + hotbar::HOTBAR_HEIGHT))
             .left_0()
             .right_0()
             .flex()
@@ -30322,9 +30336,15 @@ impl Render for MuxelApp {
                 .filter(|_| !self.project_has_live_panes(pid))
                 .map(|m| (pid, m.clone()))
         });
-        let main_content: AnyElement = if self.show_dashboard {
+        let main_content: AnyElement = if self.main_view == hotbar::MainView::Dashboard {
             self.render_dashboard(cx)
-        } else if self.show_accomplishments_overview
+        } else if self.main_view == hotbar::MainView::Changes {
+            self.render_git_diff_panel(cx).into_any_element()
+        } else if self.main_view == hotbar::MainView::Memory {
+            self.render_memory_panel(cx)
+        } else if self.main_view == hotbar::MainView::Files {
+            self.render_file_browser(cx)
+        } else if self.main_view == hotbar::MainView::Accomplishments
             && let Some(overview) = &self.accomplishments_overview
         {
             overview.clone().into_any_element()
@@ -30364,7 +30384,10 @@ impl Render for MuxelApp {
             .child(div().flex_1().min_h_0().child(main_content));
         // The file browser (second sidebar) nests its own resizable so its width
         // persists independently of the project sidebar.
-        let center: AnyElement = if self.show_file_browser {
+        // A hotbar view fills everything right of the sidebar: the docked panels
+        // and the git-diff panel step aside while it's up.
+        let full_view = self.main_view_replaced();
+        let center: AnyElement = if self.show_file_browser && !full_view {
             let fb_half = (f32::from(window.viewport_size().width) * 0.5).max(360.0);
             let fb_saved = self
                 .workspace
@@ -30395,7 +30418,7 @@ impl Render for MuxelApp {
                     }
                 })
                 .into_any_element()
-        } else if self.show_memory {
+        } else if self.show_memory && !full_view {
             let mem_half = (f32::from(window.viewport_size().width) * 0.5).max(360.0);
             let mem_saved = self
                 .workspace
@@ -30426,7 +30449,7 @@ impl Render for MuxelApp {
                     }
                 })
                 .into_any_element()
-        } else if self.show_accomplishments {
+        } else if self.show_accomplishments && !full_view {
             let acc_half = (f32::from(window.viewport_size().width) * 0.5).max(360.0);
             let acc_saved = self
                 .workspace
@@ -30461,7 +30484,9 @@ impl Render for MuxelApp {
             main_column.into_any_element()
         };
         let center_minimum = 100.0
-            + if self.show_file_browser {
+            + if full_view {
+                0.0
+            } else if self.show_file_browser {
                 180.0
             } else if self.show_memory {
                 200.0
@@ -30513,7 +30538,7 @@ impl Render for MuxelApp {
         };
 
         // Optional right-side git-diff panel, wrapping everything to its left.
-        let outer: AnyElement = if self.show_git_diff {
+        let outer: AnyElement = if self.show_git_diff && !full_view {
             let gd_half = (f32::from(window.viewport_size().width) * 0.4).max(220.0);
             let gd_saved = self
                 .workspace
@@ -30567,6 +30592,7 @@ impl Render for MuxelApp {
         let root = root
             .child(self.render_titlebar(active_name, cx))
             .child(div().flex_1().min_h_0().flex().child(outer))
+            .child(self.render_hotbar(cx))
             .children(
                 self.show_settings
                     .then(|| self.render_settings_modal(window, cx)),

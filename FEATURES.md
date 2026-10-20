@@ -10,6 +10,14 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Panes & layout
 
+- **Hotbar** — a bar along the bottom of the main window opens full views in place
+  of the panes: **Dashboard** (every agent's status), **Changes** (the active
+  project's git changes, with commit), **Memory** (its shared memory), **Files** (its
+  file tree), and **Accomplishments** (every project's log). A view fills everything
+  right of the project sidebar (docked panels and the git-diff panel step aside);
+  switching projects in the sidebar retargets Changes, Memory, and Files. The active
+  button is drawn filled with an accent bar above it, the bar names what's showing,
+  and clicking the button again returns to the panes.
 - **Recursive split layout** — panes form a horizontal/vertical split tree; any
   pane can be split again, nesting freely.
 - **Resizable splits** — drag the divider between panes; sizes persist per project.
