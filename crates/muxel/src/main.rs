@@ -211,6 +211,20 @@ fn cli_info(first_arg: Option<&str>) -> Option<String> {
     }
 }
 
+/// The base every muxel window opens with. Each one draws its own title bar
+/// (gpui-component's `TitleBar`, with its own window controls), so on Linux it
+/// asks for client-side decorations: gpui otherwise requests server-side ones, and
+/// X11 window managers and Wayland compositors that provide them (KDE, …) then add
+/// their own title bar above muxel's. `Root` draws the resize border and shadow a
+/// client-decorated window needs. Other platforms ignore the request.
+pub(crate) fn window_options() -> WindowOptions {
+    WindowOptions {
+        titlebar: Some(TitleBar::title_bar_options()),
+        window_decorations: Some(WindowDecorations::Client),
+        ..Default::default()
+    }
+}
+
 fn main() {
     // `--user-data-dir DIR` moves every setting and file muxel keeps into DIR, for
     // this process and all it starts. First, before any path is read or thread runs.
@@ -412,12 +426,11 @@ fn main() {
             // never clobber the same one.
             cx.spawn(async move |cx| {
                 let options = WindowOptions {
-                    titlebar: Some(TitleBar::title_bar_options()),
                     window_bounds,
                     // Matches the .desktop StartupWMClass so the desktop ties the
                     // window (and its notifications) to muxel's icon.
                     app_id: Some("muxel".to_string()),
-                    ..Default::default()
+                    ..window_options()
                 };
                 cx.open_window(options, move |window, cx| {
                     // Give the window an explicit title; without it the compositor
@@ -430,6 +443,21 @@ fn main() {
             })
             .detach();
         });
+}
+
+#[cfg(test)]
+mod window_options_tests {
+    use super::window_options;
+    use gpui::WindowDecorations;
+
+    /// A server-decorated muxel window gets a second, system title bar above its
+    /// own on X11 and on Wayland compositors that decorate (double title bar).
+    #[test]
+    fn windows_draw_their_own_title_bar_and_ask_for_client_decorations() {
+        let options = window_options();
+        assert!(options.titlebar.is_some());
+        assert_eq!(options.window_decorations, Some(WindowDecorations::Client));
+    }
 }
 
 #[cfg(test)]

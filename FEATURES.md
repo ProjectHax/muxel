@@ -1235,6 +1235,10 @@ feature is added or changed, update the matching entry here in the same change**
   with no terminal text, URLs, titles, or paths.
 - **Cross-platform** — Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and
   Windows (x86_64 + arm64).
+- **One title bar on every Linux desktop** — muxel's windows draw their own title
+  bar, window controls, resize border, and shadow (client-side decorations), so an
+  X11 window manager or a decorating Wayland compositor (such as KDE) doesn't add a
+  second title bar above muxel's.
 - **macOS menu bar** — the **muxel** application menu has Services, Hide muxel
   (`Cmd+H`), Hide Others (`Option+Cmd+H`), Show All, and Quit muxel (`Cmd+Q`).
   Quit asks for confirmation just like `Cmd+Q`, raising the window first so the

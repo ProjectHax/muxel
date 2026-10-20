@@ -409,10 +409,9 @@ impl MuxelApp {
         let bounds = Bounds::centered(None, size(px(560.0), px(720.0)), cx);
         let opened = cx.open_window(
             WindowOptions {
-                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(360.0), px(320.0))),
-                ..Default::default()
+                ..crate::window_options()
             },
             move |window, cx| {
                 ui_profile::register_profile_window(

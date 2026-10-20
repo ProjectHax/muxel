@@ -9521,9 +9521,8 @@ impl MuxelApp {
         let title = format!("diff — {fname}");
         let opened = cx.open_window(
             gpui::WindowOptions {
-                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                 window_min_size: Some(size(px(400.0), px(300.0))),
-                ..Default::default()
+                ..crate::window_options()
             },
             move |window, cx| {
                 ui_profile::register_profile_window(
@@ -9562,9 +9561,8 @@ impl MuxelApp {
         let app = cx.weak_entity();
         let opened = cx.open_window(
             gpui::WindowOptions {
-                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                 window_min_size: Some(size(px(420.0), px(280.0))),
-                ..Default::default()
+                ..crate::window_options()
             },
             move |window, cx| {
                 ui_profile::register_profile_window(
@@ -15957,12 +15955,11 @@ impl MuxelApp {
                 std::rc::Rc::new(std::cell::RefCell::new(None));
             let opened = cx.open_window(
                 gpui::WindowOptions {
-                    titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                     window_bounds,
                     display_id: Some(display_id),
                     app_id: Some("muxel".to_string()),
                     window_min_size: Some(size(px(480.0), px(320.0))),
-                    ..Default::default()
+                    ..crate::window_options()
                 },
                 {
                     let slot = slot.clone();
@@ -16517,9 +16514,8 @@ impl MuxelApp {
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let opened = cx.open_window(
             gpui::WindowOptions {
-                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                 window_min_size: Some(size(px(360.0), px(240.0))),
-                ..Default::default()
+                ..crate::window_options()
             },
             {
                 let slot = slot.clone();
