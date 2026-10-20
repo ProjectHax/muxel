@@ -182,13 +182,20 @@ pub(crate) struct Screen {
 }
 
 impl Screen {
-    /// Codex's unframed editor. Its cursor, final prompt and shortcut footer must
-    /// agree. A trust/choice menu also uses `›`, but has no composer footer.
+    /// Codex's unframed editor. A passive model/cwd status line can replace the
+    /// shortcut hint even with empty input; a draft hides that hint as well.
+    /// A trust/choice menu also uses `›`, but has no composer status footer.
     pub(crate) fn codex_composer_context(&self, empty: bool) -> Option<String> {
-        if !self.bracketed_paste {
-            return None;
-        }
-        self.unframed_composer('›', "? for shortcuts", empty)
+        let rows: Vec<_> = self.text.lines().collect();
+        let region = self.codex_composer_rows(&rows, empty)?;
+        Some(
+            rows[..region.start]
+                .iter()
+                .chain(rows[region.end..].iter())
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 
     /// Retry only a completely visible single-row ASCII task with its cursor at
@@ -199,41 +206,19 @@ impl Screen {
             || !input.is_ascii()
             || input.trim() != input
             || input.chars().any(char::is_control)
-            || self.codex_composer_context(false).is_none()
         {
             return false;
         }
         let rows: Vec<_> = self.text.lines().collect();
-        let Some(top) = rows
-            .iter()
-            .rposition(|row| row.trim_start().starts_with('›'))
-        else {
+        let Some(region) = self.codex_composer_rows(&rows, false) else {
             return false;
         };
+        let top = region.start;
         if usize::try_from(self.cursor_row).ok() != Some(top)
-            || !rows.get(top + 1).is_some_and(|row| row.trim().is_empty())
-        {
-            return false;
-        }
-        let Some(shortcuts) = rows
-            .iter()
-            .rposition(|row| row.trim_start().starts_with("? for shortcuts"))
-        else {
-            return false;
-        };
-        let Some(status) = rows[..shortcuts]
-            .iter()
-            .rposition(|row| !row.trim().is_empty())
-        else {
-            return false;
-        };
-        // A known model/cwd footer is the only nonblank row permitted after
-        // this one-row draft. A blank line can also be part of a longer draft;
-        // it does not establish that the rest of the editor is empty.
-        if status <= top
-            || !rows[status].trim_start().starts_with("GPT-")
-            || !rows[status].contains(" · ")
-            || rows[top + 1..status]
+            || region.end <= top + 1
+            // A blank line can also be part of a longer draft. Every row up to
+            // the independently recognized model/cwd footer must be blank.
+            || rows[top + 1..region.end]
                 .iter()
                 .any(|row| !row.trim().is_empty())
         {
@@ -255,22 +240,28 @@ impl Screen {
             && rows[top].chars().skip(end).all(char::is_whitespace)
     }
 
-    fn unframed_composer(&self, prompt: char, footer: &str, empty: bool) -> Option<String> {
-        if !self.cursor_visible {
+    fn codex_composer_rows(&self, rows: &[&str], empty: bool) -> Option<std::ops::Range<usize>> {
+        if !self.cursor_visible || !self.bracketed_paste {
             return None;
         }
         let cursor = usize::try_from(self.cursor_row).ok()?;
-        let rows: Vec<_> = self.text.lines().collect();
-        let bottom = rows.iter().rposition(|row| row.contains(footer))?;
-        let top = rows[..bottom].iter().rposition(|row| {
+        let bottom = rows.iter().rposition(|row| {
             row.trim_start()
-                .strip_prefix(prompt)
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"gpt-"))
+                && row.contains(" · ")
+        })?;
+        // Use the final prompt in the whole snapshot: a later menu cannot
+        // borrow an earlier editor's footer or cursor position.
+        let top = rows.iter().rposition(|row| {
+            row.trim_start()
+                .strip_prefix('›')
                 .is_some_and(|after| after.is_empty() || after.starts_with(char::is_whitespace))
         })?;
-        if cursor < top || cursor >= bottom {
+        if top >= bottom || cursor < top || cursor >= bottom {
             return None;
         }
-        let end = bottom;
         let prefix = rows[top]
             .chars()
             .take_while(|ch| ch.is_whitespace())
@@ -278,27 +269,18 @@ impl Screen {
         if (cursor == top && self.cursor_column == prefix + 2) != empty {
             return None;
         }
-        Some(
-            rows[..top]
-                .iter()
-                .chain(rows[end..].iter())
-                .copied()
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        Some(top..bottom)
     }
 
     pub(crate) fn codex_draft_matches(&self, input: &str) -> bool {
-        if input.len() > self.text.len() || self.codex_composer_context(false).is_none() {
+        if input.len() > self.text.len() {
             return false;
         }
         let rows: Vec<_> = self.text.lines().collect();
-        let Some(top) = rows
-            .iter()
-            .rposition(|row| row.trim_start().starts_with('›'))
-        else {
+        let Some(region) = self.codex_composer_rows(&rows, false) else {
             return false;
         };
+        let top = region.start;
         let cursor = usize::try_from(self.cursor_row).unwrap_or(top);
         if cursor < top || cursor >= rows.len() {
             return false;
@@ -525,13 +507,13 @@ mod tests {
         );
         assert!(trust.codex_composer_context(true).is_none());
         let mut ready = screen(
-            "OpenAI Codex\n› Ask Codex to do anything\n\n  GPT-6-Sol · scratch\n  ? for shortcuts",
+            "OpenAI Codex\n› Ask Codex to do anything\n\n  GPT-6-Sol · scratch\n  ⚠ 1 · f2",
             1,
             2,
         );
         assert!(ready.codex_composer_context(true).is_some());
         ready.text =
-            "OpenAI Codex\n› Answer exactly\n  B8_OK\n\n  GPT-6-Sol · scratch\n  ? for shortcuts"
+            "OpenAI Codex\n› Answer exactly\n  B8_OK\n\n  gpt-5.4 high fast · scratch · Context 0% used\n  ⚠ 1 · f2"
                 .into();
         ready.cursor_row = 2;
         ready.cursor_column = 7;

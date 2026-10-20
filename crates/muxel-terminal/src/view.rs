@@ -2643,7 +2643,11 @@ mod startup_readiness_tests {
 
     fn codex_screen(draft: &str) -> Screen {
         Screen {
-            text: format!("OpenAI Codex\n› {draft}\n\n  GPT-6-Sol · scratch\n  ? for shortcuts"),
+            // Codex 0.163's passive status line replaces the shortcut hint,
+            // including in the empty editor; drafts hide that hint as well.
+            text: format!(
+                "OpenAI Codex\n› {draft}\n\n  gpt-5.4 high fast · scratch · Context 0% used\n  ⚠ 1 · f2"
+            ),
             cursor_row: 1,
             cursor_column: if draft == "Ask Codex to do anything" {
                 2
