@@ -14,13 +14,32 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
-/// The muxel config directory (e.g. `~/.config/muxel` on Linux).
+/// Names a directory that holds muxel's settings and its own state in place of
+/// the platform's config and data directories. `muxel --user-data-dir DIR` sets
+/// it at startup, and panes inherit it, so `muxel ctl` run in one reaches the
+/// muxel it runs in.
+pub const USER_DATA_DIR_ENV: &str = "MUXEL_USER_DATA_DIR";
+
+/// `kind` (`config` or `data`) under the user data dir, when one is set.
+fn user_data_subdir(root: Option<std::ffi::OsString>, kind: &str) -> Option<PathBuf> {
+    let root = root.filter(|root| !root.is_empty())?;
+    Some(PathBuf::from(root).join(kind))
+}
+
+fn user_data_override(kind: &str) -> Option<PathBuf> {
+    user_data_subdir(std::env::var_os(USER_DATA_DIR_ENV), kind)
+}
+
+/// The muxel config directory (e.g. `~/.config/muxel` on Linux), or `config`
+/// under the user data dir.
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(feature = "test-support")]
     if let Some(root) = test_support::root() {
         return Some(root.join("config"));
     }
-    ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.config_dir().to_path_buf())
+    user_data_override("config").or_else(|| {
+        ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.config_dir().to_path_buf())
+    })
 }
 
 /// Path to the hand-editable settings file.
@@ -168,13 +187,15 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The muxel data directory (e.g. `~/.local/share/muxel` on Linux).
+/// The muxel data directory (e.g. `~/.local/share/muxel` on Linux), or `data`
+/// under the user data dir.
 pub fn data_dir() -> Option<PathBuf> {
     #[cfg(feature = "test-support")]
     if let Some(root) = test_support::root() {
         return Some(root.join("data"));
     }
-    ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.data_dir().to_path_buf())
+    user_data_override("data")
+        .or_else(|| ProjectDirs::from("dev", "muxel", "muxel").map(|d| d.data_dir().to_path_buf()))
 }
 
 /// `LIB_DIR` = `<data_dir>/libraries`; each library is cloned into
@@ -1342,5 +1363,24 @@ minute = 30
         assert!(rotated.starts_with('x'));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_data_dir_holds_config_and_data_side_by_side() {
+        let root = std::env::temp_dir().join("muxel-user-data");
+        assert_eq!(
+            user_data_subdir(Some(root.clone().into_os_string()), "config"),
+            Some(root.join("config"))
+        );
+        assert_eq!(
+            user_data_subdir(Some(root.clone().into_os_string()), "data"),
+            Some(root.join("data"))
+        );
+    }
+
+    #[test]
+    fn unset_or_empty_user_data_dir_means_the_platform_dirs() {
+        assert_eq!(user_data_subdir(None, "data"), None);
+        assert_eq!(user_data_subdir(Some("".into()), "data"), None);
     }
 }

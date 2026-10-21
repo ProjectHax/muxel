@@ -46,9 +46,16 @@ struct StatusPoller {
             defer { Task { await conn.close() } }
 
             let poll = PollService()
+            var layouts: [(RemoteProject, RemoteLayout)] = []
             for project in projects {
                 guard let layout = try? await RemoteLayoutStore.read(conn, root: project.remoteRoot) else { continue }
-                let statuses = await poll.poll(conn, instances: layout.orderedTerminalInstances)
+                layouts.append((project, layout))
+            }
+            // Read all layouts first so one host sweep includes every recorded
+            // named socket, rather than polling only the two legacy servers.
+            let paneRows = await poll.fetchPaneRows(conn, instances: layouts.flatMap { $0.1.orderedTerminalInstances })
+            for (project, layout) in layouts {
+                let statuses = poll.classify(rows: paneRows, instances: layout.orderedTerminalInstances)
                 for s in statuses {
                     let name = layout.instances.first { $0.id == s.instanceId }?.displayName ?? "agent"
                     if s.running {

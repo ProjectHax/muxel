@@ -5,12 +5,14 @@ use crate::i18n::{t, tf};
 #[cfg(test)]
 use crate::test_support::{GitStopReason, GitTimingReceipt, GitTimings};
 use anyhow::{Context, Result, bail};
+use muxel_core::accomplishments::{self, Accomplishment};
 use muxel_core::library::GitFailure;
 use muxel_core::library::resync::LocalChanges;
 use muxel_core::memory::{self, MemoryEntry};
-use muxel_core::tmux::Socket;
+use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::{
-    MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth, memory_header, remote_ops, ssh,
+    ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth,
+    accomplishments_header, memory_header, remote_ops, ssh,
 };
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -238,18 +240,20 @@ pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::
     // `tmux` is not on sshd's bare default PATH when it came from Homebrew — see
     // `ssh::tmux_path_prelude`. Unresolved, this reads as "no sessions on the host"
     // and every running agent there stays stranded.
-    let out = remote_ssh_command(c, ssh::list_sessions_command())
+    let sockets = local_tmux_sockets();
+    let out = remote_ssh_command(c, ssh::list_sessions_command_on(&sockets))
         .output()
         .ok()?;
-    ssh::parse_session_listings(&String::from_utf8_lossy(&out.stdout))
+    ssh::parse_session_listings_on(&String::from_utf8_lossy(&out.stdout), &sockets)
 }
 
 /// Every tmux session on this machine, as [`list_remote_tmux_sessions`] reports a
-/// host's: muxel's own server's, then the default one's. An empty list when no tmux
-/// server is running; `None` when tmux couldn't be run at all.
+/// host's: muxel's own server's, then the default one's. Isolated profiles list
+/// only their own server. An empty list when no tmux server is running; `None`
+/// when tmux couldn't be run at all.
 pub fn list_local_tmux_sessions() -> Option<Vec<muxel_core::tmux::RemoteSession>> {
-    let mut panes = String::new();
-    for socket in Socket::BOTH {
+    let mut panes = Vec::new();
+    for socket in local_tmux_sockets() {
         let out = tmux_on(socket)
             .args(muxel_core::tmux::list_sessions_args())
             .stdin(std::process::Stdio::null())
@@ -257,12 +261,15 @@ pub fn list_local_tmux_sessions() -> Option<Vec<muxel_core::tmux::RemoteSession>
             .ok()?;
         // No server (or no socket yet) is a perfectly good answer: nothing running.
         if out.status.success() {
-            panes.push_str(&String::from_utf8_lossy(&out.stdout));
+            panes.extend(muxel_core::tmux::parse_sessions_on(
+                &String::from_utf8_lossy(&out.stdout),
+                socket,
+            ));
         } else if !muxel_core::tmux::no_server(&String::from_utf8_lossy(&out.stderr)) {
             return None;
         }
     }
-    Some(muxel_core::tmux::parse_sessions(&panes))
+    Some(panes)
 }
 
 /// Write `content` to a remote file (overwriting), piping it over SSH stdin.
@@ -350,27 +357,44 @@ fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
 /// create `<root>/.muxel/`, seed `MEMORY.md` if absent, and add `.muxel/` to the
 /// repo's `.gitignore` if not already there. Works for a local or remote `loc`.
 pub fn ensure_memory_file(loc: &RepoLoc) -> Result<()> {
+    ensure_muxel_file(loc, MEMORY_FILE, memory_header(), "ensure memory failed")
+}
+
+/// [`ensure_memory_file`] for the project's `.muxel/ACCOMPLISHMENTS.md`.
+pub fn ensure_accomplishments_file(loc: &RepoLoc) -> Result<()> {
+    ensure_muxel_file(
+        loc,
+        ACCOMPLISHMENTS_FILE,
+        accomplishments_header(),
+        "ensure accomplishments failed",
+    )
+}
+
+/// Create `<root>/.muxel/`, seed `<file>` in it with `header` if absent, and make
+/// sure `.muxel/` is git-ignored. `failed` is the error when a remote host says
+/// nothing about why it couldn't.
+fn ensure_muxel_file(loc: &RepoLoc, file: &str, header: &str, failed: &str) -> Result<()> {
     let ignore_line = format!("{MEMORY_DIR}/");
     match loc {
         RepoLoc::Local(root) => {
             let dir = root.join(MEMORY_DIR);
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            let file = dir.join(MEMORY_FILE);
+            let file = dir.join(file);
             if !file.exists() {
-                std::fs::write(&file, memory_header())
+                std::fs::write(&file, header)
                     .with_context(|| format!("writing {}", file.display()))?;
             }
             ensure_gitignored(root, &ignore_line)
         }
         RepoLoc::Remote(c) => {
             let root = c.remote_path.trim_end_matches('/');
-            let file = format!("{MEMORY_DIR}/{MEMORY_FILE}");
+            let file = format!("{MEMORY_DIR}/{file}");
             let cmd = remote_ops::ensure_seeded_file(
                 c.host.os,
                 root,
                 MEMORY_DIR,
                 &file,
-                memory_header(),
+                header,
                 &ignore_line,
             );
             let out = remote_ssh_command(c, cmd)
@@ -379,14 +403,7 @@ pub fn ensure_memory_file(loc: &RepoLoc) -> Result<()> {
             if !out.status.success() {
                 let msg = String::from_utf8_lossy(&out.stderr);
                 let msg = msg.trim();
-                bail!(
-                    "{}",
-                    if msg.is_empty() {
-                        "ensure memory failed"
-                    } else {
-                        msg
-                    }
-                );
+                bail!("{}", if msg.is_empty() { failed } else { msg });
             }
             Ok(())
         }
@@ -395,30 +412,56 @@ pub fn ensure_memory_file(loc: &RepoLoc) -> Result<()> {
 
 /// Absolute path of a project's `.muxel/MEMORY.md`, local or remote.
 fn memory_abs(loc: &RepoLoc) -> String {
+    muxel_file_abs(loc, MEMORY_FILE)
+}
+
+/// Absolute path of `file` in a project's `.muxel/`, local or remote.
+fn muxel_file_abs(loc: &RepoLoc, file: &str) -> String {
     match loc {
-        RepoLoc::Local(root) => root
-            .join(MEMORY_DIR)
-            .join(MEMORY_FILE)
-            .display()
-            .to_string(),
+        RepoLoc::Local(root) => root.join(MEMORY_DIR).join(file).display().to_string(),
         RepoLoc::Remote(c) => format!(
-            "{}/{MEMORY_DIR}/{MEMORY_FILE}",
+            "{}/{MEMORY_DIR}/{file}",
             c.remote_path.trim_end_matches('/')
         ),
     }
 }
 
-/// Read and parse a project's memory file into entries. Missing/empty/unreadable →
-/// an empty list (the file is optional and created on first save). Works local or
-/// remote.
-pub fn load_memory(loc: &RepoLoc) -> Vec<MemoryEntry> {
-    let text = match loc {
-        RepoLoc::Local(root) => {
-            std::fs::read_to_string(root.join(MEMORY_DIR).join(MEMORY_FILE)).unwrap_or_default()
-        }
-        RepoLoc::Remote(_) => read_remote_file(loc, &memory_abs(loc)).unwrap_or_default(),
+/// Load a project's memory, maintained (new sections stamped, ordered, purged; see
+/// [`memory::maintain`]). `now` is unix seconds. A missing file is an empty memory;
+/// a file that can't be read — or a host that can't be reached — is an error, never
+/// an empty list, so nothing is ever saved over entries that merely failed to load.
+///
+/// Agents add sections while muxel may be rewriting the file, so muxel writes only
+/// when maintenance changes something, re-reading just before it writes so a
+/// section added in between is kept.
+pub fn maintain_memory(loc: &RepoLoc, now: i64) -> Result<Vec<MemoryEntry>> {
+    let text = read_muxel_text(loc, MEMORY_FILE)?;
+    let m = memory::maintain(memory::parse_document(&text), now);
+    if !m.changed {
+        return Ok(m.kept);
+    }
+    let fresh = read_muxel_text(loc, MEMORY_FILE)?;
+    let m = if fresh == text {
+        m
+    } else {
+        memory::maintain(memory::parse_document(&fresh), now)
     };
-    memory::parse_document(&text)
+    if m.changed {
+        write_memory_text(loc, &memory::render_document(&m.kept))?;
+    }
+    Ok(m.kept)
+}
+
+/// Apply a panel edit to the memory as it is on disk *now* — not to the copy the
+/// panel showed, which may predate an agent's new section — then write the
+/// maintained result and return it.
+pub fn edit_memory(loc: &RepoLoc, now: i64, edit: &memory::Edit) -> Result<Vec<MemoryEntry>> {
+    let text = read_muxel_text(loc, MEMORY_FILE)?;
+    let mut entries = memory::maintain(memory::parse_document(&text), now).kept;
+    edit.apply(&mut entries);
+    let kept = memory::maintain(entries, now).kept;
+    write_memory_text(loc, &memory::render_document(&kept))?;
+    Ok(kept)
 }
 
 /// Whether the project already has a `.muxel/MEMORY.md` — i.e. shared memory is
@@ -440,18 +483,93 @@ pub fn memory_file_exists(loc: &RepoLoc) -> bool {
     }
 }
 
-/// Render `entries` to the project's `.muxel/MEMORY.md` (overwriting). Ensures the
-/// `.muxel/` dir exists and is git-ignored first. Works local or remote.
-pub fn save_memory(loc: &RepoLoc, entries: &[MemoryEntry]) -> Result<()> {
-    let text = memory::render_document(entries);
+/// Overwrite the project's `.muxel/MEMORY.md` with `text`, creating `.muxel/`
+/// (git-ignored) first if needed. Works local or remote.
+fn write_memory_text(loc: &RepoLoc, text: &str) -> Result<()> {
     ensure_memory_file(loc)?; // dir + .gitignore (+ seed if absent)
+    let path = memory_abs(loc);
     match loc {
-        RepoLoc::Local(root) => {
-            let file = root.join(MEMORY_DIR).join(MEMORY_FILE);
-            std::fs::write(&file, text).with_context(|| format!("writing {}", file.display()))
-        }
-        RepoLoc::Remote(_) => write_remote_file(loc, &memory_abs(loc), &text),
+        RepoLoc::Local(_) => std::fs::write(&path, text).with_context(|| format!("writing {path}")),
+        RepoLoc::Remote(_) => write_remote_file(loc, &path, text),
     }
+}
+
+/// A project's accomplishment log as text (see [`read_muxel_text`]).
+fn read_accomplishments_text(loc: &RepoLoc) -> Result<String> {
+    read_muxel_text(loc, ACCOMPLISHMENTS_FILE)
+}
+
+/// One of a project's `.muxel/` files as text. A missing file reads as empty (it
+/// simply has nothing yet); an unreadable one, or a host that can't be reached, is
+/// an error, so a caller can say it couldn't load rather than show — or save over
+/// — nothing.
+fn read_muxel_text(loc: &RepoLoc, file: &str) -> Result<String> {
+    let path = muxel_file_abs(loc, file);
+    match loc {
+        RepoLoc::Local(_) => match std::fs::read(&path) {
+            // Lossy: one badly encoded append must not hide the rest of the file.
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e).with_context(|| format!("reading {path}")),
+        },
+        RepoLoc::Remote(_) => {
+            read_remote_file(loc, &path).with_context(|| format!("couldn't read {path}"))
+        }
+    }
+}
+
+/// Overwrite the accomplishment log with `text`, creating `.muxel/` (git-ignored)
+/// first if needed.
+fn write_accomplishments_text(loc: &RepoLoc, text: &str) -> Result<()> {
+    ensure_accomplishments_file(loc)?;
+    let path = muxel_file_abs(loc, ACCOMPLISHMENTS_FILE);
+    match loc {
+        RepoLoc::Local(_) => std::fs::write(&path, text).with_context(|| format!("writing {path}")),
+        RepoLoc::Remote(_) => write_remote_file(loc, &path, text),
+    }
+}
+
+/// Load a project's accomplishment log, maintained (stamped, deduped, pruned to
+/// `retention_days`; `now` is local wall-clock seconds), oldest first.
+///
+/// Agents append to this file while muxel may be rewriting it, so muxel writes only
+/// when maintenance changes something (about once a day, when an entry ages out),
+/// and re-reads just before writing so a line appended in between is kept.
+pub fn maintain_accomplishments(
+    loc: &RepoLoc,
+    now: i64,
+    retention_days: u32,
+) -> Result<Vec<Accomplishment>> {
+    let text = read_accomplishments_text(loc)?;
+    if accomplishments::plan_rewrite(&text, now, retention_days).is_none() {
+        return Ok(accomplishments::parse_document(&text));
+    }
+    let fresh = read_accomplishments_text(loc)?;
+    match accomplishments::plan_rewrite(&fresh, now, retention_days) {
+        Some(doc) => {
+            write_accomplishments_text(loc, &doc)?;
+            Ok(accomplishments::parse_document(&doc))
+        }
+        None => Ok(accomplishments::parse_document(&fresh)),
+    }
+}
+
+/// Apply a user edit (add/delete from the panel) to the log as it is on disk *now*
+/// — not to the copy the panel showed, which may predate an agent's append — then
+/// write the maintained result and return it.
+pub fn edit_accomplishments(
+    loc: &RepoLoc,
+    now: i64,
+    retention_days: u32,
+    edit: impl FnOnce(&mut Vec<Accomplishment>),
+) -> Result<Vec<Accomplishment>> {
+    let text = read_accomplishments_text(loc)?;
+    let mut entries =
+        accomplishments::maintain(accomplishments::parse_document(&text), now, retention_days).kept;
+    edit(&mut entries);
+    let kept = accomplishments::maintain(entries, now, retention_days).kept;
+    write_accomplishments_text(loc, &accomplishments::render_document(&kept))?;
+    Ok(kept)
 }
 
 /// Filename of a remote project's synced pane layout, under `<root>/.muxel/`.
@@ -1300,21 +1418,68 @@ pub fn git_diff(dir: &Path) -> String {
 /// `new-session` would re-fork the server with the project name back in its argv.
 /// [`restore_tmux_exit_empty`] puts it back when muxel quits.
 ///
-/// The server is muxel's own (`muxel_core::tmux::SOCKET_NAME`), where every new
-/// session goes.
-pub fn ensure_tmux_server() {
-    let mut tmux = tmux_on(Socket::Private);
+/// The server is this profile's own: `mxl` for the regular profile, or the
+/// isolated root's named socket.
+pub fn ensure_tmux_server(socket: Socket) {
+    let root = local_tmux_root();
+    let socket = SessionTarget::new("", Some(socket))
+        .for_profile(root.as_deref())
+        .socket
+        .unwrap();
+    if socket == Socket::Default {
+        return;
+    }
+    let mut tmux = tmux_server_command(socket, root.as_deref());
     default_utf8_locale(&mut tmux);
     let _ = tmux
-        .args(muxel_core::tmux::start_server_args())
-        // Every session's program inherits the server's environment. A muxel
-        // started from inside a muxel pane has that pane's id, which no session
-        // should inherit as its own.
-        .env_remove(crate::session_binding::MUXEL_INSTANCE_ID_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+}
+
+fn tmux_server_command(socket: Socket, root: Option<&Path>) -> Command {
+    let socket = SessionTarget::new("", Some(socket))
+        .for_profile(root)
+        .socket
+        .unwrap();
+    let mut tmux = tmux_on(socket);
+    tmux.args(muxel_core::tmux::start_server_args())
+        .env_remove(crate::session_binding::MUXEL_INSTANCE_ID_ENV);
+    if root.is_some() {
+        // A server first started by an isolated GUI must not make its profile
+        // the global default for unrelated sessions. Local panes get these
+        // values through new-session -e instead.
+        tmux.env_remove(muxel_store::USER_DATA_DIR_ENV)
+            .env_remove(crate::control::CONTROL_ENV);
+    }
+    tmux
+}
+
+#[cfg(test)]
+mod tmux_server_environment_tests {
+    use super::tmux_server_command;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn isolated_startup_uses_its_socket_without_seeding_profile_environment() {
+        for isolated in [false, true] {
+            let root = isolated.then_some(std::path::Path::new("/isolated"));
+            let command = tmux_server_command(muxel_core::tmux::Socket::Private, root);
+            let args: Vec<_> = command.get_args().collect();
+            let prefix = muxel_core::tmux::Socket::local(root)[0].args();
+            assert_eq!(args[..2], prefix.iter().map(OsStr::new).collect::<Vec<_>>());
+            let removed: Vec<_> = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key)
+                .collect();
+            assert!(removed.contains(&OsStr::new(crate::session_binding::MUXEL_INSTANCE_ID_ENV)));
+            for key in [muxel_store::USER_DATA_DIR_ENV, crate::control::CONTROL_ENV] {
+                assert_eq!(removed.contains(&OsStr::new(key)), isolated);
+            }
+        }
+    }
 }
 
 fn default_utf8_locale(cmd: &mut Command) {
@@ -1329,34 +1494,47 @@ fn default_utf8_locale(cmd: &mut Command) {
 }
 
 /// Whether the local tmux can start a session's program with variables of its
-/// own (`new-session -e`, tmux 3.2 and later). Asked once per run, and again
-/// while tmux can't be run at all, so one installed meanwhile is found.
+/// own (`new-session -e`, tmux 3.2 and later). Cache support, but probe each
+/// negative result again so restarting a pane after an upgrade can recover.
 pub fn tmux_session_env_supported() -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if let Some(supported) = SUPPORTED.get() {
-        return *supported;
+    cached_tmux_session_env_support(&SUPPORTED, || {
+        let Ok(out) = command("tmux")
+            .arg("-V")
+            .stdin(std::process::Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let version = String::from_utf8_lossy(&out.stdout);
+        muxel_core::tmux::session_env_supported(&version)
+    })
+}
+
+fn cached_tmux_session_env_support(
+    supported: &std::sync::OnceLock<bool>,
+    probe: impl FnOnce() -> bool,
+) -> bool {
+    if supported.get() == Some(&true) {
+        return true;
     }
-    let Ok(out) = command("tmux")
-        .arg("-V")
-        .stdin(std::process::Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
+    if probe() {
+        let _ = supported.set(true);
+        true
+    } else {
+        false
     }
-    let version = String::from_utf8_lossy(&out.stdout);
-    *SUPPORTED.get_or_init(|| muxel_core::tmux::session_env_supported(&version))
 }
 
 /// Undo [`ensure_tmux_server`]'s `exit-empty off` so the server goes away with
 /// its last session once muxel is gone. Best-effort, fire-and-forget.
 ///
-/// Only muxel's own server: the default one is the user's, and muxel no longer
-/// starts it or sets anything on it.
+/// Only this profile's own server: the default one is the user's.
 pub fn restore_tmux_exit_empty() {
-    let _ = tmux_on(Socket::Private)
+    let _ = tmux_on(local_tmux_sockets()[0])
         .args(muxel_core::tmux::restore_exit_empty_args())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1370,6 +1548,27 @@ fn tmux_on(socket: Socket) -> Command {
     let mut cmd = command("tmux");
     cmd.args(socket.args());
     cmd
+}
+
+fn local_tmux_root() -> Option<PathBuf> {
+    std::env::var_os(muxel_store::USER_DATA_DIR_ENV)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+}
+
+fn local_tmux_sockets() -> Vec<Socket> {
+    Socket::local(local_tmux_root().as_deref())
+}
+
+pub fn profile_tmux_target(session: &SessionTarget) -> SessionTarget {
+    session.for_profile(local_tmux_root().as_deref())
+}
+
+pub fn profile_tmux_socket() -> Socket {
+    local_tmux_root()
+        .as_deref()
+        .map(Socket::isolated)
+        .unwrap_or(Socket::Private)
 }
 
 /// Whether the local server on `socket` has session `session`.
@@ -1386,18 +1585,26 @@ fn local_tmux_has_session(socket: Socket, session: &str) -> bool {
 /// The local server holding `session`: muxel's own, unless the session is a pane
 /// from before muxel had one, still running on the default server — which is then
 /// reattached where it is rather than replaced. See `Socket::locate`. Blocking:
-/// one or two `has-session` calls.
-pub fn local_tmux_socket(session: &str) -> Socket {
-    Socket::locate(|socket| local_tmux_has_session(socket, session))
+/// one or two `has-session` calls for the regular profile. An isolated profile
+/// selects its own socket without probing either regular-profile server.
+pub fn local_tmux_socket(session: &SessionTarget) -> Socket {
+    let session = profile_tmux_target(session);
+    session
+        .socket
+        .unwrap_or_else(|| Socket::locate(|socket| local_tmux_has_session(socket, &session.name)))
 }
 
-/// Whether a tmux session is still alive, on either server (exact-match target,
+/// Whether a tmux session is still alive, on this profile's servers (exact-match target,
 /// so `muxel_p_1` never matches `muxel_p_12`). Fast and blocking; only called for
 /// a pane that just died.
-pub fn tmux_session_exists(session: &str) -> bool {
-    Socket::BOTH
-        .into_iter()
-        .any(|socket| local_tmux_has_session(socket, session))
+pub fn tmux_session_exists(session: &SessionTarget) -> bool {
+    let session = profile_tmux_target(session);
+    match session.socket {
+        Some(socket) => local_tmux_has_session(socket, &session.name),
+        None => Socket::BOTH
+            .into_iter()
+            .any(|socket| local_tmux_has_session(socket, &session.name)),
+    }
 }
 
 // --- import discovery ----------------------------------------------------------
@@ -1490,14 +1697,19 @@ pub fn claude_conversation_summary(path: &Path) -> Option<String> {
 /// Run `tmux <args>` on the server holding `session`, where its project's sessions
 /// live: on this machine, or on its SSH host (reusing the host's ControlMaster).
 /// `None` for a Windows host, which has no tmux.
-fn tmux_at(loc: &RepoLoc, session: &str, args: &[String]) -> Option<std::process::Output> {
+fn tmux_at(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    args: &[String],
+) -> Option<std::process::Output> {
     tmux_command_at(loc, session, args)?.output().ok()
 }
 
-fn tmux_command_at(loc: &RepoLoc, session: &str, args: &[String]) -> Option<Command> {
+fn tmux_command_at(loc: &RepoLoc, session: &SessionTarget, args: &[String]) -> Option<Command> {
+    let session = profile_tmux_target(session);
     let mut cmd = match loc {
         RepoLoc::Local(_) => {
-            let mut cmd = tmux_on(local_tmux_socket(session));
+            let mut cmd = tmux_on(local_tmux_socket(&session));
             cmd.args(args);
             cmd
         }
@@ -1505,7 +1717,7 @@ fn tmux_command_at(loc: &RepoLoc, session: &str, args: &[String]) -> Option<Comm
             if c.host.os.is_windows() {
                 return None;
             }
-            remote_ssh_command(c, ssh::session_tmux_command(session, args))
+            remote_ssh_command(c, ssh::session_tmux_command(&session, args))
         }
     };
     cmd.stdin(Stdio::null());
@@ -1524,19 +1736,24 @@ pub fn run_muxel_ctl(exe: &str, args: &[&str]) -> std::io::Result<std::process::
 
 /// A tmux session's user option (`@name`), wherever the session lives. `None`
 /// when it is unset, the session is gone, or tmux couldn't be reached.
-pub fn tmux_option(loc: &RepoLoc, session: &str, option: &str) -> Option<String> {
+pub fn tmux_option(loc: &RepoLoc, session: &SessionTarget, option: &str) -> Option<String> {
     let out = tmux_at(
         loc,
         session,
-        &muxel_core::tmux::show_option_args(session, option),
+        &muxel_core::tmux::show_option_args(&session.name, option),
     )?;
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !value.is_empty()).then_some(value)
 }
 
 /// Set a tmux session's user option (`@name`), wherever the session lives.
-pub fn set_tmux_option(loc: &RepoLoc, session: &str, option: &str, value: &str) -> Result<()> {
-    let args = muxel_core::tmux::set_option_args(session, option, value);
+pub fn set_tmux_option(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    value: &str,
+) -> Result<()> {
+    let args = muxel_core::tmux::set_option_args(&session.name, option, value);
     let Some(out) = tmux_at(loc, session, &args) else {
         bail!("tmux isn't reachable for session “{session}”");
     };
@@ -1552,18 +1769,64 @@ pub fn set_tmux_option(loc: &RepoLoc, session: &str, option: &str, value: &str) 
 /// Give claim cleanup two seconds before terminating its command.
 pub fn unset_tmux_option_if(
     loc: &RepoLoc,
-    session: &str,
+    session: &SessionTarget,
     option: &str,
     pattern: &str,
 ) -> Result<()> {
-    let args = muxel_core::tmux::unset_option_if_args(session, option, pattern)
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let lifecycle = GitEnv::production();
+    let session = profile_tmux_target(session);
+    let args = muxel_core::tmux::unset_option_if_args(&session.name, option, pattern)
         .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim cleanup safely"))?;
-    let cmd = tmux_command_at(loc, session, &args)
-        .ok_or_else(|| anyhow::anyhow!("tmux is unavailable"))?;
-    run_claim_cleanup(cmd, Duration::from_secs(2))
+    let cmd = match loc {
+        RepoLoc::Local(_) => {
+            let socket = bounded_tmux_socket(&session, deadline, &lifecycle, |socket| {
+                let mut cmd = tmux_on(socket);
+                cmd.args(muxel_core::tmux::has_session_args(&session.name));
+                cmd
+            })?;
+            let mut cmd = tmux_on(socket);
+            cmd.args(args);
+            cmd
+        }
+        RepoLoc::Remote(_) => tmux_command_at(loc, &session, &args)
+            .ok_or_else(|| anyhow::anyhow!("tmux is unavailable"))?,
+    };
+    run_claim_cleanup(cmd, deadline, &lifecycle)
 }
 
-fn run_claim_cleanup(mut cmd: Command, timeout: Duration) -> Result<()> {
+fn bounded_tmux_socket(
+    session: &SessionTarget,
+    deadline: Instant,
+    lifecycle: &GitEnv,
+    mut probe: impl FnMut(Socket) -> Command,
+) -> Result<Socket> {
+    if let Some(socket) = session.socket {
+        return Ok(socket);
+    }
+    Socket::try_locate(|socket| {
+        let status = run_tmux_until(probe(socket), deadline, lifecycle)?
+            .ok_or_else(|| anyhow::anyhow!("tmux socket discovery timed out"))?;
+        Ok(status.success())
+    })
+}
+
+fn run_claim_cleanup(cmd: Command, deadline: Instant, lifecycle: &GitEnv) -> Result<()> {
+    match run_tmux_until(cmd, deadline, lifecycle)? {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => bail!("tmux claim cleanup failed: {status}"),
+        None => bail!("tmux claim cleanup timed out"),
+    }
+}
+
+fn run_tmux_until(
+    mut cmd: Command,
+    deadline: Instant,
+    lifecycle: &GitEnv,
+) -> Result<Option<ExitStatus>> {
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1572,26 +1835,42 @@ fn run_claim_cleanup(mut cmd: Command, timeout: Duration) -> Result<()> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let lifecycle = GitEnv::production();
-    let child = lifecycle
-        .spawn(&mut cmd)
-        .context("starting tmux claim cleanup")?;
-    let (_, status) = lifecycle.wait_until(child, Instant::now() + timeout);
-    match status {
-        Some(status) if status.success() => Ok(()),
-        Some(status) => bail!("tmux claim cleanup failed: {status}"),
-        None => bail!("tmux claim cleanup timed out"),
-    }
+    let child = lifecycle.spawn(&mut cmd).context("starting tmux command")?;
+    let (child, status) = lifecycle.wait_until(child, deadline);
+    lifecycle.reap(child);
+    Ok(status)
 }
 
-/// Kill a tmux session, on both servers: a pane from before muxel had its own
-/// server still has its session on the default one. Best-effort.
-pub fn kill_tmux_session(session: &str) {
-    for socket in Socket::BOTH {
-        let _ = tmux_on(socket)
-            .args(muxel_core::tmux::kill_session_args(session))
-            .output();
+/// Kill a tmux session on its owner, resolving legacy bindings first. Best-effort.
+pub fn kill_tmux_session(session: &SessionTarget) {
+    let _ = tmux_on(local_tmux_socket(session))
+        .args(muxel_core::tmux::kill_session_args(&session.name))
+        .output();
+}
+
+/// Resolve a legacy close without mutating either server. The caller must save
+/// this owner before its first kill and retain it across failures and retries.
+pub fn resolve_remote_tmux_close(
+    host: &RemoteHost,
+    control_path: &str,
+    password: Option<&str>,
+    closed: &muxel_core::tmux::ClosedSession,
+) -> Result<muxel_core::tmux::ClosedSession> {
+    let mut closed = closed.clone();
+    closed.socket = profile_tmux_target(&closed.target()).socket;
+    if closed.socket.is_some() {
+        return Ok(closed);
     }
+    let sockets = local_tmux_sockets();
+    let out = ssh_run(
+        host,
+        control_path,
+        password,
+        &ssh::list_sessions_command_on(&sockets),
+    )?;
+    let sessions = ssh::parse_session_listings_on(&String::from_utf8_lossy(&out.stdout), &sockets)
+        .ok_or_else(|| anyhow::anyhow!("couldn't determine the tmux session's server"))?;
+    Ok(closed.resolve_owner(&sessions, profile_tmux_socket()))
 }
 
 /// Kill a tmux session on a remote host over SSH, and **confirm it is gone**
@@ -1606,13 +1885,17 @@ pub fn kill_remote_tmux(
     host: &RemoteHost,
     control_path: &str,
     password: Option<&str>,
-    session: &str,
+    session: &SessionTarget,
 ) -> Result<()> {
+    let session = profile_tmux_target(session);
+    if session.socket.is_none() {
+        bail!("resolve and save the tmux session owner before teardown");
+    }
     let out = ssh_run(
         host,
         control_path,
         password,
-        &ssh::kill_and_confirm_command(session),
+        &ssh::kill_and_confirm_command(&session),
     )?;
     match out.status.code() {
         Some(0) => Ok(()),
@@ -1632,14 +1915,15 @@ pub fn claim_tmux_window_size(
     host: &RemoteHost,
     control_path: &str,
     password: Option<&str>,
-    session: &str,
+    session: &SessionTarget,
     tag: &str,
 ) -> Result<()> {
+    let session = profile_tmux_target(session);
     let out = ssh_run(
         host,
         control_path,
         password,
-        &ssh::claim_window_size_command(session, tag),
+        &ssh::claim_window_size_command(&session, tag),
     )?;
     // ssh reports its own failures as 255; anything else is the command's answer.
     if out.status.code() == Some(255) {
@@ -1655,9 +1939,9 @@ pub fn kill_remote_tmux_detached(
     host: &RemoteHost,
     control_path: &str,
     password: Option<&str>,
-    session: &str,
+    session: &SessionTarget,
 ) {
-    let remote_cmd = ssh::kill_command(session);
+    let remote_cmd = ssh::kill_command(&profile_tmux_target(session));
     let mut argv = ssh::connection_args(host, control_path);
     if password.is_none() {
         argv.push("-o".into());
@@ -1684,17 +1968,26 @@ pub fn kill_remote_tmux_detached(
         .spawn();
 }
 
-/// Fire-and-forget kill of a local tmux session (quit-time cleanup), on both
-/// servers as in [`kill_tmux_session`].
-pub fn kill_local_tmux_detached(session: &str) {
-    for socket in Socket::BOTH {
-        let _ = tmux_on(socket)
-            .args(muxel_core::tmux::kill_session_args(session))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+/// Fire-and-forget kill of a local tmux session on its owner (quit-time cleanup).
+pub fn kill_local_tmux_detached(session: &SessionTarget) {
+    let session = profile_tmux_target(session);
+    let mut cmd = match session.socket {
+        Some(socket) => {
+            let mut cmd = tmux_on(socket);
+            cmd.args(muxel_core::tmux::kill_session_args(&session.name));
+            cmd
+        }
+        None => {
+            let mut cmd = command("sh");
+            cmd.args(["-c", &ssh::kill_command(&session)]);
+            cmd
+        }
+    };
+    let _ = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 /// Open the OS file manager at (or selecting) `path`. Best-effort, cross-platform.
@@ -2594,9 +2887,8 @@ fn clear_read_only(path: &Path) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn claim_cleanup_stops_a_command_that_does_not_finish() {
-        let mut cmd = if cfg!(windows) {
+    fn hanging_tmux_command() -> Command {
+        if cfg!(windows) {
             let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
                 .join("System32/WindowsPowerShell/v1.0/powershell.exe");
             let mut cmd = command(powershell);
@@ -2611,13 +2903,85 @@ mod tests {
             let mut cmd = command("/bin/sh");
             cmd.args(["-c", "sleep 30"]);
             cmd
-        };
-        cmd.stdin(Stdio::null());
+        }
+    }
+
+    fn assert_one_tmux_child_reaped(lifecycle: &GitEnv) {
+        assert_eq!(lifecycle.spawned.load(Ordering::SeqCst), 1);
+        let mut reaped = lifecycle.reaped.as_ref().unwrap().lock().unwrap();
+        assert_eq!(reaped.len(), 1);
+        assert!(reaped[0].try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn claim_cleanup_stops_a_command_that_does_not_finish() {
+        let lifecycle = GitEnv::for_tests();
         let started = Instant::now();
-        let err = run_claim_cleanup(cmd, Duration::from_millis(50))
-            .expect_err("a 30-second command must not finish within 50 ms");
+        let err = run_claim_cleanup(
+            hanging_tmux_command(),
+            started + Duration::from_millis(50),
+            &lifecycle,
+        )
+        .expect_err("a 30-second command must not finish within 50 ms");
         assert!(err.to_string().contains("timed out"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert_one_tmux_child_reaped(&lifecycle);
+    }
+
+    #[test]
+    fn claim_cleanup_deadline_includes_a_hung_socket_probe() {
+        let lifecycle = GitEnv::for_tests();
+        let started = Instant::now();
+        let mut probed = Vec::new();
+        let err = bounded_tmux_socket(
+            &"work".into(),
+            started + Duration::from_millis(50),
+            &lifecycle,
+            |socket| {
+                probed.push(socket);
+                hanging_tmux_command()
+            },
+        )
+        .expect_err("socket discovery must obey the cleanup deadline");
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert_eq!(
+            probed,
+            [Socket::Private],
+            "a failed probe must not fall through to another server"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_one_tmux_child_reaped(&lifecycle);
+    }
+
+    #[test]
+    fn claim_cleanup_reuses_the_known_socket_without_probing() {
+        let lifecycle = GitEnv::for_tests();
+        let target = SessionTarget::new("work", Some(Socket::Default));
+        let socket = bounded_tmux_socket(
+            &target,
+            Instant::now() + Duration::from_secs(2),
+            &lifecycle,
+            |_| panic!("a known owner must not probe either server"),
+        )
+        .unwrap();
+        assert_eq!(socket, Socket::Default);
+        assert_eq!(lifecycle.spawned.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn negative_tmux_capability_reprobes_after_upgrade_and_caches_success() {
+        let supported = std::sync::OnceLock::new();
+        for version in ["tmux 3.1c", "unknown", "tmux 3.2a"] {
+            assert_eq!(
+                cached_tmux_session_env_support(&supported, || {
+                    muxel_core::tmux::session_env_supported(version)
+                }),
+                muxel_core::tmux::session_env_supported(version)
+            );
+        }
+        assert!(cached_tmux_session_env_support(&supported, || panic!(
+            "positive result should be cached"
+        )));
     }
 
     #[test]
@@ -2818,6 +3182,190 @@ mod tests {
         let gi2 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gi2.matches(".muxel/").count(), 1, "no duplicate ignore");
         assert_eq!(std::fs::read_to_string(&mem).unwrap(), "kept user notes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The shared-memory failure modes found in real projects: agent sections never
+    /// stamped (so they never aged out), a panel edit saving over sections added
+    /// since it loaded, and a failed read treated as an empty memory.
+    #[test]
+    fn local_memory_is_stamped_kept_and_never_saved_over() {
+        use muxel_core::memory::{Edit, MemoryEntry};
+        use std::io::Write as _;
+
+        const DAY: i64 = 86_400;
+        let now = 1_800_057_600 + 3600;
+        let root = std::env::temp_dir().join("muxel-it-memory-upkeep");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let loc = RepoLoc::Local(root.clone());
+        let file = root.join(MEMORY_DIR).join(MEMORY_FILE);
+
+        assert!(
+            maintain_memory(&loc, now).unwrap().is_empty(),
+            "no file: empty"
+        );
+        ensure_memory_file(&loc).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        writeln!(f, "\n## Agent lesson\nuse the private socket").unwrap();
+        drop(f);
+
+        // Stamped on disk the first time muxel maintains it, then left alone.
+        let kept = maintain_memory(&loc, now).unwrap();
+        assert_eq!(kept.len(), 1);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("created=2027-01-16; accessed=2027-01-16"),
+            "{text}"
+        );
+        maintain_memory(&loc, now).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text, "stable");
+
+        // An agent adds a section after the panel loaded; pinning from the panel
+        // must not erase it.
+        let lesson = kept[0].id;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(b"\n## Second lesson\nadded while the panel was open\n")
+            .unwrap();
+        let after = edit_memory(&loc, now, &Edit::TogglePin(lesson)).unwrap();
+        let titles: Vec<_> = after.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles, ["Agent lesson", "Second lesson"]);
+        assert!(after[0].pinned);
+
+        // It ages out 30 days on; the pinned one stays.
+        let later = maintain_memory(&loc, now + 31 * DAY).unwrap();
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].title, "Agent lesson");
+
+        // An unreadable memory is an error — and an edit then writes nothing.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap(); // a directory can't be read as text
+        assert!(maintain_memory(&loc, now).is_err());
+        let add = Edit::Add(MemoryEntry::new("x", "y", Vec::new(), now));
+        assert!(edit_memory(&loc, now, &add).is_err());
+        assert!(file.is_dir(), "nothing was saved over it");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_accomplishments_maintain_only_rewrites_when_needed() {
+        use muxel_core::accomplishments::{Accomplishment, AccomplishmentKind};
+        use std::io::Write as _;
+
+        const DAY: i64 = 86_400;
+        let now = 1_800_057_600 + 3600; // 2027-01-16, local wall clock
+        let root = std::env::temp_dir().join("muxel-it-accomplishments");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let loc = RepoLoc::Local(root.clone());
+        let file = root.join(MEMORY_DIR).join(ACCOMPLISHMENTS_FILE);
+
+        // No file yet: an empty log, not an error, and nothing is created.
+        assert!(maintain_accomplishments(&loc, now, 14).unwrap().is_empty());
+        assert!(!file.exists());
+
+        ensure_accomplishments_file(&loc).expect("seed");
+        let gi = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(gi.lines().any(|l| l.trim() == ".muxel/"), "gitignored");
+
+        // Agents append: one dated and current, one stale, one undated.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        writeln!(f, "- 2027-01-15 | fix | Fixed the race | claude").unwrap();
+        writeln!(f, "- 2026-12-01 | feature | Ancient history | codex").unwrap();
+        writeln!(f, "- docs | Wrote the guide | amp").unwrap();
+        drop(f);
+
+        let kept = maintain_accomplishments(&loc, now, 14).unwrap();
+        let summaries: Vec<_> = kept.iter().map(|e| e.summary.as_str()).collect();
+        assert_eq!(summaries, ["Fixed the race", "Wrote the guide"]);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("Ancient history"), "pruned on disk");
+        assert!(
+            text.contains("- 2027-01-16 | docs | Wrote the guide | amp"),
+            "stamped"
+        );
+
+        // Clean now: a second load leaves the file byte-for-byte alone.
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        maintain_accomplishments(&loc, now, 14).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+
+        // A panel edit applies to what's on disk, keeping a line appended since.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(b"- 2027-01-16 | perf | Faster startup | claude\n")
+            .unwrap();
+        let after = edit_accomplishments(&loc, now, 14, |es| {
+            es.retain(|e| e.summary != "Fixed the race");
+            es.push(Accomplishment::new(
+                AccomplishmentKind::Test,
+                "Added tests",
+                None,
+                now,
+            ));
+        })
+        .unwrap();
+        let summaries: Vec<_> = after.iter().map(|e| e.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            ["Wrote the guide", "Faster startup", "Added tests"]
+        );
+
+        // An agent corrects an entry by appending a line with its key — muxel
+        // folds it into the original on the next load, without the agent reading.
+        let key = after
+            .iter()
+            .find(|e| e.summary == "Faster startup")
+            .and_then(|e| e.key.clone())
+            .expect("muxel keys every entry");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(
+                format!("- 2027-01-16 | perf | Faster startup and shutdown | claude | #{key}\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let corrected = maintain_accomplishments(&loc, now, 14).unwrap();
+        let summaries: Vec<_> = corrected.iter().map(|e| e.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            [
+                "Wrote the guide",
+                "Faster startup and shutdown",
+                "Added tests"
+            ]
+        );
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            text.matches(&format!("#{key}")).count(),
+            1,
+            "folded on disk"
+        );
+
+        // A shorter window prunes more on the next load.
+        assert_eq!(
+            maintain_accomplishments(&loc, now + DAY, 1).unwrap().len(),
+            0
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

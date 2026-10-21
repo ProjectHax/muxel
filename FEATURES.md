@@ -10,6 +10,14 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Panes & layout
 
+- **Hotbar** — a bar along the bottom of the main window opens full views in place
+  of the panes: **Dashboard** (every agent's status), **Changes** (the active
+  project's git changes, with commit), **Memory** (its shared memory), **Files** (its
+  file tree), and **Accomplishments** (every project's log). A view fills everything
+  right of the project sidebar (docked panels and the git-diff panel step aside);
+  switching projects in the sidebar retargets Changes, Memory, and Files. The active
+  button is drawn filled with an accent bar above it, the bar names what's showing,
+  and clicking the button again returns to the panes.
 - **Recursive split layout** — panes form a horizontal/vertical split tree; any
   pane can be split again, nesting freely.
 - **Resizable splits** — drag the divider between panes; sizes persist per project.
@@ -266,18 +274,50 @@ feature is added or changed, update the matching entry here in the same change**
   Settings → Projects); a memory button on the project row opens the manager. Plain
   shells are skipped.
 - **Self-maintaining memory** — each fact is one `##` section carrying a machine
-  meta line (id, dates, tags). muxel keeps the file **most-relevant-first** (recently
-  used entries and 📌 pinned ones rise to the top), **timestamps** every entry,
-  **auto-purges** un-pinned entries unused for 30 days, and **caps** it at 40
-  un-pinned entries (evicting the least-recently-used) — so it stays small and
-  greppable and never needs hand-pruning. A legacy flat `MEMORY.md` is imported, not
-  lost, on first open.
+  meta line (id, dates, tags). muxel maintains the file **on its own**, with or
+  without the memory panel open: a section an agent adds is stamped within about a
+  minute of being written (local projects; remote ones within ~10 minutes of an
+  agent's turn ending, or at the daily pass), and every memory-enabled project is
+  maintained once a day. It keeps the file **newest-first** (📌 pinned entries on
+  top) and **auto-purges** un-pinned entries 30 days after they were added; a safety
+  cap of 200 un-pinned entries evicts the oldest first, never an arbitrary pick among
+  same-day entries. A file that can't be read is reported, never treated as empty,
+  so nothing is saved over it. A legacy flat `MEMORY.md` is imported, not lost, on
+  first open.
 - **Memory panel** — the project row's memory button toggles a docked, resizable
   second-sidebar panel (like the file browser, sharing its slot; width persists per
   workspace): search/grep the entries, add one (title + note + tags), pin/unpin
   (pinned entries are exempt from purge and cap), delete (with confirm), or open the
-  raw `MEMORY.md` in the editor. Entries load and persist over SSH for remote
-  projects too.
+  raw `MEMORY.md` in the editor. Each change is applied to the file as it is on disk
+  when saved, so sections agents added while the panel was open are kept. Entries
+  load and persist over SSH for remote projects too.
+- **Accomplishment log** — opt-in per project (sidebar right-click or Settings →
+  Projects): agents are told to append one line to `.muxel/ACCOMPLISHMENTS.md` each
+  time they finish a feature, fix, refactor, or perf/docs/test improvement —
+  `- date | type | summary | agent | #key` — with a shell append, **never reading the
+  file**, so logging costs agents almost nothing. **Entries can be corrected**: if a
+  result later changes (more got fixed, part was reverted), the agent appends a
+  line with the same `#key` (grepping for it if needed, still not reading the file)
+  and muxel folds it into the original, which keeps its date and shows "updated"
+  with the correction's day. muxel fills in the agent's name, stamps undated lines,
+  keys unkeyed ones (so any entry can be corrected), drops duplicates, and prunes
+  entries whose last change is older than the history window
+  (**14 days** by default, 1–90 in Settings → Projects) **on its own**: a background
+  pass maintains every log-enabled project once a day (at startup and after each day
+  rollover), with or without a view open, and changing the window re-prunes them
+  all. Remote projects are maintained once their host is connected (pruning never
+  opens a connection by itself). muxel rewrites the file only when something
+  actually changes. Works for local and remote SSH projects; local agents also get
+  the path in `MUXEL_ACCOMPLISHMENTS_FILE`.
+- **Accomplishments panel** — a check button on the project row opens a docked,
+  resizable panel (sharing the file-browser/memory slot) listing the log by day,
+  newest first, with colored type tags, per-type totals, search, delete, and a
+  quick-add box (`fix: what was done`). It updates live while open: local logs are
+  watched by file stamp, and remote ones refresh when an agent finishes a turn.
+- **All-projects accomplishments** — the title-bar check button (or the palette's
+  "Show accomplishments") swaps the pane area for an overview of every log-enabled
+  project, grouped by day and then project, with type and project filters and
+  search. It can **pop out** into its own window, to keep on another monitor.
 
 ## Agent status
 
@@ -947,6 +987,22 @@ feature is added or changed, update the matching entry here in the same change**
   close is still remembered for the rest of the run, so a connect that listed the
   host's sessions a moment before the kill landed can't bring the pane back either.
   Unconfirmed closes are listed in the developer log.
+  Discovery and import retain the session's socket as well as its name. Attach,
+  restart, close and quit use that owner, leaving a same-named session on another
+  socket alone. Older panes resolve their owner before teardown. Claim cleanup
+  includes any socket discovery in its two-second deadline and reaps timed-out
+  commands before returning.
+  A legacy close saves its selected server before the first kill and keeps that
+  owner through lost replies, retries and reconnect cleanup. Only one restart
+  per pane can resolve and stop a session at a time; stale completions from a
+  closed pane or a previous workspace cannot overwrite its new owner. A pending
+  restart follows its project back to the main window if its original window
+  closes. The iOS companion serializes all layout changes with ownership binding,
+  verifies saved pane membership before attachment even for an unchanged owner,
+  preserves an already saved owner when a stale attachment disagrees, and rebuilds
+  that attachment once from the refreshed layout. It discards stale publication
+  after a project switch. Its host status sweep
+  includes recorded named sockets and uses the same session as attachment.
 - **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
   speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
   layout sync, the memory file, project scan, remote git, and the connection test
@@ -1093,6 +1149,36 @@ feature is added or changed, update the matching entry here in the same change**
   (even a crash), so no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
+- **Separate user data dir** — `muxel --user-data-dir DIR` puts settings in
+  `DIR/config`, state and the control endpoint in `DIR/data`, and credentials in
+  a separate keychain service on Windows, macOS and Linux. This separates Muxel
+  profiles for testing or a second instance; it is not a security sandbox.
+  `DIR` holds the control bearer token, workspace and settings and must be private
+  to the intended OS account. On Windows, these files inherit `DIR`'s ACL;
+  `--user-data-dir` does not impose an owner-only ACL.
+  Outside tools pass the same flag before `ctl`, and panes
+  inherit the root even when a preset sets empty or foreign profile variables.
+  AppImage cleanup retains the selected root even when its path shares the
+  runtime mount's prefix.
+  An isolated run refuses a foreign `MUXEL_CONTROL` endpoint. Browser website
+  data persists under `DIR/data/webview2` on Windows; isolated macOS and Linux
+  browser views use nonpersistent storage, discarded when each view closes.
+  If Linux's browser helper cannot start, links, browser presets and restored
+  browser panes report failure instead of opening the system browser.
+  Local tmux panes require tmux 3.2+ to pass the root and endpoint per session;
+  older versions show an upgrade error without launching a fallback shell.
+  Restarting the pane after upgrading tmux checks support again.
+  Each isolated root uses its own tmux socket locally and over SSH. Discovery,
+  reattachment, claims, restart, close and quit stay on that socket, including
+  when older or peer metadata names another server. The regular profile keeps the `mxl` socket and reattaches legacy
+  default-socket sessions. Version and help exit without initializing a profile.
+  Relative paths and `--user-data-dir=DIR` work; empty, repeated or malformed
+  forms are refused before startup. The flag can also precede Linux browser-helper
+  commands. Child agents still use their normal
+  login/config and project files; profiler paths retain their usual locations.
+  Credentials are not migrated from the default profile; if a root cannot be
+  resolved when first used, its fallback keychain name may differ from a later
+  resolved name.
 
 ## Settings & theming
 
@@ -1189,6 +1275,10 @@ feature is added or changed, update the matching entry here in the same change**
   with no terminal text, URLs, titles, or paths.
 - **Cross-platform** — Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and
   Windows (x86_64 + arm64).
+- **One title bar on every Linux desktop** — muxel's windows draw their own title
+  bar, window controls, resize border, and shadow (client-side decorations), so an
+  X11 window manager or a decorating Wayland compositor (such as KDE) doesn't add a
+  second title bar above muxel's.
 - **macOS menu bar** — the **muxel** application menu has Services, Hide muxel
   (`Cmd+H`), Hide Others (`Option+Cmd+H`), Show All, and Quit muxel (`Cmd+Q`).
   Quit asks for confirmation just like `Cmd+Q`, raising the window first so the

@@ -2,6 +2,7 @@
 //! the pane layout tree. No UI, no I/O; everything here is serializable and
 //! unit-tested so the GPUI app and persistence layer can build on it.
 
+pub mod accomplishments;
 mod agent;
 mod appimage;
 pub mod audio;
@@ -11,6 +12,7 @@ pub mod diff;
 pub mod geometry;
 mod gui_path;
 pub mod import;
+pub mod isolated_root;
 pub mod library;
 pub mod locale;
 pub mod memory;
@@ -22,6 +24,7 @@ pub mod remote_ops;
 pub mod session_discovery;
 mod shell;
 pub mod ssh;
+pub mod startup_flags;
 pub mod stt;
 pub mod tmux;
 pub mod tmux_install;
@@ -31,12 +34,13 @@ pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
-    AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
-    append_agent_instruction, claude_session_cwd, claude_session_path,
-    codex_developer_instructions_override, codex_latest_session_id, codex_session_exists,
-    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_matches_cwd,
-    codex_session_names, codex_terminal_title_override, file_link_instruction,
-    find_claude_session_path, memory_header, memory_instruction, memory_reference, resolve_launch,
+    ACCOMPLISHMENTS_FILE, AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind,
+    ResolvedLaunch, accomplishments_header, accomplishments_instruction, append_agent_instruction,
+    claude_session_cwd, claude_session_path, codex_developer_instructions_override,
+    codex_latest_session_id, codex_session_exists, codex_session_hint_from_title,
+    codex_session_id_from_hint, codex_session_matches_cwd, codex_session_names,
+    codex_terminal_title_override, file_link_instruction, find_claude_session_path, memory_header,
+    memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
     resolve_launch_for_session, session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
@@ -527,6 +531,9 @@ pub struct Instance {
     /// tmux session name, once created.
     #[serde(default)]
     pub tmux_session: Option<String>,
+    /// The server that owns the session. Absent only for older saved panes.
+    #[serde(default)]
+    pub tmux_socket: Option<tmux::Socket>,
     /// The grid `(cols, rows)` this pane last rendered at, so it can respawn at the
     /// size it will actually be laid out at instead of the 80×24 default.
     ///
@@ -618,6 +625,13 @@ impl Instance {
         Self::from_preset(project_id, &AgentPreset::shell())
     }
 
+    pub fn tmux_target(&self, slug: &str) -> tmux::SessionTarget {
+        tmux::SessionTarget::new(
+            tmux::session_for(self.tmux_session.as_deref(), slug, self.id),
+            self.tmux_socket,
+        )
+    }
+
     /// Create an instance from a preset.
     pub fn from_preset(project_id: Uuid, preset: &AgentPreset) -> Self {
         Self {
@@ -640,6 +654,7 @@ impl Instance {
             use_tmux: false,
             use_worktree: false,
             tmux_session: None,
+            tmux_socket: None,
             grid: None,
             worktree_path: None,
             worktree_branch: None,
@@ -703,6 +718,7 @@ impl Instance {
             use_tmux: false,
             use_worktree: false,
             tmux_session: None,
+            tmux_socket: None,
             grid: None,
             worktree_path: None,
             worktree_branch: None,
@@ -959,6 +975,10 @@ pub struct Project {
     /// at a `.muxel/MEMORY.md` file they read + append lessons to across runs.
     #[serde(default)]
     pub memory_enabled: bool,
+    /// Inject the accomplishment-log instruction into this project's agents, so they
+    /// append each finished feature/fix/… to `.muxel/ACCOMPLISHMENTS.md`.
+    #[serde(default)]
+    pub accomplishments_enabled: bool,
     /// Unix-seconds version stamp for this project's pane layout, advanced when the
     /// layout/instances change. Drives newer-wins sync of a remote project's layout
     /// to/from `<remote_root>/.muxel/workspace.json`. `None` until first change/sync.
@@ -995,6 +1015,7 @@ impl Project {
             startup: Vec::new(),
             remote: None,
             memory_enabled: false,
+            accomplishments_enabled: false,
             layout_updated_at: None,
             closed_sessions: Vec::new(),
         }
@@ -1012,10 +1033,11 @@ impl Project {
     /// Capped, oldest first: a host that is never reachable again would otherwise
     /// grow the ledger without bound, and an entry that old has long stopped
     /// protecting anything — its instance is gone from the workspace.
-    pub fn remember_closed_session(&mut self, session: String, instance: Uuid) {
+    pub fn remember_closed_session(&mut self, session: tmux::SessionTarget, instance: Uuid) {
         self.closed_sessions.retain(|c| c.instance != instance);
         self.closed_sessions.push(tmux::ClosedSession {
-            name: session,
+            name: session.name,
+            socket: session.socket,
             instance,
         });
         let over = self
@@ -1102,6 +1124,9 @@ pub struct Workspace {
     /// Persisted memory-panel sidebar width in pixels (None = default).
     #[serde(default)]
     pub memory_panel_width: Option<f32>,
+    /// Persisted accomplishments-panel sidebar width in pixels (None = default).
+    #[serde(default)]
+    pub accomplishments_panel_width: Option<f32>,
     /// Persisted git-diff panel width in pixels (None = default).
     #[serde(default)]
     pub gitdiff_panel_width: Option<f32>,
@@ -1285,6 +1310,11 @@ pub struct RemoteLayout {
     /// memory off for everyone.
     #[serde(default)]
     pub memory_enabled: Option<bool>,
+    /// Whether the project's accomplishment log (`.muxel/ACCOMPLISHMENTS.md`) is on.
+    /// Shared state for the same reason as [`Self::memory_enabled`]: every agent on
+    /// the host appends to the one file. `None` = a doc from before the field.
+    #[serde(default)]
+    pub accomplishments_enabled: Option<bool>,
 }
 
 impl RemoteLayout {
@@ -1325,6 +1355,7 @@ impl RemoteLayout {
             instances,
             worktrees,
             memory_enabled: Some(project.memory_enabled),
+            accomplishments_enabled: Some(project.accomplishments_enabled),
         }
     }
 
@@ -1379,6 +1410,7 @@ impl RemoteLayout {
                 instance.activity = AgentActivity::default();
                 if edits_only {
                     instance.tmux_session = None;
+                    instance.tmux_socket = None;
                     instance.session_id = None;
                     instance.session_started = false;
                     instance.auto_submit = false;
@@ -1402,6 +1434,7 @@ impl RemoteLayout {
             // In the key, so flipping the toggle counts as a change and is pushed to
             // the host rather than sitting on one machine.
             "memory_enabled": self.memory_enabled,
+            "accomplishments_enabled": self.accomplishments_enabled,
         })
         .to_string()
     }
@@ -1478,6 +1511,15 @@ pub fn merge_peer_instances(
                 instance.auto_name = mine.auto_name.clone();
                 instance.grid = mine.grid;
                 instance.activity = mine.activity.clone();
+                // Older peers cannot write socket ownership. Preserve an already
+                // resolved binding when their layout still describes that pane.
+                if instance.tmux_socket.is_none()
+                    && (instance.tmux_session.is_none()
+                        || instance.tmux_session == mine.tmux_session)
+                {
+                    instance.tmux_session = mine.tmux_session.clone();
+                    instance.tmux_socket = mine.tmux_socket;
+                }
             }
             instance
         })
@@ -1496,7 +1538,7 @@ pub fn merge_peer_instances(
 pub fn dedupe_instances(workspace: &mut Workspace) {
     use std::collections::HashSet;
     let mut seen_ids: HashSet<Uuid> = HashSet::new();
-    let mut seen_sessions: HashSet<(Uuid, String)> = HashSet::new();
+    let mut seen_sessions: HashSet<(Uuid, Option<tmux::Socket>, String)> = HashSet::new();
     let mut kept: Vec<Instance> = Vec::with_capacity(workspace.instances.len());
     // Instances dropped as duplicates, whose panes must also leave the layout. An
     // instance repeated under the *same* id is not in here: the copy we keep still
@@ -1511,7 +1553,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
             .tmux_session
             .as_ref()
             .filter(|s| !s.is_empty())
-            .map(|s| (inst.project_id, s.clone()));
+            .map(|s| (inst.project_id, inst.tmux_socket, s.clone()));
         // A tmux session is claimed by exactly one instance per project.
         if claim.is_some_and(|c| !seen_sessions.insert(c)) {
             unlink.push(inst.id);
@@ -2303,6 +2345,10 @@ pub struct Settings {
     /// Shared runners the user confirmed, with the content they confirmed.
     #[serde(default)]
     pub shared_runner_confirmations: Vec<library::SharedRunnerConfirmation>,
+    /// Days of accomplishment-log history kept per project (today counts as one);
+    /// older entries are pruned from `.muxel/ACCOMPLISHMENTS.md`.
+    #[serde(default = "default_accomplishment_retention_days")]
+    pub accomplishment_retention_days: u32,
 }
 
 fn default_stt_model() -> String {
@@ -2334,6 +2380,9 @@ fn default_tts_provider_model() -> String {
 }
 fn default_tts_rate() -> f32 {
     1.0
+}
+fn default_accomplishment_retention_days() -> u32 {
+    accomplishments::DEFAULT_RETENTION_DAYS
 }
 
 fn default_editor_font_size() -> f32 {
@@ -2594,6 +2643,7 @@ impl Default for Settings {
             libraries: Vec::new(),
             shared_loops: Vec::new(),
             shared_runner_confirmations: Vec::new(),
+            accomplishment_retention_days: default_accomplishment_retention_days(),
         }
     }
 }
@@ -2864,6 +2914,7 @@ mod settings_tests {
         assert_eq!(s.read_aloud_auto, ReadAloudAuto::Off);
         assert!(!s.read_aloud_announce);
         assert_eq!(s.tts_rate, 1.0);
+        assert_eq!(s.accomplishment_retention_days, 14);
         assert!(s.tts_system_voice.is_empty());
         assert_eq!(s.speak_options(), readaloud::SpeakOptions::default());
         // Saved choices come back.
@@ -3107,7 +3158,7 @@ mod closed_session_tests {
         let ids: Vec<Uuid> = (0..MAX_CLOSED_SESSIONS + 10)
             .map(|n| {
                 let iid = Uuid::new_v4();
-                p.remember_closed_session(format!("muxel_app_{n}"), iid);
+                p.remember_closed_session(format!("muxel_app_{n}").into(), iid);
                 iid
             })
             .collect();
@@ -3352,6 +3403,7 @@ mod remote_layout_tests {
 
         // A machine binding the pane's tmux session and conversation: content, not edit.
         ws.instances[1].tmux_session = Some("muxel_proj_1a2b3c4d".into());
+        ws.instances[1].tmux_socket = Some(tmux::Socket::Default);
         ws.instances[1].session_id = Some(Uuid::new_v4().to_string());
         ws.instances[1].session_started = true;
         let bound = RemoteLayout::capture(&proj, &ws, 1);
@@ -3500,6 +3552,7 @@ mod remote_layout_tests {
         a.grid = Some((120, 40));
         a.activity.last_state = Some(AgentActivityState::Working);
         a.tmux_session = Some("muxel_studio_1a2b3c4d".into());
+        a.tmux_socket = Some(tmux::Socket::Default);
         let b = Instance::shell(proj.id);
         proj.layout = Some(PaneNode::Split {
             direction: SplitDirection::Horizontal,
@@ -3544,6 +3597,25 @@ mod remote_layout_tests {
         assert_eq!(a2.grid, Some((120, 40)));
         assert_eq!(a2.activity.last_state, Some(AgentActivityState::Working));
         assert_eq!(a2.tmux_session, a.tmux_session);
+        assert_eq!(a2.tmux_socket, a.tmux_socket);
+    }
+
+    #[test]
+    fn namesakes_on_different_sockets_survive_dedupe_and_old_peer_sync() {
+        let mut ws = Workspace::default();
+        let mut a = Instance::shell(Uuid::new_v4());
+        a.tmux_session = Some("work".into());
+        a.tmux_socket = Some(tmux::Socket::Private);
+        let mut b = a.clone();
+        b.id = Uuid::new_v4();
+        b.tmux_socket = Some(tmux::Socket::Default);
+        ws.instances = vec![a.clone(), b];
+        dedupe_instances(&mut ws);
+        assert_eq!(ws.instances.len(), 2);
+        let mut legacy = a.clone();
+        legacy.tmux_socket = None;
+        let merged = merge_peer_instances(&ws.instances, vec![legacy], a.project_id);
+        assert_eq!(merged[0].tmux_target("p"), a.tmux_target("p"));
     }
 
     #[test]
@@ -3821,7 +3893,7 @@ mod identity_tests {
             "id": "11111111-1111-4111-8111-111111111111",
             "name": "dev",
             "hostname": "example.com",
-            "user": "ryan",
+            "user": "me",
             "auth": "Agent",
             "default_use_tmux": true
         }"#;

@@ -1020,6 +1020,8 @@ usage: muxel ctl <command> [args]
 AGENT is an id from `panes`, a name, project/name, or `focused`.
 Everything after `--` is taken literally (for text that starts with --).
 muxel must be running with Settings > Grok Bot > \"Allow outside tools to control muxel\" on.
+To reach a muxel started with --user-data-dir DIR, run `muxel --user-data-dir DIR ctl ...`;
+its own panes reach it without the flag.
 
 Replies are JSON. A failure is {\"ok\": false, \"error\": ...}, with a \"code\" when a
 script can act on it (see `muxel ctl skill`). Exit status: 0 success,

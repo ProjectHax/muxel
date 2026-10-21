@@ -5,6 +5,128 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-10-20
+
+### Added
+- **A log of what your agents got done** — turn it on for a project (its right-click
+  menu, or Settings → Projects) and every agent you start there records each feature
+  it adds, bug it fixes, or refactor, performance, docs, or test improvement it
+  finishes, as one line in `.muxel/ACCOMPLISHMENTS.md`. Agents add to the log without
+  ever reading it, so it costs them almost nothing, and an agent can correct an entry
+  later — when a fix turns out to be partial, say — and muxel replaces the original,
+  which keeps its date and shows when it was updated. muxel dates each line, drops
+  repeats, and keeps 14 days of history by default (anywhere from 1 to 90 in
+  Settings → Projects), pruning older entries on its own. A check button on the
+  project row opens the log by day, with search and a box to add your own; an
+  overview shows every project's log together, in the main window or popped out
+  into a window of its own. It works for projects on SSH hosts too.
+- **A hotbar for full views** — a bar along the bottom of the window opens the agent
+  dashboard, the active project's git changes, its shared memory, its files, or every
+  project's accomplishments in place of your panes, filling everything beside the
+  project sidebar. The button for what's open is drawn filled, the bar says what
+  you're looking at, and clicking the button again takes you back to your panes.
+  Switching projects in the sidebar switches the changes, memory, and files views
+  along with it.
+- **Run a second muxel with settings of its own** — `muxel --user-data-dir DIR` keeps
+  that muxel's settings, workspaces, saved passwords, and tmux sessions in DIR, apart
+  from your usual setup, on Windows as well as macOS and Linux: a way to try a build
+  or a configuration without touching your real one. `muxel ctl` typed in one of its
+  panes reaches that muxel; from outside, pass the same flag before `ctl`. Files in
+  your projects and your agents' own logins stay where they are. Its local tmux panes
+  need tmux 3.2 or newer. Thanks to
+  [@railapex](https://github.com/railapex) ([#93](https://github.com/ProjectHax/muxel/pull/93)).
+- **Scripts can tell why `muxel ctl` refused** — refusals now carry a stable code
+  beside the English message, so a script can tell a busy agent from an exited one or
+  an unreachable host without matching text. `panes`, `status`, and a successful
+  `send` also report an id for the pane's current run, which changes whenever muxel
+  starts a new process for it, and `send --launch-id` refuses to type into a pane that
+  has restarted since you looked, even with `--force`. Thanks to
+  [@railapex](https://github.com/railapex) ([#83](https://github.com/ProjectHax/muxel/pull/83)).
+
+### Fixed
+- **Shared memory keeps its dates and prunes itself** — muxel only tidied a project's
+  memory when you opened its memory panel. Entries agents added stayed undated until
+  then, so the file grew without limit, old entries were never removed, and the next
+  time you opened the panel every entry added since got that day's date. The 40-entry
+  limit then broke the tie by title, deleting everything past the first 40
+  alphabetically. Memory is now maintained in the background: a new entry is dated
+  within about a minute of an agent writing it (within about ten minutes of an agent's
+  turn ending, on an SSH host), entries are listed newest first, unpinned ones are
+  removed 30 days after they were added, and a safety limit of 200 removes the oldest
+  first. Pinning, deleting, or adding an entry in the panel no longer erases entries
+  an agent wrote while it was open, and a memory file that can't be read is reported
+  instead of being treated as empty and saved over. On the first run, entries muxel
+  had already dated more than 30 days ago are removed, as that rule always intended;
+  pinned entries are kept.
+- **One title bar on Linux** — on X11, and on Wayland desktops that draw their own
+  window frames such as KDE Plasma, muxel's windows showed a second title bar above
+  muxel's own. muxel now draws its title bar, window controls, and resize border
+  itself on every Linux desktop.
+- **Your agents survive another program crashing tmux** — on some systems, such as
+  RHEL 10 with tmux 3.3a, another tool reading a pane's contents could crash the tmux
+  server muxel's sessions lived on, taking every agent with it. muxel now keeps its
+  sessions on a tmux server of its own, and still reattaches sessions an earlier
+  version left on the default one. `muxel --version` and `--help` also answer without
+  starting the app.
+- **Same-named tmux sessions stay apart** — a session on muxel's tmux server and one
+  of the same name on your own tmux were treated as one, so closing or restarting the
+  pane killed both. muxel now remembers which server each pane's session is on and
+  only touches that one, through restarts, closes, and quitting, and the iOS app does
+  the same. Thanks to
+  [@railapex](https://github.com/railapex) ([#92](https://github.com/ProjectHax/muxel/pull/92)).
+- **`muxel ctl send` no longer submits what you were typing** — `send` pastes its
+  prompt and presses Enter a moment later, and anything typed into the pane in between
+  went out with it. muxel now holds back Enter if the pane got any input in that
+  moment, leaves the text for you to look at, and reports `input_changed`.
+  Thanks to
+  [@railapex](https://github.com/railapex) ([#79](https://github.com/ProjectHax/muxel/pull/79)).
+- **`muxel ctl` reaches popped-out panes** — a pane popped out into its own window was
+  listed by `ctl panes` but reported as not running, and `wait` could time out after
+  its agent had already finished or asked a question. Popped-out panes now answer like
+  docked ones. Thanks to
+  [@railapex](https://github.com/railapex) ([#81](https://github.com/ProjectHax/muxel/pull/81)).
+- **A busy pane can't eat memory or stall closing** — a pane printing faster than the
+  window could draw kept everything it printed in memory, and closing it could hang on
+  output nobody would read. Each pane now holds a bounded amount, closing a pane always
+  lets it go, and on macOS a closing pane stops waiting on its output promptly.
+  Thanks to
+  [@railapex](https://github.com/railapex) ([#88](https://github.com/ProjectHax/muxel/pull/88)).
+- **Popped-out panes keep their loops and restarts straight** — popping out a
+  scheduled loop's pane made muxel lose track of it, so its cleanup was skipped and
+  the next run could overlap it; restarting a popped-out pane left the old process
+  running beside the new one; and switching workspaces with a popped-out pane or
+  project window open could crash muxel. All three now behave as they do for docked
+  panes. Thanks to
+  [@railapex](https://github.com/railapex) ([#90](https://github.com/ProjectHax/muxel/pull/90)).
+- **A renamed Codex pane still resumes its conversation** — renaming a Codex
+  conversation changed the name muxel used to find it again, so a renamed pane could
+  lose its way back after a restart. muxel now follows the conversation's id, which a
+  rename doesn't touch. Thanks to
+  [@railapex](https://github.com/railapex) ([#78](https://github.com/ProjectHax/muxel/pull/78)).
+- **Typing stays responsive while muxel looks for agent conversations** — muxel
+  searched for a Codex pane's conversation files on the same thread that handles your
+  typing and drawing, so one pane still waiting for its conversation could stall the
+  whole window for a tenth of a second at a time, again and again. These lookups now
+  run in the background. Thanks to
+  [@railapex](https://github.com/railapex) ([#82](https://github.com/ProjectHax/muxel/pull/82)).
+- **Pasted and dropped file paths are quoted for the pane's shell** — on Windows,
+  pasting or dropping a file into a PowerShell pane used quoting that PowerShell still
+  expanded, so some names didn't arrive as written. Paths are now quoted for the shell
+  the pane runs — PowerShell, Cmd, Git Bash, or another POSIX shell — and a name that
+  shell can't represent is refused with a notice instead of being pasted partway.
+  Thanks to
+  [@railapex](https://github.com/railapex) ([#80](https://github.com/ProjectHax/muxel/pull/80)).
+- **Curly apostrophes stay literal on Windows hosts** — a path or text containing a
+  curly apostrophe (’) could break the PowerShell command muxel ran on a remote
+  Windows host, and Windows' built-in voice choked on it too. Both now keep it as
+  written. Thanks to
+  [@railapex](https://github.com/railapex) ([#77](https://github.com/ProjectHax/muxel/pull/77)).
+- **Option-, Ctrl-, and Cmd-Backspace delete a word or a line** — all three deleted a
+  single character. Option+Backspace (Alt on Windows and Linux) and Ctrl+Backspace
+  now delete the previous word, and Cmd+Backspace the whole line, as they do in
+  iTerm2 and Warp. Thanks to
+  [@freddysae0](https://github.com/freddysae0) ([#86](https://github.com/ProjectHax/muxel/pull/86)).
+
 ## [0.3.1] — 2026-10-15
 
 ### Added
