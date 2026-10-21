@@ -1032,7 +1032,7 @@ mod tests {
         let two = Path::new("/profile-two");
         let socket = Socket::isolated(one);
         assert_ne!(socket, Socket::isolated(two));
-        assert_eq!(Socket::local(Some(one)), [socket.clone()]);
+        assert_eq!(Socket::local(Some(one)), std::slice::from_ref(&socket));
         assert_eq!(
             Socket::locate_local(Some(one), |_| panic!("foreign socket probe")),
             socket

@@ -3154,7 +3154,7 @@ mod tests {
             let (target, sockets) = tmux_launch_inventory(&saved, Some(root));
             assert_eq!(target.name, saved.name);
             assert_eq!(target.socket, Some(isolated.clone()));
-            assert_eq!(sockets, [isolated.clone()]);
+            assert_eq!(sockets, std::slice::from_ref(&isolated));
             assert_eq!(
                 confirmed_tmux_respawn_target(&target, |_| panic!("global migration probe"))
                     .unwrap(),
