@@ -1857,8 +1857,8 @@ mod tests {
     fn isolated_ssh_discovery_launch_claims_and_teardown_never_probe_global_servers() {
         let root = std::path::Path::new("/isolated-ssh");
         let socket = Socket::isolated(root);
-        let label = String::from(socket);
-        let sockets = [socket];
+        let label = String::from(socket.clone());
+        let sockets = [socket.clone()];
         let listing = list_sessions_command_on(&sockets);
         assert_eq!(listing.matches(":muxel-listed:").count(), 1);
         let parsed =
@@ -1883,7 +1883,7 @@ mod tests {
                 args: &[],
                 use_tmux: true,
                 tmux_session: Some(&target.name),
-                tmux_socket: target.socket,
+                tmux_socket: target.socket.clone(),
                 tmux_client_tag: Some("ab12"),
             };
             let cleanup = crate::tmux::unset_option_if_args("work", "@claim", "owner").unwrap();

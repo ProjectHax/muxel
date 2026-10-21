@@ -30,7 +30,7 @@ use muxel_core::library::resolve::{SnippetStep, snippet_send_action};
 use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
-use muxel_core::tmux::SessionTarget;
+use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     ACCOMPLISHMENTS_FILE, AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity,
@@ -14002,8 +14002,8 @@ impl MuxelApp {
     ///
     /// A complete inventory can finish a close only on servers it actually
     /// queried. Recorded named owners are retried directly because discovery
-    /// lists only mxl/default. A listed live session gets another kill under its
-    /// actual name, which may have drifted since launch.
+    /// lists only this profile's servers. A listed live session gets another kill
+    /// under its actual name, which may have drifted since launch.
     ///
     /// A close confirmed earlier this run is checked again too: the list may predate
     /// its kill (then this kill just confirms it), or its session may have come back.
@@ -14015,6 +14015,7 @@ impl MuxelApp {
         sessions: &[muxel_core::tmux::RemoteSession],
         cx: &mut Context<Self>,
     ) {
+        let sockets = integrations::local_tmux_sockets();
         let pending: Vec<(Uuid, SessionTarget, Option<SessionTarget>)> = self
             .closed_sessions_of(pid)
             .iter()
@@ -14023,7 +14024,7 @@ impl MuxelApp {
                 (
                     c.instance,
                     c.target(),
-                    c.retry_after_inventory(sessions, &Socket::BOTH),
+                    c.retry_after_inventory(sessions, &sockets),
                 )
             })
             .collect();

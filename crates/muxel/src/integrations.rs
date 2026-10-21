@@ -1556,7 +1556,7 @@ fn local_tmux_root() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn local_tmux_sockets() -> Vec<Socket> {
+pub(crate) fn local_tmux_sockets() -> Vec<Socket> {
     Socket::local(local_tmux_root().as_deref())
 }
 
@@ -1724,8 +1724,7 @@ pub fn remote_tmux_launch_target(
     let RepoLoc::Remote(conn) = loc else {
         bail!("not a remote project")
     };
-    let session = profile_tmux_target(session);
-    let sockets = local_tmux_sockets();
+    let (session, sockets) = tmux_launch_inventory(session, local_tmux_root().as_deref());
     let cmd = remote_ssh_command(
         conn,
         format!(
@@ -1741,7 +1740,7 @@ pub fn remote_tmux_launch_target(
         &String::from_utf8_lossy(&out.stdout),
         &sockets,
     )
-    .context("couldn't confirm both tmux servers")?;
+    .context("couldn't confirm the tmux servers queried")?;
     let resolved = muxel_core::tmux::ClosedSession {
         name: session.name.clone(),
         socket: session.socket.clone(),
@@ -1761,6 +1760,18 @@ pub fn remote_tmux_launch_target(
             .iter()
             .any(|row| &row.socket == socket && row.name == resolved.name))
     })
+}
+
+fn tmux_launch_inventory(
+    session: &SessionTarget,
+    root: Option<&Path>,
+) -> (SessionTarget, Vec<Socket>) {
+    let session = session.for_profile(root);
+    let sockets = match &session.socket {
+        Some(Socket::Named(_) | Socket::Isolated(_)) => session.socket.as_slice().to_vec(),
+        _ => Socket::local(root),
+    };
+    (session, sockets)
 }
 
 /// Whether a tmux session is still alive, on this profile's servers (exact-match target,
@@ -2023,6 +2034,7 @@ pub fn kill_tmux_session_confirmed(
     session: &SessionTarget,
     deadline: Instant,
 ) -> Result<SessionTarget> {
+    let session = profile_tmux_target(session);
     let socket = session
         .socket
         .as_ref()
@@ -2033,7 +2045,7 @@ pub fn kill_tmux_session_confirmed(
     if local_tmux_has_session_confirmed(socket, &session.name, deadline)? {
         bail!("tmux session “{session}” is still running");
     }
-    confirmed_tmux_respawn_target(session, |other| {
+    confirmed_tmux_respawn_target(&session, |other| {
         if other == socket {
             Ok(false) // The owned session was just confirmed gone.
         } else {
@@ -2051,16 +2063,17 @@ pub fn restart_remote_tmux(
     let RepoLoc::Remote(conn) = loc else {
         bail!("not a remote project")
     };
+    let session = profile_tmux_target(session);
     if session.socket.is_none() {
         bail!("resolve and save the tmux owner before restart")
     }
-    let cmd = remote_ssh_command(conn, ssh::kill_and_confirm_command(session));
+    let cmd = remote_ssh_command(conn, ssh::kill_and_confirm_command(&session));
     let out = run_tmux_output_until(cmd, deadline)?;
     if !out.status.success() {
         bail!("{}", ssh_error_message(&out))
     }
     if session.socket == Some(Socket::Default) {
-        remote_tmux_launch_target(loc, session, instance, true, deadline)
+        remote_tmux_launch_target(loc, &session, instance, true, deadline)
     } else {
         let command = format!(
             "export LC_ALL=C; {}",
@@ -3125,6 +3138,45 @@ fn clear_read_only(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_inventory_pins_the_profile_and_preserves_named_owner_coverage() {
+        let root = Path::new("/isolated-migration");
+        let isolated = Socket::isolated(root);
+        for prior in [
+            None,
+            Some(Socket::Private),
+            Some(Socket::Default),
+            Some(Socket::Isolated(1)),
+            Some(Socket::Named("peer '名".into())),
+        ] {
+            let saved = SessionTarget::new("exact name ", prior);
+            let (target, sockets) = tmux_launch_inventory(&saved, Some(root));
+            assert_eq!(target.name, saved.name);
+            assert_eq!(target.socket, Some(isolated.clone()));
+            assert_eq!(sockets, [isolated.clone()]);
+            assert_eq!(
+                confirmed_tmux_respawn_target(&target, |_| panic!("global migration probe"))
+                    .unwrap(),
+                target
+            );
+            let reply = "exact name \n:muxel-listed:0\n";
+            let rows = ssh::parse_session_listings_for_migration_on(reply, &sockets).unwrap();
+            assert_eq!(rows[0].target(), target);
+            assert!(ssh::parse_session_listings_for_migration_on(reply, &Socket::BOTH).is_none());
+        }
+        let named = SessionTarget::new("work", Some(Socket::Named("peer '名".into())));
+        let (target, sockets) = tmux_launch_inventory(&named, None);
+        assert_eq!(target, named);
+        assert_eq!(sockets, named.socket.as_slice());
+        for owner in [None, Some(Socket::Private), Some(Socket::Default)] {
+            let saved = SessionTarget::new("work", owner);
+            assert_eq!(
+                tmux_launch_inventory(&saved, None),
+                (saved, Socket::BOTH.to_vec())
+            );
+        }
+    }
 
     fn hanging_tmux_command() -> Command {
         if cfg!(windows) {

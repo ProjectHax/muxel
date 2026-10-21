@@ -348,7 +348,7 @@ pub fn bind_session_owners<'a>(
     }
     for instance in instances {
         if matches!(new_socket, Socket::Isolated(_)) {
-            instance.tmux_socket = Some(new_socket);
+            instance.tmux_socket = Some(new_socket.clone());
         }
         let suffix = instance.id.simple().to_string();
         let found = instance
@@ -529,7 +529,7 @@ impl ClosedSession {
     pub fn resolve_owner(&self, sessions: &[RemoteSession], new_socket: Socket) -> Self {
         let mut resolved = self.clone();
         if matches!(new_socket, Socket::Isolated(_)) {
-            resolved.socket = Some(new_socket);
+            resolved.socket = Some(new_socket.clone());
         }
         if let Some(live) = live_closed_session(sessions, &resolved) {
             resolved.name = live.name.clone();
@@ -1032,7 +1032,7 @@ mod tests {
         let two = Path::new("/profile-two");
         let socket = Socket::isolated(one);
         assert_ne!(socket, Socket::isolated(two));
-        assert_eq!(Socket::local(Some(one)), [socket]);
+        assert_eq!(Socket::local(Some(one)), [socket.clone()]);
         assert_eq!(
             Socket::locate_local(Some(one), |_| panic!("foreign socket probe")),
             socket
@@ -1040,7 +1040,7 @@ mod tests {
         let mut probes = Vec::new();
         assert_eq!(
             Socket::locate_local(None, |socket| {
-                probes.push(socket);
+                probes.push(socket.clone());
                 socket == Socket::Default
             }),
             Socket::Default
@@ -1219,7 +1219,19 @@ mod tests {
 
     #[test]
     fn named_owner_roundtrips_without_becoming_legacy() {
-        for name in ["", "mxl-profile", "default ", "MXL", "socket '名; $()"] {
+        for name in [
+            "",
+            "   ",
+            "mxl-profile",
+            "default ",
+            "MXL",
+            "socket '名; $()",
+            "mxl-0",
+            "mxl-zzzzzzzzzzzzzzzz",
+            "mxl-0000000000000000; echo bad",
+            "mxl-0123456789ABCDEF",
+            "MXL-0123456789abcdef",
+        ] {
             let socket: Socket = serde_json::from_value(serde_json::json!(name)).unwrap();
             assert_eq!(socket, Socket::Named(name.into()));
             assert_eq!(socket.name(), name);
@@ -1345,32 +1357,30 @@ mod tests {
         let socket = Socket::isolated(root);
         let encoded = serde_json::to_string(&socket).unwrap();
         assert_eq!(serde_json::from_str::<Socket>(&encoded).unwrap(), socket);
-        for invalid in [
-            "mxl-0",
-            "mxl-zzzzzzzzzzzzzzzz",
-            "mxl-0000000000000000; echo bad",
-        ] {
-            assert!(Socket::try_from(invalid.to_string()).is_err());
-        }
         for prior in [
             None,
             Some(Socket::Private),
             Some(Socket::Default),
             Some(Socket::Isolated(1)),
+            Some(Socket::Named("peer '名".into())),
         ] {
-            let target = SessionTarget::new("work", prior);
+            let target = SessionTarget::new("work", prior.clone());
+            let isolated = target.for_profile(Some(root));
+            assert_eq!(isolated, SessionTarget::new("work", Some(socket.clone())));
             assert_eq!(
-                target.for_profile(Some(root)),
-                SessionTarget::new("work", Some(socket))
+                isolated
+                    .for_respawn::<()>(|_| panic!("isolated respawn must not probe global servers"))
+                    .unwrap(),
+                Some(isolated)
             );
             assert_eq!(target.for_profile(None), target);
             assert_eq!(target.for_profile(Some(std::path::Path::new(""))), target);
             let mut instance = crate::Instance::shell(Uuid::new_v4());
             instance.tmux_session = Some("work".into());
-            instance.tmux_socket = prior;
+            instance.tmux_socket = prior.clone();
             let mut found = parse_sessions_on("work|/real|claude|\n", Socket::Private);
-            found.extend(parse_sessions_on("work|/isolated|zsh|\n", socket));
-            bind_session_owners("p", [&mut instance], &found, socket);
+            found.extend(parse_sessions_on("work|/isolated|zsh|\n", socket.clone()));
+            bind_session_owners("p", [&mut instance], &found, socket.clone());
             assert_eq!(instance.tmux_target("p"), found[1].target());
             let closed = ClosedSession {
                 name: "work".into(),
@@ -1378,8 +1388,15 @@ mod tests {
                 instance: instance.id,
             };
             assert_eq!(
-                closed.resolve_owner(&found, socket).target(),
+                closed.resolve_owner(&found, socket.clone()).target(),
                 found[1].target()
+            );
+            let pending = closed.resolve_owner(&[], socket.clone());
+            assert!(pending.retry_after_inventory(&[], &Socket::BOTH).is_some());
+            assert!(
+                pending
+                    .retry_after_inventory(&[], std::slice::from_ref(&socket))
+                    .is_none()
             );
         }
     }
