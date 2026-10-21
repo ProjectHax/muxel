@@ -5355,13 +5355,50 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dropped_session_leaves_the_child_its_hangup_cleanup() {
-        // Hold cleanup until this observer has checked stream closure. A timed
-        // save can finish while synchronous PTY destruction is still returning.
-        let script = "trap 'trap \"\" HUP; \
-                      while [ ! -f \"${MUXEL_HUP_MARKER}.release\" ]; do sleep 0.02; done; \
-                      echo saved > \"$MUXEL_HUP_MARKER\"; exit 0' HUP; \
-                      echo ready; while :; do sleep 0.1; done";
-        let (session, rx, marker) = spawn_hangup_script(script, "session");
+        // Own both paths before spawning, including a panic while waiting for
+        // ready. The release file must outlive the child, even on failure.
+        struct Fixture {
+            marker: std::path::PathBuf,
+            release: std::path::PathBuf,
+            child_pid: Option<u32>,
+            reaped: bool,
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Some(pid) = self.child_pid
+                    && !self.reaped
+                {
+                    let pid = pid as libc::pid_t;
+                    let mut status = 0;
+                    // SAFETY: this is our direct fixture child. On failure we
+                    // may reap it before the production reader does.
+                    let mut waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    if waited == 0 {
+                        // SAFETY: waitpid just confirmed this child is ours
+                        // and still running. This is only the failure path.
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while waited == 0 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(20));
+                        // SAFETY: this is the same direct fixture child.
+                        waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    }
+                    self.reaped = waited == pid
+                        || (waited == -1
+                            && std::io::Error::last_os_error().raw_os_error()
+                                == Some(libc::ECHILD));
+                }
+                if self.reaped || self.child_pid.is_none() {
+                    let _ = std::fs::remove_file(&self.marker);
+                    let _ = std::fs::remove_file(&self.release);
+                }
+            }
+        }
+
+        let marker =
+            std::env::temp_dir().join(format!("muxel-hup-cleanup-{}-session", std::process::id()));
         let mut release = marker.clone().into_os_string();
         release.push(".release");
         let release = std::path::PathBuf::from(release);
@@ -5369,6 +5406,28 @@ mod tests {
             let _ = std::fs::remove_file(path);
             assert!(!path.exists(), "stale cleanup fixture: {path:?}");
         }
+        let mut fixture = Fixture {
+            marker,
+            release,
+            child_pid: None,
+            reaped: false,
+        };
+
+        // Hold cleanup until this observer has checked stream closure. A timed
+        // save can finish while synchronous PTY destruction is still returning.
+        let script = "trap 'trap \"\" HUP; sleep 2; \
+                      while [ ! -f \"${MUXEL_HUP_MARKER}.release\" ]; do sleep 0.02; done; \
+                      echo saved > \"$MUXEL_HUP_MARKER\"; exit 0' HUP; \
+                      echo ready; while :; do sleep 0.1; done";
+        let mut spec = CommandSpec::program("/bin/sh", vec!["-c".into(), script.into()]);
+        spec.env.push((
+            "MUXEL_HUP_MARKER".into(),
+            fixture.marker.to_string_lossy().into_owned(),
+        ));
+        let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn");
+        let pid = session.child_pid.expect("fixture child pid");
+        fixture.child_pid = Some(pid);
+        read_until(&rx, "ready");
 
         // Move the final owner so dropping it cannot delay the observer.
         let drop_worker = std::thread::spawn(move || drop(session));
@@ -5383,15 +5442,28 @@ mod tests {
                 Err(async_channel::TryRecvError::Empty) => break false,
             }
         };
-        let saved_before_release = marker.exists();
+        let saved_before_release = fixture.marker.exists();
         // Release even after a timeout. Keep the pre-release closure result:
         // cleanup completing afterward must not turn a failure into a pass.
-        std::fs::write(&release, "").expect("release the child's cleanup");
-        let saved = marker_saved(&marker, Duration::from_secs(4));
-        let drop_result = drop_worker.join();
-        let _ = std::fs::remove_file(&marker);
-        let _ = std::fs::remove_file(&release);
-        assert!(drop_result.is_ok(), "session destructor panicked");
+        let released = std::fs::write(&fixture.release, "").is_ok();
+        let saved = released && marker_saved(&fixture.marker, Duration::from_secs(4));
+        let worker_deadline = Instant::now() + Duration::from_secs(3);
+        while !drop_worker.is_finished() && Instant::now() < worker_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let drop_result = drop_worker.is_finished().then(|| drop_worker.join());
+        let reap_deadline = Instant::now() + Duration::from_secs(3);
+        while !process_reaped(pid) && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fixture.reaped = process_reaped(pid);
+        let reaped = fixture.reaped;
+        drop(fixture);
+        assert!(released, "could not release the child's cleanup");
+        assert!(
+            matches!(drop_result, Some(Ok(()))),
+            "session destructor did not finish or panicked"
+        );
         assert!(closed, "the stream stayed open after its session dropped");
         assert!(
             !saved_before_release,
@@ -5401,6 +5473,7 @@ mod tests {
             saved,
             "the child was killed before its SIGHUP handler finished"
         );
+        assert!(reaped, "the child was not reaped after its cleanup");
     }
 
     /// Dropping the receiver first stops the reader and hangs up the child;
