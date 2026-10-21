@@ -450,8 +450,8 @@ pub fn tmux_path_prelude() -> String {
 /// `tmux` on `socket`, as the words that start a remote command. Every word is
 /// shell-safe, so none is quoted.
 fn tmux_on(socket: Socket) -> String {
-    std::iter::once("tmux")
-        .chain(socket.args().iter().copied())
+    std::iter::once("tmux".to_string())
+        .chain(socket.args())
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -475,8 +475,8 @@ pub fn select_tmux_socket(session: &str) -> String {
 pub fn select_session_socket(session: &crate::tmux::SessionTarget) -> String {
     let target = sh_quote(&format!("={}", session.name));
     let point_at = |socket: Socket| {
-        std::iter::once("set --")
-            .chain(socket.args().iter().copied())
+        std::iter::once("set --".to_string())
+            .chain(socket.args())
             .collect::<Vec<_>>()
             .join(" ")
     };
@@ -1343,7 +1343,7 @@ mod tests {
     #[test]
     fn connection_args_full_options() {
         let mut h = host();
-        h.user = "ryan".into();
+        h.user = "me".into();
         h.port = Some(2222);
         h.auth = SshAuth::Key;
         h.identity_file = Some(PathBuf::from("/home/dev/.ssh/id_ed25519"));
@@ -1362,7 +1362,7 @@ mod tests {
         assert!(a.contains(&"ServerAliveInterval=30".to_string()));
         assert!(a.contains(&"ServerAliveCountMax=3".to_string()));
         assert!(a.contains(&"Compression=yes".to_string()));
-        assert_eq!(target(&h), "ryan@example.com");
+        assert_eq!(target(&h), "me@example.com");
     }
 
     #[test]
@@ -1600,6 +1600,7 @@ mod tests {
             let selection = match socket {
                 Socket::Private => "; set -- -L mxl;",
                 Socket::Default => "; set --;",
+                Socket::Isolated(_) => unreachable!("BOTH contains only real-profile sockets"),
             };
             assert!(cmd.contains(selection), "{cmd}");
             assert_eq!(cmd.matches("kill-session").count(), 1, "{cmd}");
@@ -1651,6 +1652,62 @@ mod tests {
                     !cmd.contains("tmux -L mxl"),
                     "all commands use the selected argv: {cmd}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_ssh_discovery_launch_claims_and_teardown_never_probe_global_servers() {
+        let root = std::path::Path::new("/isolated-ssh");
+        let socket = Socket::isolated(root);
+        let label = String::from(socket);
+        let sockets = [socket];
+        let listing = list_sessions_command_on(&sockets);
+        assert_eq!(listing.matches(":muxel-listed:").count(), 1);
+        let parsed =
+            parse_session_listings_on("work|/w|claude|\n:muxel-listed:0\n", &sockets).unwrap();
+        assert_eq!(parsed[0].socket, socket);
+        assert!(
+            parse_session_listings_on(":muxel-listed:0\n:muxel-listed:0\n", &sockets).is_none()
+        );
+        let h = host();
+        for prior in [
+            None,
+            Some(Socket::Private),
+            Some(Socket::Default),
+            Some(Socket::Isolated(1)),
+        ] {
+            let target = crate::tmux::SessionTarget::new("work", prior).for_profile(Some(root));
+            let spec = SshSpec {
+                host: &h,
+                control_path: "/s",
+                remote_cwd: Some("/w"),
+                program: Some("claude"),
+                args: &[],
+                use_tmux: true,
+                tmux_session: Some(&target.name),
+                tmux_socket: target.socket,
+                tmux_client_tag: Some("ab12"),
+            };
+            let cleanup = crate::tmux::unset_option_if_args("work", "@claim", "owner").unwrap();
+            for cmd in [
+                listing.clone(),
+                ssh_args(&spec).pop().unwrap(),
+                session_tmux_command(&target, &crate::tmux::show_option_args("work", "@claim")),
+                session_tmux_command(
+                    &target,
+                    &crate::tmux::set_option_args("work", "@claim", "owner"),
+                ),
+                session_tmux_command(&target, &cleanup),
+                claim_window_size_command(&target, "ab12"),
+                kill_command(&target),
+                kill_and_confirm_command(&target),
+            ] {
+                assert!(cmd.contains(&format!("-L {label}")), "{cmd}");
+                assert!(!cmd.contains("tmux -L mxl "), "global mxl: {cmd}");
+                assert!(!cmd.contains("set --;"), "default selection: {cmd}");
+                assert!(!cmd.contains("if ! tmux"), "legacy discovery: {cmd}");
+                assert!(!cmd.contains("; tmux has-session"), "default probe: {cmd}");
             }
         }
     }
@@ -1759,11 +1816,11 @@ mod tests {
         let spec = SshSpec {
             host: &h,
             control_path: "/s",
-            remote_cwd: Some("/srv/sro_client"),
+            remote_cwd: Some("/srv/webapp"),
             program: Some("claude"),
             args: &[],
             use_tmux: true,
-            tmux_session: Some("muxel_sro_client_abc123"),
+            tmux_session: Some("muxel_webapp_abc123"),
             tmux_socket: Some(Socket::Private),
             tmux_client_tag: None,
         };
@@ -1773,12 +1830,12 @@ mod tests {
             "; if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off; fi; ";
         let (before, pane) = cmd.split_once(server).expect("server starts first");
         assert!(
-            !before.contains("sro_client"),
+            !before.contains("webapp"),
             "the server's command line must not name the project: {before}"
         );
         // …nor muxel: a `pkill -f muxel` on the host must not match it either.
         assert!(!format!("{before}{server}").contains("muxel"), "{cmd}");
-        assert!(pane.contains("muxel_sro_client_abc123"));
+        assert!(pane.contains("muxel_webapp_abc123"));
     }
 
     /// The bug this guards: attaching makes a client the window's latest, so a pane
@@ -1938,8 +1995,8 @@ It is also possible that a host key has just been changed.
 The fingerprint for the ED25519 key sent by the remote host is
 SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s.
 Please contact your system administrator.
-Add correct host key in /Users/ryan/.ssh/known_hosts to get rid of this message.
-Offending ECDSA key in /Users/ryan/.ssh/known_hosts:42
+Add correct host key in /Users/me/.ssh/known_hosts to get rid of this message.
+Offending ECDSA key in /Users/me/.ssh/known_hosts:42
 Host key for example.com has changed and you have requested strict checking.
 Host key verification failed.";
 
@@ -1956,7 +2013,7 @@ Host key verification failed.";
         assert_eq!(c.offending_key_type.as_deref(), Some("ECDSA"));
         assert_eq!(
             c.known_hosts_file.as_deref(),
-            Some("/Users/ryan/.ssh/known_hosts")
+            Some("/Users/me/.ssh/known_hosts")
         );
         assert_eq!(c.known_hosts_line, Some(42));
     }
@@ -1988,7 +2045,7 @@ Host key verification failed.";
             "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
              @       WARNING: POSSIBLE DNS SPOOFING DETECTED!          @\n\
              @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
-             Offending key for IP in /Users/ryan/.ssh/known_hosts:7\n\
+             Offending key for IP in /Users/me/.ssh/known_hosts:7\n\
              {CHANGED_FULL}"
         );
         let c = HostKeyChange::parse(&stderr).expect("classified");
@@ -2011,14 +2068,14 @@ Host key verification failed.";
     fn host_key_change_keeps_windows_paths() {
         let stderr = CHANGED_FULL
             .replace(
-                "/Users/ryan/.ssh/known_hosts",
-                r"C:\Users\ryan\.ssh\known_hosts",
+                "/Users/me/.ssh/known_hosts",
+                r"C:\Users\me\.ssh\known_hosts",
             )
             .replace(":42", ":7");
         let c = HostKeyChange::parse(&stderr).expect("classified");
         assert_eq!(
             c.known_hosts_file.as_deref(),
-            Some(r"C:\Users\ryan\.ssh\known_hosts")
+            Some(r"C:\Users\me\.ssh\known_hosts")
         );
         assert_eq!(c.known_hosts_line, Some(7));
     }

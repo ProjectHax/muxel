@@ -36,12 +36,18 @@ struct RemoteLayout: Codable, Equatable {
     /// from the memory file), and re-encoding without it would erase an opinion
     /// desktop had already recorded.
     var memoryEnabled: Bool?
+    /// Whether the project's accomplishment log (`.muxel/ACCOMPLISHMENTS.md`) is on.
+    /// Shared the same way as `memoryEnabled` (agents on the host append to one
+    /// file), and carried through the same way: optional, never written back when
+    /// absent, so this app doesn't erase what desktop recorded.
+    var accomplishmentsEnabled: Bool?
 
     private enum CodingKeys: String, CodingKey {
         case version
         case updatedAt = "updated_at"
         case remoteRoot = "remote_root"
         case memoryEnabled = "memory_enabled"
+        case accomplishmentsEnabled = "accomplishments_enabled"
         case layout, instances, worktrees
     }
 
@@ -61,6 +67,7 @@ struct RemoteLayout: Codable, Equatable {
         instances = (try c.decodeIfPresent([Instance].self, forKey: .instances)) ?? []
         worktrees = (try c.decodeIfPresent([Worktree].self, forKey: .worktrees)) ?? []
         memoryEnabled = try c.decodeIfPresent(Bool.self, forKey: .memoryEnabled)
+        accomplishmentsEnabled = try c.decodeIfPresent(Bool.self, forKey: .accomplishmentsEnabled)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -74,6 +81,7 @@ struct RemoteLayout: Codable, Equatable {
         // `encodeIfPresent`: absent stays absent, so "no opinion" is preserved rather
         // than being written back as `false`.
         try c.encodeIfPresent(memoryEnabled, forKey: .memoryEnabled)
+        try c.encodeIfPresent(accomplishmentsEnabled, forKey: .accomplishmentsEnabled)
     }
 
     /// Whether this document is consumable for `root` (correct version + root).

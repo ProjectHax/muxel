@@ -44,24 +44,44 @@ pub(crate) enum PaneProcess {
 /// client's. An ssh `SendEnv` naming this variable could forward the client's
 /// local control id to the remote program, where it does not identify that
 /// program.
+///
+/// Under an isolated root, configured profile variables are never trusted,
+/// including case variants on Windows. Direct programs and ssh clients inherit
+/// the exact startup root (which need not be Unicode) and have no control
+/// override. Only the tmux launch supplies its constructed matching endpoint.
 pub(crate) fn pane_env(
     configured: &[(String, String)],
     launch: Vec<(String, String)>,
     instance_id: Uuid,
     process: PaneProcess,
+    isolated: bool,
 ) -> (Vec<(String, String)>, Vec<String>) {
-    let mut env = configured.to_vec();
+    let profile_key = |key: &str| {
+        key.eq_ignore_ascii_case(muxel_store::USER_DATA_DIR_ENV)
+            || key.eq_ignore_ascii_case(crate::control::CONTROL_ENV)
+    };
+    let mut env: Vec<_> = configured
+        .iter()
+        .filter(|(key, _)| !isolated || !profile_key(key))
+        .cloned()
+        .collect();
     env.extend(launch);
+    let mut removed = Vec::new();
+    if isolated && process != PaneProcess::TmuxClient {
+        env.retain(|(key, _)| !profile_key(key));
+        removed.push(crate::control::CONTROL_ENV.to_string());
+    }
     let not_the_id = |(key, _): &(String, String)| !key.eq_ignore_ascii_case(MUXEL_INSTANCE_ID_ENV);
     match process {
         PaneProcess::Program => {
             env.retain(not_the_id);
             env.push((MUXEL_INSTANCE_ID_ENV.to_string(), instance_id.to_string()));
-            (env, Vec::new())
+            (env, removed)
         }
         PaneProcess::TmuxClient | PaneProcess::SshClient => {
             env.retain(not_the_id);
-            (env, vec![MUXEL_INSTANCE_ID_ENV.to_string()])
+            removed.push(MUXEL_INSTANCE_ID_ENV.to_string());
+            (env, removed)
         }
     }
 }
@@ -71,13 +91,18 @@ pub(crate) fn pane_env(
 /// (with none, the user's shell).
 ///
 /// The program starts from the tmux server's environment, not this client's, so
-/// the pane's id is handed over with `new-session -e` where the local tmux takes
-/// it (`session_env`: tmux 3.2 and later). Only the id: a command line is visible
-/// to other processes, and the rest of a pane's environment can hold secrets and
-/// paths. First, on every tmux, the id is cleared from the server: one started
+/// the pane's id and isolated profile are handed over with `new-session -e`
+/// (`session_env`: tmux 3.2 and later). Older tmux cannot launch isolated panes.
+/// No preset environment or secrets go into argv. First, on every tmux, the id
+/// is cleared from the server: one started
 /// from inside another pane (by a `tmux` typed in a shell pane, or by a muxel run
 /// there) has that pane's id, which a program started without `-e` would take as
 /// its own.
+pub(crate) struct LocalTmuxLaunch {
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
 pub(crate) fn tmux_pane_args(
     socket: muxel_core::tmux::Socket,
     session: &str,
@@ -85,20 +110,31 @@ pub(crate) fn tmux_pane_args(
     args: &[String],
     instance_id: Uuid,
     session_env: bool,
-) -> Vec<String> {
-    let own = [(MUXEL_INSTANCE_ID_ENV.to_string(), instance_id.to_string())];
-    let env: &[(String, String)] = if session_env { &own } else { &[] };
+    user_data_root: Option<&Path>,
+) -> Result<LocalTmuxLaunch, muxel_core::isolated_root::TmuxEnvironmentError> {
+    let env = muxel_core::isolated_root::local_tmux_environment(
+        user_data_root,
+        instance_id,
+        session_env,
+    )?;
     // No `-c`: the client is spawned with `cwd` already, which is what tmux uses
     // for a new session anyway. Passing it would put the project's path in this
     // client's argv for no gain.
-    socket.argv(muxel_core::tmux::launch_session_args_with_env(
+    let socket = user_data_root
+        .filter(|root| !root.as_os_str().is_empty())
+        .map(muxel_core::tmux::Socket::isolated)
+        .unwrap_or(socket);
+    let args = socket.argv(muxel_core::tmux::launch_session_args_with_env(
         session,
         None,
         program,
         args,
-        env,
+        &env,
         &[MUXEL_INSTANCE_ID_ENV],
-    ))
+    ));
+    // The same profile values on the client cover user-defined
+    // update-environment options during attach. pane_env strips the pane id.
+    Ok(LocalTmuxLaunch { args, env })
 }
 
 pub(crate) fn hook_instance_from_args(
@@ -601,7 +637,7 @@ mod tests {
             pair(MUXEL_INSTANCE_ID_ENV, "also-stale"),
         ];
 
-        let (local, removed) = pane_env(&configured, Vec::new(), id, PaneProcess::Program);
+        let (local, removed) = pane_env(&configured, Vec::new(), id, PaneProcess::Program, false);
         assert_eq!(
             local,
             vec![
@@ -620,14 +656,15 @@ mod tests {
         );
 
         // A tmux client has no id, set or inherited (tmux hands the id over).
-        let (client, removed) = pane_env(&configured, Vec::new(), id, PaneProcess::TmuxClient);
+        let (client, removed) =
+            pane_env(&configured, Vec::new(), id, PaneProcess::TmuxClient, false);
         assert_eq!(client, vec![pair("FOO", "bar")]);
         assert_eq!(removed, [MUXEL_INSTANCE_ID_ENV]);
 
         // Nor has an ssh client, which an ssh `SendEnv` could forward it from. What
         // the launch needs, such as ssh's password, is kept.
         let launch = vec![pair("SSHPASS", "pw")];
-        let (remote, removed) = pane_env(&configured, launch, id, PaneProcess::SshClient);
+        let (remote, removed) = pane_env(&configured, launch, id, PaneProcess::SshClient, false);
         assert_eq!(remote, vec![pair("FOO", "bar"), pair("SSHPASS", "pw")]);
         assert_eq!(removed, [MUXEL_INSTANCE_ID_ENV]);
     }
@@ -638,7 +675,9 @@ mod tests {
         let own = format!("{MUXEL_INSTANCE_ID_ENV}={id}");
         let clear = ["set-environment", "-g", "-u", MUXEL_INSTANCE_ID_ENV, ";"];
         // After `-u set -g mouse on ;`, before the session is created.
-        let args = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true);
+        let args = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true, None)
+            .unwrap()
+            .args;
         assert_eq!(args[6..11], clear);
         assert_eq!(
             args[11..],
@@ -646,7 +685,9 @@ mod tests {
         );
         // Older tmux has no `-e`: the program starts without an id rather than
         // with whichever pane's the server had.
-        let args = tmux_pane_args(Socket::Default, "s", None, &[], id, false);
+        let args = tmux_pane_args(Socket::Default, "s", None, &[], id, false, None)
+            .unwrap()
+            .args;
         assert_eq!(args[6..11], clear);
         assert_eq!(args[11..], ["new-session", "-A", "-s", "s"]);
     }
@@ -657,11 +698,274 @@ mod tests {
     #[test]
     fn a_tmux_pane_names_the_server_its_session_is_on() {
         let id = Uuid::new_v4();
-        let private = tmux_pane_args(Socket::Private, "s", Some("claude"), &[], id, true);
-        let default = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true);
+        let private = tmux_pane_args(Socket::Private, "s", Some("claude"), &[], id, true, None)
+            .unwrap()
+            .args;
+        let default = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true, None)
+            .unwrap()
+            .args;
         assert_eq!(private[..2], ["-L", "mxl"]);
         assert_eq!(private[2..], default[..]);
         assert_eq!(default[0], "-u");
+    }
+
+    #[test]
+    fn isolated_tmux_sets_profile_only_on_its_session_and_client() {
+        let id = Uuid::new_v4();
+        let root = Path::new("/isolated root/quote'and;equals=dir");
+        let argv = vec!["two words".into(), "".into(), "--flag".into()];
+        let launch = tmux_pane_args(
+            Socket::Default,
+            "s",
+            Some("agent"),
+            &argv,
+            id,
+            true,
+            Some(root),
+        )
+        .unwrap();
+        assert_eq!(&launch.args[..2], Socket::isolated(root).args());
+        let new = launch
+            .args
+            .iter()
+            .position(|arg| arg == "new-session")
+            .unwrap();
+        assert_eq!(&launch.args[new..new + 4], ["new-session", "-A", "-s", "s"]);
+        for (i, (key, value)) in launch.env.iter().enumerate() {
+            assert_eq!(launch.args[new + 4 + i * 2], "-e");
+            assert_eq!(launch.args[new + 5 + i * 2], format!("{key}={value}"));
+        }
+        assert_eq!(launch.env.len(), 3);
+        assert_eq!(
+            &launch.args[new + 10..],
+            ["--", "agent", "two words", "", "--flag"]
+        );
+        // No profile values are installed globally on this profile's server.
+        assert_eq!(
+            &launch.args[2..new],
+            [
+                "-u",
+                "set",
+                "-g",
+                "mouse",
+                "on",
+                ";",
+                "set-environment",
+                "-g",
+                "-u",
+                MUXEL_INSTANCE_ID_ENV,
+                ";"
+            ]
+        );
+        let configured = vec![
+            ("MUXEL_CONTROL".into(), "foreign.json".into()),
+            ("muxel_control".into(), "also-foreign.json".into()),
+            ("muxel_user_data_dir".into(), "".into()),
+        ];
+        let (client, removed) =
+            pane_env(&configured, launch.env, id, PaneProcess::TmuxClient, true);
+        assert_eq!(removed, [MUXEL_INSTANCE_ID_ENV]);
+        assert!(!client.iter().any(|(key, _)| key == MUXEL_INSTANCE_ID_ENV));
+        for key in [muxel_store::USER_DATA_DIR_ENV, crate::control::CONTROL_ENV] {
+            assert_eq!(
+                client
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case(key))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            client.last().unwrap(),
+            &(
+                "MUXEL_CONTROL".into(),
+                root.join("data")
+                    .join(muxel_core::control::ENDPOINT_FILE)
+                    .to_str()
+                    .unwrap()
+                    .into()
+            )
+        );
+        assert!(tmux_pane_args(Socket::Default, "s", None, &[], id, false, Some(root)).is_err());
+    }
+
+    #[test]
+    fn isolated_tmux_client_keeps_the_root_while_argv_escapes_its_separator() {
+        let root = Path::new("/isolated;");
+        let launch = tmux_pane_args(
+            Socket::Default,
+            "s",
+            None,
+            &[],
+            Uuid::new_v4(),
+            true,
+            Some(root),
+        )
+        .unwrap();
+        assert!(
+            launch
+                .args
+                .contains(&r"MUXEL_USER_DATA_DIR=/isolated\;".to_string())
+        );
+        assert!(
+            launch
+                .env
+                .contains(&("MUXEL_USER_DATA_DIR".into(), "/isolated;".into()))
+        );
+        let endpoint = root.join("data").join(muxel_core::control::ENDPOINT_FILE);
+        assert!(
+            launch
+                .args
+                .contains(&format!("MUXEL_CONTROL={}", endpoint.display()))
+        );
+    }
+
+    #[test]
+    fn profile_overrides_remain_configurable_without_isolation() {
+        let id = Uuid::new_v4();
+        let configured = vec![
+            ("muxel_user_data_dir".into(), "configured-root".into()),
+            ("MUXEL_CONTROL".into(), "configured-control".into()),
+            ("FOO".into(), "bar".into()),
+        ];
+        for process in [
+            PaneProcess::Program,
+            PaneProcess::TmuxClient,
+            PaneProcess::SshClient,
+        ] {
+            let (env, removed) = pane_env(&configured, vec![], id, process, false);
+            assert_eq!(&env[..configured.len()], &configured);
+            assert!(!removed.iter().any(|key| key == crate::control::CONTROL_ENV));
+        }
+        for process in [PaneProcess::Program, PaneProcess::SshClient] {
+            let (env, removed) = pane_env(
+                &configured,
+                vec![("muxel_control".into(), "untrusted-launch".into())],
+                id,
+                process,
+                true,
+            );
+            assert!(!env.iter().any(|(key, _)| {
+                key.eq_ignore_ascii_case(muxel_store::USER_DATA_DIR_ENV)
+                    || key.eq_ignore_ascii_case(crate::control::CONTROL_ENV)
+            }));
+            assert!(env.contains(&("FOO".into(), "bar".into())));
+            assert!(removed.contains(&crate::control::CONTROL_ENV.to_string()));
+            assert_eq!(
+                removed.contains(&MUXEL_INSTANCE_ID_ENV.to_string()),
+                process == PaneProcess::SshClient
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_direct_preset_overrides_cannot_escape_in_spawned_pty_children() {
+        let root = temp_dir();
+        for value in ["", "foreign-profile"] {
+            for lowercase in [false, true] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "session_binding::tests::isolated_direct_child_probe",
+                        "--nocapture",
+                    ])
+                    .env("MUXEL_B3_PROBE_STAGE", "launch")
+                    .env("MUXEL_B3_PROBE_ROOT", &root)
+                    .env("MUXEL_B3_PRESET_VALUE", value)
+                    .env("MUXEL_B3_LOWERCASE", lowercase.to_string())
+                    .env(muxel_store::USER_DATA_DIR_ENV, &root)
+                    .env(crate::control::CONTROL_ENV, "inherited-foreign.json")
+                    .env(MUXEL_INSTANCE_ID_ENV, "inherited-wrong-id")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "value={value:?}, lowercase={lowercase}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn isolated_direct_child_probe() {
+        let Ok(stage) = std::env::var("MUXEL_B3_PROBE_STAGE") else {
+            return;
+        };
+        let root = std::env::var_os("MUXEL_B3_PROBE_ROOT").unwrap();
+        if stage == "observe" {
+            assert_eq!(
+                std::env::var_os(muxel_store::USER_DATA_DIR_ENV),
+                Some(root.clone())
+            );
+            assert_eq!(
+                muxel_store::data_dir(),
+                Some(PathBuf::from(root).join("data"))
+            );
+            assert!(std::env::var_os(crate::control::CONTROL_ENV).is_none());
+            assert_eq!(
+                std::env::var(MUXEL_INSTANCE_ID_ENV).unwrap(),
+                std::env::var("MUXEL_B3_EXPECTED_ID").unwrap()
+            );
+            println!("B3_ISOLATED_CHILD_OK");
+            return;
+        }
+        let lowercase = std::env::var("MUXEL_B3_LOWERCASE").unwrap() == "true";
+        let value = std::env::var("MUXEL_B3_PRESET_VALUE").unwrap();
+        let keys = [muxel_store::USER_DATA_DIR_ENV, crate::control::CONTROL_ENV];
+        let configured: Vec<_> = keys
+            .into_iter()
+            .map(|key| {
+                (
+                    if lowercase {
+                        key.to_ascii_lowercase()
+                    } else {
+                        key.to_string()
+                    },
+                    value.clone(),
+                )
+            })
+            .collect();
+        let id = Uuid::new_v4();
+        let (env, env_remove) = pane_env(&configured, Vec::new(), id, PaneProcess::Program, true);
+        let mut spec = muxel_terminal::CommandSpec::program(
+            std::env::current_exe().unwrap().to_str().unwrap(),
+            vec![
+                "--exact".into(),
+                "session_binding::tests::isolated_direct_child_probe".into(),
+                "--nocapture".into(),
+            ],
+        );
+        spec.env = env;
+        spec.env.extend([
+            ("MUXEL_B3_PROBE_STAGE".into(), "observe".into()),
+            ("MUXEL_B3_EXPECTED_ID".into(), id.to_string()),
+        ]);
+        spec.env_remove = env_remove;
+        let (_session, rx) = muxel_terminal::TerminalSession::spawn(spec, 100, 30).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut output = Vec::new();
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child timed out: {}",
+                String::from_utf8_lossy(&output)
+            );
+            match rx.try_recv() {
+                Ok(muxel_terminal::PtyChunk::Output(bytes)) => output.extend(bytes),
+                Ok(muxel_terminal::PtyChunk::Exit {
+                    code, read_error, ..
+                }) => {
+                    assert_eq!(code, Some(0), "{}", String::from_utf8_lossy(&output));
+                    assert!(read_error.is_none());
+                    assert!(String::from_utf8_lossy(&output).contains("B3_ISOLATED_CHILD_OK"));
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
     }
 
     #[test]

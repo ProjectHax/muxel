@@ -3,9 +3,11 @@
 //! accumulates about a project.
 //!
 //! Each fact is one `##` section carrying a machine-readable meta line (id, created,
-//! accessed, pinned, tags). muxel keeps the file **LRU-ordered** (most-recently-
-//! accessed first, pinned on top), **auto-purged** by age, and **capped** in count,
-//! with pinned entries exempt from both. Keeping everything in one file (rather than
+//! accessed, pinned, tags). muxel keeps the file **newest-first** (pinned on top),
+//! **auto-purged** by age, and under a generous **safety cap** in count, with pinned
+//! entries exempt from both. Agents add sections without a meta line; muxel stamps
+//! them the next time it maintains the file, which it does on its own shortly after
+//! they're written, so an entry's date is (to the day) when it was added. Keeping everything in one file (rather than
 //! an index + per-entry files) means a remote project syncs with a single SSH file
 //! read/write, and `grep -i <term> MEMORY.md` finds an entry directly.
 //!
@@ -16,11 +18,14 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Un-pinned entries not accessed within this many days are purged on maintenance.
+/// Un-pinned entries are purged this many days after they were added (or last
+/// touched, for a caller that touches them).
 pub const PURGE_AFTER_DAYS: i64 = 30;
-/// Max un-pinned entries kept; the least-recently-accessed excess is evicted.
-pub const MAX_ENTRIES: usize = 40;
-const DAY_SECS: i64 = 86_400;
+/// Safety cap on un-pinned entries, so a runaway agent can't grow the file without
+/// bound. The age purge does the real pruning; past the cap the oldest go first,
+/// never an arbitrary pick among same-day entries.
+pub const MAX_ENTRIES: usize = 200;
+pub(crate) const DAY_SECS: i64 = 86_400;
 
 /// One remembered fact — a `##` section in `MEMORY.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,20 +254,29 @@ fn parse_section(sec: &str) -> Option<MemoryEntry> {
     })
 }
 
-/// Result of [`maintain`]: the entries that stay (in display order) and the count
-/// dropped (purged + capped), so the caller can report what was pruned.
+/// Result of [`maintain`]: the entries that stay (in display order), the count
+/// dropped (purged + capped), and whether anything differs from the input — a
+/// stamp, a reorder, or a removal — so the caller knows the file needs rewriting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Maintenance {
     pub kept: Vec<MemoryEntry>,
     pub removed: usize,
+    pub changed: bool,
 }
 
-/// Order (LRU, pinned first), purge stale un-pinned entries, then cap the count.
-/// `now` is unix seconds. Entries with a non-positive `accessed` (a hand-authored
-/// or freshly-imported section) are treated as accessed `now` so they aren't purged
-/// immediately.
+/// Stamp new sections, order newest-first (pinned on top), purge stale un-pinned
+/// entries, then apply the safety cap. `entries` are in file order; `now` is unix
+/// seconds.
+///
+/// A section with a non-positive `accessed` (an agent's or a human's append, or
+/// imported legacy notes) is *fresh*: it's stamped `now` and sorts above
+/// everything already dated, the latest-appended first. Among entries with the
+/// same date the file order is kept, so a maintained file stays put and an
+/// eviction never falls on whichever title sorts last.
 pub fn maintain(mut entries: Vec<MemoryEntry>, now: i64) -> Maintenance {
+    let mut fresh = Vec::with_capacity(entries.len());
     for e in &mut entries {
+        fresh.push(e.accessed <= 0);
         if e.accessed <= 0 {
             e.accessed = now;
         }
@@ -270,13 +284,27 @@ pub fn maintain(mut entries: Vec<MemoryEntry>, now: i64) -> Maintenance {
             e.created = e.accessed;
         }
     }
-    order(&mut entries);
+    let mut changed = fresh.contains(&true);
+
+    let mut indexed: Vec<(usize, MemoryEntry)> = entries.into_iter().enumerate().collect();
+    indexed.sort_by(|(ia, a), (ib, b)| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then(b.accessed.cmp(&a.accessed))
+            .then(fresh[*ib].cmp(&fresh[*ia]))
+            .then(if fresh[*ia] && fresh[*ib] {
+                ib.cmp(ia) // appended later = newer
+            } else {
+                ia.cmp(ib)
+            })
+    });
+    changed |= indexed.iter().enumerate().any(|(pos, (i, _))| pos != *i);
 
     let cutoff = now - PURGE_AFTER_DAYS * DAY_SECS;
-    let mut kept = Vec::with_capacity(entries.len());
+    let mut kept = Vec::with_capacity(indexed.len());
     let mut removed = 0usize;
     let mut unpinned_kept = 0usize;
-    for e in entries {
+    for (_, e) in indexed {
         if !e.pinned && e.accessed < cutoff {
             removed += 1; // purged: stale + un-pinned
             continue;
@@ -290,19 +318,46 @@ pub fn maintain(mut entries: Vec<MemoryEntry>, now: i64) -> Maintenance {
         }
         kept.push(e);
     }
-    Maintenance { kept, removed }
+    changed |= removed > 0;
+    Maintenance {
+        kept,
+        removed,
+        changed,
+    }
 }
 
-/// Sort in place: pinned first, then most-recently-accessed, with created date and
-/// title as stable tie-breakers.
+/// A change made from the memory panel. It's applied to the file as it is on disk
+/// when the change is saved, not to the copy the panel loaded earlier — so a
+/// section an agent added meanwhile survives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Edit {
+    Add(MemoryEntry),
+    TogglePin(Uuid),
+    Delete(Uuid),
+}
+
+impl Edit {
+    pub fn apply(&self, entries: &mut Vec<MemoryEntry>) {
+        match self {
+            Self::Add(entry) => entries.push(entry.clone()),
+            Self::TogglePin(id) => {
+                if let Some(e) = entries.iter_mut().find(|e| e.id == *id) {
+                    e.pinned = !e.pinned;
+                }
+            }
+            Self::Delete(id) => entries.retain(|e| e.id != *id),
+        }
+    }
+}
+
+/// Sort in place: pinned first, then most-recently-accessed, then most recently
+/// created. The sort is stable, so ties keep their current order.
 pub fn order(entries: &mut [MemoryEntry]) {
     entries.sort_by(|a, b| {
         b.pinned
             .cmp(&a.pinned)
             .then(b.accessed.cmp(&a.accessed))
             .then(b.created.cmp(&a.created))
-            .then(a.title.cmp(&b.title))
-            .then(a.id.cmp(&b.id))
     });
 }
 
@@ -326,13 +381,13 @@ pub fn render_document(entries: &[MemoryEntry]) -> String {
 /// is self-explanatory to an agent or human reading it.
 pub fn document_header() -> &'static str {
     "# Project memory\n\n\
-<!-- muxel-maintained memory for this project. Most-relevant-first: recently-used
-     entries rise to the top; 📌 pinned ones stay first. Each entry is a `##` section
-     with a meta line (id, dates, tags), so `grep -i <term> MEMORY.md` finds it —
-     grep the file, then read that section. To remember something, add a `## Title`
-     section with a short note (a `- tags:` hint helps grep); muxel stamps, orders,
-     and dedupes it on the next run. Un-pinned entries unused for 30 days are purged
-     and at most 40 are kept, so don't hand-maintain ordering or delete others. -->\n"
+<!-- muxel-maintained memory for this project. Newest first; 📌 pinned entries stay
+     on top. Each entry is a `##` section with a meta line (id, dates, tags), so
+     `grep -i <term> MEMORY.md` finds it — grep the file, then read that section. To
+     remember something, add a `## Title` section with a short note (a `- tags:`
+     hint helps grep); muxel stamps and orders it shortly after. Un-pinned entries
+     are purged 30 days after they're added, so don't hand-maintain ordering or
+     delete others. -->\n"
 }
 
 /// kebab-case a title (used for stable slugs / anchors if a caller needs one).
@@ -363,7 +418,7 @@ pub fn fmt_date(secs: i64) -> String {
 }
 
 /// Parse a `YYYY-MM-DD` date to unix seconds (UTC midnight), or 0 if malformed.
-fn parse_date(s: &str) -> i64 {
+pub(crate) fn parse_date(s: &str) -> i64 {
     // Also accept a bare unix-seconds integer (forward/back compatible).
     if let Ok(secs) = s.parse::<i64>() {
         return secs;
@@ -407,7 +462,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ENTRIES, MemoryEntry, fmt_date, maintain, order, parse_date, parse_document,
+        Edit, MAX_ENTRIES, MemoryEntry, fmt_date, maintain, order, parse_date, parse_document,
         render_document, slug,
     };
 
@@ -487,6 +542,71 @@ mod tests {
             "pinned kept regardless of cap"
         );
         assert_eq!(m.removed, 3);
+    }
+
+    /// An agent's section has no meta line. Stamping it alone is a change the
+    /// caller must persist — otherwise it re-stamps as "today" on every load and
+    /// never ages out.
+    #[test]
+    fn stamping_a_new_section_is_a_change() {
+        let doc = render_document(&maintain(vec![entry("old", 3)], NOW).kept);
+        let appended = format!("{doc}\n## Agent lesson\nsomething learned\n");
+        let m = maintain(parse_document(&appended), NOW);
+        assert!(m.changed && m.removed == 0);
+        assert_eq!(m.kept[0].title, "Agent lesson", "newest first");
+        assert_eq!(m.kept[0].created, NOW);
+
+        let again = maintain(parse_document(&render_document(&m.kept)), NOW);
+        assert!(!again.changed, "a maintained file stays put");
+    }
+
+    /// Regression: sections stamped in one batch tie on date, and the cap used to
+    /// break the tie by title, deleting every entry past the alphabetical cut.
+    #[test]
+    fn same_day_entries_are_never_evicted_by_title() {
+        let mut doc = String::from("# Project memory\n");
+        let n = MAX_ENTRIES + 5;
+        for i in 0..n {
+            // Appended in reverse alphabetical order: z… first, a… last.
+            doc.push_str(&format!(
+                "\n## {} lesson\nbody\n",
+                (b'z' - (i % 26) as u8) as char
+            ));
+        }
+        let m = maintain(parse_document(&doc), NOW);
+        assert_eq!(m.kept.len(), MAX_ENTRIES);
+        assert_eq!(m.removed, 5);
+        // The newest appends survive, newest first; the 5 earliest are the ones cut.
+        let titles: Vec<_> = parse_document(&doc).into_iter().map(|e| e.title).collect();
+        let expected: Vec<_> = titles.iter().rev().take(MAX_ENTRIES).cloned().collect();
+        let kept: Vec<_> = m.kept.iter().map(|e| e.title.clone()).collect();
+        assert_eq!(kept, expected);
+    }
+
+    #[test]
+    fn new_sections_go_above_same_day_entries() {
+        let mut today = entry("dated today", 0);
+        today.accessed = (NOW / DAY) * DAY; // as parsed back from YYYY-MM-DD
+        today.created = today.accessed;
+        let doc = render_document(&[today]);
+        let appended = format!("{doc}\n## first new\nx\n\n## second new\ny\n");
+        let m = maintain(parse_document(&appended), NOW);
+        let kept: Vec<_> = m.kept.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(kept, ["second new", "first new", "dated today"]);
+    }
+
+    /// A panel edit replayed onto a newer copy of the file keeps what an agent added.
+    #[test]
+    fn edits_apply_to_whatever_is_on_disk() {
+        let keep = entry("keep", 2);
+        let gone = entry("gone", 1);
+        let mut on_disk = vec![keep.clone(), gone.clone(), entry("agent added", 0)];
+        Edit::TogglePin(keep.id).apply(&mut on_disk);
+        Edit::Delete(gone.id).apply(&mut on_disk);
+        Edit::Add(entry("typed in panel", 0)).apply(&mut on_disk);
+        let titles: Vec<_> = on_disk.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles, ["keep", "agent added", "typed in panel"]);
+        assert!(on_disk[0].pinned);
     }
 
     #[test]

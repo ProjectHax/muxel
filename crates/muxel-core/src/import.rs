@@ -860,11 +860,7 @@ nonsense
     #[test]
     fn a_shells_prompt_is_not_a_summary_but_a_colon_in_real_work_is() {
         assert_eq!(
-            informative_title(
-                "ryan@zen-rhel:~/Projects/Bot/cloud-app",
-                Some("zsh"),
-                "Shell"
-            ),
+            informative_title("me@devbox:~/Projects/work/site", Some("zsh"), "Shell"),
             None
         );
         assert_eq!(

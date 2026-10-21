@@ -7,10 +7,12 @@
 // logs stay visible during development.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accomplishments_view;
 mod app;
 mod browser;
 #[cfg(target_os = "linux")]
 mod browser_helper;
+mod browser_storage;
 mod control;
 mod editor;
 mod filetree;
@@ -33,6 +35,7 @@ mod tmux_install;
 mod tts;
 mod ui_profile;
 mod update;
+mod user_data_dir;
 
 use app::MuxelApp;
 use gpui::*;
@@ -208,13 +211,32 @@ fn cli_info(first_arg: Option<&str>) -> Option<String> {
     }
 }
 
+/// The base every muxel window opens with. Each one draws its own title bar
+/// (gpui-component's `TitleBar`, with its own window controls), so on Linux it
+/// asks for client-side decorations: gpui otherwise requests server-side ones, and
+/// X11 window managers and Wayland compositors that provide them (KDE, …) then add
+/// their own title bar above muxel's. `Root` draws the resize border and shadow a
+/// client-decorated window needs. Other platforms ignore the request.
+pub(crate) fn window_options() -> WindowOptions {
+    WindowOptions {
+        titlebar: Some(TitleBar::title_bar_options()),
+        window_decorations: Some(WindowDecorations::Client),
+        ..Default::default()
+    }
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // Answered before anything else runs: asking muxel's binary for its version
-    // must not start a second instance, which would take over the running one's
-    // control.json (so `muxel ctl` talks to the wrong muxel) and save its own
-    // window.json over it.
-    if let Some(text) = cli_info(args.first().map(String::as_str)) {
+    // `--user-data-dir DIR` moves every setting and file muxel keeps into DIR, for
+    // this process and all it starts. First, before any path is read or thread runs.
+    let args = match user_data_dir::configure(std::env::args_os().skip(1).collect()) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    // Answer version/help before GUI startup, after consuming isolation flags.
+    if let Some(text) = cli_info(args.first().and_then(|arg| arg.to_str())) {
         #[cfg(windows)]
         control::attach_parent_console();
         use std::io::Write as _;
@@ -223,13 +245,17 @@ fn main() {
         return;
     }
     // `muxel ctl …` talks to the running app and exits; it never opens a window.
-    if args.first().map(String::as_str) == Some("ctl") {
+    if args.first().is_some_and(|arg| arg == "ctl") {
         #[cfg(windows)]
         control::attach_parent_console();
-        std::process::exit(control::run_cli(&args[1..]));
+        let args: Vec<String> = args[1..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        std::process::exit(control::run_cli(&args));
     }
     match session_binding::hook_instance_from_args(
-        std::env::args_os().skip(1),
+        args.iter().cloned(),
         std::env::var_os(session_binding::MUXEL_INSTANCE_ID_ENV),
     ) {
         Ok(Some(instance_id)) => {
@@ -264,9 +290,9 @@ fn main() {
     // a standalone WebKitGTK window (gpui can't host one — see browser_helper).
     // Must run before anything gpui-related initializes.
     #[cfg(target_os = "linux")]
-    if std::env::args().nth(1).as_deref() == Some("--browser") {
-        match std::env::args().nth(2) {
-            Some(url) => browser_helper::run(&url),
+    if args.first().is_some_and(|arg| arg == "--browser") {
+        match args.get(1).and_then(|arg| arg.to_str()) {
+            Some(url) => browser_helper::run(url),
             None => {
                 eprintln!("usage: muxel --browser <url>");
                 std::process::exit(2);
@@ -400,12 +426,11 @@ fn main() {
             // never clobber the same one.
             cx.spawn(async move |cx| {
                 let options = WindowOptions {
-                    titlebar: Some(TitleBar::title_bar_options()),
                     window_bounds,
                     // Matches the .desktop StartupWMClass so the desktop ties the
                     // window (and its notifications) to muxel's icon.
                     app_id: Some("muxel".to_string()),
-                    ..Default::default()
+                    ..window_options()
                 };
                 cx.open_window(options, move |window, cx| {
                     // Give the window an explicit title; without it the compositor
@@ -418,6 +443,21 @@ fn main() {
             })
             .detach();
         });
+}
+
+#[cfg(test)]
+mod window_options_tests {
+    use super::window_options;
+    use gpui::WindowDecorations;
+
+    /// A server-decorated muxel window gets a second, system title bar above its
+    /// own on X11 and on Wayland compositors that decorate (double title bar).
+    #[test]
+    fn windows_draw_their_own_title_bar_and_ask_for_client_decorations() {
+        let options = window_options();
+        assert!(options.titlebar.is_some());
+        assert_eq!(options.window_decorations, Some(WindowDecorations::Client));
+    }
 }
 
 #[cfg(test)]
