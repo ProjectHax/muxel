@@ -1,4 +1,5 @@
 use muxel_core::control::{CliCommand, NewOptions, NewPlacement, parse_cli, place_new_pane};
+use muxel_core::tmux::Socket;
 use muxel_core::{
     AgentPreset, Instance, Project, SplitDirection, resolve_launch_for_session, session_resume_args,
 };
@@ -584,6 +585,53 @@ fn peer_layout_preserves_literal_launch_and_never_binds_it_to_tmux() {
     assert!(normal.use_tmux);
     assert!(normal.tmux_session.is_some());
     assert_eq!(normal.tmux_socket, Some(muxel_core::tmux::Socket::Private));
+}
+
+#[test]
+fn isolated_peer_binding_overrides_foreign_owners_and_leaves_literals_unchanged() {
+    use muxel_core::tmux::{RemoteSession, bind_peer_sessions, session_name};
+    let project = Project::new("repo", "/repo");
+    let socket = Socket::isolated(std::path::Path::new("/isolated-peer"));
+    let mut literal = Instance::shell(project.id);
+    literal.literal_argv = true;
+    literal.tmux_socket = Some(Socket::Default);
+    literal.args = words(&["literal task", ""]);
+    let saved_literal = serde_json::to_value(&literal).unwrap();
+    for prior in [
+        None,
+        Some(Socket::Private),
+        Some(Socket::Default),
+        Some(Socket::Isolated(1)),
+    ] {
+        let mut terminal = Instance::shell(project.id);
+        terminal.tmux_socket = prior;
+        let mut instances = [literal.clone(), terminal.clone()];
+        let own_name = session_name("isolated", terminal.id);
+        let rows = [
+            RemoteSession {
+                name: session_name("foreign", terminal.id),
+                socket: Socket::Private,
+                path: "/repo".into(),
+                command: "zsh".into(),
+                title: String::new(),
+            },
+            RemoteSession {
+                name: own_name.clone(),
+                socket,
+                path: "/repo".into(),
+                command: "zsh".into(),
+                title: String::new(),
+            },
+        ];
+        bind_peer_sessions(&project.name, &mut instances, &rows, socket);
+        assert_eq!(serde_json::to_value(&instances[0]).unwrap(), saved_literal);
+        assert!(instances[1].use_tmux);
+        assert_eq!(instances[1].tmux_socket, Some(socket));
+        assert_eq!(
+            instances[1].tmux_session.as_deref(),
+            Some(own_name.as_str())
+        );
+    }
 }
 
 #[test]

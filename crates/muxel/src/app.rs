@@ -30,7 +30,7 @@ use muxel_core::library::resolve::{SnippetStep, snippet_send_action};
 use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
-use muxel_core::tmux::SessionTarget;
+use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     ACCOMPLISHMENTS_FILE, AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity,
@@ -104,7 +104,11 @@ impl InstanceTmux {
 
 /// Build the direct command before any resume/transport discovery. Peer metadata
 /// can contain old tmux/preset fields; none may change literal argv.
-fn literal_command_spec(instance: &Instance, project: Option<&Project>) -> Option<CommandSpec> {
+fn literal_command_spec(
+    instance: &Instance,
+    project: Option<&Project>,
+    isolated: bool,
+) -> Option<CommandSpec> {
     if !instance.literal_argv {
         return None;
     }
@@ -128,6 +132,7 @@ fn literal_command_spec(instance: &Instance, project: Option<&Project>) -> Optio
         Vec::new(),
         instance.id,
         crate::session_binding::PaneProcess::Program,
+        isolated,
     );
     // These only inspect terminal output for status; they never change argv,
     // environment or startup input, so literal commands keep the built-in cues.
@@ -198,7 +203,7 @@ mod literal_command_tests {
         instance.system_prompt = Some("never inject".into());
         instance.injection = InjectionMode::TypeIn;
         instance.auto_mode_presses = 2;
-        let spec = literal_command_spec(&instance, None).unwrap();
+        let spec = literal_command_spec(&instance, None, false).unwrap();
         assert_eq!(spec.working_markers, ["esc interrupt"]);
         assert_eq!(spec.blocked_markers, ["Permission required"]);
         assert_eq!(spec.args, instance.args);
@@ -230,7 +235,7 @@ mod literal_command_tests {
             key: "CUSTOM".into(),
             value: "value".into(),
         }];
-        let spec = literal_command_spec(&instance, Some(&project)).unwrap();
+        let spec = literal_command_spec(&instance, Some(&project), false).unwrap();
         assert!(spec.literal_argv);
         assert_eq!(spec.program, "native.exe");
         assert_eq!(spec.args, instance.args);
@@ -275,7 +280,7 @@ mod literal_command_tests {
             key: ID.into(),
             value: "configured-foreign-pane".into(),
         });
-        let spec = literal_command_spec(&instance, None).unwrap();
+        let spec = literal_command_spec(&instance, None, false).unwrap();
         let ids: Vec<_> = spec
             .env
             .iter()
@@ -284,6 +289,34 @@ mod literal_command_tests {
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].1, instance.id.to_string());
         assert!(spec.env_remove.is_empty());
+    }
+
+    #[test]
+    fn isolated_literal_launch_rejects_configured_profile_and_control_overrides() {
+        let mut instance = Instance::shell(uuid::Uuid::new_v4());
+        instance.literal_argv = true;
+        instance.env = [
+            ("MUXEL_USER_DATA_DIR", "foreign-root"),
+            ("muxel_user_data_dir", "another-root"),
+            ("MUXEL_CONTROL", "foreign-endpoint"),
+            ("muxel_control", "another-endpoint"),
+            ("CUSTOM", "retained"),
+        ]
+        .into_iter()
+        .map(|(key, value)| EnvVar {
+            key: key.into(),
+            value: value.into(),
+        })
+        .collect();
+        let spec = literal_command_spec(&instance, None, true).unwrap();
+        assert_eq!(spec.env.len(), 2);
+        assert!(spec.env.contains(&("CUSTOM".into(), "retained".into())));
+        assert!(spec.env.contains(&(
+            muxel_core::control::INSTANCE_ID_ENV.into(),
+            instance.id.to_string(),
+        )));
+        assert_eq!(spec.env_remove, [crate::control::CONTROL_ENV]);
+        assert!(spec.literal_argv);
     }
 }
 
@@ -6763,11 +6796,13 @@ impl MuxelApp {
         let _phase = ui_profile::phase("activation", "command-for", Some(instance_id));
         // Literal commands bypass every transport, prompt and resume wrapper,
         // including stale tmux metadata adopted from a shared layout.
-        if let Some(spec) = self
-            .workspace
-            .instance(instance_id)
-            .and_then(|inst| literal_command_spec(inst, self.workspace.project(inst.project_id)))
-        {
+        if let Some(spec) = self.workspace.instance(instance_id).and_then(|inst| {
+            literal_command_spec(
+                inst,
+                self.workspace.project(inst.project_id),
+                crate::user_data_dir::is_isolated(),
+            )
+        }) {
             return Ok(spec);
         }
         let unresolved = self.workspace.instance(instance_id).and_then(|instance| {
@@ -7026,6 +7061,9 @@ impl MuxelApp {
 
     /// Preparation refusals never reach TerminalLaunch's fallback-shell path.
     fn refuse_terminal_launch(&mut self, iid: Uuid, error: String, cx: &mut Context<Self>) {
+        // Immediate launches may fail preparation before claiming their task.
+        // Settling the signal also covers that unowned Pending interval.
+        self.cancel_control_startup(iid);
         self.terminal_launching.remove(&iid);
         self.terminals.remove(&iid);
         self.terminal_launches.remove(&iid);
