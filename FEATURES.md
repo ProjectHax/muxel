@@ -598,8 +598,10 @@ feature is added or changed, update the matching entry here in the same change**
   conversation. Literal, shell and browser launches refuse prompts with
   `prompt_unsupported`. `--cwd`
   accepts an existing absolute directory, including a linked worktree outside
-  the project root; it defaults to the root. `--name` names the tab, `--split
-  right|down` creates a pane. Creation preserves the selected tab, focus,
+  the project root; it defaults to the root. Automatic memory and accomplishments
+  instructions still address the project's files when the launch directory differs.
+  `--name` names the tab, `--split right|down` creates a pane.
+  Creation preserves the selected tab, focus,
   project and window by default, without raising the window. `--focus` selects
   the new pane and activates its window. `--background` remains accepted as a
   compatibility no-op. JSON uses `focus` (default false); the legacy `background`

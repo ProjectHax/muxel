@@ -1393,8 +1393,7 @@ fn resolve_agent_launch(
             None => project.root_path.display().to_string(),
         };
         let cwd = instance
-            .worktree_path
-            .as_ref()
+            .working_directory()
             .map(|w| w.display().to_string());
         let path = muxel_file_reference(&root, cwd.as_deref(), ACCOMPLISHMENTS_FILE);
         let agent = accomplishments::agent_label(instance.program.as_deref(), &instance.preset);
@@ -1624,6 +1623,31 @@ mod launch_instruction_transport_tests {
         let instructions = control.startup_input.expect("TypeIn positive control");
         assert!(instructions.contains("MEMORY.md"));
         assert!(instructions.contains("file:"));
+    }
+
+    #[test]
+    fn ctl_cwd_keeps_accomplishments_at_project_root() {
+        let mut project = Project::new("repo", std::env::current_dir().unwrap());
+        project.accomplishments_enabled = true;
+        let cwd = project.root_path.join("other-directory");
+        let expected_path = format!("{}/.muxel/ACCOMPLISHMENTS.md", project.root_path.display());
+        for preset in [AgentPreset::claude(), AgentPreset::codex()] {
+            let instance = muxel_core::control::NewOptions {
+                cwd: Some(cwd.clone()),
+                prompt: Some("one exact task".into()),
+                ..Default::default()
+            }
+            .instance(&project, &[preset], 0)
+            .unwrap();
+            assert!(instance.worktree_path.is_none());
+            assert_eq!(instance.working_directory(), Some(cwd.as_path()));
+
+            let launch = resolve_agent_launch(&instance, Some(&project), false);
+            let instructions = launch.args.join(" ");
+            assert!(instructions.contains(&format!(">> {expected_path}")));
+            assert!(!instructions.contains(">> .muxel/ACCOMPLISHMENTS.md"));
+            assert_eq!(launch.startup_input.as_deref(), Some("one exact task"));
+        }
     }
 
     #[test]
