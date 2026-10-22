@@ -5,6 +5,19 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **Panes no longer inherit the environment of whatever restarted muxel's tmux
+  server** — tmux points every pane at its own server, so an agent in a muxel pane
+  that ran `tmux kill-server` and then `tmux new-session` stopped every session, then
+  started muxel's server again with the agent's own environment. Every pane muxel
+  reopened there inherited that environment: a different home directory, so shells
+  came up without your configuration, along with settings like `GIT_EDITOR=true` and
+  the agent's own variables. muxel now marks the tmux server it starts. When it finds
+  one it didn't start, it gives that server muxel's environment before opening a pane
+  there, and notes what it removed in the event log (local panes, tmux 3.1 or newer).
+  `FEATURES.md` no longer claims that a bare `tmux` command can't reach muxel's
+  server: run inside one of its panes, it can.
+
 ## [0.3.2] — 2026-10-20
 
 ### Added
