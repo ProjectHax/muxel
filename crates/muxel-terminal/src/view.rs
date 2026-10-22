@@ -439,7 +439,13 @@ impl RuntimeStatusState {
         let screen_marker = provider_screen
             .or(blocked_marker.then_some(AgentStatus::Blocked))
             .or(working_marker.then_some(AgentStatus::Working));
-        self.screen_held = screen_hold_after(self.screen_held, screen_marker, fresh_title);
+        // Only a title read after the window can confirm a held marker; one
+        // the settle deadline accepted may be the old conversation's too.
+        self.screen_held = screen_hold_after(
+            self.screen_held,
+            screen_marker,
+            fresh_title.filter(|_| evidence.title_fresh),
+        );
 
         if title_provider == TitleProvider::Grok {
             // Debounces retain only attributable source evidence. The current
@@ -5291,7 +5297,7 @@ mod provider_switch_tests {
     // Import specifically: see `tests`.
     use super::{
         AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TerminalStatusReason,
-        TitleProvider, screen_hold_after, status_is_attributable, title_status_trace,
+        TitleProvider, screen_hold_after, status_is_attributable, title_status_trace, wall_time_at,
     };
     use crate::listener::{SWITCH_SETTLE, SWITCH_SLACK};
     use crate::session::{CommandSpec, PtyOutput, TerminalSession};
@@ -5971,6 +5977,44 @@ mod provider_switch_tests {
             (AgentStatus::Blocked, true),
             "a prompt drawn after the old one went notifies"
         );
+        session.kill();
+    }
+
+    #[test]
+    fn the_settle_deadline_does_not_release_a_held_screen_marker() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Grok);
+        let clock = viewer.clock;
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let row = "◎ 1 command still running · send a message to interrupt";
+        let working = "\x1b]0;\u{2839} - Responding - Topic - grok\x07";
+        // A running row and a Working title, both read inside the window.
+        session.process_drained(&drained(&[
+            (row, hook + Duration::from_millis(100)),
+            (working, hook + Duration::from_millis(110)),
+        ]));
+        session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+        let (snapshot, deadline) = viewer.sample_at(&session, clock);
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(!snapshot.attributable);
+        // Past the settle deadline the title is level state, but it was read
+        // inside the window: it can't confirm the old row as the new one's.
+        let late = deadline.expect("a settle deadline") + Duration::from_secs(5);
+        let (snapshot, _) = viewer.sample_at(&session, late);
+        assert!(
+            !session
+                .runtime_evidence_at(None, wall_time_at(late))
+                .settling
+        );
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(!snapshot.attributable, "the row is still held");
+        assert!(viewer.runtime.screen_held);
+        // A title read after the window that agrees ends the hold.
+        let fresh = hook + SWITCH_SLACK + SWITCH_SETTLE + Duration::from_secs(1);
+        session.process_drained(&drained(&[(working, fresh)]));
+        let (snapshot, _) = viewer.sample_at(&session, late + Duration::from_millis(60));
+        assert!(!viewer.runtime.screen_held);
+        assert!(snapshot.attributable);
         session.kill();
     }
 

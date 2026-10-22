@@ -90,7 +90,8 @@ current title without a completion edge.
   wait is bounded: two seconds after the window closes, a deadline of its own
   reconciles the reducer, which then takes the level state it shows as the new
   conversation's. That forms no completion edge either (an Idle reached this
-  way arms the next turn, as at startup) and doesn't end a screen hold.
+  way arms the next turn, as at startup) and doesn't end a screen hold: only a
+  title read after the window can confirm a held marker.
 
   The status shown meanwhile is marked non-attributable
   (`status_attributable()`): a Blocked from an old title or a prompt still on

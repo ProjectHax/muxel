@@ -204,6 +204,9 @@ feature is added or changed, update the matching entry here in the same change**
   the pane still has the same launch, binding and directory, and no sibling owns it.
   On Windows, an accepted Grok conversation stays reserved to its pane even
   while its metadata save is pending.
+  A saved Claude conversation is abandoned only once muxel has confirmed its
+  transcript is really gone — a session store it couldn't read leaves the pane's
+  resume id alone — and the pane then quietly starts fresh.
   A saved Codex conversation is abandoned when its validated saved rollout
   path and compression sibling are both absent or non-files, when a complete walk
   of the rollout store does not find it, or when Codex itself reports that the
@@ -407,7 +410,9 @@ feature is added or changed, update the matching entry here in the same change**
   a turn in it. During uncertainty, `ctl` treats the pane as Working: ordinary
   sends are refused and `wait` keeps waiting; `send --force` retains its override.
   An agent that prints nothing more after the switch settles a couple of seconds
-  later, on a timer, so an idle pane accepts sends again.
+  later, on a timer, so an idle pane accepts sends again; an old prompt or
+  activity row still on screen stays uncertain until it goes or a new title
+  confirms it.
   A Grok conversation switch releases old loop ownership even if saving fails.
   Each pane uses its own discovery history, so another pane's refresh cannot
   discard its valid current title.

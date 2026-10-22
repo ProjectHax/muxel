@@ -128,6 +128,10 @@ pub(crate) struct EvidenceRead {
     /// While settling: when it ends without fresh evidence (see
     /// [`SWITCH_SETTLE`]).
     pub settles_at: Option<SystemTime>,
+    /// The current title was read after the binding's switch window (or no
+    /// window began it). Settling at the deadline doesn't make an older title
+    /// fresh: it can't confirm a held screen marker.
+    pub title_fresh: bool,
     /// The binding began at a switch reported out of band.
     pub windowed: bool,
 }
@@ -365,6 +369,8 @@ impl LifecycleEvidence {
             settles_at: window
                 .filter(|_| self.settling(now))
                 .map(|window| window.settles_at()),
+            title_fresh: window
+                .is_none_or(|window| self.title.is_some_and(|mark| mark.at > window.output_after)),
             windowed: window.is_some(),
         }
     }
