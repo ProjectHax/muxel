@@ -6115,6 +6115,52 @@ mod provider_switch_tests {
     }
 
     #[test]
+    fn a_split_title_opened_inside_the_window_cannot_release_a_screen_hold() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Grok);
+        let clock = viewer.clock;
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let row = "◎ 1 command still running · send a message to interrupt";
+        let working_prefix = "\x1b]0;\u{2839} - Responding - Topic - grok";
+        let working = "\x1b]0;\u{2839} - Responding - Topic - grok\x07";
+        session.process_drained(&drained(&[
+            (row, hook + Duration::from_millis(90)),
+            (working_prefix, hook + Duration::from_millis(100)),
+        ]));
+        session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+        let (_, deadline) = viewer.sample_at(&session, clock);
+        assert!(viewer.runtime.screen_held);
+
+        // VTE dispatches the title on this later BEL, but its read time is
+        // still the prefix's time inside the switch window.
+        let after_window = hook + SWITCH_SLACK + Duration::from_millis(100);
+        session.process_drained(&drained(&[("\x07", after_window)]));
+        let late = deadline.expect("a settle deadline") + Duration::from_secs(5);
+        let (snapshot, _) = viewer.sample_at(&session, late);
+        assert!(
+            !session
+                .runtime_evidence_at(None, wall_time_at(late))
+                .title_fresh
+        );
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(!snapshot.attributable);
+        assert!(viewer.runtime.screen_held);
+
+        // A newly opened title read after the window confirms the marker.
+        let fresh = after_window + Duration::from_secs(1);
+        session.process_drained(&drained(&[(working, fresh)]));
+        let (snapshot, _) = viewer.sample_at(&session, late + Duration::from_millis(60));
+        assert!(
+            session
+                .runtime_evidence_at(None, wall_time_at(late))
+                .title_fresh
+        );
+        assert!(!viewer.runtime.screen_held);
+        assert!(snapshot.attributable);
+        session.kill();
+    }
+
+    #[test]
     fn a_screen_hold_ends_when_the_marker_goes_or_a_fresh_title_agrees() {
         use AgentStatus::*;
         assert!(screen_hold_after(true, Some(Blocked), None));
