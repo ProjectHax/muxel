@@ -314,7 +314,7 @@ fn peer_migration_collision_stops_restart_without_changing_owner() {
             let instance = app.workspace.instance(iid).unwrap();
             assert_eq!(instance.tmux_socket, Some(Socket::Default));
             assert_eq!(instance.tmux_session.as_deref(), Some("owned"));
-            assert!(app.failed_launches[&iid].contains("Refresh"));
+            assert!(app.failed_launches[&iid].contains("shared layout"));
         });
     });
 }

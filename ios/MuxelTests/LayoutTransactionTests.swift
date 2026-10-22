@@ -529,6 +529,34 @@ final class LayoutTransactionTests: XCTestCase {
         XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") })
     }
 
+    /// The phone's write path can't move a pane back onto Default either: a plan
+    /// still bound to Default is refused against a saved `mxl` owner, and the plan
+    /// is rebuilt from that owner. Desktop's `moved_off_default` keeps the same rule
+    /// for whole-layout merges and pushes.
+    func testStaleDefaultPlanCannotUndoASavedMoveOffDefault() async throws {
+        let (state, project, a, _, layout) = fixture()
+        var stale = layout
+        stale.instances[0].tmuxSession = "owned"
+        stale.instances[0].tmuxSocket = "default"
+        state.layout = stale
+        var moved = stale
+        moved.instances[0].tmuxSocket = "mxl"
+        let conn = LayoutTransactionConnection(moved, pauseFirstRead: false)
+        state.connectionFactory = { _, _ in conn }
+        var planned: [String] = []
+        let attachment = try await state.prepareTmuxAttachmentPlan(instanceId: a.id, in: project) { current in
+            let socket = current.tmuxSocket ?? "mxl"
+            planned.append(socket)
+            return TmuxAttachmentPlan(target: .init(name: "owned", socket: socket), attachment: socket)
+        }
+        XCTAssertEqual(planned, ["default", "mxl"])
+        XCTAssertEqual(attachment, "mxl")
+        let persisted = await conn.snapshot()
+        XCTAssertEqual(persisted, moved)
+        let commands = await conn.commands
+        XCTAssertFalse(commands.contains { $0.hasPrefix("cat > ") })
+    }
+
     func testFailedDefaultMigrationSaveDoesNotAuthorizeAttachment() async throws {
         let (state, project, a, _, layout) = fixture()
         var saved = layout

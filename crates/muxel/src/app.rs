@@ -6932,30 +6932,26 @@ impl MuxelApp {
                     )
                 })
                 .await;
+            // `Some(false)`: the binding changed meanwhile (a peer layout rebound
+            // the pane), so this answer is about the wrong owner.
             let landed = Self::in_project_or_main(&this, Some(pid), cx, |this, window, cx| {
                 if this.current_workspace != workspace
                     || !launch_token_current(&this.terminal_launching, iid, token)
                 {
-                    return;
+                    return true;
                 }
                 let Some(instance) = this.workspace.instance_mut(iid) else {
-                    return;
+                    return true;
                 };
                 if instance.project_id != pid || instance.tmux_target(&host.name) != expected {
-                    this.fail_tmux_launch(
-                        iid,
-                        t("The pane's tmux owner changed while preparing attachment. Try again.")
-                            .to_string(),
-                    );
-                    cx.notify();
-                    return;
+                    return false;
                 }
                 let prepared = match prepared {
                     Ok(target) => target,
                     Err(error) => {
                         this.fail_tmux_launch(iid, format!("{error:#}"));
                         cx.notify();
-                        return;
+                        return true;
                     }
                 };
                 instance.tmux_session = Some(prepared.name);
@@ -6972,12 +6968,15 @@ impl MuxelApp {
                         t("Couldn't save the tmux session owner before launch.").to_string(),
                     );
                     cx.notify();
-                    return;
+                    return true;
                 }
                 this.reset_terminal_runtime(iid);
                 this.spawn_reserved_terminal_deferred(iid, token, window, cx);
+                true
             });
-            if landed.is_none() {
+            // Unlanded, or about a binding the pane no longer has: release this
+            // launch and run it again from the pane's current binding.
+            if landed != Some(true) {
                 Self::release_unlanded_launch(&this, iid, token, cx);
             }
         })
@@ -10379,6 +10378,7 @@ impl MuxelApp {
         } = remote;
         let mut instances = muxel_core::merge_peer_instances(&local, instances, pid);
         self.bind_peer_sessions(pid, &mut instances);
+        self.retry_rebound_launches(&local, &instances);
         let keep: HashSet<Uuid> = instances.iter().map(|i| i.id).collect();
         let closed: Vec<Uuid> = before
             .iter()
@@ -10439,6 +10439,16 @@ impl MuxelApp {
         // The peer's new panes attach to their sessions (`tmux new-session -A`).
         self.spawn_project_terminals_now(pid, window, cx);
         cx.notify();
+    }
+
+    /// A pane whose launch failed on its old tmux binding gets another go when a
+    /// peer layout gives it a new one (`before` → `after`): typically the owner a
+    /// peer moved the pane to while this machine refused to guess it, which the
+    /// pane can now attach to. Restart would instead kill what the peer started.
+    fn retry_rebound_launches(&mut self, before: &[Instance], after: &[Instance]) {
+        for iid in muxel_core::rebound_instances(before, after) {
+            self.failed_launches.remove(&iid);
+        }
     }
 
     /// After adopting a peer's layout: re-seed change detection so the adoption
@@ -14684,7 +14694,9 @@ impl MuxelApp {
     /// snapping back to where it was created.
     fn push_remote_layout_now(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         enum Pushed {
-            Written,
+            /// The layout written (its content key), and the panes whose move off
+            /// Default it kept from the file (`muxel_core::keep_moves_off_default`).
+            Written(String, Vec<(Uuid, String)>),
             /// The file holds a peer's newer layout (its JSON), left in place.
             PeerAhead(String),
         }
@@ -14706,42 +14718,46 @@ impl MuxelApp {
         };
         let name = proj.name.clone();
         let local_rev = proj.layout_updated_at.unwrap_or(0);
-        let doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
+        let mut doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
         let key = doc.content_key();
         let synced = self.layout_synced_keys.get(&pid).cloned();
         // The file already holds this layout, as far as this machine knows.
         if synced.as_deref() == Some(key.as_str()) {
             return;
         }
-        let root = doc.remote_root.clone();
-        let json = doc.to_json();
-        let local_key = key.clone();
         self.remote_push_inflight.insert(pid);
         *self.layout_push_epoch.entry(pid).or_default() += 1;
         cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
+                    let mut moved = Vec::new();
                     if let Some(current) = integrations::fetch_remote_layout(&loc)
-                        && let Some(file) = RemoteLayout::parse(&current, &root)
-                        && muxel_core::push_overwrites_peer(
+                        && let Some(file) = RemoteLayout::parse(&current, &doc.remote_root)
+                    {
+                        if muxel_core::push_overwrites_peer(
                             &file,
                             synced.as_deref(),
-                            &local_key,
+                            &key,
                             local_rev,
-                        )
-                    {
-                        return Ok(Pushed::PeerAhead(current));
+                        ) {
+                            return Ok(Pushed::PeerAhead(current));
+                        }
+                        // Overwriting the file must not move a pane back onto Default.
+                        moved =
+                            muxel_core::keep_moves_off_default(&mut doc.instances, &file.instances);
                     }
-                    integrations::push_remote_layout(&loc, &json).map(|()| Pushed::Written)
+                    integrations::push_remote_layout(&loc, &doc.to_json())
+                        .map(|()| Pushed::Written(doc.content_key(), moved))
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.remote_push_inflight.remove(&pid);
                 match res {
-                    Ok(Pushed::Written) => {
+                    Ok(Pushed::Written(key, moved)) => {
                         this.layout_synced_keys.insert(pid, key);
                         this.layout_push_failing.remove(&pid);
+                        this.take_moves_off_default(pid, &moved, window, cx);
                     }
                     Ok(Pushed::PeerAhead(current)) => {
                         this.poll_peer_layout(pid, &current, window, cx);
@@ -14775,6 +14791,44 @@ impl MuxelApp {
             });
         })
         .detach();
+    }
+
+    /// After a push kept a peer's move off Default that this machine's layout
+    /// predated (`moved`, by pane and session name): make the same move here, so
+    /// this machine attaches to that session on `mxl` too, and retry a pane that
+    /// failed waiting for it.
+    fn take_moves_off_default(
+        &mut self,
+        pid: Uuid,
+        moved: &[(Uuid, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if moved.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for (iid, name) in moved {
+            let iid = *iid;
+            let Some(instance) = self.workspace.instance_mut(iid) else {
+                continue;
+            };
+            if instance.project_id != pid
+                || instance.tmux_socket != Some(Socket::Default)
+                || instance.tmux_session.as_ref() != Some(name)
+            {
+                continue;
+            }
+            instance.tmux_socket = Some(Socket::Private);
+            self.bump_session_binding_generation(iid);
+            self.failed_launches.remove(&iid);
+            changed = true;
+        }
+        if changed {
+            self.persist();
+            self.spawn_project_terminals_now(pid, window, cx);
+            cx.notify();
+        }
     }
 
     /// Decide the connect-time sync direction for a remote project and apply it:
@@ -14911,6 +14965,7 @@ impl MuxelApp {
         // its own; a structural pull must not replace it with the peer's.
         let mut instances = muxel_core::merge_peer_instances(&local.instances, instances, pid);
         self.bind_peer_sessions(pid, &mut instances);
+        self.retry_rebound_launches(&local.instances, &instances);
         for wt in &mut worktrees {
             wt.project_id = pid;
         }

@@ -1862,7 +1862,7 @@ pub(crate) fn confirmed_tmux_respawn_target(
     probe: impl FnMut(&Socket) -> Result<bool>,
 ) -> Result<SessionTarget> {
     session.for_respawn(probe)?.with_context(|| {
-        t("That session name is in use on another tmux server. Refresh the project layout before retrying this pane.")
+        t("A session with this name is already running on another tmux server, so this pane was not started. It attaches on its own once the project's shared layout assigns that session to it; otherwise stop that session, then restart the pane.")
     })
 }
 
