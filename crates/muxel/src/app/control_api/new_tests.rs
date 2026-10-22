@@ -950,6 +950,89 @@ fn control_new_policy_ask_and_literal_allow_require_a_click_without_mutation() {
 }
 
 #[test]
+fn control_new_policy_allow_opens_only_known_agent_programs_without_a_click() {
+    for (program, known) in [
+        ("codex", true),
+        ("claude", true),
+        ("/opt/agents/bin/Grok", true),
+        (r"C:\Tools\OpenCode.EXE", true),
+        ("ssh", false),
+        ("wsl.exe", false),
+        ("python3", false),
+        ("/usr/bin/node", false),
+        ("claude-wrapper.sh", false),
+        ("codex.cmd", false),
+    ] {
+        let mut app = MuxelApp::fixture();
+        app.settings.control_allow_new = CreationPolicy::Allow;
+        assert!(!app.settings.control_allow_shells);
+        app.presets[1].program = Some(program.into());
+        app.presets[1].args = vec!["me@devbox".into()];
+        let options = ctl::NewOptions {
+            preset: Some("Codex".into()),
+            ..Default::default()
+        };
+        let instance = app
+            .prepare_control_new(app.workspace.projects[0].id, &options)
+            .unwrap();
+        // Programs that aren't shells by name still need no command grant;
+        // only a known agent provider skips the click.
+        assert_eq!(
+            app.creation_decision(&instance),
+            if known {
+                ctl::CreationDecision::Allow
+            } else {
+                ctl::CreationDecision::Ask
+            },
+            "{program}"
+        );
+        let mut window = Window::default();
+        let before = app.snapshot(&window);
+        let result = app.control_new(
+            app.workspace.projects[0].id,
+            options,
+            false,
+            &mut window,
+            &mut Context(PhantomData),
+        );
+        if known {
+            result.unwrap();
+            assert_eq!(app.launches, 1, "{program}");
+        } else {
+            assert!(
+                result.unwrap_err().message.contains("requires a click"),
+                "{program}"
+            );
+            assert_eq!(app.snapshot(&window), before, "{program}");
+        }
+    }
+}
+
+#[test]
+fn control_new_focus_without_a_click_selects_the_pane_but_never_raises_the_window() {
+    let mut app = MuxelApp::fixture();
+    let (pid, _) = target_project(&mut app, false);
+    let mut window = Window::default();
+    let result = app
+        .control_new(
+            pid,
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                focus: true,
+                ..Default::default()
+            },
+            false,
+            &mut window,
+            &mut Context(PhantomData),
+        )
+        .unwrap();
+    let iid: Uuid = serde_json::from_value(result["uuid"].clone()).unwrap();
+    assert_eq!(app.active_instance, Some(iid));
+    assert_eq!(app.workspace.active_project, Some(pid));
+    assert_eq!(window.activations, 0);
+}
+
+#[test]
 fn control_new_policy_approved_request_still_honors_revoked_creation_and_command_grants() {
     let mut app = MuxelApp::fixture();
     app.settings.control_allow_new = CreationPolicy::Off;

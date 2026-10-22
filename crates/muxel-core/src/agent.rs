@@ -501,7 +501,16 @@ impl AgentPreset {
             presets.push(Self::cmd());
             presets.push(Self::git_bash());
         }
-        presets.extend([
+        presets.extend(Self::builtin_agents());
+        presets.push(Self::browser());
+        presets
+    }
+
+    /// The built-in agent presets: every default terminal preset that runs an
+    /// agent rather than a shell. Their programs are the agent providers muxel
+    /// knows (see [`is_known_agent_program`]).
+    pub fn builtin_agents() -> [AgentPreset; 10] {
+        [
             Self::claude(),
             Self::opencode(),
             Self::amp(),
@@ -512,9 +521,7 @@ impl AgentPreset {
             Self::ollama(),
             Self::ollama_code(),
             Self::pi(),
-            Self::browser(),
-        ]);
-        presets
+        ]
     }
 
     /// Compose model, effort, then extra args. A flag containing `{}` emits one
@@ -540,6 +547,31 @@ impl AgentPreset {
         out.extend(self.args.iter().cloned());
         out
     }
+}
+
+/// Whether `program` runs one of muxel's built-in agent providers — the program
+/// of a [`AgentPreset::builtin_agents`] preset — matched on the executable's
+/// basename, ignoring its directory, a trailing `.exe` and case. Anything else
+/// (`ssh`, `wsl.exe`, `python`, a wrapper script, a shell) is not, even if a
+/// user preset runs it.
+pub fn is_known_agent_program(program: Option<&str>) -> bool {
+    fn stem(program: &str) -> Option<String> {
+        let program = program.trim();
+        let leaf = program
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(program)
+            .to_ascii_lowercase();
+        let stem = leaf.strip_suffix(".exe").unwrap_or(&leaf);
+        (!stem.is_empty()).then(|| stem.to_string())
+    }
+    let Some(name) = program.and_then(stem) else {
+        return false;
+    };
+    AgentPreset::builtin_agents()
+        .iter()
+        .filter_map(|preset| preset.program.as_deref().and_then(stem))
+        .any(|known| known == name)
 }
 
 /// Concrete launch parameters resolved from an instance.
@@ -1344,6 +1376,48 @@ pub fn memory_header() -> &'static str {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn known_agents_are_the_builtin_agent_programs_by_basename() {
+        for program in [
+            "claude",
+            "codex",
+            "grok",
+            "opencode",
+            "amp",
+            "muse",
+            "hermes",
+            "ollama",
+            "pi",
+            "/usr/local/bin/codex",
+            r"C:\Users\me\AppData\Roaming\npm\Claude.EXE",
+            "  GROK  ",
+        ] {
+            assert!(is_known_agent_program(Some(program)), "{program}");
+        }
+        for program in [
+            None,
+            Some(""),
+            Some("ssh"),
+            Some("wsl.exe"),
+            Some("python3"),
+            Some("node"),
+            Some("bash"),
+            Some("cmd.exe"),
+            Some("pwsh"),
+            Some("claude-wrapper"),
+            Some("codex.cmd"),
+            Some("/opt/codex/"),
+        ] {
+            assert!(!is_known_agent_program(program), "{program:?}");
+        }
+        // The list is the seeded built-ins, not a second copy of them.
+        let defaults = AgentPreset::defaults();
+        for agent in AgentPreset::builtin_agents() {
+            assert!(defaults.iter().any(|preset| preset.name == agent.name));
+            assert!(crate::readaloud::is_agent_program(agent.program.as_deref()));
+        }
+    }
 
     fn instance(preset: &AgentPreset, prompt: Option<&str>) -> Instance {
         let mut i = Instance::from_preset(Uuid::new_v4(), preset);

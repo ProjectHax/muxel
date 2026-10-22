@@ -7,8 +7,12 @@ impl MuxelApp {
     pub(super) fn creation_decision(&self, instance: &Instance) -> ctl::CreationDecision {
         let class = if instance.literal_argv {
             ctl::LaunchClass::Literal
+        } else if muxel_core::is_known_agent_program(instance.program.as_deref()) {
+            ctl::LaunchClass::Agent
         } else if readaloud::is_agent_program(instance.program.as_deref()) {
-            ctl::LaunchClass::Preset
+            // `ssh host`, `wsl.exe`, an interpreter: not a shell by name, but
+            // not an agent muxel knows either, so a person decides.
+            ctl::LaunchClass::Program
         } else {
             ctl::LaunchClass::Shell
         };
@@ -178,7 +182,11 @@ impl MuxelApp {
                 window,
                 cx,
             );
-            window.activate_window();
+            // Raising the window takes it from whatever the user is doing:
+            // only a request the user just clicked to approve may do that.
+            if approved {
+                window.activate_window();
+            }
         }
         if self.workspace.instance(iid).is_none() {
             self.control_turns.remove(&iid);

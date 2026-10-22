@@ -13,7 +13,8 @@ fn creation_policy_matrix_keeps_literal_and_shell_launches_click_only() {
         CreationPolicy::Allow,
     ] {
         for class in [
-            LaunchClass::Preset,
+            LaunchClass::Agent,
+            LaunchClass::Program,
             LaunchClass::Shell,
             LaunchClass::Literal,
         ] {
@@ -23,9 +24,11 @@ fn creation_policy_matrix_keeps_literal_and_shell_launches_click_only() {
                         CreationDecision::Refuse(ErrorCode::ControlDisabled)
                     } else if policy == CreationPolicy::Off {
                         CreationDecision::Refuse(ErrorCode::CreationDisabled)
-                    } else if class != LaunchClass::Preset && !commands {
+                    } else if matches!(class, LaunchClass::Shell | LaunchClass::Literal)
+                        && !commands
+                    {
                         CreationDecision::Refuse(ErrorCode::CommandPermissionRequired)
-                    } else if policy == CreationPolicy::Allow && class == LaunchClass::Preset {
+                    } else if policy == CreationPolicy::Allow && class == LaunchClass::Agent {
                         CreationDecision::Allow
                     } else {
                         CreationDecision::Ask
@@ -41,11 +44,11 @@ fn creation_policy_matrix_keeps_literal_and_shell_launches_click_only() {
 }
 
 #[test]
-fn creation_policy_accepts_old_bools_and_persists_named_choices() {
+fn creation_policy_never_grants_allow_from_a_bool_and_persists_named_choices() {
     assert_eq!(Settings::default().control_allow_new, CreationPolicy::Off);
     for (value, expected) in [
         (json!(false), CreationPolicy::Off),
-        (json!(true), CreationPolicy::Allow),
+        (json!(true), CreationPolicy::Ask),
         (json!("off"), CreationPolicy::Off),
         (json!("ask"), CreationPolicy::Ask),
         (json!("allow"), CreationPolicy::Allow),

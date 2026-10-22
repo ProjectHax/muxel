@@ -31,18 +31,28 @@ impl<'de> Deserialize<'de> for CreationPolicy {
             Legacy(bool),
             Named(Named),
         }
+        // No release stored a bool, but a development build did: keep such a
+        // settings file loadable, and never let it grant Allow.
         Ok(match Saved::deserialize(de)? {
             Saved::Legacy(false) | Saved::Named(Named::Off) => Self::Off,
-            Saved::Named(Named::Ask) => Self::Ask,
-            Saved::Legacy(true) | Saved::Named(Named::Allow) => Self::Allow,
+            Saved::Legacy(true) | Saved::Named(Named::Ask) => Self::Ask,
+            Saved::Named(Named::Allow) => Self::Allow,
         })
     }
 }
 
+/// What an outside creation would run, for its admission policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchClass {
-    Preset,
+    /// A preset running a known agent provider (`is_known_agent_program`):
+    /// the only class Allow opens without a click.
+    Agent,
+    /// A preset running any other non-shell program (`ssh`, `wsl.exe`,
+    /// `python`, …). It may give shell access, so it always Asks.
+    Program,
+    /// A shell preset or the default shell: also needs the command grant.
     Shell,
+    /// Literal argv: also needs the command grant.
     Literal,
 }
 
@@ -65,10 +75,10 @@ pub fn creation_decision(
     if policy == CreationPolicy::Off {
         return CreationDecision::Refuse(ErrorCode::CreationDisabled);
     }
-    if class != LaunchClass::Preset && !commands {
+    if matches!(class, LaunchClass::Shell | LaunchClass::Literal) && !commands {
         return CreationDecision::Refuse(ErrorCode::CommandPermissionRequired);
     }
-    if policy == CreationPolicy::Allow && class == LaunchClass::Preset {
+    if policy == CreationPolicy::Allow && class == LaunchClass::Agent {
         CreationDecision::Allow
     } else {
         CreationDecision::Ask

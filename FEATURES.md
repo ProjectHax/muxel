@@ -602,21 +602,29 @@ feature is added or changed, update the matching entry here in the same change**
   transport when available, and are omitted for TypeIn-only presets.
   The task text is discarded after first launch.
   Restart, restore and resume neither re-type nor resubmit it, including launches without a resumable
-  conversation. Literal, shell and browser launches refuse prompts with
+  conversation. A duplicate of the pane starts without it, and the phone never
+  types or submits it. Literal, shell and browser launches refuse prompts with
   `prompt_unsupported`. `--cwd`
   accepts an existing absolute directory, including a linked worktree outside
   the project root; it defaults to the root. Automatic memory and accomplishments
   instructions still address the project's files when the launch directory differs.
-  `--name` names the tab, `--split right|down` creates a pane.
+  `--name` names the tab (1–100 visible characters; `--from` likewise), and
+  `--split right|down` creates a pane. Both refuse control, bidi, zero-width and
+  line-separator characters.
   Creation preserves the selected tab, focus,
   project and window by default, without raising the window. `--focus` selects
-  the new pane and activates its window. `--background` remains accepted as a
+  the new pane, and activates its window only when the request was approved
+  with a click. `--background` remains accepted as a
   compatibility no-op. JSON uses `focus` (default false); the legacy `background`
   field is accepted and ignored. The JSON reply identifies the pane and launch.
   ALL outside creation requires both "Allow outside tools to control muxel" and
   the separate **Outside terminal creation** policy in Settings → Grok Bot.
   It defaults to **Off**. **Ask** requires a click for each request; **Allow**
-  opens configured non-shell terminal presets. All literal argv, including agent argv, and shell-classified
+  opens only presets whose program is a known agent provider (the built-in agent
+  presets' programs — Claude, Codex, Grok, opencode, Amp, Muse, Hermes, Ollama,
+  pi — by executable name) without a click. Any other program, such as
+  `ssh host`, `wsl.exe`, `python` or `node`, still Asks under Allow.
+  All literal argv, including agent argv, and shell-classified
   presets/defaults also require "Also allow typing into shell panes". Configured
   non-literal presets not classified as shells need only the first two grants.
   Literal argv and shell presets always Ask, even under Allow. All three grants
@@ -676,8 +684,7 @@ feature is added or changed, update the matching entry here in the same change**
   Finished replies remain available for ten minutes (latest 256); at most 64
   approvals wait, and approvals do not survive a host restart. Creation requests
   use protocol v2, or v3 when selecting model/effort, so older hosts refuse
-  unsupported fields. Old saved bool
-  creation settings load false as Off and true as Allow.
+  unsupported fields.
   Turning creation off leaves existing panes and typing permissions unchanged
   and does not cancel launches already admitted for spawning. Deferred requests
   still recheck the current grant. Human toolbar creation is unaffected.

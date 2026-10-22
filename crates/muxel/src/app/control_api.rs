@@ -405,7 +405,7 @@ impl MuxelApp {
                             }))
                     })))
                     .child(hint(t(
-                        "Off by default, including upgrades. Ask requires a click for each request. Allow opens configured non-shell terminal presets; literal commands and shell presets always Ask and also require the shell/command permission below. Approvals expire after 120 seconds. Turning creation or outside control off refuses all pending requests. Outside control off also stops the control server. Existing panes, admitted launches and typing permissions are unchanged. Toolbar creation is unaffected.",
+                        "Off by default, including upgrades. Ask requires a click for each request. Allow opens presets that run a known agent (Claude, Codex, Grok, opencode, Amp, …) without a click; any other program, such as ssh, wsl or python, still Asks. Literal commands and shell presets always Ask and also require the shell/command permission below. Approvals expire after 120 seconds. Turning creation or outside control off refuses all pending requests. Outside control off also stops the control server. Existing panes, admitted launches and typing permissions are unchanged. Toolbar creation is unaffected.",
                     )))
                     .child(check(
                         Checkbox::new("grok-control-shells")

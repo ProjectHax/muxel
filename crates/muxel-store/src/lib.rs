@@ -701,9 +701,11 @@ mod tests {
     #[test]
     fn outside_creation_policy_accepts_legacy_toml_and_saves_named_choices() {
         use muxel_core::control::CreationPolicy;
+        // A development build's bool still loads, and never as Allow.
         for (text, expected) in [
             ("control_allow_new = false", CreationPolicy::Off),
-            ("control_allow_new = true", CreationPolicy::Allow),
+            ("control_allow_new = true", CreationPolicy::Ask),
+            ("control_allow_new = 'allow'", CreationPolicy::Allow),
             ("control_allow_new = 'ask'", CreationPolicy::Ask),
         ] {
             let settings = parse_settings(text).unwrap();

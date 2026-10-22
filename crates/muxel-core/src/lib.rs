@@ -39,9 +39,9 @@ pub use agent::{
     claude_session_cwd, claude_session_path, codex_developer_instructions_override,
     codex_latest_session_id, codex_session_exists, codex_session_hint_from_title,
     codex_session_id_from_hint, codex_session_matches_cwd, codex_session_names,
-    codex_terminal_title_override, file_link_instruction, find_claude_session_path, memory_header,
-    memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args,
+    codex_terminal_title_override, file_link_instruction, find_claude_session_path,
+    is_known_agent_program, memory_header, memory_instruction, memory_reference,
+    muxel_file_reference, resolve_launch, resolve_launch_for_session, session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
@@ -2457,9 +2457,11 @@ pub struct Settings {
     /// Bot) list and drive the agents through `muxel ctl`. Off by default.
     #[serde(default)]
     pub control_enabled: bool,
-    /// Off / Ask / Allow for outside terminal creation. Literal argv and shell
-    /// presets always Ask and also require control_allow_shells. Old bools load
-    /// as Off / Allow. Revocation refuses pending approvals, not existing panes.
+    /// Off / Ask / Allow for outside terminal creation. Allow opens only presets
+    /// running a known agent provider; every other program Asks. Literal argv and
+    /// shell presets always Ask and also require control_allow_shells. A bool
+    /// from a development build loads as Off / Ask. Revocation refuses pending
+    /// approvals, not existing panes.
     #[serde(default)]
     pub control_allow_new: control::CreationPolicy,
     /// Also allow typing into shell panes and `ctl new` shell presets/defaults
@@ -3119,14 +3121,15 @@ mod settings_tests {
             }))
             .unwrap();
             let saved = serde_json::to_value(&settings).unwrap();
+            // A development build's bool never becomes Allow.
             let policy = if enabled {
-                control::CreationPolicy::Allow
+                control::CreationPolicy::Ask
             } else {
                 control::CreationPolicy::Off
             };
             assert_eq!(
                 saved["control_allow_new"],
-                if enabled { "allow" } else { "off" }
+                if enabled { "ask" } else { "off" }
             );
             let restored: Settings = serde_json::from_value(saved).unwrap();
             assert_eq!(restored.control_allow_new, policy);
