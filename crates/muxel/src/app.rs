@@ -142,10 +142,40 @@ fn literal_command_spec(
     Some(spec.with_markers(working, blocked))
 }
 
+/// The local tmux owner a launch must settle (resolve, or move off Default)
+/// before it attaches, if any. A literal pane has no tmux transport: a peer's
+/// stale name never causes a socket probe, a move off Default or a save.
+fn local_owner_to_prepare(instance: &Instance, project: &Project) -> Option<SessionTarget> {
+    (!instance.literal_argv
+        && project.remote.is_none()
+        && instance.tmux_session.is_some()
+        && (instance.tmux_socket.is_none()
+            || instance.tmux_socket == Some(Socket::Default)
+            || integrations::profile_tmux_target(&instance.tmux_target(&project.name)).socket
+                != instance.tmux_socket))
+        .then(|| instance.tmux_target(&project.name))
+}
+
 #[cfg(test)]
 mod literal_command_tests {
-    use super::{InstanceTmux, Socket, literal_command_spec};
+    use super::{InstanceTmux, Socket, literal_command_spec, local_owner_to_prepare};
     use muxel_core::{AgentPreset, EnvVar, InjectionMode, Instance, Project, WorktreeCleanup};
+
+    #[test]
+    fn literal_panes_never_prepare_a_tmux_owner_or_move_off_default() {
+        let project = Project::new("webapp", std::env::temp_dir());
+        for socket in [None, Some(Socket::Default)] {
+            let mut pane = Instance::shell(project.id);
+            pane.tmux_session = Some("muxel_webapp_1a2b3c4d".into());
+            pane.tmux_socket = socket.clone();
+            assert!(
+                local_owner_to_prepare(&pane, &project).is_some(),
+                "{socket:?}"
+            );
+            pane.literal_argv = true;
+            assert_eq!(local_owner_to_prepare(&pane, &project), None, "{socket:?}");
+        }
+    }
 
     #[test]
     fn literal_cleanup_rejects_peer_tmux_metadata_but_keeps_worktree_cleanup() {
@@ -7441,20 +7471,13 @@ impl MuxelApp {
         let Some((target, original_name, original_socket)) =
             self.workspace.instance(iid).and_then(|instance| {
                 let project = self.workspace.project(instance.project_id)?;
-                (project.remote.is_none()
-                    && instance.tmux_session.is_some()
-                    && (instance.tmux_socket.is_none()
-                        || instance.tmux_socket == Some(Socket::Default)
-                        || integrations::profile_tmux_target(&instance.tmux_target(&project.name))
-                            .socket
-                            != instance.tmux_socket))
-                    .then(|| {
-                        (
-                            instance.tmux_target(&project.name),
-                            instance.tmux_session.clone(),
-                            instance.tmux_socket.clone(),
-                        )
-                    })
+                local_owner_to_prepare(instance, project).map(|target| {
+                    (
+                        target,
+                        instance.tmux_session.clone(),
+                        instance.tmux_socket.clone(),
+                    )
+                })
             })
         else {
             return true;
@@ -15527,6 +15550,7 @@ impl MuxelApp {
                 continue;
             };
             if instance.project_id != pid
+                || instance.literal_argv
                 || instance.tmux_socket != Some(Socket::Default)
                 || instance.tmux_session.as_ref() != Some(name)
             {

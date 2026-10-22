@@ -1675,9 +1675,12 @@ pub fn merge_peer_instances(
 /// and a copy of the pane that predates it (a peer's layout, or this machine's
 /// own unpushed one) must not undo it. Undone, the pane would refuse to launch
 /// (Default is gone and `mxl` has the namesake) and closing it would kill on
-/// Default, orphaning the agent on `mxl`.
+/// Default, orphaning the agent on `mxl`. A literal pane runs no session, so
+/// its stale tmux fields never take part in a move.
 pub fn moved_off_default(stale: &Instance, moved: &Instance) -> bool {
-    stale.tmux_socket == Some(tmux::Socket::Default)
+    !stale.literal_argv
+        && !moved.literal_argv
+        && stale.tmux_socket == Some(tmux::Socket::Default)
         && moved.tmux_socket == Some(tmux::Socket::Private)
         && stale.tmux_session.is_some()
         && stale.tmux_session == moved.tmux_session
@@ -1703,10 +1706,12 @@ pub fn keep_moves_off_default(local: &mut [Instance], file: &[Instance]) -> Vec<
 
 /// The panes in both `before` and `after` whose tmux binding (session name and
 /// owner) differs between them: after a peer layout is adopted, a pane that failed
-/// to launch on its old binding can try the new one.
+/// to launch on its old binding can try the new one. A literal pane has no tmux
+/// transport, so a peer's stale binding never retries it.
 pub fn rebound_instances(before: &[Instance], after: &[Instance]) -> Vec<Uuid> {
     after
         .iter()
+        .filter(|now| !now.literal_argv)
         .filter(|now| {
             before.iter().any(|was| {
                 was.id == now.id
@@ -3985,6 +3990,24 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn literal_panes_take_no_part_in_a_move_off_default() {
+        let (moved, stale) = moved_and_stale();
+        for (mut stale, mut moved, literal_moved) in
+            [(stale.clone(), moved.clone(), false), (stale, moved, true)]
+        {
+            if literal_moved {
+                moved.literal_argv = true;
+            } else {
+                stale.literal_argv = true;
+            }
+            assert!(!moved_off_default(&stale, &moved));
+            let mut local = vec![stale.clone()];
+            assert!(keep_moves_off_default(&mut local, std::slice::from_ref(&moved)).is_empty());
+            assert_eq!(local[0].tmux_socket, stale.tmux_socket);
+        }
+    }
+
+    #[test]
     fn a_peer_layout_cannot_move_a_pane_back_onto_default() {
         let (moved, stale) = moved_and_stale();
         let merged = merge_peer_instances(
@@ -4068,6 +4091,9 @@ mod remote_layout_tests {
             vec![stale.id]
         );
         assert!(rebound_instances(std::slice::from_ref(&stale), &[titled, added]).is_empty());
+        let mut literal = moved.clone();
+        literal.literal_argv = true;
+        assert!(rebound_instances(std::slice::from_ref(&stale), &[literal]).is_empty());
     }
 
     /// Reduce a desktop pane subtree to what the iOS `PaneNode` encoder writes: only
