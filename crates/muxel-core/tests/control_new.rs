@@ -706,16 +706,16 @@ fn isolated_peer_binding_overrides_foreign_owners_and_leaves_literals_unchanged(
             },
             RemoteSession {
                 name: own_name.clone(),
-                socket,
+                socket: socket.clone(),
                 path: "/repo".into(),
                 command: "zsh".into(),
                 title: String::new(),
             },
         ];
-        bind_peer_sessions(&project.name, &mut instances, &rows, socket);
+        bind_peer_sessions(&project.name, &mut instances, &rows, socket.clone());
         assert_eq!(serde_json::to_value(&instances[0]).unwrap(), saved_literal);
         assert!(instances[1].use_tmux);
-        assert_eq!(instances[1].tmux_socket, Some(socket));
+        assert_eq!(instances[1].tmux_socket, Some(socket.clone()));
         assert_eq!(
             instances[1].tmux_session.as_deref(),
             Some(own_name.as_str())

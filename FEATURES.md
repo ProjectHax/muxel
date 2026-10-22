@@ -153,16 +153,33 @@ feature is added or changed, update the matching entry here in the same change**
   - **Host-minted** (Claude, Grok): `session_id_flag` + `resume_flag` — muxel
     launches with `--session-id` the first time and `--resume` on restart.
   - **Agent-minted** (Codex): only `resume_flag` (`resume`) — first launch is bare;
-    muxel captures the UUID Codex publishes for that pane, validates it against
-    `~/.codex/sessions` before restart, and relaunches as `codex resume <id>`. The immutable
+    muxel captures the UUID Codex publishes for that pane and stores its rollout path.
+    Local tmux panes read their own `pane_title` from the recorded tmux socket on a
+    background worker because tmux does not forward that title to the terminal view.
+    Before relaunch, muxel checks a saved rollout path and uses `codex resume <id>`.
+    A restored pane that needs history gets one background lookup before its
+    launch, never on the UI thread and never twice per pane in a run: a saved
+    UUID with no saved path is confirmed by its dated directory, then by one walk
+    of `~/.codex/sessions`; a started pane without a UUID binds the newest rollout
+    recorded in its directory that no other pane owns, unless its own tmux
+    session still runs (title capture binds that one exactly) or an unbound
+    sibling in that directory still runs, in this app or in tmux, since that
+    sibling's conversation would look like the newest one. The launch waits for
+    the lookup at most two seconds; an unbound pane whose lookup finds nothing,
+    is skipped, or runs out of time starts fresh, and Import can still find an
+    older conversation.
+    The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
-    UUIDs resolve only when exactly one rollout matches the pane's directory. Multiple Codex
+    UUIDs resolve in their timestamp's local day directory, with one neighboring day
+    checked near a date boundary. Only matching filenames are opened to validate the
+    pane's directory and top-level thread identity; subagent rollouts never rebind
+    a pane. Multiple Codex
     panes can share a project without resuming one another's conversations.
   **Conversation switches stick** — an agent can swap its conversation inside a live
   pane (`/resume`, `/clear`, a fork) without restarting the PTY, and muxel rebinds the
   pane to what's actually on screen instead of the conversation it launched. Local
   Claude panes learn the switch from a process-local `SessionStart` hook keyed to the
-  pane; Codex panes learn it from a later OSC title. Both are accepted only after the
+  pane; directly launched Codex panes learn it from a later OSC title. Both are accepted only after the
   new UUID's own on-disk session proves it real and no sibling pane already owns it —
   terminal titles carry no sender identity, so an unverified one cannot rebind a pane.
   A Claude conversation is matched by UUID across Claude's whole store rather than only
@@ -173,12 +190,32 @@ feature is added or changed, update the matching entry here in the same change**
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
   starter binding. Recurring Codex rollout discovery and Claude hook validation run
   in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking, and unresolved results retry with backoff.
+  lookup across pop-out and docking. Failed Codex hints retry with a delay that
+  grows from one to thirty seconds, even while the day directory changes.
+  A sibling-owned tmux title is reread under backoff so a later unowned title
+  can bind; its rollout validation is cached only while the same sibling owns
+  it. Other sibling-owned hints wait until ownership or binding changes. Launch,
+  directory, hint or binding changes reset the delay. The name index is reread
+  in full on a worker when its size or modification time changes; unchanged
+  indexes take one stat. Claude and Grok retry unresolved results with backoff.
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
-  A saved conversation is abandoned only once muxel has confirmed it
-  is really gone — a session store it couldn't read leaves the pane's resume id alone —
-  and the pane then quietly starts fresh.
+  A saved Codex conversation is abandoned when its validated saved rollout
+  path and compression sibling are both absent or non-files, when a complete walk
+  of the rollout store does not find it, or when Codex itself reports that the
+  exact resumed ID is missing soon after launch. Under local tmux that message
+  leaves with tmux's screen, so a `codex resume` whose rollout muxel could not
+  confirm, launched into a tmux session that was not running, counts as failed
+  when its client exits cleanly within ten seconds: the pane starts fresh
+  instead of closing. Such an early exit cannot be told from any other early
+  Codex exit there, so it gives up the unconfirmed id. Reattaching a running
+  session, a confirmed rollout, and remote panes keep close-on-exit; a remote
+  resume is never checked locally, and telling its failure from a quick quit
+  would need another round trip to the host. An invalid path, unreadable or
+  missing store, unfinished walk, or other early failure keeps the id and
+  attempts resume.
+  Remote Codex panes never check the local session store. Archived Codex sessions
+  require unarchiving in Codex before they can resume.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to
@@ -335,7 +372,8 @@ feature is added or changed, update the matching entry here in the same change**
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
   active work. Local Codex `/rename` values are read
-  from its session index by the pane's captured session UUID, so child commands
+  from its session index by the pane's captured session UUID. The index is checked
+  for changes and reread in full when it changes; truncating it rebuilds the names. Child commands
   such as `npm` cannot replace the session name or forge a title-derived state
   transition. Remote Codex panes retain the provider's structural title fallback.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
@@ -406,6 +444,13 @@ feature is added or changed, update the matching entry here in the same change**
 - **One-click task launchers** — predefined runners (e.g. Review, Security Review)
   spawn an agent that auto-types a task prompt. The toolbar "Run task" dropdown
   lists them; click to run, or the pencil to edit one in Settings → Runners.
+- **Built-in reviews that don't edit unasked** — the built-in Review and Security
+  Review prompts tell the agent not to edit, stage, or commit; cover staged,
+  unstaged, and untracked work (or the branch's own commits when the tree is
+  clean); and ask for verified findings, worst first, with file:line, a failure or
+  attack scenario, and a fix. Security Review ranks its findings in a table with a
+  recommendation for each, suggests which to fix, and asks you — then fixes only
+  the ones you pick. An upgrade refreshes only prompts you never edited.
 - **Templated prompts** — `{{input}}` is substituted with run-time details.
 - **Auto mode** — send a configurable number of Shift+Tab presses (then Enter) at
   startup to reach auto-accept mode.
@@ -1113,6 +1158,10 @@ feature is added or changed, update the matching entry here in the same change**
   socket alone. Older panes resolve their owner before teardown. Claim cleanup
   includes any socket discovery in its two-second deadline and reaps timed-out
   commands before returning.
+  Recorded named sockets round-trip across desktop and phone, including names a
+  newer peer introduced, without dropping the rest of a shared layout. A restart
+  whose owner cannot be saved or confirmed stops with an error instead of silently
+  reattaching the old agent.
   A legacy close saves its selected server before the first kill and keeps that
   owner through lost replies, retries and reconnect cleanup. Only one restart
   per pane can resolve and stop a session at a time; stale completions from a
@@ -1353,8 +1402,20 @@ feature is added or changed, update the matching entry here in the same change**
   hand, use `tmux -L mxl ls` and `tmux -L mxl attach -t muxel_…`. Upgrading stops
   nothing: a pane whose session is still running on the default server from an
   earlier muxel reattaches to it there (closing the pane still stops it), and its
-  next session starts on muxel's own. A tmux session of your own that you import
-  stays on the default server too. The iOS app follows the same rule.
+  next session starts on muxel's own after both servers confirm the old session is
+  gone and `mxl` has no session of that exact name. A namesake on `mxl` is left alone
+  and the pane keeps its default-server binding but stops, then attaches by itself
+  once another muxel sharing the project's layout assigns it the new owner (or
+  after you stop that session and restart the pane); retry cannot recreate a
+  second agent on Default, and Restart checks for the namesake before it stops
+  anything. Once moved, a pane stays on `mxl` whatever an older copy of the layout
+  says. A session still running on the default server reattaches even when `mxl`
+  gives an unexpected answer. An imported session also stays on its recorded owner
+  while running.
+  Desktop and phone save an allowed migration
+  before launching; a failed probe or save cannot authorize it.
+  Reconnecting also retries pending closes on their recorded named servers;
+  absence from the standard-server inventory does not forget an unconfirmed close.
   Such a `pkill` reaches only that pane's tmux client: the session and the agent keep
   running, and muxel **reattaches the pane automatically** — you see it blink, not die.
   Local and remote alike (SSH panes and the iOS companion do the same), since a host

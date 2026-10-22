@@ -5,6 +5,20 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+- **Better built-in Review and Security Review prompts** — both runners now tell
+  the agent not to edit anything on its own (they start in auto mode, so an agent
+  could otherwise start "fixing" things), and they look past `git diff`: staged
+  changes and new files count, and in a clean worktree they review the branch's
+  commits instead of reporting nothing. Findings come back verified, worst first,
+  each with file:line, a concrete failure or attack scenario, and a fix, and the
+  agent says so plainly when there's nothing to report. Security Review lays its
+  findings out as a table ranked by priority, each with a recommendation (fix now,
+  fix later, or accept the risk), then suggests which to fix and asks you; it fixes
+  only the ones you pick. Run-time details you type take priority over the
+  defaults. If you never edited these prompts, upgrading replaces them; an edited
+  prompt keeps your text.
+
 ### Fixed
 - **Panes no longer inherit the environment of whatever restarted muxel's tmux
   server** — tmux points every pane at its own server, so an agent in a muxel pane
