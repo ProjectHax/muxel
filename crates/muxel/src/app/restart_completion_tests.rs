@@ -254,7 +254,13 @@ fn local_restart_failed_owner_save_never_kills_or_respawns() {
                     .contains("couldn't save the tmux session owner before restart")
             );
             assert!(
-                app.reserve_terminal_spawn(iid, window, cx).is_none(),
+                app.reserve_terminal_spawn(
+                    iid,
+                    muxel_core::TerminalLaunchReason::Restore,
+                    window,
+                    cx,
+                )
+                .is_none(),
                 "automatic restore cannot retry a failed restart"
             );
         })
