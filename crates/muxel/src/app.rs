@@ -3384,6 +3384,25 @@ fn launch_binding(
     }
 }
 
+/// Whether a Claude launch's first SessionStart hook can be its own startup
+/// receipt. Keep this separate from the bound UUID: a fresh --session-id launch
+/// knows its UUID but writes no resume receipt.
+fn launch_expects_claude_resume_receipt(
+    program: Option<&str>,
+    args: &[String],
+    generated_resuming: bool,
+) -> bool {
+    generated_resuming
+        || (is_claude_program(program)
+            && args
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .any(|arg| {
+                    matches!(arg.as_str(), "--resume" | "--continue" | "-r" | "-c")
+                        || arg.starts_with("--resume=")
+                }))
+}
+
 fn effective_local_cwd(
     resume_cwd: Option<&Path>,
     worktree_cwd: Option<&Path>,
@@ -3455,10 +3474,74 @@ fn tmux_codex_resume_ended(armed: bool, exit_code: Option<i32>, recent_resume: b
 #[cfg(test)]
 mod claude_resume_tests {
     use super::{
-        SessionTarget, arms_tmux_resume_recovery, claude_hook_writer_survives, effective_local_cwd,
-        resume_missing_message, should_recover_expired_session, tmux_codex_resume_ended,
+        AgentPreset, Instance, SessionTarget, arms_tmux_resume_recovery,
+        claude_hook_writer_survives, effective_local_cwd, launch_expects_claude_resume_receipt,
+        resolve_agent_launch, resume_missing_message,
+        should_recover_expired_session, tmux_codex_resume_ended,
     };
     use std::path::Path;
+    use std::time::SystemTime;
+    use uuid::Uuid;
+
+    #[test]
+    fn configured_claude_resume_launch_exempts_its_first_startup_receipt() {
+        let mut preset = AgentPreset::claude();
+        preset.resume_flag = None;
+        preset.session_id_flag = None;
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &preset);
+        let id = Uuid::new_v4().to_string();
+        instance.session_id = Some(id.clone());
+        let receipt = crate::session_binding::ClaudeBinding {
+            session_id: id.clone(),
+            stamp: Some(crate::session_binding::ClaudeHookStamp {
+                nonce: Uuid::new_v4(),
+                recorded_at: SystemTime::now(),
+            }),
+        };
+        for args in [
+            vec!["--resume".into(), id.clone()],
+            vec![format!("--resume={id}")],
+            vec!["--resume".into()],
+            vec!["--continue".into()],
+            vec!["-r".into(), id.clone()],
+            vec!["-c".into()],
+        ] {
+            instance.args = args.clone();
+            let configured = launch_expects_claude_resume_receipt(
+                instance.program.as_deref(),
+                &instance.args,
+                false,
+            );
+            let resolved = resolve_agent_launch(&instance, None, configured);
+            let resumed = launch_expects_claude_resume_receipt(
+                resolved.program.as_deref(),
+                &resolved.args,
+                false,
+            );
+            assert!(
+                configured && resumed,
+                "Claude args {args:?} resume a conversation"
+            );
+            assert!(!crate::session_binding::claude_record_switches(
+                &receipt,
+                None,
+                Some(&id),
+                resumed,
+            ));
+        }
+        instance.args = vec!["--session-id".into(), id.clone()];
+        let fresh = resolve_agent_launch(&instance, None, false);
+        assert!(!launch_expects_claude_resume_receipt(
+            fresh.program.as_deref(),
+            &fresh.args,
+            false,
+        ));
+        assert!(!launch_expects_claude_resume_receipt(
+            fresh.program.as_deref(),
+            &["--".into(), "--resume".into()],
+            false,
+        ));
+    }
 
     #[test]
     fn only_a_reattach_to_a_live_tmux_session_keeps_its_writers_hook_records() {
@@ -8135,9 +8218,13 @@ impl MuxelApp {
                 .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                 .or_else(|| self.presets.iter().find(|p| p.name == i.preset))
         });
-        let resuming = session_preset
+        let generated_resuming = session_preset
             .and_then(|preset| Some((preset.resume_flag.as_deref()?, resume_args?)))
             .is_some_and(|(flag, args)| args.first().is_some_and(|arg| arg == flag));
+        let configured_resuming = inst.is_some_and(|instance| {
+            launch_expects_claude_resume_receipt(instance.program.as_deref(), &instance.args, false)
+        });
+        let resuming = generated_resuming || configured_resuming;
         // Build one instruction bundle, then let the preset's injection transport
         // deliver it. CliFlag and Codex are hidden launch-time instructions;
         // TypeIn submits one visible turn only for a new conversation. Codex's
@@ -8374,6 +8461,11 @@ impl MuxelApp {
             Some(ticket) => ticket.startup.clone(),
             None => self.claim_control_startup(instance_id),
         };
+        let launch_resumed = launch_expects_claude_resume_receipt(
+            agent_program.as_deref(),
+            &resolved.args,
+            resuming,
+        );
         Ok(control_api::control_launch_spec(
             inst,
             self.control_turns.get(&instance_id),
@@ -8382,7 +8474,7 @@ impl MuxelApp {
                 .with_startup_delay(startup_delay)
                 .with_markers(working, blocked)
                 .with_binding(binding)
-                .with_launch_resumed(resuming),
+                .with_launch_resumed(launch_resumed),
         ))
     }
 

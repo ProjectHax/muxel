@@ -1024,11 +1024,16 @@ enum OutputBoundary {
 }
 
 impl OutputReadClock {
-    fn effective_at(&self, read_at: SystemTime) -> SystemTime {
-        [self.osc_since, self.escape_at, self.sync_since]
+    fn unbuffered_at(&self, read_at: SystemTime) -> SystemTime {
+        [self.osc_since, self.escape_at]
             .into_iter()
             .flatten()
             .fold(read_at, SystemTime::min)
+    }
+
+    fn effective_at(&self, read_at: SystemTime) -> SystemTime {
+        let unbuffered = self.unbuffered_at(read_at);
+        self.sync_since.map_or(unbuffered, |at| at.min(unbuffered))
     }
 
     fn executed_control_at(&self, read_at: SystemTime) -> SystemTime {
@@ -1729,6 +1734,35 @@ impl TerminalSession {
         self.parse(output.chunks());
     }
 
+    fn advance_timed_segment(
+        &self,
+        processor: &mut Processor,
+        term: &mut Term<MuxelListener>,
+        clock: &mut OutputReadClock,
+        bytes: &[u8],
+        effective_at: SystemTime,
+        incoming_at: SystemTime,
+    ) {
+        // VTE 0.15 replays its synchronized buffer on capacity overflow, then
+        // parses the incoming bytes in the same advance call. Give the replay
+        // its old time and the new bytes their own time.
+        const VTE_SYNC_BUFFER_SIZE: usize = 0x20_0000;
+        if processor.sync_timeout().sync_timeout().is_some()
+            && processor.sync_bytes_count().saturating_add(bytes.len()) >= VTE_SYNC_BUFFER_SIZE - 1
+        {
+            self.evidence
+                .lock()
+                .begin_read(clock.sync_since.unwrap_or(effective_at));
+            processor.stop_sync(term);
+            clock.sync_since = None;
+            clock.next_sync_since = None;
+            self.evidence.lock().begin_read(incoming_at);
+        } else {
+            self.evidence.lock().begin_read(effective_at);
+        }
+        processor.advance(term, bytes);
+    }
+
     /// Collects alacritty damage for the next paint (partial row rebuild) and
     /// for paint-priority scheduling (recent interaction vs stream).
     fn parse<'a>(&self, chunks: impl IntoIterator<Item = (&'a [u8], SystemTime)>) {
@@ -1742,25 +1776,43 @@ impl TerminalSession {
             }
             let mut start = 0;
             let mut effective_at = clock.effective_at(read_at);
+            let mut unbuffered_at = clock.unbuffered_at(read_at);
             for (index, byte) in bytes.iter().copied().enumerate() {
                 if let Some(boundary) = clock.scan(byte, read_at) {
                     if matches!(boundary, OutputBoundary::ExecutedControl) {
                         if start < index {
-                            self.evidence.lock().begin_read(effective_at);
-                            processor.advance(&mut *term, &bytes[start..index]);
+                            self.advance_timed_segment(
+                                &mut processor,
+                                &mut term,
+                                &mut clock,
+                                &bytes[start..index],
+                                effective_at,
+                                unbuffered_at,
+                            );
                             clock.after_segment(
                                 None,
                                 processor.sync_timeout().sync_timeout().is_some(),
                                 read_at,
                             );
                         }
-                        self.evidence
-                            .lock()
-                            .begin_read(clock.executed_control_at(read_at));
-                        processor.advance(&mut *term, &bytes[index..=index]);
+                        let control_at = clock.executed_control_at(read_at);
+                        self.advance_timed_segment(
+                            &mut processor,
+                            &mut term,
+                            &mut clock,
+                            &bytes[index..=index],
+                            control_at,
+                            read_at,
+                        );
                     } else {
-                        self.evidence.lock().begin_read(effective_at);
-                        processor.advance(&mut *term, &bytes[start..=index]);
+                        self.advance_timed_segment(
+                            &mut processor,
+                            &mut term,
+                            &mut clock,
+                            &bytes[start..=index],
+                            effective_at,
+                            unbuffered_at,
+                        );
                     }
                     clock.after_segment(
                         Some(boundary),
@@ -1769,11 +1821,18 @@ impl TerminalSession {
                     );
                     start = index + 1;
                     effective_at = clock.effective_at(read_at);
+                    unbuffered_at = clock.unbuffered_at(read_at);
                 }
             }
             if start < bytes.len() {
-                self.evidence.lock().begin_read(effective_at);
-                processor.advance(&mut *term, &bytes[start..]);
+                self.advance_timed_segment(
+                    &mut processor,
+                    &mut term,
+                    &mut clock,
+                    &bytes[start..],
+                    effective_at,
+                    unbuffered_at,
+                );
                 clock.after_segment(
                     None,
                     processor.sync_timeout().sync_timeout().is_some(),
@@ -5493,6 +5552,7 @@ mod runtime_fact_tests {
     use super::{
         CommandSpec, PtyOutput, RESIZE_SETTLE, TerminalSession, draft_after_input, next_input_state,
     };
+    use crate::listener::SWITCH_SLACK;
     use async_channel::TryRecvError;
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -5573,6 +5633,102 @@ mod runtime_fact_tests {
         std::thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
         assert!(!session.resize(81, 24));
         assert_eq!(events.try_recv(), Ok(()));
+        session.kill();
+    }
+
+    #[test]
+    fn capacity_replay_keeps_new_title_and_bell_on_their_fresh_read() {
+        const FILL: usize = 0x20_0000 - 2;
+        for title_event in [true, false] {
+            let session = fixture();
+            let first = uuid::Uuid::new_v4();
+            let next = uuid::Uuid::new_v4();
+            session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+
+            let old = SystemTime::now() - Duration::from_secs(10);
+            let mut frame = b"\x1b[?2026h".to_vec();
+            frame.resize(frame.len() + FILL, 0);
+            let mut output = PtyOutput::default();
+            output.push(&frame, old);
+            session.process_drained(&output);
+            assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+
+            let hook = SystemTime::now();
+            session.provider_switched(hook, hook);
+            let switched = session.binding_revision();
+            let fresh = hook + SWITCH_SLACK + Duration::from_secs(1);
+            let mut output = PtyOutput::default();
+            if title_event {
+                output.push(format!("\x1b]0;{next} | Ready\x07").as_bytes(), fresh);
+            } else {
+                output.push(b"\x07", fresh);
+            }
+            session.process_drained(&output);
+            if title_event {
+                assert!(
+                    session.binding_revision() > switched,
+                    "a fresh UUID title must bind after capacity replay"
+                );
+                assert!(
+                    session
+                        .session_id_hint()
+                        .unwrap()
+                        .starts_with(&next.to_string())
+                );
+            } else {
+                assert!(
+                    session.has_bell(),
+                    "a fresh bell must survive capacity replay"
+                );
+            }
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn capacity_replay_preserves_an_osc_that_started_in_the_old_frame() {
+        const FILL: usize = 0x20_0000 - 2;
+        let session = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        let fresh = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+
+        let old = SystemTime::now() - Duration::from_secs(10);
+        let prefix = format!("\x1b]0;{stale} | Ready");
+        let mut frame = b"\x1b[?2026h".to_vec();
+        frame.resize(frame.len() + FILL - prefix.len(), 0);
+        frame.extend_from_slice(prefix.as_bytes());
+        let mut output = PtyOutput::default();
+        output.push(&frame, old);
+        session.process_drained(&output);
+        assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+
+        let hook = SystemTime::now();
+        session.provider_switched(hook, hook);
+        let switched = session.binding_revision();
+        let fresh_at = hook + SWITCH_SLACK + Duration::from_secs(1);
+        let mut output = PtyOutput::default();
+        output.push(b"\x07", fresh_at);
+        session.process_drained(&output);
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+
+        let mut output = PtyOutput::default();
+        output.push(format!("\x1b]0;{fresh} | Ready\x07").as_bytes(), fresh_at);
+        session.process_drained(&output);
+        assert!(session.binding_revision() > switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&fresh.to_string())
+        );
         session.kill();
     }
 

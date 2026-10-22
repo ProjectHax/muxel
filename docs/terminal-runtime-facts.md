@@ -51,7 +51,9 @@ each with its time. PTY output carries when the reader received it, not when
 the drain parsed it: a batch can wait in the queue and in the background
 coalescing delay. A title split across reads keeps the opening ESC/OSC read
 time through its terminator. DEC 2026 buffered output keeps its frame's opening
-time when VTE replays it. A binding begins at a point in that order; evidence
+time when VTE replays it, including a replay forced by VTE's buffer limit.
+Bytes that arrive after that replay keep their own read time. A binding begins
+at a point in that order; evidence
 before it belongs to the conversation it replaced. When the binding changes,
 the reducer resets its latches and reads the new binding's title edges from its
 start. If more title edges arrived than the 64-edge buffer keeps, it rebuilds
@@ -165,8 +167,10 @@ from the current title without a completion edge.
 - Claude's hook stamps each record with a nonce. A record whose nonce this
   launch hasn't seen is a switch even when it names the conversation already
   bound, so `/resume B` then `/resume A` between two reads is a switch. The
-  launch's first same-ID record is exempt only when muxel launched with
-  `--resume`: that command writes its own `SessionStart` receipt. A fresh
+  launch's first same-ID record is exempt only when Claude launched with a
+  resume command, whether muxel generated it or the preset supplied
+  `--resume`, `--continue`, `-r`, or `-c`: that command writes its own
+  `SessionStart` receipt. A fresh
   `--session-id` command writes no such receipt, so its first `/resume A` is a
   switch even when it returns to A. A record from an older muxel's hook has no
   nonce and switches only when it names another conversation. Recurring
