@@ -43,6 +43,9 @@ pub struct NewOptions {
     pub no_wait: bool,
 }
 
+/// The longest `--name` or `--from`, in characters.
+pub const MAX_LABEL_CHARS: usize = 100;
+
 impl NewOptions {
     /// Also checked by the server: callers may send JSON without using the CLI.
     pub fn validate(&self) -> Result<(), String> {
@@ -57,6 +60,19 @@ impl NewOptions {
             {
                 return Err(format!(
                     "--{name} needs 1–64 characters from [A-Za-z0-9._:/@+-], without a leading '-'."
+                ));
+            }
+        }
+        // Both are drawn as plain text: the name on tabs, the sidebar and the
+        // phone, the caller on the approval card.
+        for (flag, value) in [("--name", &self.name), ("--from", &self.from)] {
+            if let Some(value) = value
+                && (value.trim().is_empty()
+                    || value.chars().count() > MAX_LABEL_CHARS
+                    || value.chars().any(super::is_hidden_char))
+            {
+                return Err(format!(
+                    "{flag} needs 1–{MAX_LABEL_CHARS} visible characters, without control, format (bidi or zero-width) or line-separator characters"
                 ));
             }
         }

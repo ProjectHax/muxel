@@ -649,9 +649,13 @@ feature is added or changed, update the matching entry here in the same change**
   Ask answers admission immediately with a pending request UUID; the CLI polls
   once a second and prints the final reply. `--no-wait` returns the pending ID for
   scripts to poll with `ctl new-status ID`. The floating card shows declared
-  caller/pane information (`--from LABEL` and `MUXEL_INSTANCE_ID`), preset, cwd,
-  pane name and the prompt's first lines, or full literal argv. Long details
-  scroll, with literal arguments shown one per line, including empty arguments.
+  caller/pane information (`--from LABEL` and `MUXEL_INSTANCE_ID`), the
+  destination project, preset, cwd, pane name and the whole prompt, or full
+  literal argv. Long details scroll, with literal arguments shown one per line,
+  including empty arguments. Every value shows control, bidi and zero-width
+  characters as visible escapes (`\u{202e}`); leading or repeated blank lines
+  and long blank runs in the prompt are counted (`\n×3`) rather than drawn, and
+  a prompt past 10,000 characters ends with how many more were not shown.
   Labels are not authenticated identities. **Allow once** / **Deny** require
   mouse clicks. Both buttons stay disabled for 750 ms after each card appears,
   and double-clicks are ignored. Mouse-down and release must belong to the same

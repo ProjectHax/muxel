@@ -12,6 +12,9 @@ pub(crate) struct PreparedCreation {
     preview: Instance,
 }
 
+/// The most of a `--prompt` its approval card draws; the rest is counted.
+const PROMPT_CARD_CHARS: usize = 10_000;
+
 fn approval_now() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
@@ -214,21 +217,33 @@ impl MuxelApp {
         let armed = self.control_approvals.is_armed(id, now);
         let request = &entry.payload;
         let preview = &request.preview;
+        // Every value is caller- or configuration-supplied text: escape hidden
+        // characters so none can draw fake rows or reorder its neighbours.
         let mut details = vec![
             (
                 t("Caller (declared)"),
                 request
                     .options
                     .from
-                    .clone()
+                    .as_deref()
+                    .map(ctl::card_value)
                     .unwrap_or_else(|| t("Not supplied").to_string()),
+            ),
+            (
+                t("Project"),
+                ctl::card_value(
+                    self.workspace
+                        .project(request.pid)
+                        .map(|p| p.name.as_str())
+                        .unwrap_or(""),
+                ),
             ),
             (
                 t("Preset"),
                 if preview.literal_argv {
                     t("Literal command").to_string()
                 } else {
-                    preview.preset.clone()
+                    ctl::card_value(&preview.preset)
                 },
             ),
             (
@@ -236,10 +251,10 @@ impl MuxelApp {
                 preview
                     .launch_dir
                     .as_ref()
-                    .map(|p| p.display().to_string())
+                    .map(|p| ctl::card_value(&p.display().to_string()))
                     .unwrap_or_default(),
             ),
-            (t("Pane name"), preview.display_name().to_string()),
+            (t("Pane name"), ctl::card_value(preview.display_name())),
         ];
         let parameters = [
             request
@@ -258,7 +273,7 @@ impl MuxelApp {
         .collect::<Vec<_>>()
         .join(" · ");
         if !parameters.is_empty() {
-            details.insert(2, (t("Parameters"), parameters));
+            details.insert(3, (t("Parameters"), ctl::card_value(&parameters)));
         }
         if let Some(pane) = request
             .options
@@ -268,27 +283,32 @@ impl MuxelApp {
         {
             details.push((
                 t("Requesting pane (declared)"),
-                format!("{} ({})", pane.display_name(), ctl::short_id(pane.id)),
+                ctl::card_value(&format!(
+                    "{} ({})",
+                    pane.display_name(),
+                    ctl::short_id(pane.id)
+                )),
             ));
         }
         if let Some(argv) = &request.options.argv {
             details.push((
                 t("Full argv"),
-                serde_json::to_string_pretty(argv).unwrap_or_default(),
+                ctl::card_lines(&serde_json::to_string_pretty(argv).unwrap_or_default()),
             ));
         }
         if let Some(prompt) = &request.options.prompt {
-            details.push((
-                t("Prompt (first lines)"),
-                prompt
-                    .lines()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-                    .chars()
-                    .take(600)
-                    .collect(),
-            ));
+            // The task is what is being approved: all of it, in the scrolling
+            // details, up to a limit that keeps the card responsive.
+            let shown = ctl::card_prompt(prompt, PROMPT_CARD_CHARS);
+            let mut text = shown.text;
+            if shown.omitted_chars > 0 {
+                text.push('\n');
+                text.push_str(&tf(
+                    "… {count} more characters not shown",
+                    &[("count", &shown.omitted_chars.to_string())],
+                ));
+            }
+            details.push((t("Prompt"), text));
         }
         let waiting = self.control_approvals.len().saturating_sub(1);
         let card = div()

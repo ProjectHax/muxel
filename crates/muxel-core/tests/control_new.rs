@@ -81,6 +81,48 @@ fn new_parameters_parse_round_trip_and_validate_json_values() {
 }
 
 #[test]
+fn new_name_and_caller_label_are_bounded_visible_text() {
+    use muxel_core::control::MAX_LABEL_CHARS;
+    for field in ["name", "from"] {
+        for invalid in [
+            "".to_string(),
+            "   ".into(),
+            "two\nrows".into(),
+            "tab\there".into(),
+            "fake\rrow".into(),
+            "esc\u{1b}[31m".into(),
+            "rtl\u{202e}exe.txt".into(),
+            "isolate\u{2066}x\u{2069}".into(),
+            "zero\u{200b}width".into(),
+            "joiner\u{200d}".into(),
+            "bom\u{feff}".into(),
+            "line\u{2028}sep".into(),
+            "para\u{2029}sep".into(),
+            "next\u{85}line".into(),
+            "a".repeat(MAX_LABEL_CHARS + 1),
+        ] {
+            let options: NewOptions =
+                serde_json::from_value(serde_json::json!({field: invalid})).unwrap();
+            assert!(options.validate().is_err(), "accepted {field}={invalid:?}");
+            assert!(
+                parse_cli(&words(&["new", "repo", &format!("--{field}"), &invalid])).is_err(),
+                "CLI accepted {field}={invalid:?}"
+            );
+        }
+        for valid in [
+            "Reviewer".to_string(),
+            "claude-code (pane 1a2b3c4d)".into(),
+            "Revue · étape 2 ✓".into(),
+            "é".repeat(MAX_LABEL_CHARS),
+        ] {
+            let options: NewOptions =
+                serde_json::from_value(serde_json::json!({field: valid})).unwrap();
+            options.validate().unwrap();
+        }
+    }
+}
+
+#[test]
 fn new_parameters_freeze_both_plain_and_prompt_launches_without_mutating_preset() {
     let project = Project::new("repo", std::env::current_dir().unwrap());
     for preset in [AgentPreset::claude(), AgentPreset::codex()] {

@@ -17,9 +17,11 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 mod new;
-pub use new::{NewOptions, NewPlacement, place_new_pane};
+pub use new::{MAX_LABEL_CHARS, NewOptions, NewPlacement, place_new_pane};
 mod startup;
 pub use startup::{StartupFailure, StartupTurn, StartupTurnOwner, StartupTurnState};
+mod card;
+pub use card::{CardPrompt, card_lines, card_prompt, card_value, is_hidden_char};
 mod approval;
 pub use approval::{
     APPROVAL_ARM_DELAY_MS, APPROVAL_TIMEOUT_MS, ApprovalQueue, CreationDecision, CreationPolicy,
