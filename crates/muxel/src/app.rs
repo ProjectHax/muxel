@@ -3242,6 +3242,8 @@ pub struct MuxelApp {
     remote_layout_poll_inflight: bool,
     /// Coalescing/backoff and stale-result guards for background provider scans.
     session_discoveries: muxel_core::session_discovery::SessionDiscoveries,
+    /// Each restored Codex pane's one pre-launch history lookup (runtime only).
+    codex_restore_lookups: muxel_core::session_discovery::CodexRestoreLookups,
     /// Full persisted settings (source of truth for config not mirrored above).
     settings: muxel_core::Settings,
     /// Active theme name + mode override (persisted).
@@ -5619,6 +5621,7 @@ impl MuxelApp {
             remote_branch_poll_inflight: false,
             remote_layout_poll_inflight: false,
             session_discoveries: Default::default(),
+            codex_restore_lookups: Default::default(),
             theme: settings.theme.clone(),
             theme_mode: settings.theme_mode.clone(),
             use_tmux: settings.default_use_tmux,
@@ -6270,10 +6273,14 @@ impl MuxelApp {
     ///   `--session-id <id>`; later `--resume <id>` (or the preset's flag).
     /// - **Agent-minted** (only `resume_flag`, e.g. Codex): first launch bare;
     ///   bound panes resume their saved id. A started pane with no saved id starts
-    ///   fresh: restoration never reconstructs its identity by scanning.
+    ///   fresh here: this path never scans history. A deferred launch first
+    ///   waits (bounded) for the pane's one background restore lookup
+    ///   (`begin_codex_restore_lookup`), which may already have bound it, saved
+    ///   its rollout path, or confirmed its rollout missing.
     ///
-    /// This launch-time lookup still performs synchronous store I/O, including
-    /// when tick recovery reaches it. Recurring discovery uses background workers.
+    /// This launch-time check still performs synchronous store I/O (one stat,
+    /// or a dated directory listing), including when tick recovery reaches it.
+    /// Walks and recurring discovery use background workers.
     fn session_resume_for(&mut self, iid: Uuid) -> Option<(Vec<String>, Option<PathBuf>)> {
         let started = ui_profile::is_enabled().then(Instant::now);
         self.bump_session_binding_generation(iid);
@@ -7004,12 +7011,14 @@ impl MuxelApp {
         let Some(token) = self.reserve_terminal_spawn(instance_id, window, cx) else {
             return;
         };
+        self.begin_codex_restore_lookup(instance_id, cx);
         cx.spawn(async move |this, cx| {
             // Give GPUI a frame to paint the selected pane's loading state before
             // the worker begins process discovery and ConPTY construction.
             cx.background_executor()
                 .timer(Duration::from_millis(1))
                 .await;
+            Self::await_codex_restore_lookup(&this, instance_id, cx).await;
             let Some((meta, spec, size)) = this
                 .update(cx, |this, cx| {
                     this.prepare_reserved_terminal_spawn(instance_id, token, cx)
@@ -8091,6 +8100,14 @@ impl MuxelApp {
             *generation = generation.wrapping_add(1);
             *generation
         };
+        // Restored Codex panes that need local history start their one bounded
+        // lookup together now; each launch below waits only for its own. A pane
+        // another launch already owns may be prepared by now, so it gets none.
+        for &iid in &instances {
+            if !self.terminal_launching.contains_key(&iid) {
+                self.begin_codex_restore_lookup(iid, cx);
+            }
+        }
         if !panes.is_empty() {
             // Same debounce, move/size pause and cancellation as the terminal
             // waves, one pane per turn, but never a startup hold.
@@ -8210,6 +8227,7 @@ impl MuxelApp {
                     .enumerate()
                     .map(|(offset, iid)| (wave_start + offset, iid))
                 {
+                    Self::await_codex_restore_lookup(&this, iid, cx).await;
                     let prepared = Self::restore_step(&this, pid, cx, |this, window, cx| {
                         let _phase = ui_profile::phase("activation", "prepare-pane", Some(iid));
                         if this.deferred_activation_generation.get(&pid) != Some(&generation) {

@@ -155,9 +155,15 @@ feature is added or changed, update the matching entry here in the same change**
     Local tmux panes read their own `pane_title` from the recorded tmux socket on a
     background worker because tmux does not forward that title to the terminal view.
     Before relaunch, muxel checks a saved rollout path and uses `codex resume <id>`.
-    A started pane
-    without a saved UUID starts a fresh conversation; restore never scans history
-    to guess which conversation belonged to it. The immutable
+    A restored pane that needs history gets one background lookup before its
+    launch, never on the UI thread and never twice per pane in a run: a saved
+    UUID with no saved path is confirmed by its dated directory, then by one walk
+    of `~/.codex/sessions`; a started pane without a UUID binds the newest rollout
+    recorded in its directory that no other pane owns, unless its tmux session
+    still runs (title capture binds that one exactly). The launch waits for the
+    lookup at most two seconds; an unbound pane whose lookup finds nothing or runs
+    out of time starts fresh, and Import can still find an older conversation.
+    The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
     UUIDs resolve in their timestamp's local day directory, with one neighboring day
     checked near a date boundary. Only matching filenames are opened to validate the

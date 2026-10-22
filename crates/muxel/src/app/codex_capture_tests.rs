@@ -1,8 +1,11 @@
 use super::MuxelApp;
-use super::session_discovery::{inject_codex_launch_lookup, inject_codex_resume_lookup};
+use super::session_discovery::{
+    CodexRestoreFound, CodexRestoreKind, inject_codex_launch_lookup, inject_codex_restore_lookup,
+    inject_codex_resume_lookup,
+};
 use crate::theme;
 use gpui::{TestAppContext, WindowHandle};
-use muxel_core::{AgentPreset, CodexResumePath, Instance, Project, RemoteRef};
+use muxel_core::{AgentPreset, CodexResumePath, CodexSession, Instance, Project, RemoteRef};
 use muxel_terminal::{CommandSpec, TerminalLaunch};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,6 +63,9 @@ fn codex_pane(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
         .unwrap()
 }
 
+/// Launch preparation itself never searches history on the UI thread. The
+/// one restore-time lookup runs on a worker beforehand (next test); without
+/// it, an unbound started pane starts fresh.
 #[test]
 fn codex_launch_preparation_does_not_wait_for_slow_discovery() {
     with_app(|cx, window| {
@@ -71,6 +77,12 @@ fn codex_launch_preparation_does_not_wait_for_slow_discovery() {
             std::thread::sleep(Duration::from_millis(350));
             Some("01a0e807-a64d-7502-b922-cff0e0000000".into())
         }));
+        let restore_calls = Arc::new(AtomicUsize::new(0));
+        let restore_observed = restore_calls.clone();
+        let _restore = inject_codex_restore_lookup(Arc::new(move |_| {
+            restore_observed.fetch_add(1, Ordering::Relaxed);
+            CodexRestoreFound::Skip
+        }));
         window
             .update(cx, |app, window, cx| {
                 let (meta, spec, _) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
@@ -79,11 +91,103 @@ fn codex_launch_preparation_does_not_wait_for_slow_discovery() {
                 assert!(app.workspace.instance(pane).unwrap().session_id.is_none());
             })
             .unwrap();
+        cx.run_until_parked();
         assert_eq!(
             calls.load(Ordering::Relaxed),
             0,
             "restore enumerated session history"
         );
+        assert_eq!(
+            restore_calls.load(Ordering::Relaxed),
+            0,
+            "preparation started a history lookup"
+        );
+    });
+}
+
+#[test]
+fn unbound_codex_restore_lookup_runs_on_a_worker_once_and_binds_before_launch() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let id = "01a1543c-9700-7000-8000-000000000001";
+        let path = muxel_store::data_dir()
+            .unwrap()
+            .join(format!("rollout-{id}.jsonl"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let candidate = CodexSession {
+            id: id.into(),
+            path: path.clone(),
+        };
+        let _restore = inject_codex_restore_lookup(Arc::new(move |query| {
+            assert!(matches!(
+                query.kind,
+                CodexRestoreKind::Latest { limit: 1, .. }
+            ));
+            observed.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(350));
+            CodexRestoreFound::Latest(vec![candidate.clone()])
+        }));
+        let found = path.clone();
+        let _stat = inject_codex_resume_lookup(Arc::new(move |_, saved, _| {
+            assert_eq!(saved, id);
+            Ok(CodexResumePath::Found(found.clone()))
+        }));
+        window
+            .update(cx, |app, _, cx| app.begin_codex_restore_lookup(pane, cx))
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "the lookup ran on the UI thread"
+        );
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        window
+            .update(cx, |app, window, cx| {
+                let instance = app.workspace.instance(pane).unwrap();
+                assert_eq!(instance.session_id.as_deref(), Some(id));
+                assert_eq!(instance.session_path.as_ref(), Some(&path));
+                let (meta, spec, _) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                assert!(meta.was_resume);
+                assert!(spec.args.iter().any(|arg| arg == id));
+                // One lookup per pane in a run, even if it would qualify again.
+                app.terminal_launching.remove(&pane);
+                app.workspace.instance_mut(pane).unwrap().session_path = None;
+                app.begin_codex_restore_lookup(pane, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    });
+}
+
+#[test]
+fn codex_restore_lookup_landing_after_launch_preparation_is_dropped() {
+    with_app(|cx, window| {
+        let pane = codex_pane(cx, window);
+        let _restore = inject_codex_restore_lookup(Arc::new(|_| {
+            CodexRestoreFound::Latest(vec![CodexSession {
+                id: "01a1543c-9700-7000-8000-000000000001".into(),
+                path: "rollout.jsonl".into(),
+            }])
+        }));
+        window
+            .update(cx, |app, window, cx| {
+                app.begin_codex_restore_lookup(pane, cx);
+                // An immediate launch went ahead before the worker landed.
+                let (meta, _, _) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                assert!(!meta.was_resume);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |app, _, _| {
+                let instance = app.workspace.instance(pane).unwrap();
+                assert!(instance.session_id.is_none());
+                assert!(instance.session_path.is_none());
+            })
+            .unwrap();
     });
 }
 

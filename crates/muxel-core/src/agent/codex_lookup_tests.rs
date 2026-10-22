@@ -750,3 +750,169 @@ fn w8lm_codex_miss_checks_only_day_stamps_and_expires_after_thirty_seconds() {
         now + Duration::from_secs(1)
     )));
 }
+
+struct TempHome(PathBuf);
+
+impl Drop for TempHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write_rollout_at(path: &Path, payload: serde_json::Value, age_secs: u64) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        serde_json::json!({"type":"session_meta","payload":payload}).to_string(),
+    )
+    .unwrap();
+    let modified = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+}
+
+#[test]
+fn walked_codex_id_is_found_outside_its_day_and_a_complete_miss_is_missing() {
+    use super::codex_rollout_by_walk;
+    use std::time::{Duration, Instant};
+    let root = std::env::temp_dir().join(format!("muxel-codex-walk-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let later = Instant::now() + Duration::from_secs(60);
+    // No store at all: nothing can be resumed from it.
+    assert_eq!(
+        codex_rollout_by_walk(&root, "01a1543c-9700-7000-8000-000000000001", later),
+        CodexResumePath::Missing
+    );
+    let v7 = "01a1543c-9700-7000-8000-000000000001";
+    let pre_v7 = "6f9619ff-8b86-4011-b42d-00cf4fc964ff";
+    let moved = root
+        .join(".codex/sessions/2020/01/01")
+        .join(format!("rollout-2020-01-01T00-00-00-{v7}.jsonl"));
+    let old = root
+        .join(".codex/sessions/2025/03/04")
+        .join(format!("rollout-2025-03-04T00-00-00-{pre_v7}.jsonl.zst"));
+    write_rollout_at(&moved, serde_json::json!({"id": v7, "cwd": "/w"}), 0);
+    write_rollout_at(&old, serde_json::json!({"id": pre_v7, "cwd": "/w"}), 0);
+    // The dated lookup cannot establish either; the walk can.
+    assert_eq!(
+        codex_resume_path(&root, v7, None).unwrap(),
+        CodexResumePath::Unknown
+    );
+    assert_eq!(
+        codex_rollout_by_walk(&root, v7, later),
+        CodexResumePath::Found(moved)
+    );
+    assert_eq!(
+        codex_rollout_by_walk(&root, &pre_v7.to_uppercase(), later),
+        CodexResumePath::Found(old)
+    );
+    OPERATIONS.with_borrow_mut(Vec::clear);
+    assert_eq!(
+        codex_rollout_by_walk(&root, "01a1543c-9700-7000-8000-000000000002", later),
+        CodexResumePath::Missing
+    );
+    assert!(
+        OPERATIONS.with_borrow(|ops| !ops.iter().any(|op| matches!(op, Operation::Open(_)))),
+        "an id walk matches filenames without opening rollouts"
+    );
+    // A walk cut short proves nothing, and neither does a non-UUID id.
+    assert_eq!(
+        codex_rollout_by_walk(&root, v7, Instant::now()),
+        CodexResumePath::Unknown
+    );
+    assert_eq!(
+        codex_rollout_by_walk(&root, "not-a-uuid", later),
+        CodexResumePath::Unknown
+    );
+}
+
+#[test]
+fn latest_codex_sessions_are_newest_unowned_top_level_rollouts_for_the_directory() {
+    use super::codex_latest_sessions;
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+    let root = std::env::temp_dir().join(format!("muxel-codex-latest-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let cwd = root.join("project");
+    let elsewhere = root.join("other");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let id = |n: u32| format!("01a1543c-9700-7000-8000-{n:012}");
+    let rollout = |day: &str, n: u32| {
+        root.join(".codex/sessions")
+            .join(day)
+            .join(format!("rollout-{}.jsonl", id(n)))
+    };
+    // Newest first by modification time, whatever day directory holds it.
+    let owned = rollout("2026/10/19", 1);
+    let subagent = rollout("2026/10/19", 2);
+    let other_dir = rollout("2026/10/19", 3);
+    let resumed_old = rollout("2026/01/02", 4);
+    let older = rollout("2026/10/18", 5);
+    let oldest = rollout("2026/10/17", 6);
+    write_rollout_at(&owned, serde_json::json!({"id": id(1), "cwd": cwd}), 10);
+    write_rollout_at(
+        &subagent,
+        serde_json::json!({"id": id(2), "cwd": cwd, "source": {"subagent": "review"}}),
+        20,
+    );
+    write_rollout_at(
+        &other_dir,
+        serde_json::json!({"id": id(3), "cwd": elsewhere}),
+        30,
+    );
+    write_rollout_at(
+        &resumed_old,
+        serde_json::json!({"id": id(4), "cwd": cwd}),
+        40,
+    );
+    write_rollout_at(&older, serde_json::json!({"id": id(5), "cwd": cwd}), 50);
+    write_rollout_at(&oldest, serde_json::json!({"id": id(6), "cwd": cwd}), 60);
+    let owned_ids: HashSet<String> = [id(1)].into_iter().collect();
+    let later = Instant::now() + Duration::from_secs(60);
+
+    OPERATIONS.with_borrow_mut(Vec::clear);
+    let found = codex_latest_sessions(&root, &cwd, &owned_ids, 2, later).unwrap();
+    assert_eq!(
+        found
+            .iter()
+            .map(|session| (session.id.clone(), session.path.clone()))
+            .collect::<Vec<_>>(),
+        vec![(id(4), resumed_old.clone()), (id(5), older.clone())]
+    );
+    let opened: Vec<_> = OPERATIONS.with_borrow(|ops| {
+        ops.iter()
+            .filter_map(|op| match op {
+                Operation::Open(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    });
+    // The owned rollout is never opened, and nothing older than the last match.
+    assert_eq!(
+        opened,
+        vec![subagent, other_dir, resumed_old.clone(), older]
+    );
+
+    assert_eq!(
+        codex_latest_sessions(&root, &cwd, &HashSet::new(), 1, later)
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>(),
+        vec![id(1)]
+    );
+    assert_eq!(
+        codex_latest_sessions(&root, &root.join("missing"), &owned_ids, 1, later),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        codex_latest_sessions(&root, &cwd, &owned_ids, 1, Instant::now()),
+        None,
+        "a walk cut short has no answer"
+    );
+}

@@ -2,7 +2,7 @@
 
 use super::{codex_session_meta, is_codex_thread_id_hint, paths_loosely_equal};
 use chrono::{DateTime, FixedOffset, Local, NaiveDate, Timelike, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -237,6 +237,128 @@ pub fn codex_resume_path(
         }
     }
     Ok(CodexResumePath::Unknown)
+}
+
+/// Visit each rollout file in `~/.codex/sessions` until `visit` returns true.
+/// `Some(stopped)` once the walk ended or was stopped; `None` when `deadline`
+/// passed or a directory could not be read, so a miss proves nothing. Only a
+/// background worker may call this: it can read the whole store.
+fn walk_store(
+    home: &Path,
+    deadline: Instant,
+    visit: &mut dyn FnMut(&std::fs::DirEntry) -> bool,
+) -> Option<bool> {
+    let mut pending = vec![home.join(".codex/sessions")];
+    while let Some(directory) = pending.pop() {
+        let entries = match list(&directory) {
+            Ok(entries) => entries,
+            // Nothing can be resumed from a directory that is not there.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        for entry in entries {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let entry = entry.ok()?;
+            if entry.file_type().ok()?.is_dir() {
+                pending.push(entry.path());
+            } else if filename_uuid(&entry.file_name()).is_some() && visit(&entry) {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// One bounded walk for a saved id that has no saved path and was not in its
+/// dated directories: an id older than UUIDv7, or a day the clock or timezone
+/// moved. `Missing` only when the whole store was read without finding it;
+/// a walk cut short by `deadline` or an unreadable directory is `Unknown`.
+pub fn codex_rollout_by_walk(home: &Path, id: &str, deadline: Instant) -> CodexResumePath {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return CodexResumePath::Unknown;
+    };
+    let mut found = None;
+    let mut uncertain = false;
+    let walked = walk_store(home, deadline, &mut |entry| {
+        let path = entry.path();
+        if filename_id(&path) != Some(id) {
+            return false;
+        }
+        match stat(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                found = Some(path);
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                uncertain |= error.kind() != io::ErrorKind::NotFound;
+                false
+            }
+        }
+    });
+    match (walked, found) {
+        (Some(true), Some(path)) => CodexResumePath::Found(path),
+        (Some(false), _) if !uncertain => CodexResumePath::Missing,
+        _ => CodexResumePath::Unknown,
+    }
+}
+
+/// The newest top-level rollouts recorded in `cwd`, newest first, skipping
+/// `owned` ids, at most `limit`. Rollouts are ordered by modification time
+/// before any is opened, so only files newer than the last match are read.
+/// `None` when `deadline` passed or the store could not be read completely:
+/// a partial answer could pass over a newer conversation.
+pub fn codex_latest_sessions(
+    home: &Path,
+    cwd: &Path,
+    owned: &HashSet<String>,
+    limit: usize,
+    deadline: Instant,
+) -> Option<Vec<CodexSession>> {
+    if limit == 0 {
+        return Some(Vec::new());
+    }
+    let owned: HashSet<Uuid> = owned
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect();
+    let mut rollouts = Vec::new();
+    walk_store(home, deadline, &mut |entry| {
+        let path = entry.path();
+        if let Some(id) = filename_id(&path)
+            && !owned.contains(&id)
+            && let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified())
+        {
+            rollouts.push((modified, id, path));
+        }
+        false
+    })?;
+    rollouts.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
+    let mut sessions: Vec<CodexSession> = Vec::new();
+    for (_, file_id, path) in rollouts {
+        if sessions.len() >= limit {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let id = file_id.to_string();
+        if sessions.iter().any(|session| session.id == id) {
+            continue;
+        }
+        // Subagent rollouts have no meta here; they never describe a pane.
+        let Some((meta_id, recorded_cwd)) = codex_session_meta(&path) else {
+            continue;
+        };
+        if Uuid::parse_str(&meta_id).ok() == Some(file_id)
+            && paths_loosely_equal(Path::new(&recorded_cwd), cwd)
+        {
+            sessions.push(CodexSession { id, path });
+        }
+    }
+    Some(sessions)
 }
 
 #[derive(Default)]

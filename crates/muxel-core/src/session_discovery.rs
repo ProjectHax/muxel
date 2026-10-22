@@ -225,6 +225,57 @@ impl SessionDiscoveries {
     }
 }
 
+/// One pre-launch Codex history lookup per pane per run: confirming a saved id
+/// that has no saved rollout path, or recovering an unbound started pane's
+/// conversation. A launch waits for its pane's pending lookup for at most the
+/// lookup's budget, and a result applies only while no launch or rebind has
+/// happened since the lookup began.
+#[derive(Debug, Default)]
+pub struct CodexRestoreLookups {
+    panes: HashMap<Uuid, CodexRestoreLookup>,
+}
+
+#[derive(Debug)]
+struct CodexRestoreLookup {
+    started: Instant,
+    binding_generation: u64,
+    pending: bool,
+}
+
+impl CodexRestoreLookups {
+    /// Whether to start this pane's lookup now. A pane never gets a second one,
+    /// whatever the first found, so restarts do not keep walking history.
+    pub fn begin(&mut self, pane: Uuid, binding_generation: u64, now: Instant) -> bool {
+        if self.panes.contains_key(&pane) {
+            return false;
+        }
+        self.panes.insert(
+            pane,
+            CodexRestoreLookup {
+                started: now,
+                binding_generation,
+                pending: true,
+            },
+        );
+        true
+    }
+
+    /// Whether the pane's launch should keep waiting for its lookup.
+    pub fn holds_launch(&self, pane: Uuid, now: Instant, budget: Duration) -> bool {
+        self.panes.get(&pane).is_some_and(|lookup| {
+            lookup.pending && now.saturating_duration_since(lookup.started) < budget
+        })
+    }
+
+    /// Record a landed lookup. Returns whether its result may still be applied:
+    /// the pane has not been prepared for launch or rebound since it began.
+    pub fn finish(&mut self, pane: Uuid, binding_generation: u64) -> bool {
+        self.panes.get_mut(&pane).is_some_and(|lookup| {
+            std::mem::take(&mut lookup.pending) && lookup.binding_generation == binding_generation
+        })
+    }
+}
+
 impl SessionDiscovery {
     fn observe(&mut self, key: Option<&SessionDiscoveryKey>) {
         if self.key.as_ref() != key {
@@ -302,7 +353,10 @@ impl SessionDiscovery {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionDiscoveries, SessionDiscovery, SessionDiscoveryKey, SessionProvider};
+    use super::{
+        CodexRestoreLookups, SessionDiscoveries, SessionDiscovery, SessionDiscoveryKey,
+        SessionProvider,
+    };
     use crate::{AgentPreset, Instance, LeafData, PaneNode, Project, Workspace};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -641,5 +695,38 @@ mod tests {
             }
             assert!(discovery.begin(key, now).is_some());
         }
+    }
+
+    #[test]
+    fn codex_restore_lookup_runs_once_and_holds_its_launch_only_within_budget() {
+        let pane = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let budget = Duration::from_secs(2);
+        let now = Instant::now();
+        let mut lookups = CodexRestoreLookups::default();
+        assert!(!lookups.holds_launch(pane, now, budget), "no lookup began");
+        assert!(lookups.begin(pane, 3, now));
+        assert!(!lookups.begin(pane, 3, now), "a pane gets one lookup");
+        assert!(lookups.holds_launch(pane, now + Duration::from_millis(1999), budget));
+        assert!(!lookups.holds_launch(pane, now + budget, budget));
+        assert!(!lookups.holds_launch(other, now, budget));
+        assert!(lookups.finish(pane, 3));
+        assert!(!lookups.holds_launch(pane, now, budget));
+        assert!(!lookups.finish(pane, 3), "a result lands once");
+        assert!(!lookups.begin(pane, 4, now), "not even after it finished");
+    }
+
+    #[test]
+    fn codex_restore_lookup_result_is_dropped_after_a_launch_or_rebind() {
+        let pane = Uuid::new_v4();
+        let mut lookups = CodexRestoreLookups::default();
+        assert!(lookups.begin(pane, 3, Instant::now()));
+        // Preparing the launch (or any rebind) bumps the binding generation.
+        assert!(!lookups.finish(pane, 4));
+        assert!(!lookups.holds_launch(pane, Instant::now(), Duration::from_secs(2)));
+        assert!(
+            !lookups.finish(Uuid::new_v4(), 0),
+            "unknown panes never apply"
+        );
     }
 }

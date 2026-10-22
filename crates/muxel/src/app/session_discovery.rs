@@ -8,12 +8,13 @@ use super::{
 #[cfg(windows)]
 use super::{active_grok_session_for_process, process_parent_map, read_grok_active_sessions};
 use crate::{session_binding, ui_profile};
-use gpui::{App, Context};
+use gpui::{App, AsyncApp, Context, WeakEntity};
 use muxel_core::session_discovery::{
     CodexLookupEvidence, SessionDiscoveryKey, SessionDiscoveryRequest, SessionProvider,
 };
-use muxel_core::tmux::Socket;
-use muxel_core::{AgentPreset, CodexHintMiss};
+use muxel_core::tmux::{SessionTarget, Socket};
+use muxel_core::{AgentPreset, CodexHintMiss, Workspace};
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,7 +22,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-// Explicit Import may search history. Restoration must never call this path.
+// Explicit Import searches all history. Restoration uses the bounded,
+// ownership-aware `codex_restore_lookup` instead, on a worker.
 pub(super) fn capture_codex_session_id(home: &Path, cwd: &Path) -> Option<String> {
     #[cfg(all(test, windows))]
     let injected = CODEX_LAUNCH_TEST_LOOKUP.lock().unwrap().clone();
@@ -205,6 +207,245 @@ fn codex_tmux_capture_session(
     .flatten()
 }
 
+/// How long a launch waits for its pane's pre-launch Codex lookup, and how long
+/// that lookup may walk the rollout store. The same bound as a tmux title read.
+pub(super) const CODEX_RESTORE_LOOKUP_BUDGET: Duration = Duration::from_secs(2);
+const CODEX_RESTORE_LOOKUP_POLL: Duration = Duration::from_millis(20);
+
+/// What a restored, started Codex pane needs from local history before its
+/// launch. Captured on the UI thread without I/O.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CodexRestoreQuery {
+    pub(super) kind: CodexRestoreKind,
+    /// The pane's tmux session. One that still runs keeps its conversation:
+    /// the pane reattaches and title capture binds the exact id.
+    pub(super) tmux: Option<SessionTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CodexRestoreKind {
+    /// A saved id with no saved rollout path: confirm it before `resume <id>`.
+    Resume { id: String },
+    /// No saved id: the newest rollout for `cwd` that no other pane owns.
+    Latest {
+        cwd: PathBuf,
+        owned: HashSet<String>,
+        /// Unbound panes sharing `cwd`, so concurrent lookups can each find one.
+        limit: usize,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CodexRestoreFound {
+    Resume(muxel_core::CodexResumePath),
+    Latest(Vec<muxel_core::CodexSession>),
+    /// Nothing to apply: a running tmux session, or a walk cut short.
+    Skip,
+}
+
+fn restore_preset<'a>(
+    presets: &'a [AgentPreset],
+    instance: &muxel_core::Instance,
+) -> Option<&'a AgentPreset> {
+    instance
+        .preset_id
+        .and_then(|id| presets.iter().find(|preset| preset.id == id))
+        .or_else(|| presets.iter().find(|preset| preset.name == instance.preset))
+}
+
+fn restore_codex_pane<'a>(
+    workspace: &'a Workspace,
+    presets: &[AgentPreset],
+    instance: &'a muxel_core::Instance,
+) -> Option<&'a Path> {
+    let project = workspace.project(instance.project_id)?;
+    let preset = restore_preset(presets, instance)?;
+    (project.remote.is_none()
+        && instance.session_started
+        && is_codex_program(preset.program.as_deref())
+        && preset.resume_flag.is_some()
+        && preset.session_id_flag.is_none())
+    .then(|| {
+        instance
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&project.root_path)
+    })
+}
+
+/// The lookup a pane needs before its launch, if any: only local, started
+/// Codex panes that either lack a saved rollout path or lack an id entirely.
+pub(super) fn codex_restore_query(
+    workspace: &Workspace,
+    presets: &[AgentPreset],
+    iid: Uuid,
+) -> Option<CodexRestoreQuery> {
+    let instance = workspace.instance(iid)?;
+    let cwd = restore_codex_pane(workspace, presets, instance)?;
+    let kind = match &instance.session_id {
+        Some(id) if instance.session_path.is_none() => CodexRestoreKind::Resume { id: id.clone() },
+        Some(_) => return None,
+        None => CodexRestoreKind::Latest {
+            cwd: cwd.to_path_buf(),
+            owned: workspace
+                .instances
+                .iter()
+                .filter(|other| other.id != iid)
+                .filter_map(|other| other.session_id.clone())
+                .collect(),
+            limit: workspace
+                .instances
+                .iter()
+                .filter(|other| {
+                    other.session_id.is_none()
+                        && restore_codex_pane(workspace, presets, other) == Some(cwd)
+                })
+                .count(),
+        },
+    };
+    Some(CodexRestoreQuery {
+        kind,
+        tmux: instance
+            .tmux_session
+            .as_ref()
+            .map(|name| SessionTarget::new(name.clone(), instance.tmux_socket)),
+    })
+}
+
+/// Runs only on a worker: a dated miss and a cwd recovery both walk the store,
+/// bounded by `deadline`.
+pub(super) fn codex_restore_lookup(
+    query: &CodexRestoreQuery,
+    home: &Path,
+    deadline: Instant,
+    tmux_alive: &dyn Fn(&SessionTarget) -> bool,
+) -> CodexRestoreFound {
+    let running = || query.tmux.as_ref().is_some_and(tmux_alive);
+    match &query.kind {
+        CodexRestoreKind::Resume { id } => {
+            use muxel_core::CodexResumePath;
+            let found = match muxel_core::codex_resume_path(home, id, None) {
+                Ok(CodexResumePath::Unknown) => {
+                    muxel_core::codex_rollout_by_walk(home, id, deadline)
+                }
+                Ok(found) => found,
+                Err(_) => CodexResumePath::Unknown,
+            };
+            // A session still running its conversation is not abandoned
+            // because the store lacks the rollout.
+            if found == CodexResumePath::Missing && running() {
+                return CodexRestoreFound::Skip;
+            }
+            CodexRestoreFound::Resume(found)
+        }
+        CodexRestoreKind::Latest { cwd, owned, limit } => {
+            if running() {
+                return CodexRestoreFound::Skip;
+            }
+            muxel_core::codex_latest_sessions(home, cwd, owned, *limit, deadline)
+                .map_or(CodexRestoreFound::Skip, CodexRestoreFound::Latest)
+        }
+    }
+}
+
+fn run_codex_restore_lookup(
+    query: &CodexRestoreQuery,
+    home: &Path,
+    deadline: Instant,
+) -> CodexRestoreFound {
+    #[cfg(all(test, windows))]
+    let injected = CODEX_RESTORE_TEST_LOOKUP.lock().unwrap().clone();
+    #[cfg(all(test, windows))]
+    if let Some(lookup) = injected {
+        return lookup(query);
+    }
+    codex_restore_lookup(
+        query,
+        home,
+        deadline,
+        &crate::integrations::tmux_session_exists,
+    )
+}
+
+#[cfg(all(test, windows))]
+type CodexRestoreTestLookup =
+    std::sync::Arc<dyn Fn(&CodexRestoreQuery) -> CodexRestoreFound + Send + Sync>;
+#[cfg(all(test, windows))]
+static CODEX_RESTORE_TEST_LOOKUP: std::sync::Mutex<Option<CodexRestoreTestLookup>> =
+    std::sync::Mutex::new(None);
+#[cfg(all(test, windows))]
+pub(super) struct CodexRestoreTestGuard;
+#[cfg(all(test, windows))]
+impl Drop for CodexRestoreTestGuard {
+    fn drop(&mut self) {
+        *CODEX_RESTORE_TEST_LOOKUP.lock().unwrap() = None;
+    }
+}
+#[cfg(all(test, windows))]
+pub(super) fn inject_codex_restore_lookup(lookup: CodexRestoreTestLookup) -> CodexRestoreTestGuard {
+    *CODEX_RESTORE_TEST_LOOKUP.lock().unwrap() = Some(lookup);
+    CodexRestoreTestGuard
+}
+
+/// Apply a landed lookup while the pane still matches its query. A recovered
+/// id must still be unowned in the live workspace. Returns whether the pane's
+/// binding changed.
+pub(super) fn apply_codex_restore_found(
+    workspace: &mut Workspace,
+    iid: Uuid,
+    query: &CodexRestoreQuery,
+    found: CodexRestoreFound,
+) -> bool {
+    use muxel_core::CodexResumePath;
+    let owner_elsewhere = |workspace: &Workspace, id: &str| {
+        workspace
+            .instances
+            .iter()
+            .any(|other| other.id != iid && other.session_id.as_deref() == Some(id))
+    };
+    match (&query.kind, found) {
+        (CodexRestoreKind::Resume { id }, CodexRestoreFound::Resume(found)) => {
+            let Some(instance) = workspace.instance_mut(iid) else {
+                return false;
+            };
+            if !instance.session_started
+                || instance.session_id.as_deref() != Some(id.as_str())
+                || instance.session_path.is_some()
+            {
+                return false;
+            }
+            match found {
+                CodexResumePath::Found(path) => instance.session_path = Some(path),
+                // The whole store was read: start fresh as for a lost saved path.
+                CodexResumePath::Missing => {
+                    instance.session_id = None;
+                    instance.session_started = false;
+                }
+                CodexResumePath::Unknown => return false,
+            }
+            true
+        }
+        (CodexRestoreKind::Latest { .. }, CodexRestoreFound::Latest(sessions)) => {
+            let Some(session) = sessions
+                .into_iter()
+                .find(|session| !owner_elsewhere(workspace, &session.id))
+            else {
+                return false;
+            };
+            let Some(instance) = workspace.instance_mut(iid) else {
+                return false;
+            };
+            if !instance.session_started || instance.session_id.is_some() {
+                return false;
+            }
+            instance.session_id = Some(session.id);
+            instance.session_path = Some(session.path);
+            true
+        }
+        _ => false,
+    }
+}
+
 struct SessionBindingUpdate {
     pane: Uuid,
     provider: SessionProvider,
@@ -230,6 +471,70 @@ impl MuxelApp {
     /// A rebind away and back must still invalidate an older worker.
     pub(super) fn bump_session_binding_generation(&mut self, iid: Uuid) {
         self.session_discoveries.binding_changed(iid);
+    }
+
+    /// Start a restored Codex pane's one pre-launch history lookup, if it needs
+    /// one, on a worker. Call it only before the pane's launch is prepared. A
+    /// deferred launch then waits for it at most [`CODEX_RESTORE_LOOKUP_BUDGET`]
+    /// (see `await_codex_restore_lookup`); a result that lands after the launch
+    /// was prepared is dropped.
+    pub(super) fn begin_codex_restore_lookup(&mut self, iid: Uuid, cx: &mut Context<Self>) {
+        // A running pane already has its conversation; only title capture may
+        // rebind it.
+        if self.discovery_terminal(iid).is_some() || self.failed_launches.contains_key(&iid) {
+            return;
+        }
+        let Some(query) = codex_restore_query(&self.workspace, &self.presets, iid) else {
+            return;
+        };
+        let Some(home) = home_dir() else { return };
+        let now = Instant::now();
+        let generation = self.session_discoveries.binding_generation(iid);
+        if !self.codex_restore_lookups.begin(iid, generation, now) {
+            return;
+        }
+        let deadline = now + CODEX_RESTORE_LOOKUP_BUDGET;
+        cx.spawn(async move |this, cx| {
+            let worker_query = query.clone();
+            let found = cx
+                .background_executor()
+                .spawn(async move { run_codex_restore_lookup(&worker_query, &home, deadline) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let generation = this.session_discoveries.binding_generation(iid);
+                if this.codex_restore_lookups.finish(iid, generation)
+                    && apply_codex_restore_found(&mut this.workspace, iid, &query, found)
+                {
+                    this.bump_session_binding_generation(iid);
+                    this.persist();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Let a pane's pending restore lookup land before its launch is prepared,
+    /// polling so the UI thread is never held. Bounded by the lookup budget.
+    pub(super) async fn await_codex_restore_lookup(
+        this: &WeakEntity<Self>,
+        iid: Uuid,
+        cx: &mut AsyncApp,
+    ) {
+        while this
+            .read_with(cx, |this, _| {
+                this.codex_restore_lookups.holds_launch(
+                    iid,
+                    Instant::now(),
+                    CODEX_RESTORE_LOOKUP_BUDGET,
+                )
+            })
+            .unwrap_or(false)
+        {
+            cx.background_executor()
+                .timer(CODEX_RESTORE_LOOKUP_POLL)
+                .await;
+        }
     }
 
     fn discovery_terminal(&self, iid: Uuid) -> Option<&gpui::Entity<muxel_terminal::TerminalView>> {
@@ -943,5 +1248,444 @@ mod w8lm_tests {
         let (_, discovered, _, _) = discover_sessions(vec![retry], &root, None).pop().unwrap();
         assert!(validated(discovered).is_none(), "deleted A was rebound");
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod codex_restore_tests {
+    use super::{
+        CodexRestoreFound, CodexRestoreKind, CodexRestoreQuery, apply_codex_restore_found,
+        codex_restore_lookup, codex_restore_query,
+    };
+    use muxel_core::tmux::{SessionTarget, Socket};
+    use muxel_core::{
+        AgentPreset, CodexResumePath, CodexSession, Instance, Project, RemoteRef, Workspace,
+    };
+    use std::cell::Cell;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    struct TempHome(PathBuf);
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_home(label: &str) -> TempHome {
+        let root = std::env::temp_dir().join(format!("muxel-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        TempHome(root)
+    }
+
+    fn rollout(home: &Path, day: &str, id: &str, cwd: &Path) -> PathBuf {
+        let path = home
+            .join(".codex/sessions")
+            .join(day)
+            .join(format!("rollout-{id}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}}).to_string(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn started(project: Uuid, preset: &AgentPreset, id: Option<&str>) -> Instance {
+        let mut instance = Instance::from_preset(project, preset);
+        instance.session_started = true;
+        instance.session_id = id.map(str::to_string);
+        instance
+    }
+
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn restore_query_covers_only_started_local_codex_panes_missing_an_id_or_a_path() {
+        let codex = AgentPreset::codex();
+        let claude = AgentPreset::claude();
+        let local = Project::new("webapp", "/home/me/webapp");
+        let mut remote = Project::new("remote", "/srv/app");
+        remote.remote = Some(RemoteRef {
+            host_id: Uuid::new_v4(),
+            remote_root: "/srv/app".into(),
+        });
+        let mut unbound = started(local.id, &codex, None);
+        unbound.tmux_session = Some("muxel_webapp_1a2b3c4d".into());
+        unbound.tmux_socket = Some(Socket::Private);
+        let sibling = started(local.id, &codex, None);
+        let unconfirmed = started(
+            local.id,
+            &codex,
+            Some("01a1543c-9700-7000-8000-000000000001"),
+        );
+        let mut confirmed = started(
+            local.id,
+            &codex,
+            Some("01a1543c-9700-7000-8000-000000000002"),
+        );
+        confirmed.session_path = Some("/home/me/.codex/sessions/rollout.jsonl".into());
+        let mut fresh = Instance::from_preset(local.id, &codex);
+        fresh.session_started = false;
+        let claude_pane = started(local.id, &claude, None);
+        let remote_pane = started(remote.id, &codex, None);
+        let mut worktree = started(local.id, &codex, None);
+        worktree.worktree_path = Some("/home/me/webapp-wt".into());
+        let ids = [
+            unbound.id,
+            sibling.id,
+            unconfirmed.id,
+            confirmed.id,
+            fresh.id,
+            claude_pane.id,
+            remote_pane.id,
+            worktree.id,
+        ];
+        let workspace = Workspace {
+            projects: vec![local, remote],
+            instances: vec![
+                unbound,
+                sibling,
+                unconfirmed,
+                confirmed,
+                fresh,
+                claude_pane,
+                remote_pane,
+                worktree,
+            ],
+            ..Workspace::default()
+        };
+        let presets = [codex, claude];
+        let query = |iid| codex_restore_query(&workspace, &presets, iid);
+        let owned: HashSet<String> = [
+            "01a1543c-9700-7000-8000-000000000001".to_string(),
+            "01a1543c-9700-7000-8000-000000000002".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            query(ids[0]),
+            Some(CodexRestoreQuery {
+                kind: CodexRestoreKind::Latest {
+                    cwd: "/home/me/webapp".into(),
+                    owned: owned.clone(),
+                    limit: 2,
+                },
+                tmux: Some(SessionTarget::new(
+                    "muxel_webapp_1a2b3c4d",
+                    Some(Socket::Private)
+                )),
+            })
+        );
+        assert!(matches!(
+            query(ids[1]).map(|query| query.kind),
+            Some(CodexRestoreKind::Latest { limit: 2, .. })
+        ));
+        assert_eq!(
+            query(ids[2]).map(|query| query.kind),
+            Some(CodexRestoreKind::Resume {
+                id: "01a1543c-9700-7000-8000-000000000001".into()
+            })
+        );
+        for skipped in &ids[3..7] {
+            assert_eq!(query(*skipped), None);
+        }
+        assert_eq!(
+            query(ids[7]).map(|query| query.kind),
+            Some(CodexRestoreKind::Latest {
+                cwd: "/home/me/webapp-wt".into(),
+                owned,
+                limit: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn dated_miss_is_walked_and_a_confirmed_missing_rollout_starts_fresh() {
+        let home = temp_home("codex-restore-walk");
+        let cwd = home.0.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let moved = "01a1543c-9700-7000-8000-000000000001";
+        let gone = "01a1543c-9700-7000-8000-000000000002";
+        // Not in the UUIDv7 timestamp's day directory.
+        let path = rollout(&home.0, "2020/01/01", moved, &cwd);
+        let preset = AgentPreset::codex();
+        let project = Project::new("webapp", &cwd);
+        let pane = started(project.id, &preset, Some(moved));
+        let missing = started(project.id, &preset, Some(gone));
+        let (pane_id, missing_id) = (pane.id, missing.id);
+        let mut workspace = Workspace {
+            projects: vec![project],
+            instances: vec![pane, missing],
+            ..Workspace::default()
+        };
+        let presets = [preset.clone()];
+        let not_running = |_: &SessionTarget| panic!("no tmux session to check");
+
+        let query = codex_restore_query(&workspace, &presets, pane_id).unwrap();
+        let found = codex_restore_lookup(&query, &home.0, later(), &not_running);
+        assert_eq!(
+            found,
+            CodexRestoreFound::Resume(CodexResumePath::Found(path.clone()))
+        );
+        assert!(apply_codex_restore_found(
+            &mut workspace,
+            pane_id,
+            &query,
+            found
+        ));
+        assert_eq!(
+            workspace.instance(pane_id).unwrap().session_path,
+            Some(path)
+        );
+        assert_eq!(
+            muxel_core::session_resume_args(&preset, workspace.instance(pane_id).unwrap()),
+            Some(vec!["resume".to_string(), moved.to_string()])
+        );
+
+        // Master's walk answer: the rollout is gone, so the pane starts fresh
+        // instead of a `codex resume` that exits and closes it.
+        let query = codex_restore_query(&workspace, &presets, missing_id).unwrap();
+        let found = codex_restore_lookup(&query, &home.0, later(), &not_running);
+        assert_eq!(found, CodexRestoreFound::Resume(CodexResumePath::Missing));
+        assert!(apply_codex_restore_found(
+            &mut workspace,
+            missing_id,
+            &query,
+            found
+        ));
+        let instance = workspace.instance(missing_id).unwrap();
+        assert_eq!(instance.session_id, None);
+        assert!(!instance.session_started);
+        assert_eq!(muxel_core::session_resume_args(&preset, instance), None);
+
+        // A walk cut short keeps the id for `resume <id>`.
+        let query = CodexRestoreQuery {
+            kind: CodexRestoreKind::Resume { id: gone.into() },
+            tmux: None,
+        };
+        assert_eq!(
+            codex_restore_lookup(&query, &home.0, Instant::now(), &not_running),
+            CodexRestoreFound::Resume(CodexResumePath::Unknown)
+        );
+    }
+
+    #[test]
+    fn running_tmux_session_keeps_its_conversation_for_title_capture() {
+        let home = temp_home("codex-restore-tmux");
+        let cwd = home.0.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        rollout(
+            &home.0,
+            "2026/10/19",
+            "01a1543c-9700-7000-8000-000000000001",
+            &cwd,
+        );
+        let target = SessionTarget::new("muxel_webapp_1a2b3c4d", Some(Socket::Private));
+        let checked = Cell::new(0);
+        let alive = |session: &SessionTarget| {
+            assert_eq!(session, &target);
+            checked.set(checked.get() + 1);
+            true
+        };
+        let latest = CodexRestoreQuery {
+            kind: CodexRestoreKind::Latest {
+                cwd: cwd.clone(),
+                owned: HashSet::new(),
+                limit: 1,
+            },
+            tmux: Some(target.clone()),
+        };
+        assert_eq!(
+            codex_restore_lookup(&latest, &home.0, later(), &alive),
+            CodexRestoreFound::Skip
+        );
+        // A confirmed-missing rollout does not end a session that still runs.
+        let resume = CodexRestoreQuery {
+            kind: CodexRestoreKind::Resume {
+                id: "01a1543c-9700-7000-8000-000000000009".into(),
+            },
+            tmux: Some(target.clone()),
+        };
+        assert_eq!(
+            codex_restore_lookup(&resume, &home.0, later(), &alive),
+            CodexRestoreFound::Skip
+        );
+        assert_eq!(checked.get(), 2);
+        let gone = |_: &SessionTarget| false;
+        assert!(matches!(
+            codex_restore_lookup(&latest, &home.0, later(), &gone),
+            CodexRestoreFound::Latest(sessions) if sessions.len() == 1
+        ));
+    }
+
+    #[test]
+    fn unbound_started_pane_recovers_the_newest_rollout_no_sibling_owns() {
+        let home = temp_home("codex-restore-latest");
+        let cwd = home.0.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let preset = AgentPreset::codex();
+        let project = Project::new("webapp", &cwd);
+        let owner_id = "01a1543c-9700-7000-8000-000000000001";
+        let owned_path = rollout(&home.0, "2026/10/19", owner_id, &cwd);
+        let newest = "01a1543c-9700-7000-8000-000000000002";
+        let newest_path = rollout(&home.0, "2026/10/19", newest, &cwd);
+        let older = "01a1543c-9700-7000-8000-000000000003";
+        let older_path = rollout(&home.0, "2026/10/18", older, &cwd);
+        let age = |path: &Path, secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
+                .unwrap();
+        };
+        age(&owned_path, 1);
+        age(&newest_path, 10);
+        age(&older_path, 20);
+        let owner = started(project.id, &preset, Some(owner_id));
+        let first = started(project.id, &preset, None);
+        let second = started(project.id, &preset, None);
+        let (first_id, second_id) = (first.id, second.id);
+        let mut workspace = Workspace {
+            projects: vec![project],
+            instances: vec![owner, first, second],
+            ..Workspace::default()
+        };
+        let presets = [preset.clone()];
+        let no_tmux = |_: &SessionTarget| panic!("no tmux session to check");
+        // Both unbound panes look up together, before either binds.
+        let first_query = codex_restore_query(&workspace, &presets, first_id).unwrap();
+        let second_query = codex_restore_query(&workspace, &presets, second_id).unwrap();
+        let first_found = codex_restore_lookup(&first_query, &home.0, later(), &no_tmux);
+        let second_found = codex_restore_lookup(&second_query, &home.0, later(), &no_tmux);
+        let expected = vec![
+            CodexSession {
+                id: newest.into(),
+                path: newest_path.clone(),
+            },
+            CodexSession {
+                id: older.into(),
+                path: older_path.clone(),
+            },
+        ];
+        assert_eq!(first_found, CodexRestoreFound::Latest(expected.clone()));
+        assert_eq!(second_found, CodexRestoreFound::Latest(expected));
+
+        assert!(apply_codex_restore_found(
+            &mut workspace,
+            first_id,
+            &first_query,
+            first_found
+        ));
+        // The first pane now owns the newest; the second takes the next one.
+        assert!(apply_codex_restore_found(
+            &mut workspace,
+            second_id,
+            &second_query,
+            second_found
+        ));
+        let bound = |iid| {
+            let instance = workspace.instance(iid).unwrap();
+            (instance.session_id.clone(), instance.session_path.clone())
+        };
+        assert_eq!(bound(first_id), (Some(newest.into()), Some(newest_path)));
+        assert_eq!(bound(second_id), (Some(older.into()), Some(older_path)));
+        assert_eq!(
+            muxel_core::session_resume_args(&preset, workspace.instance(second_id).unwrap()),
+            Some(vec!["resume".to_string(), older.to_string()])
+        );
+    }
+
+    #[test]
+    fn landed_lookup_never_rebinds_a_pane_that_moved_on() {
+        let preset = AgentPreset::codex();
+        let project = Project::new("webapp", "/home/me/webapp");
+        let pane = started(project.id, &preset, None);
+        let sibling = started(
+            project.id,
+            &preset,
+            Some("01a1543c-9700-7000-8000-000000000001"),
+        );
+        let pane_id = pane.id;
+        let mut workspace = Workspace {
+            projects: vec![project],
+            instances: vec![pane, sibling],
+            ..Workspace::default()
+        };
+        let latest = CodexRestoreQuery {
+            kind: CodexRestoreKind::Latest {
+                cwd: "/home/me/webapp".into(),
+                owned: HashSet::new(),
+                limit: 1,
+            },
+            tmux: None,
+        };
+        let session = |n: u32| CodexSession {
+            id: format!("01a1543c-9700-7000-8000-{n:012}"),
+            path: PathBuf::from(format!("/home/me/.codex/sessions/rollout-{n}.jsonl")),
+        };
+        // Every candidate is owned by now: the pane starts fresh.
+        assert!(!apply_codex_restore_found(
+            &mut workspace,
+            pane_id,
+            &latest,
+            CodexRestoreFound::Latest(vec![session(1)])
+        ));
+        assert!(!apply_codex_restore_found(
+            &mut workspace,
+            pane_id,
+            &latest,
+            CodexRestoreFound::Skip
+        ));
+        // A pane that captured its own id meanwhile keeps it.
+        workspace.instance_mut(pane_id).unwrap().session_id = Some(session(5).id);
+        assert!(!apply_codex_restore_found(
+            &mut workspace,
+            pane_id,
+            &latest,
+            CodexRestoreFound::Latest(vec![session(2)])
+        ));
+        // A resume answer for a different id than the pane now holds is stale.
+        let resume = CodexRestoreQuery {
+            kind: CodexRestoreKind::Resume { id: session(4).id },
+            tmux: None,
+        };
+        for found in [
+            CodexResumePath::Missing,
+            CodexResumePath::Found(session(4).path),
+        ] {
+            assert!(!apply_codex_restore_found(
+                &mut workspace,
+                pane_id,
+                &resume,
+                CodexRestoreFound::Resume(found)
+            ));
+        }
+        let instance = workspace.instance(pane_id).unwrap();
+        assert_eq!(instance.session_id, Some(session(5).id));
+        assert!(instance.session_started);
+        assert_eq!(instance.session_path, None);
+        // An inconclusive walk changes nothing.
+        let resume = CodexRestoreQuery {
+            kind: CodexRestoreKind::Resume { id: session(5).id },
+            tmux: None,
+        };
+        assert!(!apply_codex_restore_found(
+            &mut workspace,
+            pane_id,
+            &resume,
+            CodexRestoreFound::Resume(CodexResumePath::Unknown)
+        ));
+        assert_eq!(
+            workspace.instance(pane_id).unwrap().session_id,
+            Some(session(5).id)
+        );
     }
 }
