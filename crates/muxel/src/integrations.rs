@@ -1960,22 +1960,21 @@ pub fn remote_tmux_launch_target(
         bail!("not a remote project")
     };
     let (session, sockets) = tmux_launch_inventory(session, local_tmux_root().as_deref());
-    let cmd = remote_ssh_command(
-        conn,
-        format!(
-            "export LC_ALL=C; {}",
-            ssh::list_session_names_command_on(&sockets)
-        ),
-    );
-    let out = run_tmux_output_until(cmd, deadline)?;
-    if !out.status.success() {
-        bail!("{}", ssh_error_message(&out));
-    }
-    let sessions = ssh::parse_session_listings_for_migration_on(
-        &String::from_utf8_lossy(&out.stdout),
+    let out = remote_session_names(conn, &sockets, deadline)?;
+    // A session still running on Default is reattached there, on Default's answer
+    // alone. Only moving it off Default needs every server's checked answer.
+    if ssh::still_on_default(
+        &ssh::checked_session_listings_on(&out, &sockets),
         &sockets,
-    )
-    .context("couldn't confirm the tmux servers queried")?;
+        &session,
+    ) {
+        if require_absent {
+            bail!("tmux session “{session}” is still running");
+        }
+        return Ok(session);
+    }
+    let sessions = ssh::parse_session_listings_for_migration_on(&out, &sockets)
+        .context("couldn't confirm the tmux servers queried")?;
     let resolved = muxel_core::tmux::ClosedSession {
         name: session.name.clone(),
         socket: session.socket.clone(),
@@ -1995,6 +1994,23 @@ pub fn remote_tmux_launch_target(
             .iter()
             .any(|row| &row.socket == socket && row.name == resolved.name))
     })
+}
+
+/// [`ssh::list_session_names_command_on`] `sockets` on the host, within `deadline`.
+fn remote_session_names(
+    conn: &RemoteConn,
+    sockets: &[Socket],
+    deadline: Instant,
+) -> Result<String> {
+    let command = format!(
+        "export LC_ALL=C; {}",
+        ssh::list_session_names_command_on(sockets)
+    );
+    let out = run_tmux_output_until(remote_ssh_command(conn, command), deadline)?;
+    if !out.status.success() {
+        bail!("{}", ssh_error_message(&out));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn tmux_launch_inventory(

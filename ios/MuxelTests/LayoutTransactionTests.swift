@@ -450,7 +450,7 @@ final class LayoutTransactionTests: XCTestCase {
         // A peer has started its Private replacement before this client's saved
         // layout has learned the new owner. An unrelated namesake looks identical.
         let conn = LayoutTransactionConnection(saved, pauseFirstRead: false,
-            listedTargets: "mxl\towned\n:muxel-listed:0\n:muxel-listed:0\n")
+            listedTargets: "owned\n:muxel-listed:0\n:muxel-listed:0\n")
         state.connectionFactory = { _, _ in conn }
 
         for _ in 0..<2 {

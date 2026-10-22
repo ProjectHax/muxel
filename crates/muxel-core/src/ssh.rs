@@ -566,28 +566,6 @@ pub fn parse_session_listings_on(
     out: &str,
     sockets: &[Socket],
 ) -> Option<Vec<crate::tmux::RemoteSession>> {
-    parse_session_listings_with(out, sockets, false)
-}
-
-/// Both servers must give complete name-only answers before absence may authorize
-/// moving a recorded default owner. Only name/socket are populated in these rows.
-pub fn parse_session_listings_for_migration(out: &str) -> Option<Vec<crate::tmux::RemoteSession>> {
-    parse_session_listings_for_migration_on(out, &Socket::BOTH)
-}
-
-/// The same checked reply contract when confirming one recorded named owner.
-pub fn parse_session_listings_for_migration_on(
-    out: &str,
-    sockets: &[Socket],
-) -> Option<Vec<crate::tmux::RemoteSession>> {
-    parse_session_listings_with(out, sockets, true)
-}
-
-fn parse_session_listings_with(
-    out: &str,
-    sockets: &[Socket],
-    migration: bool,
-) -> Option<Vec<crate::tmux::RemoteSession>> {
     let mut panes = Vec::new();
     let mut listing = String::new();
     let mut answered = 0;
@@ -599,39 +577,117 @@ fn parse_session_listings_with(
         };
         let socket = sockets.get(answered)?;
         if status.trim() == "0" {
-            if migration {
-                for name in listing.lines() {
-                    if name.is_empty() {
-                        return None;
-                    }
-                    panes.push(crate::tmux::RemoteSession {
-                        name: name.to_string(),
-                        socket: socket.clone(),
-                        path: String::new(),
-                        command: String::new(),
-                        title: String::new(),
-                    });
-                }
-            } else {
-                panes.extend(crate::tmux::parse_sessions_on(&listing, socket.clone()));
-            }
-        } else {
-            // A malformed status is not a failed tmux command, even when its
-            // output resembles an absent server.
-            let failed = status.trim().parse::<u8>().is_ok_and(|code| code != 0);
-            let absent = if migration {
-                failed && crate::tmux::confirmed_no_server(&listing)
-            } else {
-                crate::tmux::no_server(&listing)
-            };
-            if !absent {
-                return None;
-            }
+            panes.extend(crate::tmux::parse_sessions_on(&listing, socket.clone()));
+        } else if !crate::tmux::no_server(&listing) {
+            return None;
         }
         listing.clear();
         answered += 1;
     }
     (answered == sockets.len() && listing.trim().is_empty()).then_some(panes)
+}
+
+/// Both servers must give complete name-only answers before absence may authorize
+/// moving a recorded default owner. Only name/socket are populated in these rows.
+pub fn parse_session_listings_for_migration(out: &str) -> Option<Vec<crate::tmux::RemoteSession>> {
+    parse_session_listings_for_migration_on(out, &Socket::BOTH)
+}
+
+/// The same checked reply contract when confirming one recorded named owner:
+/// every server's [`checked_session_listings_on`] answer, and nothing after them.
+pub fn parse_session_listings_for_migration_on(
+    out: &str,
+    sockets: &[Socket],
+) -> Option<Vec<crate::tmux::RemoteSession>> {
+    let (answers, complete) = checked_listings(out, sockets);
+    if !complete {
+        return None;
+    }
+    let answers: Option<Vec<_>> = answers.into_iter().collect();
+    answers.map(|answers| answers.into_iter().flatten().collect())
+}
+
+/// [`list_session_names_command_on`]'s output, one answer per server queried, in
+/// order: the sessions it listed, none for a server confirmed not running, or
+/// `None` for any other reply (one cut off before that server answered
+/// included). A server's answer stands whatever the others said.
+///
+/// A listing that exited 0 holds one exact session name per line. An empty line
+/// is no name tmux lists, so it spoils that server's answer. Ported to Swift as
+/// `TmuxCommands.parseConfirmedListings` — keep both in step.
+pub fn checked_session_listings_on(
+    out: &str,
+    sockets: &[Socket],
+) -> Vec<Option<Vec<crate::tmux::RemoteSession>>> {
+    checked_listings(out, sockets).0
+}
+
+/// [`checked_session_listings_on`], and whether nothing but whitespace followed
+/// the last server's answer.
+fn checked_listings(
+    out: &str,
+    sockets: &[Socket],
+) -> (Vec<Option<Vec<crate::tmux::RemoteSession>>>, bool) {
+    let mut answers = Vec::with_capacity(sockets.len());
+    let mut listing = String::new();
+    let mut complete = true;
+    for line in out.lines() {
+        let Some(status) = line.strip_prefix(LISTING_END) else {
+            listing.push_str(line);
+            listing.push('\n');
+            continue;
+        };
+        match sockets.get(answers.len()) {
+            Some(socket) => answers.push(checked_listing(&listing, status, socket)),
+            // More answers than servers asked.
+            None => complete = false,
+        }
+        listing.clear();
+    }
+    complete &= answers.len() == sockets.len() && listing.trim().is_empty();
+    answers.resize(sockets.len(), None);
+    (answers, complete)
+}
+
+fn checked_listing(
+    listing: &str,
+    status: &str,
+    socket: &Socket,
+) -> Option<Vec<crate::tmux::RemoteSession>> {
+    if status.trim() == "0" {
+        return listing
+            .lines()
+            .map(|name| {
+                (!name.is_empty()).then(|| crate::tmux::RemoteSession {
+                    name: name.to_string(),
+                    socket: socket.clone(),
+                    path: String::new(),
+                    command: String::new(),
+                    title: String::new(),
+                })
+            })
+            .collect();
+    }
+    // A malformed status is not a failed tmux command, even when its output
+    // resembles an absent server.
+    let failed = status.trim().parse::<u8>().is_ok_and(|code| code != 0);
+    (failed && crate::tmux::confirmed_no_server(listing)).then(Vec::new)
+}
+
+/// Whether a pane recorded on the default server still has its session there,
+/// by `checked` ([`checked_session_listings_on`] over `sockets`). It reattaches
+/// there, whatever the other servers answered: only moving it off Default needs
+/// every server's checked answer. Ported to Swift as
+/// `TmuxCommands.defaultOwnerTargets`.
+pub fn still_on_default(
+    checked: &[Option<Vec<crate::tmux::RemoteSession>>],
+    sockets: &[Socket],
+    session: &crate::tmux::SessionTarget,
+) -> bool {
+    session.socket == Some(Socket::Default)
+        && sockets.iter().zip(checked).any(|(socket, rows)| {
+            *socket == Socket::Default && rows.iter().flatten().any(|row| row.name == session.name)
+        })
 }
 
 /// Exit codes for [`kill_and_confirm_command`], chosen above the range a shell
@@ -1761,6 +1817,84 @@ mod tests {
         assert!(
             parse_session_listings(&format!("work|/p|claude|\n:muxel-listed:0\n{permission}"))
                 .is_some()
+        );
+    }
+
+    /// Reattaching a session still running on Default needs only Default's answer;
+    /// whatever `mxl` replied (an rc file's echo, an unfamiliar error, nothing at
+    /// all), the pane attaches as it did before the migration existed.
+    #[test]
+    fn a_live_default_session_needs_only_defaults_answer() {
+        let target = crate::tmux::SessionTarget::new("owned ", Some(Socket::Default));
+        let live = "owned \n:muxel-listed:0\n";
+        for own in [
+            "Welcome to devbox\nowned \n:muxel-listed:0\n",
+            "error connecting to /tmp/tmux-1000/mxl (Permission denied)\n:muxel-listed:1\n",
+            "\n:muxel-listed:0\n",
+            "something unfamiliar\n:muxel-listed:2\n",
+            "garbage without a status\n:muxel-listed:\n",
+        ] {
+            let out = format!("{own}{live}");
+            let checked = checked_session_listings_on(&out, &Socket::BOTH);
+            assert!(still_on_default(&checked, &Socket::BOTH, &target), "{own}");
+        }
+        // Moving it would still need both servers' answers.
+        let own = "error connecting to /tmp/tmux-1000/mxl (Permission denied)\n:muxel-listed:1\n";
+        assert!(parse_session_listings_for_migration(&format!("{own}{live}")).is_none());
+        // Default's answer must itself be complete and hold the exact name.
+        for default in [
+            "owned\n:muxel-listed:0\n",
+            "owned \n",
+            "owned \n:muxel-listed:1\n",
+            "owned \n\n:muxel-listed:0\n",
+            "no server running on /tmp/tmux-1000/default\n:muxel-listed:1\n",
+        ] {
+            let out = format!("{own}{default}");
+            let checked = checked_session_listings_on(&out, &Socket::BOTH);
+            assert!(
+                !still_on_default(&checked, &Socket::BOTH, &target),
+                "{default}"
+            );
+            assert!(
+                parse_session_listings_for_migration(&out).is_none(),
+                "{default}"
+            );
+        }
+        // Only a pane recorded on Default reattaches by Default's answer alone.
+        let checked = checked_session_listings_on(&format!("{own}{live}"), &Socket::BOTH);
+        for socket in [None, Some(Socket::Private)] {
+            let other = crate::tmux::SessionTarget::new("owned ", socket);
+            assert!(!still_on_default(&checked, &Socket::BOTH, &other));
+        }
+    }
+
+    #[test]
+    fn checked_listings_answer_per_server() {
+        let out = "\
+            Welcome\n:muxel-listed:0\n\
+            no server running on /tmp/tmux-1000/default\n:muxel-listed:1\n";
+        let checked = checked_session_listings_on(out, &Socket::BOTH);
+        assert_eq!(checked.len(), 2);
+        assert_eq!(checked[0].as_ref().unwrap()[0].name, "Welcome");
+        assert_eq!(checked[0].as_ref().unwrap()[0].socket, Socket::Private);
+        assert_eq!(checked[1], Some(vec![]));
+        // Cut off before Default answered, and an extra answer nobody asked for.
+        let cut = checked_session_listings_on("a\n:muxel-listed:0\nb\n", &Socket::BOTH);
+        assert!(cut[0].is_some() && cut[1].is_none());
+        let extra = "a\n:muxel-listed:0\nb\n:muxel-listed:0\nc\n:muxel-listed:0\n";
+        assert_eq!(
+            checked_session_listings_on(extra, &Socket::BOTH)
+                .iter()
+                .filter(|a| a.is_some())
+                .count(),
+            2
+        );
+        assert!(parse_session_listings_for_migration(extra).is_none());
+        assert_eq!(
+            parse_session_listings_for_migration("a\n:muxel-listed:0\nb\n:muxel-listed:0\n \n")
+                .unwrap()
+                .len(),
+            2
         );
     }
 

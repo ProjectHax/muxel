@@ -127,44 +127,87 @@ enum TmuxCommands {
         }
     }
 
-    /// Default migration needs both complete replies. Ordinary best-effort
-    /// discovery cannot distinguish an empty server from a permission failure.
+    /// The checked listing a pane recorded on the default server needs: muxel's
+    /// own server, then the default one, each answer closed by its exit status.
+    /// Names only, one per line, so no session name is split. Port of
+    /// `ssh::list_session_names_command_on` over both servers.
     static func confirmedTargetsCommand() -> String {
         "export LC_ALL=C; " + [socketName, "default"].map { server in
-            commandLine(["list-sessions", "-F", "\(server)\t#{session_name}"], session: "", socket: server)
-                + " 2>&1; echo \":muxel-listed:$?\""
+            commandLine(["list-sessions", "-F", "#{session_name}"], session: "", socket: server)
+                + " 2>&1; echo \"\(listingEnd)$?\""
         }.joined(separator: "; ")
     }
 
-    static func parseConfirmedTargets(_ output: String) throws -> [SessionTarget] {
+    private static let listingEnd = ":muxel-listed:"
+
+    /// `confirmedTargetsCommand`'s output, one answer per server (muxel's own, then
+    /// the default one): the sessions it listed, `[]` for a server confirmed not
+    /// running, or `nil` for any other reply, one cut off before that server
+    /// answered included. A server's answer stands whatever the other said.
+    /// `complete` is whether both answered and nothing but whitespace followed.
+    ///
+    /// A listing that exited 0 holds one exact session name per line. An empty
+    /// line is no name tmux lists, so it spoils that server's answer. Port of
+    /// `ssh::checked_session_listings_on` — keep both in step.
+    static func parseConfirmedListings(_ output: String) -> (answers: [[SessionTarget]?], complete: Bool) {
         let servers = [socketName, "default"]
-        var answered = 0
+        var answers: [[SessionTarget]?] = []
         var listing: [String] = []
-        var targets: [SessionTarget] = []
+        var complete = true
         for raw in output.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(raw)
-            guard line.hasPrefix(":muxel-listed:") else {
+            guard line.hasPrefix(listingEnd) else {
                 listing.append(line); continue
             }
-            guard answered < servers.count,
-                  let status = UInt8(line.dropFirst(":muxel-listed:".count)) else { throw ProbeError.incomplete }
-            let text = listing.joined(separator: "\n")
-            if status == 0 {
-                let rows = parseTargets(text)
-                guard rows.count == listing.filter({ !$0.isEmpty }).count,
-                      rows.allSatisfy({ $0.socket == servers[answered] }) else { throw ProbeError.incomplete }
-                targets += rows
-            } else if !confirmedNoServer(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                throw ProbeError.incomplete
+            if answers.count < servers.count {
+                answers.append(checkedListing(listing, status: String(line.dropFirst(listingEnd.count)),
+                                              server: servers[answers.count]))
+            } else {
+                complete = false  // more answers than servers asked
             }
-            answered += 1
             listing = []
         }
-        guard answered == servers.count,
-              listing.allSatisfy({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
-            throw ProbeError.incomplete
+        complete = complete && answers.count == servers.count
+            && listing.allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        while answers.count < servers.count { answers.append(nil) }
+        return (answers, complete)
+    }
+
+    private static func checkedListing(_ listing: [String], status: String, server: String) -> [SessionTarget]? {
+        let status = status.trimmingCharacters(in: .whitespaces)
+        if status == "0" {
+            guard !listing.contains(where: { $0.isEmpty }) else { return nil }
+            return listing.map { SessionTarget(name: $0, socket: server) }
         }
-        return targets
+        // A malformed status is not a failed tmux command, even when its output
+        // resembles an absent server.
+        guard let code = UInt8(status), code != 0,
+              confirmedNoServer(listing.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        return []
+    }
+
+    /// Default migration needs both complete replies. Ordinary best-effort
+    /// discovery cannot distinguish an empty server from a permission failure.
+    /// Port of `ssh::parse_session_listings_for_migration`.
+    static func parseConfirmedTargets(_ output: String) throws -> [SessionTarget] {
+        let (answers, complete) = parseConfirmedListings(output)
+        let confirmed = answers.compactMap { $0 }
+        guard complete, confirmed.count == answers.count else { throw ProbeError.incomplete }
+        return confirmed.flatMap { $0 }
+    }
+
+    /// What a pane recorded on the default server attaches to or moves from. A
+    /// session still listed there under `name` is reattached on that answer alone,
+    /// whatever muxel's own server replied (an rc file's echo, an unfamiliar
+    /// error): only moving it off Default (`targetForNewSession`) needs both
+    /// servers' checked answers. Port of `ssh::still_on_default`.
+    static func defaultOwnerTargets(_ output: String, name: String) throws -> [SessionTarget] {
+        if let onDefault = parseConfirmedListings(output).answers[1],
+           onDefault.contains(where: { $0.name == name }) {
+            return onDefault
+        }
+        return try parseConfirmedTargets(output)
     }
 
     private static func confirmedNoServer(_ message: String) -> Bool {

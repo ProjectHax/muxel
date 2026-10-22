@@ -54,7 +54,7 @@ final class InteropTests: XCTestCase {
         // neither server holds the name, then saves and starts on Private.
         let firstPlan = try TmuxCommands.targetForNewSession(firstPeer, name: firstPeer.tmuxSession!, confirmedTargets: [])
         firstPeer.tmuxSocket = firstPlan.target.socket
-        let inventory = try TmuxCommands.parseConfirmedTargets("mxl\towned|with|pipes \n:muxel-listed:0\n:muxel-listed:0\n")
+        let inventory = try TmuxCommands.parseConfirmedTargets("owned|with|pipes \n:muxel-listed:0\n:muxel-listed:0\n")
         XCTAssertNil(TmuxCommands.resolveTarget(stalePeer, in: inventory))
 
         // The second peer cannot distinguish that replacement from an unrelated
@@ -82,9 +82,9 @@ final class InteropTests: XCTestCase {
     func testMigrationProbeRequiresCompleteSuccessfulOrKnownAbsentReplies() throws {
         let empty = "no server running on /tmp/mxl\n:muxel-listed:1\nerror connecting to /tmp/default (No such file or directory)\n:muxel-listed:1\n"
         XCTAssertTrue(try TmuxCommands.parseConfirmedTargets(empty).isEmpty)
-        let collision = "mxl\towned\n:muxel-listed:0\n:muxel-listed:0\n"
+        let collision = "owned\n:muxel-listed:0\n:muxel-listed:0\n"
         XCTAssertEqual(try TmuxCommands.parseConfirmedTargets(collision), [.init(name: "owned", socket: "mxl")])
-        let spaced = try TmuxCommands.parseConfirmedTargets(":muxel-listed:0\ndefault\towned \n:muxel-listed:0\n")
+        let spaced = try TmuxCommands.parseConfirmedTargets(":muxel-listed:0\nowned \n:muxel-listed:0\n")
         XCTAssertEqual(spaced, [.init(name: "owned ", socket: "default")])
         var instance = Instance(id: "aaaaaaaa-0000-0000-0000-000000000000", projectId: "p", title: "pane", program: nil, args: [])
         instance.tmuxSession = "owned "
@@ -94,12 +94,60 @@ final class InteropTests: XCTestCase {
         for bad in [
             ":muxel-listed:0\n",
             ":muxel-listed:0\nerror connecting to /tmp/default (Permission denied)\n:muxel-listed:1\n",
-            "broken row\n:muxel-listed:0\n:muxel-listed:0\n",
+            // An empty line is no session name: it spoils a status-0 answer.
+            "\n:muxel-listed:0\n:muxel-listed:0\n",
+            ":muxel-listed:0\nowned\n\n:muxel-listed:0\n",
+            "owned\n:muxel-listed:0\n:muxel-listed:0\n:muxel-listed:0\n",
             "no server running on /tmp/mxl\n:muxel-listed:unknown\n:muxel-listed:0\n"
         ] {
             XCTAssertThrowsError(try TmuxCommands.parseConfirmedTargets(bad))
         }
         XCTAssertEqual(TmuxCommands.confirmedTargetsCommand().components(separatedBy: ":muxel-listed:").count - 1, 2)
+        XCTAssertTrue(TmuxCommands.confirmedTargetsCommand().contains("'#{session_name}'"))
+        // Any other line of a status-0 answer is one exact name, like desktop's parser.
+        XCTAssertEqual(try TmuxCommands.parseConfirmedTargets("a\tb|c \n:muxel-listed:0\n:muxel-listed:0\n \n"),
+                       [.init(name: "a\tb|c ", socket: "mxl")])
+    }
+
+    /// Reattaching a session still running on Default needs only Default's answer.
+    /// Whatever muxel's own server replied, the pane attaches as it did before
+    /// migration existed; only a move off Default needs both. Mirrors
+    /// `a_live_default_session_needs_only_defaults_answer` in `ssh.rs`.
+    func testALiveDefaultSessionNeedsOnlyDefaultsAnswer() throws {
+        var instance = Instance(id: "aaaaaaaa-0000-0000-0000-000000000000", projectId: "p", title: "pane", program: nil, args: [])
+        instance.tmuxSession = "owned "
+        instance.tmuxSocket = "default"
+        let live = "owned \n:muxel-listed:0\n"
+        for own in [
+            "Welcome to devbox\nowned \n:muxel-listed:0\n",
+            "error connecting to /tmp/mxl (Permission denied)\n:muxel-listed:1\n",
+            "\n:muxel-listed:0\n",
+            "something unfamiliar\n:muxel-listed:2\n",
+            "garbage without a status\n:muxel-listed:\n"
+        ] {
+            let targets = try TmuxCommands.defaultOwnerTargets(own + live, name: "owned ")
+            XCTAssertEqual(TmuxCommands.resolveTarget(instance, in: targets),
+                           TmuxCommands.SessionTarget(name: "owned ", socket: "default"), own)
+        }
+        let denied = "error connecting to /tmp/mxl (Permission denied)\n:muxel-listed:1\n"
+        XCTAssertThrowsError(try TmuxCommands.parseConfirmedTargets(denied + live))
+        // Default's answer must itself be complete and hold the exact name.
+        for onDefault in [
+            "owned\n:muxel-listed:0\n",
+            "owned \n",
+            "owned \n:muxel-listed:1\n",
+            "owned \n\n:muxel-listed:0\n",
+            "no server running on /tmp/default\n:muxel-listed:1\n"
+        ] {
+            XCTAssertThrowsError(try TmuxCommands.defaultOwnerTargets(denied + onDefault, name: "owned ")) {
+                XCTAssertEqual($0 as? TmuxCommands.ProbeError, .incomplete)
+            }
+        }
+        // Gone from Default with both answers in: the ordinary migration decision.
+        let gone = "no server running on /tmp/mxl\n:muxel-listed:1\n:muxel-listed:0\n"
+        let targets = try TmuxCommands.defaultOwnerTargets(gone, name: "owned ")
+        XCTAssertNil(TmuxCommands.resolveTarget(instance, in: targets))
+        XCTAssertEqual(try TmuxCommands.targetForNewSession(instance, name: "owned ", confirmedTargets: targets).target.socket, "mxl")
     }
 
     func testRemoteLayoutDecodesDesktopShape() throws {

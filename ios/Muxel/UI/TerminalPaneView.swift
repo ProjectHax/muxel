@@ -168,9 +168,16 @@ struct TerminalPaneView: View {
             let conn = state.connection(for: host)
             try await conn.connect()
             guard let plan = try await state.prepareTmuxAttachmentPlan(instanceId: instance.id, in: project, prepare: { current in
+                // The name a new session gets: the authoritative one recorded in the
+                // shared layout (`tmux_session`), so we converge with the name desktop
+                // uses for this instance; else one derived from the host name.
+                let name = (current.tmuxSession?.isEmpty == false)
+                    ? current.tmuxSession!
+                    : TmuxSession.name(hostName: host.name, instanceId: current.id)
                 let targets: [TmuxCommands.SessionTarget]
                 if current.tmuxSocket == "default" {
-                    targets = try TmuxCommands.parseConfirmedTargets(try await conn.run(TmuxCommands.confirmedTargetsCommand()))
+                    targets = try TmuxCommands.defaultOwnerTargets(
+                        try await conn.run(TmuxCommands.confirmedTargetsCommand()), name: name)
                 } else {
                     targets = TmuxCommands.parseTargets(try await conn.run(
                         TmuxCommands.listTargetsCommand(socket: current.tmuxSocket)))
@@ -191,13 +198,8 @@ struct TerminalPaneView: View {
                     socket = live.socket
                     command = TmuxCommands.attachPTYCommand(session: live.name, socket: socket)
                 } else {
-                    // Creating it: prefer the authoritative name recorded in the shared
-                    // layout (`tmux_session`) so we converge with the name desktop uses for
-                    // this instance; fall back to deriving one from the host name.
+                    // Creating it, under `name`.
                     creating = true
-                    let name = (current.tmuxSession?.isEmpty == false)
-                        ? current.tmuxSession!
-                        : TmuxSession.name(hostName: host.name, instanceId: current.id)
                     sessionName = name
                     let prepared = try TmuxCommands.targetForNewSession(current, name: name, confirmedTargets: targets)
                     socket = prepared.target.socket
