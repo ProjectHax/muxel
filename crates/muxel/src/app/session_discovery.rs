@@ -1336,18 +1336,25 @@ mod tests {
         assert!(!ownership.bound_elsewhere(owner, "accepted"));
     }
 
+    /// A home and data directory under a temp dir, removed on drop.
     struct ClaudeFixture {
+        root: PathBuf,
         home: PathBuf,
         data: PathBuf,
         pane: Uuid,
         request: muxel_core::session_discovery::SessionDiscoveryRequest,
     }
 
+    impl Drop for ClaudeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     impl ClaudeFixture {
         fn new() -> Self {
-            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.wip/discovery-tests")
-                .join(Uuid::new_v4().to_string());
+            let root =
+                std::env::temp_dir().join(format!("muxel-discovery-test-{}", Uuid::new_v4()));
             let home = root.join("home");
             let data = root.join("data");
             std::fs::create_dir_all(home.join(".claude/projects/fixture")).unwrap();
@@ -1368,6 +1375,7 @@ mod tests {
                 )
                 .unwrap();
             Self {
+                root,
                 home,
                 data,
                 pane,
