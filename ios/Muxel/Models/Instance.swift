@@ -152,7 +152,11 @@ struct Instance: Codable, Equatable, Identifiable {
         useTmux = (try c.decodeIfPresent(Bool.self, forKey: .useTmux)) ?? false
         useWorktree = (try c.decodeIfPresent(Bool.self, forKey: .useWorktree)) ?? false
         tmuxSession = try c.decodeIfPresent(String.self, forKey: .tmuxSession)
-        tmuxSocket = try c.decodeIfPresent(String.self, forKey: .tmuxSocket)
+        // An owner tmux can't use as a socket name reads as none (legacy discovery),
+        // like `tmux::recorded_socket` on desktop, rather than failing the layout.
+        tmuxSocket = try c.decodeIfPresent(String.self, forKey: .tmuxSocket).flatMap {
+            TmuxCommands.isSocketName($0) ? $0 : nil
+        }
         worktreePath = try c.decodeIfPresent(String.self, forKey: .worktreePath)
         worktreeBranch = try c.decodeIfPresent(String.self, forKey: .worktreeBranch)
         autoModePresses = (try c.decodeIfPresent(Int.self, forKey: .autoModePresses)) ?? 0

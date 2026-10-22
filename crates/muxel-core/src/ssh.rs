@@ -1742,7 +1742,7 @@ mod tests {
 
     #[test]
     fn named_remote_owners_are_quoted_and_never_discovered_again() {
-        for name in ["", "mxl-profile", "owner '名; $(touch /tmp/no)"] {
+        for name in ["   ", "mxl-profile", "owner '名; $(touch no)"] {
             let socket = Socket::Named(name.into());
             let target = crate::tmux::SessionTarget::new("work", Some(socket.clone()));
             let selection = format!("set -- -L {}", sh_quote(name));

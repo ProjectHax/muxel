@@ -531,8 +531,9 @@ pub struct Instance {
     /// tmux session name, once created.
     #[serde(default)]
     pub tmux_session: Option<String>,
-    /// The server that owns the session. Absent only for older saved panes.
-    #[serde(default)]
+    /// The server that owns the session. Absent only for older saved panes (or
+    /// one recorded under a name tmux can't use, see [`tmux::recorded_socket`]).
+    #[serde(default, deserialize_with = "tmux::recorded_socket")]
     pub tmux_socket: Option<tmux::Socket>,
     /// The grid `(cols, rows)` this pane last rendered at, so it can respawn at the
     /// size it will actually be laid out at instead of the 80×24 default.
@@ -3770,7 +3771,7 @@ mod remote_layout_tests {
     fn unfamiliar_socket_owners_preserve_every_peer_pane() {
         let mut ws = Workspace::default();
         let mut project = remote_project("/srv/app");
-        let instances: Vec<_> = ["mxl", "default", "mxl-profile", "", "owner '名; $()"]
+        let instances: Vec<_> = ["mxl", "default", "mxl-profile", "   ", "owner '名; $()"]
             .into_iter()
             .map(|name| {
                 let mut instance = Instance::shell(project.id);
@@ -3812,6 +3813,15 @@ mod remote_layout_tests {
             instances.len(),
             "different owners must not collapse namesakes"
         );
+
+        // An owner tmux can't use as a socket name costs only that owner.
+        let mut json: serde_json::Value = serde_json::from_str(&doc.to_json()).unwrap();
+        json["instances"][2]["tmux_socket"] = serde_json::json!("../elsewhere");
+        let parsed = RemoteLayout::parse(&json.to_string(), "/srv/app").unwrap();
+        assert_eq!(parsed.instances.len(), instances.len());
+        let invalid = &parsed.instances[2];
+        assert_eq!(invalid.tmux_socket, None);
+        assert_eq!(invalid.tmux_session.as_deref(), Some("same-name"));
     }
 
     #[test]

@@ -150,6 +150,33 @@ final class InteropTests: XCTestCase {
         XCTAssertEqual(try TmuxCommands.targetForNewSession(instance, name: "owned ", confirmedTargets: targets).target.socket, "mxl")
     }
 
+    /// `tmux -L` joins the name onto its socket directory, so a recorded owner that
+    /// isn't a plain file name could reach a server elsewhere. It decodes as no
+    /// owner (legacy discovery) and the rest of the layout still loads. Mirrors
+    /// `a_recorded_owner_that_is_not_a_socket_name_reads_as_none` in `tmux.rs`.
+    func testARecordedOwnerThatIsNotASocketNameDecodesAsNone() throws {
+        let invalid = ["", ".", "..", "/tmp/elsewhere", "../mxl", "a/b", "nul\u{0}x"]
+        for name in invalid { XCTAssertFalse(TmuxCommands.isSocketName(name), name) }
+        for name in ["mxl", "default", "mxl-profile", "   ", "...", ".hidden"] {
+            XCTAssertTrue(TmuxCommands.isSocketName(name), name)
+        }
+        var rows: [[String: Any]] = []
+        for (index, name) in (invalid + ["mxl-profile"]).enumerated() {
+            rows.append(["id": "aaaaaaaa-0000-0000-0000-00000000000\(index)", "project_id": "p", "title": "pane",
+                         "tmux_session": "work", "tmux_socket": name])
+        }
+        let document: [String: Any] = ["version": 1, "updated_at": 1, "remote_root": "/srv/app",
+                                       "worktrees": [Any](), "instances": rows]
+        let data = try JSONSerialization.data(withJSONObject: document)
+        let layout = try MuxelJSON.decoder.decode(RemoteLayout.self, from: data)
+        XCTAssertEqual(layout.instances.count, invalid.count + 1)
+        for instance in layout.instances.dropLast() {
+            XCTAssertNil(instance.tmuxSocket)
+            XCTAssertEqual(instance.tmuxSession, "work")
+        }
+        XCTAssertEqual(layout.instances.last?.tmuxSocket, "mxl-profile")
+    }
+
     func testRemoteLayoutDecodesDesktopShape() throws {
         let json = """
         {

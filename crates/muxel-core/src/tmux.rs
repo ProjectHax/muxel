@@ -76,10 +76,17 @@ impl From<Socket> for String {
 impl TryFrom<String> for Socket {
     type Error = String;
 
+    /// Any name tmux can use as `-L <name>`. A name that isn't a plain file name
+    /// (empty, `.`, `..`, or holding a `/` or NUL) is refused: `-L` joins it onto
+    /// tmux's socket directory, so a path in it would reach a server outside that
+    /// directory. A recorded owner like that reads as no owner
+    /// ([`recorded_socket`]). Ported to Swift as `TmuxCommands.isSocketName`.
     fn try_from(name: String) -> Result<Self, Self::Error> {
         match name.as_str() {
             SOCKET_NAME => Ok(Self::Private),
             "default" => Ok(Self::Default),
+            "" | "." | ".." => Err("not a tmux socket name".to_string()),
+            _ if name.contains(['/', '\0']) => Err("not a tmux socket name".to_string()),
             _ => name
                 .strip_prefix("mxl-")
                 .filter(|hash| {
@@ -94,6 +101,17 @@ impl TryFrom<String> for Socket {
                 .unwrap_or_else(|| Ok(Self::Named(name))),
         }
     }
+}
+
+/// `deserialize_with` for a recorded owner (`Option<Socket>`). A name that isn't
+/// a socket name ([`Socket::try_from`]) reads as no owner, so its pane goes
+/// through legacy discovery instead of failing the whole document. Ported to
+/// Swift in `Instance`'s decoder.
+pub fn recorded_socket<'de, D>(deserializer: D) -> Result<Option<Socket>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.and_then(|name| Socket::try_from(name).ok()))
 }
 
 /// A session name and the server that owns it. `None` is legacy metadata whose
@@ -514,7 +532,7 @@ fn instance_suffix(instance: Uuid) -> String {
 pub struct ClosedSession {
     /// The session name the closed pane was launched with.
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "recorded_socket")]
     pub socket: Option<Socket>,
     /// The closed instance. The name is derived from a slug that can change under
     /// muxel's feet (a renamed host, a session a peer created under its own slug),
@@ -1477,8 +1495,9 @@ mod tests {
     #[test]
     fn named_owner_roundtrips_without_becoming_legacy() {
         for name in [
-            "",
             "   ",
+            "...",
+            ".hidden",
             "mxl-profile",
             "default ",
             "MXL",
@@ -1514,6 +1533,39 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// `tmux -L` joins the name onto its socket directory, so a recorded name that
+    /// isn't a plain file name could reach a server somewhere else. It reads as no
+    /// owner (legacy discovery on muxel's own servers) and the rest of the document
+    /// still loads.
+    #[test]
+    fn a_recorded_owner_that_is_not_a_socket_name_reads_as_none() {
+        for name in ["", ".", "..", "/tmp/elsewhere", "../mxl", "a/b", "nul\0x"] {
+            let name = name.to_string();
+            assert!(Socket::try_from(name.clone()).is_err(), "{name:?}");
+            let closed: ClosedSession = serde_json::from_value(serde_json::json!({
+                "name": "work",
+                "socket": name,
+                "instance": Uuid::nil(),
+            }))
+            .unwrap();
+            assert_eq!(closed.socket, None, "{name:?}");
+            let mut instance =
+                serde_json::to_value(crate::Instance::shell(Uuid::new_v4())).unwrap();
+            instance["tmux_session"] = serde_json::json!("work");
+            instance["tmux_socket"] = serde_json::json!(name);
+            let instance: crate::Instance = serde_json::from_value(instance).unwrap();
+            assert_eq!(instance.tmux_socket, None, "{name:?}");
+            assert_eq!(instance.tmux_session.as_deref(), Some("work"));
+        }
+        let closed: ClosedSession = serde_json::from_value(serde_json::json!({
+            "name": "work",
+            "socket": null,
+            "instance": Uuid::nil(),
+        }))
+        .unwrap();
+        assert_eq!(closed.socket, None);
     }
 
     /// The recorded name wins. muxel writes `muxel_<project>_<id>` onto an instance

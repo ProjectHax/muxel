@@ -127,6 +127,15 @@ enum TmuxCommands {
         }
     }
 
+    /// Whether tmux can use `name` as `-L <name>`: a plain file name in its socket
+    /// directory, so not empty, `.` or `..`, and holding no `/` or NUL (`-L` joins
+    /// the name onto that directory, so a path would reach a server elsewhere). A
+    /// recorded owner that isn't one decodes as none (`Instance`), which means
+    /// legacy discovery. Port of `Socket::try_from` in `crates/muxel-core/src/tmux.rs`.
+    static func isSocketName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
+    }
+
     /// The checked listing a pane recorded on the default server needs: muxel's
     /// own server, then the default one, each answer closed by its exit status.
     /// Names only, one per line, so no session name is split. Port of
