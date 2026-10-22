@@ -1041,6 +1041,8 @@ pub struct TerminalSession {
     scrollbar_drag: Mutex<Option<f32>>,
     /// Resize debounce state (skips redundant resizes + coalesces bursts).
     resize: Mutex<ResizeState>,
+    /// A resize away and back still invalidates a controller's input-frame proof.
+    resize_revision: AtomicU64,
     /// Active search needle (lowercased not required — matching is ASCII-insensitive).
     /// Empty = no search; the element highlights matches of this each paint.
     search: Mutex<Vec<char>>,
@@ -1532,6 +1534,7 @@ impl TerminalSession {
                 target: (cols, rows),
                 since: Instant::now(),
             }),
+            resize_revision: AtomicU64::new(0),
             search: Mutex::new(Vec::new()),
             local_paste: Mutex::new(None),
             path_paste_error: Mutex::new(None),
@@ -2060,6 +2063,10 @@ impl TerminalSession {
         self.resize.lock().applied
     }
 
+    pub(crate) fn resize_revision(&self) -> u64 {
+        self.resize_revision.load(Ordering::Relaxed)
+    }
+
     /// Resize the PTY and emulator grid, **debounced**: the requested size must
     /// hold steady for [`RESIZE_SETTLE`] before it's applied, so a burst of
     /// changes from a pane close / divider drag collapses into one resize (one
@@ -2076,6 +2083,7 @@ impl TerminalSession {
             return false; // already at this size
         }
         if st.target != (cols, rows) {
+            self.resize_revision.fetch_add(1, Ordering::Relaxed);
             // New target: start (or restart) the settle window.
             st.target = (cols, rows);
             st.since = Instant::now();
@@ -2097,6 +2105,7 @@ impl TerminalSession {
             .lock()
             .resize(TermSize::new(cols as usize, rows as usize));
         st.applied = (cols, rows);
+        self.resize_revision.fetch_add(1, Ordering::Relaxed);
         self.bump_content();
         self.trigger_runtime();
         false
@@ -3944,6 +3953,41 @@ mod wheel_report_tests {
         push_mouse_report(&mut b, 0, 0, 0, false, false);
         // ESC [ M, release button 3+32=35, cell (1,1) → 33,33
         assert_eq!(b, &[0x1b, b'[', b'M', 35, 33, 33]);
+    }
+}
+
+#[cfg(test)]
+mod ctl_resize_tests {
+    use super::{CommandSpec, RESIZE_SETTLE, TerminalSession};
+    use std::{thread, time::Duration};
+
+    #[test]
+    fn ctl_retry_frame_is_invalidated_by_resize_requests_and_application() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
+        let initial = session.resize_revision();
+        let pending = session.resize(81, 24);
+        let requested = session.resize_revision();
+        let still_pending = session.resize(81, 24);
+        let repeated = session.resize_revision();
+        thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
+        let applied = session.resize(81, 24);
+        let after_apply = session.resize_revision();
+        let away_again = session.resize(80, 24);
+        let after_away = session.resize_revision();
+        session.kill();
+        assert!(pending && still_pending && away_again);
+        assert!(!applied);
+        assert!(requested > initial);
+        assert_eq!(
+            requested, repeated,
+            "identical pending requests do not redraw"
+        );
+        assert!(after_apply > requested && after_away > after_apply);
     }
 }
 

@@ -1497,6 +1497,17 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   includes the actual `launch_id` and `"pasted": true` for admission to the PTY
   writer, not confirmation of agent delivery. A lost reply does not make a
   retry safe; inspect the agent before typing again.
+  Codex, Claude and Grok sends also observe provider acceptance for up to ten
+  seconds. `submission_confirmed` is true only for a fresh provider receipt,
+  false when acceptance remains unknown, and null for an unsupported provider.
+  `enter_retries` reports zero or one additional Enter. Windows Codex alone may
+  receive that retry after five seconds while its exact, fully visible ASCII
+  prose remains in the idle composer and no local input intervened. Clipped,
+  multiline, Unicode or completion drafts get no retry. Text is never pasted
+  twice. Retry also requires a compact composer frame from before the paste
+  and an added blank cursor line proving that the first Enter was consumed;
+  a pending Enter never authorizes another.
+  An unconfirmed receipt requires inspecting `screen` before more input.
 - `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
   ends (or it blocks on a question, or exits), then print what `show` prints.
   Startup tasks stay pending until fresh provider-owned acceptance, not merely
@@ -1553,8 +1564,9 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `not_running`, `exited` - the agent isn't running; the user has to open it.
 - `claimed_elsewhere` - another request holds the shared tmux claim.
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
-- `input_changed` - the prompt was pasted but Enter was withheld. Inspect
-  `screen` before retrying; the input is still there.
+- `input_changed` - input intervened before Enter or during submission checking.
+  No further Enter is sent. Inspect
+  `screen` before sending more input.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
 - `control_disabled` - outside control was turned off before the mutation.
 - `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
