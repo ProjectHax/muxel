@@ -2850,6 +2850,17 @@ fn probe_ssh_command_config(
     }
 }
 
+/// The pause before the next exit poll in [`GitEnv::wait_until`], after one of
+/// `pause`: starting at a millisecond and doubling to 50 ms. A short command
+/// (a tmux probe, run on the UI thread) is seen to exit within about its own
+/// run time, rather than costing a whole 50 ms step; a long one is still polled
+/// only every 50 ms.
+fn next_exit_poll(pause: Option<Duration>) -> Duration {
+    const FIRST: Duration = Duration::from_millis(1);
+    const MAX: Duration = Duration::from_millis(50);
+    pause.map_or(FIRST, |pause| (pause * 2).min(MAX))
+}
+
 impl GitEnv {
     /// Poll until exit or the original deadline, then kill and wait. Test
     /// receipts distinguish deadline expiry from a poll error and OS latency.
@@ -2859,6 +2870,7 @@ impl GitEnv {
         let mut child = spawned.child;
         #[cfg(test)]
         let mut stop = GitStopReason::Deadline;
+        let mut pause = None;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -2891,7 +2903,9 @@ impl GitEnv {
             if now >= deadline {
                 break;
             }
-            std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+            let next = next_exit_poll(pause);
+            pause = Some(next);
+            std::thread::sleep((deadline - now).min(next));
         }
         #[cfg(test)]
         let stop_observed = Instant::now();
@@ -3490,6 +3504,20 @@ mod tests {
         let lifecycle = GitEnv::for_tests();
         assert!(run_tmux_output_with(hanging_tmux_command(), Instant::now(), &lifecycle).is_err());
         assert_eq!(lifecycle.spawned.load(Ordering::SeqCst), 0);
+    }
+
+    /// A probe that exits at once is seen within about its own run time, not a
+    /// whole 50 ms poll step; a long wait still polls every 50 ms.
+    #[test]
+    fn exit_polls_start_short_and_back_off_to_fifty_ms() {
+        let mut pauses = Vec::new();
+        let mut pause = None;
+        for _ in 0..9 {
+            let next = next_exit_poll(pause);
+            pauses.push(next.as_millis());
+            pause = Some(next);
+        }
+        assert_eq!(pauses, [1, 2, 4, 8, 16, 32, 50, 50, 50]);
     }
 
     #[test]
