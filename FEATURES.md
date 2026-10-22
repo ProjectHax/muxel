@@ -597,7 +597,9 @@ feature is added or changed, update the matching entry here in the same change**
   arguments. `--prompt TEXT` (or `--prompt -` for stdin) submits a user task
   through the existing one-shot runner path for a configured non-shell terminal
   preset. This replaces the preset's configured system prompt with the task;
-  preset arguments are kept. The typed first turn is exactly the task. Automatic
+  preset arguments are kept. The typed first turn is exactly the task, without
+  trailing whitespace (at most 10,000 characters, so the approval card can show
+  all of it). Automatic
   file-link and memory instructions use the preset's separate flag/config
   transport when available, and are omitted for TypeIn-only presets.
   The task text is discarded after first launch.
@@ -660,12 +662,12 @@ feature is added or changed, update the matching entry here in the same change**
   once a second and prints the final reply. `--no-wait` returns the pending ID for
   scripts to poll with `ctl new-status ID`. The floating card shows declared
   caller/pane information (`--from LABEL` and `MUXEL_INSTANCE_ID`), the
-  destination project, preset, cwd, pane name and the whole prompt, or full
-  literal argv. Long details scroll, with literal arguments shown one per line,
-  including empty arguments. Every value shows control, bidi and zero-width
-  characters as visible escapes (`\u{202e}`); leading or repeated blank lines
-  and long blank runs in the prompt are counted (`\n×3`) rather than drawn, and
-  a prompt past 10,000 characters ends with how many more were not shown.
+  destination project, preset with the program and arguments it runs, cwd,
+  pane name and the whole prompt, or full literal argv. Long details scroll,
+  with arguments shown one per line, including empty arguments. Every value
+  shows control, bidi and zero-width characters as visible escapes
+  (`\u{202e}`); leading or repeated blank lines, long blank runs and stacked
+  combining marks in the prompt are counted (`\n×3`) rather than drawn.
   Labels are not authenticated identities. **Allow once** / **Deny** require
   mouse clicks. Both buttons stay disabled for 750 ms after each card appears,
   and double-clicks are ignored. Mouse-down and release must belong to the same

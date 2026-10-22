@@ -12,8 +12,18 @@ pub(crate) struct PreparedCreation {
     preview: Instance,
 }
 
-/// The most of a `--prompt` its approval card draws; the rest is counted.
-const PROMPT_CARD_CHARS: usize = 10_000;
+/// What a preset pane will run, one argument per line like literal argv.
+fn preset_argv(preview: &Instance) -> String {
+    let argv: Vec<String> = std::iter::once(
+        preview
+            .program
+            .clone()
+            .unwrap_or_else(|| CommandSpec::shell().program),
+    )
+    .chain(preview.args.iter().cloned())
+    .collect();
+    serde_json::to_string_pretty(&argv).unwrap_or_default()
+}
 
 fn approval_now() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -295,20 +305,17 @@ impl MuxelApp {
                 t("Full argv"),
                 ctl::card_lines(&serde_json::to_string_pretty(argv).unwrap_or_default()),
             ));
+        } else {
+            // A preset's name says nothing about what it runs ("Codex" may run
+            // `ssh me@devbox`): show the program and its arguments as well.
+            details.push((t("Command"), ctl::card_lines(&preset_argv(preview))));
         }
         if let Some(prompt) = &request.options.prompt {
             // The task is what is being approved: all of it, in the scrolling
-            // details, up to a limit that keeps the card responsive.
-            let shown = ctl::card_prompt(prompt, PROMPT_CARD_CHARS);
-            let mut text = shown.text;
-            if shown.omitted_chars > 0 {
-                text.push('\n');
-                text.push_str(&tf(
-                    "… {count} more characters not shown",
-                    &[("count", &shown.omitted_chars.to_string())],
-                ));
-            }
-            details.push((t("Prompt"), text));
+            // details. Validation refuses a task longer than the card shows.
+            let shown = ctl::card_prompt(prompt, ctl::MAX_PROMPT_CHARS);
+            debug_assert_eq!(shown.omitted_chars, 0);
+            details.push((t("Prompt"), shown.text));
         }
         let waiting = self.control_approvals.len().saturating_sub(1);
         let card = div()
@@ -390,5 +397,26 @@ impl MuxelApp {
             )
             .into_any_element();
         Some(card)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preset_argv;
+    use muxel_core::{AgentPreset, Instance};
+
+    #[test]
+    fn the_card_shows_what_a_preset_runs_not_just_its_name() {
+        let mut preset = AgentPreset::codex();
+        preset.program = Some("ssh".into());
+        preset.args = vec!["me@devbox".into(), "-t".into(), "".into()];
+        let preview = Instance::from_preset(uuid::Uuid::new_v4(), &preset);
+        assert_eq!(preview.preset, "Codex");
+        let shown: Vec<String> = serde_json::from_str(&preset_argv(&preview)).unwrap();
+        assert_eq!(shown, ["ssh", "me@devbox", "-t", ""]);
+        // The default shell names the shell it will start.
+        let shell = Instance::shell(uuid::Uuid::new_v4());
+        let shown: Vec<String> = serde_json::from_str(&preset_argv(&shell)).unwrap();
+        assert_eq!(shown, [muxel_terminal::CommandSpec::shell().program]);
     }
 }

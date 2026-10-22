@@ -158,7 +158,7 @@ impl MuxelApp {
         // in the same UI transaction, before either path can consume the task.
         if let Some(prompt) = options.prompt.as_ref() {
             self.control_turns
-                .insert(iid, ControlTurn::startup(prompt.clone()));
+                .insert(iid, ControlTurn::startup(prompt.trim_end().to_string()));
         }
         if !options.focus {
             self.place_and_spawn_with_focus(

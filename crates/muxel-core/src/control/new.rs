@@ -45,6 +45,9 @@ pub struct NewOptions {
 
 /// The longest `--name` or `--from`, in characters.
 pub const MAX_LABEL_CHARS: usize = 100;
+/// The longest `--prompt` task, in characters after trailing whitespace: all of
+/// it must fit on the approval card.
+pub const MAX_PROMPT_CHARS: usize = 10_000;
 
 impl NewOptions {
     /// Also checked by the server: callers may send JSON without using the CLI.
@@ -82,6 +85,15 @@ impl NewOptions {
             .is_some_and(|text| text.trim().is_empty() || text.contains('\0'))
         {
             return Err("--prompt needs non-empty text without NUL".into());
+        }
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|text| text.trim_end().chars().count() > MAX_PROMPT_CHARS)
+        {
+            return Err(format!(
+                "--prompt is limited to {MAX_PROMPT_CHARS} characters, so its approval card can show all of it"
+            ));
         }
         if self.cwd.as_ref().is_some_and(|cwd| !cwd.is_absolute()) {
             return Err("--cwd must be an absolute directory".into());
@@ -198,8 +210,10 @@ impl NewOptions {
                 .build_instance(project.id, &preset, prompt);
                 instance.control_prompt = true;
                 // The task is a user turn, independently of the preset's frozen
-                // transport for automatic launch instructions.
-                instance.system_prompt = Some(prompt.clone());
+                // transport for automatic launch instructions. Trailing
+                // whitespace is trimmed, as for every runner task: a pasted
+                // newline would be an extra Enter without bracketed paste.
+                instance.system_prompt = Some(prompt.trim_end().to_string());
                 instance.instruction_injection = Some(preset.injection.clone());
                 instance
             } else {

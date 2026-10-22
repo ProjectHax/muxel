@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 mod new;
-pub use new::{MAX_LABEL_CHARS, NewOptions, NewPlacement, place_new_pane};
+pub use new::{MAX_LABEL_CHARS, MAX_PROMPT_CHARS, NewOptions, NewPlacement, place_new_pane};
 mod startup;
 pub use startup::{StartupFailure, StartupTurn, StartupTurnOwner, StartupTurnState};
 mod card;

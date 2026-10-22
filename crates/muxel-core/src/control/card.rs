@@ -65,19 +65,23 @@ fn escape(text: &str, keep_newlines: bool) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardPrompt {
     pub text: String,
-    /// Characters past the display limit, for an explicit "more" marker.
+    /// Characters past the display limit (validation keeps a `--prompt`
+    /// within it, so its card never has any).
     pub omitted_chars: usize,
 }
 
 /// Runs this long of one blank-looking character are counted, not drawn.
 const SPACE_RUN: usize = 8;
 const HIDDEN_RUN: usize = 4;
+const MARK_RUN: usize = 4;
 
 /// The whole task, up to `max_chars`, escaped like [`card_value`] but keeping
-/// its line breaks. Trailing whitespace is not shown: the runner trims it
-/// before typing. Blank space can't push the task out of view: leading blank
+/// its line breaks. Trailing whitespace is not shown: it is trimmed before the
+/// task is typed. Blank space can't push the task out of view: leading blank
 /// lines, and any run of two or more, become one `\n×N` row, and long runs of
-/// one whitespace or hidden character become `\u{20}×N`.
+/// one whitespace, blank or hidden character become `\u{20}×N`. A long run of
+/// combining marks (which can stack over the rows around it) shows its first
+/// mark and its length.
 pub fn card_prompt(prompt: &str, max_chars: usize) -> CardPrompt {
     let prompt = prompt.trim_end();
     let total = prompt.chars().count();
@@ -112,10 +116,20 @@ fn prompt_line(line: &str) -> String {
     let mut index = 0;
     while index < chars.len() {
         let c = chars[index];
+        let mark = |c: &char| c.general_category() == GeneralCategory::NonspacingMark;
+        if mark(&c) {
+            let run = chars[index..].iter().take_while(|next| mark(next)).count();
+            if run >= MARK_RUN {
+                push_escaped(&mut out, c);
+                let _ = write!(out, "…×{run}");
+                index += run;
+                continue;
+            }
+        }
         let run = chars[index..].iter().take_while(|&&next| next == c).count();
         let limit = if is_hidden_char(c) {
             HIDDEN_RUN
-        } else if c.is_whitespace() {
+        } else if c.is_whitespace() || c == '\u{2800}' {
             SPACE_RUN
         } else {
             usize::MAX
@@ -226,6 +240,17 @@ mod tests {
             "\\u{200b}×50task"
         );
         assert_eq!(shown("a\u{202e}b  c\td"), "a\\u{202e}b  c\\td");
+        // Blank braille cells and stacked combining marks are counted too;
+        // an ordinary accent is left alone.
+        assert_eq!(
+            shown(&format!("{}task", "\u{2800}".repeat(30))),
+            "\\u{2800}×30task"
+        );
+        assert_eq!(
+            shown(&format!("Z{}algo", "\u{301}\u{316}\u{35c}".repeat(10))),
+            "Z\\u{301}…×30algo"
+        );
+        assert_eq!(shown("cafe\u{301}"), "cafe\u{301}");
         assert_eq!(shown("a\u{2028}b"), "a\\u{2028}b");
     }
 

@@ -123,6 +123,53 @@ fn new_name_and_caller_label_are_bounded_visible_text() {
 }
 
 #[test]
+fn new_prompt_is_typed_without_trailing_whitespace_and_fits_its_card() {
+    use muxel_core::control::{MAX_PROMPT_CHARS, card_prompt};
+    let project = Project::new("repo", std::env::current_dir().unwrap());
+    let preset = AgentPreset::claude();
+    let raw = "\n  fix the pager\n\n  then run tests \t\n\n";
+    let instance = NewOptions {
+        prompt: Some(raw.into()),
+        ..Default::default()
+    }
+    .instance(&project, std::slice::from_ref(&preset), 0)
+    .unwrap();
+    // Leading blank lines and indentation are the caller's; trailing
+    // whitespace would only be extra Enters.
+    assert_eq!(
+        instance.system_prompt.as_deref(),
+        Some("\n  fix the pager\n\n  then run tests")
+    );
+    assert_eq!(
+        resolve_launch_for_session(&instance, false)
+            .startup_input
+            .as_deref(),
+        Some("\n  fix the pager\n\n  then run tests")
+    );
+
+    // Everything accepted is drawn on the card; longer tasks are refused.
+    let longest = format!("{}{}", "é".repeat(MAX_PROMPT_CHARS), "\n \n");
+    let options = NewOptions {
+        prompt: Some(longest.clone()),
+        ..Default::default()
+    };
+    options.validate().unwrap();
+    assert_eq!(card_prompt(&longest, MAX_PROMPT_CHARS).omitted_chars, 0);
+    for too_long in [
+        format!("{}x", "é".repeat(MAX_PROMPT_CHARS)),
+        "a".repeat(MAX_PROMPT_CHARS + 1),
+    ] {
+        let options = NewOptions {
+            prompt: Some(too_long.clone()),
+            ..Default::default()
+        };
+        let error = options.validate().unwrap_err();
+        assert!(error.contains("limited to"), "{error}");
+        assert!(parse_cli(&words(&["new", "repo", "--prompt", &too_long])).is_err());
+    }
+}
+
+#[test]
 fn new_parameters_freeze_both_plain_and_prompt_launches_without_mutating_preset() {
     let project = Project::new("repo", std::env::current_dir().unwrap());
     for preset in [AgentPreset::claude(), AgentPreset::codex()] {
