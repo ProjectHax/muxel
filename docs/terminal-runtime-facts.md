@@ -26,7 +26,13 @@ transition by polling more often.
 
 - `launch_id`: a fresh UUID minted by each spawned `TerminalSession`;
 - `binding_rev`: advances when the launch switches provider conversations (see
-  below). A provider that switches without telling muxel leaves it unchanged;
+  below). A provider that switches without telling muxel leaves it unchanged.
+  A launch into a conversation muxel knows at spawn begins at revision 1: one
+  it pinned with a session flag (`--session-id`, `--resume`), or the one a
+  program that reports no id of its own is in. A launch whose provider names
+  its conversation once running (a fresh Codex) begins at 0, and its first UUID
+  title begins revision 1. A known launch's first UUID title is no switch
+  unless it names a different id than the pinned one;
 - `snapshot_seq`: advances when the status, its reason, whether it is
   attributable (see below), the binding, or completion readiness changes;
 - `input_rev`: advances before ordinary non-empty input writes reach
@@ -123,9 +129,12 @@ current title without a completion edge.
 
   Scheduled-loop cleanup also reads the current snapshot, never retained
   attention history. It owns the launch and the conversation that received
-  the first submitted turn, only when its identity was observed before that
-  submission. Without a prior identity, ownership stays unknown for the whole
-  run: a later UUID or hook cannot prove which conversation received the prompt.
+  the first submitted turn, only when its identity was known before that
+  submission: known at spawn (a fresh Claude loop pane, launched with the
+  `--session-id` muxel minted) or named by a title first. Without a prior
+  identity (a fresh Codex launch whose prompt precedes its first title),
+  ownership stays unknown for the whole run: a later UUID or hook cannot prove
+  which conversation received the prompt.
   Later identities or submissions do not establish or transfer ownership.
   Replacement
   launches or conversations abandon the old run without completion or close.

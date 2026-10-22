@@ -4,6 +4,7 @@
 //! PTY reader thread — see `replies`.
 
 use crate::replies::Replies;
+use crate::session::LaunchBinding;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::term::ClipboardType;
 use parking_lot::Mutex;
@@ -159,6 +160,9 @@ pub(crate) struct LifecycleEvidence {
     /// never transfer that ownership to a replacement conversation. Revision
     /// zero means its recipient was unknown and stays unknown for this run.
     first_submission: Option<u64>,
+    /// What muxel knew at spawn about the conversation the launch opened. A
+    /// known one is revision 1 from the start.
+    launch: LaunchBinding,
     binding_rev: u64,
     binding_since: u64,
     /// The window of the switch reported out of band that began the current
@@ -171,6 +175,34 @@ pub(crate) struct LifecycleEvidence {
 }
 
 impl LifecycleEvidence {
+    /// Evidence for a launch that opens `launch`. A conversation known at spawn
+    /// is the launch's first binding (revision 1), so a turn submitted before
+    /// any title names it still has a known recipient. An unknown one begins
+    /// at revision 0, which the first UUID title advances.
+    pub(crate) fn for_launch(launch: &LaunchBinding) -> Self {
+        Self {
+            binding_rev: match launch {
+                LaunchBinding::Unknown => 0,
+                LaunchBinding::Known(_) => 1,
+            },
+            launch: launch.clone(),
+            ..Self::default()
+        }
+    }
+
+    /// Whether the launch's first UUID title, `thread`, begins a new binding.
+    /// It does when the conversation was unknown at spawn, or after a switch
+    /// reported out of band. Otherwise the launch is still in the conversation
+    /// it opened, which the title names unless muxel pinned a different id.
+    pub(crate) fn first_thread_switches(&self, thread: &str) -> bool {
+        match &self.launch {
+            LaunchBinding::Known(pinned) if self.binding_rev == 1 => pinned
+                .as_deref()
+                .is_some_and(|id| !thread_names(id, thread)),
+            _ => true,
+        }
+    }
+
     /// The parser is about to apply output the reader received at `at`.
     pub(crate) fn begin_read(&mut self, at: SystemTime) {
         self.reading_at = Some(at);
@@ -324,6 +356,17 @@ impl LifecycleEvidence {
     }
 }
 
+/// Whether a title's thread field names conversation `id`: its full UUID, or
+/// Codex's abbreviation of it (the first 29 characters and `...`).
+fn thread_names(id: &str, thread: &str) -> bool {
+    match thread.strip_suffix("...") {
+        Some(prefix) => id
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix)),
+        None => id.eq_ignore_ascii_case(thread),
+    }
+}
+
 // Forwards terminal events to shared state. Lives inside the `Term`, so its
 /// `send_event` runs wherever the VTE processor is advanced (the GPUI thread) —
 /// and while the `Term` mutex is held, so it must never call back into the
@@ -376,7 +419,10 @@ impl EventListener for MuxelListener {
                 let at = evidence.output_time();
                 let seq = evidence.record_title(Some(title.clone()), at);
                 if let Some(next) = session_thread_field(&title) {
-                    let changed = hint.as_deref().and_then(session_thread_field) != Some(next);
+                    let changed = match hint.as_deref().and_then(session_thread_field) {
+                        Some(previous) => previous != next,
+                        None => evidence.first_thread_switches(next),
+                    };
                     *hint = Some(title.clone());
                     if changed {
                         // This title opens the new provider binding. Frames
@@ -484,6 +530,82 @@ mod tests {
         listener.send_event(Event::ResetTitle);
         assert_eq!(listener.title_generation.load(Ordering::Relaxed), 5);
         assert_eq!(*listener.title.lock(), None);
+    }
+
+    fn listener_for(launch: LaunchBinding) -> MuxelListener {
+        MuxelListener {
+            replies: Arc::new(Replies::new(Arc::new(Mutex::new(Box::new(
+                Vec::<u8>::new(),
+            ))))),
+            title: Arc::new(Mutex::new(None)),
+            evidence: Arc::new(Mutex::new(LifecycleEvidence::for_launch(&launch))),
+            title_generation: Arc::new(AtomicU64::new(0)),
+            title_changed_at: Arc::new(Mutex::new(None)),
+            session_id_hint: Arc::new(Mutex::new(None)),
+            bell: Arc::new(AtomicBool::new(false)),
+            clipboard_store: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn a_launch_into_a_known_conversation_owns_a_turn_before_any_title() {
+        // A fresh Claude pane: muxel minted its `--session-id`. Claude puts no
+        // UUID in its title, and its hook doesn't run for a fresh start.
+        let at = SystemTime::now();
+        let pinned = uuid::Uuid::new_v4().to_string();
+        let mut evidence = LifecycleEvidence::for_launch(&LaunchBinding::Known(Some(pinned)));
+        assert_eq!(evidence.binding_rev(), 1);
+        evidence.record_submission(at);
+        assert_eq!(evidence.first_submission_binding(), Some(1));
+        assert!(evidence.read(None).submitted);
+        // `/clear` reported by the hook begins another conversation; the run
+        // still owns only the first.
+        evidence.switch_binding(at, at, at);
+        assert_eq!(evidence.binding_rev(), 2);
+        assert_eq!(evidence.first_submission_binding(), Some(1));
+        // An unknown launch's turn before the first identity stays unowned.
+        let mut evidence = LifecycleEvidence::for_launch(&LaunchBinding::Unknown);
+        assert_eq!(evidence.binding_rev(), 0);
+        evidence.record_submission(at);
+        assert_eq!(evidence.first_submission_binding(), None);
+    }
+
+    #[test]
+    fn the_first_title_naming_a_known_conversation_is_not_a_switch() {
+        let pinned = "019f95d7-db31-7db0-904d-9e08330e0000";
+        let other = "8c6f2a10-5b3e-4d7a-9f21-0a1b2c3d4e5f";
+        // `codex resume <pinned>` publishes its abbreviation of the id.
+        let listener = listener_for(LaunchBinding::Known(Some(pinned.into())));
+        listener.send_event(Event::Title(format!("{}... | Working", &pinned[..29])));
+        assert_eq!(listener.evidence.lock().binding_rev(), 1);
+        listener.send_event(Event::Title(format!("{}... | Ready", &pinned[..29])));
+        assert_eq!(listener.evidence.lock().binding_rev(), 1);
+        // A different thread after it is a switch, as for any launch.
+        listener.send_event(Event::Title(format!("{other} | Ready")));
+        assert_eq!(listener.evidence.lock().binding_rev(), 2);
+
+        // A first title naming another thread than the pinned one is a switch.
+        let listener = listener_for(LaunchBinding::Known(Some(pinned.into())));
+        listener.send_event(Event::Title(format!("{other} | Ready")));
+        assert_eq!(listener.evidence.lock().binding_rev(), 2);
+
+        // Without a pinned id, the first title names the launch's conversation.
+        let listener = listener_for(LaunchBinding::Known(None));
+        listener.send_event(Event::Title(format!("{other} | Ready")));
+        assert_eq!(listener.evidence.lock().binding_rev(), 1);
+
+        // After a switch reported out of band, the first title begins the
+        // next binding, in exact order.
+        let listener = listener_for(LaunchBinding::Known(Some(pinned.into())));
+        let now = SystemTime::now();
+        listener.evidence.lock().switch_binding(now, now, now);
+        listener.send_event(Event::Title(format!("{pinned} | Ready")));
+        assert_eq!(listener.evidence.lock().binding_rev(), 3);
+
+        // An unknown launch's first title is its first identity.
+        let listener = listener_for(LaunchBinding::Unknown);
+        listener.send_event(Event::Title(format!("{pinned} | Ready")));
+        assert_eq!(listener.evidence.lock().binding_rev(), 1);
     }
 
     #[test]

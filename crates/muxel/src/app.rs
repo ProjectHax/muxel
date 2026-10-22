@@ -47,8 +47,8 @@ use muxel_core::{
     sync_agent_injection_modes, sync_codex_approval_args,
 };
 use muxel_terminal::{
-    AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
-    clean_agent_title,
+    AgentStatus, CommandSpec, LaunchBinding, TerminalLaunch, TerminalMouseMode, TerminalSession,
+    TerminalView, clean_agent_title,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -2903,6 +2903,28 @@ fn claude_session_state(
     }
 }
 
+/// What a launch knows at spawn about the conversation it opens. Session
+/// flags pin it (`resume_args`: the flag, then the id). Without them, an agent
+/// that mints its own id, as Codex does, names it only once it runs; any other
+/// program reports no id of its own, so it is in the conversation it opened
+/// until a hook or registry reports a switch.
+fn launch_binding(
+    preset: Option<&muxel_core::AgentPreset>,
+    program: Option<&str>,
+    resume_args: Option<&[String]>,
+) -> LaunchBinding {
+    if let Some(args) = resume_args {
+        return LaunchBinding::Known(args.get(1).cloned());
+    }
+    let agent_minted = preset
+        .is_some_and(|preset| preset.resume_flag.is_some() && preset.session_id_flag.is_none());
+    if agent_minted || is_codex_program(program) {
+        LaunchBinding::Unknown
+    } else {
+        LaunchBinding::Known(None)
+    }
+}
+
 fn effective_local_cwd(
     resume_cwd: Option<&Path>,
     worktree_cwd: Option<&Path>,
@@ -3182,12 +3204,15 @@ const MAX_LOOP_RUNTIME: Duration = Duration::from_secs(30 * 60);
 mod loop_cleanup_tests {
     use super::{
         AgentStatus, LoopCleanup, LoopRun, MAX_LOOP_RUNTIME, PostRunAction, SeenStatus,
-        StatusBinding, StatusSample, apply_status_sample,
+        StatusBinding, StatusSample, apply_status_sample, launch_binding, loop_heartbeat,
     };
+    use muxel_core::{AgentPreset, Instance};
     use muxel_terminal::{
-        CommandSpec, TerminalRuntimeSnapshot, TerminalSession, TerminalStatusCoverage,
-        TerminalStatusReason,
+        CommandSpec, LaunchBinding, TerminalRuntimeSnapshot, TerminalSession,
+        TerminalStatusCoverage, TerminalStatusReason,
     };
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
     use uuid::Uuid;
 
@@ -3217,6 +3242,12 @@ mod loop_cleanup_tests {
     }
 
     fn session() -> (std::sync::Arc<TerminalSession>, muxel_terminal::PtyReceiver) {
+        session_into(LaunchBinding::Unknown)
+    }
+
+    fn session_into(
+        binding: LaunchBinding,
+    ) -> (std::sync::Arc<TerminalSession>, muxel_terminal::PtyReceiver) {
         #[cfg(windows)]
         let spec = CommandSpec::program(
             "cmd.exe",
@@ -3224,7 +3255,153 @@ mod loop_cleanup_tests {
         );
         #[cfg(unix)]
         let spec = CommandSpec::program("/bin/cat", vec![]);
-        TerminalSession::spawn(spec, 80, 24).expect("spawn fixture")
+        TerminalSession::spawn(spec.with_binding(binding), 80, 24).expect("spawn fixture")
+    }
+
+    /// A fresh Claude loop pane as `command_for` launches it: muxel mints the
+    /// conversation's `--session-id`.
+    fn claude_loop_pane() -> (std::sync::Arc<TerminalSession>, muxel_terminal::PtyReceiver) {
+        let claude = AgentPreset::claude();
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &claude);
+        instance.session_id = Some(Uuid::new_v4().to_string());
+        let args = muxel_core::session_resume_args(&claude, &instance).unwrap();
+        assert_eq!(args[0], "--session-id");
+        session_into(launch_binding(
+            Some(&claude),
+            claude.program.as_deref(),
+            Some(&args),
+        ))
+    }
+
+    /// One scheduled-loop heartbeat over a docked pane whose runtime shows
+    /// `status`; returns the panes an Exit-policy run closes.
+    fn heartbeat(
+        runs: &mut HashMap<Uuid, LoopRun>,
+        pane: Uuid,
+        session: &Arc<TerminalSession>,
+        status: AgentStatus,
+    ) -> Vec<Uuid> {
+        let docked = HashMap::from([(pane, session.clone())]);
+        let popouts: HashMap<Uuid, ()> = HashMap::new();
+        loop_heartbeat(
+            runs,
+            &docked,
+            &popouts,
+            |_| None,
+            |session, run| {
+                let rev = session.binding_revision();
+                run.cleanup(
+                    snapshot(session.id, rev, status),
+                    rev,
+                    session.first_submission_binding(),
+                    Duration::ZERO,
+                )
+            },
+        )
+    }
+
+    #[test]
+    fn launches_know_the_conversation_muxel_pins() {
+        let project = Uuid::new_v4();
+        let claude = AgentPreset::claude();
+        let mut fresh = Instance::from_preset(project, &claude);
+        let id = Uuid::new_v4().to_string();
+        fresh.session_id = Some(id.clone());
+        let args = muxel_core::session_resume_args(&claude, &fresh).unwrap();
+        assert_eq!(
+            launch_binding(Some(&claude), claude.program.as_deref(), Some(&args)),
+            LaunchBinding::Known(Some(id.clone()))
+        );
+        fresh.session_started = true;
+        let args = muxel_core::session_resume_args(&claude, &fresh).unwrap();
+        assert_eq!(args[0], "--resume");
+        assert_eq!(
+            launch_binding(Some(&claude), claude.program.as_deref(), Some(&args)),
+            LaunchBinding::Known(Some(id.clone()))
+        );
+        // Codex mints its own thread on a first launch and names it later.
+        let codex = AgentPreset::codex();
+        let mut instance = Instance::from_preset(project, &codex);
+        assert_eq!(muxel_core::session_resume_args(&codex, &instance), None);
+        assert_eq!(
+            launch_binding(Some(&codex), codex.program.as_deref(), None),
+            LaunchBinding::Unknown
+        );
+        instance.session_id = Some(id.clone());
+        instance.session_started = true;
+        let args = muxel_core::session_resume_args(&codex, &instance).unwrap();
+        assert_eq!(
+            launch_binding(Some(&codex), codex.program.as_deref(), Some(&args)),
+            LaunchBinding::Known(Some(id))
+        );
+        // So does a Codex preset muxel doesn't resume.
+        assert_eq!(
+            launch_binding(None, Some("/usr/local/bin/codex"), None),
+            LaunchBinding::Unknown
+        );
+        // A program with no conversation id of its own is in the one it opened.
+        let shell = AgentPreset::shell();
+        assert_eq!(
+            launch_binding(Some(&shell), shell.program.as_deref(), None),
+            LaunchBinding::Known(None)
+        );
+        assert_eq!(
+            launch_binding(None, Some("opencode"), None),
+            LaunchBinding::Known(None)
+        );
+    }
+
+    #[test]
+    fn a_claude_loop_finishes_its_turn_and_closes_its_exit_pane() {
+        let (session, _receiver) = claude_loop_pane();
+        // The startup prompt, typed before Claude has shown any identity.
+        session.mark_turn_submitted();
+        assert_eq!(
+            session.first_submission_binding(),
+            Some(session.binding_revision())
+        );
+        let pane = Uuid::new_v4();
+        let mut runs = HashMap::from([(pane, run(session.id))]);
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Idle).is_empty());
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
+        assert!(runs.contains_key(&pane), "the run is still in flight");
+        assert_eq!(
+            heartbeat(&mut runs, pane, &session, AgentStatus::Idle),
+            vec![pane],
+            "an Exit-policy loop closes its pane when the turn finishes"
+        );
+        assert!(runs.is_empty(), "and stops blocking the next fire");
+        session.kill();
+
+        let (session, _receiver) = claude_loop_pane();
+        session.mark_turn_submitted();
+        let mut left = run(session.id);
+        left.post_run = PostRunAction::Leave;
+        let mut runs = HashMap::from([(pane, left)]);
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Done).is_empty());
+        assert!(runs.is_empty(), "a Leave run finishes without closing");
+        session.kill();
+    }
+
+    #[test]
+    fn a_claude_loop_never_owns_the_conversation_a_clear_replaces_it_with() {
+        let (session, _receiver) = claude_loop_pane();
+        session.mark_turn_submitted();
+        let pane = Uuid::new_v4();
+        let mut runs = HashMap::from([(pane, run(session.id))]);
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
+        // `/clear` (or `/resume`): its hook record is adopted and reported.
+        let now = SystemTime::now();
+        session.provider_switched(now, now);
+        for status in [AgentStatus::Idle, AgentStatus::Done] {
+            assert!(
+                heartbeat(&mut runs, pane, &session, status).is_empty(),
+                "the replacement conversation is never closed"
+            );
+        }
+        assert!(runs.is_empty(), "the old run is abandoned");
+        session.kill();
     }
 
     #[test]
@@ -3336,6 +3513,7 @@ mod loop_cleanup_tests {
 
     #[test]
     fn loop_cleanup_never_owns_a_replacement_before_the_first_uuid() {
+        // A fresh Codex launch: its conversation is unknown until it names it.
         let (session, _receiver) = session();
         let mut run = run(session.id);
         session.mark_turn_submitted();
@@ -7291,14 +7469,13 @@ impl MuxelApp {
         let pane_master = self.pane_control_path(instance_id);
         let inst = self.workspace.instance(instance_id);
         let project = inst.and_then(|i| self.workspace.project(i.project_id));
-        let resuming = inst
-            .and_then(|i| {
-                let preset = i
-                    .preset_id
-                    .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
-                    .or_else(|| self.presets.iter().find(|p| p.name == i.preset))?;
-                Some((preset.resume_flag.as_deref()?, resume_args?))
-            })
+        let session_preset = inst.and_then(|i| {
+            i.preset_id
+                .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
+                .or_else(|| self.presets.iter().find(|p| p.name == i.preset))
+        });
+        let resuming = session_preset
+            .and_then(|preset| Some((preset.resume_flag.as_deref()?, resume_args?)))
             .is_some_and(|(flag, args)| args.first().is_some_and(|arg| arg == flag));
         // Build one instruction bundle, then let the preset's injection transport
         // deliver it. CliFlag and Codex are hidden launch-time instructions;
@@ -7322,6 +7499,11 @@ impl MuxelApp {
         }
         // Classify on the agent program (the matches below consume resolved.program).
         let agent_program = resolved.program.clone();
+        let binding = launch_binding(
+            session_preset,
+            agent_program.as_deref(),
+            session_resume.as_ref().map(|(args, _)| args.as_slice()),
+        );
 
         // Claude emits an exact SessionStart event for an in-process `/resume`.
         // Add one process-local hook through an invocation-only settings file. A file
@@ -7506,7 +7688,8 @@ impl MuxelApp {
         Ok(spec
             .with_status_program(agent_program)
             .with_startup_delay(startup_delay)
-            .with_markers(working, blocked))
+            .with_markers(working, blocked)
+            .with_binding(binding))
     }
 
     /// Preparation refusals never reach TerminalLaunch's fallback-shell path.

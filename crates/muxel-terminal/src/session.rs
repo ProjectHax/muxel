@@ -624,6 +624,24 @@ impl PtyChunkSender {
     }
 }
 
+/// What muxel knows at spawn about the provider conversation a launch opens.
+/// A scheduled loop owns the conversation its first submitted turn went to
+/// only when that conversation was known before the turn (see
+/// [`TerminalSession::first_submission_binding`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LaunchBinding {
+    /// The provider names its conversation once it runs, as a fresh Codex
+    /// launch mints its own thread and publishes it in its title. The first
+    /// UUID title begins the launch's first binding.
+    #[default]
+    Unknown,
+    /// The launch opens a known conversation: one muxel pinned with a session
+    /// flag (`--session-id`, `--resume`; its id here), or the one a program
+    /// that reports no id of its own is in. The launch begins in that binding,
+    /// and its first UUID title names it unless it names another pinned id.
+    Known(Option<String>),
+}
+
 /// What to run in a terminal.
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
@@ -656,6 +674,8 @@ pub struct CommandSpec {
     /// Fixed delay (ms) after the agent's first output before startup automation
     /// types into it. 0 = auto (wait for output to go quiet instead).
     pub startup_delay_ms: u32,
+    /// The provider conversation this launch opens, if muxel knows it.
+    pub binding: LaunchBinding,
 }
 
 impl CommandSpec {
@@ -680,6 +700,7 @@ impl CommandSpec {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            binding: LaunchBinding::Unknown,
         }
     }
 
@@ -700,6 +721,7 @@ impl CommandSpec {
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
+            binding: LaunchBinding::Unknown,
         }
     }
 
@@ -742,6 +764,11 @@ impl CommandSpec {
 
     pub fn with_startup_delay(mut self, ms: u32) -> Self {
         self.startup_delay_ms = ms;
+        self
+    }
+
+    pub fn with_binding(mut self, binding: LaunchBinding) -> Self {
+        self.binding = binding;
         self
     }
 }
@@ -1386,7 +1413,7 @@ impl TerminalSession {
         drop(writer_handle);
 
         let title = Arc::new(Mutex::new(None));
-        let evidence = Arc::new(Mutex::new(LifecycleEvidence::default()));
+        let evidence = Arc::new(Mutex::new(LifecycleEvidence::for_launch(&spec.binding)));
         let title_generation = Arc::new(AtomicU64::new(0));
         let title_changed_at = Arc::new(Mutex::new(None));
         let session_id_hint = Arc::new(Mutex::new(None));
