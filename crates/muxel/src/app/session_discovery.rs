@@ -117,7 +117,42 @@ fn inject_codex_tmux_title_reader(reader: CodexTmuxTitleTestReader) -> CodexTmux
 /// Bound the discovery worker across process creation, output and reap. The
 /// command worker kills/reaps a normally stalled child at the same deadline;
 /// the caller can move on even if an OS operation itself stalls during cleanup.
-fn bounded_title_command(mut command: Command, budget: Duration) -> Option<String> {
+fn bounded_title_command(command: Command, budget: Duration) -> Option<String> {
+    let (status, output) = bounded_command(command, budget)?;
+    if !status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output?).trim().to_string())
+}
+
+/// Whether `target`'s session runs on this profile's tmux servers, asked with
+/// the same bound as a title read. `None` when tmux could not answer in time.
+pub(super) fn tmux_session_running(target: &SessionTarget) -> Option<bool> {
+    let target = crate::integrations::profile_tmux_target(target);
+    let sockets = target
+        .socket
+        .map_or_else(|| Socket::BOTH.to_vec(), |socket| vec![socket]);
+    let mut answered = true;
+    for socket in sockets {
+        let mut command = Command::new("tmux");
+        command
+            .args(socket.args())
+            .args(muxel_core::tmux::has_session_args(&target.name));
+        match bounded_command(command, Duration::from_secs(2)) {
+            Some((status, _)) if status.success() => return Some(true),
+            Some(_) => {}
+            None => answered = false,
+        }
+    }
+    answered.then_some(false)
+}
+
+/// `command`'s exit status, and its output (at most 4096 bytes) when it
+/// succeeded, or `None` when it could not start or finish within `budget`.
+fn bounded_command(
+    mut command: Command,
+    budget: Duration,
+) -> Option<(std::process::ExitStatus, Option<Vec<u8>>)> {
     let deadline = Instant::now() + budget;
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -154,15 +189,14 @@ fn bounded_title_command(mut command: Command, budget: Duration) -> Option<Strin
                 }
             };
             if !status.success() {
-                return None;
+                return Some((status, None));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match output_receiver.recv_timeout(remaining) {
-                Ok(Ok(bytes)) if bytes.len() <= 4096 => {
-                    Some(String::from_utf8_lossy(&bytes).trim().to_string())
-                }
+            let output = match output_receiver.recv_timeout(remaining) {
+                Ok(Ok(bytes)) if bytes.len() <= 4096 => Some(bytes),
                 _ => None,
-            }
+            };
+            Some((status, output))
         })();
         let _ = sender.send(result);
     });
@@ -232,6 +266,9 @@ pub(super) enum CodexRestoreKind {
         owned: HashSet<String>,
         /// Unbound panes sharing `cwd`, so concurrent lookups can each find one.
         limit: usize,
+        /// Those siblings' tmux sessions. A running one is still writing its
+        /// own unbound conversation here, which would look like this pane's.
+        sibling_sessions: Vec<SessionTarget>,
     },
 }
 
@@ -275,33 +312,53 @@ fn restore_codex_pane<'a>(
 
 /// The lookup a pane needs before its launch, if any: only local, started
 /// Codex panes that either lack a saved rollout path or lack an id entirely.
+/// `running_here` says whether a pane's terminal runs in this app now: an
+/// unbound sibling in the same directory that does is writing the newest
+/// rollout there, so a pane without an id then gets no lookup at all.
 pub(super) fn codex_restore_query(
     workspace: &Workspace,
     presets: &[AgentPreset],
     iid: Uuid,
+    running_here: &dyn Fn(Uuid) -> bool,
 ) -> Option<CodexRestoreQuery> {
     let instance = workspace.instance(iid)?;
     let cwd = restore_codex_pane(workspace, presets, instance)?;
     let kind = match &instance.session_id {
         Some(id) if instance.session_path.is_none() => CodexRestoreKind::Resume { id: id.clone() },
         Some(_) => return None,
-        None => CodexRestoreKind::Latest {
-            cwd: cwd.to_path_buf(),
-            owned: workspace
-                .instances
-                .iter()
-                .filter(|other| other.id != iid)
-                .filter_map(|other| other.session_id.clone())
-                .collect(),
-            limit: workspace
+        None => {
+            let siblings: Vec<_> = workspace
                 .instances
                 .iter()
                 .filter(|other| {
-                    other.session_id.is_none()
+                    other.id != iid
+                        && other.session_id.is_none()
                         && restore_codex_pane(workspace, presets, other) == Some(cwd)
                 })
-                .count(),
-        },
+                .collect();
+            if siblings.iter().any(|other| running_here(other.id)) {
+                return None;
+            }
+            CodexRestoreKind::Latest {
+                cwd: cwd.to_path_buf(),
+                owned: workspace
+                    .instances
+                    .iter()
+                    .filter(|other| other.id != iid)
+                    .filter_map(|other| other.session_id.clone())
+                    .collect(),
+                limit: siblings.len() + 1,
+                sibling_sessions: siblings
+                    .iter()
+                    .filter_map(|other| {
+                        other
+                            .tmux_session
+                            .as_ref()
+                            .map(|name| SessionTarget::new(name.clone(), other.tmux_socket))
+                    })
+                    .collect(),
+            }
+        }
     };
     Some(CodexRestoreQuery {
         kind,
@@ -338,8 +395,13 @@ pub(super) fn codex_restore_lookup(
             }
             CodexRestoreFound::Resume(found)
         }
-        CodexRestoreKind::Latest { cwd, owned, limit } => {
-            if running() {
+        CodexRestoreKind::Latest {
+            cwd,
+            owned,
+            limit,
+            sibling_sessions,
+        } => {
+            if running() || sibling_sessions.iter().any(tmux_alive) {
                 return CodexRestoreFound::Skip;
             }
             muxel_core::codex_latest_sessions(home, cwd, owned, *limit, deadline)
@@ -359,12 +421,10 @@ fn run_codex_restore_lookup(
     if let Some(lookup) = injected {
         return lookup(query);
     }
-    codex_restore_lookup(
-        query,
-        home,
-        deadline,
-        &crate::integrations::tmux_session_exists,
-    )
+    // A session tmux cannot answer for in time is treated as running.
+    codex_restore_lookup(query, home, deadline, &|target| {
+        tmux_session_running(target) != Some(false)
+    })
 }
 
 #[cfg(all(test, windows))]
@@ -484,7 +544,13 @@ impl MuxelApp {
         if self.discovery_terminal(iid).is_some() || self.failed_launches.contains_key(&iid) {
             return;
         }
-        let Some(query) = codex_restore_query(&self.workspace, &self.presets, iid) else {
+        let app: &App = cx;
+        let running_here = |other: Uuid| {
+            self.discovery_terminal(other)
+                .is_some_and(|view| !view.read(app).exited())
+        };
+        let Some(query) = codex_restore_query(&self.workspace, &self.presets, iid, &running_here)
+        else {
             return;
         };
         let Some(home) = home_dir() else { return };
@@ -901,8 +967,8 @@ fn discover_sessions(
 #[cfg(test)]
 mod w8lm_tests {
     use super::{
-        DiscoveryCandidate, SessionCandidate, bounded_title_command, codex_tmux_capture_session,
-        discover_sessions, inject_codex_tmux_title_reader,
+        DiscoveryCandidate, SessionCandidate, bounded_command, bounded_title_command,
+        codex_tmux_capture_session, discover_sessions, inject_codex_tmux_title_reader,
     };
     use muxel_core::session_discovery::{
         CodexLookupEvidence, SessionDiscoveries, SessionDiscoveryKey, SessionProvider,
@@ -986,6 +1052,25 @@ mod w8lm_tests {
             return;
         }
         panic!("the sleeping child never started inside a bound");
+    }
+
+    #[test]
+    fn bounded_command_reports_how_a_finished_command_exited() {
+        // A bounded `has-session` reads only the status: success means the
+        // session runs, a failure that it does not.
+        let run = |arg: &str| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", arg]);
+            bounded_command(command, Duration::from_secs(60))
+        };
+        let (status, output) = run("app::session_discovery::no_such_test").unwrap();
+        assert!(status.success());
+        assert!(output.is_some());
+        let (status, output) = run("--no-such-flag").unwrap();
+        assert!(!status.success());
+        assert_eq!(output, None);
+        let missing = Command::new("muxel-test-no-such-program");
+        assert!(bounded_command(missing, Duration::from_secs(5)).is_none());
     }
 
     fn key(root: &std::path::Path) -> SessionDiscoveryKey {
@@ -1394,7 +1479,7 @@ mod codex_restore_tests {
             ..Workspace::default()
         };
         let presets = [codex, claude];
-        let query = |iid| codex_restore_query(&workspace, &presets, iid);
+        let query = |iid| codex_restore_query(&workspace, &presets, iid, &|_| false);
         let owned: HashSet<String> = [
             "01a1543c-9700-7000-8000-000000000001".to_string(),
             "01a1543c-9700-7000-8000-000000000002".to_string(),
@@ -1408,6 +1493,7 @@ mod codex_restore_tests {
                     cwd: "/home/me/webapp".into(),
                     owned: owned.clone(),
                     limit: 2,
+                    sibling_sessions: Vec::new(),
                 },
                 tmux: Some(SessionTarget::new(
                     "muxel_webapp_1a2b3c4d",
@@ -1415,10 +1501,23 @@ mod codex_restore_tests {
                 )),
             })
         );
+        // The sibling's lookup checks the first pane's tmux session too.
         assert!(matches!(
             query(ids[1]).map(|query| query.kind),
-            Some(CodexRestoreKind::Latest { limit: 2, .. })
+            Some(CodexRestoreKind::Latest { limit: 2, sibling_sessions, .. })
+                if sibling_sessions
+                    == [SessionTarget::new("muxel_webapp_1a2b3c4d", Some(Socket::Private))]
         ));
+        // An unbound sibling running in this app now is writing the newest
+        // rollout here: the pane without an id gets no lookup.
+        assert_eq!(
+            codex_restore_query(&workspace, &presets, ids[0], &|iid| iid == ids[1]),
+            None
+        );
+        assert!(
+            codex_restore_query(&workspace, &presets, ids[2], &|iid| iid == ids[1]).is_some(),
+            "an exact id is not a sibling's to take"
+        );
         assert_eq!(
             query(ids[2]).map(|query| query.kind),
             Some(CodexRestoreKind::Resume {
@@ -1434,6 +1533,7 @@ mod codex_restore_tests {
                 cwd: "/home/me/webapp-wt".into(),
                 owned,
                 limit: 1,
+                sibling_sessions: Vec::new(),
             })
         );
     }
@@ -1460,7 +1560,7 @@ mod codex_restore_tests {
         let presets = [preset.clone()];
         let not_running = |_: &SessionTarget| panic!("no tmux session to check");
 
-        let query = codex_restore_query(&workspace, &presets, pane_id).unwrap();
+        let query = codex_restore_query(&workspace, &presets, pane_id, &|_| false).unwrap();
         let found = codex_restore_lookup(&query, &home.0, later(), &not_running);
         assert_eq!(
             found,
@@ -1483,7 +1583,7 @@ mod codex_restore_tests {
 
         // Master's walk answer: the rollout is gone, so the pane starts fresh
         // instead of a `codex resume` that exits and closes it.
-        let query = codex_restore_query(&workspace, &presets, missing_id).unwrap();
+        let query = codex_restore_query(&workspace, &presets, missing_id, &|_| false).unwrap();
         let found = codex_restore_lookup(&query, &home.0, later(), &not_running);
         assert_eq!(found, CodexRestoreFound::Resume(CodexResumePath::Missing));
         assert!(apply_codex_restore_found(
@@ -1531,6 +1631,7 @@ mod codex_restore_tests {
                 cwd: cwd.clone(),
                 owned: HashSet::new(),
                 limit: 1,
+                sibling_sessions: Vec::new(),
             },
             tmux: Some(target.clone()),
         };
@@ -1553,6 +1654,26 @@ mod codex_restore_tests {
         let gone = |_: &SessionTarget| false;
         assert!(matches!(
             codex_restore_lookup(&latest, &home.0, later(), &gone),
+            CodexRestoreFound::Latest(sessions) if sessions.len() == 1
+        ));
+        // The same holds for an unbound sibling's running session: its rollout
+        // is the newest unowned one here, and is still its conversation.
+        let sibling_running = CodexRestoreQuery {
+            kind: CodexRestoreKind::Latest {
+                cwd: cwd.clone(),
+                owned: HashSet::new(),
+                limit: 2,
+                sibling_sessions: vec![target.clone()],
+            },
+            tmux: None,
+        };
+        assert_eq!(
+            codex_restore_lookup(&sibling_running, &home.0, later(), &alive),
+            CodexRestoreFound::Skip
+        );
+        assert_eq!(checked.get(), 3);
+        assert!(matches!(
+            codex_restore_lookup(&sibling_running, &home.0, later(), &gone),
             CodexRestoreFound::Latest(sessions) if sessions.len() == 1
         ));
     }
@@ -1593,8 +1714,9 @@ mod codex_restore_tests {
         let presets = [preset.clone()];
         let no_tmux = |_: &SessionTarget| panic!("no tmux session to check");
         // Both unbound panes look up together, before either binds.
-        let first_query = codex_restore_query(&workspace, &presets, first_id).unwrap();
-        let second_query = codex_restore_query(&workspace, &presets, second_id).unwrap();
+        let first_query = codex_restore_query(&workspace, &presets, first_id, &|_| false).unwrap();
+        let second_query =
+            codex_restore_query(&workspace, &presets, second_id, &|_| false).unwrap();
         let first_found = codex_restore_lookup(&first_query, &home.0, later(), &no_tmux);
         let second_found = codex_restore_lookup(&second_query, &home.0, later(), &no_tmux);
         let expected = vec![
@@ -1656,6 +1778,7 @@ mod codex_restore_tests {
                 cwd: "/home/me/webapp".into(),
                 owned: HashSet::new(),
                 limit: 1,
+                sibling_sessions: Vec::new(),
             },
             tmux: None,
         };

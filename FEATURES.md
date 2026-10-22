@@ -159,10 +159,13 @@ feature is added or changed, update the matching entry here in the same change**
     launch, never on the UI thread and never twice per pane in a run: a saved
     UUID with no saved path is confirmed by its dated directory, then by one walk
     of `~/.codex/sessions`; a started pane without a UUID binds the newest rollout
-    recorded in its directory that no other pane owns, unless its tmux session
-    still runs (title capture binds that one exactly). The launch waits for the
-    lookup at most two seconds; an unbound pane whose lookup finds nothing or runs
-    out of time starts fresh, and Import can still find an older conversation.
+    recorded in its directory that no other pane owns, unless its own tmux
+    session still runs (title capture binds that one exactly) or an unbound
+    sibling in that directory still runs, in this app or in tmux, since that
+    sibling's conversation would look like the newest one. The launch waits for
+    the lookup at most two seconds; an unbound pane whose lookup finds nothing,
+    is skipped, or runs out of time starts fresh, and Import can still find an
+    older conversation.
     The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
     UUIDs resolve in their timestamp's local day directory, with one neighboring day
