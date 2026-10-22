@@ -17414,22 +17414,25 @@ impl MuxelApp {
             let restarted = (|| -> anyhow::Result<()> {
                 if let Some(session) = recorded_session {
                     let deadline = Instant::now() + Duration::from_secs(2);
-                    let session = integrations::resolve_local_tmux_owner(&session, deadline)?;
-                    let closed = muxel_core::tmux::ClosedSession {
-                        name: session.name.clone(),
-                        socket: session.socket.clone(),
-                        instance: iid,
-                    };
-                    if !self.terminal_restarts.record_owner(
-                        &mut self.workspace,
-                        iid,
-                        restart,
-                        &closed,
-                    ) || !self.try_persist()
-                    {
-                        anyhow::bail!("couldn't save the tmux session owner before restart");
-                    }
-                    let next = integrations::kill_tmux_session_confirmed(&session, deadline)?;
+                    let (session, next) =
+                        integrations::restart_local_tmux(&session, deadline, |owner| {
+                            let closed = muxel_core::tmux::ClosedSession {
+                                name: owner.name.clone(),
+                                socket: owner.socket.clone(),
+                                instance: iid,
+                            };
+                            if self.terminal_restarts.record_owner(
+                                &mut self.workspace,
+                                iid,
+                                restart,
+                                &closed,
+                            ) && self.try_persist()
+                            {
+                                Ok(())
+                            } else {
+                                anyhow::bail!("couldn't save the tmux session owner before restart")
+                            }
+                        })?;
                     self.save_restart_migration(iid, restart, &session, &next)?;
                 }
                 Ok(())

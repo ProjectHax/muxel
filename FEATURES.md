@@ -1206,9 +1206,13 @@ feature is added or changed, update the matching entry here in the same change**
   earlier muxel reattaches to it there (closing the pane still stops it), and its
   next session starts on muxel's own after both servers confirm the old session is
   gone and `mxl` has no session of that exact name. A namesake on `mxl` is left alone
-  and the pane keeps its default-server binding but stops until the project layout
-  supplies refreshed ownership; retry cannot recreate a second agent on Default.
-  An imported session also stays on its recorded owner while running.
+  and the pane keeps its default-server binding but stops, then attaches by itself
+  once the shared project layout assigns it the new owner; retry cannot recreate a
+  second agent on Default, and Restart checks for the namesake before it stops
+  anything. Once moved, a pane stays on `mxl` whatever an older copy of the layout
+  says. A session still running on the default server reattaches even when `mxl`
+  gives an unexpected answer. An imported session also stays on its recorded owner
+  while running.
   Desktop and phone save an allowed migration
   before launching; a failed probe or save cannot authorize it.
   Reconnecting also retries pending closes on their recorded named servers;
