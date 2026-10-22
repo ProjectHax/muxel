@@ -28,8 +28,7 @@ mod new_tests;
 /// Shared command permission for typing into an existing terminal. This is
 /// rechecked on every write, including panes created before the opt-in was revoked.
 fn control_program_writable(inst: &Instance, allow_shells: bool) -> Result<(), String> {
-    if !allow_shells && (inst.literal_argv || !readaloud::is_agent_program(inst.program.as_deref()))
-    {
+    if !allow_shells && (inst.literal_argv || !launches_known_agent(inst)) {
         let name = inst.display_name();
         return Err(format!(
             "typing into '{name}' requires command execution permission in Settings > \

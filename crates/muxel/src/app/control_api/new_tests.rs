@@ -230,6 +230,44 @@ fn argv(program: &str) -> ctl::NewOptions {
     }
 }
 
+/// A bare built-in agent resolved through an isolated, absolute PATH entry.
+/// Nothing is executed: only the production launchability check reads this file.
+struct KnownAgentPath {
+    dir: std::path::PathBuf,
+    executable: std::path::PathBuf,
+}
+
+impl KnownAgentPath {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("muxel-agent-path-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let executable = dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        std::fs::write(&executable, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        Self { dir, executable }
+    }
+
+    fn instance(&self, project_id: Uuid) -> Instance {
+        let mut instance = Instance::from_preset(project_id, &AgentPreset::codex());
+        instance.env.push(muxel_core::EnvVar {
+            key: "PATH".into(),
+            value: self.dir.to_string_lossy().into_owned(),
+        });
+        instance
+    }
+}
+
+impl Drop for KnownAgentPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.executable);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
 #[test]
 fn control_new_parameters_validate_before_mutation_and_preserve_allow_policy() {
     let mut app = MuxelApp::fixture();
@@ -619,7 +657,8 @@ fn control_new_policy_configured_agent_writes_survive_shell_opt_out() {
     app.settings.control_allow_new = CreationPolicy::Off;
     assert!(app.settings.control_enabled);
     assert!(!app.settings.control_allow_shells);
-    let instance = Instance::from_preset(app.workspace.projects[0].id, &AgentPreset::codex());
+    let agent_path = KnownAgentPath::new();
+    let instance = agent_path.instance(app.workspace.projects[0].id);
     assert!(!instance.literal_argv);
     assert!(control_program_writable(&instance, app.settings.control_allow_shells).is_ok());
     app.settings.control_allow_shells = true;
@@ -630,6 +669,47 @@ fn control_new_policy_configured_agent_writes_survive_shell_opt_out() {
             .unwrap(),
     ] {
         assert!(control_program_writable(&instance, app.settings.control_allow_shells).is_ok());
+    }
+}
+
+#[test]
+fn control_write_policy_uses_the_creation_known_agent_matcher() {
+    let app = MuxelApp::fixture();
+    let agent_path = KnownAgentPath::new();
+    let custom = agent_path.dir.join("custom").join("CoDeX.EXE");
+    for (program, known) in [
+        ("codex", true),
+        (custom.to_str().unwrap(), true),
+        ("ssh", false),
+        ("wsl.exe", false),
+        ("python3", false),
+        ("./codex", false),
+    ] {
+        let mut instance = agent_path.instance(app.workspace.projects[0].id);
+        instance.program = Some(program.into());
+        instance.args = vec!["host".into()];
+        assert!(!instance.literal_argv);
+        let before = serde_json::to_value(&instance).unwrap();
+        assert_eq!(super::launches_known_agent(&instance), known, "{program}");
+        assert_eq!(
+            app.creation_decision(&instance),
+            if known {
+                ctl::CreationDecision::Allow
+            } else {
+                ctl::CreationDecision::Ask
+            },
+            "{program}"
+        );
+        let result = control_program_writable(&instance, false);
+        assert_eq!(result.is_ok(), known, "{program}: {result:?}");
+        if let Err(error) = result {
+            assert!(error.contains(COMMAND_SETTING), "{program}: {error}");
+        }
+        assert!(
+            control_program_writable(&instance, true).is_ok(),
+            "{program}"
+        );
+        assert_eq!(serde_json::to_value(&instance).unwrap(), before);
     }
 }
 
