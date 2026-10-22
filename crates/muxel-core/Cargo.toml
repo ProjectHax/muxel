@@ -14,6 +14,8 @@ uuid.workspace = true
 # PowerShell's `-EncodedCommand` takes UTF-16LE base64. Already in the tree via
 # muxel-terminal, so this adds a dependency edge, not a new crate.
 base64 = "0.22"
+# Already resolved for the app/store; decode UUIDv7 rollout dates in local time.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Team libraries (`library`): parse `muxel-library.toml` and strip Unicode format
 # characters. Both already in the tree (via muxel-store and rustybuzz), so these
 # add dependency edges, not new crates.

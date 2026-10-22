@@ -90,6 +90,10 @@ struct Instance: Codable, Equatable, Identifiable {
     var pinned: Bool = false
     var worktreeId: String?
     var sessionId: String?
+    /// The desktop's validated provider transcript/rollout path for `sessionId`
+    /// (a path on the machine running the pane). iOS never reads it, but
+    /// preserves it so an iOS layout write-back doesn't strip it from the peer.
+    var sessionPath: String?
     var sessionStarted: Bool = false
 
     private enum CodingKeys: String, CodingKey {
@@ -118,6 +122,7 @@ struct Instance: Codable, Equatable, Identifiable {
         case pinned
         case worktreeId = "worktree_id"
         case sessionId = "session_id"
+        case sessionPath = "session_path"
         case sessionStarted = "session_started"
     }
 
@@ -166,6 +171,7 @@ struct Instance: Codable, Equatable, Identifiable {
         pinned = (try c.decodeIfPresent(Bool.self, forKey: .pinned)) ?? false
         worktreeId = try c.decodeIfPresent(String.self, forKey: .worktreeId)
         sessionId = try c.decodeIfPresent(String.self, forKey: .sessionId)
+        sessionPath = try c.decodeIfPresent(String.self, forKey: .sessionPath)
         sessionStarted = (try c.decodeIfPresent(Bool.self, forKey: .sessionStarted)) ?? false
     }
 
@@ -199,6 +205,7 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(pinned, forKey: .pinned)
         try c.encode(worktreeId, forKey: .worktreeId)
         try c.encode(sessionId, forKey: .sessionId)
+        try c.encode(sessionPath, forKey: .sessionPath)
         try c.encode(sessionStarted, forKey: .sessionStarted)
     }
 
@@ -218,6 +225,7 @@ struct Instance: Codable, Equatable, Identifiable {
 
     mutating func resetConversationForDuplicate() {
         sessionId = nil
+        sessionPath = nil
         sessionStarted = false
         autoName = nil
     }

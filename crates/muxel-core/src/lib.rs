@@ -34,14 +34,15 @@ pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
-    ACCOMPLISHMENTS_FILE, AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind,
-    ResolvedLaunch, accomplishments_header, accomplishments_instruction, append_agent_instruction,
+    ACCOMPLISHMENTS_FILE, AgentPreset, CodexHintMiss, CodexResumePath, CodexSession,
+    CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
+    accomplishments_header, accomplishments_instruction, append_agent_instruction,
     claude_session_cwd, claude_session_path, codex_developer_instructions_override,
-    codex_latest_session_id, codex_session_exists, codex_session_hint_from_title,
-    codex_session_id_from_hint, codex_session_matches_cwd, codex_session_names,
-    codex_terminal_title_override, file_link_instruction, find_claude_session_path, memory_header,
-    memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args,
+    codex_latest_session_id, codex_latest_sessions, codex_resume_path, codex_rollout_by_walk,
+    codex_session_from_hint, codex_session_hint_from_title, codex_session_id_from_hint,
+    codex_session_names, codex_terminal_title_override, file_link_instruction,
+    find_claude_session_path, memory_header, memory_instruction, memory_reference,
+    muxel_file_reference, resolve_launch, resolve_launch_for_session, session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
@@ -580,6 +581,9 @@ pub struct Instance {
     /// on restart. `None` until first launch / for agents without resume support.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Validated provider transcript/rollout path for the saved session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_path: Option<PathBuf>,
     /// Whether this instance's session has been launched at least once, so a
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
@@ -617,6 +621,7 @@ impl Instance {
     /// A duplicated pane copies launch settings, not the source conversation.
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
+        self.session_path = None;
         self.session_started = false;
         self.auto_name = None;
     }
@@ -668,6 +673,7 @@ impl Instance {
             pinned: false,
             worktree_id: None,
             session_id: None,
+            session_path: None,
             session_started: false,
         }
     }
@@ -730,6 +736,7 @@ impl Instance {
             pinned: false,
             worktree_id: None,
             session_id: None,
+            session_path: None,
             session_started: false,
         }
     }
@@ -1413,6 +1420,7 @@ impl RemoteLayout {
                     instance.tmux_session = None;
                     instance.tmux_socket = None;
                     instance.session_id = None;
+                    instance.session_path = None;
                     instance.session_started = false;
                     instance.auto_submit = false;
                 }
@@ -1499,7 +1507,8 @@ pub fn push_overwrites_peer(
 /// lists (a pane it closed is simply absent), re-homed to `project_id`, and — for a
 /// pane this machine already has — keeping what this machine observed of it (its
 /// program-supplied title, terminal grid and agent activity), which is per-machine
-/// and never part of the shared content.
+/// and never part of the shared content. A validated rollout path survives a peer
+/// that predates `session_path` while the pane keeps the same conversation.
 pub fn merge_peer_instances(
     local: &[Instance],
     peer: Vec<Instance>,
@@ -1522,6 +1531,10 @@ pub fn merge_peer_instances(
                     instance.tmux_socket = mine.tmux_socket.clone();
                 } else if moved_off_default(&instance, mine) {
                     instance.tmux_socket = mine.tmux_socket.clone();
+                }
+                if instance.session_id.is_some() && instance.session_id == mine.session_id {
+                    instance.session_path =
+                        mine.session_path.clone().or(instance.session_path.take());
                 }
             }
             instance
@@ -3936,6 +3949,43 @@ mod remote_layout_tests {
         assert_eq!(a2.activity.last_state, Some(AgentActivityState::Working));
         assert_eq!(a2.tmux_session, a.tmux_session);
         assert_eq!(a2.tmux_socket, a.tmux_socket);
+    }
+
+    #[test]
+    fn peer_without_session_path_keeps_this_machines_rollout_for_the_same_conversation() {
+        let pid = Uuid::new_v4();
+        let mut mine = Instance::from_preset(pid, &AgentPreset::codex());
+        mine.session_id = Some("01a1543c-9700-7000-8000-000000000001".into());
+        mine.session_started = true;
+        mine.session_path =
+            Some("/home/me/.codex/sessions/2026/10/19/rollout-01a1543c.jsonl".into());
+        // What a peer that predates the field (or an older iOS build) writes back.
+        let mut doc = serde_json::to_value(&mine).unwrap();
+        doc.as_object_mut().unwrap().remove("session_path");
+        let old_peer: Instance = serde_json::from_value(doc).unwrap();
+        assert_eq!(old_peer.session_path, None);
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![old_peer], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
+
+        // An iOS write-back carries the field as `null` or its value.
+        let mut doc = serde_json::to_value(&mine).unwrap();
+        doc["session_path"] = serde_json::Value::Null;
+        let ios: Instance = serde_json::from_value(doc).unwrap();
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![ios], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
+
+        // A peer that switched the pane's conversation describes another rollout.
+        let mut switched = mine.clone();
+        switched.session_id = Some("01a1543c-9700-7000-8000-000000000002".into());
+        switched.session_path = None;
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![switched], pid);
+        assert_eq!(merged[0].session_path, None);
+
+        // This machine has none yet: the peer's copy of it stands.
+        let mut unsaved = mine.clone();
+        unsaved.session_path = None;
+        let merged = merge_peer_instances(&[unsaved], vec![mine.clone()], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
     }
 
     #[test]
