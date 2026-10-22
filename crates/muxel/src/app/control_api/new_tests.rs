@@ -486,9 +486,12 @@ fn control_new_startup_lost_owner_suppresses_input_and_controller_drop_cancels_l
     let ordinary = CommandSpec::program("codex", vec![])
         .with_startup_input("task")
         .with_auto_mode(2);
-    assert!(
-        control_launch_spec(Some(&instance), None, None, ordinary.clone()).allow_shell_fallback
-    );
+    // Even without the outside-creation marker (a duplicate drops it), a task
+    // with no runtime owner is never typed by ordinary automation.
+    let unmarked = control_launch_spec(Some(&instance), None, None, ordinary.clone());
+    assert!(unmarked.allow_shell_fallback);
+    assert!(unmarked.startup_input.is_none());
+    assert!(!unmarked.submit);
     instance.control_created = true;
     let restored = control_launch_spec(Some(&instance), None, None, ordinary.clone());
     assert!(

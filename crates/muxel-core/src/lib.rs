@@ -714,6 +714,11 @@ impl Instance {
         self.auto_name = None;
         // Duplication is a new local UI action, not the outside launch approval.
         self.control_created = false;
+        // An unconsumed `ctl new --prompt` task belongs to the request that was
+        // approved, never to a copy of its pane.
+        if self.control_prompt {
+            self.system_prompt = None;
+        }
     }
 
     /// A plain shell instance.
@@ -1625,6 +1630,21 @@ pub fn merge_peer_instances(
                 {
                     instance.tmux_session = mine.tmux_session.clone();
                     instance.tmux_socket = mine.tmux_socket;
+                }
+                // Older peers drop the outside-creation launch policy too, which
+                // would turn a literal command back into a tmux-wrapped,
+                // auto-restored pane allowed a fallback shell. A missing value
+                // can't be told apart from a cleared one, but nothing clears
+                // these on an existing pane: they are set once at creation (a
+                // duplicate is a new id), so absent always means "not known here".
+                instance.literal_argv |= mine.literal_argv;
+                instance.control_created |= mine.control_created;
+                instance.control_prompt |= mine.control_prompt;
+                if instance.launch_dir.is_none() {
+                    instance.launch_dir = mine.launch_dir.clone();
+                }
+                if instance.instruction_injection.is_none() {
+                    instance.instruction_injection = mine.instruction_injection.clone();
                 }
             }
             instance
@@ -2665,6 +2685,27 @@ mod instance_tests {
         assert_eq!(instance.auto_name, None);
         assert_eq!(instance.session_id, None);
         assert!(!instance.session_started);
+    }
+
+    #[test]
+    fn duplicate_never_carries_an_unconsumed_outside_task() {
+        let mut task = Instance::shell(Uuid::new_v4());
+        task.is_runner = true;
+        task.control_prompt = true;
+        task.control_created = true;
+        task.system_prompt = Some("deploy the branch".into());
+        task.reset_conversation_for_duplicate();
+        assert_eq!(task.system_prompt, None);
+        assert!(!task.control_created);
+        // An ordinary runner's prompt is its reusable launch setting.
+        let mut runner = Instance::shell(Uuid::new_v4());
+        runner.is_runner = true;
+        runner.system_prompt = Some("Review the current changes".into());
+        runner.reset_conversation_for_duplicate();
+        assert_eq!(
+            runner.system_prompt.as_deref(),
+            Some("Review the current changes")
+        );
     }
 }
 
@@ -3752,6 +3793,57 @@ mod remote_layout_tests {
         assert_eq!(a2.activity.last_state, Some(AgentActivityState::Working));
         assert_eq!(a2.tmux_session, a.tmux_session);
         assert_eq!(a2.tmux_socket, a.tmux_socket);
+    }
+
+    #[test]
+    fn an_older_peer_cannot_strip_outside_creation_launch_policy() {
+        let pid = Uuid::new_v4();
+        let mut literal = Instance::shell(pid);
+        literal.program = Some("/usr/local/bin/native".into());
+        literal.args = vec!["opening brief".into(), "".into()];
+        literal.literal_argv = true;
+        literal.control_created = true;
+        literal.launch_dir = Some("/srv/external".into());
+        let mut task = Instance::from_preset(pid, &AgentPreset::claude());
+        task.control_created = true;
+        task.control_prompt = true;
+        task.instruction_injection = Some(InjectionMode::CliFlag {
+            flag: "--append-system-prompt".into(),
+        });
+        task.launch_dir = Some("/srv/external".into());
+        let local = vec![literal.clone(), task.clone()];
+        // The same panes as an older build writes them back: unknown fields gone.
+        let older: Vec<Instance> = local
+            .iter()
+            .map(|instance| {
+                let mut json = serde_json::to_value(instance).unwrap();
+                let fields = json.as_object_mut().unwrap();
+                for field in [
+                    "literal_argv",
+                    "launch_dir",
+                    "control_created",
+                    "control_prompt",
+                    "instruction_injection",
+                ] {
+                    fields.remove(field);
+                }
+                serde_json::from_value(json).unwrap()
+            })
+            .collect();
+        assert!(!older[0].literal_argv && older[0].launch_dir.is_none());
+        let merged = merge_peer_instances(&local, older, pid);
+        for (merged, mine) in merged.iter().zip(&local) {
+            assert_eq!(merged.literal_argv, mine.literal_argv);
+            assert_eq!(merged.control_created, mine.control_created);
+            assert_eq!(merged.control_prompt, mine.control_prompt);
+            assert_eq!(merged.launch_dir, mine.launch_dir);
+            assert_eq!(merged.instruction_injection, mine.instruction_injection);
+        }
+        // A pane only the peer has keeps exactly what the peer wrote.
+        let added = Instance::shell(pid);
+        let merged = merge_peer_instances(&local, vec![added.clone()], pid);
+        assert!(!merged[0].literal_argv && !merged[0].control_created);
+        assert!(merged[0].launch_dir.is_none());
     }
 
     #[test]

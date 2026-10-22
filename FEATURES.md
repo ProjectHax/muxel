@@ -639,7 +639,9 @@ feature is added or changed, update the matching entry here in the same change**
   The sidebar labels an unspawned restored literal pane as **stopped**. Retained
   exited terminals keep their **done** badge and completion age.
   Literal panes never claim or clean up tmux sessions, including stale peer
-  metadata. Phone duplicates keep them stopped without assigning a tmux session;
+  metadata. A layout written back by an older peer that doesn't know them
+  cannot clear a pane's literal argv, launch directory or outside-creation
+  marks. Phone duplicates keep them stopped without assigning a tmux session;
   closing them still removes their layout entry and owned worktree normally.
   Launch directories are stored separately from owned worktrees, so closing a
   pane never deletes its cwd and migration never registers it as owned.

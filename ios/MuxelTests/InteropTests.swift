@@ -84,6 +84,19 @@ final class InteropTests: XCTestCase {
         XCTAssertFalse(instance.controlCreated)
     }
 
+    func testDuplicateNeverCarriesAnUnconsumedCtlTask() {
+        var task = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
+        task.controlPrompt = true
+        task.systemPrompt = "deploy the branch"
+        task.resetConversationForDuplicate()
+        XCTAssertNil(task.systemPrompt)
+        var runner = Instance(id: "bbbb", projectId: "p", title: "Claude", program: "claude", args: [])
+        runner.isRunner = true
+        runner.systemPrompt = "Review the diff"
+        runner.resetConversationForDuplicate()
+        XCTAssertEqual(runner.systemPrompt, "Review the diff")
+    }
+
     func testOutsideCreationOriginRoundTripsAndDefaultsForOlderDocuments() throws {
         var instance = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
         instance.controlCreated = true

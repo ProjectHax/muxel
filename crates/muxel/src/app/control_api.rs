@@ -99,10 +99,11 @@ pub(super) fn control_launch_spec(
 ) -> CommandSpec {
     spec.allow_shell_fallback &= !instance.is_some_and(|instance| instance.control_created);
     let owner = owner.filter(ctl::StartupTurnOwner::is_pending);
+    // Keyed on the task, not on `control_created`: a duplicate drops that
+    // approval marker, and must still never type a task nobody owns.
     if owner.is_none()
-        && instance.is_some_and(|instance| {
-            instance.control_created && instance.control_prompt && instance.system_prompt.is_some()
-        })
+        && instance
+            .is_some_and(|instance| instance.control_prompt && instance.system_prompt.is_some())
     {
         if let Some(startup) = turn.and_then(|turn| turn.startup.as_ref()) {
             startup.cancel();

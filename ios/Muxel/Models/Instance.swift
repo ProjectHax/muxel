@@ -237,5 +237,11 @@ struct Instance: Codable, Equatable, Identifiable {
         sessionStarted = false
         autoName = nil
         controlCreated = false
+        // An unconsumed `ctl new --prompt` task belongs to the request that was
+        // approved, never to a copy of its pane. Port of Rust's
+        // `reset_conversation_for_duplicate`.
+        if controlPrompt {
+            systemPrompt = nil
+        }
     }
 }

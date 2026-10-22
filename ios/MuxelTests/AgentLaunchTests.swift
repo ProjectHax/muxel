@@ -17,10 +17,32 @@ final class AgentLaunchTests: XCTestCase {
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(json["control_prompt"] as? Bool, true)
         XCTAssertNotNil(json["instruction_injection"])
+        // The phone never owns the task: it neither types nor submits it.
         let launch = AgentLaunch.resolveLaunch(restored)
         XCTAssertEqual(launch.args, original.args)
-        XCTAssertEqual(launch.startupInput, "/or-spar 20689")
-        XCTAssertTrue(launch.submit)
+        XCTAssertNil(launch.startupInput)
+        XCTAssertFalse(launch.submit)
+    }
+
+    func testPhoneNeverReplaysAnUnconsumedCtlTask() {
+        for injection in [InjectionMode.typeIn, .cliFlag(flag: "--append-system-prompt"),
+                          InjectionMode.none] {
+            var task = inst(args: ["--model", "sonnet"], prompt: "deploy the branch",
+                            injection: injection)
+            task.controlPrompt = true
+            task.instructionInjection = injection
+            task.isRunner = true
+            task.autoSubmit = true
+            let launch = AgentLaunch.resolveLaunch(task)
+            XCTAssertEqual(launch.args, ["--model", "sonnet"], "\(injection)")
+            XCTAssertNil(launch.startupInput, "\(injection)")
+            XCTAssertFalse(launch.submit, "\(injection)")
+        }
+        // An ordinary runner still types its prompt.
+        var runner = inst(prompt: "Review the diff", injection: .typeIn)
+        runner.isRunner = true
+        runner.autoSubmit = true
+        XCTAssertEqual(AgentLaunch.resolveLaunch(runner).startupInput, "Review the diff")
     }
 
     func testLegacyTaskDefaultsToNoSeparateInstructionTransport() throws {

@@ -32,7 +32,11 @@ enum AgentLaunch {
     /// Resolve an instance into program/args + any TypeIn startup input, applying its
     /// system-prompt injection mode. Port of `resolve_launch`.
     static func resolveLaunch(_ instance: Instance) -> ResolvedLaunch {
-        if instance.literalArgv {
+        // A `ctl new --prompt` task is owned by the desktop muxel that admitted
+        // it, for one launch. Its `systemPrompt` is that task, not instructions:
+        // the phone never types, submits or passes it, even if the desktop quit
+        // or refused the launch before consuming it.
+        if instance.literalArgv || instance.controlPrompt {
             return ResolvedLaunch(program: instance.program, args: instance.args,
                                   startupInput: nil, submit: false)
         }
