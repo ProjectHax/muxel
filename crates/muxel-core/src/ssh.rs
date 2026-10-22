@@ -1890,6 +1890,11 @@ mod tests {
             2
         );
         assert!(parse_session_listings_for_migration(extra).is_none());
+        // CRLF line ends, as the phone's port reads them too.
+        let crlf =
+            "owned\r\n:muxel-listed:0\r\nno server running on /tmp/default\r\n:muxel-listed:1\r\n";
+        let rows = parse_session_listings_for_migration(crlf).unwrap();
+        assert_eq!((rows.len(), rows[0].name.as_str()), (1, "owned"));
         assert_eq!(
             parse_session_listings_for_migration("a\n:muxel-listed:0\nb\n:muxel-listed:0\n \n")
                 .unwrap()

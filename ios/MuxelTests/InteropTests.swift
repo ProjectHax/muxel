@@ -104,6 +104,10 @@ final class InteropTests: XCTestCase {
         }
         XCTAssertEqual(TmuxCommands.confirmedTargetsCommand().components(separatedBy: ":muxel-listed:").count - 1, 2)
         XCTAssertTrue(TmuxCommands.confirmedTargetsCommand().contains("'#{session_name}'"))
+        // CRLF line ends read as desktop's `str::lines` reads them.
+        XCTAssertEqual(try TmuxCommands.parseConfirmedTargets(
+            "owned\r\n:muxel-listed:0\r\nno server running on /tmp/default\r\n:muxel-listed:1\r\n"),
+            [.init(name: "owned", socket: "mxl")])
         // Any other line of a status-0 answer is one exact name, like desktop's parser.
         XCTAssertEqual(try TmuxCommands.parseConfirmedTargets("a\tb|c \n:muxel-listed:0\n:muxel-listed:0\n \n"),
                        [.init(name: "a\tb|c ", socket: "mxl")])

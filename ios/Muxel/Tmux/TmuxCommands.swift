@@ -122,7 +122,7 @@ enum TmuxCommands {
             case .incomplete:
                 return "Couldn't confirm both tmux servers. Reconnect and try again."
             case .ownershipRefreshRequired:
-                return "That session name is in use on another tmux server. Refresh the project layout before reconnecting."
+                return "A session with this name is already running on another tmux server, so this pane was not started. Try again once another muxel sharing this project's layout has assigned that session to it, or after stopping that session."
             }
         }
     }
@@ -156,14 +156,16 @@ enum TmuxCommands {
     /// `complete` is whether both answered and nothing but whitespace followed.
     ///
     /// A listing that exited 0 holds one exact session name per line. An empty
-    /// line is no name tmux lists, so it spoils that server's answer. Port of
+    /// line is no name tmux lists, so it spoils that server's answer. Lines end in
+    /// `\n` or `\r\n`, as Rust's `str::lines` reads them. Port of
     /// `ssh::checked_session_listings_on` — keep both in step.
     static func parseConfirmedListings(_ output: String) -> (answers: [[SessionTarget]?], complete: Bool) {
         let servers = [socketName, "default"]
         var answers: [[SessionTarget]?] = []
         var listing: [String] = []
         var complete = true
-        for raw in output.split(separator: "\n", omittingEmptySubsequences: false) {
+        // "\r\n" is one Character, so it needs naming beside "\n".
+        for raw in output.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" }) {
             let line = String(raw)
             guard line.hasPrefix(listingEnd) else {
                 listing.append(line); continue
@@ -183,7 +185,7 @@ enum TmuxCommands {
     }
 
     private static func checkedListing(_ listing: [String], status: String, server: String) -> [SessionTarget]? {
-        let status = status.trimmingCharacters(in: .whitespaces)
+        let status = status.trimmingCharacters(in: .whitespacesAndNewlines)
         if status == "0" {
             guard !listing.contains(where: { $0.isEmpty }) else { return nil }
             return listing.map { SessionTarget(name: $0, socket: server) }
