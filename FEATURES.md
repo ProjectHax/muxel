@@ -404,6 +404,13 @@ feature is added or changed, update the matching entry here in the same change**
 - **One-click task launchers** — predefined runners (e.g. Review, Security Review)
   spawn an agent that auto-types a task prompt. The toolbar "Run task" dropdown
   lists them; click to run, or the pencil to edit one in Settings → Runners.
+- **Built-in reviews that don't edit unasked** — the built-in Review and Security
+  Review prompts tell the agent not to edit, stage, or commit; cover staged,
+  unstaged, and untracked work (or the branch's own commits when the tree is
+  clean); and ask for verified findings, worst first, with file:line, a failure or
+  attack scenario, and a fix. Security Review ranks its findings in a table with a
+  recommendation for each, suggests which to fix, and asks you — then fixes only
+  the ones you pick. An upgrade refreshes only prompts you never edited.
 - **Templated prompts** — `{{input}}` is substituted with run-time details.
 - **Auto mode** — send a configurable number of Shift+Tab presses (then Enter) at
   startup to reach auto-accept mode.

@@ -1933,24 +1933,110 @@ impl Runner {
         instance
     }
 
-    /// Built-in example runners.
+    /// Built-in example runners. They run in auto mode, so each prompt forbids
+    /// edits (Security Review fixes only the findings the user then picks), and
+    /// the scope covers staged, untracked and branch work (a worktree's agent may
+    /// already have committed it).
     pub fn defaults() -> Vec<Runner> {
         vec![
             Runner::new(
                 "Review",
-                "Review the current changes (git diff) for correctness, bugs, and \
-                 code quality. Call out specific issues with file:line references and \
-                 suggest concrete fixes.\n\n{{input}}",
+                "Review the current code changes for bugs and correctness problems. \
+                 This is a read-only review: don't edit, stage, or commit anything; \
+                 I'll decide what to fix.\n\
+                 \n\
+                 Scope: all uncommitted work (staged, unstaged, and new untracked \
+                 files). If the working tree is clean, review the commits on this \
+                 branch that aren't on its base branch (main, master, or its \
+                 upstream).\n\
+                 \n\
+                 How to review:\n\
+                 - Read the surrounding code, callers, and tests, not just the diff \
+                 hunks, so you judge each change in context.\n\
+                 - Look for logic errors, mishandled edge cases (empty, missing, \
+                 boundary, concurrent), errors that are swallowed or misreported, \
+                 resource leaks, behavior changes that break existing callers, and \
+                 new behavior with missing or wrong tests.\n\
+                 - Confirm each suspicion before reporting it; you may run the \
+                 existing tests or a quick read-only check. Drop anything you can't \
+                 back up.\n\
+                 - Skip style and formatting preferences.\n\
+                 \n\
+                 Report findings most severe first. For each: file:line, what's \
+                 wrong, a concrete scenario where it fails (input or state, then the \
+                 wrong result), and the fix you'd make. If nothing needs fixing, say \
+                 so plainly instead of padding the list. End with a one-line verdict: \
+                 ready to merge, or what must change first.\n\
+                 \n\
+                 Any notes I add below take priority over these defaults.\n\
+                 \n\
+                 {{input}}",
             ),
             Runner::new(
                 "Security Review",
-                "Perform a security review of the current changes (git diff). Look for \
-                 injection, auth/authorization gaps, unsafe input handling, leaked \
-                 secrets, and risky dependencies. Report findings with severity and \
-                 file:line.\n\n{{input}}",
+                "Do a security review of the current code changes. Don't edit, \
+                 stage, or commit anything until I've chosen what to fix, and don't \
+                 run exploits against live systems.\n\
+                 \n\
+                 Scope: all uncommitted work (staged, unstaged, and new untracked \
+                 files). If the working tree is clean, review the commits on this \
+                 branch that aren't on its base branch (main, master, or its \
+                 upstream).\n\
+                 \n\
+                 How to review:\n\
+                 - Work out where untrusted data enters (network requests, files, \
+                 command-line arguments, environment, IPC, user or third-party \
+                 content) and trace it through the changed code, reading callers \
+                 and helpers outside the diff as needed.\n\
+                 - Look for injection (shell, SQL, path traversal, templates, XSS), \
+                 missing or bypassable authentication and authorization, unsafe \
+                 deserialization, SSRF, secrets in code or logs, weak crypto or \
+                 randomness, unsafe file handling (permissions, symlinks, races), \
+                 memory-unsafe code, unbounded resource use, and new or upgraded \
+                 dependencies with known problems.\n\
+                 - Report only issues with a plausible attack path. A pre-existing \
+                 problem counts only if this change introduces, exposes, or \
+                 worsens it.\n\
+                 \n\
+                 Present your findings as a table ranked from highest to lowest \
+                 priority (severity first, then how likely the attack is), with the \
+                 columns #, Severity (Critical, High, Medium, Low, or Info for minor \
+                 hardening ideas), Issue, Location (file:line), and Recommendation \
+                 (fix now, fix later, or accept the risk). Under the table, give each \
+                 finding a short note by number: who the attacker is and what they \
+                 control, what they gain, and the fix. If you find nothing \
+                 exploitable, say so plainly; don't inflate severity to fill the \
+                 table.\n\
+                 \n\
+                 Then recommend which findings to fix (for example, \"I'd fix 1, 2 \
+                 and 4\"), ask me which ones you should fix, and stop until I answer. \
+                 Fix only the ones I pick, then run the relevant tests and summarize \
+                 what you changed.\n\
+                 \n\
+                 Any notes I add below take priority over these defaults.\n\
+                 \n\
+                 {{input}}",
             ),
         ]
     }
+
+    /// The built-in runner prompts before v19, by runner name. An unedited copy
+    /// of one is replaced with the current built-in prompt.
+    const LEGACY_PROMPTS: [(&'static str, &'static str); 2] = [
+        (
+            "Review",
+            "Review the current changes (git diff) for correctness, bugs, and \
+             code quality. Call out specific issues with file:line references and \
+             suggest concrete fixes.\n\n{{input}}",
+        ),
+        (
+            "Security Review",
+            "Perform a security review of the current changes (git diff). Look for \
+             injection, auth/authorization gaps, unsafe input handling, leaked \
+             secrets, and risky dependencies. Report findings with severity and \
+             file:line.\n\n{{input}}",
+        ),
+    ];
 }
 
 /// A reusable snippet of text typed into an **already-running** pane on demand
@@ -2714,7 +2800,8 @@ impl Default for Settings {
 /// v16: added the Windows Git Bash preset.
 /// v17: Grok preset gains a runner startup delay (its output never goes quiet).
 /// v18: added the Muse Code preset.
-pub const PRESET_SEED_VERSION: u32 = 18;
+/// v19: refreshed the built-in Review and Security Review runner prompts.
+pub const PRESET_SEED_VERSION: u32 = 19;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
@@ -2733,8 +2820,9 @@ impl Settings {
     }
 
     /// Apply pending built-in migrations, matching presets by name. The v18
-    /// migration only adds Muse; older catch-up migrations must not replay over
-    /// choices saved at v17. Returns whether settings should be persisted.
+    /// migration only adds Muse and v19 only refreshes unedited built-in runner
+    /// prompts; older catch-up migrations must not replay over choices saved at
+    /// v17. Returns whether settings should be persisted.
     pub fn seed_builtin_presets(&mut self) -> bool {
         if self.preset_seed_version >= PRESET_SEED_VERSION {
             return false;
@@ -2823,6 +2911,23 @@ impl Settings {
             let muse = AgentPreset::muse();
             if !self.presets.iter().any(|preset| preset.name == muse.name) {
                 self.presets.push(muse);
+            }
+        }
+        // A built-in runner still carrying its old prompt word for word gets the
+        // current one; any edit to the prompt keeps the user's text.
+        if self.preset_seed_version < 19 {
+            for builtin in Runner::defaults() {
+                let Some((_, legacy)) = Runner::LEGACY_PROMPTS
+                    .iter()
+                    .find(|(name, _)| *name == builtin.name)
+                else {
+                    continue;
+                };
+                for runner in &mut self.runners {
+                    if runner.name == builtin.name && runner.prompt == *legacy {
+                        runner.prompt = builtin.prompt.clone();
+                    }
+                }
             }
         }
         self.preset_seed_version = PRESET_SEED_VERSION;
@@ -2921,7 +3026,7 @@ mod settings_tests {
             }
             let before = serde_json::to_value(&settings).unwrap();
             assert!(settings.seed_builtin_presets());
-            assert_eq!(settings.preset_seed_version, 18);
+            assert_eq!(settings.preset_seed_version, PRESET_SEED_VERSION);
             assert_eq!(
                 settings
                     .presets
@@ -2940,6 +3045,90 @@ mod settings_tests {
                 serde_json::to_value(&settings).unwrap(),
                 before,
                 "no old preset/runner resurrection or replay of saved defaults"
+            );
+        }
+    }
+
+    #[test]
+    fn unedited_legacy_runner_prompts_are_refreshed_once() {
+        let legacy = |name: &str| {
+            let (_, prompt) = Runner::LEGACY_PROMPTS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap();
+            prompt.to_string()
+        };
+        let current = |name: &str| {
+            Runner::defaults()
+                .into_iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .prompt
+        };
+        let mut settings = Settings {
+            preset_seed_version: 18,
+            ..Settings::default()
+        };
+        settings.runners[0].prompt = legacy("Review");
+        settings.runners[0].auto_mode_presses = 1;
+        settings.runners[1].prompt =
+            format!("{} Also check the CI config.", legacy("Security Review"));
+        let mut renamed = settings.runners[0].clone();
+        renamed.name = "My Review".to_string();
+        settings.runners.push(renamed);
+
+        assert!(settings.seed_builtin_presets());
+        assert_eq!(settings.runners[0].prompt, current("Review"));
+        assert_eq!(
+            settings.runners[0].auto_mode_presses, 1,
+            "only the prompt changes"
+        );
+        assert!(
+            settings.runners[1]
+                .prompt
+                .ends_with("Also check the CI config."),
+            "an edited prompt is the user's own"
+        );
+        assert_eq!(
+            settings.runners[2].prompt,
+            legacy("Review"),
+            "matched by name"
+        );
+
+        // Restoring the old text afterwards sticks: the migration runs once.
+        settings.runners[0].prompt = legacy("Review");
+        assert!(!settings.seed_builtin_presets());
+        assert_eq!(settings.runners[0].prompt, legacy("Review"));
+    }
+
+    #[test]
+    fn builtin_runner_prompts_take_details_and_end_cleanly_without_them() {
+        let preset = AgentPreset::claude();
+        for runner in Runner::defaults() {
+            assert!(
+                runner
+                    .prompt
+                    .to_lowercase()
+                    .contains("don't edit, stage, or commit anything"),
+                "{} starts in auto mode, so it must not edit unasked",
+                runner.name
+            );
+            let with = runner.build_instance(Uuid::nil(), &preset, "only src/auth.rs");
+            assert!(
+                with.system_prompt
+                    .unwrap()
+                    .ends_with("take priority over these defaults.\n\nonly src/auth.rs"),
+                "{}",
+                runner.name
+            );
+            let without = runner.build_instance(Uuid::nil(), &preset, "");
+            assert!(
+                without
+                    .system_prompt
+                    .unwrap()
+                    .ends_with("take priority over these defaults."),
+                "{}",
+                runner.name
             );
         }
     }
