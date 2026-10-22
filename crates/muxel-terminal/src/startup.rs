@@ -183,6 +183,9 @@ impl Drop for Guard {
 /// stops when dropped, or after `lifetime` if its owner never drops it.
 pub(crate) struct TitleProbe {
     shared: std::sync::Arc<ProbeShared>,
+    /// Never joined in production: a blocked read must not stall its owner.
+    #[cfg_attr(not(test), allow(dead_code))]
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -226,7 +229,23 @@ impl TitleProbe {
         if spawned.is_err() {
             log::warn!("could not start the startup title probe");
         }
-        Self { shared }
+        Self {
+            shared,
+            worker: spawned.ok(),
+        }
+    }
+
+    /// Tests: stop (or, with `stop` false, let the lifetime end) and wait for
+    /// the worker, so nothing can read after this returns.
+    #[cfg(test)]
+    fn join(mut self, stop: bool) {
+        if stop {
+            self.shared.state.lock().stopped = true;
+            self.shared.wake.notify_all();
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
     }
 
     /// The latest title read and its change generation.
@@ -441,21 +460,21 @@ impl Screen {
 /// A row Codex draws below its live editor: its own shortcut hint or context
 /// meter (`? for shortcuts … 98% context left`), or a passive status line that
 /// opens with a model id (`gpt-5.4 high fast · scratch`, `o4-mini · …`, a custom
-/// provider's `llama3.1:8b · …`). Menus separate key hints with ` · ` as well
-/// (`enter continue · esc quit`), so a status line must open with a model-like
-/// token and name no keys.
+/// provider's `llama3.1:8b · …`). A model name with no digit and no `gpt-` or
+/// `codex-` prefix is not recognised without one of the other two footers.
+/// Menus separate key hints with ` · ` as well (`enter continue · esc quit`),
+/// so a status line must open with a model-like token and no later segment may
+/// read as a key hint. A segment that merely is such a word (a project folder
+/// named `continue`) is not one.
 fn codex_footer(row: &str) -> bool {
-    const KEYS: &[&str] = &[
-        "enter", "esc", "tab", "press", "select", "confirm", "cancel", "quit", "continue", "ctrl",
-        "shift", "⏎", "↑", "↓", "↑/↓",
-    ];
     let row = row.trim();
     if row.starts_with("? for shortcuts") || row.contains("% context left") {
         return true;
     }
-    let Some(id) = row
-        .split_once(" · ")
-        .and_then(|(model, _)| model.split_whitespace().next())
+    let mut segments = row.split(" · ");
+    let Some(id) = segments
+        .next()
+        .and_then(|model| model.split_whitespace().next())
     else {
         return false;
     };
@@ -469,10 +488,27 @@ fn codex_footer(row: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
         && (openai || id.bytes().any(|b| b.is_ascii_digit()));
-    model_like
-        && !row
-            .split(|c: char| c.is_whitespace() || c == '·')
-            .any(|word| KEYS.iter().any(|key| word.eq_ignore_ascii_case(key)))
+    let mut rest = segments.peekable();
+    model_like && rest.peek().is_some() && !rest.any(key_hint)
+}
+
+/// `enter to confirm`, `esc quit`, `press enter …`, `ctrl+t transcript`,
+/// `↑/↓ select`: a key (or `press`) followed by what it does.
+fn key_hint(segment: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "enter", "esc", "escape", "tab", "space", "ctrl", "shift", "alt", "press", "⏎", "↵", "↑",
+        "↓", "←", "→", "↑/↓",
+    ];
+    let mut words = segment.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    let first = first.to_ascii_lowercase();
+    let key = KEYS.contains(&first.as_str())
+        || ["ctrl+", "shift+", "alt+", "ctrl-", "^"]
+            .iter()
+            .any(|prefix| first.starts_with(prefix) && first.len() > prefix.len());
+    key && words.next().is_some()
 }
 
 pub(crate) fn normalized(text: &str) -> String {
@@ -652,14 +688,33 @@ mod tests {
             assert!(draft.codex_draft_matches("run the tests"), "{footer}");
             assert!(draft.codex_exact_retry_draft("run the tests"), "{footer}");
         }
+        // A project folder named like a key word is still a status line.
+        for footer in [
+            "  gpt-5 · continue",
+            "  gpt-5.4 high · select · Context 0% used",
+            "  o3 · tab",
+            "  gpt-5 · cancel · enter",
+        ] {
+            let empty = screen(
+                &format!("OpenAI Codex\n› Ask Codex to do anything\n\n{footer}"),
+                1,
+                2,
+            );
+            assert!(empty.codex_composer_context(true).is_some(), "{footer}");
+        }
         // Key-hint rows are not editor footers, whatever precedes them; nor is
         // a row that only shares the separator or a model-less word.
         for footer in [
             "enter continue · esc quit",
             "  ↑/↓ select · enter confirm",
             "  gpt-5.4 · press enter to continue",
+            "  gpt-5.4 · enter to confirm · esc to cancel",
+            "  o3 · Esc quit",
+            "  gpt-5 · ctrl+c exit",
+            "  gpt-5.4",
             "  ⚠ 1 · f2",
             "  scratch · Context 0% used",
+            "  sonnet · scratch",
             "  Press enter to confirm or esc to cancel",
         ] {
             let menu = screen(
@@ -708,20 +763,19 @@ mod tests {
             std::thread::sleep(ms(5));
         }
         assert_eq!(probe.snapshot().0, 2);
-        drop(probe);
-        std::thread::sleep(ms(50));
+        probe.join(true);
         let stopped = reads.load(Ordering::SeqCst);
-        std::thread::sleep(ms(100));
+        std::thread::sleep(ms(50));
         assert_eq!(
             reads.load(Ordering::SeqCst),
             stopped,
-            "dropped probe kept reading"
+            "stopped probe kept reading"
         );
 
         // Its own lifetime bounds a probe whose owner never drops it.
         let reads = Arc::new(AtomicUsize::new(0));
         let counter = reads.clone();
-        let _forgotten = TitleProbe::spawn(
+        let forgotten = TitleProbe::spawn(
             crate::TitleSource::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
                 None
@@ -729,9 +783,10 @@ mod tests {
             ms(5),
             ms(40),
         );
-        std::thread::sleep(ms(200));
+        forgotten.join(false);
         let ended = reads.load(Ordering::SeqCst);
-        std::thread::sleep(ms(100));
+        assert!(ended > 0);
+        std::thread::sleep(ms(50));
         assert_eq!(reads.load(Ordering::SeqCst), ended);
     }
 
