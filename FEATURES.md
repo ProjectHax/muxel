@@ -227,7 +227,9 @@ feature is added or changed, update the matching entry here in the same change**
   binding was saved is logged and the pane launches, unless a newer record waits
   behind it. A record that can't be adopted yet (a `/clear` before Claude
   creates its project directory) is kept and retried until it validates or a
-  newer one replaces it.
+  newer one replaces it, as long as the process that wrote it runs: a relaunch
+  that starts a new process drops it, while reattaching a live tmux session
+  keeps it.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to

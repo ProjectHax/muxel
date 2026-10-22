@@ -175,7 +175,12 @@ current title without a completion edge.
   Claude creates the cwd's project directory), or another pane owns its
   conversation. A newer shared record supersedes it, so one that never
   validates can't hold back the next; only a record that isn't a Claude
-  `SessionStart` event is dropped unadopted. Prelaunch recovery refuses the
+  `SessionStart` event is dropped unadopted while its writer runs. Such a
+  record names a conversation of the process that wrote it, so prelaunch
+  recovery keeps it only when the launch reattaches that process's live tmux
+  session; a launch that starts a new process (a direct pane, an ended tmux
+  session, or one tmux can't answer for) drops it, so the new process never
+  adopts its predecessor's conversation. Prelaunch recovery refuses the
   launch when a pending record can't be claimed or read, or its binding can't
   be saved. Failing to acknowledge a saved binding is logged and the launch
   goes ahead, unless a newer record waits behind the stuck claim.

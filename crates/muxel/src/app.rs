@@ -3434,6 +3434,18 @@ fn arms_tmux_resume_recovery(
     unconfirmed_resume && session_running() == Some(false)
 }
 
+/// Whether the Claude process that wrote a pane's pending hook records
+/// survives its next launch: only when the launch reattaches the pane's tmux
+/// session and tmux says it still runs. Any other launch, including one tmux
+/// can't answer for, starts a new process. `session_running` is asked only for
+/// a tmux pane.
+fn claude_hook_writer_survives(
+    tmux: Option<&SessionTarget>,
+    session_running: impl FnOnce(&SessionTarget) -> Option<bool>,
+) -> bool {
+    tmux.is_some_and(|target| session_running(target) == Some(true))
+}
+
 /// A clean exit this soon after an armed launch counts as the failed resume:
 /// the pane starts fresh instead of closing.
 fn tmux_codex_resume_ended(armed: bool, exit_code: Option<i32>, recent_resume: bool) -> bool {
@@ -3443,10 +3455,29 @@ fn tmux_codex_resume_ended(armed: bool, exit_code: Option<i32>, recent_resume: b
 #[cfg(test)]
 mod claude_resume_tests {
     use super::{
-        arms_tmux_resume_recovery, effective_local_cwd, resume_missing_message,
-        should_recover_expired_session, tmux_codex_resume_ended,
+        SessionTarget, arms_tmux_resume_recovery, claude_hook_writer_survives, effective_local_cwd,
+        resume_missing_message, should_recover_expired_session, tmux_codex_resume_ended,
     };
     use std::path::Path;
+
+    #[test]
+    fn only_a_reattach_to_a_live_tmux_session_keeps_its_writers_hook_records() {
+        let session = SessionTarget::new("muxel_webapp_1a2b3c4d".to_string(), None);
+        assert!(claude_hook_writer_survives(Some(&session), |target| {
+            assert_eq!(target, &session);
+            Some(true)
+        }));
+        // A session that ended starts a new process; so does one tmux can't
+        // answer for, as master dropped such records.
+        assert!(!claude_hook_writer_survives(Some(&session), |_| Some(
+            false
+        )));
+        assert!(!claude_hook_writer_survives(Some(&session), |_| None));
+        // A direct pane always starts a new process, and never asks tmux.
+        assert!(!claude_hook_writer_survives(None, |_| panic!(
+            "tmux asked for a direct pane"
+        )));
+    }
 
     #[test]
     fn relocated_resume_cwd_wins_over_saved_instance_paths() {
@@ -7942,9 +7973,19 @@ impl MuxelApp {
         if local && is_claude_program(preset.program.as_deref()) {
             let _phase = ui_profile::phase("activation", "claude-binding", Some(iid));
             if let (Some(data_dir), Some(home)) = (muxel_store::data_dir(), home_dir()) {
+                let tmux = self.workspace.instance(iid).and_then(|inst| {
+                    let name = inst.tmux_session.clone()?;
+                    Some(SessionTarget::new(name, inst.tmux_socket.clone()))
+                });
                 crate::session_binding::recover_claude_bindings_before_resume(
                     &data_dir,
                     iid,
+                    || {
+                        claude_hook_writer_survives(
+                            tmux.as_ref(),
+                            session_discovery::tmux_session_running,
+                        )
+                    },
                     |record| self.adopt_claude_session_record(iid, None, record, &home),
                 )
                 .with_context(|| t("Could not recover this conversation before launch."))?;
