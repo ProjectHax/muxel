@@ -1155,14 +1155,19 @@ impl MuxelApp {
             session_binding::defer_claude_binding(record);
             return None;
         };
-        let launch = self.discovery_terminal(iid)?.read(cx).session().id;
+        let terminal = self.discovery_terminal(iid)?;
+        let (launch, launch_resumed) = {
+            let view = terminal.read(cx);
+            let session = view.session();
+            (session.id, session.launch_resumed())
+        };
         let seen = self
             .claude_hook_seen
             .get(&iid)
             .filter(|(seen_launch, _)| *seen_launch == launch)
             .map(|(_, nonce)| *nonce);
         let bound = self.workspace.instance(iid)?.session_id.as_deref();
-        if !session_binding::claude_record_switches(&binding, seen, bound) {
+        if !session_binding::claude_record_switches(&binding, seen, bound, launch_resumed) {
             self.remember_claude_hook(iid, Some(launch), binding.stamp);
             session_binding::acknowledge_claude_binding(record);
             return None;

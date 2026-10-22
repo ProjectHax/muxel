@@ -711,6 +711,8 @@ pub struct CommandSpec {
     pub startup_delay_ms: u32,
     /// The provider conversation this launch opens, if muxel knows it.
     pub binding: LaunchBinding,
+    /// Whether the command actually resumes an existing provider conversation.
+    pub launch_resumed: bool,
 }
 
 impl CommandSpec {
@@ -740,6 +742,7 @@ impl CommandSpec {
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
+            launch_resumed: false,
         }
     }
 
@@ -765,6 +768,7 @@ impl CommandSpec {
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
+            launch_resumed: false,
         }
     }
 
@@ -830,6 +834,11 @@ impl CommandSpec {
 
     pub fn with_binding(mut self, binding: LaunchBinding) -> Self {
         self.binding = binding;
+        self
+    }
+
+    pub fn with_launch_resumed(mut self, resumed: bool) -> Self {
+        self.launch_resumed = resumed;
         self
     }
 
@@ -997,6 +1006,7 @@ pub(crate) struct PointerHit {
 
 pub struct TerminalSession {
     pub id: Uuid,
+    launch_resumed: bool,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
     writer: SharedWriter,
@@ -1202,6 +1212,10 @@ pub(crate) struct PaintDrawList {
 }
 
 impl TerminalSession {
+    pub fn launch_resumed(&self) -> bool {
+        self.launch_resumed
+    }
+
     /// Spawn a PTY running `spec` at the given initial grid size. Returns the
     /// session plus the receiver the UI drains for output/exit events.
     pub fn spawn(spec: CommandSpec, cols: u16, rows: u16) -> Result<(Arc<Self>, PtyReceiver)> {
@@ -1506,6 +1520,7 @@ impl TerminalSession {
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
+            launch_resumed: spec.launch_resumed,
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
             writer,

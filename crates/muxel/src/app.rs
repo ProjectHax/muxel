@@ -3811,17 +3811,23 @@ mod loop_cleanup_tests {
 
     /// A fresh Claude loop pane as `command_for` launches it: muxel mints the
     /// conversation's `--session-id`.
-    fn claude_loop_pane() -> (std::sync::Arc<TerminalSession>, muxel_terminal::PtyReceiver) {
+    fn claude_loop_pane() -> (
+        std::sync::Arc<TerminalSession>,
+        muxel_terminal::PtyReceiver,
+        String,
+    ) {
         let claude = AgentPreset::claude();
         let mut instance = Instance::from_preset(Uuid::new_v4(), &claude);
         instance.session_id = Some(Uuid::new_v4().to_string());
         let args = muxel_core::session_resume_args(&claude, &instance).unwrap();
         assert_eq!(args[0], "--session-id");
-        session_into(launch_binding(
+        let binding = instance.session_id.clone().unwrap();
+        let (session, receiver) = session_into(launch_binding(
             Some(&claude),
             claude.program.as_deref(),
             Some(&args),
-        ))
+        ));
+        (session, receiver, binding)
     }
 
     /// One scheduled-loop heartbeat over a docked pane whose runtime shows
@@ -3942,7 +3948,7 @@ mod loop_cleanup_tests {
 
     #[test]
     fn a_claude_loop_finishes_its_turn_and_closes_its_exit_pane() {
-        let (session, _receiver) = claude_loop_pane();
+        let (session, _receiver, _) = claude_loop_pane();
         // The startup prompt, typed before Claude has shown any identity.
         session.mark_turn_submitted();
         assert_eq!(
@@ -3962,7 +3968,7 @@ mod loop_cleanup_tests {
         assert!(runs.is_empty(), "and stops blocking the next fire");
         session.kill();
 
-        let (session, _receiver) = claude_loop_pane();
+        let (session, _receiver, _) = claude_loop_pane();
         session.mark_turn_submitted();
         let mut left = run(session.id);
         left.post_run = PostRunAction::Leave;
@@ -3975,7 +3981,7 @@ mod loop_cleanup_tests {
 
     #[test]
     fn a_claude_loop_never_owns_the_conversation_a_clear_replaces_it_with() {
-        let (session, _receiver) = claude_loop_pane();
+        let (session, _receiver, _) = claude_loop_pane();
         session.mark_turn_submitted();
         let pane = Uuid::new_v4();
         let mut runs = HashMap::from([(pane, run(session.id))]);
@@ -3990,6 +3996,34 @@ mod loop_cleanup_tests {
             );
         }
         assert!(runs.is_empty(), "the old run is abandoned");
+        session.kill();
+    }
+
+    #[test]
+    fn a_fresh_claude_loops_first_same_id_resume_abandons_exit_cleanup() {
+        let (session, _receiver, bound) = claude_loop_pane();
+        assert!(!session.launch_resumed());
+        session.mark_turn_submitted();
+        let pane = Uuid::new_v4();
+        let mut runs = HashMap::from([(pane, run(session.id))]);
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
+        let hook = crate::session_binding::ClaudeBinding {
+            session_id: bound.clone(),
+            stamp: Some(crate::session_binding::ClaudeHookStamp {
+                nonce: Uuid::new_v4(),
+                recorded_at: SystemTime::now(),
+            }),
+        };
+        assert!(crate::session_binding::claude_record_switches(
+            &hook,
+            None,
+            Some(bound.as_str()),
+            session.launch_resumed()
+        ));
+        let now = SystemTime::now();
+        session.provider_switched(now, now);
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Done).is_empty());
+        assert!(runs.is_empty(), "the resumed pane must stay open");
         session.kill();
     }
 
@@ -8347,7 +8381,8 @@ impl MuxelApp {
             spec.with_status_program(agent_program)
                 .with_startup_delay(startup_delay)
                 .with_markers(working, blocked)
-                .with_binding(binding),
+                .with_binding(binding)
+                .with_launch_resumed(resuming),
         ))
     }
 
@@ -12363,7 +12398,7 @@ impl MuxelApp {
             .workspace
             .instance(iid)
             .and_then(|instance| instance.session_id.as_deref());
-        if !crate::session_binding::claude_record_switches(&binding, seen, bound) {
+        if !crate::session_binding::claude_record_switches(&binding, seen, bound, true) {
             self.remember_claude_hook(iid, launch, binding.stamp);
             return Ok(Handled);
         }
