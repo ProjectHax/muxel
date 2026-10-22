@@ -574,6 +574,41 @@ pub fn is_known_agent_program(program: Option<&str>) -> bool {
         .any(|known| known == name)
 }
 
+/// Whether launching `program` runs a known agent provider
+/// ([`is_known_agent_program`]) from a place its caller can't choose: an
+/// absolute path, or a bare name that `path` (a `PATH` value) resolves through
+/// absolute entries only. A relative path, or a relative or empty `PATH` entry
+/// reached before the match, resolves against a working directory — for
+/// outside creation, the caller's `--cwd` — so it doesn't count. `found` says
+/// whether a launchable file is at a candidate path (with Windows' extensions).
+pub fn launches_known_agent(
+    program: Option<&str>,
+    path: Option<&std::ffi::OsStr>,
+    found: impl Fn(&Path) -> bool,
+) -> bool {
+    let Some(program) = program.map(str::trim).filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    if !is_known_agent_program(Some(program)) {
+        return false;
+    }
+    if program.contains(['/', '\\']) {
+        return Path::new(program).is_absolute();
+    }
+    let Some(path) = path else {
+        return false;
+    };
+    for dir in std::env::split_paths(path) {
+        if !dir.is_absolute() {
+            return false;
+        }
+        if found(&dir.join(program)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Concrete launch parameters resolved from an instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedLaunch {
@@ -1411,6 +1446,47 @@ mod tests {
         ] {
             assert!(!is_known_agent_program(program), "{program:?}");
         }
+        // Only a location the caller can't choose counts: an absolute path, or
+        // a bare name found through absolute PATH entries.
+        let root = if cfg!(windows) {
+            r"C:\tools"
+        } else {
+            "/usr/local/bin"
+        };
+        let elsewhere = if cfg!(windows) {
+            r"C:\other"
+        } else {
+            "/opt/other"
+        };
+        let path = |dirs: &[&str]| std::env::join_paths(dirs).unwrap();
+        let installed = |candidate: &Path| candidate.starts_with(root);
+        let absolute = Path::new(root).join("claude");
+        for (program, dirs, expected) in [
+            (absolute.to_str().unwrap(), vec![], true),
+            ("claude", vec![elsewhere, root], true),
+            ("claude", vec![elsewhere], false),
+            ("claude", vec![".", root], false),
+            ("claude", vec!["node_modules/.bin", root], false),
+            ("claude", vec!["", root], false),
+            ("claude", vec![root, "."], true),
+            ("./node_modules/.bin/claude", vec![root], false),
+            ("bin/claude", vec![root], false),
+            ("ssh", vec![root], false),
+        ] {
+            let dirs = path(&dirs);
+            assert_eq!(
+                launches_known_agent(Some(program), Some(dirs.as_os_str()), installed),
+                expected,
+                "{program} via {dirs:?}"
+            );
+        }
+        assert!(!launches_known_agent(Some("claude"), None, installed));
+        assert!(!launches_known_agent(
+            None,
+            Some(path(&[root]).as_os_str()),
+            installed
+        ));
+
         // The list is the seeded built-ins, not a second copy of them.
         let defaults = AgentPreset::defaults();
         for agent in AgentPreset::builtin_agents() {

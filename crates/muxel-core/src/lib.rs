@@ -40,8 +40,9 @@ pub use agent::{
     codex_latest_session_id, codex_session_exists, codex_session_hint_from_title,
     codex_session_id_from_hint, codex_session_matches_cwd, codex_session_names,
     codex_terminal_title_override, file_link_instruction, find_claude_session_path,
-    is_known_agent_program, memory_header, memory_instruction, memory_reference,
-    muxel_file_reference, resolve_launch, resolve_launch_for_session, session_resume_args,
+    is_known_agent_program, launches_known_agent, memory_header, memory_instruction,
+    memory_reference, muxel_file_reference, resolve_launch, resolve_launch_for_session,
+    session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};

@@ -89,6 +89,38 @@ impl Drop for ControlTurn {
     }
 }
 
+/// [`muxel_core::launches_known_agent`] for `instance`'s program, through the
+/// `PATH` it would be found by: its preset's own, else muxel's.
+fn launches_known_agent(instance: &Instance) -> bool {
+    let path = instance
+        .env
+        .iter()
+        .rev()
+        .find(|var| var.key.eq_ignore_ascii_case("PATH"))
+        .map(|var| std::ffi::OsString::from(&var.value))
+        .or_else(|| std::env::var_os("PATH"));
+    muxel_core::launches_known_agent(instance.program.as_deref(), path.as_deref(), launchable)
+}
+
+/// Whether a PATH search would launch `candidate`: an executable file, or on
+/// Windows one with an extension it tries.
+fn launchable(candidate: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(candidate)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        ["", ".exe", ".cmd", ".bat", ".com"].iter().any(|ext| {
+            let mut path = candidate.as_os_str().to_owned();
+            path.push(ext);
+            Path::new(&path).is_file()
+        })
+    }
+}
+
 /// Apply outside creation's launch policy after all program/transport wrappers.
 /// A missing startup owner must not silently become ordinary runner automation.
 pub(super) fn control_launch_spec(
@@ -405,7 +437,7 @@ impl MuxelApp {
                             }))
                     })))
                     .child(hint(t(
-                        "Off by default, including upgrades. Ask requires a click for each request. Allow opens presets that run a known agent (Claude, Codex, Grok, opencode, Amp, …) without a click; any other program, such as ssh, wsl or python, still Asks. Literal commands and shell presets always Ask and also require the shell/command permission below. Approvals expire after 120 seconds. Turning creation or outside control off refuses all pending requests. Outside control off also stops the control server. Existing panes, admitted launches and typing permissions are unchanged. Toolbar creation is unaffected.",
+                        "Off by default, including upgrades. Ask requires a click for each request. Allow opens presets that run a known agent (Claude, Codex, Grok, opencode, Amp, …) from an absolute path or PATH entry without a click; any other program, such as ssh, wsl or python, and any relative path still Asks. Literal commands and shell presets always Ask and also require the shell/command permission below. Approvals expire after 120 seconds. Turning creation or outside control off refuses all pending requests. Outside control off also stops the control server. Existing panes, admitted launches and typing permissions are unchanged. Toolbar creation is unaffected.",
                     )))
                     .child(check(
                         Checkbox::new("grok-control-shells")

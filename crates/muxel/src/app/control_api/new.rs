@@ -7,11 +7,13 @@ impl MuxelApp {
     pub(super) fn creation_decision(&self, instance: &Instance) -> ctl::CreationDecision {
         let class = if instance.literal_argv {
             ctl::LaunchClass::Literal
-        } else if muxel_core::is_known_agent_program(instance.program.as_deref()) {
+        } else if launches_known_agent(instance) {
             ctl::LaunchClass::Agent
         } else if readaloud::is_agent_program(instance.program.as_deref()) {
             // `ssh host`, `wsl.exe`, an interpreter: not a shell by name, but
-            // not an agent muxel knows either, so a person decides.
+            // not an agent muxel knows either, so a person decides. So does a
+            // known agent found by a relative path, which the caller's `--cwd`
+            // could supply.
             ctl::LaunchClass::Program
         } else {
             ctl::LaunchClass::Shell
@@ -142,9 +144,14 @@ impl MuxelApp {
             })
             .or_else(|| project.preferred_instance());
         let iid = instance.id;
+        // Taking focus moves the user's keystrokes (a password, say) into the
+        // new pane, so only a request the user just clicked to approve may.
+        // Under Allow, `--focus` opens it in the background like any other.
+        let focused = options.focus && approved;
         let result = json!({
             "id": ctl::short_id(iid), "uuid": iid,
             "project": project.name, "project_id": pid,
+            "focused": focused,
             "cwd": cwd,
             "program": instance.program.clone().unwrap_or_else(|| CommandSpec::shell().program),
             "args": instance.args,
@@ -160,7 +167,7 @@ impl MuxelApp {
             self.control_turns
                 .insert(iid, ControlTurn::startup(prompt.trim_end().to_string()));
         }
-        if !options.focus {
+        if !focused {
             self.place_and_spawn_with_focus(
                 pid,
                 instance,
@@ -182,11 +189,7 @@ impl MuxelApp {
                 window,
                 cx,
             );
-            // Raising the window takes it from whatever the user is doing:
-            // only a request the user just clicked to approve may do that.
-            if approved {
-                window.activate_window();
-            }
+            window.activate_window();
         }
         if self.workspace.instance(iid).is_none() {
             self.control_turns.remove(&iid);

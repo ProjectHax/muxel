@@ -615,8 +615,10 @@ feature is added or changed, update the matching entry here in the same change**
   line-separator characters.
   Creation preserves the selected tab, focus,
   project and window by default, without raising the window. `--focus` selects
-  the new pane, and activates its window only when the request was approved
-  with a click. `--background` remains accepted as a
+  the new pane, its project and window only when the request was approved with
+  a click; under Allow the pane opens in the background as usual, so a request
+  can't move keystrokes the user is typing into it, and the reply's `focused`
+  says which happened. `--background` remains accepted as a
   compatibility no-op. JSON uses `focus` (default false); the legacy `background`
   field is accepted and ignored. The JSON reply identifies the pane and launch.
   ALL outside creation requires both "Allow outside tools to control muxel" and
@@ -624,8 +626,10 @@ feature is added or changed, update the matching entry here in the same change**
   It defaults to **Off**. **Ask** requires a click for each request; **Allow**
   opens only presets whose program is a known agent provider (the built-in agent
   presets' programs — Claude, Codex, Grok, opencode, Amp, Muse, Hermes, Ollama,
-  pi — by executable name) without a click. Any other program, such as
-  `ssh host`, `wsl.exe`, `python` or `node`, still Asks under Allow.
+  pi — by executable name) without a click, when it is given as an absolute
+  path or found through absolute `PATH` entries. Any other program, such as
+  `ssh host`, `wsl.exe`, `python` or `node`, and a relative path or `PATH`
+  entry, which the caller's `--cwd` could supply, still Asks under Allow.
   All literal argv, including agent argv, and shell-classified
   presets/defaults also require "Also allow typing into shell panes". Configured
   non-literal presets not classified as shells need only the first two grants.

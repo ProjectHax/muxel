@@ -210,6 +210,15 @@ impl MuxelApp {
     }
 }
 
+/// Bare names resolve through one absolute PATH entry here; the PATH rules
+/// themselves are muxel-core's `launches_known_agent`.
+fn launches_known_agent(instance: &Instance) -> bool {
+    let root = std::env::temp_dir();
+    muxel_core::launches_known_agent(instance.program.as_deref(), Some(root.as_os_str()), |_| {
+        true
+    })
+}
+
 fn argv(program: &str) -> ctl::NewOptions {
     ctl::NewOptions {
         argv: Some(vec![
@@ -361,6 +370,7 @@ fn control_new_focus_selects_the_new_pane_project_and_activates_its_window() {
                 )
                 .unwrap();
             let iid: Uuid = serde_json::from_value(result["uuid"].clone()).unwrap();
+            assert_eq!(result["focused"], true);
             assert_eq!(app.active_instance, Some(iid));
             assert_eq!(app.workspace.active_project, Some(pid));
             assert_eq!(app.selections, 1);
@@ -951,15 +961,21 @@ fn control_new_policy_ask_and_literal_allow_require_a_click_without_mutation() {
 
 #[test]
 fn control_new_policy_allow_opens_only_known_agent_programs_without_a_click() {
+    let grok = std::env::temp_dir().join("bin").join("Grok");
+    let opencode = std::env::temp_dir().join("OpenCode.EXE");
+    let node = std::env::temp_dir().join("node");
     for (program, known) in [
         ("codex", true),
         ("claude", true),
-        ("/opt/agents/bin/Grok", true),
-        (r"C:\Tools\OpenCode.EXE", true),
+        (grok.to_str().unwrap(), true),
+        (opencode.to_str().unwrap(), true),
+        // A relative path resolves against the caller's --cwd.
+        ("./node_modules/.bin/claude", false),
+        ("bin/codex", false),
         ("ssh", false),
         ("wsl.exe", false),
         ("python3", false),
-        ("/usr/bin/node", false),
+        (node.to_str().unwrap(), false),
         ("claude-wrapper.sh", false),
         ("codex.cmd", false),
     ] {
@@ -1009,27 +1025,49 @@ fn control_new_policy_allow_opens_only_known_agent_programs_without_a_click() {
 }
 
 #[test]
-fn control_new_focus_without_a_click_selects_the_pane_but_never_raises_the_window() {
-    let mut app = MuxelApp::fixture();
-    let (pid, _) = target_project(&mut app, false);
-    let mut window = Window::default();
-    let result = app
-        .control_new(
-            pid,
-            ctl::NewOptions {
-                preset: Some("Codex".into()),
-                focus: true,
-                ..Default::default()
-            },
-            false,
-            &mut window,
-            &mut Context(PhantomData),
-        )
-        .unwrap();
-    let iid: Uuid = serde_json::from_value(result["uuid"].clone()).unwrap();
-    assert_eq!(app.active_instance, Some(iid));
-    assert_eq!(app.workspace.active_project, Some(pid));
-    assert_eq!(window.activations, 0);
+fn control_new_focus_without_a_click_never_takes_focus_or_raises_the_window() {
+    for placement in [ctl::NewPlacement::Tab, ctl::NewPlacement::Right] {
+        let mut app = MuxelApp::fixture();
+        let active = app.active_instance;
+        let project = app.workspace.active_project;
+        let (pid, selected) = target_project(&mut app, false);
+        let mut window = Window::default();
+        let result = app
+            .control_new(
+                pid,
+                ctl::NewOptions {
+                    preset: Some("Codex".into()),
+                    focus: true,
+                    placement,
+                    ..Default::default()
+                },
+                false,
+                &mut window,
+                &mut Context(PhantomData),
+            )
+            .unwrap();
+        // Under Allow, keystrokes stay where the user is typing.
+        assert_eq!(result["focused"], false);
+        assert_eq!(app.active_instance, active);
+        assert_eq!(app.workspace.active_project, project);
+        assert_eq!(app.selections, 0);
+        assert_eq!(window.activations, 0);
+        let iid: Uuid = serde_json::from_value(result["uuid"].clone()).unwrap();
+        assert!(app.workspace.instance(iid).is_some());
+        let PaneNode::Leaf(leaf) = app
+            .workspace
+            .project(pid)
+            .unwrap()
+            .layout
+            .as_ref()
+            .unwrap()
+            .leaf_containing(selected.unwrap())
+            .unwrap()
+        else {
+            panic!("expected leaf");
+        };
+        assert_eq!(leaf.tabs[leaf.active], selected.unwrap());
+    }
 }
 
 #[test]
