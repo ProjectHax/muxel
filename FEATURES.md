@@ -201,10 +201,16 @@ feature is added or changed, update the matching entry here in the same change**
   A saved Codex conversation is abandoned when its validated saved rollout
   path and compression sibling are both absent or non-files, when a complete walk
   of the rollout store does not find it, or when Codex itself reports that the
-  exact resumed ID is missing soon after launch. Under tmux, where that message
-  leaves with tmux's screen, a clean exit within ten seconds of a Codex resume
-  counts as one: the pane starts fresh instead of closing. An invalid path,
-  unreadable store, unfinished walk, or unrelated early failure keeps the id and
+  exact resumed ID is missing soon after launch. Under local tmux that message
+  leaves with tmux's screen, so a `codex resume` whose rollout muxel could not
+  confirm, launched into a tmux session that was not running, counts as failed
+  when its client exits cleanly within ten seconds: the pane starts fresh
+  instead of closing. Such an early exit cannot be told from any other early
+  Codex exit there, so it gives up the unconfirmed id. Reattaching a running
+  session, a confirmed rollout, and remote panes keep close-on-exit; a remote
+  resume is never checked locally, and telling its failure from a quick quit
+  would need another round trip to the host. An invalid path, unreadable or
+  missing store, unfinished walk, or other early failure keeps the id and
   attempts resume.
   Remote Codex panes never check the local session store. Archived Codex sessions
   require unarchiving in Codex before they can resume.

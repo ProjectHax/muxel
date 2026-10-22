@@ -2440,25 +2440,31 @@ fn resume_missing_message(program: Option<&str>, id: Option<&str>, text: &str) -
     text.contains("No conversation found")
 }
 
-/// Whether a tmux-wrapped Codex pane's clean exit is its resume failing. A
-/// Codex that cannot find the conversation ends its tmux session, the client
-/// exits 0, and tmux takes Codex's message away with its screen, so the
-/// missing-ID detector rarely sees it. A clean exit this soon after a resume
-/// launch counts as that failure: the pane starts fresh instead of closing.
-fn tmux_codex_resume_ended(
-    program: Option<&str>,
-    tmux: bool,
-    exit_code: Option<i32>,
-    recent_resume: bool,
+/// Whether a launch may read a clean early tmux client exit as its Codex resume
+/// failing. A Codex that cannot find the conversation ends its tmux session,
+/// the client exits 0, and tmux takes Codex's message away with its screen, so
+/// the missing-ID detector rarely sees it. Only a local `codex resume` whose
+/// rollout muxel could not confirm, starting a session that tmux says is not
+/// running, qualifies: reattaching a running session runs nothing new, so its
+/// clean exit is a quit. `session_running` is asked only for such a resume.
+fn arms_tmux_resume_recovery(
+    unconfirmed_resume: bool,
+    session_running: impl FnOnce() -> Option<bool>,
 ) -> bool {
-    is_codex_program(program) && tmux && exit_code == Some(0) && recent_resume
+    unconfirmed_resume && session_running() == Some(false)
+}
+
+/// A clean exit this soon after an armed launch counts as the failed resume:
+/// the pane starts fresh instead of closing.
+fn tmux_codex_resume_ended(armed: bool, exit_code: Option<i32>, recent_resume: bool) -> bool {
+    armed && exit_code == Some(0) && recent_resume
 }
 
 #[cfg(test)]
 mod claude_resume_tests {
     use super::{
-        effective_local_cwd, resume_missing_message, should_recover_expired_session,
-        tmux_codex_resume_ended,
+        arms_tmux_resume_recovery, effective_local_cwd, resume_missing_message,
+        should_recover_expired_session, tmux_codex_resume_ended,
     };
     use std::path::Path;
 
@@ -2508,34 +2514,28 @@ mod claude_resume_tests {
     fn tmux_codex_clean_exit_after_resume_recovers_instead_of_closing() {
         // What tick sees when `codex resume <id>` cannot find the rollout under
         // tmux: the client exits 0 and the missing-ID message is gone.
-        let ended = tmux_codex_resume_ended(Some("codex"), true, Some(0), true);
+        let ended = tmux_codex_resume_ended(true, Some(0), true);
         assert!(ended);
         assert!(should_recover_expired_session(Some("codex"), ended, false));
-        // A deliberate quit later, or a fresh launch, still closes on exit.
-        assert!(!tmux_codex_resume_ended(
-            Some("codex"),
-            true,
-            Some(0),
-            false
-        ));
-        // Only the tmux client hides the message; a direct child keeps it.
-        assert!(!tmux_codex_resume_ended(
-            Some("codex"),
-            false,
-            Some(0),
-            true
-        ));
+        // A later deliberate quit, or any unarmed launch, still closes on exit.
+        assert!(!tmux_codex_resume_ended(true, Some(0), false));
+        assert!(!tmux_codex_resume_ended(false, Some(0), true));
         // A failing client belongs to the reattach path.
-        assert!(!tmux_codex_resume_ended(Some("codex"), true, Some(1), true));
-        assert!(!tmux_codex_resume_ended(Some("codex"), true, None, true));
-        // Other providers keep their own recovery rules.
-        assert!(!tmux_codex_resume_ended(
-            Some("claude"),
-            true,
-            Some(0),
-            true
-        ));
-        assert!(!tmux_codex_resume_ended(Some("grok"), true, Some(0), true));
+        assert!(!tmux_codex_resume_ended(true, Some(1), true));
+        assert!(!tmux_codex_resume_ended(true, None, true));
+    }
+
+    #[test]
+    fn only_an_unconfirmed_resume_into_a_new_tmux_session_arms_recovery() {
+        assert!(arms_tmux_resume_recovery(true, || Some(false)));
+        // Reattaching a running session, quit within seconds, is a quit.
+        assert!(!arms_tmux_resume_recovery(true, || Some(true)));
+        // tmux could not say: keep close-on-exit.
+        assert!(!arms_tmux_resume_recovery(true, || None));
+        // A confirmed rollout (or no resume at all) never asks tmux.
+        assert!(!arms_tmux_resume_recovery(false, || {
+            panic!("tmux asked for a confirmed resume")
+        }));
     }
 }
 
@@ -3295,6 +3295,9 @@ pub struct MuxelApp {
     session_discoveries: muxel_core::session_discovery::SessionDiscoveries,
     /// Each restored Codex pane's one pre-launch history lookup (runtime only).
     codex_restore_lookups: muxel_core::session_discovery::CodexRestoreLookups,
+    /// Panes whose latest launch is armed by `arms_tmux_resume_recovery`
+    /// (runtime only): only they may read a clean early exit as a failed resume.
+    codex_unconfirmed_resumes: HashSet<Uuid>,
     /// Full persisted settings (source of truth for config not mirrored above).
     settings: muxel_core::Settings,
     /// Active theme name + mode override (persisted).
@@ -5673,6 +5676,7 @@ impl MuxelApp {
             remote_layout_poll_inflight: false,
             session_discoveries: Default::default(),
             codex_restore_lookups: Default::default(),
+            codex_unconfirmed_resumes: HashSet::new(),
             theme: settings.theme.clone(),
             theme_mode: settings.theme_mode.clone(),
             use_tmux: settings.default_use_tmux,
@@ -6411,6 +6415,8 @@ impl MuxelApp {
         let previous_session_path = inst.session_path.clone();
         let host_minted = preset.session_id_flag.is_some();
         let mut resume_cwd = None;
+        // `codex resume <id>` without a rollout this check could confirm.
+        let mut unconfirmed_resume = false;
         if host_minted {
             if inst.session_id.is_none() {
                 inst.session_id = Some(Uuid::new_v4().to_string());
@@ -6460,15 +6466,23 @@ impl MuxelApp {
                         inst.session_path = None;
                         inst.session_started = false;
                     }
-                    Ok(muxel_core::CodexResumePath::Unknown) => {}
+                    Ok(muxel_core::CodexResumePath::Unknown) => unconfirmed_resume = true,
                     // An unreadable store does not prove an exact identity expired.
                     Err(error) => {
-                        log::warn!("could not check Codex rollout before resume: {error}")
+                        log::warn!("could not check Codex rollout before resume: {error}");
+                        unconfirmed_resume = true;
                     }
                 }
             }
         }
         let snapshot = inst.clone();
+        // `command_for` keeps this only for a launch that starts a new tmux
+        // session (`arms_tmux_resume_recovery`).
+        if unconfirmed_resume {
+            self.codex_unconfirmed_resumes.insert(iid);
+        } else {
+            self.codex_unconfirmed_resumes.remove(&iid);
+        }
         let result =
             muxel_core::session_resume_args(&preset, &snapshot).map(|args| (args, resume_cwd));
         if snapshot.session_path != previous_session_path {
@@ -6582,6 +6596,7 @@ impl MuxelApp {
         // Build program/args (and, for local, the PTY working dir). For remote the
         // command becomes `ssh … -- 'cd <dir> && exec <program>'`; the cwd lives
         // inside that remote string, so there is no local PTY cwd.
+        let mut armed_resume = false;
         let (mut spec, local_cwd, extra_env) = if let Some((host, rref)) = remote {
             let remote_cwd = inst
                 .and_then(|i| i.worktree_path.as_ref())
@@ -6612,6 +6627,15 @@ impl MuxelApp {
                 Some(session) => {
                     let root = std::env::var_os(muxel_store::USER_DATA_DIR_ENV).map(PathBuf::from);
                     let socket = integrations::local_tmux_socket(&session);
+                    armed_resume = arms_tmux_resume_recovery(
+                        self.codex_unconfirmed_resumes.contains(&instance_id),
+                        || {
+                            session_discovery::tmux_session_running(&SessionTarget::new(
+                                session.name.clone(),
+                                Some(socket),
+                            ))
+                        },
+                    );
                     let launch = crate::session_binding::tmux_pane_args(
                         socket,
                         &session.name,
@@ -6644,6 +6668,9 @@ impl MuxelApp {
             };
             (spec, cwd, extra_env)
         };
+        if !armed_resume {
+            self.codex_unconfirmed_resumes.remove(&instance_id);
+        }
         if let Some(shell) = remote_paste_shell {
             spec = spec.with_paste_shell(shell);
         } else if agent_program.is_some() {
@@ -10981,8 +11008,9 @@ impl MuxelApp {
             // `session_id` — every time the server died twice inside
             // `RECOVER_WITHIN_SECS`. Those panes belong to `tmux_lost` below.
             // A Codex resume that fails ends its session and leaves the client
-            // at 0, though, so that clean exit recovers instead of closing the
-            // pane (`tmux_codex_resume_ended`).
+            // at 0, though. For an unconfirmed rollout resumed into a new
+            // session, that clean exit recovers instead of closing the pane
+            // (`arms_tmux_resume_recovery`).
             let recent_resume =
                 self.terminal_launches
                     .get(&iid)
@@ -10993,8 +11021,7 @@ impl MuxelApp {
                 exited && exit_code != Some(0) && tmux_session.is_none() && recent_resume;
             let tmux_resume_ended = exited
                 && tmux_codex_resume_ended(
-                    self.resume_program(iid),
-                    tmux_session.is_some(),
+                    self.codex_unconfirmed_resumes.contains(&iid),
                     exit_code,
                     recent_resume,
                 );
