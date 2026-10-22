@@ -297,6 +297,18 @@ pub fn no_server(stderr: &str) -> bool {
     stderr.contains("no server running") || stderr.contains("error connecting to")
 }
 
+/// Whether a failed (exit 1) [`has_session_args`] said the session isn't there:
+/// the server has no session of that name, has no sessions at all (tmux then
+/// finds no "current target" before it gets to the name; muxel's own server
+/// keeps running empty, `exit-empty off`), or isn't running
+/// ([`confirmed_no_server`]). Any other failure is no answer.
+pub fn has_session_absent(stderr: &str) -> bool {
+    let message = stderr.trim();
+    message.starts_with("can't find session:")
+        || message == "no current target"
+        || confirmed_no_server(message)
+}
+
 /// Only a definite absent server can authorize owner migration. In particular,
 /// permission failures and incomplete listings are not evidence of absence.
 pub fn confirmed_no_server(stderr: &str) -> bool {
@@ -1467,6 +1479,28 @@ mod tests {
             Some(Socket::Private)
         );
         assert_eq!(running.len(), 1);
+    }
+
+    #[test]
+    fn has_session_absent_reads_only_tmuxs_answers_of_absence() {
+        for message in [
+            "can't find session: work\n",
+            "no current target\n",
+            "no server running on /tmp/tmux-1000/mxl\n",
+            "error connecting to /tmp/tmux-1000/mxl (No such file or directory)\n",
+        ] {
+            assert!(has_session_absent(message), "{message}");
+        }
+        for message in [
+            "",
+            "lost server",
+            "server exited unexpectedly",
+            "error connecting to /tmp/tmux-1000/mxl (Permission denied)",
+            "no current target\nPermission denied",
+            "warning: no current target",
+        ] {
+            assert!(!has_session_absent(message), "{message}");
+        }
     }
 
     #[test]

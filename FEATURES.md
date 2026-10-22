@@ -1207,7 +1207,8 @@ feature is added or changed, update the matching entry here in the same change**
   next session starts on muxel's own after both servers confirm the old session is
   gone and `mxl` has no session of that exact name. A namesake on `mxl` is left alone
   and the pane keeps its default-server binding but stops, then attaches by itself
-  once the shared project layout assigns it the new owner; retry cannot recreate a
+  once another muxel sharing the project's layout assigns it the new owner (or
+  after you stop that session and restart the pane); retry cannot recreate a
   second agent on Default, and Restart checks for the namesake before it stops
   anything. Once moved, a pane stays on `mxl` whatever an older copy of the layout
   says. A session still running on the default server reattaches even when `mxl`
