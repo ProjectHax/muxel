@@ -1116,6 +1116,18 @@ fn startup_provider_accepted(
             && startup_title_working(attempt.provider, title))
 }
 
+/// The provider title a controller task's startup judges, with its change
+/// generation: a tmux-wrapped pane's title read through tmux, else the PTY's own.
+fn startup_title(
+    session: &TerminalSession,
+    probe: Option<&crate::startup::TitleProbe>,
+) -> (u64, Option<String>) {
+    match probe {
+        Some(probe) => probe.snapshot(),
+        None => session.title_snapshot(),
+    }
+}
+
 async fn confirm_startup_submission(
     view: &WeakEntity<TerminalView>,
     session: &Arc<TerminalSession>,
@@ -1123,6 +1135,7 @@ async fn confirm_startup_submission(
     guard: &mut crate::startup::Guard,
     armed_at: Instant,
     attempt: &StartupAttempt<'_>,
+    probe: Option<&crate::startup::TitleProbe>,
 ) -> Result<(), crate::startup::Stop> {
     use crate::startup::{Acceptance, AcceptanceAction};
     let mut acceptance = Acceptance::default();
@@ -1130,7 +1143,7 @@ async fn confirm_startup_submission(
     loop {
         let (accepted, retryable) = with_startup_view(view, session, cx, |view| {
             guard.check(armed_at.elapsed(), session.input_rev())?;
-            let (generation, title) = session.title_snapshot();
+            let (generation, title) = startup_title(session, probe);
             let screen = session.startup_screen();
             let history = session.recent_text(500);
             let prompt = muxel_core::readaloud::prompt_from_screen(&history);
@@ -1183,6 +1196,135 @@ async fn confirm_startup_submission(
     }
 }
 
+const STARTUP_POLL_MS: u64 = 100;
+const STARTUP_SETTLE_MS: u128 = 2000;
+const STARTUP_MAX_WAIT_MS: u64 = 30_000;
+const STARTUP_KEY_GAP_MS: u64 = 150;
+const STARTUP_PRE_TYPE_MS: u64 = 300;
+// The prompt is typed in one burst; wait before the submit Enter so the agent
+// has finished ingesting the text and treats it as a deliberate submit rather
+// than a newline within a paste.
+const STARTUP_SUBMIT_DELAY_MS: u64 = 400;
+/// How long a controller task keeps checking for a ready composer after the
+/// settle cap and its own fixed pauses, before it reports `NotReady`.
+const STARTUP_READY_GRACE_MS: u64 = 5_000;
+/// How often a tmux-wrapped controller task reads its pane title through tmux.
+const STARTUP_TITLE_POLL_MS: u64 = 250;
+const SHIFT_TAB: &[u8] = b"\x1b[Z";
+
+/// A controller task's readiness deadline. The settle loop may use its whole
+/// cap (a UI that never goes quiet) and the configured delay; the auto-mode
+/// keys, the pre-type and pre-submit pauses that follow, and one readiness
+/// window must still fit, or a slow UI would always be refused at its write.
+fn controlled_startup_deadline(startup_delay_ms: u32, auto_mode_presses: u8) -> Duration {
+    let keys = match auto_mode_presses {
+        0 => 0,
+        presses => (u64::from(presses) + 1) * STARTUP_KEY_GAP_MS,
+    };
+    Duration::from_millis(
+        STARTUP_MAX_WAIT_MS
+            + u64::from(startup_delay_ms)
+            + keys
+            + STARTUP_PRE_TYPE_MS
+            + STARTUP_SUBMIT_DELAY_MS
+            + STARTUP_READY_GRACE_MS,
+    )
+}
+
+/// The terminal side of [`quiet_startup`], so its timing can be tested
+/// without a PTY.
+trait QuietStartupTarget {
+    fn has_output(&self) -> bool;
+    fn idle_for(&self) -> Duration;
+    fn write_input(&self, data: &[u8]);
+    fn paste(&self, text: &str);
+    fn mark_turn_submitted(&self);
+}
+
+impl QuietStartupTarget for TerminalSession {
+    fn has_output(&self) -> bool {
+        TerminalSession::has_output(self)
+    }
+    fn idle_for(&self) -> Duration {
+        TerminalSession::idle_for(self)
+    }
+    fn write_input(&self, data: &[u8]) {
+        TerminalSession::write_input(self, data)
+    }
+    fn paste(&self, text: &str) {
+        TerminalSession::paste(self, text)
+    }
+    fn mark_turn_submitted(&self) {
+        TerminalSession::mark_turn_submitted(self)
+    }
+}
+
+struct QuietStartup {
+    input: Option<String>,
+    auto_mode_presses: u8,
+    startup_delay_ms: u32,
+    submit: bool,
+}
+
+/// Startup automation for runners, TypeIn presets and loops — everything but a
+/// controller task, which has its own verified protocol.
+///
+/// "Ready" = the child has produced output AND has then been quiet for
+/// SETTLE_MS. This adapts to slow starters (e.g. opencode, whose first output —
+/// clearing the screen — comes early but whose input box only appears seconds
+/// later, once it stops emitting): we wait for the load output to actually stop,
+/// not a guessed delay. SETTLE_MS is generous so a brief pause mid-load isn't
+/// mistaken for ready. Capped by MAX_WAIT in case a UI never goes quiet: the
+/// input is still typed at the cap. No provider title or composer is required,
+/// so this works the same under tmux, for any agent and any Codex footer.
+async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Output = ()>>(
+    target: &T,
+    mut timer: impl FnMut(u64) -> F,
+    plan: QuietStartup,
+    mut event: impl FnMut(&'static str, usize),
+) {
+    // Wait for the agent's first output (it has started up).
+    let mut waited = 0u64;
+    while !target.has_output() && waited < STARTUP_MAX_WAIT_MS {
+        timer(STARTUP_POLL_MS).await;
+        waited += STARTUP_POLL_MS;
+    }
+    event("automation-first-output", 0);
+    if plan.startup_delay_ms > 0 {
+        // Preset-configured fixed delay after first output — for agents that
+        // keep loading well past their first draw (e.g. opencode).
+        timer(plan.startup_delay_ms as u64).await;
+    } else {
+        // Auto: wait until output goes quiet (UI finished drawing).
+        while waited < STARTUP_MAX_WAIT_MS && target.idle_for().as_millis() < STARTUP_SETTLE_MS {
+            timer(STARTUP_POLL_MS).await;
+            waited += STARTUP_POLL_MS;
+        }
+    }
+    event("automation-settled", 0);
+    for _ in 0..plan.auto_mode_presses {
+        target.write_input(SHIFT_TAB);
+        timer(STARTUP_KEY_GAP_MS).await;
+    }
+    // Confirm the mode switch with a single Enter.
+    if plan.auto_mode_presses > 0 {
+        target.write_input(b"\r");
+        timer(STARTUP_KEY_GAP_MS).await;
+    }
+    if let Some(input) = plan.input {
+        timer(STARTUP_PRE_TYPE_MS).await;
+        target.paste(&input);
+        event("automation-pasted", input.len());
+        // On restore, leave the prompt typed but unsubmitted.
+        if plan.submit {
+            timer(STARTUP_SUBMIT_DELAY_MS).await;
+            target.mark_turn_submitted();
+            target.write_input(b"\r");
+            event("automation-submitted", 1);
+        }
+    }
+}
+
 fn startup_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1197,11 +1339,12 @@ async fn wait_startup_composer(
     guard: &mut crate::startup::Guard,
     armed_at: Instant,
     empty: bool,
+    probe: Option<&crate::startup::TitleProbe>,
 ) -> Result<(), crate::startup::Stop> {
     loop {
         let ready = with_startup_view(view, session, cx, |view| {
             let screen = session.startup_screen();
-            let title = session.title();
+            let title = startup_title(session, probe).1;
             guard.ready(
                 armed_at.elapsed(),
                 session.input_rev(),
@@ -1469,6 +1612,7 @@ impl TerminalView {
         } = launch;
         let startup_input = spec.startup_input.clone();
         let startup_owner = spec.startup_turn.clone();
+        let title_source = spec.title_source.clone();
         let startup_turn = startup_owner
             .as_ref()
             .map(muxel_core::control::StartupTurnOwner::signal);
@@ -1516,8 +1660,10 @@ impl TerminalView {
         // ready, optionally send Shift+Tab a few times to reach auto-accept mode,
         // press Enter to confirm it, then type the prompt and press Enter.
         //
-        // Silence is not an editable composer. Known providers must pass their
-        // input protocol, and controller tasks need independent turn acceptance.
+        // Runners, TypeIn presets and loops keep the quiet-then-type behavior
+        // ([`quiet_startup`]). A controller task (`ctl new --prompt`) instead
+        // needs its provider's verified composer, then independent acceptance:
+        // silence is not an editable composer.
         if let Some(input) = startup_input.as_ref() {
             profile::startup_event(
                 instance_id,
@@ -1527,32 +1673,31 @@ impl TerminalView {
                 input.len(),
             );
         }
-        if auto_mode_presses > 0 || startup_input.is_some() {
-            const POLL_MS: u64 = 100;
-            const SETTLE_MS: u128 = 2000;
-            const MAX_WAIT_MS: u64 = 30_000;
-            const KEY_GAP_MS: u64 = 150;
-            const PRE_TYPE_MS: u64 = 300;
-            // The prompt is typed in one burst; wait before the submit Enter so
-            // the agent has finished ingesting the text and treats it as a
-            // deliberate submit rather than a newline within a paste.
-            const SUBMIT_DELAY_MS: u64 = 400;
-            const SHIFT_TAB: &[u8] = b"\x1b[Z";
+        if (auto_mode_presses > 0 || startup_input.is_some())
+            && let Some(owner) = startup_owner.clone()
+        {
             let session = session.clone();
             let automation_program = startup_program.clone();
             let known_provider = title_provider != TitleProvider::Other;
             let framed_readiness =
                 matches!(title_provider, TitleProvider::Claude | TitleProvider::Codex);
-            let control_task = startup_owner.is_some();
             let armed_at = Instant::now();
-            let mut guard = crate::startup::Guard::new(
-                session.input_rev(),
-                Some(Duration::from_millis(MAX_WAIT_MS + startup_delay_ms as u64)),
-            )
-            .with_control_turn(startup_owner.clone());
+            let deadline = controlled_startup_deadline(startup_delay_ms, auto_mode_presses);
+            let mut guard = crate::startup::Guard::new(session.input_rev(), Some(deadline))
+                .with_control_turn(Some(owner));
+            // Only a task that is still waiting pays for reading the title
+            // through tmux, and only until its startup settles either way.
+            let probe = title_source.map(|source| {
+                crate::startup::TitleProbe::spawn(
+                    source,
+                    Duration::from_millis(STARTUP_TITLE_POLL_MS),
+                    deadline + crate::startup::ACCEPTANCE_WINDOW + Duration::from_secs(5),
+                )
+            });
             cx.spawn(async move |view: WeakEntity<Self>, cx| {
+                let probe = probe.as_ref();
                 let result: Result<(), crate::startup::Stop> = async {
-                    if control_task && !known_provider {
+                    if !known_provider {
                         guard.fail(crate::startup::Stop::UnsupportedProvider);
                         return Err(crate::startup::Stop::UnsupportedProvider);
                     }
@@ -1563,13 +1708,13 @@ impl TerminalView {
                             guard.check(armed_at.elapsed(), session.input_rev())?;
                             Ok::<_, crate::startup::Stop>(session.has_output())
                         })??;
-                        if has_output || waited >= MAX_WAIT_MS {
+                        if has_output || waited >= STARTUP_MAX_WAIT_MS {
                             break;
                         }
                         cx.background_executor()
-                            .timer(Duration::from_millis(POLL_MS))
+                            .timer(Duration::from_millis(STARTUP_POLL_MS))
                             .await;
-                        waited += POLL_MS;
+                        waited += STARTUP_POLL_MS;
                     }
                     profile::startup_event(
                         instance_id,
@@ -1586,20 +1731,20 @@ impl TerminalView {
                             .await;
                     } else if !framed_readiness {
                         // Auto: wait until output goes quiet (UI finished drawing).
-                        while waited < MAX_WAIT_MS && session.idle_for().as_millis() < SETTLE_MS {
+                        while waited < STARTUP_MAX_WAIT_MS
+                            && session.idle_for().as_millis() < STARTUP_SETTLE_MS
+                        {
                             with_startup_view(&view, &session, cx, |_| {
                                 guard.check(armed_at.elapsed(), session.input_rev())
                             })??;
                             cx.background_executor()
-                                .timer(Duration::from_millis(POLL_MS))
+                                .timer(Duration::from_millis(STARTUP_POLL_MS))
                                 .await;
-                            waited += POLL_MS;
+                            waited += STARTUP_POLL_MS;
                         }
                     }
-                    if known_provider {
-                        wait_startup_composer(&view, &session, cx, &mut guard, armed_at, true)
-                            .await?;
-                    }
+                    wait_startup_composer(&view, &session, cx, &mut guard, armed_at, true, probe)
+                        .await?;
                     profile::startup_event(
                         instance_id,
                         &automation_program,
@@ -1618,7 +1763,7 @@ impl TerminalView {
                             |session| session.try_write_input(SHIFT_TAB),
                         )?;
                         cx.background_executor()
-                            .timer(Duration::from_millis(KEY_GAP_MS))
+                            .timer(Duration::from_millis(STARTUP_KEY_GAP_MS))
                             .await;
                     }
                     // Confirm the mode switch with a single Enter.
@@ -1633,18 +1778,18 @@ impl TerminalView {
                             |session| session.try_write_input(b"\r"),
                         )?;
                         cx.background_executor()
-                            .timer(Duration::from_millis(KEY_GAP_MS))
+                            .timer(Duration::from_millis(STARTUP_KEY_GAP_MS))
                             .await;
                     }
                     if let Some(input) = startup_input {
                         cx.background_executor()
-                            .timer(Duration::from_millis(PRE_TYPE_MS))
+                            .timer(Duration::from_millis(STARTUP_PRE_TYPE_MS))
                             .await;
-                        if known_provider {
-                            guard.reset_ready();
-                            wait_startup_composer(&view, &session, cx, &mut guard, armed_at, true)
-                                .await?;
-                        }
+                        guard.reset_ready();
+                        wait_startup_composer(
+                            &view, &session, cx, &mut guard, armed_at, true, probe,
+                        )
+                        .await?;
                         write_startup_input(
                             &view,
                             &session,
@@ -1664,20 +1809,18 @@ impl TerminalView {
                         // On restore, leave the prompt typed but unsubmitted.
                         if submit {
                             cx.background_executor()
-                                .timer(Duration::from_millis(SUBMIT_DELAY_MS))
+                                .timer(Duration::from_millis(STARTUP_SUBMIT_DELAY_MS))
                                 .await;
-                            if known_provider {
-                                guard.reset_ready();
-                                wait_startup_composer(
-                                    &view, &session, cx, &mut guard, armed_at, false,
-                                )
-                                .await?;
-                            }
+                            guard.reset_ready();
+                            wait_startup_composer(
+                                &view, &session, cx, &mut guard, armed_at, false, probe,
+                            )
+                            .await?;
                             let attempt = StartupAttempt {
                                 provider: title_provider,
                                 input: &input,
                                 expected_input: crate::startup::normalized(&input),
-                                before_title: session.title_snapshot().0,
+                                before_title: startup_title(&session, probe).0,
                                 before_prompt: muxel_core::readaloud::prompt_from_screen(
                                     &session.recent_text(500),
                                 )
@@ -1700,19 +1843,17 @@ impl TerminalView {
                                 startup_started.elapsed(),
                                 1,
                             );
-                            if known_provider {
-                                confirm_startup_submission(
-                                    &view, &session, cx, &mut guard, armed_at, &attempt,
-                                )
-                                .await?;
-                                profile::startup_event(
-                                    instance_id,
-                                    &automation_program,
-                                    "automation-submitted",
-                                    startup_started.elapsed(),
-                                    0,
-                                );
-                            }
+                            confirm_startup_submission(
+                                &view, &session, cx, &mut guard, armed_at, &attempt, probe,
+                            )
+                            .await?;
+                            profile::startup_event(
+                                instance_id,
+                                &automation_program,
+                                "automation-submitted",
+                                startup_started.elapsed(),
+                                0,
+                            );
                         }
                     }
                     Ok(())
@@ -1737,6 +1878,34 @@ impl TerminalView {
                     );
                     log::warn!("terminal startup automation stopped: {reason:?}");
                 }
+            })
+            .detach();
+        } else if auto_mode_presses > 0 || startup_input.is_some() {
+            let session = session.clone();
+            let automation_program = startup_program.clone();
+            let plan = QuietStartup {
+                input: startup_input,
+                auto_mode_presses,
+                startup_delay_ms,
+                submit,
+            };
+            cx.spawn(async move |_view: WeakEntity<Self>, cx| {
+                let executor = cx.background_executor().clone();
+                quiet_startup(
+                    &*session,
+                    |ms| executor.timer(Duration::from_millis(ms)),
+                    plan,
+                    |phase, bytes| {
+                        profile::startup_event(
+                            instance_id,
+                            &automation_program,
+                            phase,
+                            startup_started.elapsed(),
+                            bytes,
+                        )
+                    },
+                )
+                .await;
             })
             .detach();
         }
@@ -2633,11 +2802,148 @@ mod launch_tests {
     }
 }
 
+/// A controller task in a real tmux pane, on a throwaway socket no muxel
+/// profile uses. Skipped where tmux isn't installed.
+#[cfg(all(test, unix))]
+mod tmux_startup_tests {
+    use super::{TitleProvider, startup_ready};
+    use crate::session::{CommandSpec, PtyChunk, TerminalSession};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A stand-in for Codex's idle editor: its Ready title, bracketed paste, a
+    /// visible cursor at the empty prompt and a non-GPT model status line.
+    const FAKE_CODEX: &str = r#"printf '\033]2;scratch | Ready\033\\'
+printf '\033[?2004h\033[2J\033[HOpenAI Codex\r\n› Ask Codex to do anything\r\n\r\n'
+printf '  o4-mini medium · scratch\033[2;3H\033[?25h'
+sleep 30
+"#;
+
+    struct Server {
+        socket: String,
+        dir: std::path::PathBuf,
+    }
+
+    impl Server {
+        fn tmux(&self) -> Command {
+            let mut tmux = Command::new("tmux");
+            tmux.args(["-L", &self.socket, "-f", "/dev/null"])
+                .env_remove("TMUX");
+            tmux
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let path = self
+                .tmux()
+                .args(["display-message", "-p", "#{socket_path}"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+                .filter(|path| path.ends_with(&self.socket));
+            let _ = self.tmux().arg("kill-server").output();
+            if let Some(path) = path {
+                let _ = std::fs::remove_file(path);
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn a_tmux_wrapped_codex_is_ready_only_through_its_tmux_pane_title() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux is not installed; skipping");
+            return;
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let server = Server {
+            socket: format!("mxltest-{id}"),
+            dir: std::env::temp_dir().join(format!("muxel-tmux-startup-{id}")),
+        };
+        std::fs::create_dir_all(&server.dir).unwrap();
+        let script = server.dir.join("codex.sh");
+        std::fs::write(&script, FAKE_CODEX).unwrap();
+        let name = format!("muxel_startup_{}", &id[..8]);
+        let mut args: Vec<String> = ["-L", &server.socket, "-f", "/dev/null"]
+            .map(String::from)
+            .into();
+        args.extend(["new-session", "-A", "-s", &name, "--", "sh"].map(String::from));
+        args.push(script.display().to_string());
+        let mut spec = CommandSpec::program("tmux", args);
+        spec.env_remove.push("TMUX".into());
+        let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn tmux client");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let screen = loop {
+            while let Ok(chunk) = rx.try_recv() {
+                if let PtyChunk::Output(bytes) = chunk {
+                    session.process_output(&bytes);
+                }
+            }
+            let screen = session.startup_screen();
+            if screen.codex_composer_context(true).is_some() {
+                break screen;
+            }
+            if Instant::now() >= deadline {
+                session.kill();
+                panic!("the tmux client never showed the editor: {:?}", screen.text);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // tmux forwards the editor, its cursor and bracketed paste, but not the
+        // program's title: from the PTY alone, Codex could never become ready.
+        assert_ne!(session.title().as_deref(), Some("scratch | Ready"));
+        assert!(!startup_ready(
+            TitleProvider::Codex,
+            &screen,
+            session.title().as_deref(),
+            &[],
+            true
+        ));
+        // Read through tmux, as a controller task's probe reads it, it is.
+        let (socket, target) = (server.socket.clone(), name.clone());
+        let probe = crate::startup::TitleProbe::spawn(
+            crate::TitleSource::new(move || {
+                let out = Command::new("tmux")
+                    .args(["-L", &socket, "-f", "/dev/null"])
+                    .args(muxel_core::tmux::pane_title_args(&target))
+                    .env_remove("TMUX")
+                    .output()
+                    .ok()?;
+                muxel_core::tmux::parse_pane_title(&target, &String::from_utf8_lossy(&out.stdout))
+            }),
+            Duration::from_millis(50),
+            Duration::from_secs(20),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while probe.snapshot().1.as_deref() != Some("scratch | Ready") {
+            if Instant::now() >= deadline {
+                session.kill();
+                panic!("tmux never reported the title: {:?}", probe.snapshot());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(startup_ready(
+            TitleProvider::Codex,
+            &screen,
+            probe.snapshot().1.as_deref(),
+            &[],
+            true
+        ));
+        drop(probe);
+        session.kill();
+    }
+}
+
 #[cfg(test)]
 mod startup_readiness_tests {
     use super::{
-        StartupAttempt, TitleProvider, claude_startup_ready, startup_provider_accepted,
-        startup_ready, startup_retry_allowed,
+        QuietStartup, QuietStartupTarget, SHIFT_TAB, STARTUP_KEY_GAP_MS, STARTUP_MAX_WAIT_MS,
+        STARTUP_PRE_TYPE_MS, STARTUP_SUBMIT_DELAY_MS, StartupAttempt, TitleProvider,
+        claude_startup_ready, controlled_startup_deadline, quiet_startup,
+        startup_provider_accepted, startup_ready, startup_retry_allowed,
     };
     use crate::startup::Screen;
 
@@ -2656,6 +2962,159 @@ mod startup_readiness_tests {
             },
             cursor_visible: true,
             bracketed_paste: true,
+        }
+    }
+
+    struct FakeUi {
+        clock: std::rc::Rc<std::cell::Cell<u64>>,
+        output_at: Option<u64>,
+        never_quiet: bool,
+        writes: std::cell::RefCell<Vec<(u64, Vec<u8>)>>,
+        submitted: std::cell::Cell<bool>,
+    }
+
+    impl QuietStartupTarget for FakeUi {
+        fn has_output(&self) -> bool {
+            self.output_at.is_some_and(|at| self.clock.get() >= at)
+        }
+        fn idle_for(&self) -> std::time::Duration {
+            match self.output_at {
+                Some(at) if !self.never_quiet => {
+                    std::time::Duration::from_millis(self.clock.get().saturating_sub(at))
+                }
+                _ => std::time::Duration::ZERO,
+            }
+        }
+        fn write_input(&self, data: &[u8]) {
+            self.writes
+                .borrow_mut()
+                .push((self.clock.get(), data.to_vec()));
+        }
+        fn paste(&self, text: &str) {
+            self.write_input(text.as_bytes());
+        }
+        fn mark_turn_submitted(&self) {
+            self.submitted.set(true);
+        }
+    }
+
+    /// Run a future whose timers are all already elapsed (the fake clock).
+    fn run_now<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => panic!("fake timers never wait"),
+        }
+    }
+
+    /// Timed writes, whether a turn was submitted, and the profile phases.
+    type QuietRun = (Vec<(u64, Vec<u8>)>, bool, Vec<&'static str>);
+
+    fn quiet_run(output_at: Option<u64>, never_quiet: bool, presses: u8, delay: u32) -> QuietRun {
+        let clock = std::rc::Rc::new(std::cell::Cell::new(0));
+        let ui = FakeUi {
+            clock: clock.clone(),
+            output_at,
+            never_quiet,
+            writes: Default::default(),
+            submitted: Default::default(),
+        };
+        let mut events = Vec::new();
+        run_now(quiet_startup(
+            &ui,
+            |ms| {
+                clock.set(clock.get() + ms);
+                std::future::ready(())
+            },
+            QuietStartup {
+                input: Some("review the diff".into()),
+                auto_mode_presses: presses,
+                startup_delay_ms: delay,
+                submit: true,
+            },
+            |phase, _| events.push(phase),
+        ));
+        (ui.writes.into_inner(), ui.submitted.get(), events)
+    }
+
+    #[test]
+    fn runner_automation_types_at_the_cap_without_any_provider_evidence() {
+        // No title, no composer, no tmux pane title: runners, TypeIn presets and
+        // loops never wait on provider evidence. A UI that never goes quiet, or
+        // never prints, still gets its task typed and submitted at the cap.
+        for output_at in [Some(500), None] {
+            let (writes, submitted, events) = quiet_run(output_at, true, 0, 0);
+            assert_eq!(
+                writes,
+                [
+                    (
+                        STARTUP_MAX_WAIT_MS + STARTUP_PRE_TYPE_MS,
+                        b"review the diff".to_vec()
+                    ),
+                    (
+                        STARTUP_MAX_WAIT_MS + STARTUP_PRE_TYPE_MS + STARTUP_SUBMIT_DELAY_MS,
+                        b"\r".to_vec()
+                    ),
+                ]
+            );
+            assert!(submitted);
+            assert_eq!(
+                events,
+                [
+                    "automation-first-output",
+                    "automation-settled",
+                    "automation-pasted",
+                    "automation-submitted"
+                ]
+            );
+        }
+        // A UI that goes quiet is typed into once it has been quiet long enough.
+        let (writes, _, _) = quiet_run(Some(1000), false, 0, 0);
+        assert_eq!(writes[0].0, 1000 + 2000 + STARTUP_PRE_TYPE_MS);
+        // Auto mode, then the configured delay instead of the quiet wait.
+        let (writes, _, _) = quiet_run(Some(1000), true, 2, 4000);
+        let sent: Vec<_> = writes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        assert_eq!(
+            sent,
+            [SHIFT_TAB, SHIFT_TAB, b"\r", b"review the diff", b"\r"]
+        );
+        assert_eq!(writes[0].0, 1000 + 4000);
+    }
+
+    #[test]
+    fn controller_deadline_leaves_room_for_the_writes_after_a_capped_settle() {
+        use crate::startup::{Guard, Stop};
+        for (delay, presses) in [(0u32, 0u8), (0, 3), (4000, 0), (4000, 3)] {
+            let deadline = controlled_startup_deadline(delay, presses);
+            let mut guard = Guard::new(0, Some(deadline));
+            // The settle loop ran to its cap (plus a second of timer slack),
+            // then readiness took a moment before the fixed pauses.
+            let mut at = STARTUP_MAX_WAIT_MS + u64::from(delay) + 1_000 + 500;
+            let mut revision = 0;
+            let mut write = |guard: &mut Guard, at: u64| {
+                let admitted =
+                    guard.write(std::time::Duration::from_millis(at), revision, || Ok(()));
+                revision += 1;
+                admitted
+            };
+            for _ in 0..presses {
+                write(&mut guard, at).unwrap();
+                at += STARTUP_KEY_GAP_MS;
+            }
+            if presses > 0 {
+                write(&mut guard, at).unwrap();
+                at += STARTUP_KEY_GAP_MS;
+            }
+            at += STARTUP_PRE_TYPE_MS;
+            write(&mut guard, at).expect("paste after a capped settle");
+            at += STARTUP_SUBMIT_DELAY_MS;
+            write(&mut guard, at).expect("Enter after a capped settle");
+            // Still a deadline: readiness never falls through to typing.
+            assert_eq!(
+                Guard::new(0, Some(deadline)).check(deadline, 0),
+                Err(Stop::NotReady)
+            );
         }
     }
 

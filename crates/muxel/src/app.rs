@@ -6983,7 +6983,15 @@ impl MuxelApp {
                     // server inherits this argv and a stray `pkill -f <project>` kills
                     // every agent in every session. See `ensure_tmux_server`.
                     integrations::ensure_tmux_server(socket);
-                    (CommandSpec::program("tmux", launch.args), launch.env)
+                    // A controller task's startup reads the provider's title here.
+                    let name = session.name.clone();
+                    let title = muxel_terminal::TitleSource::new(move || {
+                        integrations::tmux_pane_title(socket, &name)
+                    });
+                    (
+                        CommandSpec::program("tmux", launch.args).with_title_source(title),
+                        launch.env,
+                    )
                 }
                 None => (
                     match resolved.program.clone() {

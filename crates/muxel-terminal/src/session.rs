@@ -579,6 +579,30 @@ impl PtyChunkSender {
     }
 }
 
+/// Reads a pane's title from outside its PTY. A tmux client forwards none of
+/// the titles its pane's program sets unless `set-titles` is on, which muxel
+/// leaves to the user, so a tmux-wrapped pane's title is read through tmux.
+#[derive(Clone)]
+pub struct TitleSource(Arc<dyn Fn() -> Option<String> + Send + Sync>);
+
+impl TitleSource {
+    /// `read` blocks (it may run a process); it is only ever called from a
+    /// background thread, and must bound its own time.
+    pub fn new(read: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    pub fn read(&self) -> Option<String> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for TitleSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TitleSource(..)")
+    }
+}
+
 /// What to run in a terminal.
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
@@ -605,6 +629,9 @@ pub struct CommandSpec {
     pub startup_input: Option<String>,
     /// Runtime lease for the first task created through outside control.
     pub startup_turn: Option<muxel_core::control::StartupTurnOwner>,
+    /// Where that task's startup reads the provider's title when the PTY can't
+    /// see it (a tmux-wrapped pane). Unused by any other automation.
+    pub title_source: Option<TitleSource>,
     /// Shift+Tab presses to send at startup before typing (runner auto mode).
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input` (false = leave it in
@@ -642,6 +669,7 @@ impl CommandSpec {
             startup_input: None,
             auto_mode_presses: 0,
             startup_turn: None,
+            title_source: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -665,6 +693,7 @@ impl CommandSpec {
             startup_input: None,
             auto_mode_presses: 0,
             startup_turn: None,
+            title_source: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -729,6 +758,11 @@ impl CommandSpec {
 
     pub fn with_startup_delay(mut self, ms: u32) -> Self {
         self.startup_delay_ms = ms;
+        self
+    }
+
+    pub fn with_title_source(mut self, source: TitleSource) -> Self {
+        self.title_source = Some(source);
         self
     }
 }
@@ -2407,12 +2441,6 @@ fn push_mouse_report(
     }
 }
 
-/// Resolve `program` to a path CreateProcess can launch on Windows.
-///
-/// portable-pty's PATH search prefers an extension-less file over PATHEXT
-/// (`.exe`/`.cmd`). npm puts a Unix `#!/bin/sh` shim at that name, so agents
-/// like Codex fail with os error 193 ("%1 is not a valid Win32 application").
-/// Prefer PATHEXT matches and skip shebang scripts; leave non-Windows alone.
 /// Resolve a literal launch without permitting a batch interpreter to reparse
 /// argv. Windows npm Codex wrappers resolve to their packaged native executable.
 pub fn literal_program_for_spawn(program: &str) -> anyhow::Result<String> {
@@ -2460,6 +2488,12 @@ fn validate_literal_program(program: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve `program` to a path CreateProcess can launch on Windows.
+///
+/// portable-pty's PATH search prefers an extension-less file over PATHEXT
+/// (`.exe`/`.cmd`). npm puts a Unix `#!/bin/sh` shim at that name, so agents
+/// like Codex fail with os error 193 ("%1 is not a valid Win32 application").
+/// Prefer PATHEXT matches and skip shebang scripts; leave non-Windows alone.
 fn resolve_program_for_spawn(program: &str) -> String {
     #[cfg(not(windows))]
     {

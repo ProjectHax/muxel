@@ -19,6 +19,9 @@ pub(crate) enum AcceptanceAction {
     Failed,
 }
 
+/// How long after its Enter a task has to show provider evidence of acceptance.
+pub(crate) const ACCEPTANCE_WINDOW: Duration = Duration::from_secs(10);
+
 #[derive(Default)]
 pub(crate) struct Acceptance {
     considered_retry: bool,
@@ -36,7 +39,7 @@ impl Acceptance {
         if accepted {
             return AcceptanceAction::Accepted;
         }
-        if elapsed >= Duration::from_secs(10) {
+        if elapsed >= ACCEPTANCE_WINDOW {
             return AcceptanceAction::Failed;
         }
         if elapsed >= Duration::from_secs(5) && !self.considered_retry {
@@ -173,6 +176,73 @@ impl Drop for Guard {
     }
 }
 
+/// Polls a [`TitleSource`](crate::TitleSource) on its own thread while one
+/// controller task waits for readiness and acceptance, so a blocking read
+/// (a tmux client) never runs on the UI thread. Each change of the read title
+/// bumps a generation, the way an OSC title event bumps the session's. It
+/// stops when dropped, or after `lifetime` if its owner never drops it.
+pub(crate) struct TitleProbe {
+    shared: std::sync::Arc<ProbeShared>,
+}
+
+#[derive(Default)]
+struct ProbeShared {
+    state: parking_lot::Mutex<ProbeState>,
+    wake: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct ProbeState {
+    generation: u64,
+    title: Option<String>,
+    stopped: bool,
+}
+
+impl TitleProbe {
+    pub(crate) fn spawn(
+        source: crate::TitleSource,
+        interval: Duration,
+        lifetime: Duration,
+    ) -> Self {
+        let shared = std::sync::Arc::new(ProbeShared::default());
+        let worker = shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("muxel-title-probe".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                while started.elapsed() < lifetime && !worker.state.lock().stopped {
+                    let title = source.read();
+                    let mut state = worker.state.lock();
+                    if state.stopped {
+                        break;
+                    }
+                    if state.title != title {
+                        state.title = title;
+                        state.generation += 1;
+                    }
+                    let _ = worker.wake.wait_for(&mut state, interval);
+                }
+            });
+        if spawned.is_err() {
+            log::warn!("could not start the startup title probe");
+        }
+        Self { shared }
+    }
+
+    /// The latest title read and its change generation.
+    pub(crate) fn snapshot(&self) -> (u64, Option<String>) {
+        let state = self.shared.state.lock();
+        (state.generation, state.title.clone())
+    }
+}
+
+impl Drop for TitleProbe {
+    fn drop(&mut self) {
+        self.shared.state.lock().stopped = true;
+        self.shared.wake.notify_all();
+    }
+}
+
 pub(crate) struct Screen {
     pub text: String,
     pub cursor_column: usize,
@@ -245,13 +315,7 @@ impl Screen {
             return None;
         }
         let cursor = usize::try_from(self.cursor_row).ok()?;
-        let bottom = rows.iter().rposition(|row| {
-            row.trim_start()
-                .as_bytes()
-                .get(..4)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"gpt-"))
-                && row.contains(" · ")
-        })?;
+        let bottom = rows.iter().rposition(|row| codex_footer(row))?;
         // Use the final prompt in the whole snapshot: a later menu cannot
         // borrow an earlier editor's footer or cursor position.
         let top = rows.iter().rposition(|row| {
@@ -372,6 +436,43 @@ impl Screen {
         let cursor_at_start = cursor == top + 1 && self.cursor_column == prefix + 2;
         (cursor_at_start == empty).then_some(top + 1..bottom)
     }
+}
+
+/// A row Codex draws below its live editor: its own shortcut hint or context
+/// meter (`? for shortcuts … 98% context left`), or a passive status line that
+/// opens with a model id (`gpt-5.4 high fast · scratch`, `o4-mini · …`, a custom
+/// provider's `llama3.1:8b · …`). Menus separate key hints with ` · ` as well
+/// (`enter continue · esc quit`), so a status line must open with a model-like
+/// token and name no keys.
+fn codex_footer(row: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "enter", "esc", "tab", "press", "select", "confirm", "cancel", "quit", "continue", "ctrl",
+        "shift", "⏎", "↑", "↓", "↑/↓",
+    ];
+    let row = row.trim();
+    if row.starts_with("? for shortcuts") || row.contains("% context left") {
+        return true;
+    }
+    let Some(id) = row
+        .split_once(" · ")
+        .and_then(|(model, _)| model.split_whitespace().next())
+    else {
+        return false;
+    };
+    let openai = ["gpt-", "codex-"].iter().any(|prefix| {
+        id.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    });
+    let model_like = id.len() >= 2
+        && id.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
+        && (openai || id.bytes().any(|b| b.is_ascii_digit()));
+    model_like
+        && !row
+            .split(|c: char| c.is_whitespace() || c == '·')
+            .any(|word| KEYS.iter().any(|key| word.eq_ignore_ascii_case(key)))
 }
 
 pub(crate) fn normalized(text: &str) -> String {
@@ -529,6 +630,111 @@ mod tests {
         );
         assert!(!residual_menu.codex_draft_matches("task"));
     }
+    #[test]
+    fn codex_editor_accepts_non_gpt_models_and_the_shortcut_footer_but_no_menu() {
+        for footer in [
+            "  o4-mini medium · scratch · Context 0% used",
+            "  o3 · scratch",
+            "  llama3.1:8b · ~/src/webapp",
+            "  codex-mini-latest · scratch",
+            "  ? for shortcuts                                   98% context left",
+            "  ? for shortcuts",
+            "                                                    98% context left",
+        ] {
+            let empty = screen(
+                &format!("OpenAI Codex\n› Ask Codex to do anything\n\n{footer}"),
+                1,
+                2,
+            );
+            assert!(empty.codex_composer_context(true).is_some(), "{footer}");
+            assert!(empty.codex_composer_context(false).is_none(), "{footer}");
+            let draft = screen(&format!("OpenAI Codex\n› run the tests\n\n{footer}"), 1, 15);
+            assert!(draft.codex_draft_matches("run the tests"), "{footer}");
+            assert!(draft.codex_exact_retry_draft("run the tests"), "{footer}");
+        }
+        // Key-hint rows are not editor footers, whatever precedes them; nor is
+        // a row that only shares the separator or a model-less word.
+        for footer in [
+            "enter continue · esc quit",
+            "  ↑/↓ select · enter confirm",
+            "  gpt-5.4 · press enter to continue",
+            "  ⚠ 1 · f2",
+            "  scratch · Context 0% used",
+            "  Press enter to confirm or esc to cancel",
+        ] {
+            let menu = screen(
+                &format!("Pick one\n› 1. First\n  2. Second\n{footer}"),
+                1,
+                2,
+            );
+            assert!(menu.codex_composer_context(true).is_none(), "{footer}");
+            assert!(menu.codex_composer_context(false).is_none(), "{footer}");
+        }
+    }
+
+    #[test]
+    fn title_probe_counts_changes_only_and_stops_when_dropped() {
+        use super::TitleProbe;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = reads.clone();
+        let probe = TitleProbe::spawn(
+            crate::TitleSource::new(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                Some(
+                    if n < 3 {
+                        "scratch | Starting"
+                    } else {
+                        "scratch | Ready"
+                    }
+                    .into(),
+                )
+            }),
+            ms(5),
+            Duration::from_secs(30),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while probe.snapshot().1.as_deref() != Some("scratch | Ready") {
+            assert!(std::time::Instant::now() < deadline, "probe never updated");
+            std::thread::sleep(ms(5));
+        }
+        // Repeated identical reads are not new title events.
+        while reads.load(Ordering::SeqCst) < 8 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "probe stopped polling"
+            );
+            std::thread::sleep(ms(5));
+        }
+        assert_eq!(probe.snapshot().0, 2);
+        drop(probe);
+        std::thread::sleep(ms(50));
+        let stopped = reads.load(Ordering::SeqCst);
+        std::thread::sleep(ms(100));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            stopped,
+            "dropped probe kept reading"
+        );
+
+        // Its own lifetime bounds a probe whose owner never drops it.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = reads.clone();
+        let _forgotten = TitleProbe::spawn(
+            crate::TitleSource::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                None
+            }),
+            ms(5),
+            ms(40),
+        );
+        std::thread::sleep(ms(200));
+        let ended = reads.load(Ordering::SeqCst);
+        std::thread::sleep(ms(100));
+        assert_eq!(reads.load(Ordering::SeqCst), ended);
+    }
+
     #[test]
     fn external_input_before_paste_or_after_our_paste_stops_automation() {
         let mut before = Guard::new(0, None);

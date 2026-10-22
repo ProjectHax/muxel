@@ -1969,6 +1969,132 @@ pub fn run_muxel_ctl(exe: &str, args: &[&str]) -> std::io::Result<std::process::
         .output()
 }
 
+/// The title of local `session`'s active pane (`#{pane_title}`): what its
+/// program last set with OSC 0/2. A tmux client forwards none of those titles
+/// unless `set-titles` is on, which muxel leaves to the user's own tmux config.
+/// Blocking and bounded to two seconds; `None` when the session or server is
+/// gone. Never `capture-pane`.
+pub fn tmux_pane_title(socket: Socket, session: &str) -> Option<String> {
+    pane_title_from(tmux_on(socket), session)
+}
+
+fn pane_title_from(mut tmux: Command, session: &str) -> Option<String> {
+    use std::io::Read as _;
+    tmux.args(muxel_core::tmux::pane_title_args(session))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        tmux.process_group(0);
+    }
+    let mut child = tmux.spawn().ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    status
+        .success()
+        .then(|| muxel_core::tmux::parse_pane_title(session, &out))
+        .flatten()
+}
+
+/// Against a real tmux on a throwaway socket that no muxel profile uses.
+/// Skipped where tmux isn't installed.
+#[cfg(all(test, unix))]
+mod pane_title_tests {
+    use super::pane_title_from;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    struct Server(String);
+
+    impl Server {
+        fn tmux(&self) -> Command {
+            let mut tmux = Command::new("tmux");
+            tmux.args(["-L", &self.0, "-f", "/dev/null"])
+                .env_remove("TMUX");
+            tmux
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let socket = self
+                .tmux()
+                .args(["display-message", "-p", "#{socket_path}"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+                .filter(|path| path.ends_with(&self.0));
+            let _ = self.tmux().arg("kill-server").output();
+            if let Some(socket) = socket {
+                let _ = std::fs::remove_file(socket);
+            }
+        }
+    }
+
+    #[test]
+    fn a_tmux_panes_program_title_is_read_without_set_titles() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux is not installed; skipping");
+            return;
+        }
+        let server = Server(format!("mxltest-{}", uuid::Uuid::new_v4().simple()));
+        let session = "muxel_title_12345678";
+        let status = server
+            .tmux()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "--",
+            ])
+            .args([
+                "sh",
+                "-c",
+                r"printf '\033]2;scratch | Ready\033\\'; sleep 30",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let title = pane_title_from(server.tmux(), session);
+            if title.as_deref() == Some("scratch | Ready") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pane title never arrived: {title:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The exact-match target never reads a namesake, and a missing
+        // session or server is no title rather than a stale one.
+        assert_eq!(pane_title_from(server.tmux(), "muxel_title_1234567"), None);
+        let gone = Server(format!("mxltest-{}", uuid::Uuid::new_v4().simple()));
+        assert_eq!(pane_title_from(gone.tmux(), session), None);
+    }
+}
+
 /// A tmux session's user option (`@name`), wherever the session lives. `None`
 /// when it is unset, the session is gone, or tmux couldn't be reached.
 pub fn tmux_option(loc: &RepoLoc, session: &SessionTarget, option: &str) -> Option<String> {

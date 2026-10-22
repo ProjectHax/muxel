@@ -443,11 +443,18 @@ feature is added or changed, update the matching entry here in the same change**
   sends auto-mode Shift+Tab presses, and respects the agent's startup delay (so
   opencode and Grok work). The pane is **visible but not focused** and never switches your
   active project — a loop firing on a timer can't interrupt what you're typing.
-- **Provider startup input** — typed startup tasks wait for Claude's editable
-  composer and bracketed-paste mode, Codex's live editor and Ready title, or
-  Grok's semantic idle state after its configured startup delay.
-  Codex folder-trust menus receive no task input; readiness failure leaves the
-  provider running and reports `startup_error` through `ctl status` and `show`.
+- **Provider startup input** — runners, TypeIn presets and loops type their
+  task once the agent's output has gone quiet (or after the preset's startup
+  delay), and at the 30-second cap if it never does, for any agent.
+  A `ctl new --prompt` task is stricter: it waits for Claude's editable
+  composer and bracketed-paste mode, Codex's live editor (under its model
+  status line, `? for shortcuts` or context-left footer) and Ready title, or
+  Grok's semantic idle state after its configured startup delay. In a tmux
+  pane, which forwards no program titles unless tmux's own `set-titles` is on,
+  muxel reads the provider's title through tmux (`#{pane_title}`) while that
+  task waits; it never changes tmux options. Codex folder-trust menus receive no
+  task input; readiness failure leaves the provider running and reports
+  `startup_error` through `ctl status` and `show`.
   Permission text inside Claude's pasted task does not block its submission.
   `ctl wait` keeps a newly created task pending through startup and paste, then
   confirms submission only from a fresh provider turn or rendered user row.
@@ -458,8 +465,8 @@ feature is added or changed, update the matching entry here in the same change**
   seconds without acceptance, `ctl wait` reports `submission_failed`, with an
   explanation in `startup_error`. Providers without a verified input/acceptance
   protocol (including Muse) refuse controller startup tasks without typing.
-  Input stops if the pane is replaced, someone types, the writer fails, or
-  readiness times out; it never replays a submitted task automatically.
+  A task's input stops if the pane is replaced, someone types, the writer fails,
+  or readiness times out; it never replays a submitted task automatically.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
   copy.

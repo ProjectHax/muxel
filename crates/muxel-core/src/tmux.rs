@@ -893,6 +893,34 @@ pub fn show_option_args(session: &str, option: &str) -> Vec<String> {
     ]
 }
 
+/// Arguments for `tmux …` printing the title of a session's active pane — what
+/// the program in it last set with OSC 0/2 — which a tmux client never forwards
+/// to its own terminal unless `set-titles` is on. `=name:` is the exact-match
+/// session's current window, so `muxel_p_1` never reads `muxel_p_12`. Read the
+/// output with [`parse_pane_title`]. Reading the title never needs, and must
+/// never use, `capture-pane`.
+pub fn pane_title_args(session: &str) -> Vec<String> {
+    vec![
+        "display-message".to_string(),
+        "-p".to_string(),
+        "-t".to_string(),
+        format!("={session}:"),
+        "#{session_name}:#{pane_title}".to_string(),
+    ]
+}
+
+/// The title in [`pane_title_args`]' output, only when it is `session`'s own.
+/// `display-message` may not fail on a target it can't find: it formats with
+/// no target instead and succeeds, so the output names its session, and tmux
+/// session names cannot contain `:`.
+pub fn parse_pane_title(session: &str, out: &str) -> Option<String> {
+    let line = out.strip_suffix('\n').unwrap_or(out);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    line.strip_prefix(session)?
+        .strip_prefix(':')
+        .map(str::to_string)
+}
+
 /// Arguments for `tmux …` to set a session's user option (`@name`).
 pub fn set_option_args(session: &str, option: &str, value: &str) -> Vec<String> {
     vec![
@@ -1696,6 +1724,45 @@ mod tests {
             "tmux",
         ] {
             assert!(!session_env_supported(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn pane_title_is_read_from_the_exact_session_without_capturing_it() {
+        let args = pane_title_args("muxel_p_1");
+        assert_eq!(
+            args,
+            [
+                "display-message",
+                "-p",
+                "-t",
+                "=muxel_p_1:",
+                "#{session_name}:#{pane_title}"
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.contains("capture")));
+        assert_eq!(
+            parse_pane_title("muxel_p_1", "muxel_p_1:scratch | Ready\n").as_deref(),
+            Some("scratch | Ready")
+        );
+        // A title may itself contain the separator or be empty.
+        assert_eq!(
+            parse_pane_title("muxel_p_1", "muxel_p_1:a: b\n").as_deref(),
+            Some("a: b")
+        );
+        assert_eq!(
+            parse_pane_title("muxel_p_1", "muxel_p_1:\n").as_deref(),
+            Some("")
+        );
+        // A missing target formats with no session; another session is not ours.
+        for out in [
+            "\n",
+            ":\n",
+            "",
+            "muxel_p_12:scratch | Ready\n",
+            "other:muxel_p_1:x\n",
+        ] {
+            assert_eq!(parse_pane_title("muxel_p_1", out), None, "{out:?}");
         }
     }
 
