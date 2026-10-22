@@ -726,6 +726,11 @@ fn isolated_peer_binding_overrides_foreign_owners_and_leaves_literals_unchanged(
 #[test]
 fn linked_launch_worktree_survives_migration_and_close_cleanup_plan() {
     use std::process::Command;
+    // The Nix package build runs this crate's tests in a sandbox without git.
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("skipped: git is not installed");
+        return;
+    }
     let root = std::env::temp_dir().join(format!("muxel-cwd-{}", Uuid::new_v4()));
     let repo = root.join("repo");
     let linked = root.join("linked");
