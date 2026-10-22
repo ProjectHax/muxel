@@ -29,7 +29,10 @@ const SESSION_PREFIX: &str = "muxel_";
 /// tmux and with every tool that runs a bare `tmux …`, and any of them could take
 /// that server down with every agent in it. RHEL 10's tmux 3.3a aborts in
 /// `capture-pane`, so an outside tool merely *reading* a muxel pane killed every
-/// session muxel had. Only a command that names this socket reaches muxel's server.
+/// session muxel had. From outside muxel, only a command that names this socket
+/// reaches muxel's server. Inside a pane, a bare `tmux …` reaches it too, because
+/// tmux sets `TMUX` in every pane to that pane's own server (see
+/// [`SERVER_MARK_ENV`]).
 ///
 /// Not `muxel`: the server keeps the command line of the client that started it
 /// (see [`start_server_args`]), which names this socket, so a socket called `muxel`
@@ -569,6 +572,171 @@ pub fn restore_exit_empty_args() -> Vec<String> {
         .collect()
 }
 
+/// Set on the client that runs [`start_server_args`] locally, so muxel can tell its
+/// own server from one that something else started on the same socket.
+///
+/// tmux copies the environment of the client that *starts* a server into that
+/// server's global environment, and never takes a later client's. So the marker is
+/// there only if muxel's own `start-server` created the server. A process inside a
+/// pane reaches muxel's server with a bare `tmux` (tmux points every pane at its
+/// server through `TMUX`), and one that kills the server and then runs `tmux
+/// new-session` starts a new one with its own environment: its `HOME`, its
+/// `GIT_EDITOR`, its agent's variables. Every pane muxel opened there would start
+/// from that environment. [`server_origin_args`] then flags the marker removed, so
+/// no pane inherits it and hands it on to a server muxel didn't start.
+///
+/// An environment variable, not part of the command line: the server keeps the
+/// command line of the client that started it, and that must not name muxel (see
+/// [`start_server_args`]).
+pub const SERVER_MARK_ENV: &str = "MUXEL_TMUX_SERVER";
+
+/// Arguments for `tmux …` that print [`SERVER_MARK_ENV`] (read it with
+/// [`ServerOrigin::from_probe`]) and then flag it removed, run right after
+/// [`start_server_args`]. On a server muxel didn't start there is no marker to
+/// print, and tmux skips the rest of a command sequence after a failed command, so
+/// that server stays unmarked until [`reseed_environment_script`] has given it
+/// muxel's environment.
+pub fn server_origin_args() -> Vec<String> {
+    [
+        "show-environment",
+        "-g",
+        SERVER_MARK_ENV,
+        ";",
+        "set-environment",
+        "-g",
+        "-r",
+        SERVER_MARK_ENV,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Arguments for `tmux …` that mark a server as muxel's without touching the rest
+/// of its environment. For a tmux too old to run [`reseed_environment_script`]:
+/// trying again on the same server would only fail again on every pane.
+pub fn mark_server_args() -> Vec<String> {
+    ["set-environment", "-g", "-r", SERVER_MARK_ENV]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Who started a tmux server, as [`server_origin_args`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerOrigin {
+    /// muxel's `start-server` just started it.
+    Started,
+    /// muxel started it before, or has since given it muxel's environment.
+    Muxel,
+    /// Something else started it, or an earlier muxel that didn't mark its server.
+    /// Its global environment is whatever that process had.
+    Foreign,
+}
+
+impl ServerOrigin {
+    /// Read [`server_origin_args`]' output: `NAME=1` while the marker is fresh,
+    /// `-NAME` once it is flagged removed, and nothing (just an error) on a server
+    /// muxel didn't start.
+    pub fn from_probe(stdout: &[u8]) -> Self {
+        let removed = format!("-{SERVER_MARK_ENV}");
+        let set = format!("{SERVER_MARK_ENV}=");
+        let mut lines = stdout.split(|&b| b == b'\n');
+        if lines.clone().any(|line| line == removed.as_bytes()) {
+            ServerOrigin::Muxel
+        } else if lines.any(|line| line.starts_with(set.as_bytes())) {
+            ServerOrigin::Started
+        } else {
+            ServerOrigin::Foreign
+        }
+    }
+}
+
+/// The variable names in `tmux show-environment -g` output (`NAME=value` lines),
+/// leaving out the ones flagged removed (`-NAME`). A value containing a newline
+/// carries on onto the next line, which can then look like a variable of its own.
+/// That costs nothing in [`reseed_environment_script`]: unsetting a variable that
+/// isn't there does nothing.
+pub fn environment_names(show_environment: &[u8]) -> Vec<&[u8]> {
+    show_environment
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.starts_with(b"-"))
+        .filter_map(|line| line.iter().position(|&b| b == b'=').map(|eq| &line[..eq]))
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// A script for `tmux source-file -` that makes a server's global environment
+/// `wanted`, the environment muxel would have started that server with. It unsets
+/// every variable in `current` (see [`environment_names`]) that `wanted` lacks, sets
+/// everything in `wanted`, and last marks the server as muxel's
+/// ([`SERVER_MARK_ENV`]). `PWD` is left as it is, because tmux sets it itself when
+/// it starts.
+///
+/// It goes in through stdin because these values must not appear in a command line,
+/// where any process can read them. Each name and value is a double-quoted string
+/// with every byte outside a small safe set written as an octal escape, so nothing
+/// in it can expand (`$`, `~`), end the string, or start another command, and a
+/// value that isn't UTF-8 arrives byte for byte. Octal escapes need tmux 3.0 and a
+/// script on stdin needs 3.1. Older tmux runs none of the script (see
+/// [`mark_server_args`]).
+///
+/// Variables a `tmux.conf` sets on the server can't be told apart from the starting
+/// process's, so the script replaces them too. This only happens on a server muxel
+/// didn't start, and they come back the next time that server starts.
+pub fn reseed_environment_script(current: &[&[u8]], wanted: &[(&[u8], &[u8])]) -> String {
+    use std::fmt::Write as _;
+    let mut script = String::new();
+    for name in environment_extras(current, wanted) {
+        let _ = writeln!(script, "set-environment -g -u -- {}", tmux_string(name));
+    }
+    for &(name, value) in wanted {
+        if !reseed_skips(name) {
+            let _ = writeln!(
+                script,
+                "set-environment -g -- {} {}",
+                tmux_string(name),
+                tmux_string(value)
+            );
+        }
+    }
+    let _ = writeln!(script, "set-environment -g -r -- {SERVER_MARK_ENV}");
+    script
+}
+
+/// The variables [`reseed_environment_script`] unsets: those in `current` that
+/// `wanted` lacks, once each, in order.
+pub fn environment_extras<'a>(current: &[&'a [u8]], wanted: &[(&[u8], &[u8])]) -> Vec<&'a [u8]> {
+    let keep: HashSet<&[u8]> = wanted.iter().map(|(name, _)| *name).collect();
+    let mut seen = HashSet::new();
+    current
+        .iter()
+        .copied()
+        .filter(|name| !reseed_skips(name) && !keep.contains(name) && seen.insert(*name))
+        .collect()
+}
+
+fn reseed_skips(name: &[u8]) -> bool {
+    name.is_empty() || name == b"PWD" || name == SERVER_MARK_ENV.as_bytes()
+}
+
+/// `bytes` as a double-quoted string in tmux's command syntax, with every byte
+/// outside `[A-Za-z0-9_./:,+@=-]` as a three-digit octal escape (tmux 3.0+).
+fn tmux_string(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('"');
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || b"_./:,+@=-".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "\\{b:03o}");
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Arguments for `tmux …` to create-or-attach (`-A`) a session named `session`,
 /// starting in `cwd` and running `program` + `args`. With no `program`, tmux
 /// runs the user's default shell.
@@ -876,6 +1044,95 @@ mod tests {
         let server = Socket::Private.argv(start_server_args()).join(" ");
         assert_eq!(server, "-L mxl start-server ; set -s exit-empty off");
         assert!(!server.contains("muxel"), "{server}");
+    }
+
+    #[test]
+    fn the_origin_probe_reads_the_marker_then_flags_it_removed() {
+        assert_eq!(
+            server_origin_args(),
+            [
+                "show-environment",
+                "-g",
+                "MUXEL_TMUX_SERVER",
+                ";",
+                "set-environment",
+                "-g",
+                "-r",
+                "MUXEL_TMUX_SERVER"
+            ]
+        );
+        assert_eq!(
+            mark_server_args(),
+            ["set-environment", "-g", "-r", "MUXEL_TMUX_SERVER"]
+        );
+        assert_eq!(
+            ServerOrigin::from_probe(b"MUXEL_TMUX_SERVER=1\n"),
+            ServerOrigin::Started
+        );
+        assert_eq!(
+            ServerOrigin::from_probe(b"-MUXEL_TMUX_SERVER\n"),
+            ServerOrigin::Muxel
+        );
+        // A server muxel didn't start has no marker: tmux prints only an error, to
+        // stderr.
+        assert_eq!(ServerOrigin::from_probe(b""), ServerOrigin::Foreign);
+        assert_eq!(
+            ServerOrigin::from_probe(b"MUXEL_TMUX_SERVER_OTHER=1\n"),
+            ServerOrigin::Foreign
+        );
+    }
+
+    #[test]
+    fn environment_names_skip_removed_variables() {
+        let out = b"HOME=/home/u\n-GONE\nEMPTY=\nF%%=() {  echo hi\n}\nPATH=/bin:/usr/bin\n";
+        assert_eq!(
+            environment_names(out),
+            [&b"HOME"[..], b"EMPTY", b"F%%", b"PATH"]
+        );
+    }
+
+    #[test]
+    fn the_reseed_script_unsets_extras_sets_muxels_environment_and_marks_last() {
+        let current: [&[u8]; 6] = [
+            b"HOME",
+            b"GIT_EDITOR",
+            b"PWD",
+            b"MUXEL_TMUX_SERVER",
+            b"GIT_EDITOR",
+            b"AGENT",
+        ];
+        let wanted: [(&[u8], &[u8]); 3] = [
+            (b"HOME", b"/home/u"),
+            (b"PWD", b"/elsewhere"),
+            (b"LANG", b"en_US.UTF-8"),
+        ];
+        assert_eq!(
+            environment_extras(&current, &wanted),
+            [&b"GIT_EDITOR"[..], b"AGENT"]
+        );
+        assert_eq!(
+            reseed_environment_script(&current, &wanted),
+            "set-environment -g -u -- \"GIT_EDITOR\"\n\
+             set-environment -g -u -- \"AGENT\"\n\
+             set-environment -g -- \"HOME\" \"/home/u\"\n\
+             set-environment -g -- \"LANG\" \"en_US.UTF-8\"\n\
+             set-environment -g -r -- MUXEL_TMUX_SERVER\n"
+        );
+    }
+
+    #[test]
+    fn tmux_strings_cannot_expand_end_early_or_start_a_command() {
+        assert_eq!(
+            tmux_string(b"/usr/bin:/a-b_c.d,e+f@g=h"),
+            "\"/usr/bin:/a-b_c.d,e+f@g=h\""
+        );
+        assert_eq!(
+            tmux_string(b"$HOME ~\"\\;#{x}\n"),
+            "\"\\044HOME\\040\\176\\042\\134\\073\\043\\173x\\175\\012\""
+        );
+        assert_eq!(tmux_string("é".as_bytes()), "\"\\303\\251\"");
+        assert_eq!(tmux_string(b"\xff"), "\"\\377\"");
+        assert_eq!(tmux_string(b""), "\"\"");
     }
 
     #[test]

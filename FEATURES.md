@@ -1191,19 +1191,28 @@ feature is added or changed, update the matching entry here in the same change**
   Its socket is named `mxl` rather than `muxel` for the same reason: a `pkill -f
   muxel` stops muxel's windows but leaves the agents running in tmux.
 - **A tmux server of its own** — muxel keeps its sessions on a private tmux socket
-  (`tmux -L mxl`), on this computer and on remote hosts alike, so nothing that runs
-  a bare `tmux` command can reach them: not your own tmux, and not another tool's
-  `tmux capture-pane`, which on builds that abort on it (RHEL 10's stock tmux) used to
-  take down the server and every agent in it. To look at a session by hand, use
-  `tmux -L mxl ls` and `tmux -L mxl attach -t muxel_…`. Upgrading stops nothing: a
-  pane whose session is still running on the default server from an earlier muxel
-  reattaches to it there (closing the pane still stops it), and its next session
-  starts on muxel's own. A tmux session of your own that you import stays on the
-  default server too. The iOS app follows the same rule.
+  (`tmux -L mxl`), on this computer and on remote hosts alike, so nothing outside
+  muxel that runs a bare `tmux` command can reach them: not your own tmux, and not
+  another tool's `tmux capture-pane`, which on builds that abort on it (RHEL 10's
+  stock tmux) used to take down the server and every agent in it. A command run
+  *inside* a muxel pane is different: tmux points every pane at its own server, so a
+  bare `tmux kill-server` typed there still stops muxel's. To look at a session by
+  hand, use `tmux -L mxl ls` and `tmux -L mxl attach -t muxel_…`. Upgrading stops
+  nothing: a pane whose session is still running on the default server from an
+  earlier muxel reattaches to it there (closing the pane still stops it), and its
+  next session starts on muxel's own. A tmux session of your own that you import
+  stays on the default server too. The iOS app follows the same rule.
   Such a `pkill` reaches only that pane's tmux client: the session and the agent keep
   running, and muxel **reattaches the pane automatically** — you see it blink, not die.
   Local and remote alike (SSH panes and the iOS companion do the same), since a host
   has one tmux server shared by every session on it.
+- **New panes start from muxel's environment** — a tmux pane's program starts from
+  the tmux server's environment, which tmux copies from whatever started the server.
+  When that isn't muxel (an agent that kills the server and then runs `tmux
+  new-session` to try something, say), muxel notices before opening a pane there and
+  gives the server muxel's own environment back, so new panes don't inherit that
+  command's home directory, editor setting, or agent variables. The event log notes
+  what was removed. Local panes, with tmux 3.1 or newer.
 - **Killed tmux sessions come back** — if the tmux session (or the whole server) dies
   anyway, the pane doesn't tombstone: muxel recreates the session and relaunches the
   agent with `--resume`, so a resume-capable agent picks its conversation back up where
