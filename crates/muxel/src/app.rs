@@ -140,7 +140,10 @@ fn literal_command_spec(
     // These only inspect terminal output for status; they never change argv,
     // environment or startup input, so literal commands keep the built-in cues.
     let (working, blocked) = default_markers(instance.program.as_deref());
-    Some(spec.with_markers(working, blocked))
+    // Muxel passes no session flag here, so it pins no conversation: only an
+    // agent that names its own (Codex) leaves the launch's binding unknown.
+    let binding = launch_binding(None, instance.program.as_deref(), None);
+    Some(spec.with_markers(working, blocked).with_binding(binding))
 }
 
 /// The local tmux owner a launch must settle (resolve, or move off Default)
@@ -159,7 +162,9 @@ fn local_owner_to_prepare(instance: &Instance, project: &Project) -> Option<Sess
 
 #[cfg(test)]
 mod literal_command_tests {
-    use super::{InstanceTmux, Socket, literal_command_spec, local_owner_to_prepare};
+    use super::{
+        InstanceTmux, LaunchBinding, Socket, literal_command_spec, local_owner_to_prepare,
+    };
     use muxel_core::{AgentPreset, EnvVar, InjectionMode, Instance, Project, WorktreeCleanup};
 
     #[test]
@@ -250,6 +255,19 @@ mod literal_command_tests {
         assert!(spec.startup_input.is_none());
         assert_eq!(spec.auto_mode_presses, 0);
         assert!(!spec.submit);
+        // No session flag and no id of its own: the launch is its conversation.
+        assert_eq!(spec.binding, LaunchBinding::Known(None));
+    }
+
+    #[test]
+    fn a_literal_codex_names_its_own_conversation_later() {
+        let mut instance = Instance::from_preset(uuid::Uuid::new_v4(), &AgentPreset::codex());
+        instance.literal_argv = true;
+        instance.session_id = Some(uuid::Uuid::new_v4().to_string());
+        instance.session_started = true;
+        let spec = literal_command_spec(&instance, None, false).unwrap();
+        assert!(spec.args.iter().all(|arg| arg != "resume"));
+        assert_eq!(spec.binding, LaunchBinding::Unknown);
     }
 
     #[test]
@@ -3850,6 +3868,44 @@ mod loop_cleanup_tests {
         assert_eq!(
             launch_binding(None, Some("opencode"), None),
             LaunchBinding::Known(None)
+        );
+    }
+
+    #[test]
+    fn a_codex_pane_its_restore_lookup_bound_resumes_a_known_conversation() {
+        use super::session_discovery::{
+            CodexRestoreFound, apply_codex_restore_found, codex_restore_query,
+        };
+        let codex = AgentPreset::codex();
+        let project = muxel_core::Project::new("webapp", std::env::temp_dir());
+        // A restored, started Codex pane whose id was never captured.
+        let mut instance = Instance::from_preset(project.id, &codex);
+        instance.session_started = true;
+        let iid = instance.id;
+        let mut workspace = muxel_core::Workspace {
+            projects: vec![project],
+            instances: vec![instance],
+            ..Default::default()
+        };
+        let presets = [codex.clone()];
+        let query = codex_restore_query(&workspace, &presets, iid, &|_| false).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let found = CodexRestoreFound::Latest(vec![muxel_core::CodexSession {
+            id: id.clone(),
+            path: std::env::temp_dir().join(format!("rollout-{id}.jsonl")),
+        }]);
+        assert!(apply_codex_restore_found(
+            &mut workspace,
+            iid,
+            &query,
+            found
+        ));
+        let args = muxel_core::session_resume_args(&codex, workspace.instance(iid).unwrap())
+            .expect("the bound pane resumes");
+        assert_eq!(args, ["resume".to_string(), id.clone()]);
+        assert_eq!(
+            launch_binding(Some(&codex), codex.program.as_deref(), Some(&args)),
+            LaunchBinding::Known(Some(id))
         );
     }
 
