@@ -28,7 +28,11 @@ mod new_tests;
 /// Shared command permission for typing into an existing terminal. This is
 /// rechecked on every write, including panes created before the opt-in was revoked.
 fn control_program_writable(inst: &Instance, allow_shells: bool) -> Result<(), String> {
-    if !allow_shells && (inst.literal_argv || !launches_known_agent(inst)) {
+    // Existing panes may run remotely. Match the provider name without
+    // resolving local executables on the UI thread.
+    if !allow_shells
+        && (inst.literal_argv || !muxel_core::is_known_agent_program(inst.program.as_deref()))
+    {
         let name = inst.display_name();
         return Err(format!(
             "typing into '{name}' requires command execution permission in Settings > \

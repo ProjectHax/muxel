@@ -759,8 +759,8 @@ feature is added or changed, update the matching entry here in the same change**
   Turning "Also allow typing into shell panes" off refuses subsequent control
   writes to every literal argv pane, even agent-looking or interpreter programs,
   and every program outside the known built-in agent providers, including SSH
-  and WSL shell presets. Creation and existing-pane writes use the same
-  path-aware known-agent matcher.
+  and WSL shell presets. Existing-pane writes recognize known agents by executable
+  name, including custom paths and agents in remote projects.
   Configured non-literal known agents remain controllable while outside control is on;
   disabling all outside control is a separate setting. Delayed Enter and keys
   recheck the shell-input grant and terminal/session availability before writing.
