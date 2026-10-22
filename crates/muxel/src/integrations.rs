@@ -9,7 +9,7 @@ use muxel_core::accomplishments::{self, Accomplishment};
 use muxel_core::library::GitFailure;
 use muxel_core::library::resync::LocalChanges;
 use muxel_core::memory::{self, MemoryEntry};
-use muxel_core::tmux::{SessionTarget, Socket};
+use muxel_core::tmux::{ServerOrigin, SessionTarget, Socket};
 use muxel_core::{
     ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth,
     accomplishments_header, memory_header, remote_ops, ssh,
@@ -1420,6 +1420,13 @@ pub fn git_diff(dir: &Path) -> String {
 ///
 /// The server is this profile's own: `mxl` for the regular profile, or the
 /// isolated root's named socket.
+///
+/// The server's environment has to be muxel's too. A pane's program starts from
+/// the server's global environment, which tmux copies from whatever process
+/// started the server. If that wasn't muxel (say a pane killed the server and then
+/// ran `tmux new-session`), muxel gives the server the environment it would have
+/// started it with before opening a pane there. See
+/// `muxel_core::tmux::SERVER_MARK_ENV`.
 pub fn ensure_tmux_server(socket: Socket) {
     let root = local_tmux_root();
     let socket = SessionTarget::new("", Some(socket))
@@ -1429,13 +1436,122 @@ pub fn ensure_tmux_server(socket: Socket) {
     if socket == Socket::Default {
         return;
     }
-    let mut tmux = tmux_server_command(socket, root.as_deref());
+    ensure_tmux_server_on(socket, root.as_deref());
+}
+
+/// [`ensure_tmux_server`] on `socket`, for the profile rooted at `root`.
+fn ensure_tmux_server_on(socket: Socket, root: Option<&Path>) {
+    let mut tmux = tmux_server_command(socket, root);
     default_utf8_locale(&mut tmux);
-    let _ = tmux
+    let started = tmux
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+        .is_ok_and(|status| status.success());
+    if started && tmux_server_origin(socket) == Some(ServerOrigin::Foreign) {
+        reseed_tmux_server(socket, &command_environment(&tmux));
+    }
+}
+
+/// Who started the local server on `socket`, read from the marker that
+/// [`tmux_server_command`] gives a server it starts. Reading it also flags the
+/// marker removed, so no pane inherits it. `None` if tmux couldn't be run.
+fn tmux_server_origin(socket: Socket) -> Option<ServerOrigin> {
+    let out = tmux_on(socket)
+        .args(muxel_core::tmux::server_origin_args())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    Some(ServerOrigin::from_probe(&out.stdout))
+}
+
+/// The environment `cmd` runs with: this process's, plus `cmd`'s own changes.
+/// For [`tmux_server_command`] this is the global environment of a server it
+/// starts, apart from the `PWD` tmux adds.
+fn command_environment(cmd: &Command) -> Vec<(OsString, OsString)> {
+    let mut env: std::collections::BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    for (name, value) in cmd.get_envs() {
+        match value {
+            Some(value) => env.insert(name.to_owned(), value.to_owned()),
+            None => env.remove(name),
+        };
+    }
+    env.into_iter().collect()
+}
+
+/// Give the local server on `socket`, which muxel didn't start, the environment
+/// muxel would have started it with (`wanted`), and mark it as muxel's either way,
+/// so this happens once per server. Blocking, best-effort, and logged. See
+/// `muxel_core::tmux::reseed_environment_script`.
+fn reseed_tmux_server(socket: Socket, wanted: &[(OsString, OsString)]) {
+    let Ok(out) = tmux_on(socket)
+        .args(["show-environment", "-g"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let current = muxel_core::tmux::environment_names(&out.stdout);
+    let wanted: Vec<_> = wanted
+        .iter()
+        .map(|(name, value)| (name.as_encoded_bytes(), value.as_encoded_bytes()))
+        .collect();
+    let script = muxel_core::tmux::reseed_environment_script(&current, &wanted);
+    let server = String::from(socket);
+    if tmux_source_stdin(socket, &script) {
+        let removed: Vec<_> = muxel_core::tmux::environment_extras(&current, &wanted)
+            .into_iter()
+            .map(String::from_utf8_lossy)
+            .collect();
+        let removed = if removed.is_empty() {
+            "nothing".to_string()
+        } else {
+            removed.join(", ")
+        };
+        muxel_store::append_event_log(&format!(
+            "tmux server {server} was not started by muxel; gave it muxel's environment (removed: {removed})"
+        ));
+    } else {
+        // Mark it anyway: another try on this server would fail the same way, on
+        // every pane.
+        let _ = tmux_on(socket)
+            .args(muxel_core::tmux::mark_server_args())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        muxel_store::append_event_log(&format!(
+            "tmux server {server} was not started by muxel; could not give it muxel's environment (needs tmux 3.1 or newer)"
+        ));
+    }
+}
+
+/// Run `script` on the local server on `socket` through `tmux source-file -`, so
+/// nothing in it lands in a command line. Whether tmux ran it.
+fn tmux_source_stdin(socket: Socket, script: &str) -> bool {
+    use std::io::Write as _;
+    let Ok(mut child) = tmux_on(socket)
+        .args(["source-file", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    // Dropping stdin ends the script. A tmux too old to read one from stdin looks
+    // for a file named `-` instead, and fails.
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(script.as_bytes()).is_ok());
+    child.wait().is_ok_and(|status| status.success()) && written
 }
 
 fn tmux_server_command(socket: Socket, root: Option<&Path>) -> Command {
@@ -1445,6 +1561,7 @@ fn tmux_server_command(socket: Socket, root: Option<&Path>) -> Command {
         .unwrap();
     let mut tmux = tmux_on(socket);
     tmux.args(muxel_core::tmux::start_server_args())
+        .env(muxel_core::tmux::SERVER_MARK_ENV, "1")
         .env_remove(crate::session_binding::MUXEL_INSTANCE_ID_ENV);
     if root.is_some() {
         // A server first started by an isolated GUI must not make its profile
@@ -1478,7 +1595,125 @@ mod tmux_server_environment_tests {
             for key in [muxel_store::USER_DATA_DIR_ENV, crate::control::CONTROL_ENV] {
                 assert_eq!(removed.contains(&OsStr::new(key)), isolated);
             }
+            assert!(command.get_envs().any(|(key, value)| {
+                key == OsStr::new(muxel_core::tmux::SERVER_MARK_ENV) && value.is_some()
+            }));
         }
+    }
+}
+
+/// Against a real tmux, each on a socket of its own.
+#[cfg(all(test, unix))]
+mod tmux_server_origin_tests {
+    use super::{ensure_tmux_server_on, tmux_on, tmux_source_stdin};
+    use muxel_core::tmux::{SERVER_MARK_ENV, Socket};
+    use std::time::{Duration, Instant};
+
+    /// A server on a socket no other test or muxel uses, killed when dropped.
+    struct Server(Socket);
+
+    impl Server {
+        fn new() -> Self {
+            Self(Socket::Isolated(uuid::Uuid::new_v4().as_u128() as u64))
+        }
+
+        fn global(&self, name: &str) -> String {
+            let out = tmux_on(self.0)
+                .args(["show-environment", "-g", name])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+        }
+
+        /// `name` as a new pane's program sees it, or `None` if it isn't set.
+        fn pane_sees(&self, name: &str) -> Option<String> {
+            let file = std::env::temp_dir().join(format!("muxel-tmux-{}", uuid::Uuid::new_v4()));
+            let done = file.with_extension("done");
+            let script = r#"eval "test \${$1+set}" && eval "printf %s \"\$$1\"" > "$2"; : > "$3""#;
+            let status = tmux_on(self.0)
+                .args(["new-session", "-d", "--", "sh", "-c", script, "sh", name])
+                .arg(&file)
+                .arg(&done)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done.exists() {
+                assert!(Instant::now() < deadline, "the pane never ran");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let value = std::fs::read(&file).ok();
+            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_file(&done);
+            value.map(|bytes| String::from_utf8(bytes).unwrap())
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = tmux_on(self.0).arg("kill-server").output();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires tmux 3.1 or newer"]
+    fn a_server_muxel_starts_is_marked_without_panes_seeing_the_marker() {
+        let server = Server::new();
+        ensure_tmux_server_on(server.0, None);
+        assert_eq!(
+            server.global(SERVER_MARK_ENV),
+            format!("-{SERVER_MARK_ENV}")
+        );
+        assert_eq!(server.pane_sees(SERVER_MARK_ENV), None);
+    }
+
+    #[test]
+    #[ignore = "requires tmux 3.1 or newer"]
+    fn a_server_something_else_started_gets_muxels_environment() {
+        let root = std::env::temp_dir().join(format!("muxel-tmux-{}", uuid::Uuid::new_v4()));
+        let storage = muxel_store::test_support::set_root(root.clone());
+        let server = Server::new();
+        let home = std::env::var("HOME").unwrap();
+        // What a pane that kills the server and runs `tmux new-session` leaves.
+        let started = tmux_on(server.0)
+            .args(muxel_core::tmux::start_server_args())
+            .env("HOME", "/nonexistent")
+            .env("MUXEL_TEST_LEFTOVER", "1")
+            .status()
+            .unwrap();
+        assert!(started.success());
+        assert_eq!(server.pane_sees("HOME").as_deref(), Some("/nonexistent"));
+
+        ensure_tmux_server_on(server.0, None);
+        assert_eq!(server.pane_sees("HOME"), Some(home));
+        assert_eq!(server.pane_sees("MUXEL_TEST_LEFTOVER"), None);
+        assert_eq!(
+            server.global(SERVER_MARK_ENV),
+            format!("-{SERVER_MARK_ENV}")
+        );
+        let log = std::fs::read_to_string(muxel_store::event_log_path().unwrap()).unwrap();
+        assert!(log.contains("was not started by muxel"), "{log}");
+        assert!(log.contains("MUXEL_TEST_LEFTOVER"), "{log}");
+        drop(storage);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires tmux 3.1 or newer"]
+    fn values_reach_panes_byte_for_byte() {
+        let server = Server::new();
+        ensure_tmux_server_on(server.0, None);
+        let value = " $HOME ${HOME} ~ \"q\" 'q' \\ ; \\; #{pid} %if {} -x\nline\ttab é ";
+        let script = muxel_core::tmux::reseed_environment_script(
+            &[],
+            &[
+                (b"MUXEL_TEST_VALUE", value.as_bytes()),
+                (b"MUXEL_TEST_EMPTY", b""),
+            ],
+        );
+        assert!(tmux_source_stdin(server.0, &script));
+        assert_eq!(server.pane_sees("MUXEL_TEST_VALUE").as_deref(), Some(value));
+        assert_eq!(server.pane_sees("MUXEL_TEST_EMPTY").as_deref(), Some(""));
     }
 }
 
