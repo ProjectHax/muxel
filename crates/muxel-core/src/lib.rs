@@ -1506,7 +1506,8 @@ pub fn push_overwrites_peer(
 /// lists (a pane it closed is simply absent), re-homed to `project_id`, and — for a
 /// pane this machine already has — keeping what this machine observed of it (its
 /// program-supplied title, terminal grid and agent activity), which is per-machine
-/// and never part of the shared content.
+/// and never part of the shared content. A validated rollout path survives a peer
+/// that predates `session_path` while the pane keeps the same conversation.
 pub fn merge_peer_instances(
     local: &[Instance],
     peer: Vec<Instance>,
@@ -1527,6 +1528,10 @@ pub fn merge_peer_instances(
                 {
                     instance.tmux_session = mine.tmux_session.clone();
                     instance.tmux_socket = mine.tmux_socket;
+                }
+                if instance.session_id.is_some() && instance.session_id == mine.session_id {
+                    instance.session_path =
+                        mine.session_path.clone().or(instance.session_path.take());
                 }
             }
             instance
@@ -3606,6 +3611,43 @@ mod remote_layout_tests {
         assert_eq!(a2.activity.last_state, Some(AgentActivityState::Working));
         assert_eq!(a2.tmux_session, a.tmux_session);
         assert_eq!(a2.tmux_socket, a.tmux_socket);
+    }
+
+    #[test]
+    fn peer_without_session_path_keeps_this_machines_rollout_for_the_same_conversation() {
+        let pid = Uuid::new_v4();
+        let mut mine = Instance::from_preset(pid, &AgentPreset::codex());
+        mine.session_id = Some("01a1543c-9700-7000-8000-000000000001".into());
+        mine.session_started = true;
+        mine.session_path =
+            Some("/home/me/.codex/sessions/2026/10/19/rollout-01a1543c.jsonl".into());
+        // What a peer that predates the field (or an older iOS build) writes back.
+        let mut doc = serde_json::to_value(&mine).unwrap();
+        doc.as_object_mut().unwrap().remove("session_path");
+        let old_peer: Instance = serde_json::from_value(doc).unwrap();
+        assert_eq!(old_peer.session_path, None);
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![old_peer], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
+
+        // An iOS write-back carries the field as `null` or its value.
+        let mut doc = serde_json::to_value(&mine).unwrap();
+        doc["session_path"] = serde_json::Value::Null;
+        let ios: Instance = serde_json::from_value(doc).unwrap();
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![ios], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
+
+        // A peer that switched the pane's conversation describes another rollout.
+        let mut switched = mine.clone();
+        switched.session_id = Some("01a1543c-9700-7000-8000-000000000002".into());
+        switched.session_path = None;
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![switched], pid);
+        assert_eq!(merged[0].session_path, None);
+
+        // This machine has none yet: the peer's copy of it stands.
+        let mut unsaved = mine.clone();
+        unsaved.session_path = None;
+        let merged = merge_peer_instances(&[unsaved], vec![mine.clone()], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
     }
 
     #[test]
