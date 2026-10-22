@@ -5324,6 +5324,102 @@ mod provider_switch_tests {
     }
 
     #[test]
+    fn split_old_osc_title_cannot_rebind_on_a_fresh_terminator() {
+        let (session, _receiver) = fixture();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let c = uuid::Uuid::new_v4();
+        let old = SystemTime::now() - Duration::from_secs(3);
+        let hook = old + Duration::from_secs(1);
+        let fresh = hook + Duration::from_secs(4);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{a} | Ready\x07"),
+            old - Duration::from_secs(1),
+        )]));
+        session.process_drained(&drained(&[(&format!("\x1b]0;{b} | Ready"), old)]));
+        session.provider_switched_at(hook, hook, SystemTime::now());
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[("\x07", fresh)]));
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&a.to_string())
+        );
+
+        // A title whose opening bytes were read after the hook still binds.
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{c} | Ready\x07"),
+            fresh + Duration::from_millis(1),
+        )]));
+        assert!(session.binding_revision() > switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&c.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn synchronized_old_title_keeps_its_opening_read_time() {
+        let (session, _receiver) = fixture();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let old = SystemTime::now() - Duration::from_secs(3);
+        let hook = old + Duration::from_secs(1);
+        let fresh = hook + Duration::from_secs(4);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{a} | Working\x07"),
+            old - Duration::from_secs(1),
+        )]));
+        session.process_drained(&drained(&[(
+            &format!("\x1b[?2026h\x1b]0;{b} | Ready\x07"),
+            old,
+        )]));
+        session.provider_switched_at(hook, hook, SystemTime::now());
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[("\x1b[?2026l", fresh)]));
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&a.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn escape_controls_keep_an_old_title_old_but_a_fresh_bell_fresh() {
+        let (session, _receiver) = fixture();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let old = SystemTime::now() - Duration::from_secs(3);
+        let hook = old + Duration::from_secs(1);
+        let fresh = hook + Duration::from_secs(4);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{a} | Working\x07"),
+            old - Duration::from_secs(1),
+        )]));
+        session.process_drained(&drained(&[("\x1b", old)]));
+        session.provider_switched_at(hook, hook, SystemTime::now());
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[(&format!("\x00\x07]0;{b} | Ready\x07"), fresh)]));
+        assert!(session.has_bell());
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&a.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
     fn a_switch_with_no_fresh_evidence_settles_at_its_deadline_without_completing() {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);

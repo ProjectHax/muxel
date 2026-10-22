@@ -49,11 +49,13 @@ transition by polling more often.
 OSC title edges, bells, and submissions are recorded in one order per launch,
 each with its time. PTY output carries when the reader received it, not when
 the drain parsed it: a batch can wait in the queue and in the background
-coalescing delay. A binding begins at a point in that order; evidence before it
-belongs to the conversation it replaced. When the binding changes, the reducer
-resets its latches and reads the new binding's title edges from its start. If
-more title edges arrived than the 64-edge buffer keeps, it rebuilds from the
-current title without a completion edge.
+coalescing delay. A title split across reads keeps the opening ESC/OSC read
+time through its terminator. DEC 2026 buffered output keeps its frame's opening
+time when VTE replays it. A binding begins at a point in that order; evidence
+before it belongs to the conversation it replaced. When the binding changes,
+the reducer resets its latches and reads the new binding's title edges from its
+start. If more title edges arrived than the 64-edge buffer keeps, it rebuilds
+from the current title without a completion edge.
 
 - A Codex title with a different UUID thread begins the binding at that title,
   in exact order. Earlier frames, and a bell that rang before it, are retired;
