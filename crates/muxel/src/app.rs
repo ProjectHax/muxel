@@ -31,7 +31,7 @@ use muxel_core::library::resolve::{SnippetStep, snippet_send_action};
 use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
-use muxel_core::tmux::SessionTarget;
+use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
     ACCOMPLISHMENTS_FILE, AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity,
@@ -57,6 +57,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod accomplishments_ui;
+#[cfg(all(test, windows))]
+mod codex_capture_tests;
 mod control_api;
 mod hotbar;
 mod libraries_ui;
@@ -72,6 +74,284 @@ mod upkeep;
 
 use popout_lifecycle::loop_heartbeat;
 use restart_guard::{PendingRestarts, RemoteRestartCompletion};
+
+/// Capture tmux eligibility before removing a pane's metadata. An absent
+/// recorded name still permits the legacy remote-name fallback; a literal pane
+/// has no tmux transport at all, even if a peer supplied a stale name.
+struct InstanceTmux {
+    instance_id: Uuid,
+    recorded_session: Option<String>,
+    socket: Option<Socket>,
+}
+
+impl InstanceTmux {
+    fn capture(instance: &Instance) -> Option<Self> {
+        (!instance.literal_argv).then(|| Self {
+            instance_id: instance.id,
+            recorded_session: instance.tmux_session.clone(),
+            socket: instance.tmux_socket.clone(),
+        })
+    }
+
+    fn on_host(&self, host_name: &str) -> SessionTarget {
+        SessionTarget::new(
+            muxel_core::tmux::session_for(
+                self.recorded_session.as_deref(),
+                host_name,
+                self.instance_id,
+            ),
+            self.socket.clone(),
+        )
+    }
+}
+
+/// Build the direct command before any resume/transport discovery. Peer metadata
+/// can contain old tmux/preset fields; none may change literal argv.
+fn literal_command_spec(
+    instance: &Instance,
+    project: Option<&Project>,
+    isolated: bool,
+) -> Option<CommandSpec> {
+    if !instance.literal_argv {
+        return None;
+    }
+    let mut spec = CommandSpec::literal(
+        instance.program.clone().unwrap_or_default(),
+        instance.args.clone(),
+    );
+    if let Some(cwd) = instance
+        .working_directory()
+        .or_else(|| project.map(|p| p.root_path.as_path()))
+    {
+        spec = spec.with_cwd(cwd.display().to_string());
+    }
+    let configured = instance
+        .env
+        .iter()
+        .map(|v| (v.key.clone(), v.value.clone()))
+        .collect::<Vec<_>>();
+    (spec.env, spec.env_remove) = crate::session_binding::pane_env(
+        &configured,
+        Vec::new(),
+        instance.id,
+        crate::session_binding::PaneProcess::Program,
+        isolated,
+    );
+    // These only inspect terminal output for status; they never change argv,
+    // environment or startup input, so literal commands keep the built-in cues.
+    let (working, blocked) = default_markers(instance.program.as_deref());
+    Some(spec.with_markers(working, blocked))
+}
+
+/// The local tmux owner a launch must settle (resolve, or move off Default)
+/// before it attaches, if any. A literal pane has no tmux transport: a peer's
+/// stale name never causes a socket probe, a move off Default or a save.
+fn local_owner_to_prepare(instance: &Instance, project: &Project) -> Option<SessionTarget> {
+    (!instance.literal_argv
+        && project.remote.is_none()
+        && instance.tmux_session.is_some()
+        && (instance.tmux_socket.is_none()
+            || instance.tmux_socket == Some(Socket::Default)
+            || integrations::profile_tmux_target(&instance.tmux_target(&project.name)).socket
+                != instance.tmux_socket))
+        .then(|| instance.tmux_target(&project.name))
+}
+
+#[cfg(test)]
+mod literal_command_tests {
+    use super::{InstanceTmux, Socket, literal_command_spec, local_owner_to_prepare};
+    use muxel_core::{AgentPreset, EnvVar, InjectionMode, Instance, Project, WorktreeCleanup};
+
+    #[test]
+    fn literal_panes_never_prepare_a_tmux_owner_or_move_off_default() {
+        let project = Project::new("webapp", std::env::temp_dir());
+        for socket in [None, Some(Socket::Default)] {
+            let mut pane = Instance::shell(project.id);
+            pane.tmux_session = Some("muxel_webapp_1a2b3c4d".into());
+            pane.tmux_socket = socket.clone();
+            assert!(
+                local_owner_to_prepare(&pane, &project).is_some(),
+                "{socket:?}"
+            );
+            pane.literal_argv = true;
+            assert_eq!(local_owner_to_prepare(&pane, &project), None, "{socket:?}");
+        }
+    }
+
+    #[test]
+    fn literal_cleanup_rejects_peer_tmux_metadata_but_keeps_worktree_cleanup() {
+        let mut instance = Instance::shell(uuid::Uuid::new_v4());
+        instance.literal_argv = true;
+        instance.use_tmux = true;
+        instance.tmux_socket = Some(Socket::Default);
+        instance.worktree_id = Some(uuid::Uuid::new_v4());
+        instance.launch_dir = Some(std::env::temp_dir());
+        for recorded in [None, Some("peer-owned-session".to_string())] {
+            instance.tmux_session = recorded;
+            let captured = (
+                InstanceTmux::capture(&instance),
+                instance.worktree_cleanup(),
+            );
+            assert!(captured.0.is_none());
+            assert_eq!(
+                captured.1,
+                WorktreeCleanup::Registered(instance.worktree_id.unwrap())
+            );
+        }
+        instance.worktree_id = None;
+        assert_eq!(instance.worktree_cleanup(), WorktreeCleanup::None);
+    }
+
+    #[test]
+    fn nonliteral_cleanup_keeps_recorded_names_and_remote_name_fallback() {
+        let mut instance = Instance::shell(uuid::Uuid::new_v4());
+        let captured = InstanceTmux::capture(&instance).unwrap();
+        assert!(captured.recorded_session.is_none());
+        assert_eq!(
+            captured.on_host("remote-host").name,
+            muxel_core::tmux::session_name("remote-host", instance.id)
+        );
+        instance.tmux_session = Some("renamed-peer-session".into());
+        instance.tmux_socket = Some(Socket::Default);
+        let captured = InstanceTmux::capture(&instance).unwrap();
+        assert_eq!(
+            captured.on_host("different-host").socket,
+            Some(Socket::Default)
+        );
+        assert_eq!(
+            captured.on_host("different-host").name,
+            "renamed-peer-session"
+        );
+        assert_eq!(
+            captured.recorded_session.as_deref(),
+            Some("renamed-peer-session")
+        );
+    }
+
+    #[test]
+    fn literal_opencode_keeps_passive_status_markers_without_injection() {
+        let mut instance = Instance::from_preset(uuid::Uuid::new_v4(), &AgentPreset::opencode());
+        instance.literal_argv = true;
+        instance.args = vec!["opening brief".into(), "".into()];
+        instance.system_prompt = Some("never inject".into());
+        instance.injection = InjectionMode::TypeIn;
+        instance.auto_mode_presses = 2;
+        let spec = literal_command_spec(&instance, None, false).unwrap();
+        assert_eq!(spec.working_markers, ["esc interrupt"]);
+        assert_eq!(spec.blocked_markers, ["Permission required"]);
+        assert_eq!(spec.args, instance.args);
+        assert_eq!(
+            spec.env,
+            [(
+                muxel_core::control::INSTANCE_ID_ENV.to_string(),
+                instance.id.to_string()
+            )]
+        );
+        assert!(spec.startup_input.is_none());
+        assert_eq!(spec.auto_mode_presses, 0);
+        assert!(!spec.submit);
+    }
+
+    #[test]
+    fn stale_peer_transport_and_preset_metadata_never_wrap_a_literal_command() {
+        let project = Project::new("repo", std::env::current_dir().unwrap());
+        let mut instance = Instance::from_preset(project.id, &AgentPreset::codex());
+        instance.literal_argv = true;
+        instance.program = Some("native.exe".into());
+        instance.args = vec!["brief with spaces".into(), "".into()];
+        instance.launch_dir = Some(std::env::temp_dir());
+        instance.use_tmux = true;
+        instance.tmux_session = Some("stale-peer-session".into());
+        instance.system_prompt = Some("never inject".into());
+        instance.injection = InjectionMode::TypeIn;
+        instance.env = vec![EnvVar {
+            key: "CUSTOM".into(),
+            value: "value".into(),
+        }];
+        let spec = literal_command_spec(&instance, Some(&project), false).unwrap();
+        assert!(spec.literal_argv);
+        assert_eq!(spec.program, "native.exe");
+        assert_eq!(spec.args, instance.args);
+        assert_eq!(
+            spec.cwd,
+            instance.launch_dir.map(|p| p.display().to_string())
+        );
+        assert!(
+            spec.env
+                .contains(&("CUSTOM".to_string(), "value".to_string()))
+        );
+        assert!(spec.env.contains(&(
+            muxel_core::control::INSTANCE_ID_ENV.to_string(),
+            instance.id.to_string()
+        )));
+        assert_eq!(spec.env.len(), 2);
+        assert!(spec.startup_input.is_none());
+        assert_eq!(spec.auto_mode_presses, 0);
+    }
+
+    #[test]
+    fn literal_command_owns_instance_id_even_when_inherited() {
+        const CHILD: &str = "MUXEL_LITERAL_ENV_TEST_CHILD";
+        const ID: &str = muxel_core::control::INSTANCE_ID_ENV;
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "app::literal_command_tests::literal_command_owns_instance_id_even_when_inherited", "--nocapture"])
+                .env(CHILD, "1").env(ID, "inherited-foreign-pane").output().unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert_eq!(std::env::var(ID).unwrap(), "inherited-foreign-pane");
+        let mut instance = Instance::shell(uuid::Uuid::new_v4());
+        instance.literal_argv = true;
+        instance.env.push(EnvVar {
+            key: ID.into(),
+            value: "configured-foreign-pane".into(),
+        });
+        let spec = literal_command_spec(&instance, None, false).unwrap();
+        let ids: Vec<_> = spec
+            .env
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(ID))
+            .collect();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].1, instance.id.to_string());
+        assert!(spec.env_remove.is_empty());
+    }
+
+    #[test]
+    fn isolated_literal_launch_rejects_configured_profile_and_control_overrides() {
+        let mut instance = Instance::shell(uuid::Uuid::new_v4());
+        instance.literal_argv = true;
+        instance.env = [
+            ("MUXEL_USER_DATA_DIR", "foreign-root"),
+            ("muxel_user_data_dir", "another-root"),
+            ("MUXEL_CONTROL", "foreign-endpoint"),
+            ("muxel_control", "another-endpoint"),
+            ("CUSTOM", "retained"),
+        ]
+        .into_iter()
+        .map(|(key, value)| EnvVar {
+            key: key.into(),
+            value: value.into(),
+        })
+        .collect();
+        let spec = literal_command_spec(&instance, None, true).unwrap();
+        assert_eq!(spec.env.len(), 2);
+        assert!(spec.env.contains(&("CUSTOM".into(), "retained".into())));
+        assert!(spec.env.contains(&(
+            muxel_core::control::INSTANCE_ID_ENV.into(),
+            instance.id.to_string(),
+        )));
+        assert_eq!(spec.env_remove, [crate::control::CONTROL_ENV]);
+        assert!(spec.literal_argv);
+    }
+}
 
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
 /// TUIs (Claude/opencode/…) don't get squished narrow enough to overflow.
@@ -309,7 +589,7 @@ fn restore_startup_holds_admission(
     let holding = |iid: Uuid| {
         launching
             .get(&iid)
-            .is_some_and(|&launch| launch_holds_admission(launch, now))
+            .is_some_and(|launch| launch_holds_admission(launch, now))
     };
     if queued().any(holding) {
         return true;
@@ -329,14 +609,15 @@ const TERMINAL_LAUNCH_DEADLINE: Duration = Duration::from_secs(20);
 
 /// A pane's launch in flight: the token that owns it, and when its worker was
 /// dispatched (when it was reserved, until then).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct LaunchTicket {
     token: u64,
     since: Instant,
+    startup: Option<muxel_core::control::StartupTurnOwner>,
 }
 
 /// Whether a running launch still holds restore admission at `now`.
-fn launch_holds_admission(launch: LaunchTicket, now: Instant) -> bool {
+fn launch_holds_admission(launch: &LaunchTicket, now: Instant) -> bool {
     now.saturating_duration_since(launch.since) < TERMINAL_LAUNCH_DEADLINE
 }
 
@@ -1538,6 +1819,17 @@ fn resolve_agent_launch(
     resuming: bool,
 ) -> ResolvedLaunch {
     let mut instance = instance.clone();
+    let control_prompt = instance.control_prompt;
+    let control_task = if control_prompt {
+        instance.control_prompt = false;
+        instance.injection = instance
+            .instruction_injection
+            .clone()
+            .unwrap_or(InjectionMode::None);
+        instance.system_prompt.take()
+    } else {
+        None
+    };
     let mut codex_instructions = Vec::new();
     let is_codex = instance
         .program
@@ -1545,6 +1837,11 @@ fn resolve_agent_launch(
         .and_then(|program| std::path::Path::new(program).file_stem())
         .and_then(|stem| stem.to_str())
         .is_some_and(|stem| stem.eq_ignore_ascii_case("codex"));
+    if control_prompt && !is_codex && instance.injection == InjectionMode::TypeIn {
+        // A TypeIn-only preset has no separate instruction channel. Keep the
+        // caller's task exact rather than joining instructions onto its turn.
+        instance.injection = InjectionMode::None;
+    }
     if is_codex && let Some(custom) = take_codex_rules_prompt(&mut instance, resuming) {
         codex_instructions.push(custom);
     }
@@ -1574,8 +1871,7 @@ fn resolve_agent_launch(
         };
         // Relative references keep project paths out of process argv.
         let cwd = instance
-            .worktree_path
-            .as_ref()
+            .working_directory()
             .map(|w| w.display().to_string());
         let instruction = memory_instruction(&memory_reference(&root, cwd.as_deref()));
         add_automatic(instruction, &mut instance);
@@ -1590,8 +1886,7 @@ fn resolve_agent_launch(
             None => project.root_path.display().to_string(),
         };
         let cwd = instance
-            .worktree_path
-            .as_ref()
+            .working_directory()
             .map(|w| w.display().to_string());
         let path = muxel_file_reference(&root, cwd.as_deref(), ACCOMPLISHMENTS_FILE);
         let agent = accomplishments::agent_label(instance.program.as_deref(), &instance.preset);
@@ -1603,6 +1898,11 @@ fn resolve_agent_launch(
         resolved.args.push(codex_developer_instructions_override(
             &codex_instructions.join("\n\n"),
         ));
+    }
+    if control_prompt {
+        resolved.startup_input =
+            control_task.filter(|task| !task.is_empty() && !resuming && instance.auto_submit);
+        resolved.submit = resolved.startup_input.is_some();
     }
     resolved
 }
@@ -1631,6 +1931,87 @@ mod launch_instruction_transport_tests {
     };
     use muxel_core::resolve_launch_for_session;
     use uuid::Uuid;
+
+    #[test]
+    fn ctl_prompt_keeps_task_separate_from_automatic_instructions() {
+        let mut project = Project::new("repo", std::env::current_dir().unwrap());
+        project.memory_enabled = true;
+        for preset in [AgentPreset::claude(), AgentPreset::codex()] {
+            let instance = muxel_core::control::NewOptions {
+                prompt: Some("/or-spar 20689".into()),
+                ..Default::default()
+            }
+            .instance(&project, &[preset], 0)
+            .unwrap();
+            let launch = resolve_agent_launch(&instance, Some(&project), false);
+            assert_eq!(launch.startup_input.as_deref(), Some("/or-spar 20689"));
+            assert!(launch.submit);
+            assert!(!launch.args.iter().any(|arg| arg.contains("/or-spar")));
+            let instructions = launch.args.join(" ");
+            assert!(instructions.contains("MEMORY.md"));
+            assert!(instructions.contains("file:"));
+            if instance.program.as_deref() == Some("claude") {
+                assert!(
+                    launch
+                        .args
+                        .iter()
+                        .any(|arg| arg == "--append-system-prompt")
+                );
+            } else {
+                assert!(instructions.contains("developer_instructions"));
+            }
+            let resumed = resolve_agent_launch(&instance, Some(&project), true);
+            assert!(resumed.startup_input.is_none());
+            assert!(!resumed.submit);
+        }
+    }
+
+    #[test]
+    fn ctl_prompt_type_in_only_presets_omit_automatic_instructions() {
+        let mut project = Project::new("repo", std::env::current_dir().unwrap());
+        project.memory_enabled = true;
+        for injection in [InjectionMode::TypeIn, InjectionMode::None] {
+            let mut preset = AgentPreset::claude();
+            preset.injection = injection;
+            preset.system_prompt = Some("old preset rules".into());
+            let mut instance = muxel_core::control::NewOptions {
+                prompt: Some("/or-spar 20689".into()),
+                ..Default::default()
+            }
+            .instance(&project, &[preset], 0)
+            .unwrap();
+            let launch = resolve_agent_launch(&instance, Some(&project), false);
+            assert_eq!(launch.startup_input.as_deref(), Some("/or-spar 20689"));
+            assert_eq!(launch.args, instance.args);
+            assert!(launch.submit);
+            instance.consume_runner_prompt();
+            let later = resolve_agent_launch(&instance, Some(&project), false);
+            assert!(later.startup_input.is_none());
+            assert!(!later.submit);
+        }
+    }
+
+    #[test]
+    fn ctl_prompt_legacy_records_do_not_append_instructions_to_task() {
+        let mut project = Project::new("repo", std::env::current_dir().unwrap());
+        project.memory_enabled = true;
+        let original = muxel_core::control::NewOptions {
+            prompt: Some("/or-spar 20689".into()),
+            ..Default::default()
+        }
+        .instance(&project, &[AgentPreset::claude()], 0)
+        .unwrap();
+        let mut saved = serde_json::to_value(original).unwrap();
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("instruction_injection");
+        let legacy: Instance = serde_json::from_value(saved).unwrap();
+        let launch = resolve_agent_launch(&legacy, Some(&project), false);
+        assert_eq!(launch.startup_input.as_deref(), Some("/or-spar 20689"));
+        assert_eq!(launch.args, legacy.args);
+        assert!(launch.submit);
+    }
 
     fn codex(prompt: &str, runner: bool) -> Instance {
         let mut instance = Instance::from_preset(Uuid::new_v4(), &AgentPreset::codex());
@@ -1675,6 +2056,41 @@ mod launch_instruction_transport_tests {
     }
 
     #[test]
+    fn consumed_ctl_tasks_leave_no_startup_text_after_launch_instructions_are_assembled() {
+        let mut project = Project::new("repo", std::env::current_dir().unwrap());
+        project.memory_enabled = true;
+        for preset in [
+            AgentPreset::claude(),
+            AgentPreset::grok(),
+            AgentPreset::codex(),
+            AgentPreset::opencode(),
+        ] {
+            let mut instance = muxel_core::control::NewOptions {
+                prompt: Some("B5 one-shot task".into()),
+                ..Default::default()
+            }
+            .instance(&project, &[preset], 0)
+            .unwrap();
+            let first = resolve_agent_launch(&instance, Some(&project), false);
+            assert!(
+                first
+                    .startup_input
+                    .as_deref()
+                    .unwrap()
+                    .contains("B5 one-shot task")
+            );
+            assert!(first.submit);
+            assert!(instance.consume_runner_prompt());
+            let restored = serde_json::from_value(serde_json::to_value(instance).unwrap()).unwrap();
+            for resuming in [false, true] {
+                let launch = resolve_agent_launch(&restored, Some(&project), resuming);
+                assert_eq!(launch.startup_input, None);
+                assert!(!launch.submit);
+            }
+        }
+    }
+
+    #[test]
     fn muse_launch_assembly_sends_no_automatic_input_or_instructions() {
         let mut project = Project::new("repo", "/tmp/repo");
         project.memory_enabled = true;
@@ -1700,6 +2116,31 @@ mod launch_instruction_transport_tests {
         let instructions = control.startup_input.expect("TypeIn positive control");
         assert!(instructions.contains("MEMORY.md"));
         assert!(instructions.contains("file:"));
+    }
+
+    #[test]
+    fn ctl_cwd_keeps_accomplishments_at_project_root() {
+        let mut project = Project::new("repo", std::env::current_dir().unwrap());
+        project.accomplishments_enabled = true;
+        let cwd = project.root_path.join("other-directory");
+        let expected_path = format!("{}/.muxel/ACCOMPLISHMENTS.md", project.root_path.display());
+        for preset in [AgentPreset::claude(), AgentPreset::codex()] {
+            let instance = muxel_core::control::NewOptions {
+                cwd: Some(cwd.clone()),
+                prompt: Some("one exact task".into()),
+                ..Default::default()
+            }
+            .instance(&project, &[preset], 0)
+            .unwrap();
+            assert!(instance.worktree_path.is_none());
+            assert_eq!(instance.working_directory(), Some(cwd.as_path()));
+
+            let launch = resolve_agent_launch(&instance, Some(&project), false);
+            let instructions = launch.args.join(" ");
+            assert!(instructions.contains(&format!(">> {expected_path}")));
+            assert!(!instructions.contains(">> .muxel/ACCOMPLISHMENTS.md"));
+            assert_eq!(launch.startup_input.as_deref(), Some("one exact task"));
+        }
     }
 
     #[test]
@@ -1872,7 +2313,7 @@ fn scan_importable(
         if let import::ImportSource::TmuxSession { session } = &row.source
             && let Some(found) = sessions
                 .iter()
-                .find(|s| s.name == session.name && Some(s.socket) == session.socket)
+                .find(|s| s.name == session.name && Some(&s.socket) == session.socket.as_ref())
             && !found.title.is_empty()
         {
             row.summary = row
@@ -1910,7 +2351,7 @@ fn scan_importable(
             Some("claude") => integrations::claude_conversations(home, cwd)
                 .first()
                 .map(|(id, _)| id.clone()),
-            Some("codex") => muxel_core::codex_latest_session_id(home, cwd),
+            Some("codex") => session_discovery::capture_codex_session_id(home, cwd),
             _ => None,
         }
     };
@@ -2936,21 +3377,57 @@ fn effective_local_cwd(
         .map(|path| path.display().to_string())
 }
 
-/// Claude's transcript probe decides whether its UUID is missing before launch.
-/// Once launched, neither generic failure nor "No conversation found" proves the
-/// UUID is invalid: a cwd mismatch produces the same message. Other providers
-/// retain the established early-exit recovery.
+/// A generic early exit does not prove a saved Codex or Claude conversation is
+/// gone. Only a provider-specific missing-session message can recover Codex;
+/// Claude's transcript probe decides before launch because a cwd mismatch can
+/// produce the same message as a missing conversation.
 fn should_recover_expired_session(
-    is_claude: bool,
+    program: Option<&str>,
     explicit_missing: bool,
     early_nonzero_exit: bool,
 ) -> bool {
-    !is_claude && (explicit_missing || early_nonzero_exit)
+    if is_claude_program(program) {
+        return false;
+    }
+    if is_codex_program(program) {
+        return explicit_missing;
+    }
+    explicit_missing || early_nonzero_exit
+}
+
+fn resume_missing_message(program: Option<&str>, id: Option<&str>, text: &str) -> bool {
+    if is_codex_program(program) {
+        return id.is_some_and(|id| text.contains(&format!("No saved session found with ID {id}")));
+    }
+    text.contains("No conversation found")
+}
+
+/// Whether a launch may read a clean early tmux client exit as its Codex resume
+/// failing. A Codex that cannot find the conversation ends its tmux session,
+/// the client exits 0, and tmux takes Codex's message away with its screen, so
+/// the missing-ID detector rarely sees it. Only a local `codex resume` whose
+/// rollout muxel could not confirm, starting a session that tmux says is not
+/// running, qualifies: reattaching a running session runs nothing new, so its
+/// clean exit is a quit. `session_running` is asked only for such a resume.
+fn arms_tmux_resume_recovery(
+    unconfirmed_resume: bool,
+    session_running: impl FnOnce() -> Option<bool>,
+) -> bool {
+    unconfirmed_resume && session_running() == Some(false)
+}
+
+/// A clean exit this soon after an armed launch counts as the failed resume:
+/// the pane starts fresh instead of closing.
+fn tmux_codex_resume_ended(armed: bool, exit_code: Option<i32>, recent_resume: bool) -> bool {
+    armed && exit_code == Some(0) && recent_resume
 }
 
 #[cfg(test)]
 mod claude_resume_tests {
-    use super::{effective_local_cwd, should_recover_expired_session};
+    use super::{
+        arms_tmux_resume_recovery, effective_local_cwd, resume_missing_message,
+        should_recover_expired_session, tmux_codex_resume_ended,
+    };
     use std::path::Path;
 
     #[test]
@@ -2968,38 +3445,63 @@ mod claude_resume_tests {
 
     #[test]
     fn unrelated_claude_resume_failure_preserves_the_saved_uuid() {
-        assert!(!should_recover_expired_session(true, false, true));
-        assert!(!should_recover_expired_session(true, true, false));
-        assert!(should_recover_expired_session(false, false, true));
+        assert!(!should_recover_expired_session(Some("claude"), false, true));
+        assert!(!should_recover_expired_session(Some("claude"), true, false));
+        assert!(!should_recover_expired_session(Some("codex"), false, true));
+        assert!(should_recover_expired_session(Some("codex"), true, false));
+        assert!(should_recover_expired_session(Some("grok"), false, true));
+    }
+
+    #[test]
+    fn codex_resume_failure_requires_its_own_exact_missing_message() {
+        let id = "01a1543c-9700-7000-8000-000000000001";
+        assert!(!resume_missing_message(
+            Some("codex"),
+            Some(id),
+            "network failed"
+        ));
+        assert!(!resume_missing_message(
+            Some("codex"),
+            Some(id),
+            "No saved session found with ID another-id"
+        ));
+        assert!(resume_missing_message(
+            Some("codex"),
+            Some(id),
+            &format!("No saved session found with ID {id}")
+        ));
+    }
+
+    #[test]
+    fn tmux_codex_clean_exit_after_resume_recovers_instead_of_closing() {
+        // What tick sees when `codex resume <id>` cannot find the rollout under
+        // tmux: the client exits 0 and the missing-ID message is gone.
+        let ended = tmux_codex_resume_ended(true, Some(0), true);
+        assert!(ended);
+        assert!(should_recover_expired_session(Some("codex"), ended, false));
+        // A later deliberate quit, or any unarmed launch, still closes on exit.
+        assert!(!tmux_codex_resume_ended(true, Some(0), false));
+        assert!(!tmux_codex_resume_ended(false, Some(0), true));
+        // A failing client belongs to the reattach path.
+        assert!(!tmux_codex_resume_ended(true, Some(1), true));
+        assert!(!tmux_codex_resume_ended(true, None, true));
+    }
+
+    #[test]
+    fn only_an_unconfirmed_resume_into_a_new_tmux_session_arms_recovery() {
+        assert!(arms_tmux_resume_recovery(true, || Some(false)));
+        // Reattaching a running session, quit within seconds, is a quit.
+        assert!(!arms_tmux_resume_recovery(true, || Some(true)));
+        // tmux could not say: keep close-on-exit.
+        assert!(!arms_tmux_resume_recovery(true, || None));
+        // A confirmed rollout (or no resume at all) never asks tmux.
+        assert!(!arms_tmux_resume_recovery(false, || {
+            panic!("tmux asked for a confirmed resume")
+        }));
     }
 }
 
-/// Whether an agent-minted session id is no longer on disk (Codex today).
-fn agent_minted_session_gone(preset: &muxel_core::AgentPreset, session_id: &str) -> bool {
-    let program = preset.program.as_deref().unwrap_or_default();
-    if !is_codex_program(Some(program)) {
-        return false;
-    }
-    let Some(home) = home_dir() else {
-        return false;
-    };
-    !muxel_core::codex_session_exists(&home, session_id)
-}
-
-/// Recover a legacy agent-minted session id by cwd when no exact binding was saved.
-fn capture_agent_session_id(
-    preset: &muxel_core::AgentPreset,
-    cwd: Option<&std::path::Path>,
-) -> Option<String> {
-    let program = preset.program.as_deref().unwrap_or_default();
-    if !is_codex_program(Some(program)) {
-        return None;
-    }
-    let home = home_dir()?;
-    let cwd = cwd?;
-    muxel_core::codex_latest_session_id(&home, cwd)
-}
-
+#[cfg(test)]
 fn unowned_captured_session_id(
     captured: Option<String>,
     sibling_session_ids: &HashSet<String>,
@@ -3015,7 +3517,7 @@ fn validated_codex_session_id(
     home: &std::path::Path,
     cwd: &std::path::Path,
     profile_pane: Option<Uuid>,
-) -> Option<String> {
+) -> Option<muxel_core::CodexSession> {
     let hint = muxel_core::codex_session_hint_from_title(preset, title_hint?)?;
     let prefix = hint.strip_suffix("...").unwrap_or(&hint);
     if current.is_some_and(|id| id.starts_with(prefix)) {
@@ -3026,7 +3528,7 @@ fn validated_codex_session_id(
         "codex-session-validate",
         profile_pane,
     );
-    muxel_core::codex_session_id_from_hint(home, &hint, cwd)
+    muxel_core::codex_session_from_hint(home, &hint, cwd)
 }
 
 fn session_id_bound_elsewhere(instances: &[Instance], owner: Uuid, session_id: &str) -> bool {
@@ -4218,6 +4720,7 @@ pub struct MuxelApp {
     /// Parent-owned Codex thread names, keyed by the session UUID captured from
     /// that pane. Refreshed from Codex's append-only session index.
     codex_session_names: HashMap<String, String>,
+    codex_name_index: muxel_core::CodexSessionNames,
     worktree_changes: HashMap<Uuid, usize>,
     /// Whether the GitHub CLI (`gh`) is installed (gates worktree PR actions).
     gh_available: bool,
@@ -4250,6 +4753,11 @@ pub struct MuxelApp {
     grok_observations: HashMap<Uuid, session_discovery::GrokObservation>,
     /// Per pane, the PTY launch and nonce of the last Claude hook record read.
     claude_hook_seen: HashMap<Uuid, (Uuid, Uuid)>,
+    /// Each restored Codex pane's one pre-launch history lookup (runtime only).
+    codex_restore_lookups: muxel_core::session_discovery::CodexRestoreLookups,
+    /// Panes whose latest launch is armed by `arms_tmux_resume_recovery`
+    /// (runtime only): only they may read a clean early exit as a failed resume.
+    codex_unconfirmed_resumes: HashSet<Uuid>,
     /// Full persisted settings (source of truth for config not mirrored above).
     settings: muxel_core::Settings,
     /// Active theme name + mode override (persisted).
@@ -4694,6 +5202,9 @@ pub struct MuxelApp {
     control_failed: bool,
     /// Prompts typed through `muxel ctl`, per pane, for `show` and `wait`.
     control_turns: HashMap<Uuid, control_api::ControlTurn>,
+    /// Runtime-only click approvals; no connection waits for the human.
+    control_approvals: muxel_core::control::ApprovalQueue<control_api::PreparedCreation>,
+    control_approval_notified: Option<Uuid>,
 }
 
 /// One content-search match (file + 0-based line + the matched line text).
@@ -6614,6 +7125,7 @@ impl MuxelApp {
             project_branch_lists: HashMap::new(),
             status_refresh_in_flight: false,
             codex_session_names: HashMap::new(),
+            codex_name_index: Default::default(),
             worktree_changes: HashMap::new(),
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
@@ -6630,6 +7142,8 @@ impl MuxelApp {
             #[cfg(windows)]
             grok_observations: HashMap::new(),
             claude_hook_seen: HashMap::new(),
+            codex_restore_lookups: Default::default(),
+            codex_unconfirmed_resumes: HashSet::new(),
             theme: settings.theme.clone(),
             theme_mode: settings.theme_mode.clone(),
             use_tmux: settings.default_use_tmux,
@@ -6823,6 +7337,8 @@ impl MuxelApp {
             control_task: None,
             control_failed: false,
             control_turns: HashMap::new(),
+            control_approvals: Default::default(),
+            control_approval_notified: None,
         };
 
         // Flush any coalesced auto-title before shutdown. On Unix, muxel also
@@ -7190,7 +7706,7 @@ impl MuxelApp {
             args: &resolved.args,
             use_tmux,
             tmux_session: session.as_ref().map(|session| session.name.as_str()),
-            tmux_socket: session.as_ref().and_then(|session| session.socket),
+            tmux_socket: session.as_ref().and_then(|session| session.socket.clone()),
             tmux_client_tag: Some(&tag),
         });
         // sshpass -e reads the password from $SSHPASS (kept off the command line /
@@ -7280,11 +7796,15 @@ impl MuxelApp {
     /// - **Host-minted** (`session_id_flag` set): first launch
     ///   `--session-id <id>`; later `--resume <id>` (or the preset's flag).
     /// - **Agent-minted** (only `resume_flag`, e.g. Codex): first launch bare;
-    ///   bound panes resume their saved id. A legacy started pane with no saved id
-    ///   recovers the newest cwd-matching rollout before `resume <id>`.
+    ///   bound panes resume their saved id. A started pane with no saved id starts
+    ///   fresh here: this path never scans history. A deferred launch first
+    ///   waits (bounded) for the pane's one background restore lookup
+    ///   (`begin_codex_restore_lookup`), which may already have bound it, saved
+    ///   its rollout path, or confirmed its rollout missing.
     ///
-    /// This launch-time lookup still performs synchronous store I/O, including
-    /// when tick recovery reaches it. Recurring discovery uses background workers.
+    /// This launch-time check still performs synchronous store I/O (one stat,
+    /// or a dated directory listing), including when tick recovery reaches it.
+    /// Walks and recurring discovery use background workers.
     fn session_resume_for(&mut self, iid: Uuid) -> anyhow::Result<Option<SessionResume>> {
         let started = ui_profile::is_enabled().then(Instant::now);
         self.bump_session_binding_generation(iid);
@@ -7342,6 +7862,9 @@ impl MuxelApp {
         let _phase = ui_profile::phase("activation", "session-resume", Some(iid));
         let Some((preset, cwd, local)) = (|| {
             let inst = self.workspace.instance(iid)?;
+            if inst.literal_argv {
+                return None;
+            }
             let preset = inst
                 .preset_id
                 .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
@@ -7349,8 +7872,8 @@ impl MuxelApp {
             preset.resume_flag.as_ref()?;
             let project = self.workspace.project(inst.project_id);
             let cwd = inst
-                .worktree_path
-                .clone()
+                .working_directory()
+                .map(std::path::Path::to_path_buf)
                 .or_else(|| project.map(|project| project.root_path.clone()));
             let local = project.is_some_and(|project| project.remote.is_none());
             Some((preset.clone(), cwd, local))
@@ -7371,21 +7894,18 @@ impl MuxelApp {
                 .with_context(|| t("Could not recover this conversation before launch."))?;
             }
         }
-        let sibling_session_ids: HashSet<String> = self
-            .workspace
-            .instances
-            .iter()
-            .filter(|instance| instance.id != iid)
-            .filter_map(|instance| instance.session_id.clone())
-            .collect();
         let Some(inst) = self.workspace.instance_mut(iid) else {
             return Ok(None);
         };
+        let previous_session_path = inst.session_path.clone();
         let host_minted = preset.session_id_flag.is_some();
         let mut resume_cwd = None;
+        // `codex resume <id>` without a rollout this check could confirm.
+        let mut unconfirmed_resume = false;
         if host_minted {
             if inst.session_id.is_none() {
                 inst.session_id = Some(Uuid::new_v4().to_string());
+                inst.session_path = None;
             }
             // Proactive resume: if we'd `--resume` an already-started session but its
             // transcript is gone from disk (deleted/expired), start a *fresh* session
@@ -7405,56 +7925,69 @@ impl MuxelApp {
                     ClaudeSessionState::Found { cwd } => resume_cwd = cwd,
                     ClaudeSessionState::Missing => {
                         inst.session_id = Some(Uuid::new_v4().to_string());
+                        inst.session_path = None;
                         inst.session_started = false;
                     }
                     ClaudeSessionState::NotClaude | ClaudeSessionState::Unknown => {}
                 }
             }
         } else if inst.session_started {
-            // Agent-minted (Codex): legacy panes created before exact title
-            // capture have no id, so recover their newest cwd-matching rollout.
-            // A known id that disappeared must start fresh; adopting "latest"
-            // there can steal a sibling pane's conversation.
             if inst.session_id.is_none() {
-                let captured = {
-                    let _phase = ui_profile::phase("activation", "codex-session-latest", Some(iid));
-                    capture_agent_session_id(&preset, cwd.as_deref())
-                };
-                if let Some(id) = unowned_captured_session_id(captured, &sibling_session_ids) {
-                    inst.session_id = Some(id);
-                } else {
-                    inst.session_started = false;
-                }
-            } else if inst.session_id.as_deref().is_some_and(|sid| {
-                let _phase = ui_profile::phase("activation", "codex-session-exists", Some(iid));
-                agent_minted_session_gone(&preset, sid)
-            }) {
-                inst.session_id = None;
+                inst.session_path = None;
                 inst.session_started = false;
+            } else if local
+                && is_codex_program(preset.program.as_deref())
+                && let (Some(home), Some(id)) = (home_dir(), inst.session_id.as_deref())
+            {
+                let _phase = ui_profile::phase("activation", "codex-session-exists", Some(iid));
+                match session_discovery::resume_codex_session(
+                    &home,
+                    id,
+                    inst.session_path.as_deref(),
+                ) {
+                    Ok(muxel_core::CodexResumePath::Found(path)) => inst.session_path = Some(path),
+                    Ok(muxel_core::CodexResumePath::Missing) => {
+                        inst.session_id = None;
+                        inst.session_path = None;
+                        inst.session_started = false;
+                    }
+                    Ok(muxel_core::CodexResumePath::Unknown) => unconfirmed_resume = true,
+                    // An unreadable store does not prove an exact identity expired.
+                    Err(error) => {
+                        log::warn!("could not check Codex rollout before resume: {error}");
+                        unconfirmed_resume = true;
+                    }
+                }
             }
         }
         let snapshot = inst.clone();
-        Ok(muxel_core::session_resume_args(&preset, &snapshot).map(|args| (args, resume_cwd)))
+        // `command_for` keeps this only for a launch that starts a new tmux
+        // session (`arms_tmux_resume_recovery`).
+        if unconfirmed_resume {
+            self.codex_unconfirmed_resumes.insert(iid);
+        } else {
+            self.codex_unconfirmed_resumes.remove(&iid);
+        }
+        let result =
+            muxel_core::session_resume_args(&preset, &snapshot).map(|args| (args, resume_cwd));
+        if snapshot.session_path != previous_session_path {
+            self.persist();
+        }
+        Ok(result)
     }
 
     fn command_for(&mut self, instance_id: Uuid) -> anyhow::Result<CommandSpec> {
         let _phase = ui_profile::phase("activation", "command-for", Some(instance_id));
-        let unresolved = self.workspace.instance(instance_id).and_then(|instance| {
-            let project = self.workspace.project(instance.project_id)?;
-            (project.remote.is_none()
-                && instance.tmux_session.is_some()
-                && (instance.tmux_socket.is_none()
-                    || integrations::profile_tmux_target(&instance.tmux_target(&project.name))
-                        .socket
-                        != instance.tmux_socket))
-                .then(|| instance.tmux_target(&project.name))
-        });
-        if let Some(target) = unresolved {
-            let socket = integrations::local_tmux_socket(&target);
-            if let Some(instance) = self.workspace.instance_mut(instance_id) {
-                instance.tmux_socket = Some(socket);
-            }
-            self.persist();
+        // Literal commands bypass every transport, prompt and resume wrapper,
+        // including stale tmux metadata adopted from a shared layout.
+        if let Some(spec) = self.workspace.instance(instance_id).and_then(|inst| {
+            literal_command_spec(
+                inst,
+                self.workspace.project(inst.project_id),
+                crate::user_data_dir::is_isolated(),
+            )
+        }) {
+            return Ok(spec);
         }
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
         // resolve the --session-id / --resume flag *before* anything borrows the
@@ -7513,6 +8046,7 @@ impl MuxelApp {
             .iter()
             .any(|arg| arg == "--settings" || arg.starts_with("--settings="));
         let local_claude = is_claude_program(agent_program.as_deref())
+            && inst.is_none_or(|i| !i.literal_argv)
             && project.is_some_and(|project| project.remote.is_none());
         // The hook finds its pane through `MUXEL_INSTANCE_ID`. Direct launches
         // get it below; new tmux sessions get it when tmux supports `-e`.
@@ -7546,9 +8080,10 @@ impl MuxelApp {
         // Build program/args (and, for local, the PTY working dir). For remote the
         // command becomes `ssh … -- 'cd <dir> && exec <program>'`; the cwd lives
         // inside that remote string, so there is no local PTY cwd.
+        let mut armed_resume = false;
         let (mut spec, local_cwd, extra_env) = if let Some((host, rref)) = remote {
             let remote_cwd = inst
-                .and_then(|i| i.worktree_path.as_ref())
+                .and_then(Instance::working_directory)
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| rref.remote_root.clone());
             let control_path = pane_master.unwrap_or_else(|| {
@@ -7563,7 +8098,7 @@ impl MuxelApp {
             // project directory, even though the transcript itself still exists.
             let cwd = effective_local_cwd(
                 session_resume.as_ref().and_then(|(_, cwd)| cwd.as_deref()),
-                inst.and_then(|i| i.worktree_path.as_deref()),
+                inst.and_then(Instance::working_directory),
                 project.map(|p| p.root_path.as_path()),
             );
             // If this instance uses tmux, wrap the command in `tmux new-session -A`
@@ -7571,13 +8106,22 @@ impl MuxelApp {
             let (spec, extra_env) = match inst.and_then(|i| {
                 i.tmux_session
                     .as_ref()
-                    .map(|name| SessionTarget::new(name.clone(), i.tmux_socket))
+                    .map(|name| SessionTarget::new(name.clone(), i.tmux_socket.clone()))
             }) {
                 Some(session) => {
                     let root = std::env::var_os(muxel_store::USER_DATA_DIR_ENV).map(PathBuf::from);
                     let socket = integrations::local_tmux_socket(&session);
+                    armed_resume = arms_tmux_resume_recovery(
+                        self.codex_unconfirmed_resumes.contains(&instance_id),
+                        || {
+                            session_discovery::tmux_session_running(&SessionTarget::new(
+                                session.name.clone(),
+                                Some(socket.clone()),
+                            ))
+                        },
+                    );
                     let launch = crate::session_binding::tmux_pane_args(
-                        socket,
+                        socket.clone(),
                         &session.name,
                         resolved.program.as_deref(),
                         &resolved.args,
@@ -7595,8 +8139,18 @@ impl MuxelApp {
                     // *before* this client creates its session — otherwise the shared
                     // server inherits this argv and a stray `pkill -f <project>` kills
                     // every agent in every session. See `ensure_tmux_server`.
-                    integrations::ensure_tmux_server(socket);
-                    (CommandSpec::program("tmux", launch.args), launch.env)
+                    integrations::ensure_tmux_server(&socket);
+                    // A controller task's startup reads the provider's title
+                    // here: the owner this client attaches to, after any move.
+                    let name = session.name.clone();
+                    let title_socket = socket.clone();
+                    let title = muxel_terminal::TitleSource::new(move || {
+                        integrations::tmux_pane_title(&title_socket, &name)
+                    });
+                    (
+                        CommandSpec::program("tmux", launch.args).with_title_source(title),
+                        launch.env,
+                    )
                 }
                 None => (
                     match resolved.program.clone() {
@@ -7608,6 +8162,9 @@ impl MuxelApp {
             };
             (spec, cwd, extra_env)
         };
+        if !armed_resume {
+            self.codex_unconfirmed_resumes.remove(&instance_id);
+        }
         if let Some(shell) = remote_paste_shell {
             spec = spec.with_paste_shell(shell);
         } else if agent_program.is_some() {
@@ -7682,15 +8239,26 @@ impl MuxelApp {
             .filter(|v| !v.is_empty())
             .unwrap_or(def_blocked);
         let startup_delay = preset.map(|p| p.startup_delay_ms).unwrap_or(0);
-        Ok(spec
-            .with_status_program(agent_program)
-            .with_startup_delay(startup_delay)
-            .with_markers(working, blocked)
-            .with_binding(binding))
+        let owner = match self.terminal_launching.get(&instance_id) {
+            Some(ticket) => ticket.startup.clone(),
+            None => self.claim_control_startup(instance_id),
+        };
+        Ok(control_api::control_launch_spec(
+            inst,
+            self.control_turns.get(&instance_id),
+            owner,
+            spec.with_status_program(agent_program)
+                .with_startup_delay(startup_delay)
+                .with_markers(working, blocked)
+                .with_binding(binding),
+        ))
     }
 
     /// Preparation refusals never reach TerminalLaunch's fallback-shell path.
     fn refuse_terminal_launch(&mut self, iid: Uuid, error: String, cx: &mut Context<Self>) {
+        // Immediate launches may fail preparation before claiming their task.
+        // Settling the signal also covers that unowned Pending interval.
+        self.cancel_control_startup(iid);
         self.terminal_launching.remove(&iid);
         self.terminals.remove(&iid);
         self.terminal_launches.remove(&iid);
@@ -7722,7 +8290,39 @@ impl MuxelApp {
 
     /// Spawn (or replace) the live terminal for an instance id.
     fn spawn_terminal(&mut self, instance_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.spawn_terminal_for(
+            instance_id,
+            muxel_core::TerminalLaunchReason::Recovery,
+            window,
+            cx,
+        );
+    }
+
+    fn launch_permitted(&self, iid: Uuid, reason: muxel_core::TerminalLaunchReason) -> bool {
+        self.workspace.instance(iid).is_some_and(|i| {
+            i.permits_launch(reason)
+                && (!i.literal_argv
+                    || self
+                        .workspace
+                        .project(i.project_id)
+                        .is_some_and(|p| !p.is_remote()))
+        })
+    }
+
+    fn spawn_terminal_for(
+        &mut self,
+        instance_id: Uuid,
+        reason: muxel_core::TerminalLaunchReason,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.terminal_restarts.contains(instance_id) {
+            return;
+        }
+        if reason != muxel_core::TerminalLaunchReason::NewPane {
+            self.cancel_control_startup(instance_id);
+        }
+        if !self.launch_permitted(instance_id, reason) {
             return;
         }
         let _phase = ui_profile::phase("activation", "spawn-terminal-immediate", Some(instance_id));
@@ -7741,15 +8341,15 @@ impl MuxelApp {
             self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
             return;
         }
-        if self.resolve_remote_tmux_owner(instance_id, window, cx) {
+        if self.resolve_remote_tmux_owner(instance_id, reason, window, cx) {
+            return;
+        }
+        if !self.prepare_local_tmux_owner(instance_id) {
+            cx.notify();
             return;
         }
         // Whether this launch will `--resume` a saved session (true on every
         // launch after the first, for resume-capable agents).
-        let was_resume = self
-            .workspace
-            .instance(instance_id)
-            .is_some_and(|i| i.session_started);
         let spec = match self.command_for(instance_id) {
             Ok(spec) => spec,
             Err(error) => {
@@ -7757,6 +8357,10 @@ impl MuxelApp {
                 return;
             }
         };
+        let was_resume = self
+            .workspace
+            .instance(instance_id)
+            .is_some_and(|i| i.session_started);
         // Capture program + cwd before `spec` moves into the launch, so a failed
         // launch can be reported with the path it tried.
         let prog = spec.program.clone();
@@ -7788,6 +8392,9 @@ impl MuxelApp {
     /// Whether `iid` runs a preset that can reopen its conversation (`resume_flag`).
     fn resume_capable(&self, iid: Uuid) -> bool {
         self.workspace.instance(iid).is_some_and(|inst| {
+            if inst.literal_argv {
+                return false;
+            }
             inst.preset_id
                 .and_then(|id| self.presets.iter().find(|preset| preset.id == id))
                 .or_else(|| {
@@ -7821,8 +8428,18 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<PreparedTerminalSpawn> {
-        let token = self.reserve_terminal_spawn(instance_id, window, cx)?;
-        self.prepare_reserved_terminal_spawn(instance_id, token, cx)
+        let token = self.reserve_terminal_spawn(
+            instance_id,
+            muxel_core::TerminalLaunchReason::Restore,
+            window,
+            cx,
+        )?;
+        self.prepare_reserved_terminal_spawn(
+            instance_id,
+            token,
+            muxel_core::TerminalLaunchReason::Restore,
+            cx,
+        )
     }
 
     /// Claim one generation without doing command discovery or PTY work. This
@@ -7830,27 +8447,31 @@ impl MuxelApp {
     fn reserve_terminal_spawn(
         &mut self,
         instance_id: Uuid,
+        reason: muxel_core::TerminalLaunchReason,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<u64> {
         let _phase = ui_profile::phase("activation", "reserve-terminal", Some(instance_id));
-        if self.terminals.contains_key(&instance_id)
-            || self.failed_launches.contains_key(&instance_id)
-            || self.terminal_launching.contains_key(&instance_id)
-            || self.terminal_restarts.contains(instance_id)
-        {
+        // A queued restart owns this pane's launch and startup lease until its
+        // confirmed teardown completes. Merely requesting a launch cannot cancel it.
+        if self.terminal_restarts.contains(instance_id) {
             return None;
         }
-        self.next_terminal_launch_token = self.next_terminal_launch_token.wrapping_add(1);
-        let token = self.next_terminal_launch_token;
-        self.terminal_launching.insert(
-            instance_id,
-            LaunchTicket {
-                token,
-                since: Instant::now(),
-            },
-        );
-        self.reset_terminal_runtime(instance_id);
+        if !self.launch_permitted(instance_id, reason)
+            || self.terminals.contains_key(&instance_id)
+            || self.failed_launches.contains_key(&instance_id)
+            || self.terminal_launching.contains_key(&instance_id)
+        {
+            if !self.terminal_launching.contains_key(&instance_id)
+                && !self.terminals.contains_key(&instance_id)
+            {
+                self.cancel_control_startup(instance_id);
+            }
+            return None;
+        }
+        if reason != muxel_core::TerminalLaunchReason::NewPane {
+            self.cancel_control_startup(instance_id);
+        }
         if let Some(host) = self.remote_host_for_instance(instance_id)
             && host.auth == SshAuth::Password
             && self.remote_password(&host).is_none()
@@ -7860,10 +8481,82 @@ impl MuxelApp {
             self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
             return None;
         }
-        if self.resolve_remote_tmux_owner(instance_id, window, cx) {
+        if self.resolve_remote_tmux_owner(instance_id, reason, window, cx) {
             return None;
         }
+        // Owner discovery only reserves lookup admission. Claim startup input
+        // once a real terminal can be prepared, so dropping a discovery ticket
+        // cannot cancel the first task of a newly created remote pane.
+        let startup = self.claim_control_startup(instance_id);
+        self.next_terminal_launch_token = self.next_terminal_launch_token.wrapping_add(1);
+        let token = self.next_terminal_launch_token;
+        self.terminal_launching.insert(
+            instance_id,
+            LaunchTicket {
+                token,
+                since: Instant::now(),
+                startup,
+            },
+        );
+        self.reset_terminal_runtime(instance_id);
         Some(token)
+    }
+
+    fn fail_tmux_launch(&mut self, iid: Uuid, message: String) {
+        self.terminal_launching.remove(&iid);
+        self.failed_launches.insert(iid, message.clone());
+        self.add_event(NotifKind::Error, t("Launch failed"), message);
+    }
+
+    /// Resolve legacy local ownership and move an extinct Default session only
+    /// after exact probes confirm the destination has no namesake.
+    fn prepare_local_tmux_owner(&mut self, iid: Uuid) -> bool {
+        let Some((target, original_name, original_socket)) =
+            self.workspace.instance(iid).and_then(|instance| {
+                let project = self.workspace.project(instance.project_id)?;
+                local_owner_to_prepare(instance, project).map(|target| {
+                    (
+                        target,
+                        instance.tmux_session.clone(),
+                        instance.tmux_socket.clone(),
+                    )
+                })
+            })
+        else {
+            return true;
+        };
+        let result = integrations::local_tmux_launch_target(
+            &target,
+            Instant::now() + Duration::from_secs(2),
+        );
+        let result = result.and_then(|prepared| {
+            let instance = self
+                .workspace
+                .instance_mut(iid)
+                .expect("local pane still present");
+            instance.tmux_session = Some(prepared.name);
+            instance.tmux_socket = prepared.socket;
+            if self.try_persist() {
+                Ok(())
+            } else {
+                let instance = self
+                    .workspace
+                    .instance_mut(iid)
+                    .expect("local pane still present");
+                instance.tmux_session = original_name;
+                instance.tmux_socket = original_socket;
+                Err(anyhow::anyhow!(
+                    "couldn't save the tmux session owner before launch"
+                ))
+            }
+        });
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.fail_tmux_launch(iid, format!("{error:#}"));
+                false
+            }
+        }
     }
 
     /// Older layouts have only a session name. Resolve and persist its owner
@@ -7872,6 +8565,7 @@ impl MuxelApp {
     fn resolve_remote_tmux_owner(
         &mut self,
         iid: Uuid,
+        reason: muxel_core::TerminalLaunchReason,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -7882,6 +8576,7 @@ impl MuxelApp {
         let Some(host) = self.remote_host_for_instance(iid).filter(|host| {
             host.use_tmux(instance.use_tmux)
                 && (instance.tmux_socket.is_none()
+                    || instance.tmux_socket == Some(Socket::Default)
                     || integrations::profile_tmux_target(&instance.tmux_target(&host.name)).socket
                         != instance.tmux_socket)
         }) else {
@@ -7890,6 +8585,10 @@ impl MuxelApp {
         let Some(loc) = self.repo_loc(pid) else {
             return false;
         };
+        let expected = instance.tmux_target(&host.name);
+        let original_name = instance.tmux_session.clone();
+        let original_socket = instance.tmux_socket.clone();
+        let workspace = self.current_workspace;
         let token = match self.terminal_launching.get(&iid) {
             Some(ticket) => ticket.token,
             None => {
@@ -7900,43 +8599,71 @@ impl MuxelApp {
                     LaunchTicket {
                         token,
                         since: Instant::now(),
+                        startup: None,
                     },
                 );
                 token
             }
         };
         cx.spawn_in(window, async move |this, cx| {
-            let sessions = cx
+            let pending = expected.clone();
+            let prepared = cx
                 .background_executor()
-                .spawn(async move { integrations::list_remote_tmux_sessions(&loc) })
+                .spawn(async move {
+                    integrations::remote_tmux_launch_target(
+                        &loc,
+                        &pending,
+                        iid,
+                        false,
+                        Instant::now() + Duration::from_secs(10),
+                    )
+                })
                 .await;
+            // `Some(false)`: the binding changed meanwhile (a peer layout rebound
+            // the pane), so this answer is about the wrong owner.
             let landed = Self::in_project_or_main(&this, Some(pid), cx, |this, window, cx| {
-                if !launch_token_current(&this.terminal_launching, iid, token) {
-                    return;
+                if this.current_workspace != workspace
+                    || !launch_token_current(&this.terminal_launching, iid, token)
+                {
+                    return true;
                 }
-                this.terminal_launching.remove(&iid);
                 let Some(instance) = this.workspace.instance_mut(iid) else {
-                    return;
+                    return true;
                 };
-                let Some(sessions) = sessions else {
-                    let message =
-                        t("Couldn't determine the tmux session's server. Reconnect and try again.")
-                            .to_string();
-                    this.failed_launches.insert(iid, message.clone());
-                    this.add_event(NotifKind::Error, t("Launch failed"), message);
+                if instance.project_id != pid || instance.tmux_target(&host.name) != expected {
+                    return false;
+                }
+                let prepared = match prepared {
+                    Ok(target) => target,
+                    Err(error) => {
+                        this.fail_tmux_launch(iid, format!("{error:#}"));
+                        cx.notify();
+                        return true;
+                    }
+                };
+                instance.tmux_session = Some(prepared.name);
+                instance.tmux_socket = prepared.socket;
+                if !this.try_persist() {
+                    let instance = this
+                        .workspace
+                        .instance_mut(iid)
+                        .expect("prepared pane still present");
+                    instance.tmux_session = original_name;
+                    instance.tmux_socket = original_socket;
+                    this.fail_tmux_launch(
+                        iid,
+                        t("Couldn't save the tmux session owner before launch.").to_string(),
+                    );
                     cx.notify();
-                    return;
-                };
-                muxel_core::tmux::bind_session_owners(
-                    &host.name,
-                    [instance],
-                    &sessions,
-                    integrations::profile_tmux_socket(),
-                );
-                this.persist();
-                this.spawn_terminal_deferred(iid, window, cx);
+                    return true;
+                }
+                this.reset_terminal_runtime(iid);
+                this.spawn_reserved_terminal_deferred(iid, token, reason, window, cx);
+                true
             });
-            if landed.is_none() {
+            // Unlanded, or about a binding the pane no longer has: release this
+            // launch and run it again from the pane's current binding.
+            if landed != Some(true) {
                 Self::release_unlanded_launch(&this, iid, token, cx);
             }
         })
@@ -7950,19 +8677,23 @@ impl MuxelApp {
         &mut self,
         instance_id: Uuid,
         token: u64,
+        reason: muxel_core::TerminalLaunchReason,
         cx: &mut Context<Self>,
     ) -> Option<PreparedTerminalSpawn> {
         let _phase =
             ui_profile::phase("activation", "prepare-reserved-terminal", Some(instance_id));
-        if !launch_token_current(&self.terminal_launching, instance_id, token)
-            || self.workspace.instance(instance_id).is_none()
-        {
+        if !launch_token_current(&self.terminal_launching, instance_id, token) {
             return None;
         }
-        let was_resume = self
-            .workspace
-            .instance(instance_id)
-            .is_some_and(|i| i.session_started);
+        // A peer/workspace update can change metadata while the task yields.
+        // Recheck before discovery so a restore reservation cannot replay argv.
+        if !self.launch_permitted(instance_id, reason) {
+            self.terminal_launching.remove(&instance_id);
+            return None;
+        }
+        if !self.prepare_local_tmux_owner(instance_id) {
+            return None;
+        }
         let spec = match self.command_for(instance_id) {
             Ok(spec) => spec,
             Err(error) => {
@@ -7972,6 +8703,10 @@ impl MuxelApp {
         };
         let program = spec.program.clone();
         let cwd = spec.cwd.clone().unwrap_or_default();
+        let was_resume = self
+            .workspace
+            .instance(instance_id)
+            .is_some_and(|i| i.session_started);
         let meta = TerminalSpawnMeta {
             instance_id,
             token,
@@ -8023,21 +8758,37 @@ impl MuxelApp {
     fn spawn_terminal_deferred(
         &mut self,
         instance_id: Uuid,
+        reason: muxel_core::TerminalLaunchReason,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(token) = self.reserve_terminal_spawn(instance_id, window, cx) else {
+        let Some(token) = self.reserve_terminal_spawn(instance_id, reason, window, cx) else {
             return;
         };
+        self.spawn_reserved_terminal_deferred(instance_id, token, reason, window, cx);
+    }
+
+    /// Continue the admitted generation after owner discovery. Re-reserving here
+    /// would repeat Default discovery forever when its owner must stay Default.
+    fn spawn_reserved_terminal_deferred(
+        &mut self,
+        instance_id: Uuid,
+        token: u64,
+        reason: muxel_core::TerminalLaunchReason,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_codex_restore_lookup(instance_id, cx);
         cx.spawn(async move |this, cx| {
             // Give GPUI a frame to paint the selected pane's loading state before
             // the worker begins process discovery and ConPTY construction.
             cx.background_executor()
                 .timer(Duration::from_millis(1))
                 .await;
+            Self::await_codex_restore_lookup(&this, instance_id, cx).await;
             let Some((meta, spec, size)) = this
                 .update(cx, |this, cx| {
-                    this.prepare_reserved_terminal_spawn(instance_id, token, cx)
+                    this.prepare_reserved_terminal_spawn(instance_id, token, reason, cx)
                 })
                 .ok()
                 .flatten()
@@ -8201,10 +8952,8 @@ impl MuxelApp {
             .insert(instance_id, (Instant::now(), was_resume));
         let mut state_changed = false;
         if let Some(inst) = self.workspace.instance_mut(instance_id)
-            && inst.is_runner
-            && inst.auto_submit
+            && inst.consume_runner_prompt()
         {
-            inst.auto_submit = false;
             state_changed = true;
         }
         state_changed |= self.mark_terminal_session_started(instance_id);
@@ -8406,7 +9155,10 @@ impl MuxelApp {
             .unwrap_or_default()
             .into_iter()
             .any(|iid| {
-                !self.terminals.contains_key(&iid)
+                self.workspace.instance(iid).is_some_and(|i| {
+                    i.kind != InstanceKind::Terminal
+                        || i.permits_launch(muxel_core::TerminalLaunchReason::ProjectSelection)
+                }) && !self.terminals.contains_key(&iid)
                     && !self.editors.contains_key(&iid)
                     && !self.browsers.contains_key(&iid)
             });
@@ -8856,7 +9608,7 @@ impl MuxelApp {
             ImportSource::TmuxSession { session } => {
                 // The binding that makes this an attach rather than a launch.
                 instance.tmux_session = Some(session.name.clone());
-                instance.tmux_socket = session.socket;
+                instance.tmux_socket = session.socket.clone();
                 t("Attached to the running session — the agent was never interrupted.").to_string()
             }
             ImportSource::Running {
@@ -8910,6 +9662,7 @@ impl MuxelApp {
             .instances
             .iter()
             .filter_map(|i| {
+                let tmux = InstanceTmux::capture(i)?;
                 let project = self.workspace.project(i.project_id)?;
                 let host = project
                     .remote
@@ -8921,12 +9674,12 @@ impl MuxelApp {
                     // name the pane was launched with rather than skipping it, which
                     // would leave the session alive on the host forever.
                     Some(host) if host.default_use_tmux || i.use_tmux => {
-                        Some((i.project_id, i.tmux_target(&host.name), true))
+                        Some((i.project_id, tmux.on_host(&host.name), true))
                     }
                     Some(_) => None,
                     None => Some((
                         i.project_id,
-                        SessionTarget::new(i.tmux_session.clone()?, i.tmux_socket),
+                        SessionTarget::new(tmux.recorded_session?, tmux.socket),
                         false,
                     )),
                 }
@@ -9116,6 +9869,14 @@ impl MuxelApp {
             *generation = generation.wrapping_add(1);
             *generation
         };
+        // Restored Codex panes that need local history start their one bounded
+        // lookup together now; each launch below waits only for its own. A pane
+        // another launch already owns may be prepared by now, so it gets none.
+        for &iid in &instances {
+            if !self.terminal_launching.contains_key(&iid) {
+                self.begin_codex_restore_lookup(iid, cx);
+            }
+        }
         if !panes.is_empty() {
             // Same debounce, move/size pause and cancellation as the terminal
             // waves, one pane per turn, but never a startup hold.
@@ -9235,6 +9996,7 @@ impl MuxelApp {
                     .enumerate()
                     .map(|(offset, iid)| (wave_start + offset, iid))
                 {
+                    Self::await_codex_restore_lookup(&this, iid, cx).await;
                     let prepared = Self::restore_step(&this, pid, cx, |this, window, cx| {
                         let _phase = ui_profile::phase("activation", "prepare-pane", Some(iid));
                         if this.deferred_activation_generation.get(&pid) != Some(&generation) {
@@ -9562,7 +10324,12 @@ impl MuxelApp {
                     self.terminal_launching.contains_key(&iid),
                 ) && !self.failed_launches.contains_key(&iid)
                 {
-                    self.spawn_terminal(iid, window, cx);
+                    self.spawn_terminal_for(
+                        iid,
+                        muxel_core::TerminalLaunchReason::ProjectSelection,
+                        window,
+                        cx,
+                    );
                 }
             }
             InstanceKind::Editor => {
@@ -9681,6 +10448,7 @@ impl MuxelApp {
         self.workspace_lock = Some(lock);
 
         self.failed_launches.clear();
+        self.control_turns.clear();
         // Invalidate background launches from the old workspace before ids from
         // the new document can be admitted.
         self.terminal_launching.clear();
@@ -11062,35 +11830,50 @@ impl MuxelApp {
             })
             .then(home_dir)
             .flatten();
+        let mut codex_name_index = std::mem::take(&mut self.codex_name_index);
         cx.spawn(async move |this, cx| {
-            let (available, gh, sshpass, tmux, branches, changes, codex_names) = cx
-                .background_executor()
-                .spawn(async move {
-                    let available = installed_programs(&presets);
-                    let gh = program_on_path("gh");
-                    let sshpass = program_on_path("sshpass");
-                    let tmux = cfg!(unix) && program_on_path("tmux");
-                    let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
-                        .into_iter()
-                        .map(|(id, root)| {
-                            let loc = integrations::RepoLoc::Local(root);
-                            (
-                                id,
-                                integrations::repo_current_branch(&loc),
-                                integrations::list_branches(&loc),
-                            )
-                        })
-                        .collect();
-                    let changes: Vec<(Uuid, usize)> = worktrees
-                        .into_iter()
-                        .map(|(id, path)| (id, integrations::worktree_change_count(&path)))
-                        .collect();
-                    let codex_names = codex_home.map(|home| muxel_core::codex_session_names(&home));
-                    (available, gh, sshpass, tmux, branches, changes, codex_names)
-                })
-                .await;
+            let (available, gh, sshpass, tmux, branches, changes, codex_names, codex_name_index) =
+                cx.background_executor()
+                    .spawn(async move {
+                        let available = installed_programs(&presets);
+                        let gh = program_on_path("gh");
+                        let sshpass = program_on_path("sshpass");
+                        let tmux = cfg!(unix) && program_on_path("tmux");
+                        let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
+                            .into_iter()
+                            .map(|(id, root)| {
+                                let loc = integrations::RepoLoc::Local(root);
+                                (
+                                    id,
+                                    integrations::repo_current_branch(&loc),
+                                    integrations::list_branches(&loc),
+                                )
+                            })
+                            .collect();
+                        let changes: Vec<(Uuid, usize)> = worktrees
+                            .into_iter()
+                            .map(|(id, path)| (id, integrations::worktree_change_count(&path)))
+                            .collect();
+                        let codex_names = codex_home.map(|home| {
+                            codex_name_index
+                                .refresh(&home)
+                                .map(|changed| changed.then(|| codex_name_index.names().clone()))
+                        });
+                        (
+                            available,
+                            gh,
+                            sshpass,
+                            tmux,
+                            branches,
+                            changes,
+                            codex_names,
+                            codex_name_index,
+                        )
+                    })
+                    .await;
             let _ = this.update(cx, |this, cx| {
                 this.status_refresh_in_flight = false;
+                this.codex_name_index = codex_name_index;
                 this.available_programs = available;
                 this.gh_available = gh;
                 this.sshpass_available = sshpass;
@@ -11106,12 +11889,16 @@ impl MuxelApp {
                 }
                 this.worktree_changes = changes.into_iter().collect();
                 match codex_names {
-                    Some(Ok(names)) => this.codex_session_names = names,
+                    Some(Ok(Some(names))) => this.codex_session_names = names,
+                    Some(Ok(None)) => {}
                     Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                         this.codex_session_names.clear();
                     }
                     Some(Err(_)) => {}
-                    None => this.codex_session_names.clear(),
+                    None => {
+                        this.codex_session_names.clear();
+                        this.codex_name_index = Default::default();
+                    }
                 }
                 let updates: Vec<(Uuid, String)> = this
                     .workspace
@@ -11325,6 +12112,7 @@ impl MuxelApp {
         } = remote;
         let mut instances = muxel_core::merge_peer_instances(&local, instances, pid);
         self.bind_peer_sessions(pid, &mut instances);
+        self.retry_rebound_launches(&local, &instances);
         let keep: HashSet<Uuid> = instances.iter().map(|i| i.id).collect();
         let closed: Vec<Uuid> = before
             .iter()
@@ -11387,6 +12175,16 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// A pane whose launch failed on its old tmux binding gets another go when a
+    /// peer layout gives it a new one (`before` → `after`): typically the owner a
+    /// peer moved the pane to while this machine refused to guess it, which the
+    /// pane can now attach to. Restart would instead kill what the peer started.
+    fn retry_rebound_launches(&mut self, before: &[Instance], after: &[Instance]) {
+        for iid in muxel_core::rebound_instances(before, after) {
+            self.failed_launches.remove(&iid);
+        }
+    }
+
     /// After adopting a peer's layout: re-seed change detection so the adoption
     /// isn't pushed straight back, and remember the file as synced. Whatever this
     /// machine had to add (a session binding the peer never recorded) makes the
@@ -11423,23 +12221,13 @@ impl MuxelApp {
         let Some(project) = self.workspace.project(pid).filter(|p| p.remote.is_none()) else {
             return;
         };
-        let unbound = |i: &Instance| {
-            i.kind == InstanceKind::Terminal
-                && i.tmux_session
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-        };
-        if !instances.iter().any(unbound) {
+        if !instances.iter().any(Instance::needs_peer_session) {
             return;
         }
         let sessions = integrations::list_local_tmux_sessions().unwrap_or_default();
-        for instance in instances.iter_mut().filter(|i| unbound(i)) {
-            instance.use_tmux = true;
-        }
-        let eligible = instances.iter_mut().filter(|i| unbound(i));
-        muxel_core::tmux::bind_session_owners(
+        muxel_core::tmux::bind_peer_sessions(
             &project.name,
-            eligible,
+            instances,
             &sessions,
             integrations::profile_tmux_socket(),
         );
@@ -11526,6 +12314,34 @@ impl MuxelApp {
         if let (Some(launch), Some(stamp)) = (launch, stamp) {
             self.claude_hook_seen.insert(iid, (launch, stamp.nonce));
         }
+    }
+
+    fn resume_program(&self, iid: Uuid) -> Option<&str> {
+        self.workspace.instance(iid).and_then(|instance| {
+            instance
+                .preset_id
+                .and_then(|preset_id| self.presets.iter().find(|preset| preset.id == preset_id))
+                .or_else(|| {
+                    self.presets
+                        .iter()
+                        .find(|preset| preset.name == instance.preset)
+                })
+                .and_then(|preset| preset.program.as_deref())
+                .or(instance.program.as_deref())
+        })
+    }
+
+    fn should_recover_expired_resume(
+        &self,
+        iid: Uuid,
+        explicit_missing: bool,
+        early_nonzero_exit: bool,
+    ) -> bool {
+        should_recover_expired_session(
+            self.resume_program(iid),
+            explicit_missing,
+            early_nonzero_exit,
+        )
     }
 
     /// Status-refresh tick: re-render and fire desktop notifications for
@@ -11694,18 +12510,21 @@ impl MuxelApp {
                 let exit_code = v.exit_code();
                 let exit_signal = v.exit_signal().map(str::to_string);
                 let read_error = v.exit_read_error().map(str::to_string);
-                // Some providers hang on "No conversation found" instead of
-                // exiting. Search recent reflowed text while the resume is fresh;
-                // Claude still preserves its UUID because cwd mismatch produces
-                // the same message.
+                let inst = self.workspace.instance(*iid);
+                // Some providers hang after reporting a missing conversation.
+                // The Codex message names the exact saved ID; a generic failure
+                // or unrelated screen text cannot erase its binding.
                 let resume_error =
                     self.terminal_launches
                         .get(iid)
                         .is_some_and(|&(at, was_resume)| {
                             was_resume && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
                         })
-                        && v.recent_text(40).contains("No conversation found");
-                let inst = self.workspace.instance(*iid);
+                        && resume_missing_message(
+                            self.resume_program(*iid),
+                            inst.and_then(|instance| instance.session_id.as_deref()),
+                            &v.recent_text(40),
+                        );
                 let title = inst
                     .map(|i| i.display_name().to_string())
                     .unwrap_or_default();
@@ -11892,46 +12711,44 @@ impl MuxelApp {
                     );
                 }
             }
-            let tmux_session = self.workspace.instance(iid).and_then(|i| {
-                i.tmux_session
-                    .as_ref()
-                    .map(|name| SessionTarget::new(name.clone(), i.tmux_socket))
-            });
-            let is_claude = self.workspace.instance(iid).is_some_and(|instance| {
-                instance
-                    .preset_id
-                    .and_then(|preset_id| self.presets.iter().find(|preset| preset.id == preset_id))
-                    .or_else(|| {
-                        self.presets
-                            .iter()
-                            .find(|preset| preset.name == instance.preset)
-                    })
-                    .is_some_and(|preset| is_claude_program(preset.program.as_deref()))
-            });
-            // A `--resume` launch whose saved session is invalid (deleted/expired)
-            // recovers by re-spawning the same agent with a fresh session, rather
-            // than closing it. Claude never qualifies here: its proactive transcript
-            // probe already handles a confirmed miss, while both this message and a
-            // generic non-zero exit can be caused by a cwd mismatch. Replacing the
-            // UUID in that case would hide a valid conversation. Other providers
-            // retain the earlier generic early-exit recovery.
+            let tmux_session = self
+                .workspace
+                .instance(iid)
+                .and_then(InstanceTmux::capture)
+                .and_then(|tmux| {
+                    tmux.recorded_session
+                        .map(|name| SessionTarget::new(name, tmux.socket))
+                });
+            // A `--resume` launch with a proven missing session recovers by
+            // re-spawning fresh. Claude's proactive transcript probe handles its
+            // confirmed misses before launch. Codex requires its exact missing-ID
+            // message here; an unrelated early failure retains the valid binding.
+            // Other providers retain the earlier generic early-exit recovery.
             // A clean exit (code 0) is a deliberate quit — left to close-on-exit.
             //
-            // Never for a tmux pane: what exits there is the tmux *client*, and its
-            // status says nothing about the agent's resume (an agent that failed to
-            // resume would end its session and leave the client at 0). Treating a
-            // killed tmux server as a bad resume threw the conversation away — it
-            // reset `session_id` — every time the server died twice inside
+            // Never infer an expired resume from a tmux client's *failure*: what
+            // exits there is the *client*, and a killed tmux server is not a bad
+            // resume. Treating it as one threw the conversation away — it reset
+            // `session_id` — every time the server died twice inside
             // `RECOVER_WITHIN_SECS`. Those panes belong to `tmux_lost` below.
-            let exit_recover = exited
-                && exit_code != Some(0)
-                && tmux_session.is_none()
-                && self
-                    .terminal_launches
+            // A Codex resume that fails ends its session and leaves the client
+            // at 0, though. For an unconfirmed rollout resumed into a new
+            // session, that clean exit recovers instead of closing the pane
+            // (`arms_tmux_resume_recovery`).
+            let recent_resume =
+                self.terminal_launches
                     .get(&iid)
                     .is_some_and(|&(at, was_resume)| {
                         was_resume && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
                     });
+            let exit_recover =
+                exited && exit_code != Some(0) && tmux_session.is_none() && recent_resume;
+            let tmux_resume_ended = exited
+                && tmux_codex_resume_ended(
+                    self.codex_unconfirmed_resumes.contains(&iid),
+                    exit_code,
+                    recent_resume,
+                );
             // A tmux pane died in a way tmux itself never does on purpose. Either the
             // client was signalled (an agent's `pkill -f <project>` matching the
             // session name in its argv), or the *server* went away underneath it —
@@ -11956,7 +12773,14 @@ impl MuxelApp {
                     at.elapsed() >= reattach_backoff(self.reconnecting.get(&iid).copied())
                 });
 
-            if should_recover_expired_session(is_claude, resume_error, exit_recover) {
+            // A literal pane restores stopped: no recovery may replay its argv.
+            if self.launch_permitted(iid, muxel_core::TerminalLaunchReason::Recovery)
+                && self.should_recover_expired_resume(
+                    iid,
+                    resume_error || tmux_resume_ended,
+                    exit_recover,
+                )
+            {
                 to_recover.push((iid, title));
             } else if let Some(session) = tmux_session.filter(|_| tmux_lost) {
                 to_reattach.push((iid, title, session));
@@ -12081,8 +12905,10 @@ impl MuxelApp {
             // Reset to a brand-new session so the relaunch uses `--session-id`
             // (not the invalid `--resume`), then re-spawn the agent in place.
             self.bump_session_binding_generation(iid);
+            let agent_minted = is_codex_program(self.resume_program(iid));
             if let Some(inst) = self.workspace.instance_mut(iid) {
-                inst.session_id = Some(Uuid::new_v4().to_string());
+                inst.session_id = (!agent_minted).then(|| Uuid::new_v4().to_string());
+                inst.session_path = None;
                 inst.session_started = false;
             }
             self.persist();
@@ -12998,10 +13824,36 @@ impl MuxelApp {
     fn place_and_spawn(
         &mut self,
         pid: Uuid,
+        instance: Instance,
+        placement: PlacementMode,
+        target: Option<Uuid>,
+        explicit_worktree: Option<WorktreeChoice>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.place_and_spawn_with_focus(
+            pid,
+            instance,
+            placement,
+            target,
+            explicit_worktree,
+            true,
+            window,
+            cx,
+        );
+    }
+
+    /// Outside control can place through the same spawn path without changing
+    /// selection or native focus. UI callers use `place_and_spawn` above.
+    #[allow(clippy::too_many_arguments)]
+    fn place_and_spawn_with_focus(
+        &mut self,
+        pid: Uuid,
         mut instance: Instance,
         placement: PlacementMode,
         target: Option<Uuid>,
         explicit_worktree: Option<WorktreeChoice>,
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -13021,7 +13873,12 @@ impl MuxelApp {
             // Keep that binding — and keep tmux on — instead of letting the toolbar
             // toggle re-decide and mint a second session beside the live one.
             let adopted = instance.tmux_session.is_some();
-            instance.use_tmux = adopted || (self.use_tmux && self.tmux_available);
+            instance.use_tmux =
+                !instance.literal_argv && (adopted || (self.use_tmux && self.tmux_available));
+            if instance.literal_argv {
+                instance.tmux_session = None;
+                instance.tmux_socket = None;
+            }
 
             // Decide the worktree: explicit (duplicate/resume) wins; otherwise a new
             // tab OR split inherits the worktree of the pane it joins, if it has one;
@@ -13052,6 +13909,7 @@ impl MuxelApp {
                 instance.tmux_socket = Some(integrations::profile_tmux_socket());
             }
             if !adopted
+                && !instance.literal_argv
                 && instance.tmux_session.is_none()
                 && let Some(host) = self
                     .remote_host_for_project(pid)
@@ -13062,34 +13920,22 @@ impl MuxelApp {
             }
         }
 
-        match (placement, placed_target) {
-            (PlacementMode::Split(direction), Some(active)) => {
-                let ok = self
-                    .workspace
-                    .project_mut(pid)
-                    .is_some_and(|p| split(&mut p.layout, active, direction, iid));
-                if !ok {
-                    return;
-                }
-                self.workspace.add_instance(instance);
-            }
-            (PlacementMode::Tab, Some(active)) => {
-                let ok = self
-                    .workspace
-                    .project_mut(pid)
-                    .is_some_and(|p| add_tab(&mut p.layout, active, iid));
-                if !ok {
-                    return;
-                }
-                self.workspace.add_instance(instance);
-            }
-            (_, None) => {
-                self.workspace.add_instance(instance);
-                if let Some(project) = self.workspace.project_mut(pid) {
-                    project.layout = Some(PaneNode::leaf(iid));
-                }
-            }
+        let direction = match placement {
+            PlacementMode::Split(direction) => Some(direction),
+            PlacementMode::Tab => None,
+        };
+        if !self.workspace.project_mut(pid).is_some_and(|project| {
+            muxel_core::control::place_new_pane(
+                &mut project.layout,
+                placed_target,
+                iid,
+                direction,
+                !focus,
+            )
+        }) {
+            return;
         }
+        self.workspace.add_instance(instance);
         // Build the right live view for the pane's kind (mirrors the restore
         // dispatch in `spawn_project_terminals_now`).
         match kind {
@@ -13098,9 +13944,16 @@ impl MuxelApp {
                 let view = cx.new(|cx| crate::browser::BrowserView::new(iid, pid, url, window, cx));
                 self.browsers.insert(iid, view);
             }
-            _ => self.spawn_terminal_deferred(iid, window, cx),
+            _ => self.spawn_terminal_deferred(
+                iid,
+                muxel_core::TerminalLaunchReason::NewPane,
+                window,
+                cx,
+            ),
         }
-        self.focus_instance(iid, window, cx);
+        if focus {
+            self.focus_instance(iid, window, cx);
+        }
         self.persist();
         cx.notify();
     }
@@ -13115,11 +13968,13 @@ impl MuxelApp {
     ) {
         match choice {
             WorktreeChoice::New => {
+                instance.launch_dir = None;
                 instance.use_worktree = true;
                 self.setup_worktree_into_registry(pid, instance);
             }
             WorktreeChoice::Inherit(src) => {
                 if let Some(s) = self.workspace.instance(src) {
+                    instance.launch_dir = None;
                     instance.use_worktree = s.use_worktree;
                     instance.worktree_path = s.worktree_path.clone();
                     instance.worktree_branch = s.worktree_branch.clone();
@@ -13128,6 +13983,7 @@ impl MuxelApp {
             }
             WorktreeChoice::Resume(wid) => {
                 if let Some(w) = self.workspace.worktree(wid) {
+                    instance.launch_dir = None;
                     instance.use_worktree = true;
                     instance.worktree_path = Some(w.path.clone());
                     instance.worktree_branch = Some(w.branch.clone());
@@ -13604,6 +14460,7 @@ impl MuxelApp {
     /// NOTE: every new modal/palette/menu flag MUST be added here (see CLAUDE.md).
     fn any_overlay_open(&self, cx: &App) -> bool {
         self.show_settings
+            || !self.control_approvals.is_empty()
             || self.show_search_palette
             || self.show_find_panel
             || self.show_update_modal
@@ -13817,8 +14674,8 @@ impl MuxelApp {
         };
         let pid = src.project_id;
         let dir = src
-            .worktree_path
-            .clone()
+            .working_directory()
+            .map(std::path::Path::to_path_buf)
             .or_else(|| self.workspace.project(pid).map(|p| p.root_path.clone()))
             .unwrap_or_default();
         self.open_diff_for_dir(pid, dir, Some(source_iid), window, cx);
@@ -14719,10 +15576,8 @@ impl MuxelApp {
         &mut self,
         iid: Uuid,
         project_id: Uuid,
-        // The session name recorded on the instance, if it had one (`tmux_session`).
-        recorded_session: Option<SessionTarget>,
-        worktree_path: Option<PathBuf>,
-        worktree_id: Option<Uuid>,
+        tmux: Option<InstanceTmux>,
+        worktree_cleanup: muxel_core::WorktreeCleanup,
         cx: &mut Context<Self>,
     ) {
         let is_remote = self
@@ -14750,36 +15605,39 @@ impl MuxelApp {
                     .map(|h| h.effective(&self.identities))
             })
             .filter(|host| !host.os.is_windows());
-        match remote_host {
+        match (tmux, remote_host) {
             // The same name the pane was launched with — a recomputed one would
             // leave the session it was actually running alive on the host forever.
             // A pane that never had a session confirms as already gone, so aiming
             // at one costs a single round trip and nothing else.
-            Some(host) => {
-                let session = recorded_session.unwrap_or_else(|| {
-                    SessionTarget::new(muxel_core::tmux::session_name(&host.name, iid), None)
-                });
+            (Some(tmux), Some(host)) => {
+                let session = tmux.on_host(&host.name);
                 self.reap_remote_session(project_id, iid, host, session, cx);
             }
             // A remote instance's session lives on the host, not here; killing the
             // recorded name locally would be a no-op at best.
-            None if !is_remote => {
-                if let Some(session) = recorded_session {
-                    integrations::kill_tmux_session(&session);
+            (Some(tmux), None) if !is_remote => {
+                if let Some(session) = tmux.recorded_session {
+                    integrations::kill_tmux_session(&SessionTarget::new(session, tmux.socket));
                 }
             }
-            None => {}
+            _ => {}
         }
         // Worktree disposed only when its last instance is gone.
         let root = self
             .workspace
             .project(project_id)
             .map(|p| p.root_path.clone());
-        if let Some(wid) = worktree_id {
-            self.dispose_worktree_if_orphaned(wid, cx);
-        } else if let (Some(path), Some(root)) = (worktree_path, root) {
-            // Legacy instance (no worktree_id): old direct-removal behavior.
-            integrations::remove_worktree(&root, &path);
+        match worktree_cleanup {
+            muxel_core::WorktreeCleanup::Registered(wid) => {
+                self.dispose_worktree_if_orphaned(wid, cx)
+            }
+            muxel_core::WorktreeCleanup::Legacy(path) => {
+                if let Some(root) = root {
+                    integrations::remove_worktree(&root, &path);
+                }
+            }
+            muxel_core::WorktreeCleanup::None => {}
         }
     }
 
@@ -14949,7 +15807,7 @@ impl MuxelApp {
         if !reaped.iter().any(|c| c.instance == iid) {
             reaped.push(muxel_core::tmux::ClosedSession {
                 name: session.name.clone(),
-                socket: session.socket,
+                socket: session.socket.clone(),
                 instance: iid,
             });
         }
@@ -14983,11 +15841,10 @@ impl MuxelApp {
     /// Connect-time half of [`Self::reap_remote_session`]: reconcile a project's
     /// remembered closes against what is actually running on its host.
     ///
-    /// The host's session list is the authority muxel lacked at close time. A close
-    /// with nothing left running is finished, whatever became of its kill. One with a
-    /// session still there gets another kill — aimed at the name the session actually
-    /// has, which a derived name may no longer match (a renamed host, a session a
-    /// peer created under its own slug).
+    /// A complete inventory can finish a close only on servers it actually
+    /// queried. Recorded named owners are retried directly because discovery
+    /// lists only this profile's servers. A listed live session gets another kill
+    /// under its actual name, which may have drifted since launch.
     ///
     /// A close confirmed earlier this run is checked again too: the list may predate
     /// its kill (then this kill just confirms it), or its session may have come back.
@@ -14999,6 +15856,7 @@ impl MuxelApp {
         sessions: &[muxel_core::tmux::RemoteSession],
         cx: &mut Context<Self>,
     ) {
+        let sockets = integrations::local_tmux_sockets();
         let pending: Vec<(Uuid, SessionTarget, Option<SessionTarget>)> = self
             .closed_sessions_of(pid)
             .iter()
@@ -15007,7 +15865,7 @@ impl MuxelApp {
                 (
                     c.instance,
                     c.target(),
-                    muxel_core::tmux::live_closed_session(sessions, &c).map(|s| s.target()),
+                    c.retry_after_inventory(sessions, &sockets),
                 )
             })
             .collect();
@@ -15088,26 +15946,13 @@ impl MuxelApp {
         self.browsers.remove(&iid);
 
         // Tear down tmux (local or remote) + worktree (capture info before drop).
-        let info = self.workspace.instance(iid).map(|i| {
-            (
-                i.tmux_session
-                    .as_ref()
-                    .map(|name| SessionTarget::new(name.clone(), i.tmux_socket)),
-                i.worktree_path.clone(),
-                i.worktree_id,
-                i.project_id,
-            )
-        });
+        let info = self
+            .workspace
+            .instance(iid)
+            .map(|i| (InstanceTmux::capture(i), i.worktree_cleanup(), i.project_id));
         self.workspace.remove_instance_meta(iid);
-        if let Some((local_session, worktree_path, worktree_id, project_id)) = info {
-            self.teardown_closed_instance(
-                iid,
-                project_id,
-                local_session,
-                worktree_path,
-                worktree_id,
-                cx,
-            );
+        if let Some((tmux, worktree_cleanup, project_id)) = info {
+            self.teardown_closed_instance(iid, project_id, tmux, worktree_cleanup, cx);
         }
         self.last_status.remove(&iid);
         self.failed_launches.remove(&iid);
@@ -15667,7 +16512,9 @@ impl MuxelApp {
     /// snapping back to where it was created.
     fn push_remote_layout_now(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         enum Pushed {
-            Written,
+            /// The layout written (its content key), and the panes whose move off
+            /// Default it kept from the file (`muxel_core::keep_moves_off_default`).
+            Written(String, Vec<(Uuid, String)>),
             /// The file holds a peer's newer layout (its JSON), left in place.
             PeerAhead(String),
         }
@@ -15689,42 +16536,46 @@ impl MuxelApp {
         };
         let name = proj.name.clone();
         let local_rev = proj.layout_updated_at.unwrap_or(0);
-        let doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
+        let mut doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
         let key = doc.content_key();
         let synced = self.layout_synced_keys.get(&pid).cloned();
         // The file already holds this layout, as far as this machine knows.
         if synced.as_deref() == Some(key.as_str()) {
             return;
         }
-        let root = doc.remote_root.clone();
-        let json = doc.to_json();
-        let local_key = key.clone();
         self.remote_push_inflight.insert(pid);
         *self.layout_push_epoch.entry(pid).or_default() += 1;
         cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
+                    let mut moved = Vec::new();
                     if let Some(current) = integrations::fetch_remote_layout(&loc)
-                        && let Some(file) = RemoteLayout::parse(&current, &root)
-                        && muxel_core::push_overwrites_peer(
+                        && let Some(file) = RemoteLayout::parse(&current, &doc.remote_root)
+                    {
+                        if muxel_core::push_overwrites_peer(
                             &file,
                             synced.as_deref(),
-                            &local_key,
+                            &key,
                             local_rev,
-                        )
-                    {
-                        return Ok(Pushed::PeerAhead(current));
+                        ) {
+                            return Ok(Pushed::PeerAhead(current));
+                        }
+                        // Overwriting the file must not move a pane back onto Default.
+                        moved =
+                            muxel_core::keep_moves_off_default(&mut doc.instances, &file.instances);
                     }
-                    integrations::push_remote_layout(&loc, &json).map(|()| Pushed::Written)
+                    integrations::push_remote_layout(&loc, &doc.to_json())
+                        .map(|()| Pushed::Written(doc.content_key(), moved))
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.remote_push_inflight.remove(&pid);
                 match res {
-                    Ok(Pushed::Written) => {
+                    Ok(Pushed::Written(key, moved)) => {
                         this.layout_synced_keys.insert(pid, key);
                         this.layout_push_failing.remove(&pid);
+                        this.take_moves_off_default(pid, &moved, window, cx);
                     }
                     Ok(Pushed::PeerAhead(current)) => {
                         this.poll_peer_layout(pid, &current, window, cx);
@@ -15758,6 +16609,45 @@ impl MuxelApp {
             });
         })
         .detach();
+    }
+
+    /// After a push kept a peer's move off Default that this machine's layout
+    /// predated (`moved`, by pane and session name): make the same move here, so
+    /// this machine attaches to that session on `mxl` too, and retry a pane that
+    /// failed waiting for it.
+    fn take_moves_off_default(
+        &mut self,
+        pid: Uuid,
+        moved: &[(Uuid, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if moved.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for (iid, name) in moved {
+            let iid = *iid;
+            let Some(instance) = self.workspace.instance_mut(iid) else {
+                continue;
+            };
+            if instance.project_id != pid
+                || instance.literal_argv
+                || instance.tmux_socket != Some(Socket::Default)
+                || instance.tmux_session.as_ref() != Some(name)
+            {
+                continue;
+            }
+            instance.tmux_socket = Some(Socket::Private);
+            self.bump_session_binding_generation(iid);
+            self.failed_launches.remove(&iid);
+            changed = true;
+        }
+        if changed {
+            self.persist();
+            self.spawn_project_terminals_now(pid, window, cx);
+            cx.notify();
+        }
     }
 
     /// Decide the connect-time sync direction for a remote project and apply it:
@@ -15894,6 +16784,7 @@ impl MuxelApp {
         // its own; a structural pull must not replace it with the peer's.
         let mut instances = muxel_core::merge_peer_instances(&local.instances, instances, pid);
         self.bind_peer_sessions(pid, &mut instances);
+        self.retry_rebound_launches(&local.instances, &instances);
         for wt in &mut worktrees {
             wt.project_id = pid;
         }
@@ -17793,27 +18684,14 @@ impl MuxelApp {
             view.read(cx).session().kill();
         }
         // Tear down tmux (local or remote) + worktree, then drop the orphan meta.
-        let info = self.workspace.instance(iid).map(|i| {
-            (
-                i.tmux_session
-                    .as_ref()
-                    .map(|name| SessionTarget::new(name.clone(), i.tmux_socket)),
-                i.worktree_path.clone(),
-                i.worktree_id,
-                i.project_id,
-            )
-        });
+        let info = self
+            .workspace
+            .instance(iid)
+            .map(|i| (InstanceTmux::capture(i), i.worktree_cleanup(), i.project_id));
         self.workspace.remove_instance_meta(iid);
-        if let Some((local_session, worktree_path, worktree_id, project_id)) = info {
+        if let Some((tmux, worktree_cleanup, project_id)) = info {
             // Popout window closed deliberately → kill the remote session too.
-            self.teardown_closed_instance(
-                iid,
-                project_id,
-                local_session,
-                worktree_path,
-                worktree_id,
-                cx,
-            );
+            self.teardown_closed_instance(iid, project_id, tmux, worktree_cleanup, cx);
         }
         self.last_status.remove(&iid);
         self.persist();
@@ -18327,7 +19205,7 @@ impl MuxelApp {
         };
         // Editors, diffs and browsers have no process (respawning would put a
         // shell over them).
-        if inst.kind != InstanceKind::Terminal {
+        if !inst.permits_launch(muxel_core::TerminalLaunchReason::Restart) {
             return;
         }
         let Some(restart) = self.terminal_restarts.begin(inst) else {
@@ -18337,7 +19215,7 @@ impl MuxelApp {
         let recorded_session = inst
             .tmux_session
             .as_ref()
-            .map(|name| SessionTarget::new(name.clone(), inst.tmux_socket));
+            .map(|name| SessionTarget::new(name.clone(), inst.tmux_socket.clone()));
         muxel_store::append_event_log(&format!("restart: \"{}\" [{iid}]", inst.display_name()));
         self.redock_for_restart(iid, cx);
         self.terminal_launching.remove(&iid);
@@ -18353,16 +19231,38 @@ impl MuxelApp {
             .remote_host_for_instance(iid)
             .filter(|host| !host.os.is_windows());
         let Some(host) = remote_host else {
-            if let Some(mut session) = recorded_session {
-                session.socket = Some(integrations::local_tmux_socket(&session));
-                if let Some(instance) = self.workspace.instance_mut(iid) {
-                    instance.tmux_socket = session.socket;
+            let restarted = (|| -> anyhow::Result<()> {
+                if let Some(session) = recorded_session {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let (session, next) =
+                        integrations::restart_local_tmux(&session, deadline, |owner| {
+                            let closed = muxel_core::tmux::ClosedSession {
+                                name: owner.name.clone(),
+                                socket: owner.socket.clone(),
+                                instance: iid,
+                            };
+                            if self.terminal_restarts.record_owner(
+                                &mut self.workspace,
+                                iid,
+                                restart,
+                                &closed,
+                            ) && self.try_persist()
+                            {
+                                Ok(())
+                            } else {
+                                anyhow::bail!("couldn't save the tmux session owner before restart")
+                            }
+                        })?;
+                    self.save_restart_migration(iid, restart, &session, &next)?;
                 }
-                if self.try_persist() {
-                    integrations::kill_tmux_session(&session);
-                }
-            }
+                Ok(())
+            })();
             self.terminal_restarts.finish(iid, restart);
+            if let Err(error) = restarted {
+                self.fail_restart(iid, t("Couldn't restart"), &format!("{error:#}"));
+                cx.notify();
+                return;
+            }
             self.spawn_terminal(iid, window, cx);
             self.focus_instance(iid, window, cx);
             cx.notify();
@@ -18418,16 +19318,38 @@ impl MuxelApp {
                         })
                         .unwrap_or(false);
                     if saved {
-                        cx.background_executor()
+                        let expected = closed.target();
+                        let pending = expected.clone();
+                        let prepared = cx
+                            .background_executor()
                             .spawn(async move {
-                                integrations::kill_remote_tmux(
-                                    &host,
-                                    &control_path,
-                                    password.as_deref(),
-                                    &closed.target(),
+                                let loc = integrations::RepoLoc::remote(
+                                    host,
+                                    String::new(),
+                                    control_path,
+                                    password,
+                                );
+                                integrations::restart_remote_tmux(
+                                    &loc,
+                                    &pending,
+                                    iid,
+                                    Instant::now() + Duration::from_secs(10),
                                 )
                             })
-                            .await
+                            .await;
+                        match prepared {
+                            Ok(next) => this
+                                .update(cx, |this, _| {
+                                    if this.current_workspace != workspace {
+                                        anyhow::bail!("workspace changed during restart");
+                                    }
+                                    this.save_restart_migration(iid, restart, &expected, &next)
+                                })
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!("restart owner is no longer available"))
+                                }),
+                            Err(error) => Err(error),
+                        }
                     } else {
                         Err(anyhow::anyhow!(
                             "couldn't save the tmux session owner before restart"
@@ -18455,6 +19377,49 @@ impl MuxelApp {
         cx.notify();
     }
 
+    fn fail_restart(&mut self, iid: Uuid, title: impl Into<String>, error: &str) {
+        let message = tf("The pane was not restarted: {err}", &[("err", error)]);
+        self.failed_launches.insert(iid, message.clone());
+        self.add_event(NotifKind::Error, title, message);
+    }
+
+    fn save_restart_migration(
+        &mut self,
+        iid: Uuid,
+        token: Uuid,
+        expected: &SessionTarget,
+        next: &SessionTarget,
+    ) -> anyhow::Result<()> {
+        let current = self.workspace.instance(iid).and_then(|instance| {
+            instance
+                .tmux_session
+                .as_ref()
+                .map(|name| SessionTarget::new(name.clone(), instance.tmux_socket.clone()))
+        });
+        if !self.terminal_restarts.current(iid, token) || current.as_ref() != Some(expected) {
+            anyhow::bail!("the pane's tmux owner changed during restart");
+        }
+        if next != expected {
+            if !self.terminal_restarts.migrate_default(
+                &mut self.workspace,
+                iid,
+                token,
+                expected,
+                next,
+            ) {
+                anyhow::bail!("the pane's tmux owner changed during migration");
+            }
+            if !self.try_persist() {
+                self.workspace
+                    .instance_mut(iid)
+                    .expect("restarting pane present")
+                    .tmux_socket = expected.socket.clone();
+                anyhow::bail!("couldn't save the new tmux owner before restart");
+            }
+        }
+        Ok(())
+    }
+
     /// Finish in the window owning the project now, including a project redocked
     /// while SSH was pending. An old window never owns completion admission.
     fn complete_remote_restart(
@@ -18471,6 +19436,10 @@ impl MuxelApp {
             session: label,
             killed,
         } = completion;
+        let failure = killed
+            .as_ref()
+            .err()
+            .map(|error| format!("{label}: {error:#}"));
         let completed = Self::in_project_or_main(this, Some(project), cx, |this, window, cx| {
             if this.current_workspace != workspace
                 || !this.terminal_restarts.finish(iid, restart)
@@ -18478,21 +19447,17 @@ impl MuxelApp {
             {
                 return; // closed while the kill was in flight
             }
-            // Say so rather than letting it pass as a restart: the respawn below
-            // is `new-session -A`, so a session that survived is *reattached* —
-            // the same agent, looking like a restart that did nothing.
             if let Err(e) = killed {
-                this.add_event(
-                    NotifKind::Error,
+                this.fail_restart(
+                    iid,
                     tf(
                         "Couldn't restart on “{host}”",
                         &[("host", &host_name.to_string())],
                     ),
-                    tf(
-                        "{session} is still running, so the pane reattached to it: {err}",
-                        &[("session", &label), ("err", &format!("{e}"))],
-                    ),
+                    &format!("{label}: {e:#}"),
                 );
+                cx.notify();
+                return;
             }
             // A project restore may have reattached the old session meanwhile.
             this.redock_for_restart(iid, cx);
@@ -18510,10 +19475,15 @@ impl MuxelApp {
             // restart held admission. Release only this generation and retry in
             // whichever window now shows the project.
             let project = this
-                .update(cx, |this, _| {
+                .update(cx, |this, cx| {
                     if this.current_workspace != workspace
                         || !this.terminal_restarts.finish(iid, restart)
                     {
+                        return None;
+                    }
+                    if let Some(error) = &failure {
+                        this.fail_restart(iid, t("Couldn't restart"), error);
+                        cx.notify();
                         return None;
                     }
                     this.workspace
@@ -18537,6 +19507,9 @@ impl MuxelApp {
         inst.id = Uuid::new_v4();
         inst.tmux_session = None;
         inst.tmux_socket = None;
+        if inst.literal_argv {
+            inst.use_tmux = false;
+        }
         inst.pinned = false; // a duplicate starts unpinned
         // A pane owns one resumable conversation. Reusing the source session id
         // lets two live Claudes create branches in one transcript; after restart
@@ -18554,7 +19527,8 @@ impl MuxelApp {
             inst.tmux_session = Some(muxel_core::tmux::session_name(&project_name, inst.id));
             inst.tmux_socket = Some(integrations::profile_tmux_socket());
         }
-        if inst.tmux_session.is_none()
+        if !inst.literal_argv
+            && inst.tmux_session.is_none()
             && let Some(host) = self
                 .remote_host_for_project(pid)
                 .filter(|host| host.use_tmux(inst.use_tmux))
@@ -19331,8 +20305,7 @@ impl MuxelApp {
         let local = project.remote.is_none();
         let transcript = if local && is_claude_program(inst.program.as_deref()) {
             let cwd = inst
-                .worktree_path
-                .as_deref()
+                .working_directory()
                 .unwrap_or(project.root_path.as_path());
             home_dir()
                 .zip(inst.session_id.as_deref())
@@ -19513,7 +20486,7 @@ impl MuxelApp {
         cx: &mut Context<Self>,
     ) -> bool {
         // A pane whose launch is still in flight is starting, not dead.
-        if self.workspace.instance(iid).map(|i| i.kind) != Some(InstanceKind::Terminal)
+        if !self.launch_permitted(iid, muxel_core::TerminalLaunchReason::EnsureRunning)
             || !needs_immediate_spawn(
                 self.is_running(iid, cx),
                 self.terminal_launching.contains_key(&iid),
@@ -19555,8 +20528,7 @@ impl MuxelApp {
                 p.instances()
                     .into_iter()
                     .filter(|iid| {
-                        self.workspace.instance(*iid).map(|i| i.kind)
-                            == Some(InstanceKind::Terminal)
+                        self.launch_permitted(*iid, muxel_core::TerminalLaunchReason::Wake)
                     })
                     .map(|iid| (p.id, iid))
                     .collect::<Vec<_>>()
@@ -20592,15 +21564,14 @@ impl MuxelApp {
             return;
         };
         let mut instance = Instance::from_preset(pid, &AgentPreset::shell());
-        // command_for uses worktree_path as the cwd (no worktree_id = plain cwd).
-        instance.worktree_path = Some(dir);
+        instance.launch_dir = Some(dir);
         let target = self.active_instance;
         self.place_and_spawn(
             pid,
             instance,
             PlacementMode::Split(SplitDirection::Horizontal),
             target,
-            None,
+            Some(WorktreeChoice::None),
             window,
             cx,
         );
@@ -21062,6 +22033,52 @@ impl MuxelApp {
             .into_any_element()
     }
 
+    fn run_literal_again(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.workspace.instance(iid).is_some_and(|i| i.literal_argv)
+            || !self.launch_permitted(iid, muxel_core::TerminalLaunchReason::RunAgain)
+            || self.is_running(iid, cx)
+            || self.terminal_launching.contains_key(&iid)
+        {
+            return;
+        }
+        if let Some(view) = self.terminals.remove(&iid) {
+            view.read(cx).session().kill();
+        }
+        self.failed_launches.remove(&iid);
+        self.spawn_terminal_deferred(iid, muxel_core::TerminalLaunchReason::RunAgain, window, cx);
+        self.focus_instance(iid, window, cx);
+        cx.notify();
+    }
+
+    fn literal_stopped(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .child(t("Command stopped"))
+            .children(self.failed_launches.get(&iid).map(|err| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(err.clone())
+            }))
+            .child(
+                Button::new(format!("run-again-{iid}"))
+                    .label(t("Run again"))
+                    .disabled(
+                        !self.launch_permitted(iid, muxel_core::TerminalLaunchReason::RunAgain),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_literal_again(iid, window, cx)
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn terminal_starting(&self, iid: Uuid, cx: &mut Context<Self>) -> AnyElement {
         // gpui-component defaults to ease-in-out, which visibly accelerates and
         // decelerates every 800 ms. Terminal startup wants a steady activity cue.
@@ -21165,6 +22182,24 @@ impl MuxelApp {
                         } else {
                             t("Restart to relaunch")
                         };
+                        let action = if self.workspace.instance(iid).is_some_and(|i| i.literal_argv)
+                        {
+                            Button::new(format!("run-again-{iid}"))
+                                .label(t("Run again"))
+                                .disabled(!self.launch_permitted(
+                                    iid,
+                                    muxel_core::TerminalLaunchReason::RunAgain,
+                                ))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.run_literal_again(iid, window, cx)
+                                }))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(hint)
+                                .into_any_element()
+                        };
                         div()
                             .size_full()
                             .flex()
@@ -21186,9 +22221,7 @@ impl MuxelApp {
                                     .bg(bg)
                                     .text_color(fg)
                                     .child(label)
-                                    .child(
-                                        div().text_color(cx.theme().muted_foreground).child(hint),
-                                    ),
+                                    .child(action),
                             )
                             .into_any_element()
                     } else if !v.has_visible_content() {
@@ -21224,6 +22257,10 @@ impl MuxelApp {
                         )
                         .child(bv.clone())
                         .into_any_element()
+                } else if self.workspace.instance(iid).is_some_and(|i| i.literal_argv)
+                    && !self.terminal_launching.contains_key(&iid)
+                {
+                    self.literal_stopped(iid, cx)
                 } else if let Some(err) = self.failed_launches.get(&iid) {
                     // The launch failed completely (fallback shell included):
                     // show the error in place; the toolbar Restart retries.
@@ -24062,6 +25099,12 @@ impl MuxelApp {
                         .map(|i| i.display_name().to_string())
                         .unwrap_or_default();
                     let loading = self.terminal_is_loading(iid, cx);
+                    let stopped = inst.is_some_and(|instance| {
+                        instance.is_stopped_literal(
+                            self.terminals.contains_key(&iid),
+                            self.terminal_launching.contains_key(&iid),
+                        )
+                    });
                     let (app_title, status) = if let Some(view) = self.terminals.get(&iid) {
                         let view = view.read(cx);
                         // Shells show their cwd: strip the `user@host:` OSC prefix.
@@ -24184,6 +25227,8 @@ impl MuxelApp {
                             )
                             .child(div().flex_none().child(if loading {
                                 status_tag(AgentStatus::Working, t("loading").to_string())
+                            } else if stopped {
+                                status_tag(AgentStatus::Idle, t("stopped").to_string())
                             } else {
                                 status_tag(
                                     status,
@@ -31783,6 +32828,7 @@ impl Render for MuxelApp {
                 (self.auto_message_popup.is_some() && self.auto_message_window_pid().is_none())
                     .then(|| self.render_auto_message_popup(cx)),
             )
+            .children(self.render_control_approval(cx))
             // Fullscreen with the sidebar hidden: a floating left-edge pill
             // brings it back without leaving fullscreen (F11's escape hatch).
             .children((window.is_fullscreen() && sidebar_hidden).then(|| {
@@ -31969,7 +33015,7 @@ mod grok_session_tests {
 #[cfg(test)]
 mod shell_title_tests {
     use super::{
-        agent_minted_session_gone, authoritative_terminal_auto_title, codex_session_auto_title,
+        authoritative_terminal_auto_title, codex_session_auto_title, is_codex_program,
         session_id_bound_elsewhere, shell_dir_title, terminal_auto_title,
         unowned_captured_session_id, validated_codex_session_id,
     };
@@ -32101,14 +33147,14 @@ mod shell_title_tests {
 
     #[test]
     fn codex_session_binding_resolves_provider_hint_and_rejects_owned_rollout() {
-        let first = Uuid::new_v4().to_string();
-        let later = Uuid::new_v4().to_string();
+        let first = "01a1543c-9700-7000-8000-000000000001".to_string();
+        let later = "01a1543c-9701-7000-8000-000000000002".to_string();
         let preset = AgentPreset::codex();
         let initial_frame = format!("{}... | Ready", &first[..29]);
         let later_frame = format!("{}... | Ready", &later[..29]);
         let home = std::env::temp_dir().join(format!("muxel-codex-binding-{}", Uuid::new_v4()));
         let cwd = home.join("project");
-        let sessions = home.join(".codex/sessions/2026/08/23");
+        let sessions = home.join(".codex/sessions/2026/10/19");
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         for id in [&first, &later] {
@@ -32125,7 +33171,8 @@ mod shell_title_tests {
 
         assert_eq!(
             validated_codex_session_id(&preset, None, Some(&initial_frame), &home, &cwd, None,)
-                .as_deref(),
+                .as_ref()
+                .map(|session| session.id.as_str()),
             Some(first.as_str())
         );
         assert_eq!(
@@ -32148,7 +33195,8 @@ mod shell_title_tests {
                 &cwd,
                 None,
             )
-            .as_deref(),
+            .as_ref()
+            .map(|session| session.id.as_str()),
             Some(later.as_str())
         );
         assert_eq!(
@@ -32167,7 +33215,7 @@ mod shell_title_tests {
             program: Some("codex-title-proxy.exe".to_string()),
             ..preset
         };
-        assert!(!agent_minted_session_gone(&proxy, &first));
+        assert!(!is_codex_program(proxy.program.as_deref()));
 
         let owner = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
         let mut sibling = Instance::from_preset(owner.project_id, &AgentPreset::claude());
@@ -32221,8 +33269,50 @@ mod restore_wave_policy_tests {
     fn launches(tokens: &[(Uuid, u64)], since: Instant) -> HashMap<Uuid, LaunchTicket> {
         tokens
             .iter()
-            .map(|&(iid, token)| (iid, LaunchTicket { token, since }))
+            .map(|&(iid, token)| {
+                (
+                    iid,
+                    LaunchTicket {
+                        token,
+                        since,
+                        startup: None,
+                    },
+                )
+            })
             .collect()
+    }
+
+    #[test]
+    fn control_new_reservation_owns_startup_through_worker_and_rejects_stale_release() {
+        use muxel_core::control::{StartupTurn, StartupTurnState};
+        let iid = Uuid::new_v4();
+        let old = StartupTurn::default();
+        let mut tickets = HashMap::from([(
+            iid,
+            LaunchTicket {
+                token: 1,
+                since: Instant::now(),
+                startup: old.claim(),
+            },
+        )]);
+        let command = tickets[&iid].startup.clone();
+        assert!(release_launch_token(&mut tickets, iid, 1));
+        assert_eq!(old.state(), StartupTurnState::Pending);
+        drop(command); // stale/unlanded worker result
+        assert_eq!(old.state(), StartupTurnState::Cancelled);
+        let current = StartupTurn::default();
+        tickets.insert(
+            iid,
+            LaunchTicket {
+                token: 2,
+                since: Instant::now(),
+                startup: current.claim(),
+            },
+        );
+        assert!(!release_launch_token(&mut tickets, iid, 1));
+        assert_eq!(current.state(), StartupTurnState::Pending);
+        tickets.clear(); // abandoned before command preparation
+        assert_eq!(current.state(), StartupTurnState::Cancelled);
     }
 
     fn startup(
@@ -32552,6 +33642,7 @@ mod restore_wave_policy_tests {
             LaunchTicket {
                 token: 8,
                 since: deadline,
+                startup: None,
             },
         );
         assert!(!launch_token_current(&launching, a, 7));

@@ -34,12 +34,14 @@ pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
-    ACCOMPLISHMENTS_FILE, AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind,
-    ResolvedLaunch, accomplishments_header, accomplishments_instruction, append_agent_instruction,
+    ACCOMPLISHMENTS_FILE, AgentPreset, CodexHintMiss, CodexResumePath, CodexSession,
+    CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
+    accomplishments_header, accomplishments_instruction, append_agent_instruction,
     claude_session_cwd, claude_session_path, codex_developer_instructions_override,
-    codex_latest_session_id, codex_session_exists, codex_session_hint_from_title,
-    codex_session_id_from_hint, codex_session_matches_cwd, codex_session_names,
-    codex_terminal_title_override, file_link_instruction, find_claude_session_path, memory_header,
+    codex_latest_session_id, codex_latest_sessions, codex_resume_path, codex_rollout_by_walk,
+    codex_session_from_hint, codex_session_hint_from_title, codex_session_id_from_hint,
+    codex_session_names, codex_terminal_title_override, file_link_instruction,
+    find_claude_session_path, is_known_agent_program, launches_known_agent, memory_header,
     memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
     resolve_launch_for_session, session_resume_args,
 };
@@ -504,12 +506,19 @@ pub struct Instance {
     pub program: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Run the saved argv unchanged, without preset injection or session rewriting.
+    #[serde(default)]
+    pub literal_argv: bool,
     /// Optional system prompt delivered to the agent on startup.
     #[serde(default)]
     pub system_prompt: Option<String>,
     /// How the system prompt is delivered.
     #[serde(default)]
     pub injection: InjectionMode,
+    /// Frozen separate transport for automatic instructions on a ctl task.
+    /// Older task records omit this and receive no extra typed instructions.
+    #[serde(default)]
+    pub instruction_injection: Option<InjectionMode>,
     /// Name of the preset this instance was created from (for display).
     #[serde(default)]
     pub preset: String,
@@ -531,8 +540,9 @@ pub struct Instance {
     /// tmux session name, once created.
     #[serde(default)]
     pub tmux_session: Option<String>,
-    /// The server that owns the session. Absent only for older saved panes.
-    #[serde(default)]
+    /// The server that owns the session. Absent only for older saved panes (or
+    /// one recorded under a name tmux can't use, see [`tmux::recorded_socket`]).
+    #[serde(default, deserialize_with = "tmux::recorded_socket")]
     pub tmux_socket: Option<tmux::Socket>,
     /// The grid `(cols, rows)` this pane last rendered at, so it can respawn at the
     /// size it will actually be laid out at instead of the 80×24 default.
@@ -544,7 +554,10 @@ pub struct Instance {
     /// size means nothing has to resize at all.
     #[serde(default)]
     pub grid: Option<(u16, u16)>,
-    /// Worktree directory, once created (becomes this instance's working dir).
+    /// Launch directory supplied by the caller; never owned or removed by muxel.
+    #[serde(default)]
+    pub launch_dir: Option<PathBuf>,
+    /// Owned worktree directory (including legacy worktrees before migration).
     #[serde(default)]
     pub worktree_path: Option<std::path::PathBuf>,
     /// Branch checked out in the worktree.
@@ -561,6 +574,16 @@ pub struct Instance {
     /// Created by a runner (one-off task launcher).
     #[serde(default)]
     pub is_runner: bool,
+    /// A task supplied by `ctl new --prompt`. Erase its text after building the
+    /// first launch plan so a non-resuming relaunch cannot re-type the old task.
+    /// `instruction_injection` keeps the preset's separate rules transport;
+    /// `injection` remains TypeIn for the exact typed user task.
+    #[serde(default)]
+    pub control_prompt: bool,
+    /// Outside creation must never substitute an unapproved fallback shell.
+    /// Retain the launch policy across restore and restart.
+    #[serde(default)]
+    pub control_created: bool,
     /// Press Enter to submit after typing the startup prompt. New instances set
     /// this true; a runner clears it after its first launch so reopening the app
     /// re-types the prompt but does NOT auto-submit it (defaults false for
@@ -579,13 +602,90 @@ pub struct Instance {
     /// on restart. `None` until first launch / for agents without resume support.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Validated provider transcript/rollout path for the saved session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_path: Option<PathBuf>,
     /// Whether this instance's session has been launched at least once, so a
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
     pub session_started: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalLaunchReason {
+    NewPane,
+    RunAgain,
+    Restore,
+    ProjectSelection,
+    Restart,
+    Wake,
+    EnsureRunning,
+    Recovery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorktreeCleanup {
+    None,
+    Registered(Uuid),
+    Legacy(PathBuf),
+}
+
 impl Instance {
+    /// Called after the launch plan has captured its startup input, before the
+    /// updated instance is persisted. Reusable runners keep their task text.
+    pub fn consume_runner_prompt(&mut self) -> bool {
+        if !self.is_runner {
+            return false;
+        }
+        let changed = self.auto_submit || (self.control_prompt && self.system_prompt.is_some());
+        self.auto_submit = false;
+        if self.control_prompt {
+            self.system_prompt = None;
+        }
+        changed
+    }
+
+    /// Literal commands may replay an opening brief, so only creation and the
+    /// explicit Run again action can start them. Recovery must leave them stopped.
+    pub fn permits_launch(&self, reason: TerminalLaunchReason) -> bool {
+        self.kind == InstanceKind::Terminal
+            && (!self.literal_argv
+                || matches!(
+                    reason,
+                    TerminalLaunchReason::NewPane | TerminalLaunchReason::RunAgain
+                ))
+    }
+
+    pub fn working_directory(&self) -> Option<&std::path::Path> {
+        self.launch_dir.as_deref().or(self.worktree_path.as_deref())
+    }
+
+    /// An unspawned saved literal command is stopped, rather than an idle agent.
+    /// Retained views keep their lifecycle badge, including done after exit.
+    /// Do not show stopped while a user-requested launch is in flight.
+    pub fn is_stopped_literal(&self, has_terminal_view: bool, launching: bool) -> bool {
+        self.literal_argv && self.kind == InstanceKind::Terminal && !has_terminal_view && !launching
+    }
+
+    /// Capture before removing instance metadata. Launch directories never enter
+    /// this plan, even when they happen to be git worktrees of the project repo.
+    pub fn worktree_cleanup(&self) -> WorktreeCleanup {
+        match (self.worktree_id, &self.worktree_path) {
+            (Some(id), _) => WorktreeCleanup::Registered(id),
+            (None, Some(path)) => WorktreeCleanup::Legacy(path.clone()),
+            _ => WorktreeCleanup::None,
+        }
+    }
+
+    pub fn needs_peer_session(&self) -> bool {
+        self.kind == InstanceKind::Terminal
+            && !self.literal_argv
+            && self
+                .tmux_session
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+    }
+
     /// Display label precedence. Empty persisted values do not mask the next
     /// useful source.
     pub fn display_name(&self) -> &str {
@@ -616,8 +716,16 @@ impl Instance {
     /// A duplicated pane copies launch settings, not the source conversation.
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
+        self.session_path = None;
         self.session_started = false;
         self.auto_name = None;
+        // Duplication is a new local UI action, not the outside launch approval.
+        self.control_created = false;
+        // An unconsumed `ctl new --prompt` task belongs to the request that was
+        // approved, never to a copy of its pane.
+        if self.control_prompt {
+            self.system_prompt = None;
+        }
     }
 
     /// A plain shell instance.
@@ -628,7 +736,7 @@ impl Instance {
     pub fn tmux_target(&self, slug: &str) -> tmux::SessionTarget {
         tmux::SessionTarget::new(
             tmux::session_for(self.tmux_session.as_deref(), slug, self.id),
-            self.tmux_socket,
+            self.tmux_socket.clone(),
         )
     }
 
@@ -645,6 +753,7 @@ impl Instance {
             auto_name: None,
             program: preset.program.clone(),
             args: preset.compose_args(),
+            literal_argv: false,
             system_prompt: preset.system_prompt.clone(),
             injection: preset.injection.clone(),
             preset: preset.name.clone(),
@@ -656,17 +765,22 @@ impl Instance {
             tmux_session: None,
             tmux_socket: None,
             grid: None,
+            launch_dir: None,
             worktree_path: None,
             worktree_branch: None,
             auto_mode_presses: 0,
             auto_continue_message: None,
             is_runner: false,
+            control_prompt: false,
+            instruction_injection: None,
+            control_created: false,
             // New instances submit their startup prompt; persisted ones default
             // to false (so restored runners re-type without auto-submitting).
             auto_submit: true,
             pinned: false,
             worktree_id: None,
             session_id: None,
+            session_path: None,
             session_started: false,
         }
     }
@@ -709,6 +823,7 @@ impl Instance {
             auto_name: None,
             program: None,
             args: Vec::new(),
+            literal_argv: false,
             system_prompt: None,
             injection: InjectionMode::default(),
             preset: String::new(),
@@ -720,15 +835,20 @@ impl Instance {
             tmux_session: None,
             tmux_socket: None,
             grid: None,
+            launch_dir: None,
             worktree_path: None,
             worktree_branch: None,
             auto_mode_presses: 0,
             auto_continue_message: None,
             is_runner: false,
+            control_prompt: false,
+            instruction_injection: None,
             auto_submit: false,
+            control_created: false,
             pinned: false,
             worktree_id: None,
             session_id: None,
+            session_path: None,
             session_started: false,
         }
     }
@@ -1412,6 +1532,7 @@ impl RemoteLayout {
                     instance.tmux_session = None;
                     instance.tmux_socket = None;
                     instance.session_id = None;
+                    instance.session_path = None;
                     instance.session_started = false;
                     instance.auto_submit = false;
                 }
@@ -1498,7 +1619,8 @@ pub fn push_overwrites_peer(
 /// lists (a pane it closed is simply absent), re-homed to `project_id`, and — for a
 /// pane this machine already has — keeping what this machine observed of it (its
 /// program-supplied title, terminal grid and agent activity), which is per-machine
-/// and never part of the shared content.
+/// and never part of the shared content. A validated rollout path survives a peer
+/// that predates `session_path` while the pane keeps the same conversation.
 pub fn merge_peer_instances(
     local: &[Instance],
     peer: Vec<Instance>,
@@ -1518,11 +1640,85 @@ pub fn merge_peer_instances(
                         || instance.tmux_session == mine.tmux_session)
                 {
                     instance.tmux_session = mine.tmux_session.clone();
-                    instance.tmux_socket = mine.tmux_socket;
+                    instance.tmux_socket = mine.tmux_socket.clone();
+                } else if moved_off_default(&instance, mine) {
+                    instance.tmux_socket = mine.tmux_socket.clone();
+                }
+                if instance.session_id.is_some() && instance.session_id == mine.session_id {
+                    instance.session_path =
+                        mine.session_path.clone().or(instance.session_path.take());
+                }
+                // Older peers drop the outside-creation launch policy too, which
+                // would turn a literal command back into a tmux-wrapped,
+                // auto-restored pane allowed a fallback shell. A missing value
+                // can't be told apart from a cleared one, but nothing clears
+                // these on an existing pane: they are set once at creation (a
+                // duplicate is a new id), so absent always means "not known here".
+                instance.literal_argv |= mine.literal_argv;
+                instance.control_created |= mine.control_created;
+                instance.control_prompt |= mine.control_prompt;
+                if instance.launch_dir.is_none() {
+                    instance.launch_dir = mine.launch_dir.clone();
+                }
+                if instance.instruction_injection.is_none() {
+                    instance.instruction_injection = mine.instruction_injection.clone();
                 }
             }
             instance
         })
+        .collect()
+}
+
+/// Whether `moved` has already taken `stale`'s session off the default tmux
+/// server: both name the same session, `stale` on Default and `moved` on muxel's
+/// own. No client creates a session on Default any more, so that move is one-way,
+/// and a copy of the pane that predates it (a peer's layout, or this machine's
+/// own unpushed one) must not undo it. Undone, the pane would refuse to launch
+/// (Default is gone and `mxl` has the namesake) and closing it would kill on
+/// Default, orphaning the agent on `mxl`. A literal pane runs no session, so
+/// its stale tmux fields never take part in a move.
+pub fn moved_off_default(stale: &Instance, moved: &Instance) -> bool {
+    !stale.literal_argv
+        && !moved.literal_argv
+        && stale.tmux_socket == Some(tmux::Socket::Default)
+        && moved.tmux_socket == Some(tmux::Socket::Private)
+        && stale.tmux_session.is_some()
+        && stale.tmux_session == moved.tmux_session
+}
+
+/// Before this machine's layout (`local`) overwrites the shared file: keep every
+/// Default→`mxl` move the file records that `local` doesn't have yet (see
+/// [`moved_off_default`]). Returns the panes it moved, with their session names,
+/// for this machine to make the same move.
+pub fn keep_moves_off_default(local: &mut [Instance], file: &[Instance]) -> Vec<(Uuid, String)> {
+    let mut moved = Vec::new();
+    for instance in local {
+        if let Some(theirs) = file.iter().find(|f| f.id == instance.id)
+            && moved_off_default(instance, theirs)
+            && let Some(name) = instance.tmux_session.clone()
+        {
+            instance.tmux_socket = theirs.tmux_socket.clone();
+            moved.push((instance.id, name));
+        }
+    }
+    moved
+}
+
+/// The panes in both `before` and `after` whose tmux binding (session name and
+/// owner) differs between them: after a peer layout is adopted, a pane that failed
+/// to launch on its old binding can try the new one. A literal pane has no tmux
+/// transport, so a peer's stale binding never retries it.
+pub fn rebound_instances(before: &[Instance], after: &[Instance]) -> Vec<Uuid> {
+    after
+        .iter()
+        .filter(|now| !now.literal_argv)
+        .filter(|now| {
+            before.iter().any(|was| {
+                was.id == now.id
+                    && (was.tmux_session != now.tmux_session || was.tmux_socket != now.tmux_socket)
+            })
+        })
+        .map(|now| now.id)
         .collect()
 }
 
@@ -1553,7 +1749,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
             .tmux_session
             .as_ref()
             .filter(|s| !s.is_empty())
-            .map(|s| (inst.project_id, inst.tmux_socket, s.clone()));
+            .map(|s| (inst.project_id, inst.tmux_socket.clone(), s.clone()));
         // A tmux session is claimed by exactly one instance per project.
         if claim.is_some_and(|c| !seen_sessions.insert(c)) {
             unlink.push(inst.id);
@@ -1882,24 +2078,110 @@ impl Runner {
         instance
     }
 
-    /// Built-in example runners.
+    /// Built-in example runners. They run in auto mode, so each prompt forbids
+    /// edits (Security Review fixes only the findings the user then picks), and
+    /// the scope covers staged, untracked and branch work (a worktree's agent may
+    /// already have committed it).
     pub fn defaults() -> Vec<Runner> {
         vec![
             Runner::new(
                 "Review",
-                "Review the current changes (git diff) for correctness, bugs, and \
-                 code quality. Call out specific issues with file:line references and \
-                 suggest concrete fixes.\n\n{{input}}",
+                "Review the current code changes for bugs and correctness problems. \
+                 This is a read-only review: don't edit, stage, or commit anything; \
+                 I'll decide what to fix.\n\
+                 \n\
+                 Scope: all uncommitted work (staged, unstaged, and new untracked \
+                 files). If the working tree is clean, review the commits on this \
+                 branch that aren't on its base branch (main, master, or its \
+                 upstream).\n\
+                 \n\
+                 How to review:\n\
+                 - Read the surrounding code, callers, and tests, not just the diff \
+                 hunks, so you judge each change in context.\n\
+                 - Look for logic errors, mishandled edge cases (empty, missing, \
+                 boundary, concurrent), errors that are swallowed or misreported, \
+                 resource leaks, behavior changes that break existing callers, and \
+                 new behavior with missing or wrong tests.\n\
+                 - Confirm each suspicion before reporting it; you may run the \
+                 existing tests or a quick read-only check. Drop anything you can't \
+                 back up.\n\
+                 - Skip style and formatting preferences.\n\
+                 \n\
+                 Report findings most severe first. For each: file:line, what's \
+                 wrong, a concrete scenario where it fails (input or state, then the \
+                 wrong result), and the fix you'd make. If nothing needs fixing, say \
+                 so plainly instead of padding the list. End with a one-line verdict: \
+                 ready to merge, or what must change first.\n\
+                 \n\
+                 Any notes I add below take priority over these defaults.\n\
+                 \n\
+                 {{input}}",
             ),
             Runner::new(
                 "Security Review",
-                "Perform a security review of the current changes (git diff). Look for \
-                 injection, auth/authorization gaps, unsafe input handling, leaked \
-                 secrets, and risky dependencies. Report findings with severity and \
-                 file:line.\n\n{{input}}",
+                "Do a security review of the current code changes. Don't edit, \
+                 stage, or commit anything until I've chosen what to fix, and don't \
+                 run exploits against live systems.\n\
+                 \n\
+                 Scope: all uncommitted work (staged, unstaged, and new untracked \
+                 files). If the working tree is clean, review the commits on this \
+                 branch that aren't on its base branch (main, master, or its \
+                 upstream).\n\
+                 \n\
+                 How to review:\n\
+                 - Work out where untrusted data enters (network requests, files, \
+                 command-line arguments, environment, IPC, user or third-party \
+                 content) and trace it through the changed code, reading callers \
+                 and helpers outside the diff as needed.\n\
+                 - Look for injection (shell, SQL, path traversal, templates, XSS), \
+                 missing or bypassable authentication and authorization, unsafe \
+                 deserialization, SSRF, secrets in code or logs, weak crypto or \
+                 randomness, unsafe file handling (permissions, symlinks, races), \
+                 memory-unsafe code, unbounded resource use, and new or upgraded \
+                 dependencies with known problems.\n\
+                 - Report only issues with a plausible attack path. A pre-existing \
+                 problem counts only if this change introduces, exposes, or \
+                 worsens it.\n\
+                 \n\
+                 Present your findings as a table ranked from highest to lowest \
+                 priority (severity first, then how likely the attack is), with the \
+                 columns #, Severity (Critical, High, Medium, Low, or Info for minor \
+                 hardening ideas), Issue, Location (file:line), and Recommendation \
+                 (fix now, fix later, or accept the risk). Under the table, give each \
+                 finding a short note by number: who the attacker is and what they \
+                 control, what they gain, and the fix. If you find nothing \
+                 exploitable, say so plainly; don't inflate severity to fill the \
+                 table.\n\
+                 \n\
+                 Then recommend which findings to fix (for example, \"I'd fix 1, 2 \
+                 and 4\"), ask me which ones you should fix, and stop until I answer. \
+                 Fix only the ones I pick, then run the relevant tests and summarize \
+                 what you changed.\n\
+                 \n\
+                 Any notes I add below take priority over these defaults.\n\
+                 \n\
+                 {{input}}",
             ),
         ]
     }
+
+    /// The built-in runner prompts before v19, by runner name. An unedited copy
+    /// of one is replaced with the current built-in prompt.
+    const LEGACY_PROMPTS: [(&'static str, &'static str); 2] = [
+        (
+            "Review",
+            "Review the current changes (git diff) for correctness, bugs, and \
+             code quality. Call out specific issues with file:line references and \
+             suggest concrete fixes.\n\n{{input}}",
+        ),
+        (
+            "Security Review",
+            "Perform a security review of the current changes (git diff). Look for \
+             injection, auth/authorization gaps, unsafe input handling, leaked \
+             secrets, and risky dependencies. Report findings with severity and \
+             file:line.\n\n{{input}}",
+        ),
+    ];
 }
 
 /// A reusable snippet of text typed into an **already-running** pane on demand
@@ -2331,8 +2613,17 @@ pub struct Settings {
     /// Bot) list and drive the agents through `muxel ctl`. Off by default.
     #[serde(default)]
     pub control_enabled: bool,
-    /// …including typing into shell panes, which is running commands. Off by
-    /// default: outside control reaches coding agents only.
+    /// Off / Ask / Allow for outside terminal creation. Allow opens only presets
+    /// running a known agent provider; every other program Asks. Literal argv and
+    /// shell presets always Ask and also require control_allow_shells. A bool
+    /// from a development build loads as Off / Ask. Revocation refuses pending
+    /// approvals, not existing panes.
+    #[serde(default)]
+    pub control_allow_new: control::CreationPolicy,
+    /// Also allow typing into shell panes and `ctl new` shell presets/defaults
+    /// or any literal argv. Commands run as the host muxel process, outside the
+    /// caller's sandbox. Off by default; non-literal agent writes need only global
+    /// outside control. Creation also requires a non-Off control_allow_new policy.
     #[serde(default)]
     pub control_allow_shells: bool,
     // --- Team libraries (`library`) ---
@@ -2553,6 +2844,27 @@ mod instance_tests {
         assert_eq!(instance.session_id, None);
         assert!(!instance.session_started);
     }
+
+    #[test]
+    fn duplicate_never_carries_an_unconsumed_outside_task() {
+        let mut task = Instance::shell(Uuid::new_v4());
+        task.is_runner = true;
+        task.control_prompt = true;
+        task.control_created = true;
+        task.system_prompt = Some("deploy the branch".into());
+        task.reset_conversation_for_duplicate();
+        assert_eq!(task.system_prompt, None);
+        assert!(!task.control_created);
+        // An ordinary runner's prompt is its reusable launch setting.
+        let mut runner = Instance::shell(Uuid::new_v4());
+        runner.is_runner = true;
+        runner.system_prompt = Some("Review the current changes".into());
+        runner.reset_conversation_for_duplicate();
+        assert_eq!(
+            runner.system_prompt.as_deref(),
+            Some("Review the current changes")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2639,6 +2951,7 @@ impl Default for Settings {
             read_aloud_tables: false,
             read_aloud_max_chars: 0,
             control_enabled: false,
+            control_allow_new: control::CreationPolicy::Off,
             control_allow_shells: false,
             libraries: Vec::new(),
             shared_loops: Vec::new(),
@@ -2663,7 +2976,8 @@ impl Default for Settings {
 /// v16: added the Windows Git Bash preset.
 /// v17: Grok preset gains a runner startup delay (its output never goes quiet).
 /// v18: added the Muse Code preset.
-pub const PRESET_SEED_VERSION: u32 = 18;
+/// v19: refreshed the built-in Review and Security Review runner prompts.
+pub const PRESET_SEED_VERSION: u32 = 19;
 
 /// Current version of the Terms of Service / Privacy notice. Bump this when the
 /// terms change so users are asked to accept again on next launch (see
@@ -2682,8 +2996,9 @@ impl Settings {
     }
 
     /// Apply pending built-in migrations, matching presets by name. The v18
-    /// migration only adds Muse; older catch-up migrations must not replay over
-    /// choices saved at v17. Returns whether settings should be persisted.
+    /// migration only adds Muse and v19 only refreshes unedited built-in runner
+    /// prompts; older catch-up migrations must not replay over choices saved at
+    /// v17. Returns whether settings should be persisted.
     pub fn seed_builtin_presets(&mut self) -> bool {
         if self.preset_seed_version >= PRESET_SEED_VERSION {
             return false;
@@ -2772,6 +3087,23 @@ impl Settings {
             let muse = AgentPreset::muse();
             if !self.presets.iter().any(|preset| preset.name == muse.name) {
                 self.presets.push(muse);
+            }
+        }
+        // A built-in runner still carrying its old prompt word for word gets the
+        // current one; any edit to the prompt keeps the user's text.
+        if self.preset_seed_version < 19 {
+            for builtin in Runner::defaults() {
+                let Some((_, legacy)) = Runner::LEGACY_PROMPTS
+                    .iter()
+                    .find(|(name, _)| *name == builtin.name)
+                else {
+                    continue;
+                };
+                for runner in &mut self.runners {
+                    if runner.name == builtin.name && runner.prompt == *legacy {
+                        runner.prompt = builtin.prompt.clone();
+                    }
+                }
             }
         }
         self.preset_seed_version = PRESET_SEED_VERSION;
@@ -2870,7 +3202,7 @@ mod settings_tests {
             }
             let before = serde_json::to_value(&settings).unwrap();
             assert!(settings.seed_builtin_presets());
-            assert_eq!(settings.preset_seed_version, 18);
+            assert_eq!(settings.preset_seed_version, PRESET_SEED_VERSION);
             assert_eq!(
                 settings
                     .presets
@@ -2889,6 +3221,90 @@ mod settings_tests {
                 serde_json::to_value(&settings).unwrap(),
                 before,
                 "no old preset/runner resurrection or replay of saved defaults"
+            );
+        }
+    }
+
+    #[test]
+    fn unedited_legacy_runner_prompts_are_refreshed_once() {
+        let legacy = |name: &str| {
+            let (_, prompt) = Runner::LEGACY_PROMPTS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap();
+            prompt.to_string()
+        };
+        let current = |name: &str| {
+            Runner::defaults()
+                .into_iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .prompt
+        };
+        let mut settings = Settings {
+            preset_seed_version: 18,
+            ..Settings::default()
+        };
+        settings.runners[0].prompt = legacy("Review");
+        settings.runners[0].auto_mode_presses = 1;
+        settings.runners[1].prompt =
+            format!("{} Also check the CI config.", legacy("Security Review"));
+        let mut renamed = settings.runners[0].clone();
+        renamed.name = "My Review".to_string();
+        settings.runners.push(renamed);
+
+        assert!(settings.seed_builtin_presets());
+        assert_eq!(settings.runners[0].prompt, current("Review"));
+        assert_eq!(
+            settings.runners[0].auto_mode_presses, 1,
+            "only the prompt changes"
+        );
+        assert!(
+            settings.runners[1]
+                .prompt
+                .ends_with("Also check the CI config."),
+            "an edited prompt is the user's own"
+        );
+        assert_eq!(
+            settings.runners[2].prompt,
+            legacy("Review"),
+            "matched by name"
+        );
+
+        // Restoring the old text afterwards sticks: the migration runs once.
+        settings.runners[0].prompt = legacy("Review");
+        assert!(!settings.seed_builtin_presets());
+        assert_eq!(settings.runners[0].prompt, legacy("Review"));
+    }
+
+    #[test]
+    fn builtin_runner_prompts_take_details_and_end_cleanly_without_them() {
+        let preset = AgentPreset::claude();
+        for runner in Runner::defaults() {
+            assert!(
+                runner
+                    .prompt
+                    .to_lowercase()
+                    .contains("don't edit, stage, or commit anything"),
+                "{} starts in auto mode, so it must not edit unasked",
+                runner.name
+            );
+            let with = runner.build_instance(Uuid::nil(), &preset, "only src/auth.rs");
+            assert!(
+                with.system_prompt
+                    .unwrap()
+                    .ends_with("take priority over these defaults.\n\nonly src/auth.rs"),
+                "{}",
+                runner.name
+            );
+            let without = runner.build_instance(Uuid::nil(), &preset, "");
+            assert!(
+                without
+                    .system_prompt
+                    .unwrap()
+                    .ends_with("take priority over these defaults."),
+                "{}",
+                runner.name
             );
         }
     }
@@ -2932,11 +3348,52 @@ mod settings_tests {
         // Nothing outside muxel can drive its agents until the user says so.
         let s: Settings = serde_json::from_str("{}").expect("parse");
         assert!(!s.control_enabled);
+        assert_eq!(s.control_allow_new, control::CreationPolicy::Off);
         assert!(!s.control_allow_shells);
         assert!(!Settings::default().control_enabled);
+        assert_eq!(
+            Settings::default().control_allow_new,
+            control::CreationPolicy::Off
+        );
+        assert!(!Settings::default().control_allow_shells);
         let s: Settings = serde_json::from_str(r#"{"control_enabled": true}"#).expect("parse");
         assert!(s.control_enabled);
+        assert_eq!(s.control_allow_new, control::CreationPolicy::Off);
         assert!(!s.control_allow_shells);
+    }
+
+    #[test]
+    fn outside_terminal_creation_is_an_independent_opt_in() {
+        let legacy: Settings =
+            serde_json::from_str(r#"{"control_enabled":true,"control_allow_shells":true}"#)
+                .unwrap();
+        assert!(legacy.control_enabled);
+        assert!(legacy.control_allow_shells);
+        assert!(
+            legacy.control_allow_new == control::CreationPolicy::Off,
+            "old grants must not authorize creation on upgrade"
+        );
+        for enabled in [false, true] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "control_enabled": true, "control_allow_shells": true,
+                "control_allow_new": enabled,
+            }))
+            .unwrap();
+            let saved = serde_json::to_value(&settings).unwrap();
+            // A development build's bool never becomes Allow.
+            let policy = if enabled {
+                control::CreationPolicy::Ask
+            } else {
+                control::CreationPolicy::Off
+            };
+            assert_eq!(
+                saved["control_allow_new"],
+                if enabled { "ask" } else { "off" }
+            );
+            let restored: Settings = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.control_allow_new, policy);
+            assert!(restored.control_enabled && restored.control_allow_shells);
+        }
     }
 
     #[test]
@@ -3520,6 +3977,125 @@ mod remote_layout_tests {
         assert_eq!(a.tmux_session, added.tmux_session);
     }
 
+    /// A pane this machine moved off Default (saved, not yet pushed) against a
+    /// peer layout that still has it there, and the reverse.
+    fn moved_and_stale() -> (Instance, Instance) {
+        let mut moved = Instance::shell(Uuid::new_v4());
+        moved.tmux_session = Some("muxel_proj_12345678".into());
+        moved.tmux_socket = Some(tmux::Socket::Private);
+        let mut stale = moved.clone();
+        stale.tmux_socket = Some(tmux::Socket::Default);
+        stale.custom_name = Some("Renamed by the peer".into());
+        (moved, stale)
+    }
+
+    #[test]
+    fn literal_panes_take_no_part_in_a_move_off_default() {
+        let (moved, stale) = moved_and_stale();
+        for (mut stale, mut moved, literal_moved) in
+            [(stale.clone(), moved.clone(), false), (stale, moved, true)]
+        {
+            if literal_moved {
+                moved.literal_argv = true;
+            } else {
+                stale.literal_argv = true;
+            }
+            assert!(!moved_off_default(&stale, &moved));
+            let mut local = vec![stale.clone()];
+            assert!(keep_moves_off_default(&mut local, std::slice::from_ref(&moved)).is_empty());
+            assert_eq!(local[0].tmux_socket, stale.tmux_socket);
+        }
+    }
+
+    #[test]
+    fn a_peer_layout_cannot_move_a_pane_back_onto_default() {
+        let (moved, stale) = moved_and_stale();
+        let merged = merge_peer_instances(
+            std::slice::from_ref(&moved),
+            vec![stale.clone()],
+            moved.project_id,
+        );
+        assert_eq!(merged[0].tmux_socket, Some(tmux::Socket::Private));
+        assert_eq!(merged[0].tmux_session, moved.tmux_session);
+        // The rest of the peer's copy still wins.
+        assert_eq!(merged[0].custom_name, stale.custom_name);
+
+        // The other way round the peer's move is adopted as usual.
+        let merged = merge_peer_instances(
+            std::slice::from_ref(&stale),
+            vec![moved.clone()],
+            moved.project_id,
+        );
+        assert_eq!(merged[0].tmux_socket, Some(tmux::Socket::Private));
+
+        // Only the same session moves one way: a peer that rebound the pane to
+        // another session on Default, or to another server, is adopted.
+        let mut rebound = stale.clone();
+        rebound.tmux_session = Some("imported".into());
+        let mut named = stale.clone();
+        named.tmux_socket = Some(tmux::Socket::Named("peer".into()));
+        for peer in [rebound, named] {
+            let merged = merge_peer_instances(
+                std::slice::from_ref(&moved),
+                vec![peer.clone()],
+                moved.project_id,
+            );
+            assert_eq!(merged[0].tmux_socket, peer.tmux_socket);
+            assert_eq!(merged[0].tmux_session, peer.tmux_session);
+        }
+    }
+
+    #[test]
+    fn a_push_keeps_a_move_off_default_the_file_already_has() {
+        let (moved, stale) = moved_and_stale();
+        let mut other = Instance::shell(moved.project_id);
+        other.tmux_session = Some("work".into());
+        other.tmux_socket = Some(tmux::Socket::Default);
+        let mut local = vec![stale.clone(), other.clone()];
+        let mut file_other = other.clone();
+        file_other.tmux_session = Some("elsewhere".into());
+        file_other.tmux_socket = Some(tmux::Socket::Private);
+        let ids = keep_moves_off_default(&mut local, &[moved.clone(), file_other]);
+        assert_eq!(ids, vec![(moved.id, "muxel_proj_12345678".to_string())]);
+        assert_eq!(local[0].tmux_socket, Some(tmux::Socket::Private));
+        assert_eq!(
+            local[0].custom_name, stale.custom_name,
+            "only the owner moves"
+        );
+        assert_eq!(
+            (&local[1].tmux_session, &local[1].tmux_socket),
+            (&other.tmux_session, &other.tmux_socket),
+            "a different session is not this pane's move"
+        );
+
+        // A file that predates the move changes nothing.
+        let mut local = vec![moved.clone()];
+        assert!(keep_moves_off_default(&mut local, &[stale]).is_empty());
+        assert_eq!(local[0].tmux_socket, moved.tmux_socket);
+    }
+
+    #[test]
+    fn rebound_instances_are_those_whose_session_or_owner_changed() {
+        let (moved, stale) = moved_and_stale();
+        let mut renamed = stale.clone();
+        renamed.tmux_session = Some("other".into());
+        let mut titled = stale.clone();
+        titled.custom_name = Some("only the title".into());
+        let added = Instance::shell(moved.project_id);
+        assert_eq!(
+            rebound_instances(std::slice::from_ref(&stale), std::slice::from_ref(&moved)),
+            vec![moved.id]
+        );
+        assert_eq!(
+            rebound_instances(std::slice::from_ref(&stale), &[renamed]),
+            vec![stale.id]
+        );
+        assert!(rebound_instances(std::slice::from_ref(&stale), &[titled, added]).is_empty());
+        let mut literal = moved.clone();
+        literal.literal_argv = true;
+        assert!(rebound_instances(std::slice::from_ref(&stale), &[literal]).is_empty());
+    }
+
     /// Reduce a desktop pane subtree to what the iOS `PaneNode` encoder writes: only
     /// its coding keys (no `pane_id`).
     fn as_ios_pane(node: &mut serde_json::Value) {
@@ -3601,6 +4177,94 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn an_older_peer_cannot_strip_outside_creation_launch_policy() {
+        let pid = Uuid::new_v4();
+        let mut literal = Instance::shell(pid);
+        literal.program = Some("/usr/local/bin/native".into());
+        literal.args = vec!["opening brief".into(), "".into()];
+        literal.literal_argv = true;
+        literal.control_created = true;
+        literal.launch_dir = Some("/srv/external".into());
+        let mut task = Instance::from_preset(pid, &AgentPreset::claude());
+        task.control_created = true;
+        task.control_prompt = true;
+        task.instruction_injection = Some(InjectionMode::CliFlag {
+            flag: "--append-system-prompt".into(),
+        });
+        task.launch_dir = Some("/srv/external".into());
+        let local = vec![literal.clone(), task.clone()];
+        // The same panes as an older build writes them back: unknown fields gone.
+        let older: Vec<Instance> = local
+            .iter()
+            .map(|instance| {
+                let mut json = serde_json::to_value(instance).unwrap();
+                let fields = json.as_object_mut().unwrap();
+                for field in [
+                    "literal_argv",
+                    "launch_dir",
+                    "control_created",
+                    "control_prompt",
+                    "instruction_injection",
+                ] {
+                    fields.remove(field);
+                }
+                serde_json::from_value(json).unwrap()
+            })
+            .collect();
+        assert!(!older[0].literal_argv && older[0].launch_dir.is_none());
+        let merged = merge_peer_instances(&local, older, pid);
+        for (merged, mine) in merged.iter().zip(&local) {
+            assert_eq!(merged.literal_argv, mine.literal_argv);
+            assert_eq!(merged.control_created, mine.control_created);
+            assert_eq!(merged.control_prompt, mine.control_prompt);
+            assert_eq!(merged.launch_dir, mine.launch_dir);
+            assert_eq!(merged.instruction_injection, mine.instruction_injection);
+        }
+        // A pane only the peer has keeps exactly what the peer wrote.
+        let added = Instance::shell(pid);
+        let merged = merge_peer_instances(&local, vec![added.clone()], pid);
+        assert!(!merged[0].literal_argv && !merged[0].control_created);
+        assert!(merged[0].launch_dir.is_none());
+    }
+
+    #[test]
+    fn peer_without_session_path_keeps_this_machines_rollout_for_the_same_conversation() {
+        let pid = Uuid::new_v4();
+        let mut mine = Instance::from_preset(pid, &AgentPreset::codex());
+        mine.session_id = Some("01a1543c-9700-7000-8000-000000000001".into());
+        mine.session_started = true;
+        mine.session_path =
+            Some("/home/me/.codex/sessions/2026/10/19/rollout-01a1543c.jsonl".into());
+        // What a peer that predates the field (or an older iOS build) writes back.
+        let mut doc = serde_json::to_value(&mine).unwrap();
+        doc.as_object_mut().unwrap().remove("session_path");
+        let old_peer: Instance = serde_json::from_value(doc).unwrap();
+        assert_eq!(old_peer.session_path, None);
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![old_peer], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
+
+        // An iOS write-back carries the field as `null` or its value.
+        let mut doc = serde_json::to_value(&mine).unwrap();
+        doc["session_path"] = serde_json::Value::Null;
+        let ios: Instance = serde_json::from_value(doc).unwrap();
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![ios], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
+
+        // A peer that switched the pane's conversation describes another rollout.
+        let mut switched = mine.clone();
+        switched.session_id = Some("01a1543c-9700-7000-8000-000000000002".into());
+        switched.session_path = None;
+        let merged = merge_peer_instances(std::slice::from_ref(&mine), vec![switched], pid);
+        assert_eq!(merged[0].session_path, None);
+
+        // This machine has none yet: the peer's copy of it stands.
+        let mut unsaved = mine.clone();
+        unsaved.session_path = None;
+        let merged = merge_peer_instances(&[unsaved], vec![mine.clone()], pid);
+        assert_eq!(merged[0].session_path, mine.session_path);
+    }
+
+    #[test]
     fn namesakes_on_different_sockets_survive_dedupe_and_old_peer_sync() {
         let mut ws = Workspace::default();
         let mut a = Instance::shell(Uuid::new_v4());
@@ -3616,6 +4280,63 @@ mod remote_layout_tests {
         legacy.tmux_socket = None;
         let merged = merge_peer_instances(&ws.instances, vec![legacy], a.project_id);
         assert_eq!(merged[0].tmux_target("p"), a.tmux_target("p"));
+    }
+
+    #[test]
+    fn unfamiliar_socket_owners_preserve_every_peer_pane() {
+        let mut ws = Workspace::default();
+        let mut project = remote_project("/srv/app");
+        let instances: Vec<_> = ["mxl", "default", "mxl-profile", "   ", "owner '名; $()"]
+            .into_iter()
+            .map(|name| {
+                let mut instance = Instance::shell(project.id);
+                instance.tmux_session = Some("same-name".into());
+                instance.tmux_socket = Some(tmux::Socket::try_from(name.to_string()).unwrap());
+                instance
+            })
+            .collect();
+        let ids: Vec<_> = instances.iter().map(|i| i.id).collect();
+        project.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: ids.clone(),
+            active: 0,
+        }));
+        ws.instances = instances.clone();
+        ws.projects = vec![project.clone()];
+        let doc = RemoteLayout::capture(&project, &ws, 42);
+        let parsed = RemoteLayout::parse(&doc.to_json(), "/srv/app").unwrap();
+        assert_eq!(parsed.instances.len(), instances.len());
+        assert_eq!(parsed.layout.as_ref().unwrap().collect_instances(), ids);
+        for expected in &instances {
+            let actual = parsed
+                .instances
+                .iter()
+                .find(|i| i.id == expected.id)
+                .unwrap();
+            assert_eq!(actual.tmux_target("p"), expected.tmux_target("p"));
+        }
+        assert_eq!(
+            RemoteLayout::parse(&parsed.to_json(), "/srv/app")
+                .unwrap()
+                .content_key(),
+            doc.content_key()
+        );
+        ws.instances = merge_peer_instances(&instances, parsed.instances, project.id);
+        dedupe_instances(&mut ws);
+        assert_eq!(
+            ws.instances.len(),
+            instances.len(),
+            "different owners must not collapse namesakes"
+        );
+
+        // An owner tmux can't use as a socket name costs only that owner.
+        let mut json: serde_json::Value = serde_json::from_str(&doc.to_json()).unwrap();
+        json["instances"][2]["tmux_socket"] = serde_json::json!("../elsewhere");
+        let parsed = RemoteLayout::parse(&json.to_string(), "/srv/app").unwrap();
+        assert_eq!(parsed.instances.len(), instances.len());
+        let invalid = &parsed.instances[2];
+        assert_eq!(invalid.tmux_socket, None);
+        assert_eq!(invalid.tmux_session.as_deref(), Some("same-name"));
     }
 
     #[test]

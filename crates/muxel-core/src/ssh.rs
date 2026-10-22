@@ -448,10 +448,11 @@ pub fn tmux_path_prelude() -> String {
 }
 
 /// `tmux` on `socket`, as the words that start a remote command. Every word is
-/// shell-safe, so none is quoted.
-fn tmux_on(socket: Socket) -> String {
-    std::iter::once("tmux".to_string())
-        .chain(socket.args())
+/// shell-quoted, including recorded socket names supplied by peers.
+fn tmux_on(socket: &Socket) -> String {
+    std::iter::once("tmux")
+        .map(str::to_string)
+        .chain(socket.args().iter().map(|arg| sh_quote(arg)))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -474,22 +475,23 @@ pub fn select_tmux_socket(session: &str) -> String {
 
 pub fn select_session_socket(session: &crate::tmux::SessionTarget) -> String {
     let target = sh_quote(&format!("={}", session.name));
-    let point_at = |socket: Socket| {
-        std::iter::once("set --".to_string())
-            .chain(socket.args())
+    let point_at = |socket: &Socket| {
+        std::iter::once("set --")
+            .map(str::to_string)
+            .chain(socket.args().iter().map(|arg| sh_quote(arg)))
             .collect::<Vec<_>>()
             .join(" ")
     };
-    if let Some(socket) = session.socket {
+    if let Some(socket) = &session.socket {
         return point_at(socket);
     }
     format!(
         "if ! {} has-session -t {target} 2>/dev/null \
          && {} has-session -t {target} 2>/dev/null; then {}; else {}; fi",
-        tmux_on(Socket::Private),
-        tmux_on(Socket::Default),
-        point_at(Socket::Default),
-        point_at(Socket::Private),
+        tmux_on(&Socket::Private),
+        tmux_on(&Socket::Default),
+        point_at(&Socket::Default),
+        point_at(&Socket::Private),
     )
 }
 
@@ -521,12 +523,26 @@ pub fn list_sessions_command() -> String {
 }
 
 pub fn list_sessions_command_on(sockets: &[Socket]) -> String {
-    let args: Vec<String> = crate::tmux::list_sessions_args()
-        .iter()
-        .map(|a| sh_quote(a))
-        .collect();
+    tmux_listing_command_on(sockets, crate::tmux::list_sessions_args())
+}
+
+/// Migration needs only names. Do not split a valid session name on the pane
+/// inventory's `|` separator, or a live imported owner can appear absent.
+pub fn list_session_names_command_on(sockets: &[Socket]) -> String {
+    tmux_listing_command_on(
+        sockets,
+        vec![
+            "list-sessions".into(),
+            "-F".into(),
+            "#{session_name}".into(),
+        ],
+    )
+}
+
+fn tmux_listing_command_on(sockets: &[Socket], args: Vec<String>) -> String {
+    let args: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
     let mut cmd = tmux_path_prelude();
-    for &socket in sockets {
+    for socket in sockets {
         cmd.push_str(&format!(
             "; {} {} 2>&1; echo \"{LISTING_END}$?\"",
             tmux_on(socket),
@@ -559,9 +575,9 @@ pub fn parse_session_listings_on(
             listing.push('\n');
             continue;
         };
-        let &socket = sockets.get(answered)?;
+        let socket = sockets.get(answered)?;
         if status.trim() == "0" {
-            panes.extend(crate::tmux::parse_sessions_on(&listing, socket));
+            panes.extend(crate::tmux::parse_sessions_on(&listing, socket.clone()));
         } else if !crate::tmux::no_server(&listing) {
             return None;
         }
@@ -569,6 +585,109 @@ pub fn parse_session_listings_on(
         answered += 1;
     }
     (answered == sockets.len() && listing.trim().is_empty()).then_some(panes)
+}
+
+/// Both servers must give complete name-only answers before absence may authorize
+/// moving a recorded default owner. Only name/socket are populated in these rows.
+pub fn parse_session_listings_for_migration(out: &str) -> Option<Vec<crate::tmux::RemoteSession>> {
+    parse_session_listings_for_migration_on(out, &Socket::BOTH)
+}
+
+/// The same checked reply contract when confirming one recorded named owner:
+/// every server's [`checked_session_listings_on`] answer, and nothing after them.
+pub fn parse_session_listings_for_migration_on(
+    out: &str,
+    sockets: &[Socket],
+) -> Option<Vec<crate::tmux::RemoteSession>> {
+    let (answers, complete) = checked_listings(out, sockets);
+    if !complete {
+        return None;
+    }
+    let answers: Option<Vec<_>> = answers.into_iter().collect();
+    answers.map(|answers| answers.into_iter().flatten().collect())
+}
+
+/// [`list_session_names_command_on`]'s output, one answer per server queried, in
+/// order: the sessions it listed, none for a server confirmed not running, or
+/// `None` for any other reply (one cut off before that server answered
+/// included). A server's answer stands whatever the others said.
+///
+/// A listing that exited 0 holds one exact session name per line. An empty line
+/// is no name tmux lists, so it spoils that server's answer. Ported to Swift as
+/// `TmuxCommands.parseConfirmedListings` — keep both in step.
+pub fn checked_session_listings_on(
+    out: &str,
+    sockets: &[Socket],
+) -> Vec<Option<Vec<crate::tmux::RemoteSession>>> {
+    checked_listings(out, sockets).0
+}
+
+/// [`checked_session_listings_on`], and whether nothing but whitespace followed
+/// the last server's answer.
+fn checked_listings(
+    out: &str,
+    sockets: &[Socket],
+) -> (Vec<Option<Vec<crate::tmux::RemoteSession>>>, bool) {
+    let mut answers = Vec::with_capacity(sockets.len());
+    let mut listing = String::new();
+    let mut complete = true;
+    for line in out.lines() {
+        let Some(status) = line.strip_prefix(LISTING_END) else {
+            listing.push_str(line);
+            listing.push('\n');
+            continue;
+        };
+        match sockets.get(answers.len()) {
+            Some(socket) => answers.push(checked_listing(&listing, status, socket)),
+            // More answers than servers asked.
+            None => complete = false,
+        }
+        listing.clear();
+    }
+    complete &= answers.len() == sockets.len() && listing.trim().is_empty();
+    answers.resize(sockets.len(), None);
+    (answers, complete)
+}
+
+fn checked_listing(
+    listing: &str,
+    status: &str,
+    socket: &Socket,
+) -> Option<Vec<crate::tmux::RemoteSession>> {
+    if status.trim() == "0" {
+        return listing
+            .lines()
+            .map(|name| {
+                (!name.is_empty()).then(|| crate::tmux::RemoteSession {
+                    name: name.to_string(),
+                    socket: socket.clone(),
+                    path: String::new(),
+                    command: String::new(),
+                    title: String::new(),
+                })
+            })
+            .collect();
+    }
+    // A malformed status is not a failed tmux command, even when its output
+    // resembles an absent server.
+    let failed = status.trim().parse::<u8>().is_ok_and(|code| code != 0);
+    (failed && crate::tmux::confirmed_no_server(listing)).then(Vec::new)
+}
+
+/// Whether a pane recorded on the default server still has its session there,
+/// by `checked` ([`checked_session_listings_on`] over `sockets`). It reattaches
+/// there, whatever the other servers answered: only moving it off Default needs
+/// every server's checked answer. Ported to Swift as
+/// `TmuxCommands.defaultOwnerTargets`.
+pub fn still_on_default(
+    checked: &[Option<Vec<crate::tmux::RemoteSession>>],
+    sockets: &[Socket],
+    session: &crate::tmux::SessionTarget,
+) -> bool {
+    session.socket == Some(Socket::Default)
+        && sockets.iter().zip(checked).any(|(socket, rows)| {
+            *socket == Socket::Default && rows.iter().flatten().any(|row| row.name == session.name)
+        })
 }
 
 /// Exit codes for [`kill_and_confirm_command`], chosen above the range a shell
@@ -832,7 +951,7 @@ fn remote_command(spec: &SshSpec) -> String {
         // is cleared from the server before creating a session. A local control id
         // does not identify the remote program, so no id is passed to it.
         let session = spec.tmux_session.unwrap_or("muxel");
-        let target = crate::tmux::SessionTarget::new(session, spec.tmux_socket);
+        let target = crate::tmux::SessionTarget::new(session, spec.tmux_socket.clone());
         let targs = crate::tmux::launch_session_args_with_env(
             session,
             spec.remote_cwd,
@@ -1595,12 +1714,13 @@ mod tests {
     #[test]
     fn a_remote_session_is_killed_and_confirmed_only_on_its_owner() {
         for socket in Socket::BOTH {
-            let target = crate::tmux::SessionTarget::new("work", Some(socket));
+            let target = crate::tmux::SessionTarget::new("work", Some(socket.clone()));
             let cmd = kill_and_confirm_command(&target);
             let selection = match socket {
                 Socket::Private => "; set -- -L mxl;",
                 Socket::Default => "; set --;",
                 Socket::Isolated(_) => unreachable!("BOTH contains only real-profile sockets"),
+                Socket::Named(_) => unreachable!("BOTH contains only the standard servers"),
             };
             assert!(cmd.contains(selection), "{cmd}");
             assert_eq!(cmd.matches("kill-session").count(), 1, "{cmd}");
@@ -1621,6 +1741,222 @@ mod tests {
     }
 
     #[test]
+    fn named_remote_owners_are_quoted_and_never_discovered_again() {
+        for name in ["   ", "mxl-profile", "owner '名; $(touch no)"] {
+            let socket = Socket::Named(name.into());
+            let target = crate::tmux::SessionTarget::new("work", Some(socket.clone()));
+            let selection = format!("set -- -L {}", sh_quote(name));
+            assert_eq!(select_session_socket(&target), selection);
+            for command in [
+                kill_command(&target),
+                claim_window_size_command(&target, "ab12"),
+            ] {
+                assert!(command.contains(&format!("; {selection};")), "{command}");
+                assert!(
+                    !command.contains("has-session"),
+                    "known owner must not rediscover: {command}"
+                );
+            }
+            let listing = list_sessions_command_on(std::slice::from_ref(&socket));
+            assert!(listing.contains(&format!("; tmux -L {} list-panes", sh_quote(name))));
+            let parsed = parse_session_listings_on(
+                "work|/p|zsh|\n:muxel-listed:0\n",
+                std::slice::from_ref(&socket),
+            )
+            .unwrap();
+            assert_eq!(parsed[0].socket, socket);
+            let h = host();
+            let command = ssh_args(&SshSpec {
+                host: &h,
+                control_path: "/s",
+                remote_cwd: Some("/w"),
+                program: Some("claude"),
+                args: &[],
+                use_tmux: true,
+                tmux_session: Some("work"),
+                tmux_socket: Some(socket),
+                tmux_client_tag: None,
+            })
+            .pop()
+            .unwrap();
+            assert!(command.contains(&format!("; {selection};")), "{command}");
+            assert!(!command.contains("has-session"));
+        }
+    }
+
+    #[test]
+    fn migration_listing_requires_complete_success_or_confirmed_absence() {
+        let absent =
+            "error connecting to /tmp/tmux-1000/mxl (Connection refused)\n:muxel-listed:1\n";
+        let live = "work\n:muxel-listed:0\n";
+        let parsed = parse_session_listings_for_migration(&format!("{absent}{live}")).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].socket, Socket::Default);
+        assert_eq!(
+            parse_session_listings_for_migration(&format!("{absent}{absent}")),
+            Some(vec![])
+        );
+        for failed in [
+            "error connecting to /tmp/tmux-1000/mxl (Permission denied)\n:muxel-listed:1\n",
+            "error connecting to /tmp/tmux-1000/mxl (unknown error)\n:muxel-listed:1\n",
+            "work|/p|claude|\nerror connecting to /tmp/tmux-1000/mxl (Connection refused)\n:muxel-listed:1\n",
+            "work|/p|claude|\n", // missing completion marker
+            "work|/p|claude|\n:muxel-listed:0\ntruncated",
+            "\n:muxel-listed:0\n",
+            "no server running on /tmp/tmux-1000/mxl\n:muxel-listed:not-a-status\n",
+        ] {
+            assert!(
+                parse_session_listings_for_migration(&format!("{live}{failed}")).is_none(),
+                "{failed}"
+            );
+        }
+        assert!(parse_session_listings_for_migration(live).is_none());
+        // The older discovery parser retains its existing error classification.
+        let permission =
+            "error connecting to /tmp/tmux-1000/mxl (Permission denied)\n:muxel-listed:1\n";
+        assert!(
+            parse_session_listings(&format!("work|/p|claude|\n:muxel-listed:0\n{permission}"))
+                .is_some()
+        );
+    }
+
+    /// Reattaching a session still running on Default needs only Default's answer;
+    /// whatever `mxl` replied (an rc file's echo, an unfamiliar error, nothing at
+    /// all), the pane attaches as it did before the migration existed.
+    #[test]
+    fn a_live_default_session_needs_only_defaults_answer() {
+        let target = crate::tmux::SessionTarget::new("owned ", Some(Socket::Default));
+        let live = "owned \n:muxel-listed:0\n";
+        for own in [
+            "Welcome to devbox\nowned \n:muxel-listed:0\n",
+            "error connecting to /tmp/tmux-1000/mxl (Permission denied)\n:muxel-listed:1\n",
+            "\n:muxel-listed:0\n",
+            "something unfamiliar\n:muxel-listed:2\n",
+            "garbage without a status\n:muxel-listed:\n",
+        ] {
+            let out = format!("{own}{live}");
+            let checked = checked_session_listings_on(&out, &Socket::BOTH);
+            assert!(still_on_default(&checked, &Socket::BOTH, &target), "{own}");
+        }
+        // Moving it would still need both servers' answers.
+        let own = "error connecting to /tmp/tmux-1000/mxl (Permission denied)\n:muxel-listed:1\n";
+        assert!(parse_session_listings_for_migration(&format!("{own}{live}")).is_none());
+        // Default's answer must itself be complete and hold the exact name.
+        for default in [
+            "owned\n:muxel-listed:0\n",
+            "owned \n",
+            "owned \n:muxel-listed:1\n",
+            "owned \n\n:muxel-listed:0\n",
+            "no server running on /tmp/tmux-1000/default\n:muxel-listed:1\n",
+        ] {
+            let out = format!("{own}{default}");
+            let checked = checked_session_listings_on(&out, &Socket::BOTH);
+            assert!(
+                !still_on_default(&checked, &Socket::BOTH, &target),
+                "{default}"
+            );
+            assert!(
+                parse_session_listings_for_migration(&out).is_none(),
+                "{default}"
+            );
+        }
+        // Only a pane recorded on Default reattaches by Default's answer alone.
+        let checked = checked_session_listings_on(&format!("{own}{live}"), &Socket::BOTH);
+        for socket in [None, Some(Socket::Private)] {
+            let other = crate::tmux::SessionTarget::new("owned ", socket);
+            assert!(!still_on_default(&checked, &Socket::BOTH, &other));
+        }
+    }
+
+    #[test]
+    fn checked_listings_answer_per_server() {
+        let out = "\
+            Welcome\n:muxel-listed:0\n\
+            no server running on /tmp/tmux-1000/default\n:muxel-listed:1\n";
+        let checked = checked_session_listings_on(out, &Socket::BOTH);
+        assert_eq!(checked.len(), 2);
+        assert_eq!(checked[0].as_ref().unwrap()[0].name, "Welcome");
+        assert_eq!(checked[0].as_ref().unwrap()[0].socket, Socket::Private);
+        assert_eq!(checked[1], Some(vec![]));
+        // Cut off before Default answered, and an extra answer nobody asked for.
+        let cut = checked_session_listings_on("a\n:muxel-listed:0\nb\n", &Socket::BOTH);
+        assert!(cut[0].is_some() && cut[1].is_none());
+        let extra = "a\n:muxel-listed:0\nb\n:muxel-listed:0\nc\n:muxel-listed:0\n";
+        assert_eq!(
+            checked_session_listings_on(extra, &Socket::BOTH)
+                .iter()
+                .filter(|a| a.is_some())
+                .count(),
+            2
+        );
+        assert!(parse_session_listings_for_migration(extra).is_none());
+        // CRLF line ends, as the phone's port reads them too.
+        let crlf =
+            "owned\r\n:muxel-listed:0\r\nno server running on /tmp/default\r\n:muxel-listed:1\r\n";
+        let rows = parse_session_listings_for_migration(crlf).unwrap();
+        assert_eq!((rows.len(), rows[0].name.as_str()), (1, "owned"));
+        assert_eq!(
+            parse_session_listings_for_migration("a\n:muxel-listed:0\nb\n:muxel-listed:0\n \n")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn strict_confirmation_keeps_a_named_owner_and_rejects_failed_replies() {
+        let sockets = [Socket::Named("mxl-profile".into())];
+        let rows = parse_session_listings_for_migration_on(
+            "owned|with|pipes \n:muxel-listed:0\n",
+            &sockets,
+        )
+        .unwrap();
+        assert_eq!(rows[0].socket, sockets[0]);
+        assert_eq!(rows[0].name, "owned|with|pipes ");
+        let target = crate::tmux::SessionTarget::new(rows[0].name.clone(), Some(Socket::Default));
+        let default_rows = parse_session_listings_for_migration(
+            ":muxel-listed:0\nowned|with|pipes \n:muxel-listed:0\n",
+        )
+        .unwrap();
+        let legacy = crate::tmux::ClosedSession {
+            name: target.name.clone(),
+            socket: None,
+            instance: uuid::Uuid::nil(),
+        };
+        assert_eq!(
+            legacy
+                .resolve_owner(&default_rows, Socket::Private)
+                .target(),
+            target
+        );
+        assert_eq!(
+            target
+                .for_respawn::<()>(|socket| Ok(default_rows
+                    .iter()
+                    .any(|row| &row.socket == socket && row.name == target.name)))
+                .unwrap()
+                .unwrap(),
+            target
+        );
+        assert_eq!(
+            parse_session_listings_for_migration_on(":muxel-listed:0\n", &sockets),
+            Some(vec![])
+        );
+        assert!(
+            parse_session_listings_for_migration_on(
+                "error connecting to /tmp/profile (Permission denied)\n:muxel-listed:1\n",
+                &sockets
+            )
+            .is_none()
+        );
+        let command = list_session_names_command_on(&sockets);
+        assert!(command.contains("-L mxl-profile"));
+        assert!(command.contains("'#{session_name}'"));
+        assert!(!command.contains("#{session_path}"));
+        assert_eq!(command.matches(":muxel-listed:").count(), 1);
+    }
+
+    #[test]
     fn a_known_remote_owner_is_used_for_launch_and_window_claims() {
         let h = host();
         for socket in Socket::BOTH {
@@ -1633,7 +1969,7 @@ mod tests {
                 args: &[],
                 use_tmux: true,
                 tmux_session: Some(&target.name),
-                tmux_socket: target.socket,
+                tmux_socket: target.socket.clone(),
                 tmux_client_tag: Some("ab12"),
             };
             for cmd in [
@@ -1660,8 +1996,8 @@ mod tests {
     fn isolated_ssh_discovery_launch_claims_and_teardown_never_probe_global_servers() {
         let root = std::path::Path::new("/isolated-ssh");
         let socket = Socket::isolated(root);
-        let label = String::from(socket);
-        let sockets = [socket];
+        let label = String::from(socket.clone());
+        let sockets = [socket.clone()];
         let listing = list_sessions_command_on(&sockets);
         assert_eq!(listing.matches(":muxel-listed:").count(), 1);
         let parsed =
@@ -1686,7 +2022,7 @@ mod tests {
                 args: &[],
                 use_tmux: true,
                 tmux_session: Some(&target.name),
-                tmux_socket: target.socket,
+                tmux_socket: target.socket.clone(),
                 tmux_client_tag: Some("ab12"),
             };
             let cleanup = crate::tmux::unset_option_if_args("work", "@claim", "owner").unwrap();

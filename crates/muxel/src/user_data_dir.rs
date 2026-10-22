@@ -157,6 +157,38 @@ mod tests {
     }
 
     #[test]
+    fn isolated_ctl_new_preserves_a_literal_user_data_dir_argument() {
+        use muxel_core::control::{CliCommand, parse_cli};
+        let (root, remaining) = take_flag(args(&[
+            "--user-data-dir",
+            "isolated-root",
+            "ctl",
+            "new",
+            "repo",
+            "--",
+            "native.exe",
+            "--user-data-dir",
+            "literal-root",
+        ]))
+        .unwrap();
+        assert_eq!(root, Some(PathBuf::from("isolated-root")));
+        assert_eq!(remaining[0], "ctl");
+        let ctl_args: Vec<_> = remaining[1..]
+            .iter()
+            .map(|arg| arg.to_str().unwrap().to_string())
+            .collect();
+        let CliCommand::Request(command) = parse_cli(&ctl_args).unwrap() else {
+            panic!("expected creation request");
+        };
+        let request = serde_json::to_value(command).unwrap();
+        assert_eq!(request["cmd"], "new");
+        assert_eq!(
+            request["argv"],
+            serde_json::json!(["native.exe", "--user-data-dir", "literal-root"])
+        );
+    }
+
+    #[test]
     fn refuses_a_missing_empty_or_repeated_directory() {
         assert!(take_flag(args(&["--user-data-dir"])).is_err());
         assert!(take_flag(args(&["--user-data-dir", ""])).is_err());

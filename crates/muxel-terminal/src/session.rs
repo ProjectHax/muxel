@@ -642,12 +642,42 @@ pub enum LaunchBinding {
     Known(Option<String>),
 }
 
+/// Reads a pane's title from outside its PTY. A tmux client forwards none of
+/// the titles its pane's program sets unless `set-titles` is on, which muxel
+/// leaves to the user, so a tmux-wrapped pane's title is read through tmux.
+#[derive(Clone)]
+pub struct TitleSource(Arc<dyn Fn() -> Option<String> + Send + Sync>);
+
+impl TitleSource {
+    /// `read` blocks (it may run a process); it is only ever called from a
+    /// background thread, and must bound its own time.
+    pub fn new(read: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    pub fn read(&self) -> Option<String> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for TitleSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TitleSource(..)")
+    }
+}
+
 /// What to run in a terminal.
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
     pub program: String,
     /// Syntax for file arguments at launch, retained across transport wrappers.
     pub paste_shell: PasteShell,
+    /// Already resolved literal target. Never repeat PATH/PATHEXT lookup or use
+    /// a batch interpreter at the final spawn boundary.
+    pub literal_argv: bool,
+    /// False for outside-created panes: a failed approved program must surface
+    /// its launch error instead of installing a writable default shell.
+    pub allow_shell_fallback: bool,
     /// Logical agent program when `program` is a transport/wrapper such as ssh
     /// or tmux. Lifecycle title parsing keys off this, not the local child name.
     pub status_program: Option<String>,
@@ -660,6 +690,11 @@ pub struct CommandSpec {
     /// Text to type into the terminal shortly after start (system-prompt
     /// "type-in" injection). Handled by the view, not the session.
     pub startup_input: Option<String>,
+    /// Runtime lease for the first task created through outside control.
+    pub startup_turn: Option<muxel_core::control::StartupTurnOwner>,
+    /// Where that task's startup reads the provider's title when the PTY can't
+    /// see it (a tmux-wrapped pane). Unused by any other automation.
+    pub title_source: Option<TitleSource>,
     /// Shift+Tab presses to send at startup before typing (runner auto mode).
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input` (false = leave it in
@@ -689,13 +724,17 @@ impl CommandSpec {
         Self {
             paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             program,
+            literal_argv: false,
             status_program: None,
+            allow_shell_fallback: true,
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
             env_remove: Vec::new(),
             startup_input: None,
             auto_mode_presses: 0,
+            startup_turn: None,
+            title_source: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -711,17 +750,39 @@ impl CommandSpec {
             paste_shell: PasteShell::for_program(Some(&program), PasteShell::default()),
             status_program: Some(program.clone()),
             program,
+            literal_argv: false,
             args,
+            allow_shell_fallback: true,
             cwd: None,
             env: Vec::new(),
             env_remove: Vec::new(),
             startup_input: None,
             auto_mode_presses: 0,
+            startup_turn: None,
+            title_source: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
+        }
+    }
+
+    pub fn literal(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            literal_argv: true,
+            submit: false,
+            allow_shell_fallback: false,
+            ..Self::program(program, args)
+        }
+    }
+
+    fn program_for_spawn(&self) -> Result<String> {
+        if self.literal_argv {
+            validate_literal_program(&self.program)?;
+            Ok(self.program.clone())
+        } else {
+            Ok(resolve_program_for_spawn(&self.program))
         }
     }
 
@@ -769,6 +830,11 @@ impl CommandSpec {
 
     pub fn with_binding(mut self, binding: LaunchBinding) -> Self {
         self.binding = binding;
+        self
+    }
+
+    pub fn with_title_source(mut self, source: TitleSource) -> Self {
+        self.title_source = Some(source);
         self
     }
 }
@@ -1224,7 +1290,7 @@ impl TerminalSession {
         // returns the shim first and CreateProcessW fails with
         // ERROR_BAD_EXE_FORMAT (193) "%1 is not a valid Win32 application".
         let phase = std::time::Instant::now();
-        let program = resolve_program_for_spawn(&spec.program);
+        let program = spec.program_for_spawn()?;
         if let Some(instance_id) = instance_id {
             crate::profile::startup_event(
                 instance_id,
@@ -2193,6 +2259,11 @@ impl TerminalSession {
     /// The visible screen as text (one row per line, newline-separated). Used for
     /// marker-based agent-status detection (e.g. scanning for "esc to interrupt").
     pub(crate) fn visible_text(&self) -> String {
+        self.startup_screen().text
+    }
+
+    /// Capture input geometry and modes with the same grid generation.
+    pub(crate) fn startup_screen(&self) -> crate::startup::Screen {
         use alacritty_terminal::index::{Column, Line, Point as GridPoint};
         self.with_term(|term| {
             let grid = term.grid();
@@ -2211,7 +2282,14 @@ impl TerminalSession {
                 }
                 s.push('\n');
             }
-            s
+            let cursor = grid.cursor.point;
+            crate::startup::Screen {
+                text: s,
+                cursor_column: cursor.column.0,
+                cursor_row: cursor.line.0,
+                cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR),
+                bracketed_paste: term.mode().contains(TermMode::BRACKETED_PASTE),
+            }
         })
     }
 
@@ -2599,6 +2677,53 @@ fn push_mouse_report(
         let enc = |v: usize| -> u8 { ((v + 1).min(223) + 32) as u8 };
         buf.extend_from_slice(&[0x1b, b'[', b'M', cb.saturating_add(32), enc(col), enc(row)]);
     }
+}
+
+/// Resolve a literal launch without permitting a batch interpreter to reparse
+/// argv. Windows npm Codex wrappers resolve to their packaged native executable.
+pub fn literal_program_for_spawn(program: &str) -> anyhow::Result<String> {
+    #[cfg(windows)]
+    let path = std::path::Path::new(program);
+    #[cfg(windows)]
+    let resolved = if path.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("com"))
+    {
+        program.to_string()
+    } else {
+        resolve_program_for_spawn(program)
+    };
+    #[cfg(not(windows))]
+    let resolved = resolve_program_for_spawn(program);
+    #[cfg(windows)]
+    let resolved = {
+        // Resolution can return a relative PATH entry. Persist an absolute target
+        // so neither the PTY cwd nor a later PATH change can choose another file.
+        let path = std::path::absolute(&resolved)?;
+        path.to_string_lossy().into_owned()
+    };
+    validate_literal_program(&resolved)?;
+    Ok(resolved)
+}
+
+fn validate_literal_program(program: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        anyhow::ensure!(
+            !is_windows_batch_program(program),
+            "literal argv cannot run Windows batch script '{program}'; choose its native executable or use --preset"
+        );
+        let path = std::path::Path::new(program);
+        anyhow::ensure!(
+            path.is_absolute() && path.is_file(),
+            "literal executable '{program}' must be an existing absolute native executable"
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = program;
+    Ok(())
 }
 
 /// Resolve `program` to a path CreateProcess can launch on Windows.
@@ -4840,12 +4965,150 @@ mod bounded_output_pty_tests {
 // Windows PATH resolution for npm shims (CreateProcess cannot run #!/bin/sh).
 #[cfg(all(test, windows))]
 mod windows_spawn_resolve {
-    use super::{CommandSpec, PtyChunk, TerminalSession, resolve_program_for_spawn_windows};
+    use super::{
+        CommandSpec, PtyChunk, TerminalSession, literal_program_for_spawn,
+        resolve_program_for_spawn_windows,
+    };
     use std::io::Write;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn literal_launch_refuses_batch_scripts_before_spawning() {
+        for extension in ["cmd", "bat"] {
+            let path = std::env::temp_dir().join(format!(
+                "muxel-literal-{}.{}",
+                uuid::Uuid::new_v4(),
+                extension
+            ));
+            std::fs::write(&path, "@echo off\r\n").unwrap();
+            let error = literal_program_for_spawn(path.to_str().unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(path.to_str().unwrap()), "{error}");
+            assert!(
+                error.contains("native executable") && error.contains("--preset"),
+                "{error}"
+            );
+            let spec = CommandSpec::literal(path.display().to_string(), vec![]);
+            assert!(
+                spec.program_for_spawn().is_err(),
+                "final boundary allowed batch target"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn literal_executable_is_resolved_once_even_with_a_batch_sidecar() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("muxel-native-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("tool.exe");
+        std::fs::write(&exe, b"native fixture").unwrap();
+        std::fs::write(dir.join("tool.exe.cmd"), b"@echo off\r\n").unwrap();
+        let resolved = literal_program_for_spawn(exe.to_str().unwrap()).unwrap();
+        assert_eq!(std::path::Path::new(&resolved), exe);
+        let spec = CommandSpec::literal(&resolved, vec!["brief".into()]);
+        // Exercise the same final-boundary method used by TerminalSession::spawn.
+        // The ordinary resolver would prefer tool.exe.cmd on its second lookup.
+        assert_eq!(spec.program_for_spawn().unwrap(), resolved);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Invoked as a child of the real ConPTY launch test below. The libtest `--`
+    // separator accepts arbitrary filter tokens, letting this executable itself
+    // capture the original argv without a shell or another tool dependency.
+    #[test]
+    fn literal_argv_fixture() {
+        let Ok(path) = std::env::var("MUXEL_TEST_ARGV_CAPTURE") else {
+            return;
+        };
+        let args: Vec<_> = std::env::args()
+            .skip_while(|arg| arg != "--")
+            .skip(1)
+            .collect();
+        std::fs::write(path, serde_json::to_vec(&args).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn native_pty_preserves_literal_argv() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let capture =
+            std::env::temp_dir().join(format!("muxel-argv-{}.json", uuid::Uuid::new_v4()));
+        let payload: Vec<String> = [
+            "a brief with spaces",
+            "say \"hello\"",
+            "",
+            "--",
+            "--background",
+            "ampersand & pipe | percent % caret ^",
+            "unicode 🦀",
+            "trailing\\",
+            "white space\\\\",
+            "backslashes\\\\\"quote",
+            "line one\nline two",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut args: Vec<String> = [
+            "--exact",
+            "session::windows_spawn_resolve::literal_argv_fixture",
+            "--nocapture",
+            "--",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        args.extend(payload.clone());
+        let program =
+            literal_program_for_spawn(std::env::current_exe().unwrap().to_str().unwrap()).unwrap();
+        let mut spec = CommandSpec::literal(program, args);
+        spec.env.push((
+            "MUXEL_TEST_ARGV_CAPTURE".into(),
+            capture.display().to_string(),
+        ));
+        let (session, rx) =
+            TerminalSession::spawn(spec, 80, 24).expect("spawn native argv fixture");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut received: Option<Vec<String>> = None;
+        while Instant::now() < deadline {
+            // ConPTY can keep its output pipe open after the child writes its
+            // result. The contract here is argv delivery, not pipe teardown.
+            if let Ok(bytes) = std::fs::read(&capture)
+                && let Ok(args) = serde_json::from_slice(&bytes)
+            {
+                received = Some(args);
+                break;
+            }
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+                        session.write_input(b"\x1b[1;1R");
+                    }
+                }
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => {
+                    break;
+                }
+                Err(async_channel::TryRecvError::Empty) => {}
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session.kill();
+        drop(_guard);
+        let received = received
+            .or_else(|| {
+                std::fs::read(&capture)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            })
+            .expect("native child captured argv");
+        std::fs::remove_file(capture).unwrap();
+        assert_eq!(received, payload);
+    }
 
     #[test]
     fn prefers_cmd_over_shebang_shim() {
@@ -4929,6 +5192,8 @@ mod windows_spawn_resolve {
             std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
         }
         let resolved = resolve_program_for_spawn_windows("codex");
+        let literal = literal_program_for_spawn("codex")
+            .expect("packaged native Codex supports literal argv");
         unsafe {
             match prev {
                 Some(value) => std::env::set_var("PATH", value),
@@ -4941,6 +5206,7 @@ mod windows_spawn_resolve {
         }
 
         assert_eq!(std::path::PathBuf::from(resolved), native);
+        assert_eq!(std::path::PathBuf::from(literal), native);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6148,6 +6414,77 @@ mod tests {
             session.is_idle_foreground(),
             "the direct child should be the foreground process group"
         );
+        session.kill();
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::{CommandSpec, TerminalSession};
+    use crate::startup::Guard;
+    use std::{sync::atomic::Ordering, time::Duration};
+
+    fn spawn() -> std::sync::Arc<TerminalSession> {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        TerminalSession::spawn(spec, 40, 12).expect("spawn").0
+    }
+
+    #[test]
+    fn quiet_control_output_waits_for_the_actual_claude_composer() {
+        let session = spawn();
+        session.process_probe_output(b"\x1b[2J\x1b[H");
+        let mut guard = Guard::new(0, Some(Duration::from_secs(30)));
+        assert!(session.has_output());
+        assert!(
+            !guard
+                .ready(
+                    Duration::from_millis(2500),
+                    0,
+                    session.startup_screen().claude_composer(true)
+                )
+                .unwrap()
+        );
+        let frame = format!(
+            "\x1b[2J\x1b[HClaude Code\r\n{}\r\n❯ Try a task\r\n{}\r\nmode\x1b[3;3H\x1b[?25h\x1b[?2004h",
+            "─".repeat(30),
+            "─".repeat(30)
+        );
+        session.process_probe_output(frame.as_bytes());
+        assert!(session.startup_screen().claude_composer(true));
+        assert!(
+            !guard
+                .ready(
+                    Duration::from_millis(7000),
+                    0,
+                    session.startup_screen().claude_composer(true)
+                )
+                .unwrap()
+        );
+        assert!(
+            guard
+                .ready(
+                    Duration::from_millis(7100),
+                    0,
+                    session.startup_screen().claude_composer(true)
+                )
+                .unwrap()
+        );
+        session.process_probe_output(b"\x1b[3;3H/b12-ready\x1b[K");
+        assert!(!session.startup_screen().claude_composer(true));
+        assert!(session.startup_screen().claude_composer(false));
+        session.kill();
+    }
+
+    #[test]
+    fn failed_submit_admission_does_not_mark_a_turn_submitted() {
+        let session = spawn();
+        session.input_closed.store(true, Ordering::Release);
+        assert!(session.try_submit_input(b"\r").is_err());
+        assert!(!session.has_submitted_turn());
         session.kill();
     }
 }
