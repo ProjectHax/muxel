@@ -2440,9 +2440,26 @@ fn resume_missing_message(program: Option<&str>, id: Option<&str>, text: &str) -
     text.contains("No conversation found")
 }
 
+/// Whether a tmux-wrapped Codex pane's clean exit is its resume failing. A
+/// Codex that cannot find the conversation ends its tmux session, the client
+/// exits 0, and tmux takes Codex's message away with its screen, so the
+/// missing-ID detector rarely sees it. A clean exit this soon after a resume
+/// launch counts as that failure: the pane starts fresh instead of closing.
+fn tmux_codex_resume_ended(
+    program: Option<&str>,
+    tmux: bool,
+    exit_code: Option<i32>,
+    recent_resume: bool,
+) -> bool {
+    is_codex_program(program) && tmux && exit_code == Some(0) && recent_resume
+}
+
 #[cfg(test)]
 mod claude_resume_tests {
-    use super::{effective_local_cwd, resume_missing_message, should_recover_expired_session};
+    use super::{
+        effective_local_cwd, resume_missing_message, should_recover_expired_session,
+        tmux_codex_resume_ended,
+    };
     use std::path::Path;
 
     #[test]
@@ -2485,6 +2502,40 @@ mod claude_resume_tests {
             Some(id),
             &format!("No saved session found with ID {id}")
         ));
+    }
+
+    #[test]
+    fn tmux_codex_clean_exit_after_resume_recovers_instead_of_closing() {
+        // What tick sees when `codex resume <id>` cannot find the rollout under
+        // tmux: the client exits 0 and the missing-ID message is gone.
+        let ended = tmux_codex_resume_ended(Some("codex"), true, Some(0), true);
+        assert!(ended);
+        assert!(should_recover_expired_session(Some("codex"), ended, false));
+        // A deliberate quit later, or a fresh launch, still closes on exit.
+        assert!(!tmux_codex_resume_ended(
+            Some("codex"),
+            true,
+            Some(0),
+            false
+        ));
+        // Only the tmux client hides the message; a direct child keeps it.
+        assert!(!tmux_codex_resume_ended(
+            Some("codex"),
+            false,
+            Some(0),
+            true
+        ));
+        // A failing client belongs to the reattach path.
+        assert!(!tmux_codex_resume_ended(Some("codex"), true, Some(1), true));
+        assert!(!tmux_codex_resume_ended(Some("codex"), true, None, true));
+        // Other providers keep their own recovery rules.
+        assert!(!tmux_codex_resume_ended(
+            Some("claude"),
+            true,
+            Some(0),
+            true
+        ));
+        assert!(!tmux_codex_resume_ended(Some("grok"), true, Some(0), true));
     }
 }
 
@@ -10924,22 +10975,29 @@ impl MuxelApp {
             // Other providers retain the earlier generic early-exit recovery.
             // A clean exit (code 0) is a deliberate quit — left to close-on-exit.
             //
-            // Never infer an expired resume from a tmux client's exit: what exits
-            // there is the *client*, and its status says nothing about the agent's
-            // resume (an agent that failed to resume would end its session and
-            // leave the client at 0). Treating a
-            // killed tmux server as a bad resume threw the conversation away — it
-            // reset `session_id` — every time the server died twice inside
+            // Never infer an expired resume from a tmux client's *failure*: what
+            // exits there is the *client*, and a killed tmux server is not a bad
+            // resume. Treating it as one threw the conversation away — it reset
+            // `session_id` — every time the server died twice inside
             // `RECOVER_WITHIN_SECS`. Those panes belong to `tmux_lost` below.
-            let exit_recover = exited
-                && exit_code != Some(0)
-                && tmux_session.is_none()
-                && self
-                    .terminal_launches
+            // A Codex resume that fails ends its session and leaves the client
+            // at 0, though, so that clean exit recovers instead of closing the
+            // pane (`tmux_codex_resume_ended`).
+            let recent_resume =
+                self.terminal_launches
                     .get(&iid)
                     .is_some_and(|&(at, was_resume)| {
                         was_resume && at.elapsed().as_secs() < RECOVER_WITHIN_SECS
                     });
+            let exit_recover =
+                exited && exit_code != Some(0) && tmux_session.is_none() && recent_resume;
+            let tmux_resume_ended = exited
+                && tmux_codex_resume_ended(
+                    self.resume_program(iid),
+                    tmux_session.is_some(),
+                    exit_code,
+                    recent_resume,
+                );
             // A tmux pane died in a way tmux itself never does on purpose. Either the
             // client was signalled (an agent's `pkill -f <project>` matching the
             // session name in its argv), or the *server* went away underneath it —
@@ -10964,7 +11022,11 @@ impl MuxelApp {
                     at.elapsed() >= reattach_backoff(self.reconnecting.get(&iid).copied())
                 });
 
-            if self.should_recover_expired_resume(iid, resume_error, exit_recover) {
+            if self.should_recover_expired_resume(
+                iid,
+                resume_error || tmux_resume_ended,
+                exit_recover,
+            ) {
                 to_recover.push((iid, title));
             } else if let Some(session) = tmux_session.filter(|_| tmux_lost) {
                 to_reattach.push((iid, title, session));
@@ -11089,9 +11151,9 @@ impl MuxelApp {
             // Reset to a brand-new session so the relaunch uses `--session-id`
             // (not the invalid `--resume`), then re-spawn the agent in place.
             self.bump_session_binding_generation(iid);
+            let agent_minted = is_codex_program(self.resume_program(iid));
             if let Some(inst) = self.workspace.instance_mut(iid) {
-                inst.session_id = (!is_codex_program(inst.program.as_deref()))
-                    .then(|| Uuid::new_v4().to_string());
+                inst.session_id = (!agent_minted).then(|| Uuid::new_v4().to_string());
                 inst.session_path = None;
                 inst.session_started = false;
             }

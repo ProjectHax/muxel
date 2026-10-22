@@ -196,9 +196,12 @@ feature is added or changed, update the matching entry here in the same change**
   Discovery continues in popped-out terminals. A result applies only when
   the pane still has the same launch, binding and directory, and no sibling owns it.
   A saved Codex conversation is abandoned when its validated saved rollout
-  path and compression sibling are both absent or non-files, or when Codex itself
-  reports that the exact resumed ID is missing soon after launch. An invalid path,
-  unreadable store, dated lookup miss, or unrelated early exit keeps the id and
+  path and compression sibling are both absent or non-files, when a complete walk
+  of the rollout store does not find it, or when Codex itself reports that the
+  exact resumed ID is missing soon after launch. Under tmux, where that message
+  leaves with tmux's screen, a clean exit within ten seconds of a Codex resume
+  counts as one: the pane starts fresh instead of closing. An invalid path,
+  unreadable store, unfinished walk, or unrelated early failure keeps the id and
   attempts resume.
   Remote Codex panes never check the local session store. Archived Codex sessions
   require unarchiving in Codex before they can resume.
