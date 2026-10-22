@@ -31,6 +31,13 @@ const MAX_TITLE_EVENT_BYTES: usize = 16 * 1024;
 /// starting and finishing inside the window shows no Done.
 pub(crate) const SWITCH_SLACK: Duration = Duration::from_secs(2);
 
+/// How long after a switch window closes the reducer waits for fresh evidence
+/// before it takes the level state it shows as the new conversation's. An idle
+/// provider may print nothing more after `/clear` or `/resume`; without a bound
+/// its status would stay uncertain, and `ctl` would treat it as Working, until
+/// something else printed. Settling this way forms no completion edge.
+pub(crate) const SWITCH_SETTLE: Duration = Duration::from_secs(2);
+
 /// Where one piece of lifecycle evidence (an OSC title, a bell, a submitted
 /// turn) falls in this PTY's evidence order. The sequence orders evidence
 /// exactly; the wall-clock time places it against a provider switch that is
@@ -118,6 +125,9 @@ pub(crate) struct EvidenceRead {
     /// The binding began at a switch reported out of band and has no fresh
     /// evidence yet, so the level state may still be the old conversation's.
     pub settling: bool,
+    /// While settling: when it ends without fresh evidence (see
+    /// [`SWITCH_SETTLE`]).
+    pub settles_at: Option<SystemTime>,
     /// The binding began at a switch reported out of band.
     pub windowed: bool,
 }
@@ -140,6 +150,15 @@ struct SwitchWindow {
     /// When muxel learned of the switch, or `input_after` plus the slack if
     /// that is later. Output read after it is the new conversation's.
     output_after: SystemTime,
+}
+
+impl SwitchWindow {
+    /// When the level state settles if no fresh evidence has arrived.
+    fn settles_at(&self) -> SystemTime {
+        self.output_after
+            .checked_add(SWITCH_SETTLE)
+            .unwrap_or(self.output_after)
+    }
 }
 
 /// A PTY launch's lifecycle evidence, in one order, and the provider binding
@@ -317,10 +336,15 @@ impl LifecycleEvidence {
         switch
     }
 
-    /// Read for the reducer. `cursor: None` reads the current binding's title
-    /// edges from its start; a cursor never reaches back into a retired
-    /// binding.
+    #[cfg(test)]
     pub(crate) fn read(&self, cursor: Option<u64>) -> EvidenceRead {
+        self.read_at(cursor, SystemTime::now())
+    }
+
+    /// Read for the reducer at wall-clock time `now`. `cursor: None` reads the
+    /// current binding's title edges from its start; a cursor never reaches
+    /// back into a retired binding.
+    pub(crate) fn read_at(&self, cursor: Option<u64>, now: SystemTime) -> EvidenceRead {
         let start = self.binding_since.saturating_sub(1);
         let cursor = cursor.map_or(start, |cursor| cursor.max(start));
         let window = self.window;
@@ -337,18 +361,25 @@ impl LifecycleEvidence {
                 Some(window) => mark.at > window.input_after,
                 None => mark.seq >= self.binding_since,
             }),
-            settling: self.settling(),
+            settling: self.settling(now),
+            settles_at: window
+                .filter(|_| self.settling(now))
+                .map(|window| window.settles_at()),
             windowed: window.is_some(),
         }
     }
 
     /// After a switch reported out of band, until fresh evidence sets the
     /// level state: the current title was read inside the window, or there is
-    /// none and no output read after the window has been parsed.
-    fn settling(&self) -> bool {
+    /// none and no output read after the window has been parsed. Without
+    /// fresh evidence, it ends [`SWITCH_SETTLE`] after the window closes.
+    fn settling(&self, now: SystemTime) -> bool {
         let Some(window) = self.window else {
             return false;
         };
+        if now >= window.settles_at() {
+            return false;
+        }
         match self.title {
             Some(mark) => mark.at <= window.output_after,
             None => !self.fresh_output,
@@ -740,6 +771,39 @@ mod tests {
         let read = evidence.read(None);
         assert_eq!(read.titles, vec![Some("fresh".into())]);
         assert!(!read.settling);
+    }
+
+    #[test]
+    fn an_uncertain_level_state_settles_after_the_window_without_fresh_evidence() {
+        let t0 = SystemTime::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let slack = SWITCH_SLACK.as_millis() as u64;
+        let mut evidence = LifecycleEvidence::default();
+        // `/clear` while idle: Claude redraws around its hook, then prints
+        // nothing more.
+        evidence.record_submission(at(9_000));
+        evidence.switch_binding(at(10_000), at(10_000), at(10_400));
+        evidence.record_title(Some("idle".into()), at(10_100));
+        let closes = at(10_000 + slack);
+        let read = evidence.read_at(None, closes);
+        assert!(read.settling);
+        assert_eq!(read.settles_at, Some(closes + SWITCH_SETTLE));
+        let almost = closes + SWITCH_SETTLE - Duration::from_millis(1);
+        assert!(evidence.read_at(None, almost).settling);
+        let settled = evidence.read_at(None, closes + SWITCH_SETTLE);
+        assert!(!settled.settling);
+        assert_eq!(settled.settles_at, None);
+        assert!(
+            settled.titles.is_empty(),
+            "a title read in the window still forms no edge"
+        );
+        assert!(!settled.submitted, "nor does the Enter before the hook arm");
+
+        // Fresh evidence settles it sooner, with no deadline left.
+        evidence.record_title(Some("fresh".into()), at(10_001 + slack));
+        let read = evidence.read_at(None, closes);
+        assert!(!read.settling);
+        assert_eq!(read.settles_at, None);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
 use gpui::*;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 /// Stop draining after this many bytes in a single turn so one noisy terminal
@@ -331,8 +331,16 @@ impl RuntimeStatusState {
             // switch window never rang.
         }
 
-        let evidence = session.runtime_evidence(self.title_cursor);
+        // Evidence is timed on the wall clock. Read it at the time `now` stands
+        // for, so a deadline the caller's clock has reached has passed there too.
+        let wall = wall_time_at(now);
+        let evidence = session.runtime_evidence_at(self.title_cursor, wall);
         self.title_cursor = Some(evidence.cursor);
+        // An uncertain level state settles at a deadline of its own, in case
+        // no fresh evidence ever comes; just after it, so it has passed.
+        let settle_deadline = evidence
+            .settles_at
+            .map(|at| now + at.duration_since(wall).unwrap_or_default() + Duration::from_millis(1));
         let (title_events, title_overflowed) = (evidence.titles, evidence.overflowed);
         let (_, title_text) = session.title_snapshot();
         let observed_title =
@@ -511,7 +519,11 @@ impl RuntimeStatusState {
             status,
             title_provider,
             !working_markers.is_empty(),
-        ) {
+        )
+        .into_iter()
+        .chain(settle_deadline)
+        .min()
+        {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
 
@@ -1423,6 +1435,16 @@ fn fallback_status_deadline(
         && !has_working_markers
         && idle < Duration::from_secs(2))
     .then(|| now + (Duration::from_secs(2) - idle))
+}
+
+/// The wall-clock time `at` stands for.
+fn wall_time_at(at: Instant) -> SystemTime {
+    let (now, wall) = (Instant::now(), SystemTime::now());
+    if at >= now {
+        wall.checked_add(at - now).unwrap_or(wall)
+    } else {
+        wall.checked_sub(now - at).unwrap_or(wall)
+    }
 }
 
 fn runtime_timer_is_current(current: u64, callback: u64) -> bool {
@@ -4019,7 +4041,7 @@ mod provider_switch_tests {
         AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TerminalStatusReason,
         TitleProvider, screen_hold_after, status_is_attributable, title_status_trace,
     };
-    use crate::listener::SWITCH_SLACK;
+    use crate::listener::{SWITCH_SETTLE, SWITCH_SLACK};
     use crate::session::{CommandSpec, PtyOutput, TerminalSession};
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
@@ -4044,7 +4066,7 @@ mod provider_switch_tests {
     }
 
     #[test]
-    fn delayed_initial_binding_can_remain_uncertain_after_the_task_finishes() {
+    fn a_switch_with_no_fresh_evidence_settles_at_its_deadline_without_completing() {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
         let clock = Instant::now();
@@ -4063,9 +4085,37 @@ mod provider_switch_tests {
                 learned - Duration::from_millis(10),
             ),
         ]));
-        // No more output arrives. Passage of time cannot attribute a final
-        // title that was read inside the switch window. Loop cleanup must
-        // therefore release tracking at its cap without closing this pane.
+        // No more output arrives, as from an idle Claude after `/clear`.
+        let (_, deadline) =
+            runtime.reconcile(&session, TitleProvider::Claude, &[], &[], false, clock);
+        let snapshot = runtime.snapshot(&session);
+        assert!(
+            !snapshot.attributable,
+            "the final title was read in the window"
+        );
+        assert!(
+            snapshot.completion_ready,
+            "input after the hook still arms a turn"
+        );
+        // The reducer wakes itself when the window has been closed for
+        // SWITCH_SETTLE; it doesn't wait for output that may never come.
+        let deadline = deadline.expect("a settle deadline");
+        let settles = learned + SWITCH_SETTLE;
+        let due = Instant::now() + settles.duration_since(SystemTime::now()).unwrap();
+        assert!(
+            deadline + Duration::from_millis(100) >= due
+                && deadline <= due + Duration::from_millis(100)
+        );
+        let mut earlier = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        earlier.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            deadline - Duration::from_millis(500),
+        );
+        assert!(!earlier.snapshot(&session).attributable);
         for elapsed in [Duration::ZERO, Duration::from_secs(30 * 60)] {
             runtime.reconcile(
                 &session,
@@ -4073,17 +4123,43 @@ mod provider_switch_tests {
                 &[],
                 &[],
                 false,
-                clock + elapsed,
+                deadline + elapsed,
             );
             let snapshot = runtime.snapshot(&session);
-            assert!(!snapshot.attributable);
-            assert!(
-                snapshot.completion_ready,
-                "input after the hook still arms a turn"
-            );
+            assert!(snapshot.attributable, "ctl may send to an idle pane again");
+            assert_eq!(snapshot.status, AgentStatus::Idle);
+            assert!(snapshot.completion_ready);
+            // The turn finished inside the window: settling forms no edge.
             assert_ne!(snapshot.status, AgentStatus::Done);
-            assert!(session.runtime_evidence(None).settling);
         }
+        // A later turn in the new conversation completes as usual.
+        let later = settles + Duration::from_secs(1);
+        session.mark_turn_submitted();
+        session.process_drained(&drained(&[("\x1b]0;\u{25d0} Next\x07", later)]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            deadline + Duration::from_secs(2),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+        session.process_drained(&drained(&[(
+            "\x1b]0;\u{2733} Next\x07",
+            later + Duration::from_millis(10),
+        )]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            deadline + Duration::from_secs(3),
+        );
+        let done = runtime.snapshot(&session);
+        assert_eq!(done.status, AgentStatus::Done);
+        assert!(done.attributable);
         session.kill();
     }
 
@@ -4337,7 +4413,8 @@ mod provider_switch_tests {
         let (session, _receiver) = fixture();
         let mut viewer = Viewer::new(TitleProvider::Grok);
         let clock = viewer.clock;
-        let hook = SystemTime::now() - Duration::from_secs(10);
+        // Recent enough that the window's settle deadline is still ahead.
+        let hook = SystemTime::now() - Duration::from_secs(1);
         let blocked = "\x1b]0;\u{26a0} Action Required - \u{280b} - Preparing question\u{2026} - Topic - grok\x07";
         let working = "\x1b]0;\u{2839} - Responding - Topic - grok\x07";
         session.process_drained(&drained(&[(blocked, hook + Duration::from_millis(100))]));
@@ -4393,7 +4470,8 @@ mod provider_switch_tests {
         ] {
             let (session, _receiver) = fixture();
             let mut viewer = Viewer::new(TitleProvider::Claude);
-            let hook = SystemTime::now() - Duration::from_secs(10);
+            // Recent enough that the window's settle deadline is still ahead.
+            let hook = SystemTime::now() - Duration::from_secs(1);
             session.process_drained(&drained(&[(old_title, hook + Duration::from_millis(100))]));
             session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
             assert_eq!(viewer.sample(&session), (old_status, false));

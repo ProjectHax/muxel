@@ -1815,11 +1815,16 @@ impl TerminalSession {
         (state >> 1, state & 1 != 0)
     }
 
-    /// Lifecycle evidence for the runtime reducer: title edges after `cursor`
-    /// (`None`: from the current binding's start) and whether a turn was
-    /// submitted in the current binding.
+    #[cfg(test)]
     pub(crate) fn runtime_evidence(&self, cursor: Option<u64>) -> EvidenceRead {
-        self.evidence.lock().read(cursor)
+        self.runtime_evidence_at(cursor, SystemTime::now())
+    }
+
+    /// Lifecycle evidence for the runtime reducer at wall-clock time `now`:
+    /// title edges after `cursor` (`None`: from the current binding's start)
+    /// and whether a turn was submitted in the current binding.
+    pub(crate) fn runtime_evidence_at(&self, cursor: Option<u64>, now: SystemTime) -> EvidenceRead {
+        self.evidence.lock().read_at(cursor, now)
     }
 
     /// Coalesced lifecycle invalidations for the runtime reducer. Receivers

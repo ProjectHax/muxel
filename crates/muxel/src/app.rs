@@ -3476,9 +3476,9 @@ mod loop_cleanup_tests {
         let (session, _receiver) = session();
         let hook = SystemTime::now() - Duration::from_secs(1);
         session.mark_turn_submitted();
-        // The initial hook is discovered after submission. The task finishes
-        // inside its ambiguity window, then emits no more output. The terminal
-        // reducer regression covers the resulting persistent uncertainty.
+        // An unknown launch's first identity is reported after submission. The
+        // task finishes inside its ambiguity window, then emits no more output;
+        // the status stays uncertain until the window's settle deadline.
         session.provider_switched(hook, hook);
         session.process_probe_output("\x1b]0;\u{2733} Finished\x07".as_bytes());
         let rev = session.binding_revision();

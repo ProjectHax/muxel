@@ -363,6 +363,8 @@ feature is added or changed, update the matching entry here in the same change**
   evidence arrives, and the Enter that picked the conversation doesn't count as
   a turn in it. During uncertainty, `ctl` treats the pane as Working: ordinary
   sends are refused and `wait` keeps waiting; `send --force` retains its override.
+  An agent that prints nothing more after the switch settles a couple of seconds
+  later, on a timer, so an idle pane accepts sends again.
   A Grok conversation switch releases old loop ownership even if saving fails.
   Each pane uses its own discovery history, so another pane's refresh cannot
   discard its valid current title.

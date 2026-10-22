@@ -10,7 +10,7 @@ invalidates cached facts before its queued reconciliation runs.
 
 The view reconciles after drained PTY output, process exit, a settled resize,
 a submission, a provider binding switch, an acknowledged bell, or the earliest
-due quiet/provider debounce deadline. A one-entry runtime trigger coalesces
+due quiet/provider debounce or switch settle deadline. A one-entry runtime trigger coalesces
 redundant invalidations. Timers carry a generation and become no-ops after a
 newer deadline replaces them.
 
@@ -86,6 +86,12 @@ current title without a completion edge.
   edge nor arms one; a submission made after the switch still arms. A turn
   that starts and finishes inside the window shows no Done.
 
+  An idle provider may print nothing more after `/clear` or `/resume`, so the
+  wait is bounded: two seconds after the window closes, a deadline of its own
+  reconciles the reducer, which then takes the level state it shows as the new
+  conversation's. That forms no completion edge either (an Idle reached this
+  way arms the next turn, as at startup) and doesn't end a screen hold.
+
   The status shown meanwhile is marked non-attributable
   (`status_attributable()`): a Blocked from an old title or a prompt still on
   screen may be the old conversation's. The app neither notifies for a
@@ -112,8 +118,9 @@ current title without a completion edge.
   Control commands use current runtime facts rather than the attention history
   held through uncertainty. A non-attributable status, including a cached
   snapshot from before the session's current revision, is treated as Working:
-  an ordinary `send` is refused and `wait` keeps waiting. `send --force` retains
-  its explicit override. Exit and failed/not-running launch states keep their
+  an ordinary `send` is refused and `wait` keeps waiting, at most until the
+  settle deadline unless an old prompt's screen hold persists. `send --force`
+  retains its explicit override. Exit and failed/not-running launch states keep their
   existing control behavior.
 
   Docked and popped-out terminals use the same attribution gate for activity
