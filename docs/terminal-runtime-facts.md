@@ -163,7 +163,15 @@ current title without a completion edge.
   before applying or acknowledging it. Prelaunch recovery uses the same UI
   claim owner. A record the hook writes meanwhile waits at the shared path;
   a newer mismatching claim or one whose binding failed to save is retained
-  and validated before the next shared record.
+  and validated before the next shared record. So is a record muxel can't
+  adopt yet: its transcript doesn't validate yet (`/clear` can run before
+  Claude creates the cwd's project directory), or another pane owns its
+  conversation. A newer shared record supersedes it, so one that never
+  validates can't hold back the next; only a record that isn't a Claude
+  `SessionStart` event is dropped unadopted. Prelaunch recovery refuses the
+  launch when a pending record can't be claimed or read, or its binding can't
+  be saved. Failing to acknowledge a saved binding is logged and the launch
+  goes ahead, unless a newer record waits behind the stuck claim.
 - An accepted Grok identity is retained separately from durable workspace
   metadata. A real identity change invalidates the live terminal before saving,
   so a failed save cannot leave an old Exit-policy loop owning the replacement.

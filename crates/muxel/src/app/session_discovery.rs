@@ -336,7 +336,8 @@ impl MuxelApp {
                     if unowned {
                         self.stage_discovered_claude(iid, record, binding, cx)
                     } else {
-                        session_binding::acknowledge_claude_binding(record);
+                        // Not valid yet, or another pane's conversation.
+                        session_binding::defer_claude_binding(record);
                         None
                     }
                 }
@@ -526,7 +527,7 @@ impl MuxelApp {
         cx: &App,
     ) -> Option<SessionBindingUpdate> {
         let Some(binding) = binding else {
-            session_binding::acknowledge_claude_binding(record);
+            session_binding::defer_claude_binding(record);
             return None;
         };
         let launch = self.discovery_terminal(iid)?.read(cx).session().id;
@@ -1410,6 +1411,19 @@ mod tests {
             session_binding::ClaudeBindingSnapshot,
             session_binding::ClaudeBinding,
         ) {
+            match self.read() {
+                (snapshot, Some(binding)) => (snapshot, binding),
+                _ => panic!("expected validated pending Claude snapshot"),
+            }
+        }
+
+        /// One worker read of the pane's pending record, validated or not.
+        fn read(
+            &self,
+        ) -> (
+            session_binding::ClaudeBindingSnapshot,
+            Option<session_binding::ClaudeBinding>,
+        ) {
             let (home, data, request) =
                 (self.home.clone(), self.data.clone(), self.request.clone());
             let mut batch = std::thread::spawn(move || {
@@ -1418,11 +1432,8 @@ mod tests {
             .join()
             .unwrap();
             match batch.results.pop().unwrap().1 {
-                DiscoveryCandidate::Claude {
-                    snapshot,
-                    binding: Some(binding),
-                } => (snapshot, binding),
-                _ => panic!("expected validated pending Claude snapshot"),
+                DiscoveryCandidate::Claude { snapshot, binding } => (snapshot, binding),
+                _ => panic!("expected a pending Claude snapshot"),
             }
         }
 
@@ -1480,6 +1491,38 @@ mod tests {
         let (retry, binding) = fixture.candidate();
         assert_eq!(binding.session_id, newer_identity.to_string());
         session_binding::acknowledge_claude_binding(fixture.claim(&retry).unwrap());
+        assert!(
+            session_binding::read_pending_claude_binding(&fixture.data, fixture.pane).is_none()
+        );
+    }
+
+    #[test]
+    fn claude_worker_keeps_a_clear_record_until_its_project_directory_exists() {
+        let fixture = ClaudeFixture::new();
+        // `/clear` in a cwd Claude hasn't written a transcript for yet.
+        let identity = Uuid::new_v4();
+        let project = fixture.home.join(".claude/projects/fresh");
+        let bytes = json!({
+            "hook_event_name":"SessionStart", "source":"clear", "session_id":identity,
+            "cwd":project, "transcript_path":project.join(format!("{identity}.jsonl")),
+            "muxel_hook":{"nonce":Uuid::new_v4(), "recorded_at_us":123456000_u64}
+        })
+        .to_string()
+        .into_bytes();
+        std::fs::create_dir_all(fixture.shared().parent().unwrap()).unwrap();
+        std::fs::write(fixture.shared(), &bytes).unwrap();
+        let (snapshot, binding) = fixture.read();
+        assert!(binding.is_none());
+        // What the UI does with a record it can't adopt yet.
+        session_binding::defer_claude_binding(fixture.claim(&snapshot).unwrap());
+        let (retry, binding) = fixture.read();
+        assert_eq!(retry.bytes, bytes, "the switch isn't lost");
+        assert!(binding.is_none());
+        std::fs::create_dir_all(&project).unwrap();
+        let (snapshot, binding) = fixture.candidate();
+        assert_eq!(snapshot.bytes, bytes);
+        assert_eq!(binding.session_id, identity.to_string());
+        session_binding::acknowledge_claude_binding(fixture.claim(&snapshot).unwrap());
         assert!(
             session_binding::read_pending_claude_binding(&fixture.data, fixture.pane).is_none()
         );

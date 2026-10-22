@@ -182,8 +182,12 @@ feature is added or changed, update the matching entry here in the same change**
   is really gone — a session store it couldn't read leaves the pane's resume id alone —
   and the pane then quietly starts fresh. Before a local Claude relaunch, pending hook
   records are handled through the newest binding before resume arguments are chosen.
-  If recovery cannot be saved or acknowledged, launch stops and the pending record
-  remains available for retry.
+  If a recovered binding cannot be saved, or a pending record cannot be read, launch
+  stops and the record remains available for retry; failing only to remove a record
+  whose binding was saved is logged and the pane launches, unless a newer record
+  waits behind it. A record that can't be
+  adopted yet (a `/clear` before Claude creates its project directory) is kept and
+  retried until it validates or a newer one replaces it.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to

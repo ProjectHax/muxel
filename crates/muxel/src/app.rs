@@ -7366,10 +7366,7 @@ impl MuxelApp {
                 crate::session_binding::recover_claude_bindings_before_resume(
                     &data_dir,
                     iid,
-                    |record| {
-                        self.adopt_claude_session_record(iid, None, record, &home)
-                            .map(|_| ())
-                    },
+                    |record| self.adopt_claude_session_record(iid, None, record, &home),
                 )
                 .with_context(|| t("Could not recover this conversation before launch."))?;
             }
@@ -11454,28 +11451,23 @@ impl MuxelApp {
     /// records require a real transcript; clear/fork records may precede their
     /// first write. The cwd may differ after `/cd` or an all-project `/resume`.
     /// `launch` is the pane's live PTY launch, if it has one; the nonce of the
-    /// last record read is remembered per launch. Returns when the hook ran if
-    /// the record reports a switch and the binding was adopted.
+    /// last record read is remembered per launch. A record that doesn't
+    /// validate yet, or names another pane's conversation, isn't adopted yet;
+    /// any other is handled once its switch, if any, is saved.
     fn adopt_claude_session_record(
         &mut self,
         iid: Uuid,
         launch: Option<Uuid>,
         record: &crate::session_binding::ClaimedClaudeRecord,
         home: &std::path::Path,
-    ) -> anyhow::Result<Option<SystemTime>> {
+    ) -> anyhow::Result<crate::session_binding::RecoveredClaudeRecord> {
+        use crate::session_binding::RecoveredClaudeRecord::{Handled, NotYet};
         let Some(binding) = crate::session_binding::claude_binding_from_record(&record.bytes, home)
         else {
-            return Ok(None);
+            return Ok(NotYet);
         };
-        // The hook stamps when it ran. An older muxel's hook didn't; its
-        // record's write time stands in, and an unreadable one falls back to now.
-        let switched_at = binding
-            .stamp
-            .map(|stamp| stamp.recorded_at)
-            .or(record.modified)
-            .unwrap_or_else(SystemTime::now);
         if session_id_bound_elsewhere(&self.workspace.instances, iid, &binding.session_id) {
-            return Ok(None);
+            return Ok(NotYet);
         }
         let seen = self
             .claude_hook_seen
@@ -11488,10 +11480,10 @@ impl MuxelApp {
             .and_then(|instance| instance.session_id.as_deref());
         if !crate::session_binding::claude_record_switches(&binding, seen, bound) {
             self.remember_claude_hook(iid, launch, binding.stamp);
-            return Ok(None);
+            return Ok(Handled);
         }
         let Some(instance) = self.workspace.instance_mut(iid) else {
-            return Ok(None);
+            return Ok(Handled);
         };
         let previous_session_id = instance.session_id.clone();
         let previous_session_started = instance.session_started;
@@ -11502,7 +11494,7 @@ impl MuxelApp {
         self.bump_session_binding_generation(iid);
         if self.try_persist() {
             self.remember_claude_hook(iid, launch, binding.stamp);
-            Ok(Some(switched_at))
+            Ok(Handled)
         } else {
             // The claimed record stays; the next claim retries it before any
             // record the hook has written since.

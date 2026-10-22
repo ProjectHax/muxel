@@ -425,6 +425,16 @@ fn read_claude_binding(data_dir: &Path, instance_id: Uuid, home: &Path) -> Optio
     )
 }
 
+/// Whether a binding record can never validate: it isn't a Claude
+/// `SessionStart` event the hook would write. A well-formed record can fail
+/// [`claude_binding_from_record`] only for now, while its transcript's project
+/// directory doesn't exist yet.
+pub(crate) fn claude_record_is_malformed(record: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(record)
+        .ok()
+        .is_none_or(|event| validate_claude_event(&event).is_err())
+}
+
 /// Parse and validate one read of a binding record. The session id, its
 /// transcript and the hook's stamp all come from the same bytes.
 pub(crate) fn claude_binding_from_record(record: &[u8], home: &Path) -> Option<ClaudeBinding> {
@@ -491,8 +501,19 @@ pub(crate) fn read_pending_claude_binding(
 
 pub(crate) struct ClaimedClaudeRecord {
     path: PathBuf,
+    /// The shared path, where the hook writes the pane's next record.
+    shared: PathBuf,
     pub bytes: Vec<u8>,
     pub modified: Option<SystemTime>,
+}
+
+impl ClaimedClaudeRecord {
+    /// Whether the hook has written a newer record since this one was claimed.
+    fn superseded(&self) -> Result<bool> {
+        self.shared
+            .try_exists()
+            .context("check for a newer Claude conversation binding")
+    }
 }
 
 /// Where a pane's binding record moves while muxel handles it. The hook never
@@ -520,8 +541,9 @@ fn try_claim_claude_binding(
     instance_id: Uuid,
 ) -> Result<Option<ClaimedClaudeRecord>> {
     let path = claude_claimed_binding_path(data_dir, instance_id);
+    let shared = claude_binding_path(data_dir, instance_id);
     if !path.try_exists()? {
-        match std::fs::rename(claude_binding_path(data_dir, instance_id), &path) {
+        match std::fs::rename(&shared, &path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("claim Claude conversation binding"),
@@ -533,22 +555,58 @@ fn try_claim_claude_binding(
         .ok();
     Ok(Some(ClaimedClaudeRecord {
         path,
+        shared,
         bytes,
         modified,
     }))
 }
 
-/// Drain pending records before choosing launch arguments. A failed handler leaves
-/// its claim intact; failed acknowledgement stops recovery rather than retrying
-/// the same claim forever or launching over a pending newer binding.
+/// What prelaunch recovery's handler did with one claimed record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveredClaudeRecord {
+    /// Adopted and saved, or nothing to adopt: it names the saved
+    /// conversation. Acknowledge it.
+    Handled,
+    /// It isn't adopted now (see [`defer_claude_binding`]). Recovery keeps it
+    /// unless it can never validate or a newer record supersedes it.
+    NotYet,
+}
+
+/// Drain pending records before choosing launch arguments, through the newest.
+/// A failed handler leaves its claim intact and stops the launch. A record that
+/// can't be adopted yet stays claimed for a later retry, and the launch uses the
+/// saved binding, unless the hook has written a newer record, which supersedes it.
+///
+/// A handled record's binding is already saved, so failing to acknowledge it is
+/// logged and the launch goes ahead; the claim stays for a later retry, where it
+/// names the saved conversation. Only a newer record waiting behind it stops
+/// the launch: it can't be claimed past the stuck one, and launching would
+/// resume the conversation it replaced. So do claim and read failures, which
+/// leave a pending record unread.
 pub(crate) fn recover_claude_bindings_before_resume(
     data_dir: &Path,
     instance_id: Uuid,
-    mut adopt: impl FnMut(&ClaimedClaudeRecord) -> Result<()>,
+    mut adopt: impl FnMut(&ClaimedClaudeRecord) -> Result<RecoveredClaudeRecord>,
 ) -> Result<()> {
     while let Some(record) = try_claim_claude_binding(data_dir, instance_id)? {
-        adopt(&record)?;
-        std::fs::remove_file(record.path).context("acknowledge recovered Claude conversation")?;
+        if adopt(&record)? == RecoveredClaudeRecord::NotYet
+            && !claude_record_is_malformed(&record.bytes)
+            && !record.superseded()?
+        {
+            return Ok(());
+        }
+        match std::fs::remove_file(&record.path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                if record.superseded()? {
+                    return Err(error).context("acknowledge recovered Claude conversation");
+                }
+                log::warn!(
+                    "could not acknowledge a recovered Claude conversation; launching with the saved binding: {error}"
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -557,6 +615,18 @@ pub(crate) fn recover_claude_bindings_before_resume(
 /// goes; a record the hook has written since waits for the next claim.
 pub(crate) fn acknowledge_claude_binding(record: ClaimedClaudeRecord) {
     let _ = std::fs::remove_file(record.path);
+}
+
+/// Keep a claimed record muxel can't adopt yet: its transcript doesn't
+/// validate yet (`/clear` can run before Claude creates the project
+/// directory), or another pane owns its conversation. The next claim retries
+/// it, as a later read retried an unclaimed record, until the hook writes a
+/// newer one: that supersedes it, so a record that never validates can't hold
+/// back the next. A record that can never validate goes now.
+pub(crate) fn defer_claude_binding(record: ClaimedClaudeRecord) {
+    if claude_record_is_malformed(&record.bytes) || record.superseded().unwrap_or(false) {
+        acknowledge_claude_binding(record);
+    }
 }
 
 #[cfg(test)]
@@ -643,16 +713,58 @@ mod tests {
             muxel_store::load_workspace_from(&self.workspace_path).unwrap()
         }
 
+        /// The production handler's outcomes: a record that doesn't validate
+        /// yet isn't adopted yet; any other is saved, then handled.
         fn persist_record(
             &self,
             workspace: &mut muxel_core::Workspace,
             record: &ClaimedClaudeRecord,
-        ) -> Result<()> {
-            let binding = claude_binding_from_record(&record.bytes, &self.home).unwrap();
+        ) -> Result<RecoveredClaudeRecord> {
+            let Some(binding) = claude_binding_from_record(&record.bytes, &self.home) else {
+                return Ok(RecoveredClaudeRecord::NotYet);
+            };
             let instance = workspace.instance_mut(self.instance_id).unwrap();
             instance.session_id = Some(binding.session_id);
             instance.session_started = true;
-            muxel_store::save_workspace_to(&self.workspace_path, workspace)
+            muxel_store::save_workspace_to(&self.workspace_path, workspace)?;
+            Ok(RecoveredClaudeRecord::Handled)
+        }
+
+        fn saved_id(&self) -> Option<String> {
+            self.workspace()
+                .instance(self.instance_id)
+                .unwrap()
+                .session_id
+                .clone()
+        }
+
+        /// Run the hook as Claude does on `/clear`, which can announce the new
+        /// conversation before Claude creates its project directory.
+        fn clear_hook(&self, session_id: &str, cwd: &Path) {
+            let transcript = muxel_core::claude_session_path(&self.home, cwd, session_id);
+            let event = json!({
+                "session_id": session_id,
+                "transcript_path": transcript,
+                "cwd": cwd,
+                "hook_event_name": "SessionStart",
+                "source": "clear"
+            });
+            write_claude_binding_from_reader(
+                &self.data,
+                self.instance_id,
+                std::io::Cursor::new(event.to_string()),
+            )
+            .unwrap();
+        }
+
+        /// Drain the old record, leaving nothing pending.
+        fn drain(&self) {
+            let mut workspace = self.workspace();
+            recover_claude_bindings_before_resume(&self.data, self.instance_id, |record| {
+                self.persist_record(&mut workspace, record)
+            })
+            .unwrap();
+            assert!(claim_claude_binding(&self.data, self.instance_id).is_none());
         }
 
         fn resume_args(&self, workspace: &muxel_core::Workspace) -> Vec<String> {
@@ -733,20 +845,141 @@ mod tests {
         );
     }
 
+    /// Make a claimed record impossible to acknowledge: a directory takes its
+    /// place, which `remove_file` refuses on every platform.
+    fn block_acknowledgement(record: &ClaimedClaudeRecord) -> Result<()> {
+        std::fs::remove_file(&record.path)?;
+        std::fs::create_dir(&record.path)?;
+        Ok(())
+    }
+
     #[test]
-    fn prelaunch_recovery_stops_if_acknowledgement_fails() {
+    fn prelaunch_recovery_stops_if_a_newer_record_waits_behind_a_failed_acknowledgement() {
         let pending = PendingResume::new();
+        let mut workspace = pending.workspace();
         let mut handled = 0;
         let result =
             recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
                 handled += 1;
-                std::fs::remove_file(&record.path)?;
-                std::fs::create_dir(&record.path)?;
-                Ok(())
+                let outcome = pending.persist_record(&mut workspace, record)?;
+                block_acknowledgement(record)?;
+                Ok(outcome)
             });
+        // The newer record can't be claimed past the stuck one, and the saved
+        // binding is the conversation it replaced.
         assert!(result.unwrap_err().to_string().contains("acknowledge"));
         assert_eq!(handled, 1);
+        assert_eq!(pending.saved_id(), Some(pending.old_id.clone()));
         assert!(claude_binding_path(&pending.data, pending.instance_id).exists());
+    }
+
+    #[test]
+    fn prelaunch_recovery_launches_after_failing_to_acknowledge_a_saved_binding() {
+        let pending = PendingResume::new();
+        pending.drain();
+        let cwd = pending.root.join("project");
+        let newest = Uuid::new_v4().to_string();
+        resume_hook(
+            &pending.data,
+            &pending.home,
+            &cwd,
+            pending.instance_id,
+            &newest,
+        );
+        let mut workspace = pending.workspace();
+        let mut handled = 0;
+        recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+            handled += 1;
+            let outcome = pending.persist_record(&mut workspace, record)?;
+            block_acknowledgement(record)?;
+            Ok(outcome)
+        })
+        .expect("a saved binding whose record can't be removed still launches");
+        assert_eq!(handled, 1, "the stuck claim isn't retried in a loop");
+        assert_eq!(
+            pending.resume_args(&pending.workspace()),
+            vec!["--resume".to_string(), newest]
+        );
+    }
+
+    #[test]
+    fn prelaunch_recovery_keeps_a_record_that_cannot_validate_yet() {
+        let pending = PendingResume::new();
+        pending.drain();
+        // `/clear` before Claude has created the cwd's project directory.
+        let cwd = pending.root.join("fresh-project");
+        let cleared = Uuid::new_v4().to_string();
+        pending.clear_hook(&cleared, &cwd);
+        let recover = || {
+            let mut workspace = pending.workspace();
+            recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+                pending.persist_record(&mut workspace, record)
+            })
+        };
+        recover().expect("launch goes ahead with the saved binding");
+        assert_eq!(pending.saved_id(), Some(pending.new_id.clone()));
+        let kept = claim_claude_binding(&pending.data, pending.instance_id)
+            .expect("the record is kept for a retry");
+        assert_eq!(claude_binding_from_record(&kept.bytes, &pending.home), None);
+        drop(kept);
+        // Once the directory exists, the record validates and is adopted.
+        let transcript = muxel_core::claude_session_path(&pending.home, &cwd, &cleared);
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        recover().unwrap();
+        assert_eq!(pending.saved_id(), Some(cleared));
+        assert!(claim_claude_binding(&pending.data, pending.instance_id).is_none());
+    }
+
+    #[test]
+    fn a_kept_record_gives_way_to_a_newer_one_and_a_malformed_one_goes() {
+        let pending = PendingResume::new();
+        pending.drain();
+        let cwd = pending.root.join("fresh-project");
+        pending.clear_hook(&Uuid::new_v4().to_string(), &cwd);
+        // The recurring reader claims it and can't adopt it yet.
+        defer_claude_binding(claim_claude_binding(&pending.data, pending.instance_id).unwrap());
+        assert!(claim_claude_binding(&pending.data, pending.instance_id).is_some());
+        // `/resume` before the cleared conversation ever validated: the newer
+        // record supersedes the kept one.
+        let resumed = Uuid::new_v4().to_string();
+        resume_hook(
+            &pending.data,
+            &pending.home,
+            &pending.root.join("project"),
+            pending.instance_id,
+            &resumed,
+        );
+        defer_claude_binding(claim_claude_binding(&pending.data, pending.instance_id).unwrap());
+        let next = claim_claude_binding(&pending.data, pending.instance_id).unwrap();
+        assert_eq!(claimed_session(&next, &pending.home), resumed);
+        acknowledge_claude_binding(next);
+
+        // Prelaunch recovery reaches the newer record the same way.
+        pending.clear_hook(&Uuid::new_v4().to_string(), &cwd);
+        drop(claim_claude_binding(&pending.data, pending.instance_id).unwrap());
+        let newest = Uuid::new_v4().to_string();
+        resume_hook(
+            &pending.data,
+            &pending.home,
+            &pending.root.join("project"),
+            pending.instance_id,
+            &newest,
+        );
+        let mut workspace = pending.workspace();
+        recover_claude_bindings_before_resume(&pending.data, pending.instance_id, |record| {
+            pending.persist_record(&mut workspace, record)
+        })
+        .unwrap();
+        assert_eq!(pending.saved_id(), Some(newest));
+        assert!(claim_claude_binding(&pending.data, pending.instance_id).is_none());
+
+        // A record that isn't a SessionStart event never will be.
+        let shared = claude_binding_path(&pending.data, pending.instance_id);
+        std::fs::write(&shared, b"not json").unwrap();
+        defer_claude_binding(claim_claude_binding(&pending.data, pending.instance_id).unwrap());
+        assert!(claim_claude_binding(&pending.data, pending.instance_id).is_none());
+        std::fs::write(&shared, b"not json").unwrap();
+        pending.drain();
     }
 
     #[test]
