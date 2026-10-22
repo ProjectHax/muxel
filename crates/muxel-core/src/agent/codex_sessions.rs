@@ -241,18 +241,24 @@ pub fn codex_resume_path(
 
 /// Visit each rollout file in `~/.codex/sessions` until `visit` returns true.
 /// `Some(stopped)` once the walk ended or was stopped; `None` when `deadline`
-/// passed or a directory could not be read, so a miss proves nothing. Only a
-/// background worker may call this: it can read the whole store.
+/// passed or part of the store could not be read, so a miss proves nothing.
+/// Only a background worker may call this: it can read the whole store.
 fn walk_store(
     home: &Path,
     deadline: Instant,
     visit: &mut dyn FnMut(&std::fs::DirEntry) -> bool,
 ) -> Option<bool> {
-    let mut pending = vec![home.join(".codex/sessions")];
+    let root = home.join(".codex/sessions");
+    let mut pending = vec![root.clone()];
+    // Not followed, so a link loop cannot hold the walk; its contents are
+    // unread, though, so a miss is no longer conclusive.
+    let mut skipped_link = false;
     while let Some(directory) = pending.pop() {
         let entries = match list(&directory) {
             Ok(entries) => entries,
-            // Nothing can be resumed from a directory that is not there.
+            // A store that is not there may simply live elsewhere (CODEX_HOME).
+            Err(_) if directory == root => return None,
+            // A day removed mid-walk held nothing to find.
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(_) => return None,
         };
@@ -261,14 +267,17 @@ fn walk_store(
                 return None;
             }
             let entry = entry.ok()?;
-            if entry.file_type().ok()?.is_dir() {
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
                 pending.push(entry.path());
+            } else if file_type.is_symlink() && stat(&entry.path()).is_ok_and(|m| m.is_dir()) {
+                skipped_link = true;
             } else if filename_uuid(&entry.file_name()).is_some() && visit(&entry) {
                 return Some(true);
             }
         }
     }
-    Some(false)
+    (!skipped_link).then_some(false)
 }
 
 /// One bounded walk for a saved id that has no saved path and was not in its
@@ -308,8 +317,9 @@ pub fn codex_rollout_by_walk(home: &Path, id: &str, deadline: Instant) -> CodexR
 /// The newest top-level rollouts recorded in `cwd`, newest first, skipping
 /// `owned` ids, at most `limit`. Rollouts are ordered by modification time
 /// before any is opened, so only files newer than the last match are read.
-/// `None` when `deadline` passed or the store could not be read completely:
-/// a partial answer could pass over a newer conversation.
+/// `None` when the store could not be walked completely, since a partial
+/// walk could pass over a newer conversation. A deadline reached while
+/// opening keeps the matches found so far: everything newer was opened.
 pub fn codex_latest_sessions(
     home: &Path,
     cwd: &Path,
@@ -336,13 +346,29 @@ pub fn codex_latest_sessions(
         false
     })?;
     rollouts.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
+    newest_matches(
+        rollouts.into_iter().map(|(_, id, path)| (id, path)),
+        cwd,
+        limit,
+        &mut || Instant::now() >= deadline,
+    )
+}
+
+/// Open `rollouts` (newest first) until `limit` match `cwd`. Every match found
+/// before `expired` is as new as any later one could be, so it is kept.
+pub(super) fn newest_matches(
+    rollouts: impl Iterator<Item = (Uuid, PathBuf)>,
+    cwd: &Path,
+    limit: usize,
+    expired: &mut dyn FnMut() -> bool,
+) -> Option<Vec<CodexSession>> {
     let mut sessions: Vec<CodexSession> = Vec::new();
-    for (_, file_id, path) in rollouts {
+    for (file_id, path) in rollouts {
         if sessions.len() >= limit {
             break;
         }
-        if Instant::now() >= deadline {
-            return None;
+        if expired() {
+            return (!sessions.is_empty()).then_some(sessions);
         }
         let id = file_id.to_string();
         if sessions.iter().any(|session| session.id == id) {

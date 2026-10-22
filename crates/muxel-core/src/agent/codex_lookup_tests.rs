@@ -782,10 +782,10 @@ fn walked_codex_id_is_found_outside_its_day_and_a_complete_miss_is_missing() {
     let root = std::env::temp_dir().join(format!("muxel-codex-walk-{}", Uuid::new_v4()));
     let _home = TempHome(root.clone());
     let later = Instant::now() + Duration::from_secs(60);
-    // No store at all: nothing can be resumed from it.
+    // No store here proves nothing: CODEX_HOME may have moved it.
     assert_eq!(
         codex_rollout_by_walk(&root, "01a1543c-9700-7000-8000-000000000001", later),
-        CodexResumePath::Missing
+        CodexResumePath::Unknown
     );
     let v7 = "01a1543c-9700-7000-8000-000000000001";
     let pre_v7 = "6f9619ff-8b86-4011-b42d-00cf4fc964ff";
@@ -914,5 +914,85 @@ fn latest_codex_sessions_are_newest_unowned_top_level_rollouts_for_the_directory
         codex_latest_sessions(&root, &cwd, &owned_ids, 1, Instant::now()),
         None,
         "a walk cut short has no answer"
+    );
+}
+
+#[test]
+fn walk_through_a_linked_day_directory_is_inconclusive() {
+    use super::{codex_latest_sessions, codex_rollout_by_walk};
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+    let root = std::env::temp_dir().join(format!("muxel-codex-link-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let elsewhere = root.join("elsewhere/2026/10/19");
+    let id = "01a1543c-9700-7000-8000-000000000001";
+    write_rollout_at(
+        &elsewhere.join(format!("rollout-{id}.jsonl")),
+        serde_json::json!({"id": id, "cwd": root}),
+        0,
+    );
+    let month = root.join(".codex/sessions/2026/10");
+    std::fs::create_dir_all(&month).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&elsewhere, month.join("19")).unwrap();
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_dir(&elsewhere, month.join("19")).is_err() {
+        return; // Creating links needs Developer Mode or elevation.
+    }
+    let later = Instant::now() + Duration::from_secs(60);
+    // The link is not followed, so its rollouts are unread: not a confirmed miss.
+    assert_eq!(
+        codex_rollout_by_walk(&root, "01a1543c-9700-7000-8000-000000000002", later),
+        CodexResumePath::Unknown
+    );
+    assert_eq!(
+        codex_latest_sessions(&root, &root, &HashSet::new(), 1, later),
+        None
+    );
+}
+
+#[test]
+fn latest_lookup_out_of_time_while_opening_keeps_the_newest_matches_found() {
+    use super::codex_sessions::newest_matches;
+    let root = std::env::temp_dir().join(format!("muxel-codex-open-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let cwd = root.join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let id = |n: u128| Uuid::from_u128(0x01a1543c_9700_7000_8000_000000000000 | n);
+    let rollouts: Vec<_> = (1..=4)
+        .map(|n| {
+            let path = root.join(format!("rollout-{}.jsonl", id(n)));
+            let recorded = if n == 1 {
+                cwd.clone()
+            } else {
+                root.join("other")
+            };
+            write_rollout_at(
+                &path,
+                serde_json::json!({"id": id(n).to_string(), "cwd": recorded}),
+                0,
+            );
+            (id(n), path)
+        })
+        .collect();
+    // Two panes want two matches, but only the newest rollout is this
+    // directory's; time runs out among the older ones.
+    let mut opened = 0;
+    let found = newest_matches(rollouts.clone().into_iter(), &cwd, 2, &mut || {
+        opened += 1;
+        opened > 2
+    })
+    .expect("a match found before the deadline is still the newest");
+    assert_eq!(
+        found
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>(),
+        vec![id(1).to_string()]
+    );
+    // Nothing found before the deadline is no answer at all.
+    assert_eq!(
+        newest_matches(rollouts.into_iter().skip(1), &cwd, 1, &mut || true),
+        None
     );
 }
