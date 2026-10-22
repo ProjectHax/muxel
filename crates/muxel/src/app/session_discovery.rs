@@ -913,6 +913,7 @@ mod w8lm_tests {
     use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
 
@@ -937,23 +938,54 @@ mod w8lm_tests {
 
     #[test]
     fn bounded_title_command_bounds_a_stalled_process() {
-        let ready = std::env::temp_dir().join(format!("muxel-title-ready-{}", Uuid::new_v4()));
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--ignored",
-                "--exact",
-                "app::session_discovery::w8lm_tests::sleeping_title_child",
-            ])
-            .env("MUXEL_TEST_SLEEPY_TITLE_READY", &ready);
-        let started = Instant::now();
-        assert!(bounded_title_command(command, Duration::from_secs(4)).is_none());
-        assert!(
-            ready.exists(),
-            "sleeping child did not start before the deadline"
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
-        std::fs::remove_file(ready).unwrap();
+        // Relaunching the test binary can take seconds on a loaded runner, and
+        // that startup is not what is bounded. Time the bound only once the
+        // child is running; a child still starting at the deadline gets a
+        // longer budget instead of failing the test.
+        for budget in [2, 4, 8, 16].map(Duration::from_secs) {
+            let ready = std::env::temp_dir().join(format!("muxel-title-ready-{}", Uuid::new_v4()));
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "app::session_discovery::w8lm_tests::sleeping_title_child",
+                ])
+                .env("MUXEL_TEST_SLEEPY_TITLE_READY", &ready);
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(bounded_title_command(command, budget));
+            });
+            let running = loop {
+                if ready.exists() {
+                    break Some(Instant::now());
+                }
+                match receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(title) => {
+                        assert!(title.is_none());
+                        break None;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(error) => panic!("bounded call vanished: {error}"),
+                }
+            };
+            let Some(running) = running else {
+                let _ = std::fs::remove_file(&ready);
+                continue;
+            };
+            let title = receiver
+                .recv_timeout(budget + Duration::from_secs(10))
+                .expect("a stalled child held its caller past the bound");
+            assert!(title.is_none());
+            assert!(
+                running.elapsed() < budget + Duration::from_secs(2),
+                "returned {:?} after the child was running, bound {budget:?}",
+                running.elapsed()
+            );
+            std::fs::remove_file(ready).unwrap();
+            return;
+        }
+        panic!("the sleeping child never started inside a bound");
     }
 
     fn key(root: &std::path::Path) -> SessionDiscoveryKey {
