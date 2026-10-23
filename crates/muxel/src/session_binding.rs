@@ -321,7 +321,7 @@ pub(crate) fn claude_binding_path(data_dir: &Path, instance_id: Uuid) -> PathBuf
         .join(format!("{instance_id}.json"))
 }
 
-fn write_claude_binding_from_reader(
+pub(crate) fn write_claude_binding_from_reader(
     data_dir: &Path,
     instance_id: Uuid,
     reader: impl std::io::Read,

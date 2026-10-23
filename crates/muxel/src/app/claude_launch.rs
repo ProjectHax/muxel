@@ -431,7 +431,15 @@ impl MuxelApp {
                 session_id_bound_elsewhere(&self.workspace.instances, key.pane, id)
             })
         {
-            return None;
+            // A sibling may adopt the hook after this pane's worker snapshot.
+            // Refresh ownership before resolving the pane's saved binding.
+            return self.prepare_claude_launch_for(
+                key.pane,
+                key.token,
+                key.reason,
+                request.home,
+                request.data,
+            );
         }
         let previous = self.workspace.instance(key.pane)?.clone();
         let instance = self.workspace.instance_mut(key.pane)?;
@@ -1096,6 +1104,17 @@ mod tests {
         source: &str,
         transcript_exists: bool,
     ) -> std::path::PathBuf {
+        w8lm_hook_with_format(home, pane, id, source, transcript_exists, true)
+    }
+
+    fn w8lm_hook_with_format(
+        home: &std::path::Path,
+        pane: Uuid,
+        id: &str,
+        source: &str,
+        transcript_exists: bool,
+        stamped: bool,
+    ) -> std::path::PathBuf {
         let data = muxel_store::data_dir().unwrap();
         let cwd = data.join("claude-project");
         std::fs::create_dir_all(&cwd).unwrap();
@@ -1104,15 +1123,21 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, serde_json::json!({"cwd":cwd}).to_string()).unwrap();
         }
-        let record = crate::session_binding::claude_binding_path(&data, pane);
-        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
-        std::fs::write(
-            record,
-            serde_json::json!({"hook_event_name":"SessionStart","source":source,
-            "session_id":id,"transcript_path":path,"cwd":cwd})
-            .to_string(),
-        )
-        .unwrap();
+        let event = serde_json::json!({"hook_event_name":"SessionStart","source":source,
+            "session_id":id,"transcript_path":path,"cwd":cwd});
+        if stamped {
+            crate::session_binding::write_claude_binding_from_reader(
+                &data,
+                pane,
+                std::io::Cursor::new(event.to_string()),
+            )
+            .unwrap();
+        } else {
+            // Old hook records without a stamp remain readable after an upgrade.
+            let record = crate::session_binding::claude_binding_path(&data, pane);
+            std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+            std::fs::write(record, event.to_string()).unwrap();
+        }
         path
     }
 
@@ -1211,6 +1236,82 @@ mod tests {
                         app.workspace.instance(id).unwrap().session_id.as_deref(),
                         Some(newest.as_str())
                     );
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn w8lm_late_sibling_claim_reprepares_the_other_pane() {
+        with_app(|cx, window| {
+            let home = muxel_store::data_dir().unwrap().join("w8lm-sibling-home");
+            let announced = Uuid::new_v4().to_string();
+            let (first, second, mut first_pending, mut second_pending) = window
+                .update(cx, |app, window, cx| {
+                    let first = pane(app);
+                    let second = pane(app);
+                    w8lm_hook(&home, first, &announced, "resume", true);
+                    w8lm_hook(&home, second, &announced, "resume", true);
+                    (
+                        first,
+                        second,
+                        app.prepare_terminal_spawn(first, window, cx)
+                            .unwrap()
+                            .pending
+                            .unwrap(),
+                        app.prepare_terminal_spawn(second, window, cx)
+                            .unwrap()
+                            .pending
+                            .unwrap(),
+                    )
+                })
+                .unwrap();
+            first_pending.request.home = Some(home.clone());
+            second_pending.request.home = Some(home.clone());
+            resolve_batch(vec![
+                (
+                    first_pending.request.clone(),
+                    first_pending.sender.take().unwrap(),
+                ),
+                (
+                    second_pending.request.clone(),
+                    second_pending.sender.take().unwrap(),
+                ),
+            ]);
+            let first_resolution = first_pending.receiver.recv_blocking().unwrap();
+            let second_resolution = second_pending.receiver.recv_blocking().unwrap();
+            let token = second_pending.request.key.token;
+            let mut refreshed = window
+                .update(cx, |app, _, cx| {
+                    app.apply_claude_launch(first_pending.request, first_resolution, cx)
+                        .unwrap();
+                    assert_eq!(
+                        app.workspace.instance(first).unwrap().session_id.as_deref(),
+                        Some(announced.as_str())
+                    );
+                    let next = app
+                        .advance_claude_launch(second_pending.request, second_resolution, cx)
+                        .expect("late sibling claim must refresh the other launch");
+                    assert_eq!(next.meta.instance_id, second);
+                    assert_eq!(next.meta.token, token);
+                    next.pending.expect("sibling ownership must be re-probed")
+                })
+                .unwrap();
+            let resolution = w8lm_resolve(&mut refreshed, &home);
+            window
+                .update(cx, |app, _, cx| {
+                    let (_, command, _) = app
+                        .apply_claude_launch(refreshed.request, resolution, cx)
+                        .expect("second pane must launch on its saved binding");
+                    assert_ne!(
+                        app.workspace
+                            .instance(second)
+                            .unwrap()
+                            .session_id
+                            .as_deref(),
+                        Some(announced.as_str())
+                    );
+                    assert!(!command.args.iter().any(|arg| arg == &announced));
                 })
                 .unwrap();
         });
@@ -1371,6 +1472,9 @@ mod tests {
             let record =
                 crate::session_binding::claude_binding_path(&muxel_store::data_dir().unwrap(), id);
             let first_modified = std::fs::metadata(&record).unwrap().modified().unwrap();
+            let first_receipt =
+                crate::session_binding::claude_hook_identity(&muxel_store::data_dir().unwrap(), id)
+                    .unwrap();
             let token = pending.request.key.token;
             let resolution = w8lm_resolve(&mut pending, &home);
             window
@@ -1415,11 +1519,14 @@ mod tests {
                 .write(true)
                 .open(&record)
                 .unwrap()
-                .set_times(
-                    std::fs::FileTimes::new()
-                        .set_modified(first_modified + std::time::Duration::from_secs(1)),
-                )
+                .set_times(std::fs::FileTimes::new().set_modified(first_modified))
                 .unwrap();
+            assert_ne!(
+                crate::session_binding::claude_hook_identity(&muxel_store::data_dir().unwrap(), id)
+                    .unwrap(),
+                first_receipt,
+                "new stamped publication must differ even at the same mtime"
+            );
             let mut resumed = window
                 .update(cx, |app, _, _| {
                     app.prepare_claude_launch(id, token)
@@ -1511,7 +1618,7 @@ mod tests {
                         .session_id
                         .clone()
                         .unwrap();
-                    let old = w8lm_hook(&home, id, &announced, "clear", false);
+                    let old = w8lm_hook_with_format(&home, id, &announced, "clear", false, false);
                     std::fs::create_dir_all(old.parent().unwrap()).unwrap();
                     let moved = muxel_store::data_dir()
                         .unwrap()
@@ -1604,14 +1711,6 @@ mod tests {
                         }
                         std::fs::remove_file(transcript).unwrap();
                         w8lm_hook(&home, id, &announced, "clear", false);
-                        let record = crate::session_binding::claude_binding_path(
-                            &muxel_store::data_dir().unwrap(),
-                            id,
-                        );
-                        let mut event: serde_json::Value =
-                            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
-                        event["muxel_record_id"] = serde_json::json!(Uuid::new_v4().to_string());
-                        std::fs::write(record, serde_json::to_vec(&event).unwrap()).unwrap();
                         (
                             announced,
                             app.prepare_terminal_spawn(id, window, cx)

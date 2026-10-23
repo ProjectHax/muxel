@@ -191,7 +191,8 @@ feature is added or changed, update the matching entry here in the same change**
   and `/clear` or a fork may announce its new UUID before Claude has written the first
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
   starter binding. Claude bindings save the exact transcript path. Launch checks that
-  path once and reads its current working directory on a worker; legacy or moved
+  path once and reads its current working directory on a worker; a pending hook's
+  validated cwd still takes precedence for that launch. Legacy or moved
   transcripts share one fallback search per launch batch, with the found path saved
   for later launches. Launch preflight lists the hook directory once per batch and
   reads only panes with a pending record. Read-aloud and control reads use the saved
@@ -199,7 +200,8 @@ feature is added or changed, update the matching entry here in the same change**
   Grok's process lookup run in the background. A newer Claude hook supersedes an
   older pending launch, and consumed hook records cannot revive a discarded or
   expired conversation. A missing Claude store permits fresh launches; a hook
-  read error affects only that pane. Preset edits during restore continue the
+  record read error affects only that pane; an error listing the hook directory
+  refuses the batch. Preset edits during restore continue the
   launch automatically. Each pane keeps one pending lookup across pop-out and
   docking. Failed Codex hints retry with a delay that grows from
   one to thirty seconds, even while the day directory changes. A sibling-owned
