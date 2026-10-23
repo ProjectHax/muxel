@@ -9364,18 +9364,7 @@ impl MuxelApp {
                             // not adopted a second time.
                             if let Some(sessions) = sessions {
                                 if let Some(host) = this.remote_host_for_project(pid) {
-                                    let instances =
-                                        this.workspace.instances.iter_mut().filter(|instance| {
-                                            instance.project_id == pid
-                                                && instance.kind == InstanceKind::Terminal
-                                                && host.use_tmux(instance.use_tmux)
-                                        });
-                                    muxel_core::tmux::bind_session_owners(
-                                        &host.name,
-                                        instances,
-                                        &sessions,
-                                        integrations::profile_tmux_socket(),
-                                    );
+                                    this.bind_connect_session_owners(pid, &host, &sessions);
                                     this.persist();
                                 }
                                 // Finish any close whose kill never landed *first*,
@@ -9917,6 +9906,63 @@ impl MuxelApp {
             .iter()
             .find(|h| h.id == r.host_id)
             .map(|h| h.effective(&self.identities))
+    }
+
+    fn bind_connect_session_owners(
+        &mut self,
+        pid: Uuid,
+        host: &RemoteHost,
+        sessions: &[muxel_core::tmux::RemoteSession],
+    ) {
+        let eligible = |instance: &Instance| {
+            instance.project_id == pid
+                && instance.kind == InstanceKind::Terminal
+                && host.use_tmux(instance.use_tmux)
+        };
+        let before: Vec<_> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|instance| eligible(instance))
+            .map(|instance| {
+                (
+                    instance.id,
+                    instance.tmux_session.clone(),
+                    instance.tmux_socket.clone(),
+                )
+            })
+            .collect();
+        let instances = self
+            .workspace
+            .instances
+            .iter_mut()
+            .filter(|instance| eligible(instance));
+        muxel_core::tmux::bind_session_owners(
+            &host.name,
+            instances,
+            sessions,
+            integrations::profile_tmux_socket(),
+        );
+        // Connection inventory can establish a new owner without changing the
+        // peer layout. A restart still targeting the old owner must give up its
+        // lease before the connection attempts to spawn this pane.
+        let changed: Vec<_> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|instance| eligible(instance))
+            .zip(before)
+            .filter_map(|(now, (iid, old_session, old_socket))| {
+                debug_assert_eq!(now.id, iid);
+                (!now.literal_argv
+                    && (now.tmux_session != old_session || now.tmux_socket != old_socket))
+                    .then_some(iid)
+            })
+            .collect();
+        for iid in changed {
+            self.terminal_restarts.owner_changed(iid);
+            self.failed_launches.remove(&iid);
+        }
     }
 
     /// Spawn any missing terminals/editors for a project's panes (no remote

@@ -1,5 +1,5 @@
 use super::{
-    Instance, MuxelApp, PaneNode, Project, RemoteRestartCompletion, SecondaryWindow,
+    Instance, MuxelApp, PaneNode, Project, RemoteHost, RemoteRestartCompletion, SecondaryWindow,
     WorkspaceWindow,
 };
 use crate::theme;
@@ -301,6 +301,77 @@ fn rebound_adoption_cancels_restart_before_retrying_launch() {
             .unwrap();
         assert!(!failed);
         assert!(!restarting);
+    });
+}
+
+#[test]
+fn connect_inventory_rebinding_cancels_delayed_restart_failure() {
+    use muxel_core::tmux::{RemoteSession, Socket};
+
+    with_app(|cx, main| {
+        let (mut completion, _secondary) = pending_secondary_restart(cx, main);
+        let iid = completion.instance;
+        let (socket, restarting, unchanged_restart, unchanged_failure) = main
+            .update(cx, |app, _, _| {
+                let instance = app.workspace.instance_mut(iid).unwrap();
+                instance.tmux_session = Some("legacy".into());
+                instance.tmux_socket = None;
+                instance.use_tmux = true;
+                app.terminal_restarts.cancel(iid);
+                completion.token = app
+                    .terminal_restarts
+                    .begin(app.workspace.instance(iid).unwrap())
+                    .unwrap();
+                completion.owner_generation = app.terminal_restarts.owner_generation(iid);
+                app.failed_launches
+                    .insert(iid, "old Default lookup failed".into());
+
+                let mut unchanged = Instance::shell(completion.project);
+                unchanged.tmux_session = Some("unchanged".into());
+                unchanged.tmux_socket = Some(Socket::Private);
+                unchanged.use_tmux = true;
+                let unchanged_id = unchanged.id;
+                let unchanged_token = app.terminal_restarts.begin(&unchanged).unwrap();
+                app.workspace.add_instance(unchanged);
+                app.failed_launches
+                    .insert(unchanged_id, "existing failure".into());
+
+                let host = RemoteHost::new("remote", "example.test");
+                let sessions = ["legacy", "unchanged"].map(|name| RemoteSession {
+                    name: name.into(),
+                    socket: Socket::Private,
+                    path: "/remote".into(),
+                    command: "claude".into(),
+                    title: String::new(),
+                });
+                app.bind_connect_session_owners(completion.project, &host, &sessions);
+                (
+                    app.workspace.instance(iid).unwrap().tmux_socket.clone(),
+                    app.terminal_restarts.contains(iid),
+                    app.terminal_restarts.current(unchanged_id, unchanged_token),
+                    app.failed_launches.contains_key(&unchanged_id),
+                )
+            })
+            .unwrap();
+        assert_eq!(socket, Some(Socket::Private));
+        assert!(unchanged_restart);
+        assert!(unchanged_failure);
+        assert!(
+            !restarting,
+            "the new owner must not inherit the old restart lease"
+        );
+
+        completion.killed = Err(anyhow::anyhow!("delayed Default owner lookup failed"));
+        let app = main.entity(cx).unwrap();
+        MuxelApp::complete_remote_restart(&app.downgrade(), completion, cx);
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.workspace.instance(iid).unwrap().tmux_socket,
+                Some(Socket::Private)
+            );
+            assert!(!app.failed_launches.contains_key(&iid));
+        });
     });
 }
 
