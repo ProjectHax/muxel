@@ -94,6 +94,9 @@ fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>, &Probe
 fn exited_remote_pane(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -> Uuid {
     let pane = window
         .update(cx, |app, window, cx| {
+            // Keep unrelated branch polling from launching SSH Git queries
+            // while these ticks exercise the controlled owner-probe replies.
+            app.remote_branch_poll_inflight = true;
             let root = muxel_store::data_dir().unwrap().join("project");
             std::fs::create_dir_all(&root).unwrap();
             let pid = app.workspace.add_project(Project::new("reconnect", root));
