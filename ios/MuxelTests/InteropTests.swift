@@ -67,9 +67,33 @@ final class InteropTests: XCTestCase {
         XCTAssertEqual(decoded.displayName, "Generated title")
     }
 
+    func testInstanceSessionPathRoundTrips() throws {
+        // The desktop's saved Codex rollout path must survive an iOS write-back,
+        // or the desktop's next restore has to look the conversation up again.
+        let json = """
+        { "id": "aaaa", "project_id": "p", "title": "Codex", "program": "codex",
+          "session_id": "01a1543c-9700-7000-8000-000000000001", "session_started": true,
+          "session_path": "/home/me/.codex/sessions/2026/10/19/rollout-01a1543c.jsonl" }
+        """
+        let decoded = try MuxelJSON.decoder.decode(Instance.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.sessionPath, "/home/me/.codex/sessions/2026/10/19/rollout-01a1543c.jsonl")
+
+        let data = try MuxelJSON.encoder.encode(decoded)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["session_path"] as? String, decoded.sessionPath)
+        let back = try MuxelJSON.decoder.decode(Instance.self, from: data)
+        XCTAssertEqual(back.sessionPath, decoded.sessionPath)
+
+        // Documents from desktops that predate the field still decode.
+        let older = try MuxelJSON.decoder.decode(
+            Instance.self, from: Data(#"{ "id": "bbbb", "project_id": "p", "title": "Codex" }"#.utf8))
+        XCTAssertNil(older.sessionPath)
+    }
+
     func testDuplicateResetClearsConversationStateAndAutoName() {
         var instance = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
         instance.sessionId = "session"
+        instance.sessionPath = "/home/me/.claude/projects/p/session.jsonl"
         instance.sessionStarted = true
         instance.autoName = "Generated title"
         instance.customName = "Manual title"
@@ -77,6 +101,7 @@ final class InteropTests: XCTestCase {
         instance.resetConversationForDuplicate()
 
         XCTAssertNil(instance.sessionId)
+        XCTAssertNil(instance.sessionPath)
         XCTAssertFalse(instance.sessionStarted)
         XCTAssertNil(instance.autoName)
         XCTAssertEqual(instance.customName, "Manual title")
