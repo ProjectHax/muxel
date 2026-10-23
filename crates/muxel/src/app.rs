@@ -12278,6 +12278,8 @@ impl MuxelApp {
     /// pane can now attach to. Restart would instead kill what the peer started.
     fn retry_rebound_launches(&mut self, before: &[Instance], after: &[Instance]) {
         for iid in muxel_core::rebound_instances(before, after) {
+            // The old restart no longer owns the peer's new session.
+            self.terminal_restarts.cancel(iid);
             self.failed_launches.remove(&iid);
         }
     }
@@ -16736,6 +16738,8 @@ impl MuxelApp {
                 continue;
             }
             instance.tmux_socket = Some(Socket::Private);
+            // Free launch admission before trying to attach to the peer's owner.
+            self.terminal_restarts.cancel(iid);
             self.bump_session_binding_generation(iid);
             self.failed_launches.remove(&iid);
             changed = true;
@@ -19305,6 +19309,7 @@ impl MuxelApp {
         if !inst.permits_launch(muxel_core::TerminalLaunchReason::Restart) {
             return;
         }
+        let binding_generation = self.session_discoveries.binding_generation(iid);
         let Some(restart) = self.terminal_restarts.begin(inst) else {
             return;
         };
@@ -19400,7 +19405,10 @@ impl MuxelApp {
                 Ok(closed) => {
                     let saved = this
                         .update(cx, |this, _| {
-                            if this.current_workspace != workspace {
+                            if this.current_workspace != workspace
+                                || this.session_discoveries.binding_generation(iid)
+                                    != binding_generation
+                            {
                                 return false;
                             }
                             if !this.terminal_restarts.record_owner(
@@ -19437,8 +19445,11 @@ impl MuxelApp {
                         match prepared {
                             Ok(next) => this
                                 .update(cx, |this, _| {
-                                    if this.current_workspace != workspace {
-                                        anyhow::bail!("workspace changed during restart");
+                                    if this.current_workspace != workspace
+                                        || this.session_discoveries.binding_generation(iid)
+                                            != binding_generation
+                                    {
+                                        anyhow::bail!("the pane's binding changed during restart");
                                     }
                                     this.save_restart_migration(iid, restart, &expected, &next)
                                 })
@@ -19462,6 +19473,7 @@ impl MuxelApp {
                     project,
                     workspace,
                     token: restart,
+                    binding_generation,
                     host: host_name,
                     session: label,
                     killed,
@@ -19529,6 +19541,7 @@ impl MuxelApp {
             project,
             workspace,
             token: restart,
+            binding_generation,
             host: host_name,
             session: label,
             killed,
@@ -19538,11 +19551,16 @@ impl MuxelApp {
             .err()
             .map(|error| format!("{label}: {error:#}"));
         let completed = Self::in_project_or_main(this, Some(project), cx, |this, window, cx| {
-            if this.current_workspace != workspace
-                || !this.terminal_restarts.finish(iid, restart)
+            if this.current_workspace != workspace {
+                return;
+            }
+            let same_binding =
+                this.session_discoveries.binding_generation(iid) == binding_generation;
+            if !this.terminal_restarts.finish(iid, restart)
+                || !same_binding
                 || this.workspace.instance(iid).is_none()
             {
-                return; // closed while the kill was in flight
+                return; // closed or rebound while the kill was in flight
             }
             if let Err(e) = killed {
                 this.fail_restart(
@@ -19573,9 +19591,12 @@ impl MuxelApp {
             // whichever window now shows the project.
             let project = this
                 .update(cx, |this, cx| {
-                    if this.current_workspace != workspace
-                        || !this.terminal_restarts.finish(iid, restart)
-                    {
+                    if this.current_workspace != workspace {
+                        return None;
+                    }
+                    let same_binding =
+                        this.session_discoveries.binding_generation(iid) == binding_generation;
+                    if !this.terminal_restarts.finish(iid, restart) || !same_binding {
                         return None;
                     }
                     if let Some(error) = &failure {

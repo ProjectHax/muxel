@@ -19,6 +19,8 @@ pub(super) struct RemoteRestartCompletion {
     pub project: Uuid,
     pub workspace: Option<Uuid>,
     pub token: Uuid,
+    /// Binding observed before remote resolution and kill began.
+    pub binding_generation: u64,
     pub host: String,
     pub session: String,
     pub killed: anyhow::Result<()>,

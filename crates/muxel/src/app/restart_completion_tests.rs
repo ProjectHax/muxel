@@ -115,6 +115,7 @@ fn pending_secondary_restart(
                 project,
                 workspace: app.current_workspace,
                 token,
+                binding_generation: app.session_discoveries.binding_generation(iid),
                 host: "test host".into(),
                 session: "test session".into(),
                 killed: Ok(()),
@@ -219,6 +220,107 @@ fn stale_remote_restart_completion_leaves_new_generation_pending() {
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert!(app.terminal_restarts.current(iid, next));
+            assert!(app.terminals.is_empty());
+        });
+    });
+}
+
+#[test]
+fn push_move_cancels_restart_and_discards_its_late_kill_failure() {
+    use muxel_core::tmux::Socket;
+
+    with_app(|cx, main| {
+        let (mut completion, _secondary) = pending_secondary_restart(cx, main);
+        let iid = completion.instance;
+        let name = "peer-owned".to_string();
+        let (socket, failed, restarting) = main
+            .update(cx, |app, window, cx| {
+                let instance = app.workspace.instance_mut(iid).unwrap();
+                instance.tmux_session = Some(name.clone());
+                instance.tmux_socket = Some(Socket::Default);
+                app.terminal_restarts.cancel(iid);
+                completion.token = app
+                    .terminal_restarts
+                    .begin(app.workspace.instance(iid).unwrap())
+                    .unwrap();
+                app.failed_launches.insert(iid, "old binding failed".into());
+
+                app.take_moves_off_default(completion.project, &[(iid, name)], window, cx);
+
+                (
+                    app.workspace.instance(iid).unwrap().tmux_socket.clone(),
+                    app.failed_launches.contains_key(&iid),
+                    app.terminal_restarts.contains(iid),
+                )
+            })
+            .unwrap();
+        assert_eq!(socket, Some(Socket::Private));
+        assert!(!failed);
+        assert!(
+            !restarting,
+            "the peer's new binding needs launch admission immediately"
+        );
+
+        completion.killed = Err(anyhow::anyhow!("old Default kill failed"));
+        let app = main.entity(cx).unwrap();
+        MuxelApp::complete_remote_restart(&app.downgrade(), completion, cx);
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.workspace.instance(iid).unwrap().tmux_socket,
+                Some(Socket::Private)
+            );
+            assert!(!app.failed_launches.contains_key(&iid));
+        });
+    });
+}
+
+#[test]
+fn rebound_adoption_cancels_restart_before_retrying_launch() {
+    use muxel_core::tmux::Socket;
+
+    with_app(|cx, main| {
+        let (completion, _secondary) = pending_secondary_restart(cx, main);
+        let iid = completion.instance;
+        let (failed, restarting) = main
+            .update(cx, |app, _, _| {
+                let mut before = app.workspace.instance(iid).unwrap().clone();
+                before.tmux_session = Some("peer-owned".into());
+                before.tmux_socket = Some(Socket::Default);
+                let mut after = before.clone();
+                after.tmux_socket = Some(Socket::Private);
+                app.failed_launches.insert(iid, "old binding failed".into());
+
+                app.retry_rebound_launches(&[before], &[after]);
+
+                (
+                    app.failed_launches.contains_key(&iid),
+                    app.terminal_restarts.contains(iid),
+                )
+            })
+            .unwrap();
+        assert!(!failed);
+        assert!(!restarting);
+    });
+}
+
+#[test]
+fn changed_binding_generation_disowns_remote_restart_completion() {
+    with_app(|cx, main| {
+        let (mut completion, _secondary) = pending_secondary_restart(cx, main);
+        let iid = completion.instance;
+        main.update(cx, |app, _, _| {
+            app.bump_session_binding_generation(iid);
+            assert!(app.terminal_restarts.current(iid, completion.token));
+        })
+        .unwrap();
+        completion.killed = Err(anyhow::anyhow!("old binding kill failed"));
+        let app = main.entity(cx).unwrap();
+        MuxelApp::complete_remote_restart(&app.downgrade(), completion, cx);
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(!app.failed_launches.contains_key(&iid));
+            assert!(!app.terminal_restarts.contains(iid));
             assert!(app.terminals.is_empty());
         });
     });
