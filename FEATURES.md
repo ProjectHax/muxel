@@ -695,6 +695,8 @@ feature is added or changed, update the matching entry here in the same change**
   file-link and memory instructions use the preset's separate flag/config
   transport when available, and are omitted for TypeIn-only presets.
   The task text is discarded after first launch.
+  Remote tmux owner discovery keeps the task pending until that same launch
+  can prepare its terminal; refused ownership or launch permission cancels it.
   Restart, restore and resume neither re-type nor resubmit it, including launches without a resumable
   conversation. A duplicate of the pane starts without it, and the phone never
   types or submits it. Literal, shell and browser launches refuse prompts with
