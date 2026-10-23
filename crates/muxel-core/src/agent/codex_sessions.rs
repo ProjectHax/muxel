@@ -127,7 +127,7 @@ fn filename_uuid(name: &std::ffi::OsStr) -> Option<&str> {
     stem.get(start..)
 }
 
-fn filename_id(path: &Path) -> Option<Uuid> {
+pub(super) fn filename_id(path: &Path) -> Option<Uuid> {
     Uuid::parse_str(filename_uuid(path.file_name()?)?).ok()
 }
 
@@ -137,11 +137,15 @@ pub fn codex_session_from_hint(home: &Path, hint: &str, cwd: &Path) -> Option<Co
         .unwrap_or(hint)
         .to_ascii_lowercase();
     let mut matched: Option<CodexSession> = None;
+    let mut unresolved = HashSet::new();
     for directory in directories(home, hint) {
-        let Ok(entries) = list(&directory) else {
-            continue;
+        let entries = match list(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.ok()?;
             let name = entry.file_name();
             let Some(file_uuid) = filename_uuid(&name) else {
                 continue;
@@ -156,8 +160,13 @@ pub fn codex_session_from_hint(home: &Path, hint: &str, cwd: &Path) -> Option<Co
                 continue;
             };
             let path = entry.path();
-            let Some((id, recorded_cwd)) = codex_session_meta(&path) else {
-                continue;
+            let (id, recorded_cwd) = match codex_session_meta(&path) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => continue,
+                Err(_) => {
+                    unresolved.insert(file_id);
+                    continue;
+                }
             };
             if Uuid::parse_str(&id).ok() != Some(file_id)
                 || !paths_loosely_equal(Path::new(&recorded_cwd), cwd)
@@ -171,7 +180,14 @@ pub fn codex_session_from_hint(home: &Path, hint: &str, cwd: &Path) -> Option<Co
             matched = Some(CodexSession { id, path });
         }
     }
-    matched
+    let matched = matched?;
+    let id = Uuid::parse_str(&matched.id).ok()?;
+    // A compressed/uncompressed sibling cannot add another thread identity
+    // once this id's cwd and top-level metadata have been verified.
+    unresolved
+        .iter()
+        .all(|candidate| *candidate == id)
+        .then_some(matched)
 }
 
 /// A stored path takes one stat in the normal case. A rollout compressed since
@@ -315,11 +331,12 @@ pub fn codex_rollout_by_walk(home: &Path, id: &str, deadline: Instant) -> CodexR
 }
 
 /// The newest top-level rollouts recorded in `cwd`, newest first, skipping
-/// `owned` ids, at most `limit`. Rollouts are ordered by modification time
-/// before any is opened, so only files newer than the last match are read.
+/// `owned` ids, at most `limit`. Identities are ordered by their newest file's
+/// modification time; all identities tied at the cutoff are checked. A readable
+/// sibling can verify an identity whose newer compressed copy cannot be read.
 /// `None` when the store could not be walked completely, since a partial
 /// walk could pass over a newer conversation. A deadline reached while
-/// opening keeps the matches found so far: everything newer was opened.
+/// opening keeps only matches strictly newer than any unresolved candidate.
 pub fn codex_latest_sessions(
     home: &Path,
     cwd: &Path,
@@ -335,56 +352,152 @@ pub fn codex_latest_sessions(
         .filter_map(|id| Uuid::parse_str(id).ok())
         .collect();
     let mut rollouts = Vec::new();
+    let mut unknown_time = false;
     walk_store(home, deadline, &mut |entry| {
         let path = entry.path();
         if let Some(id) = filename_id(&path)
             && !owned.contains(&id)
-            && let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified())
         {
-            rollouts.push((modified, id, path));
+            match entry.metadata().and_then(|metadata| metadata.modified()) {
+                Ok(modified) => rollouts.push((modified, id, path)),
+                Err(_) => {
+                    unknown_time = true;
+                    return true;
+                }
+            }
         }
         false
     })?;
-    rollouts.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
+    if unknown_time {
+        return None;
+    }
     newest_matches(
-        rollouts.into_iter().map(|(_, id, path)| (id, path)),
+        rollouts
+            .into_iter()
+            .map(|(modified, id, path)| (modified, Some(id), path)),
         cwd,
         limit,
         &mut || Instant::now() >= deadline,
     )
 }
 
-/// Open `rollouts` (newest first) until `limit` match `cwd`. Every match found
-/// before `expired` is as new as any later one could be, so it is kept.
+struct RolloutGroup {
+    id: Option<Uuid>,
+    newest: (SystemTime, PathBuf),
+    // Most identities have one file; allocate only when a sibling exists.
+    siblings: Vec<(SystemTime, PathBuf)>,
+}
+
+impl RolloutGroup {
+    fn push(&mut self, modified: SystemTime, path: PathBuf) {
+        let file = (modified, path);
+        if modified > self.newest.0 {
+            self.siblings
+                .push(std::mem::replace(&mut self.newest, file));
+        } else {
+            self.siblings.push(file);
+        }
+    }
+
+    /// A verified sibling resolves this identity, including a confirmed subagent
+    /// exclusion, even if its compressed copy cannot be read. Otherwise errors
+    /// or expiry leave the group unresolved.
+    fn read(
+        mut self,
+        cwd: &Path,
+        expired: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<CodexSession>, ()> {
+        self.siblings.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        let mut unresolved = false;
+        for (_, path) in std::iter::once(self.newest).chain(self.siblings) {
+            if expired() {
+                return Err(());
+            }
+            match codex_session_meta(&path) {
+                Ok(Some((id, recorded_cwd))) => {
+                    if self
+                        .id
+                        .is_some_and(|expected| Uuid::parse_str(&id).ok() != Some(expected))
+                    {
+                        unresolved = true;
+                        continue;
+                    }
+                    return Ok(paths_loosely_equal(Path::new(&recorded_cwd), cwd).then(|| {
+                        CodexSession {
+                            id: self.id.map_or(id, |id| id.to_string()),
+                            path,
+                        }
+                    }));
+                }
+                Ok(None) => return Ok(None),
+                Err(_) => unresolved = true,
+            }
+        }
+        if unresolved { Err(()) } else { Ok(None) }
+    }
+}
+
+/// Resolve identities newest first, including every identity tied at the cutoff.
+/// An unresolved group can only retain a verified prefix strictly newer than it.
+/// `None` ids preserve legacy Import filenames without grouping unrelated files.
 pub(super) fn newest_matches(
-    rollouts: impl Iterator<Item = (Uuid, PathBuf)>,
+    rollouts: impl Iterator<Item = (SystemTime, Option<Uuid>, PathBuf)>,
     cwd: &Path,
     limit: usize,
     expired: &mut dyn FnMut() -> bool,
 ) -> Option<Vec<CodexSession>> {
-    let mut sessions: Vec<CodexSession> = Vec::new();
-    for (file_id, path) in rollouts {
-        if sessions.len() >= limit {
-            break;
-        }
-        if expired() {
-            return (!sessions.is_empty()).then_some(sessions);
-        }
-        let id = file_id.to_string();
-        if sessions.iter().any(|session| session.id == id) {
-            continue;
-        }
-        // Subagent rollouts have no meta here; they never describe a pane.
-        let Some((meta_id, recorded_cwd)) = codex_session_meta(&path) else {
-            continue;
-        };
-        if Uuid::parse_str(&meta_id).ok() == Some(file_id)
-            && paths_loosely_equal(Path::new(&recorded_cwd), cwd)
-        {
-            sessions.push(CodexSession { id, path });
+    if limit == 0 {
+        return Some(Vec::new());
+    }
+    let mut groups: Vec<RolloutGroup> = Vec::new();
+    let mut positions: HashMap<Uuid, usize> = HashMap::new();
+    for (modified, id, path) in rollouts {
+        if let Some(index) = id.and_then(|id| positions.get(&id).copied()) {
+            groups[index].push(modified, path);
+        } else {
+            if let Some(id) = id {
+                positions.insert(id, groups.len());
+            }
+            groups.push(RolloutGroup {
+                id,
+                newest: (modified, path),
+                siblings: Vec::new(),
+            });
         }
     }
-    Some(sessions)
+    groups.sort_by_key(|group| std::cmp::Reverse(group.newest.0));
+    let mut sessions: Vec<(SystemTime, CodexSession)> = Vec::new();
+    let mut accepted = HashSet::new();
+    let mut unresolved = false;
+    for group in groups {
+        let modified = group.newest.0;
+        if sessions.len() >= limit && sessions.last().is_some_and(|(at, _)| modified < *at) {
+            break;
+        }
+        match group.read(cwd, expired) {
+            Ok(Some(session)) => {
+                if accepted.insert(session.id.clone()) {
+                    sessions.push((modified, session));
+                }
+            }
+            Ok(None) => {}
+            Err(()) => {
+                sessions.retain(|(at, _)| *at > modified);
+                unresolved = true;
+                break;
+            }
+        }
+    }
+    if unresolved && sessions.is_empty() {
+        return None;
+    }
+    Some(
+        sessions
+            .into_iter()
+            .take(limit)
+            .map(|(_, session)| session)
+            .collect(),
+    )
 }
 
 #[derive(Default)]
