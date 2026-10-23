@@ -1054,6 +1054,88 @@ fn review_rollout_import_uses_the_readable_compression_sibling() {
     assert_eq!(super::codex_latest_session_id(&home.0, &home.0), Some(id));
 }
 
+fn excluded_subagent_siblings(unreadable_newer: bool) -> (TempHome, String) {
+    let root = std::env::temp_dir().join(format!("muxel-codex-subagent-{}", Uuid::new_v4()));
+    let conversation = "01a1543c-9700-7000-8000-000000000001";
+    let subagent = "01a1543c-9700-7000-8000-000000000002";
+    let day = root.join(".codex/sessions/2026/10/19");
+    write_rollout_at(
+        &day.join(format!("rollout-{conversation}.jsonl")),
+        serde_json::json!({"id":conversation,"cwd":root}),
+        60,
+    );
+    let jsonl = day.join(format!("rollout-{subagent}.jsonl"));
+    write_rollout_at(
+        &jsonl,
+        serde_json::json!({"id":subagent,"cwd":root,"source":"subagent"}),
+        0,
+    );
+    let compressed = jsonl.with_extension("jsonl.zst");
+    std::fs::write(&compressed, [0x28, 0xb5, 0x2f, 0xfd]).unwrap();
+    let newest = std::time::SystemTime::now();
+    for (path, age) in [
+        (&jsonl, if unreadable_newer { 10 } else { 0 }),
+        (&compressed, if unreadable_newer { 0 } else { 10 }),
+    ] {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(newest - std::time::Duration::from_secs(age))
+            .unwrap();
+    }
+    (TempHome(root), conversation.to_string())
+}
+
+fn assert_subagent_siblings_allow_restore(unreadable_newer: bool) {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+    let (home, conversation) = excluded_subagent_siblings(unreadable_newer);
+    let found = super::codex_latest_sessions(
+        &home.0,
+        &home.0,
+        &HashSet::new(),
+        1,
+        Instant::now() + Duration::from_secs(60),
+    );
+    assert_eq!(
+        found.map(|sessions| sessions
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>()),
+        Some(vec![conversation]),
+        "a confirmed subagent excludes its unreadable same-UUID sibling"
+    );
+}
+
+#[test]
+fn subagent_siblings_restore_with_unreadable_copy_newer() {
+    assert_subagent_siblings_allow_restore(true);
+}
+
+#[test]
+fn subagent_siblings_restore_with_readable_copy_newer() {
+    assert_subagent_siblings_allow_restore(false);
+}
+
+#[test]
+fn subagent_siblings_import_with_unreadable_copy_newer() {
+    let (home, conversation) = excluded_subagent_siblings(true);
+    assert_eq!(
+        super::codex_latest_session_id(&home.0, &home.0),
+        Some(conversation)
+    );
+}
+
+#[test]
+fn subagent_siblings_import_with_readable_copy_newer() {
+    let (home, conversation) = excluded_subagent_siblings(false);
+    assert_eq!(
+        super::codex_latest_session_id(&home.0, &home.0),
+        Some(conversation)
+    );
+}
+
 #[test]
 fn walked_codex_id_is_found_outside_its_day_and_a_complete_miss_is_missing() {
     use super::codex_rollout_by_walk;

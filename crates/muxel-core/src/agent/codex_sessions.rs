@@ -399,8 +399,9 @@ impl RolloutGroup {
         }
     }
 
-    /// A verified sibling resolves this identity even if its compressed copy
-    /// cannot be read. Otherwise errors or expiry leave the group unresolved.
+    /// A verified sibling resolves this identity, including a confirmed subagent
+    /// exclusion, even if its compressed copy cannot be read. Otherwise errors
+    /// or expiry leave the group unresolved.
     fn read(
         mut self,
         cwd: &Path,
@@ -428,7 +429,7 @@ impl RolloutGroup {
                         }
                     }));
                 }
-                Ok(None) => {}
+                Ok(None) => return Ok(None),
                 Err(_) => unresolved = true,
             }
         }
