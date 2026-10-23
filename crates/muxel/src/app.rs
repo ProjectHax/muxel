@@ -1248,6 +1248,8 @@ struct StatusBinding {
 struct SeenStatus {
     status: AgentStatus,
     binding: StatusBinding,
+    coverage: muxel_terminal::TerminalStatusCoverage,
+    completion_revision: u64,
 }
 
 /// What one status sample does on the app's attention path: the last status
@@ -1312,6 +1314,8 @@ fn status_attention(
 struct StatusSample {
     status: AgentStatus,
     binding: StatusBinding,
+    coverage: muxel_terminal::TerminalStatusCoverage,
+    completion_revision: u64,
     attributable: bool,
     /// The pane is focused in its active window.
     attended: bool,
@@ -1333,6 +1337,8 @@ impl StatusSample {
                 launch: runtime.launch_id,
                 rev: runtime.binding_rev,
             },
+            coverage: runtime.coverage,
+            completion_revision: runtime.completion_revision,
             attributable: runtime.is_attributable_to(binding_rev),
             attended,
             preserve_restored,
@@ -1352,6 +1358,9 @@ struct SampleEffect {
     notify: Option<NotifKind>,
     /// A new completion, for auto-read.
     completed: bool,
+    /// Provider-owned completion even if a later clear or exit changed the
+    /// current status coverage before this sample was consumed.
+    program_completion: bool,
 }
 
 /// Apply one status sample to a pane's attention: the status recorded for it,
@@ -1365,6 +1374,8 @@ fn apply_status_sample(
     let StatusSample {
         status,
         binding,
+        coverage,
+        completion_revision,
         attributable,
         attended,
         preserve_restored,
@@ -1379,7 +1390,17 @@ fn apply_status_sample(
             } => (true, notify, new_binding),
         };
     let previous = record.filter(|_| !new_binding).map(|seen| seen.status);
-    *record = Some(SeenStatus { status, binding });
+    let completion_pulse = record
+        .filter(|seen| seen.binding == binding)
+        .map_or(completion_revision > 0, |seen| {
+            completion_revision > seen.completion_revision
+        });
+    *record = Some(SeenStatus {
+        status,
+        binding,
+        coverage,
+        completion_revision,
+    });
     let mut effect = SampleEffect {
         changed,
         ..SampleEffect::default()
@@ -1387,30 +1408,69 @@ fn apply_status_sample(
     let restored_state = activity.as_deref().and_then(AgentActivity::current_state);
     if !preserve_restored
         && let Some(activity) = activity
-        && (new_binding || activity_needs_observation(previous, status, activity))
+        && (new_binding
+            || completion_pulse
+            || activity_needs_observation(previous, status, activity))
     {
         // A new binding's first status is a new event. Its previous state is
         // none of the old conversation's: a durable Done there would swallow
         // this conversation's completion.
         let previous_activity = if new_binding {
             Some(AgentActivityState::Idle)
+        } else if completion_pulse {
+            Some(AgentActivityState::Working)
         } else {
             activity
                 .current_state()
                 .or_else(|| previous.map(activity_state))
         };
-        effect.activity_changed |= activity.observe(previous_activity, activity_state(status), now);
+        if completion_pulse && status != AgentStatus::Done {
+            // Two protocol turns can fit in one PTY drain. Keep the current
+            // badge Working/Blocked while recording the intervening finish.
+            effect.activity_changed |=
+                activity.observe(previous_activity, AgentActivityState::Done, now);
+            effect.activity_changed |=
+                activity.observe(Some(AgentActivityState::Done), activity_state(status), now);
+        } else {
+            effect.activity_changed |=
+                activity.observe(previous_activity, activity_state(status), now);
+        }
         if attended && status == AgentStatus::Done {
             effect.activity_changed |= activity.attend(now);
         }
     }
     // The first live sample after restore describes durable state, not a new
     // event; a new binding's never does.
-    let restored =
-        !new_binding && is_restored_transition(preserve_restored, status, restored_state);
-    effect.completed = changed && status == AgentStatus::Done && !restored;
-    effect.notify = notify.filter(|_| !attended && !restored);
+    let restored = preserve_restored
+        || (!completion_pulse
+            && !new_binding
+            && is_restored_transition(false, status, restored_state));
+    effect.program_completion = completion_pulse && !restored;
+    effect.completed = (changed && status == AgentStatus::Done || completion_pulse) && !restored;
+    effect.notify = if completion_pulse && status == AgentStatus::Done && !attended && !restored {
+        Some(NotifKind::Done)
+    } else {
+        notify.filter(|_| !attended && !restored)
+    };
     effect
+}
+
+fn should_refresh_accomplishments_after_status(
+    previous: Option<SeenStatus>,
+    effect: SampleEffect,
+    coverage: muxel_terminal::TerminalStatusCoverage,
+) -> bool {
+    if effect.program_completion {
+        true
+    } else if coverage == muxel_terminal::TerminalStatusCoverage::ProgramStatus {
+        effect.completed
+    } else {
+        effect.changed
+            && previous.is_some_and(|seen| {
+                seen.status == AgentStatus::Working
+                    && seen.coverage != muxel_terminal::TerminalStatusCoverage::ProgramStatus
+            })
+    }
 }
 
 fn apply_popout_status_sample(
@@ -1443,12 +1503,238 @@ fn apply_popout_status_sample(
 mod status_attention_tests {
     use super::{
         AgentActivity, AgentStatus, NotifKind, SampleEffect, SeenStatus, StatusAttention,
-        StatusBinding, StatusSample, apply_status_sample, status_attention,
+        StatusBinding, StatusSample, apply_status_sample,
+        should_refresh_accomplishments_after_status, status_attention,
     };
+    use muxel_terminal::TerminalStatusCoverage;
     use uuid::Uuid;
 
     fn seen(status: AgentStatus, binding: StatusBinding) -> Option<SeenStatus> {
-        Some(SeenStatus { status, binding })
+        Some(SeenStatus {
+            status,
+            binding,
+            coverage: TerminalStatusCoverage::ProviderVisible,
+            completion_revision: 0,
+        })
+    }
+
+    #[test]
+    fn a_coalesced_program_status_completion_refreshes_accomplishments_once() {
+        let completed = SampleEffect {
+            changed: true,
+            completed: true,
+            ..SampleEffect::default()
+        };
+        assert!(should_refresh_accomplishments_after_status(
+            None,
+            completed,
+            TerminalStatusCoverage::ProgramStatus,
+        ));
+        assert!(!should_refresh_accomplishments_after_status(
+            None,
+            SampleEffect::default(),
+            TerminalStatusCoverage::ProgramStatus,
+        ));
+        assert!(!should_refresh_accomplishments_after_status(
+            None,
+            completed,
+            TerminalStatusCoverage::ProviderVisible,
+        ));
+    }
+
+    #[test]
+    fn program_status_completion_revision_survives_done_to_done_once() {
+        let binding = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 1,
+        };
+        let mut record = Some(SeenStatus {
+            status: AgentStatus::Done,
+            binding,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            completion_revision: 1,
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(
+            Some(muxel_core::AgentActivityState::Working),
+            muxel_core::AgentActivityState::Done,
+            100,
+        );
+        let sample = StatusSample {
+            status: AgentStatus::Done,
+            binding,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            completion_revision: 2,
+            attributable: true,
+            attended: false,
+            preserve_restored: false,
+        };
+        let previous = record;
+        let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 200);
+        assert!(!effect.changed && effect.completed);
+        assert_eq!(effect.notify, Some(NotifKind::Done));
+        assert_eq!(activity.completed_at, Some(200));
+        assert!(should_refresh_accomplishments_after_status(
+            previous,
+            effect,
+            sample.coverage
+        ));
+        let previous = record;
+        let repeated = apply_status_sample(&mut record, Some(&mut activity), sample, 300);
+        assert!(!repeated.completed && repeated.notify.is_none());
+        assert_eq!(activity.completed_at, Some(200));
+        assert!(!should_refresh_accomplishments_after_status(
+            previous,
+            repeated,
+            sample.coverage
+        ));
+    }
+
+    #[test]
+    fn program_status_completion_pulse_survives_newer_working_level() {
+        let binding = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 1,
+        };
+        let mut record = Some(SeenStatus {
+            status: AgentStatus::Working,
+            binding,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            completion_revision: 0,
+        });
+        let mut activity = AgentActivity::default();
+        activity.observe(
+            Some(muxel_core::AgentActivityState::Idle),
+            muxel_core::AgentActivityState::Working,
+            100,
+        );
+        let sample = StatusSample {
+            status: AgentStatus::Working,
+            binding,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            completion_revision: 1,
+            attributable: true,
+            attended: false,
+            preserve_restored: false,
+        };
+        let previous = record;
+        let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 200);
+        assert!(effect.completed);
+        assert!(!effect.changed);
+        assert_eq!(effect.notify, None);
+        assert_eq!(activity.completed_at, Some(200));
+        assert_eq!(
+            activity.current_state(),
+            Some(muxel_core::AgentActivityState::Working)
+        );
+        assert!(should_refresh_accomplishments_after_status(
+            previous,
+            effect,
+            sample.coverage
+        ));
+        let repeated = apply_status_sample(&mut record, Some(&mut activity), sample, 300);
+        assert!(!repeated.completed);
+        assert_eq!(activity.completed_at, Some(200));
+
+        let blocked = StatusSample {
+            status: AgentStatus::Blocked,
+            completion_revision: 2,
+            ..sample
+        };
+        let effect = apply_status_sample(&mut record, Some(&mut activity), blocked, 400);
+        assert!(effect.completed);
+        assert_eq!(effect.notify, Some(NotifKind::Blocked));
+        assert_eq!(activity.completed_at, Some(400));
+    }
+
+    #[test]
+    fn program_completion_survives_clear_or_exit_to_fallback_coverage() {
+        let binding = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 1,
+        };
+        for status in [AgentStatus::Idle, AgentStatus::Done] {
+            let mut record = Some(SeenStatus {
+                status: AgentStatus::Working,
+                binding,
+                coverage: TerminalStatusCoverage::ProgramStatus,
+                completion_revision: 0,
+            });
+            let mut activity = AgentActivity::default();
+            activity.observe(
+                Some(muxel_core::AgentActivityState::Idle),
+                muxel_core::AgentActivityState::Working,
+                100,
+            );
+            let sample = StatusSample {
+                status,
+                binding,
+                coverage: TerminalStatusCoverage::ProviderVisible,
+                completion_revision: 1,
+                attributable: true,
+                attended: false,
+                preserve_restored: false,
+            };
+            let previous = record;
+            let effect = apply_status_sample(&mut record, Some(&mut activity), sample, 200);
+            assert!(effect.program_completion, "{status:?}");
+            assert!(effect.completed, "{status:?}");
+            assert!(should_refresh_accomplishments_after_status(
+                previous,
+                effect,
+                sample.coverage
+            ));
+            assert_eq!(activity.completed_at, Some(200));
+            let repeated = apply_status_sample(&mut record, Some(&mut activity), sample, 300);
+            assert!(!repeated.program_completion);
+            assert!(!should_refresh_accomplishments_after_status(
+                record,
+                repeated,
+                sample.coverage
+            ));
+        }
+    }
+
+    #[test]
+    fn program_status_working_blocked_done_refreshes_only_at_done() {
+        let binding = StatusBinding {
+            launch: Uuid::new_v4(),
+            rev: 1,
+        };
+        let mut record = None;
+        let mut activity = AgentActivity::default();
+        let sample = |status, completion_revision| StatusSample {
+            status,
+            binding,
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            completion_revision,
+            attributable: true,
+            attended: false,
+            preserve_restored: false,
+        };
+        for (status, revision, should_refresh) in [
+            (AgentStatus::Working, 0, false),
+            (AgentStatus::Blocked, 0, false),
+            (AgentStatus::Done, 1, true),
+            (AgentStatus::Done, 1, false),
+        ] {
+            let previous = record;
+            let effect = apply_status_sample(
+                &mut record,
+                Some(&mut activity),
+                sample(status, revision),
+                100 + revision as i64,
+            );
+            assert_eq!(
+                should_refresh_accomplishments_after_status(
+                    previous,
+                    effect,
+                    TerminalStatusCoverage::ProgramStatus,
+                ),
+                should_refresh,
+                "{status:?} revision {revision}"
+            );
+        }
     }
 
     #[test]
@@ -1481,6 +1767,7 @@ mod status_attention_tests {
             input_rev: 0,
             draft_latched: false,
             completion_ready: true,
+            completion_revision: 0,
         };
         let mut record = seen(AgentStatus::Working, old);
         let mut activity = AgentActivity::default();
@@ -1619,6 +1906,8 @@ mod status_attention_tests {
                 StatusSample {
                     status,
                     binding,
+                    coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
+                    completion_revision: 0,
                     attributable,
                     attended,
                     preserve_restored: false,
@@ -3948,6 +4237,7 @@ mod loop_cleanup_tests {
             input_rev: 0,
             draft_latched: false,
             completion_ready: status == AgentStatus::Done,
+            completion_revision: 0,
         }
     }
 
@@ -4227,6 +4517,8 @@ mod loop_cleanup_tests {
                 launch: session.id,
                 rev: a,
             },
+            coverage: TerminalStatusCoverage::ProviderVisible,
+            completion_revision: 0,
         });
         // A completes between loop heartbeats. B is adopted before the next
         // heartbeat, and the runtime has not refreshed its cached A snapshot.
@@ -13121,6 +13413,7 @@ impl MuxelApp {
                 self.restoring_activity.remove(&iid);
             }
             let mut record = self.last_status.get(&iid).copied();
+            let previous_record = record;
             let previous = record.map(|seen| seen.status);
             let effect = apply_status_sample(
                 &mut record,
@@ -13141,9 +13434,11 @@ impl MuxelApp {
             }
             activity_changed |= effect.activity_changed;
             let changed = effect.changed;
-            if changed
-                && previous == Some(AgentStatus::Working)
-                && let Some(instance) = self.workspace.instance(iid)
+            if should_refresh_accomplishments_after_status(
+                previous_record,
+                effect,
+                runtime.coverage,
+            ) && let Some(instance) = self.workspace.instance(iid)
             {
                 turns_finished.push(instance.project_id);
             }
@@ -13547,7 +13842,7 @@ impl MuxelApp {
             .map(|v| v.read(cx).session().clone())
         {
             session.write_input(self.continue_message_for(iid).as_bytes());
-            session.mark_turn_submitted();
+            session.mark_prompt_submitted();
             session.write_input(b"\r");
         }
     }
@@ -20420,7 +20715,7 @@ impl MuxelApp {
         for iid in self.broadcast_targets() {
             if let Some(view) = self.terminals.get(&iid) {
                 let session = view.read(cx).session();
-                session.mark_turn_submitted();
+                session.mark_prompt_submitted();
                 session.write_input(payload.as_bytes());
             }
         }
@@ -20463,12 +20758,20 @@ impl MuxelApp {
         else {
             return;
         };
+        let mut supplied_prompt = false;
         for step in steps {
             match step {
-                SnippetStep::Paste(text) => session.paste(text),
+                SnippetStep::Paste(text) => {
+                    supplied_prompt |= !text.is_empty();
+                    session.paste(text);
+                }
                 SnippetStep::Write(bytes) => {
                     if bytes.ends_with(b"\r") {
-                        session.mark_turn_submitted();
+                        if supplied_prompt || bytes.len() > 1 {
+                            session.mark_prompt_submitted();
+                        } else {
+                            session.mark_turn_submitted();
+                        }
                     }
                     session.write_input(bytes);
                 }
@@ -21190,7 +21493,7 @@ impl MuxelApp {
         };
         session.paste(text);
         if submit {
-            session.mark_turn_submitted();
+            session.mark_prompt_submitted();
             session.write_input(b"\r");
         }
         self.focus_instance(iid, window, cx);
@@ -34976,6 +35279,8 @@ mod popout_activity_tests {
         let mut record = Some(SeenStatus {
             status: AgentStatus::Done,
             binding,
+            coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
+            completion_revision: 0,
         });
         let before_record = record;
         let mut activity = AgentActivity::default();
@@ -34992,6 +35297,8 @@ mod popout_activity_tests {
             StatusSample {
                 status: AgentStatus::Done,
                 binding: StatusBinding { rev: 2, ..binding },
+                coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
+                completion_revision: 0,
                 attributable: false,
                 attended: true,
                 preserve_restored: false,
@@ -35013,6 +35320,8 @@ mod popout_activity_tests {
         let mut record = Some(SeenStatus {
             status: AgentStatus::Done,
             binding,
+            coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
+            completion_revision: 0,
         });
         let mut activity = AgentActivity::default();
         activity.observe(None, AgentActivityState::Working, 100);
@@ -35024,6 +35333,8 @@ mod popout_activity_tests {
         let sample = StatusSample {
             status: AgentStatus::Done,
             binding: StatusBinding { rev: 2, ..binding },
+            coverage: muxel_terminal::TerminalStatusCoverage::ProviderVisible,
+            completion_revision: 0,
             attributable: true,
             attended: false,
             preserve_restored: false,

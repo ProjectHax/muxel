@@ -13,6 +13,7 @@
 
 use crate::colors::{TerminalPalette, index_to_rgb};
 use crate::listener::SharedWriter;
+use crate::program_status::{CAPABILITY_REPLY, Event as ProgramStatusEvent, Scanner};
 use alacritty_terminal::term::{Config as TermConfig, Osc52};
 use alacritty_terminal::vte::ansi::{Handler, Mode, PrivateMode, Processor, Timeout};
 use parking_lot::Mutex;
@@ -121,6 +122,7 @@ fn answered_by_reader(reply: &str) -> bool {
 pub(crate) struct ImmediateReplies {
     parser: Processor<Unsynchronized>,
     handler: ReplyHandler,
+    program_status_scanner: Scanner,
 }
 
 impl ImmediateReplies {
@@ -133,6 +135,7 @@ impl ImmediateReplies {
     ) -> Self {
         Self {
             parser: Processor::new(),
+            program_status_scanner: Scanner::default(),
             handler: ReplyHandler {
                 replies,
                 palette,
@@ -143,7 +146,31 @@ impl ImmediateReplies {
     }
 
     pub(crate) fn advance(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.handler, bytes);
+        // Query and DA can arrive in the same PTY read. Feed VTE the span up
+        // through each completed 7501 event before handling it, then resume.
+        // This preserves reply order without calling VTE once per byte.
+        let mut start = 0;
+        for (index, &byte) in bytes.iter().enumerate() {
+            let Some(event) = self.program_status_scanner.advance(byte) else {
+                continue;
+            };
+            self.parser
+                .advance(&mut self.handler, &bytes[start..=index]);
+            start = index + 1;
+            match event {
+                ProgramStatusEvent::Query => {
+                    log::debug!("program status source=osc7501 query; sending capability answer");
+                    self.handler.replies.send(CAPABILITY_REPLY.to_owned());
+                }
+                ProgramStatusEvent::Report(_)
+                | ProgramStatusEvent::Reset
+                | ProgramStatusEvent::ShellPrompt
+                | ProgramStatusEvent::Title(_) => {}
+            }
+        }
+        if start < bytes.len() {
+            self.parser.advance(&mut self.handler, &bytes[start..]);
+        }
     }
 }
 
@@ -241,6 +268,7 @@ mod tests {
     use super::{ImmediateReplies, Replies, SECONDARY_DA};
     use crate::colors::{TerminalPalette, index_to_rgb};
     use crate::listener::MuxelListener;
+    use crate::program_status::CAPABILITY_REPLY;
     use crate::session::term_config;
     use alacritty_terminal::event::{Event, EventListener};
     use alacritty_terminal::term::Term;
@@ -400,6 +428,57 @@ mod tests {
         assert_eq!(pipeline.drain(probe), "\x1b[1;1R\x1b[?6c");
         // With nothing owed any more, the next query is answered at once again.
         assert_eq!(pipeline.read(b"\x1b[c"), "\x1b[?6c");
+    }
+
+    #[test]
+    fn program_status_answer_precedes_da_in_the_same_read() {
+        for terminator in ["\x07", "\x1b\\"] {
+            let mut pipeline = Pipeline::new();
+            let wire = format!("\x1b]7501;?{terminator}\x1b[c");
+            assert_eq!(
+                pipeline.read(wire.as_bytes()),
+                format!("{CAPABILITY_REPLY}\x1b[?6c")
+            );
+            assert_eq!(pipeline.drain(wire.as_bytes()), "");
+
+            let mut reversed = Pipeline::new();
+            let wire = format!("\x1b[c\x1b]7501;?{terminator}");
+            assert_eq!(
+                reversed.read(wire.as_bytes()),
+                format!("\x1b[?6c{CAPABILITY_REPLY}")
+            );
+        }
+    }
+
+    #[test]
+    fn program_status_answer_waits_for_earlier_grid_reply() {
+        let mut pipeline = Pipeline::new();
+        let wire = b"\x1b[6n\x1b]7501;?\x1b\\\x1b[c";
+        assert_eq!(pipeline.read(wire), "");
+        assert_eq!(
+            pipeline.drain(wire),
+            format!("\x1b[1;1R{CAPABILITY_REPLY}\x1b[?6c")
+        );
+    }
+
+    #[test]
+    fn interrupted_dcs_then_ris_restores_capability_queries() {
+        let mut pipeline = Pipeline::new();
+        assert_eq!(pipeline.read(b"\x1bPunterminated\x1b"), "");
+        assert_eq!(pipeline.read(b"c\x1b]7501;?\x07"), CAPABILITY_REPLY);
+    }
+
+    #[test]
+    fn reports_and_malformed_queries_never_get_an_answer() {
+        let mut pipeline = Pipeline::new();
+        for wire in [
+            b"\x1b]7501;state=working\x07".as_slice(),
+            b"\x1b]7501;?extra\x07",
+            b"\x1b]7501;?\x1bX",
+            b"\x1b]7501;?\x18",
+        ] {
+            assert_eq!(pipeline.read(wire), "");
+        }
     }
 
     /// The reader and alacritty must agree on exactly which queries get a reply

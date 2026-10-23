@@ -2099,6 +2099,7 @@ mod runtime_control_tests {
             input_rev: 0,
             draft_latched: false,
             completion_ready: true,
+            completion_revision: 0,
         };
         let now = SystemTime::now();
         session.provider_switched(now, now);

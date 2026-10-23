@@ -10,7 +10,8 @@ invalidates cached facts before its queued reconciliation runs.
 
 The view reconciles after drained PTY output, process exit, a settled resize,
 a submission, a provider binding switch, an acknowledged bell, or the earliest
-due quiet/provider debounce or switch settle deadline. A one-entry runtime trigger coalesces
+due quiet/provider debounce, switch settle, or synchronized-output deadline.
+A one-entry runtime trigger coalesces
 redundant invalidations. Timers carry a generation and become no-ops after a
 newer deadline replaces them.
 
@@ -34,15 +35,48 @@ transition by polling more often.
   title begins revision 1. A known launch's first UUID title is no switch
   unless it names a different id than the pinned one;
 - `snapshot_seq`: advances when the status, its reason, whether it is
-  attributable (see below), the binding, or completion readiness changes;
+  attributable (see below), the binding, completion readiness, coverage, or
+  completion revision changes;
 - `input_rev`: advances before ordinary non-empty input writes reach
   the PTY writer; fallible control submissions commit it after successful writer
   admission. Keys, pastes, sends, and mouse and wheel reports count. Focus
   reports and the terminal's own replies to the program don't count;
 - `draft_latched`: set by typed input and cleared by a submission (see below);
   mouse and wheel reports leave it as it was;
-- the status, whether it is attributable, its strongest visible reason,
+- `completion_revision`: counts observed program completion transitions in this
+  launch and binding. Consumers compare it even when successive sampled badges
+  are both Done, or new Working/Blocked reports follow a completion in one drain;
+- the status, whether it is attributable, its strongest reason,
   completion readiness, and evidence coverage.
+
+## Program status reports
+
+Direct PTY panes accept validated OSC 7501 root reports. A current root supplies
+`ProgramStatus` coverage and overrides visible fallback detection. Child-id
+reports cannot control the pane. The PTY reader answers capability queries
+through the existing ordered reply queue, preserving earlier grid-dependent
+replies and following DA replies. Only the UI drain publishes status reports.
+
+The drain's passive observer processes each timed segment after synchronized
+capacity replay selects its read time and before VTE can defer title callbacks.
+Old partial reports retain their opening freshness and binding generation; a
+fresh terminator cannot revive them. Replayed bytes are not observed twice.
+The synchronized-output deadline flushes a stuck frame without another read,
+retaining its original time.
+
+Working/Blocked-to-Done/Error transitions advance the completion counter. Codex
+also completes a submitted Working-to-Idle turn in its current binding. Explicit
+initial prompt paths may carry Working evidence through the first UUID title;
+a bare Enter cannot. This completion hint never grants loop ownership to a
+prompt submitted before its identity was known.
+
+Clear and reset release protocol authority. A shell prompt retires unfinished
+Working/Blocked reports; completed Done/Error reports remain visible. Process
+exit uses fallback status. Clear and exit preserve completion pulses already
+observed in that binding, so a fast finish is not lost before the next sample.
+A provider binding switch or relaunch retires both reports and their completion
+counts. Local and remote tmux panes keep fallback detection because tmux does
+not forward OSC 7501 reports.
 
 ## Provider bindings
 
@@ -59,6 +93,10 @@ the reducer resets its latches and reads the new binding's title edges from its
 start. If more title edges arrived than the 64-edge buffer keeps, it rebuilds
 from the current title without a completion edge.
 
+- A pinned `--session-id` or `--resume` launch begins at binding revision one,
+  as does a provider with no binding source. Its first matching UUID title
+  confirms that binding; a different UUID begins a replacement binding.
+  An unpinned provider with a binding source waits for its first report.
 - A Codex title with a different UUID thread begins the binding at that title,
   in exact order. Earlier frames, and a bell that rang before it, are retired;
   a bell after it, even in the same drained batch, survives.
@@ -80,9 +118,18 @@ from the current title without a completion edge.
     retired.
   - Output read inside the window is ambiguous. The current title stays as
     level state (Working, Idle or Blocked), but nothing in the window forms a
-    completion edge, latches Done, or rings the bell.
+    completion edge, latches Done, rings the bell, changes the session hint, or
+    starts another UUID binding.
   - Output read after the window, and input written after the interval's end,
     are attributed to the new conversation.
+
+  An OSC title split across reads keeps the read time of its opening escape
+  through BEL or ST. A control such as BEL executed between that escape and
+  the OSC selector uses its own read time without changing the title's origin.
+  DEC synchronized updates can defer title callbacks until
+  ESU or a timeout; replay keeps the oldest read time of that frame. Each new
+  frame gets its own origin, even when the previous frame closes in the same
+  read. A late terminator or ESU cannot turn an old UUID into a new binding.
 
   Until fresh evidence arrives (a title read after the window or, with no
   title, any output read after it), the reducer shows level state only. An
@@ -96,6 +143,10 @@ from the current title without a completion edge.
   conversation's. That forms no completion edge either (an Idle reached this
   way arms the next turn, as at startup) and doesn't end a screen hold: only a
   title read after the window can confirm a held marker.
+  Independently, five seconds of PTY silence retires an old Working or Blocked
+  title to Idle when there is no current-binding submission, fresh semantic
+  title, screen marker, bell or exit. This forms no completion edge and does not
+  seed readiness. New output resumes the normal evidence rules.
 
   The status shown meanwhile is marked non-attributable
   (`status_attributable()`): a Blocked from an old title or a prompt still on
@@ -164,23 +215,17 @@ from the current title without a completion edge.
   still compare as unchanged, so after a relaunch into a different
   conversation, an event in the state last recorded for the pane can be
   missed.
-- Claude's hook stamps each record with a nonce. A record whose nonce this
-  launch hasn't seen is a switch even when it names the conversation already
-  bound, so `/resume B` then `/resume A` between two reads is a switch. The
-  launch's first same-ID record is exempt only when muxel generated its own
-  `--resume` flag, because that launch can write a `SessionStart` receipt.
-  Configured provider arguments are opaque: even a startup receipt from a
-  preset's `--resume` or `--continue` is treated as a switch. This may retire
-  completion evidence early, but also releases loop ownership before Exit
-  cleanup can close the resumed pane. A fresh `--session-id` command writes no
-  startup receipt, so its first `/resume A` is a switch even when it returns
-  to A. A `tmux new-session -A` attach may run no new Claude process despite
-  muxel's generated resume flag; without a reliable attach result at launch,
-  its first same-ID user resume can still be exempted. A record from an older
-  muxel's hook has no nonce and switches only when it names another
-  conversation. Recurring
-  discovery validates an immutable snapshot on a worker. The UI claims the
-  current record by
+- Claude's hook stamps each record with a nonce; older records are identified
+  by their exact bytes and write time. A new record is a switch even when it
+  names the bound conversation, so `/resume B` then `/resume A` between two
+  reads retires the old runtime. Only a `resume` receipt from a launch that
+  used muxel's generated `--resume` flag, recorded after spawn and before its
+  first submitted turn, confirms that launch without opening another binding.
+  Configured provider arguments are opaque, so their receipts are switches.
+  A fresh `--session-id` launch has no startup receipt. A tmux attach cannot
+  prove whether a new process started; a same-ID resume before the first prompt
+  can still be indistinguishable from a startup receipt. Recurring discovery validates an
+  immutable snapshot on a worker. The UI claims the current record by
   renaming it, then requires its bytes and write time to match that snapshot
   before applying or acknowledging it. Prelaunch recovery uses the same UI
   claim owner. A record the hook writes meanwhile waits at the shared path;

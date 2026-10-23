@@ -179,6 +179,9 @@ pub(crate) struct LifecycleEvidence {
     /// The latest bell. Acknowledging it clears the session's flag, not this.
     bell: Option<EvidenceMark>,
     submitted: Option<EvidenceMark>,
+    /// A prompt with draft text was submitted before the first title bound it.
+    /// A bare Enter can be a resume selector and does not establish this fact.
+    initial_unbound_prompt: bool,
     /// The first submitted turn owns an unattended loop run. Later input must
     /// never transfer that ownership to a replacement conversation. Revision
     /// zero means its recipient was unknown and stays unknown for this run.
@@ -229,9 +232,11 @@ impl LifecycleEvidence {
     }
 
     /// The parser is about to apply output the reader received at `at`.
-    pub(crate) fn begin_read(&mut self, at: SystemTime) {
+    pub(crate) fn begin_read(&mut self, at: SystemTime) -> bool {
         self.reading_at = Some(at);
-        self.fresh_output |= self.output_is_fresh(at);
+        let fresh = self.output_is_fresh(at);
+        self.fresh_output |= fresh;
+        fresh
     }
 
     pub(crate) fn end_read(&mut self) {
@@ -275,8 +280,32 @@ impl LifecycleEvidence {
         self.first_submission.get_or_insert(self.binding_rev);
     }
 
+    pub(crate) fn record_prompt_submission(&mut self, at: SystemTime) {
+        if self.binding_rev == 0 && self.first_submission.is_none() {
+            self.initial_unbound_prompt = true;
+        }
+        self.record_submission(at);
+    }
+
+    pub(crate) fn can_carry_initial_working(&self) -> bool {
+        self.binding_rev == 0
+            && self.first_submission == Some(0)
+            && self.initial_unbound_prompt
+            && self.window.is_none()
+    }
+
     pub(crate) fn first_submission_binding(&self) -> Option<u64> {
         self.first_submission.filter(|rev| *rev != 0)
+    }
+
+    /// An initial prompt can reach a provider before its first UUID title.
+    /// This is only a completion hint for that first title binding; it never
+    /// transfers unattended-loop ownership or crosses a later switch.
+    pub(crate) fn initial_unbound_submission(&self) -> bool {
+        self.binding_rev == 1
+            && self.first_submission == Some(0)
+            && self.initial_unbound_prompt
+            && self.window.is_none()
     }
 
     pub(crate) fn first_submission_at(&self) -> Option<SystemTime> {
@@ -437,7 +466,7 @@ pub(crate) struct MuxelListener {
     pub clipboard_store: Arc<Mutex<Vec<(ClipboardType, String)>>>,
 }
 
-fn session_thread_field(title: &str) -> Option<&str> {
+pub(crate) fn session_thread_field(title: &str) -> Option<&str> {
     let title = title.trim();
     let title = title
         .strip_prefix("[ ! ] Action Required | ")

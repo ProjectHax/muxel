@@ -1898,6 +1898,7 @@ mod grok_regressions {
                         input_rev: 0,
                         draft_latched: false,
                         completion_ready: true,
+                        completion_revision: 0,
                     };
                     let mut run = LoopRun {
                         loop_id: Uuid::new_v4(),

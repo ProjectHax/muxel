@@ -7,8 +7,13 @@
 //! so the `Term` is only ever touched from the GPUI thread.
 
 use crate::colors::TerminalPalette;
-use crate::listener::{EvidenceRead, LifecycleEvidence, MuxelListener, SharedWriter};
+use crate::listener::{
+    EvidenceRead, LifecycleEvidence, MuxelListener, SharedWriter, session_thread_field,
+};
 use crate::profile;
+use crate::program_status::{
+    Event as ProgramStatusEvent, Observer, ProgramStatusSnapshot, ThreadKey,
+};
 use crate::replies::{ImmediateReplies, Replies};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
@@ -1142,6 +1147,8 @@ pub struct TerminalSession {
     launch_resumed: bool,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
+    program_status_observer: Mutex<Observer>,
+    program_status_generation: AtomicU64,
     read_clock: Mutex<OutputReadClock>,
     writer: SharedWriter,
     output_queue: Arc<OutputQueueState>,
@@ -1162,6 +1169,9 @@ pub struct TerminalSession {
     child_pid: Option<u32>,
     title: Arc<Mutex<Option<String>>>,
     evidence: Arc<Mutex<LifecycleEvidence>>,
+    /// Current root OSC 7501 report from this PTY launch. Child-id records do
+    /// not drive pane status; a provider binding switch clears the root.
+    program_status: Arc<Mutex<ProgramStatusSnapshot>>,
     title_generation: Arc<AtomicU64>,
     title_changed_at: Arc<Mutex<Option<Instant>>>,
     session_id_hint: Arc<Mutex<Option<String>>>,
@@ -1578,6 +1588,10 @@ impl TerminalSession {
         let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let term_config = term_config();
         let replies = Arc::new(Replies::new(writer.clone()));
+        let program_status = Arc::new(Mutex::new(ProgramStatusSnapshot::default()));
+        if matches!(&spec.binding, LaunchBinding::Known(_)) {
+            program_status.lock().adopt_binding(1);
+        }
         let immediate_replies =
             ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
         let output_queue = tx.queue_state();
@@ -1669,6 +1683,8 @@ impl TerminalSession {
             launch_resumed: spec.launch_resumed,
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
+            program_status_observer: Mutex::new(Observer::default()),
+            program_status_generation: AtomicU64::new(0),
             read_clock: Mutex::new(OutputReadClock::default()),
             writer,
             master,
@@ -1679,6 +1695,7 @@ impl TerminalSession {
             child_pid,
             title,
             evidence,
+            program_status,
             title_generation,
             title_changed_at,
             session_id_hint,
@@ -1761,7 +1778,7 @@ impl TerminalSession {
         // parses the incoming bytes in the same advance call. Give the replay
         // its old time and the new bytes their own time.
         const VTE_SYNC_BUFFER_SIZE: usize = 0x20_0000;
-        if processor.sync_timeout().sync_timeout().is_some()
+        let fresh = if processor.sync_timeout().sync_timeout().is_some()
             && processor.sync_bytes_count().saturating_add(bytes.len()) >= VTE_SYNC_BUFFER_SIZE - 1
         {
             self.evidence
@@ -1770,11 +1787,69 @@ impl TerminalSession {
             processor.stop_sync(term);
             clock.sync_since = None;
             clock.next_sync_since = None;
-            self.evidence.lock().begin_read(incoming_at);
+            self.evidence.lock().begin_read(incoming_at)
         } else {
-            self.evidence.lock().begin_read(effective_at);
-        }
+            self.evidence.lock().begin_read(effective_at)
+        };
+        self.observe_program_status(bytes, fresh);
         processor.advance(term, bytes);
+    }
+
+    /// Observe each timed segment before VTE can defer its title callbacks.
+    /// Capacity replay has already separated the old frame from these bytes,
+    /// so the observer and the listener receive the same attribution time.
+    fn observe_program_status(&self, bytes: &[u8], fresh: bool) {
+        let mut observer = self.program_status_observer.lock();
+        for &byte in bytes {
+            let generation = self.program_status_generation.load(Ordering::Acquire);
+            let Some(event) = observer.advance_at(byte, fresh, generation) else {
+                continue;
+            };
+            if let ProgramStatusEvent::Title(ref title) = event
+                && let Some(thread) = session_thread_field(title)
+                && let Some(key) = ThreadKey::from_field(thread)
+            {
+                let evidence = self.evidence.lock();
+                let carry = evidence.can_carry_initial_working();
+                let confirms_launch = !evidence.first_thread_switches(thread);
+                drop(evidence);
+                let mut status = self.program_status.lock();
+                if fresh && self.program_status_generation.load(Ordering::Acquire) == generation {
+                    status.observe_title(key, carry, confirms_launch);
+                }
+            }
+            match event {
+                ProgramStatusEvent::Report(report) => {
+                    let mut status = self.program_status.lock();
+                    if fresh && self.program_status_generation.load(Ordering::Acquire) == generation
+                    {
+                        if report.id.is_none() {
+                            log::debug!(
+                                "program status source=osc7501 report state={:?} kind={:?}",
+                                report.state,
+                                report.kind
+                            );
+                        }
+                        status.apply(report);
+                    }
+                }
+                ProgramStatusEvent::Reset => {
+                    let mut status = self.program_status.lock();
+                    if fresh && self.program_status_generation.load(Ordering::Acquire) == generation
+                    {
+                        status.clear();
+                    }
+                }
+                ProgramStatusEvent::ShellPrompt => {
+                    let mut status = self.program_status.lock();
+                    if fresh && self.program_status_generation.load(Ordering::Acquire) == generation
+                    {
+                        status.shell_prompt();
+                    }
+                }
+                ProgramStatusEvent::Query | ProgramStatusEvent::Title(_) => {}
+            }
+        }
     }
 
     /// Collects alacritty damage for the next paint (partial row rebuild) and
@@ -1855,26 +1930,8 @@ impl TerminalSession {
             }
             parsed = true;
         }
-        // Synchronized updates (DECSET 2026): vte BUFFERS everything between
-        // BSU/ESU instead of applying it, and expiring a stuck window is the
-        // embedder's job (alacritty services this in its event loop; vte's
-        // deadline is 150ms). Without this check, an app that opens a window
-        // and never closes it would freeze the grid until it next goes idle.
-        // Checking here bounds the freeze to deadline + one batch gap. Replay
-        // keeps the opening read time of the buffered frame.
-        if processor
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|d| Instant::now() >= d)
-        {
-            self.evidence
-                .lock()
-                .begin_read(clock.effective_at(SystemTime::now()));
-            processor.stop_sync(&mut *term);
-            clock.sync_since = None;
-            clock.next_sync_since = None;
-            profile::sync_expired();
-        }
+        // Expiry without another read uses the same original frame time.
+        parsed |= self.flush_expired_sync_locked(&mut term, &mut processor, &mut clock);
         self.evidence.lock().end_read();
         if parsed {
             let screen = term.screen_lines() as i32;
@@ -2035,7 +2092,10 @@ impl TerminalSession {
         writer.write_all(data)?;
         writer.flush()?;
         if !data.is_empty() {
-            self.evidence.lock().record_submission(submitted_at);
+            // This API admits a known prompt after `paste_prompt` has checked
+            // the pane and input revision. Generic keyboard Enter uses
+            // `mark_turn_submitted` and cannot prove prompt intent.
+            self.evidence.lock().record_prompt_submission(submitted_at);
             self.turn_submitted.store(true, Ordering::Relaxed);
             self.advance_input(Some(true));
             self.mark_interactive();
@@ -2114,7 +2174,18 @@ impl TerminalSession {
     /// Announce that the next input write submits a turn. Call it just before
     /// writing the Enter (or the text ending in one).
     pub fn mark_turn_submitted(&self) {
-        self.evidence.lock().record_submission(SystemTime::now());
+        let submitted_at = SystemTime::now();
+        self.evidence.lock().record_submission(submitted_at);
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        self.submission_pending.store(true, Ordering::Release);
+    }
+
+    /// Explicit prompt submission from a path that supplied the prompt text.
+    /// Keyboard Enter alone can select a resume item, even after arrow input.
+    pub fn mark_prompt_submitted(&self) {
+        let submitted_at = SystemTime::now();
+        let mut evidence = self.evidence.lock();
+        evidence.record_prompt_submission(submitted_at);
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);
     }
@@ -2129,6 +2200,10 @@ impl TerminalSession {
     /// identity or submission never establishes or transfers that ownership.
     pub fn first_submission_binding(&self) -> Option<u64> {
         self.evidence.lock().first_submission_binding()
+    }
+
+    pub(crate) fn initial_unbound_submission(&self) -> bool {
+        self.evidence.lock().initial_unbound_submission()
     }
 
     /// The input revision and draft bit. Ordinary non-empty input writes (keys,
@@ -2712,8 +2787,15 @@ impl TerminalSession {
         to: SystemTime,
         learned_at: SystemTime,
     ) {
+        // A sequence begun before this boundary cannot become a new binding's
+        // report just because its terminator arrives in a later PTY read.
+        self.program_status_generation
+            .fetch_add(1, Ordering::AcqRel);
         let evidence = &mut *self.evidence.lock();
         let switch = evidence.switch_binding(from, to, learned_at);
+        self.program_status
+            .lock()
+            .adopt_binding(evidence.binding_rev());
         if switch.bell {
             self.bell.store(false, Ordering::Relaxed);
         }
@@ -2736,6 +2818,77 @@ impl TerminalSession {
     /// Revision of the provider conversation bound to this live PTY launch.
     pub fn binding_revision(&self) -> u64 {
         self.evidence.lock().binding_rev()
+    }
+
+    /// The embedder owns vte's synchronized-update timeout. The view uses this
+    /// deadline to revisit a title/report held by a BSU without more PTY bytes.
+    pub(crate) fn program_status_sync_deadline(&self) -> Option<Instant> {
+        self.processor.lock().sync_timeout().sync_timeout()
+    }
+
+    fn flush_expired_sync_locked(
+        &self,
+        term: &mut Term<MuxelListener>,
+        processor: &mut Processor,
+        clock: &mut OutputReadClock,
+    ) -> bool {
+        let Some(deadline) = processor.sync_timeout().sync_timeout() else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.evidence
+            .lock()
+            .begin_read(clock.effective_at(SystemTime::now()));
+        processor.stop_sync(term);
+        clock.sync_since = None;
+        clock.next_sync_since = None;
+        self.evidence.lock().end_read();
+        profile::sync_expired();
+        true
+    }
+
+    fn flush_expired_program_status_sync(&self) {
+        let mut term = self.term.lock();
+        let mut processor = self.processor.lock();
+        let mut clock = self.read_clock.lock();
+        if self.flush_expired_sync_locked(&mut term, &mut processor, &mut clock) {
+            self.bump_content();
+            self.trigger_runtime();
+        }
+    }
+
+    pub(crate) fn program_status_snapshot(&self) -> ProgramStatusSnapshot {
+        self.flush_expired_program_status_sync();
+        // A synchronized update may have supplied a new UUID title while VTE
+        // still holds its callback. The observer is then ahead of #91.
+        // The listener takes hint before evidence for a title callback. Keep
+        // that order here when recovering from an over-budget title.
+        let hint_thread = self
+            .session_id_hint
+            .lock()
+            .as_deref()
+            .and_then(session_thread_field)
+            .and_then(ThreadKey::from_field);
+        let binding_rev = self.evidence.lock().binding_rev();
+        let mut status = self.program_status.lock();
+        if status.binding_revision > binding_rev {
+            return ProgramStatusSnapshot::default();
+        }
+        if status.binding_revision < binding_rev {
+            // An overlong title can be rejected by the observer's OSC budget
+            // while alacritty still emits it. The listener proves a newer
+            // binding; retire old PSP facts and accept later fresh reports.
+            status.recover_binding(binding_rev, hint_thread);
+        }
+        *status
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_program_status(&self, wire: &[u8]) {
+        self.process_output(wire);
+        self.trigger_runtime();
     }
 
     /// PID of the process attached directly to this PTY. On Windows agent
@@ -5896,6 +6049,149 @@ mod runtime_fact_tests {
     }
 
     #[test]
+    fn fresh_program_reports_survive_capacity_replay_of_an_old_frame() {
+        const FILL: usize = 0x20_0000 - 2;
+        for ending in [b"\x07".as_slice(), b"\x1b\\", b"\x1b"] {
+            let session = fixture();
+            let first = uuid::Uuid::new_v4();
+            session.process_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+            let old = SystemTime::now() - Duration::from_secs(10);
+            let mut frame = b"\x1b[?2026h".to_vec();
+            frame.resize(frame.len() + FILL, 0);
+            let mut output = PtyOutput::default();
+            output.push(&frame, old);
+            session.process_drained(&output);
+            assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+            assert!(
+                session
+                    .processor
+                    .lock()
+                    .sync_timeout()
+                    .sync_timeout()
+                    .is_some()
+            );
+
+            let hook = SystemTime::now();
+            session.provider_switched(hook, hook);
+            let switched = session.binding_revision();
+            let fresh = hook + SWITCH_SLACK + Duration::from_secs(1);
+            let mut report = b"\x1b]7501;state=working".to_vec();
+            report.extend_from_slice(ending);
+            let mut output = PtyOutput::default();
+            output.push(&report, fresh);
+            session.process_drained(&output);
+            if ending == b"\x1b" {
+                assert_eq!(session.program_status_snapshot().root, None);
+                let mut output = PtyOutput::default();
+                output.push(b"\\", fresh);
+                session.process_drained(&output);
+            }
+            assert_eq!(session.binding_revision(), switched);
+            assert_eq!(
+                session.program_status_snapshot().root.unwrap().state,
+                crate::program_status::ProgramState::Working
+            );
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn capacity_replay_cannot_refresh_an_old_partial_program_report() {
+        const FILL: usize = 0x20_0000 - 2;
+        for ending in [b"\x07".as_slice(), b"\x1b\\"] {
+            let session = fixture();
+            let first = uuid::Uuid::new_v4();
+            session.process_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+            let old = SystemTime::now() - Duration::from_secs(10);
+            let prefix = b"\x1b]7501;state=done";
+            let mut frame = b"\x1b[?2026h".to_vec();
+            frame.resize(frame.len() + FILL - prefix.len(), 0);
+            frame.extend_from_slice(prefix);
+            let mut output = PtyOutput::default();
+            output.push(&frame, old);
+            session.process_drained(&output);
+            assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+            assert!(
+                session
+                    .processor
+                    .lock()
+                    .sync_timeout()
+                    .sync_timeout()
+                    .is_some()
+            );
+
+            let hook = SystemTime::now();
+            session.provider_switched(hook, hook);
+            let switched = session.binding_revision();
+            let fresh = hook + SWITCH_SLACK + Duration::from_secs(1);
+            let mut output = PtyOutput::default();
+            output.push(ending, fresh);
+            session.process_drained(&output);
+            assert_eq!(session.binding_revision(), switched);
+            assert_eq!(session.program_status_snapshot().root, None);
+            let mut output = PtyOutput::default();
+            output.push(b"\x1b]7501;state=working\x07", fresh);
+            session.process_drained(&output);
+            assert_eq!(
+                session.program_status_snapshot().root.unwrap().state,
+                crate::program_status::ProgramState::Working
+            );
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn queued_and_cross_boundary_reports_cannot_restore_a_retired_binding() {
+        let session = fixture();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(10);
+        let mut first = PtyOutput::default();
+        first.push(b"\x1b]7501;state=working\x07", old);
+        session.process_drained(&first);
+        assert!(session.program_status_snapshot().root.is_some());
+
+        session.provider_switched_at(now, now, now);
+        let mut queued = PtyOutput::default();
+        queued.push(b"\x1b]7501;state=done\x07", old);
+        session.process_drained(&queued);
+        let snapshot = session.program_status_snapshot();
+        assert_eq!(snapshot.root, None);
+        assert_eq!(snapshot.explicit_completions, 0);
+
+        let mut ambiguous_start = PtyOutput::default();
+        ambiguous_start.push(b"\x1b]7501;state=done", now + Duration::from_secs(1));
+        session.process_drained(&ambiguous_start);
+        let mut fresh_end = PtyOutput::default();
+        fresh_end.push(b"\x07", now + Duration::from_secs(10));
+        session.process_drained(&fresh_end);
+        assert_eq!(session.program_status_snapshot().root, None);
+
+        // The first half of this frame is parsed before another switch; its
+        // terminator arrives in a fresh read after the boundary.
+        let before = now + Duration::from_secs(20);
+        let mut partial = PtyOutput::default();
+        partial.push(b"\x1b]7501;state=done", before);
+        session.process_drained(&partial);
+        session.provider_switched_at(before, before, before);
+        let mut ending = PtyOutput::default();
+        ending.push(b"\x07", before + Duration::from_secs(10));
+        session.process_drained(&ending);
+        assert_eq!(session.program_status_snapshot().root, None);
+
+        let mut new = PtyOutput::default();
+        new.push(
+            b"\x1b]7501;state=working\x07",
+            before + Duration::from_secs(11),
+        );
+        session.process_drained(&new);
+        assert_eq!(
+            session.program_status_snapshot().root.unwrap().state,
+            crate::program_status::ProgramState::Working
+        );
+        session.kill();
+    }
+
+    #[test]
     fn failed_submission_admission_leaves_no_facts_or_pending_marker() {
         struct RefuseSubmission {
             on_flush: bool,
@@ -6113,6 +6409,40 @@ mod tests {
         let reply = std::fs::read(&out).unwrap_or_default();
         let _ = std::fs::remove_file(&out);
         assert_eq!(String::from_utf8_lossy(&reply), "\x1b[>0;2501;1c");
+    }
+
+    #[test]
+    fn program_status_answer_reaches_a_unix_child_before_da() {
+        let out = std::env::temp_dir().join(format!("muxel-psp-{}", Uuid::new_v4()));
+        let expected = format!("{}\x1b[?6c", crate::program_status::CAPABILITY_REPLY);
+        let script = format!(
+            "stty raw -echo; printf '\\033]7501;?\\033\\\\\\033[c'; head -c {} > '{}'",
+            expected.len(),
+            out.display()
+        );
+        let (session, rx) = TerminalSession::spawn(
+            CommandSpec::program("/bin/sh", vec!["-c".into(), script]),
+            80,
+            24,
+        )
+        .expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
+                Ok(PtyChunk::Output(_)) | Err(async_channel::TryRecvError::Empty) => {}
+            }
+            if Instant::now() > deadline {
+                session.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let reply = std::fs::read(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(reply, expected.as_bytes());
     }
 
     /// End-to-end check of the backend: spawn a process, drain its PTY output
