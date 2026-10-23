@@ -32,7 +32,8 @@ pub use session::{
 };
 pub use view::{
     AgentStatus, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
-    PathPasteErrorHandler, TerminalFocusObserver, TerminalFocusProfile, TerminalLaunch,
-    TerminalMouseMode, TerminalNotifyCause, TerminalRuntimeSnapshot, TerminalStatusCoverage,
-    TerminalStatusReason, TerminalView, clean_agent_title, paste_clipboard_into_session,
+    PathPasteErrorHandler, PromptSubmission, PromptSubmissionState, TerminalFocusObserver,
+    TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
+    TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,
+    clean_agent_title, paste_clipboard_into_session,
 };
