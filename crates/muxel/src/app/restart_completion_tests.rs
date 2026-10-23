@@ -115,7 +115,7 @@ fn pending_secondary_restart(
                 project,
                 workspace: app.current_workspace,
                 token,
-                binding_generation: app.session_discoveries.binding_generation(iid),
+                owner_generation: app.terminal_restarts.owner_generation(iid),
                 host: "test host".into(),
                 session: "test session".into(),
                 killed: Ok(()),
@@ -305,24 +305,74 @@ fn rebound_adoption_cancels_restart_before_retrying_launch() {
 }
 
 #[test]
-fn changed_binding_generation_disowns_remote_restart_completion() {
+fn unrelated_peer_adoption_keeps_restarting_panes_replacement() {
+    use muxel_core::RemoteLayout;
+    use muxel_core::tmux::Socket;
+
     with_app(|cx, main| {
         let (mut completion, _secondary) = pending_secondary_restart(cx, main);
         let iid = completion.instance;
-        main.update(cx, |app, _, _| {
-            app.bump_session_binding_generation(iid);
+        let pid = completion.project;
+        let peer = main
+            .update(cx, |app, _, _| {
+                let restarting = app.workspace.instance_mut(iid).unwrap();
+                restarting.tmux_session = Some("restarting".into());
+                restarting.tmux_socket = Some(Socket::Private);
+                app.terminal_restarts.cancel(iid);
+                completion.token = app
+                    .terminal_restarts
+                    .begin(app.workspace.instance(iid).unwrap())
+                    .unwrap();
+
+                let mut other = Instance::shell(pid);
+                other.program = Some("cmd.exe".into());
+                other.args = ["/d", "/q", "/c", "more"].map(String::from).into();
+                other.tmux_session = Some("other".into());
+                other.tmux_socket = Some(Socket::Default);
+                let other_id = other.id;
+                app.workspace.add_instance(other);
+                let project = app.workspace.project_mut(pid).unwrap();
+                assert!(muxel_core::add_tab(&mut project.layout, iid, other_id));
+                project.layout_updated_at = Some(1);
+
+                let mut peer =
+                    RemoteLayout::capture(app.workspace.project(pid).unwrap(), &app.workspace, 2);
+                peer.updated_at = 2;
+                peer.instances
+                    .iter_mut()
+                    .find(|instance| instance.id == other_id)
+                    .unwrap()
+                    .tmux_socket = Some(Socket::Private);
+                peer
+            })
+            .unwrap();
+
+        main.update(cx, |app, window, cx| {
+            app.adopt_peer_layout(pid, peer, window, cx);
+            assert_eq!(
+                app.workspace.instance(iid).unwrap().tmux_socket,
+                Some(Socket::Private)
+            );
             assert!(app.terminal_restarts.current(iid, completion.token));
         })
         .unwrap();
-        completion.killed = Err(anyhow::anyhow!("old binding kill failed"));
+
+        completion.killed = Ok(());
         let app = main.entity(cx).unwrap();
         MuxelApp::complete_remote_restart(&app.downgrade(), completion, cx);
         cx.run_until_parked();
-        app.read_with(cx, |app, _| {
-            assert!(!app.failed_launches.contains_key(&iid));
-            assert!(!app.terminal_restarts.contains(iid));
-            assert!(app.terminals.is_empty());
-        });
+        let session = main
+            .read_with(cx, |app, cx| {
+                app.terminals
+                    .get(&iid)
+                    .expect("unchanged owner needs its restarted replacement")
+                    .read(cx)
+                    .session()
+                    .clone()
+            })
+            .unwrap();
+        let replacement = StopChild::new(session);
+        replacement.assert_running();
     });
 }
 

@@ -12279,7 +12279,7 @@ impl MuxelApp {
     fn retry_rebound_launches(&mut self, before: &[Instance], after: &[Instance]) {
         for iid in muxel_core::rebound_instances(before, after) {
             // The old restart no longer owns the peer's new session.
-            self.terminal_restarts.cancel(iid);
+            self.terminal_restarts.owner_changed(iid);
             self.failed_launches.remove(&iid);
         }
     }
@@ -16739,7 +16739,7 @@ impl MuxelApp {
             }
             instance.tmux_socket = Some(Socket::Private);
             // Free launch admission before trying to attach to the peer's owner.
-            self.terminal_restarts.cancel(iid);
+            self.terminal_restarts.owner_changed(iid);
             self.bump_session_binding_generation(iid);
             self.failed_launches.remove(&iid);
             changed = true;
@@ -19309,7 +19309,7 @@ impl MuxelApp {
         if !inst.permits_launch(muxel_core::TerminalLaunchReason::Restart) {
             return;
         }
-        let binding_generation = self.session_discoveries.binding_generation(iid);
+        let owner_generation = self.terminal_restarts.owner_generation(iid);
         let Some(restart) = self.terminal_restarts.begin(inst) else {
             return;
         };
@@ -19406,8 +19406,7 @@ impl MuxelApp {
                     let saved = this
                         .update(cx, |this, _| {
                             if this.current_workspace != workspace
-                                || this.session_discoveries.binding_generation(iid)
-                                    != binding_generation
+                                || this.terminal_restarts.owner_generation(iid) != owner_generation
                             {
                                 return false;
                             }
@@ -19446,8 +19445,8 @@ impl MuxelApp {
                             Ok(next) => this
                                 .update(cx, |this, _| {
                                     if this.current_workspace != workspace
-                                        || this.session_discoveries.binding_generation(iid)
-                                            != binding_generation
+                                        || this.terminal_restarts.owner_generation(iid)
+                                            != owner_generation
                                     {
                                         anyhow::bail!("the pane's binding changed during restart");
                                     }
@@ -19473,7 +19472,7 @@ impl MuxelApp {
                     project,
                     workspace,
                     token: restart,
-                    binding_generation,
+                    owner_generation,
                     host: host_name,
                     session: label,
                     killed,
@@ -19541,7 +19540,7 @@ impl MuxelApp {
             project,
             workspace,
             token: restart,
-            binding_generation,
+            owner_generation,
             host: host_name,
             session: label,
             killed,
@@ -19554,8 +19553,7 @@ impl MuxelApp {
             if this.current_workspace != workspace {
                 return;
             }
-            let same_binding =
-                this.session_discoveries.binding_generation(iid) == binding_generation;
+            let same_binding = this.terminal_restarts.owner_generation(iid) == owner_generation;
             if !this.terminal_restarts.finish(iid, restart)
                 || !same_binding
                 || this.workspace.instance(iid).is_none()
@@ -19595,7 +19593,7 @@ impl MuxelApp {
                         return None;
                     }
                     let same_binding =
-                        this.session_discoveries.binding_generation(iid) == binding_generation;
+                        this.terminal_restarts.owner_generation(iid) == owner_generation;
                     if !this.terminal_restarts.finish(iid, restart) || !same_binding {
                         return None;
                     }
