@@ -980,14 +980,25 @@ pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
         return None;
     }
     let mut best: Option<(std::time::SystemTime, String)> = None;
+    let mut unresolved = None;
+    let mut unknown_time = false;
     walk_jsonl(&root, &mut |path| {
         let Ok(meta) = std::fs::metadata(path) else {
-            return false;
+            unknown_time = true;
+            return true;
         };
         let Ok(mtime) = meta.modified() else {
-            return false;
+            unknown_time = true;
+            return true;
         };
-        let Some((id, session_cwd)) = codex_session_meta(path) else {
+        let meta = match codex_session_meta(path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                unresolved = Some(unresolved.map_or(mtime, |at| mtime.max(at)));
+                return false;
+            }
+        };
+        let Some((id, session_cwd)) = meta else {
             return false;
         };
         if !paths_loosely_equal(Path::new(&session_cwd), cwd) {
@@ -997,27 +1008,26 @@ pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
             best = Some((mtime, id));
         }
         false // scan every rollout to find the newest
-    });
-    best.map(|(_, id)| id)
+    })?;
+    let (modified, id) = best?;
+    (!unknown_time && unresolved.is_none_or(|at| at < modified)).then_some(id)
 }
 
 /// Walk Codex rollout files (`*.jsonl` and compressed `*.jsonl.zst`) under `dir`,
 /// calling `visit` on each. `visit` returns `true` to stop the walk early (used by
-/// existence checks); returns whether the walk was stopped.
-fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
+/// existence checks); returns whether the walk was stopped, or `None` if any
+/// directory or entry could not be read.
+fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> Option<bool> {
     #[cfg(test)]
     codex_lookup_tests::record_directory(dir);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+        let file_type = entry.file_type().ok()?;
         if file_type.is_dir() {
-            if walk_jsonl(&path, visit) {
-                return true;
+            if walk_jsonl(&path, visit)? {
+                return Some(true);
             }
         } else if path
             .file_name()
@@ -1025,25 +1035,33 @@ fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
             .is_some_and(|n| n.ends_with(".jsonl") || n.ends_with(".jsonl.zst"))
             && visit(&path)
         {
-            return true;
+            return Some(true);
         }
     }
-    false
+    Some(false)
 }
 
-/// First top-level `session_meta` line → `(thread id, cwd)`.
-fn codex_session_meta(path: &Path) -> Option<(String, String)> {
-    use std::io::{BufRead, BufReader};
+/// First top-level `session_meta` line → `(thread id, cwd)`. Only a confirmed
+/// subagent is `Ok(None)`; unreadable or incomplete metadata remains unresolved.
+fn codex_session_meta(path: &Path) -> std::io::Result<Option<(String, String)>> {
+    use std::io::{self, BufRead, BufReader};
+    let invalid_meta = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unresolved Codex session metadata",
+        )
+    };
     #[cfg(test)]
     codex_lookup_tests::record_open(path);
-    let file = std::fs::File::open(path).ok()?;
+    let file = std::fs::File::open(path)?;
     for line in BufReader::new(file).lines().take(8) {
-        let line = line.ok()?;
-        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-        if v.get("type")?.as_str()? != "session_meta" {
+        let line = line?;
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
             continue;
         }
-        let payload = v.get("payload")?;
+        let payload = v.get("payload").ok_or_else(invalid_meta)?;
         // A subagent shares its parent's session_id but owns a different thread.
         // Neither its thread nor its parent's id describes this terminal pane.
         if payload
@@ -1053,17 +1071,22 @@ fn codex_session_meta(path: &Path) -> Option<(String, String)> {
                 source.as_str() == Some("subagent") || source.get("subagent").is_some()
             })
         {
-            return None;
+            return Ok(None);
         }
         let id = payload
             .get("id")
-            .or_else(|| payload.get("session_id"))?
-            .as_str()?
+            .or_else(|| payload.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid_meta)?
             .to_string();
-        let cwd = payload.get("cwd")?.as_str()?.to_string();
-        return Some((id, cwd));
+        let cwd = payload
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid_meta)?
+            .to_string();
+        return Ok(Some((id, cwd)));
     }
-    None
+    Err(invalid_meta())
 }
 
 pub(crate) fn paths_loosely_equal(a: &Path, b: &Path) -> bool {

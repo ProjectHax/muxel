@@ -137,11 +137,15 @@ pub fn codex_session_from_hint(home: &Path, hint: &str, cwd: &Path) -> Option<Co
         .unwrap_or(hint)
         .to_ascii_lowercase();
     let mut matched: Option<CodexSession> = None;
+    let mut unresolved = HashSet::new();
     for directory in directories(home, hint) {
-        let Ok(entries) = list(&directory) else {
-            continue;
+        let entries = match list(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.ok()?;
             let name = entry.file_name();
             let Some(file_uuid) = filename_uuid(&name) else {
                 continue;
@@ -156,8 +160,13 @@ pub fn codex_session_from_hint(home: &Path, hint: &str, cwd: &Path) -> Option<Co
                 continue;
             };
             let path = entry.path();
-            let Some((id, recorded_cwd)) = codex_session_meta(&path) else {
-                continue;
+            let (id, recorded_cwd) = match codex_session_meta(&path) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => continue,
+                Err(_) => {
+                    unresolved.insert(file_id);
+                    continue;
+                }
             };
             if Uuid::parse_str(&id).ok() != Some(file_id)
                 || !paths_loosely_equal(Path::new(&recorded_cwd), cwd)
@@ -171,7 +180,14 @@ pub fn codex_session_from_hint(home: &Path, hint: &str, cwd: &Path) -> Option<Co
             matched = Some(CodexSession { id, path });
         }
     }
-    matched
+    let matched = matched?;
+    let id = Uuid::parse_str(&matched.id).ok()?;
+    // A compressed/uncompressed sibling cannot add another thread identity
+    // once this id's cwd and top-level metadata have been verified.
+    unresolved
+        .iter()
+        .all(|candidate| *candidate == id)
+        .then_some(matched)
 }
 
 /// A stored path takes one stat in the normal case. A rollout compressed since
@@ -335,16 +351,25 @@ pub fn codex_latest_sessions(
         .filter_map(|id| Uuid::parse_str(id).ok())
         .collect();
     let mut rollouts = Vec::new();
+    let mut unknown_time = false;
     walk_store(home, deadline, &mut |entry| {
         let path = entry.path();
         if let Some(id) = filename_id(&path)
             && !owned.contains(&id)
-            && let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified())
         {
-            rollouts.push((modified, id, path));
+            match entry.metadata().and_then(|metadata| metadata.modified()) {
+                Ok(modified) => rollouts.push((modified, id, path)),
+                Err(_) => {
+                    unknown_time = true;
+                    return true;
+                }
+            }
         }
         false
     })?;
+    if unknown_time {
+        return None;
+    }
     rollouts.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
     newest_matches(
         rollouts.into_iter().map(|(_, id, path)| (id, path)),
@@ -374,8 +399,9 @@ pub(super) fn newest_matches(
         if sessions.iter().any(|session| session.id == id) {
             continue;
         }
-        // Subagent rollouts have no meta here; they never describe a pane.
-        let Some((meta_id, recorded_cwd)) = codex_session_meta(&path) else {
+        // Only confirmed subagents can be skipped. An unresolved newer rollout
+        // might change which conversation belongs to this directory.
+        let Some((meta_id, recorded_cwd)) = codex_session_meta(&path).ok()? else {
             continue;
         };
         if Uuid::parse_str(&meta_id).ok() == Some(file_id)

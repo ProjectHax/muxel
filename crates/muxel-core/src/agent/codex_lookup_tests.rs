@@ -776,6 +776,143 @@ fn write_rollout_at(path: &Path, payload: serde_json::Value, age_secs: u64) {
 }
 
 #[test]
+fn latest_sessions_unreadable_rollout_does_not_select_an_older_conversation() {
+    use super::codex_latest_sessions;
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+    let root = std::env::temp_dir().join(format!("muxel-codex-unreadable-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let older = "01a1543c-9700-7000-8000-000000000001";
+    let newer = "01a1543c-9700-7000-8000-000000000002";
+    let day = super::codex_sessions::directories(&root, older)[0].clone();
+    write_rollout_at(
+        &day.join(format!("rollout-{older}.jsonl")),
+        serde_json::json!({"id":older,"cwd":root}),
+        60,
+    );
+    let unresolved = day.join(format!("rollout-{newer}.jsonl"));
+    for bytes in [
+        b"{incomplete".as_slice(),
+        b"",
+        b"\xff\n",
+        b"{\"type\":\"session_meta\",\"payload\":{}}",
+        b"{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+    ] {
+        std::fs::write(&unresolved, bytes).unwrap();
+        assert_eq!(
+            codex_latest_sessions(
+                &root,
+                &root,
+                &HashSet::new(),
+                1,
+                Instant::now() + Duration::from_secs(60)
+            ),
+            None,
+            "an unresolved newer rollout could be this directory's latest conversation"
+        );
+    }
+    let owned = [newer.to_string()].into_iter().collect();
+    let found = codex_latest_sessions(
+        &root,
+        &root,
+        &owned,
+        1,
+        Instant::now() + Duration::from_secs(60),
+    )
+    .unwrap();
+    assert_eq!(
+        found[0].id, older,
+        "an owned unresolved thread cannot change the match"
+    );
+}
+
+#[test]
+fn hint_unreadable_rollout_keeps_a_truncated_hint_ambiguous() {
+    let root = std::env::temp_dir().join(format!("muxel-codex-unreadable-hint-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let first = "01a1543c-9700-7000-8000-000000000001";
+    let second = "01a1543c-9700-7000-8000-000000000002";
+    let day = super::codex_sessions::directories(&root, first)[0].clone();
+    write_rollout_at(
+        &day.join(format!("rollout-{first}.jsonl")),
+        serde_json::json!({"id":first,"cwd":root}),
+        60,
+    );
+    std::fs::write(day.join(format!("rollout-{second}.jsonl")), b"{incomplete").unwrap();
+    assert_eq!(
+        codex_session_id_from_hint(&root, &format!("{}...", &first[..29]), &root),
+        None,
+        "a matching filename with unreadable metadata may be a second matching thread"
+    );
+    assert_eq!(
+        codex_session_id_from_hint(&root, first, &root).as_deref(),
+        Some(first)
+    );
+    write_rollout_at(
+        &day.join(format!("rollout-{second}.jsonl")),
+        serde_json::json!({"id":second,"source":"subagent"}),
+        0,
+    );
+    // A confirmed subagent is excluded even without a cwd; an unreadable
+    // compression sibling cannot introduce a different thread identity.
+    std::fs::write(
+        day.join(format!("rollout-{first}.jsonl.zst")),
+        b"compressed",
+    )
+    .unwrap();
+    assert_eq!(
+        codex_session_id_from_hint(&root, &format!("{}...", &first[..29]), &root).as_deref(),
+        Some(first)
+    );
+}
+
+#[test]
+fn import_unreadable_rollout_does_not_select_an_older_conversation() {
+    let root =
+        std::env::temp_dir().join(format!("muxel-codex-unreadable-import-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let day = root.join(".codex/sessions/2026/10/19");
+    write_rollout_at(
+        &day.join("rollout-older.jsonl"),
+        serde_json::json!({"id":"older","cwd":root}),
+        60,
+    );
+    std::fs::write(day.join("rollout-newer.jsonl"), b"{incomplete").unwrap();
+    assert_eq!(
+        super::codex_latest_session_id(&root, &root),
+        None,
+        "Import must not mistake an unreadable newer rollout for another directory"
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(day.join("rollout-newer.jsonl"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+        .unwrap();
+    assert_eq!(
+        super::codex_latest_session_id(&root, &root).as_deref(),
+        Some("older"),
+        "an unresolved older rollout cannot replace the known newer conversation"
+    );
+}
+
+#[test]
+fn unreadable_rollout_removed_after_enumeration_keeps_latest_match_unresolved() {
+    let root = std::env::temp_dir().join(format!("muxel-codex-removed-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let id = Uuid::new_v4();
+    assert_eq!(
+        super::codex_sessions::newest_matches(
+            std::iter::once((id, root.join(format!("rollout-{id}.jsonl")))),
+            &root,
+            1,
+            &mut || false,
+        ),
+        None
+    );
+}
+
+#[test]
 fn walked_codex_id_is_found_outside_its_day_and_a_complete_miss_is_missing() {
     use super::codex_rollout_by_walk;
     use std::time::{Duration, Instant};

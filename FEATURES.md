@@ -170,6 +170,9 @@ feature is added or changed, update the matching entry here in the same change**
     the lookup at most two seconds; an unbound pane whose lookup finds nothing,
     is skipped, or runs out of time starts fresh, and Import can still find an
     older conversation.
+    An unreadable rollout that could change the chosen conversation leaves
+    discovery unresolved, including shortened title hints and Import; confirmed
+    subagent rollouts remain excluded.
     The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
     UUIDs resolve in their timestamp's local day directory, with one neighboring day
