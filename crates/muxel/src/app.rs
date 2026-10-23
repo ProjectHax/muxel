@@ -3384,6 +3384,16 @@ fn launch_binding(
     }
 }
 
+/// Only muxel's own generated resume flag grants a first hook's startup
+/// exemption. Configured provider arguments are opaque: parsing them here can
+/// mistake an option value for a resume flag, and tmux might only attach to an
+/// existing process. An unproven receipt switches conservatively.
+fn generated_resume_receipt(preset: Option<&AgentPreset>, resume_args: Option<&[String]>) -> bool {
+    preset
+        .and_then(|preset| Some((preset.resume_flag.as_deref()?, resume_args?)))
+        .is_some_and(|(flag, args)| args.first().is_some_and(|arg| arg == flag))
+}
+
 fn effective_local_cwd(
     resume_cwd: Option<&Path>,
     worktree_cwd: Option<&Path>,
@@ -3455,10 +3465,63 @@ fn tmux_codex_resume_ended(armed: bool, exit_code: Option<i32>, recent_resume: b
 #[cfg(test)]
 mod claude_resume_tests {
     use super::{
-        SessionTarget, arms_tmux_resume_recovery, claude_hook_writer_survives, effective_local_cwd,
+        AgentPreset, Instance, SessionTarget, arms_tmux_resume_recovery,
+        claude_hook_writer_survives, effective_local_cwd, generated_resume_receipt,
         resume_missing_message, should_recover_expired_session, tmux_codex_resume_ended,
     };
     use std::path::Path;
+    use std::time::SystemTime;
+    use uuid::Uuid;
+
+    #[test]
+    fn only_muxel_generated_resume_exempts_the_first_claude_receipt() {
+        let mut preset = AgentPreset::claude();
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &preset);
+        let id = Uuid::new_v4().to_string();
+        instance.session_id = Some(id.clone());
+        let receipt = crate::session_binding::ClaudeBinding {
+            session_id: id.clone(),
+            stamp: Some(crate::session_binding::ClaudeHookStamp {
+                nonce: Uuid::new_v4(),
+                recorded_at: SystemTime::now(),
+            }),
+        };
+        let generated_args = vec!["--resume".into(), id.clone()];
+        let generated = generated_resume_receipt(Some(&preset), Some(&generated_args));
+        assert!(generated);
+        assert!(!crate::session_binding::claude_record_switches(
+            &receipt,
+            None,
+            Some(&id),
+            generated,
+        ));
+
+        preset.resume_flag = None;
+        preset.session_id_flag = None;
+        for args in [
+            vec!["--resume".into(), id.clone()],
+            vec![format!("--resume={id}")],
+            vec!["--resume".into()],
+            vec!["--continue".into()],
+            vec!["-r".into(), id.clone()],
+            vec!["-c".into()],
+            vec![format!("-r{id}")],
+            vec!["--append-system-prompt".into(), format!("--resume={id}")],
+        ] {
+            instance.args = args.clone();
+            let generated = generated_resume_receipt(Some(&preset), Some(&instance.args));
+            assert!(
+                !generated,
+                "configured Claude args {args:?} do not prove muxel's resume decision"
+            );
+            assert!(crate::session_binding::claude_record_switches(
+                &receipt,
+                None,
+                Some(&id),
+                generated,
+            ));
+        }
+    }
 
     #[test]
     fn only_a_reattach_to_a_live_tmux_session_keeps_its_writers_hook_records() {
@@ -3811,17 +3874,23 @@ mod loop_cleanup_tests {
 
     /// A fresh Claude loop pane as `command_for` launches it: muxel mints the
     /// conversation's `--session-id`.
-    fn claude_loop_pane() -> (std::sync::Arc<TerminalSession>, muxel_terminal::PtyReceiver) {
+    fn claude_loop_pane() -> (
+        std::sync::Arc<TerminalSession>,
+        muxel_terminal::PtyReceiver,
+        String,
+    ) {
         let claude = AgentPreset::claude();
         let mut instance = Instance::from_preset(Uuid::new_v4(), &claude);
         instance.session_id = Some(Uuid::new_v4().to_string());
         let args = muxel_core::session_resume_args(&claude, &instance).unwrap();
         assert_eq!(args[0], "--session-id");
-        session_into(launch_binding(
+        let binding = instance.session_id.clone().unwrap();
+        let (session, receiver) = session_into(launch_binding(
             Some(&claude),
             claude.program.as_deref(),
             Some(&args),
-        ))
+        ));
+        (session, receiver, binding)
     }
 
     /// One scheduled-loop heartbeat over a docked pane whose runtime shows
@@ -3942,7 +4011,7 @@ mod loop_cleanup_tests {
 
     #[test]
     fn a_claude_loop_finishes_its_turn_and_closes_its_exit_pane() {
-        let (session, _receiver) = claude_loop_pane();
+        let (session, _receiver, _) = claude_loop_pane();
         // The startup prompt, typed before Claude has shown any identity.
         session.mark_turn_submitted();
         assert_eq!(
@@ -3962,7 +4031,7 @@ mod loop_cleanup_tests {
         assert!(runs.is_empty(), "and stops blocking the next fire");
         session.kill();
 
-        let (session, _receiver) = claude_loop_pane();
+        let (session, _receiver, _) = claude_loop_pane();
         session.mark_turn_submitted();
         let mut left = run(session.id);
         left.post_run = PostRunAction::Leave;
@@ -3975,7 +4044,7 @@ mod loop_cleanup_tests {
 
     #[test]
     fn a_claude_loop_never_owns_the_conversation_a_clear_replaces_it_with() {
-        let (session, _receiver) = claude_loop_pane();
+        let (session, _receiver, _) = claude_loop_pane();
         session.mark_turn_submitted();
         let pane = Uuid::new_v4();
         let mut runs = HashMap::from([(pane, run(session.id))]);
@@ -3990,6 +4059,34 @@ mod loop_cleanup_tests {
             );
         }
         assert!(runs.is_empty(), "the old run is abandoned");
+        session.kill();
+    }
+
+    #[test]
+    fn a_fresh_claude_loops_first_same_id_resume_abandons_exit_cleanup() {
+        let (session, _receiver, bound) = claude_loop_pane();
+        assert!(!session.launch_resumed());
+        session.mark_turn_submitted();
+        let pane = Uuid::new_v4();
+        let mut runs = HashMap::from([(pane, run(session.id))]);
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
+        let hook = crate::session_binding::ClaudeBinding {
+            session_id: bound.clone(),
+            stamp: Some(crate::session_binding::ClaudeHookStamp {
+                nonce: Uuid::new_v4(),
+                recorded_at: SystemTime::now(),
+            }),
+        };
+        assert!(crate::session_binding::claude_record_switches(
+            &hook,
+            None,
+            Some(bound.as_str()),
+            session.launch_resumed()
+        ));
+        let now = SystemTime::now();
+        session.provider_switched(now, now);
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Done).is_empty());
+        assert!(runs.is_empty(), "the resumed pane must stay open");
         session.kill();
     }
 
@@ -8101,9 +8198,7 @@ impl MuxelApp {
                 .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                 .or_else(|| self.presets.iter().find(|p| p.name == i.preset))
         });
-        let resuming = session_preset
-            .and_then(|preset| Some((preset.resume_flag.as_deref()?, resume_args?)))
-            .is_some_and(|(flag, args)| args.first().is_some_and(|arg| arg == flag));
+        let resuming = generated_resume_receipt(session_preset, resume_args.map(Vec::as_slice));
         // Build one instruction bundle, then let the preset's injection transport
         // deliver it. CliFlag and Codex are hidden launch-time instructions;
         // TypeIn submits one visible turn only for a new conversation. Codex's
@@ -8199,7 +8294,11 @@ impl MuxelApp {
                 project.map(|p| p.root_path.as_path()),
             );
             // If this instance uses tmux, wrap the command in `tmux new-session -A`
-            // so it persists and re-attaches across restarts.
+            // so it persists and re-attaches across restarts. Whether tmux
+            // creates Claude or attaches to an existing process is decided
+            // when this command runs, after the launch spec is built. The
+            // generated resume flag can therefore over-exempt an attach's
+            // first same-ID hook; do not infer a result from configured args.
             let (spec, extra_env) = match inst.and_then(|i| {
                 i.tmux_session
                     .as_ref()
@@ -8347,7 +8446,8 @@ impl MuxelApp {
             spec.with_status_program(agent_program)
                 .with_startup_delay(startup_delay)
                 .with_markers(working, blocked)
-                .with_binding(binding),
+                .with_binding(binding)
+                .with_launch_resumed(resuming),
         ))
     }
 
@@ -12363,7 +12463,7 @@ impl MuxelApp {
             .workspace
             .instance(iid)
             .and_then(|instance| instance.session_id.as_deref());
-        if !crate::session_binding::claude_record_switches(&binding, seen, bound) {
+        if !crate::session_binding::claude_record_switches(&binding, seen, bound, true) {
             self.remember_claude_hook(iid, launch, binding.stamp);
             return Ok(Handled);
         }

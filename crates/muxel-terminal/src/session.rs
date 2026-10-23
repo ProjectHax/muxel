@@ -711,6 +711,8 @@ pub struct CommandSpec {
     pub startup_delay_ms: u32,
     /// The provider conversation this launch opens, if muxel knows it.
     pub binding: LaunchBinding,
+    /// Whether the command actually resumes an existing provider conversation.
+    pub launch_resumed: bool,
 }
 
 impl CommandSpec {
@@ -740,6 +742,7 @@ impl CommandSpec {
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
+            launch_resumed: false,
         }
     }
 
@@ -765,6 +768,7 @@ impl CommandSpec {
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
+            launch_resumed: false,
         }
     }
 
@@ -830,6 +834,11 @@ impl CommandSpec {
 
     pub fn with_binding(mut self, binding: LaunchBinding) -> Self {
         self.binding = binding;
+        self
+    }
+
+    pub fn with_launch_resumed(mut self, resumed: bool) -> Self {
+        self.launch_resumed = resumed;
         self
     }
 
@@ -995,10 +1004,144 @@ pub(crate) struct PointerHit {
     pub rows: u16,
 }
 
+/// Read times for controls whose VTE callback can arrive in a later PTY read.
+/// This only finds boundaries; VTE still decides whether bytes form an event.
+#[derive(Default)]
+struct OutputReadClock {
+    osc_since: Option<SystemTime>,
+    escape_at: Option<SystemTime>,
+    sync_since: Option<SystemTime>,
+    next_sync_since: Option<SystemTime>,
+    sync_prefix_len: usize,
+    sync_prefix_at: Option<SystemTime>,
+}
+
+enum OutputBoundary {
+    Plain,
+    ExecutedControl,
+    SyncStart(SystemTime),
+    SyncEnd,
+}
+
+impl OutputReadClock {
+    fn unbuffered_at(&self, read_at: SystemTime) -> SystemTime {
+        [self.osc_since, self.escape_at]
+            .into_iter()
+            .flatten()
+            .fold(read_at, SystemTime::min)
+    }
+
+    fn effective_at(&self, read_at: SystemTime) -> SystemTime {
+        let unbuffered = self.unbuffered_at(read_at);
+        self.sync_since.map_or(unbuffered, |at| at.min(unbuffered))
+    }
+
+    fn executed_control_at(&self, read_at: SystemTime) -> SystemTime {
+        self.sync_since.map_or(read_at, |at| at.min(read_at))
+    }
+
+    /// Split after an OSC ends, an Escape-state C0 executes, or DEC 2026
+    /// changes frames so the next event in the same read gets its own origin.
+    fn scan(&mut self, byte: u8, read_at: SystemTime) -> Option<OutputBoundary> {
+        let mut boundary = None;
+        if self.osc_since.is_some() {
+            match byte {
+                0x07 | 0x18 | 0x1a => {
+                    self.osc_since = None;
+                    boundary = Some(OutputBoundary::Plain);
+                }
+                0x1b => {
+                    self.osc_since = None;
+                    self.escape_at = Some(read_at);
+                    boundary = Some(OutputBoundary::Plain);
+                }
+                _ => {}
+            }
+        } else if let Some(escape_at) = self.escape_at {
+            // vte 0.15's Escape state: these C0 bytes execute without leaving
+            // it; ESC, DEL, and high bytes are ignored; CAN/SUB abort it.
+            match byte {
+                b']' => {
+                    self.escape_at = None;
+                    self.osc_since = Some(escape_at);
+                }
+                0x18 | 0x1a => {
+                    self.escape_at = None;
+                    boundary = Some(OutputBoundary::ExecutedControl);
+                }
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+                    boundary = Some(OutputBoundary::ExecutedControl);
+                }
+                0x1b | 0x7f..=0xff => {}
+                _ => {
+                    self.escape_at = None;
+                    boundary = Some(OutputBoundary::Plain);
+                }
+            }
+        } else if byte == 0x1b {
+            self.escape_at = Some(read_at);
+        }
+
+        const PREFIX: &[u8] = b"\x1b[?2026";
+        if self.sync_prefix_len == 0 {
+            if byte == 0x1b {
+                self.sync_prefix_len = 1;
+                self.sync_prefix_at = Some(read_at);
+            }
+        } else if self.sync_prefix_len < PREFIX.len() && byte == PREFIX[self.sync_prefix_len] {
+            self.sync_prefix_len += 1;
+        } else if self.sync_prefix_len == PREFIX.len() && matches!(byte, b'h' | b'l') {
+            let started = self.sync_prefix_at.take().unwrap_or(read_at);
+            self.sync_prefix_len = 0;
+            boundary = Some(if byte == b'h' {
+                OutputBoundary::SyncStart(started)
+            } else {
+                OutputBoundary::SyncEnd
+            });
+        } else {
+            self.sync_prefix_len = usize::from(byte == 0x1b);
+            self.sync_prefix_at = (byte == 0x1b).then_some(read_at);
+        }
+        boundary
+    }
+
+    fn after_segment(
+        &mut self,
+        boundary: Option<OutputBoundary>,
+        active: bool,
+        read_at: SystemTime,
+    ) {
+        match boundary {
+            Some(OutputBoundary::SyncStart(started)) if active => {
+                if self.sync_since.is_some() {
+                    self.next_sync_since.get_or_insert(started);
+                } else {
+                    self.sync_since = Some(started);
+                }
+            }
+            Some(OutputBoundary::SyncEnd) if active => {
+                if let Some(started) = self.next_sync_since.take() {
+                    self.sync_since = Some(started);
+                }
+            }
+            _ => {}
+        }
+        if !active {
+            self.sync_since = None;
+            self.next_sync_since = None;
+        } else if self.sync_since.is_none() {
+            // VTE can also end a frame at its buffer limit.
+            self.sync_since = Some(read_at);
+        }
+    }
+}
+
 pub struct TerminalSession {
     pub id: Uuid,
+    launch_resumed: bool,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
+    read_clock: Mutex<OutputReadClock>,
     writer: SharedWriter,
     output_queue: Arc<OutputQueueState>,
     // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
@@ -1202,6 +1345,10 @@ pub(crate) struct PaintDrawList {
 }
 
 impl TerminalSession {
+    pub fn launch_resumed(&self) -> bool {
+        self.launch_resumed
+    }
+
     /// Spawn a PTY running `spec` at the given initial grid size. Returns the
     /// session plus the receiver the UI drains for output/exit events.
     pub fn spawn(spec: CommandSpec, cols: u16, rows: u16) -> Result<(Arc<Self>, PtyReceiver)> {
@@ -1506,8 +1653,10 @@ impl TerminalSession {
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
+            launch_resumed: spec.launch_resumed,
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
+            read_clock: Mutex::new(OutputReadClock::default()),
             writer,
             master,
             output_queue,
@@ -1571,8 +1720,8 @@ impl TerminalSession {
     }
 
     /// Feed PTY output through the VTE parser into the terminal grid. Evidence
-    /// it raises (a title, a bell) is stamped as read now; the view's drain uses
-    /// [`Self::process_drained`], which stamps it with when it was read.
+    /// uses this read time, or the opening read of a title or synchronized frame
+    /// that began earlier. The view's drain uses the reader's timestamps.
     pub(crate) fn process_output(&self, data: &[u8]) {
         self.parse([(data, SystemTime::now())]);
     }
@@ -1585,18 +1734,111 @@ impl TerminalSession {
         self.parse(output.chunks());
     }
 
+    fn advance_timed_segment(
+        &self,
+        processor: &mut Processor,
+        term: &mut Term<MuxelListener>,
+        clock: &mut OutputReadClock,
+        bytes: &[u8],
+        effective_at: SystemTime,
+        incoming_at: SystemTime,
+    ) {
+        // VTE 0.15 replays its synchronized buffer on capacity overflow, then
+        // parses the incoming bytes in the same advance call. Give the replay
+        // its old time and the new bytes their own time.
+        const VTE_SYNC_BUFFER_SIZE: usize = 0x20_0000;
+        if processor.sync_timeout().sync_timeout().is_some()
+            && processor.sync_bytes_count().saturating_add(bytes.len()) >= VTE_SYNC_BUFFER_SIZE - 1
+        {
+            self.evidence
+                .lock()
+                .begin_read(clock.sync_since.unwrap_or(effective_at));
+            processor.stop_sync(term);
+            clock.sync_since = None;
+            clock.next_sync_since = None;
+            self.evidence.lock().begin_read(incoming_at);
+        } else {
+            self.evidence.lock().begin_read(effective_at);
+        }
+        processor.advance(term, bytes);
+    }
+
     /// Collects alacritty damage for the next paint (partial row rebuild) and
     /// for paint-priority scheduling (recent interaction vs stream).
     fn parse<'a>(&self, chunks: impl IntoIterator<Item = (&'a [u8], SystemTime)>) {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
+        let mut clock = self.read_clock.lock();
         let mut parsed = false;
         for (bytes, read_at) in chunks {
             if bytes.is_empty() {
                 continue;
             }
-            self.evidence.lock().begin_read(read_at);
-            processor.advance(&mut *term, bytes);
+            let mut start = 0;
+            let mut effective_at = clock.effective_at(read_at);
+            let mut unbuffered_at = clock.unbuffered_at(read_at);
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                if let Some(boundary) = clock.scan(byte, read_at) {
+                    if matches!(boundary, OutputBoundary::ExecutedControl) {
+                        if start < index {
+                            self.advance_timed_segment(
+                                &mut processor,
+                                &mut term,
+                                &mut clock,
+                                &bytes[start..index],
+                                effective_at,
+                                unbuffered_at,
+                            );
+                            clock.after_segment(
+                                None,
+                                processor.sync_timeout().sync_timeout().is_some(),
+                                read_at,
+                            );
+                        }
+                        let control_at = clock.executed_control_at(read_at);
+                        self.advance_timed_segment(
+                            &mut processor,
+                            &mut term,
+                            &mut clock,
+                            &bytes[index..=index],
+                            control_at,
+                            read_at,
+                        );
+                    } else {
+                        self.advance_timed_segment(
+                            &mut processor,
+                            &mut term,
+                            &mut clock,
+                            &bytes[start..=index],
+                            effective_at,
+                            unbuffered_at,
+                        );
+                    }
+                    clock.after_segment(
+                        Some(boundary),
+                        processor.sync_timeout().sync_timeout().is_some(),
+                        read_at,
+                    );
+                    start = index + 1;
+                    effective_at = clock.effective_at(read_at);
+                    unbuffered_at = clock.unbuffered_at(read_at);
+                }
+            }
+            if start < bytes.len() {
+                self.advance_timed_segment(
+                    &mut processor,
+                    &mut term,
+                    &mut clock,
+                    &bytes[start..],
+                    effective_at,
+                    unbuffered_at,
+                );
+                clock.after_segment(
+                    None,
+                    processor.sync_timeout().sync_timeout().is_some(),
+                    read_at,
+                );
+            }
             parsed = true;
         }
         // Synchronized updates (DECSET 2026): vte BUFFERS everything between
@@ -1604,14 +1846,19 @@ impl TerminalSession {
         // embedder's job (alacritty services this in its event loop; vte's
         // deadline is 150ms). Without this check, an app that opens a window
         // and never closes it would freeze the grid until it next goes idle.
-        // Checking here bounds the freeze to deadline + one batch gap. What it
-        // applies was read by the last chunk at the latest, and is stamped so.
+        // Checking here bounds the freeze to deadline + one batch gap. Replay
+        // keeps the opening read time of the buffered frame.
         if processor
             .sync_timeout()
             .sync_timeout()
             .is_some_and(|d| Instant::now() >= d)
         {
+            self.evidence
+                .lock()
+                .begin_read(clock.effective_at(SystemTime::now()));
             processor.stop_sync(&mut *term);
+            clock.sync_since = None;
+            clock.next_sync_since = None;
             profile::sync_expired();
         }
         self.evidence.lock().end_read();
@@ -5305,6 +5552,7 @@ mod runtime_fact_tests {
     use super::{
         CommandSpec, PtyOutput, RESIZE_SETTLE, TerminalSession, draft_after_input, next_input_state,
     };
+    use crate::listener::SWITCH_SLACK;
     use async_channel::TryRecvError;
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -5385,6 +5633,102 @@ mod runtime_fact_tests {
         std::thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
         assert!(!session.resize(81, 24));
         assert_eq!(events.try_recv(), Ok(()));
+        session.kill();
+    }
+
+    #[test]
+    fn capacity_replay_keeps_new_title_and_bell_on_their_fresh_read() {
+        const FILL: usize = 0x20_0000 - 2;
+        for title_event in [true, false] {
+            let session = fixture();
+            let first = uuid::Uuid::new_v4();
+            let next = uuid::Uuid::new_v4();
+            session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+
+            let old = SystemTime::now() - Duration::from_secs(10);
+            let mut frame = b"\x1b[?2026h".to_vec();
+            frame.resize(frame.len() + FILL, 0);
+            let mut output = PtyOutput::default();
+            output.push(&frame, old);
+            session.process_drained(&output);
+            assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+
+            let hook = SystemTime::now();
+            session.provider_switched(hook, hook);
+            let switched = session.binding_revision();
+            let fresh = hook + SWITCH_SLACK + Duration::from_secs(1);
+            let mut output = PtyOutput::default();
+            if title_event {
+                output.push(format!("\x1b]0;{next} | Ready\x07").as_bytes(), fresh);
+            } else {
+                output.push(b"\x07", fresh);
+            }
+            session.process_drained(&output);
+            if title_event {
+                assert!(
+                    session.binding_revision() > switched,
+                    "a fresh UUID title must bind after capacity replay"
+                );
+                assert!(
+                    session
+                        .session_id_hint()
+                        .unwrap()
+                        .starts_with(&next.to_string())
+                );
+            } else {
+                assert!(
+                    session.has_bell(),
+                    "a fresh bell must survive capacity replay"
+                );
+            }
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn capacity_replay_preserves_an_osc_that_started_in_the_old_frame() {
+        const FILL: usize = 0x20_0000 - 2;
+        let session = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        let fresh = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+
+        let old = SystemTime::now() - Duration::from_secs(10);
+        let prefix = format!("\x1b]0;{stale} | Ready");
+        let mut frame = b"\x1b[?2026h".to_vec();
+        frame.resize(frame.len() + FILL - prefix.len(), 0);
+        frame.extend_from_slice(prefix.as_bytes());
+        let mut output = PtyOutput::default();
+        output.push(&frame, old);
+        session.process_drained(&output);
+        assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+
+        let hook = SystemTime::now();
+        session.provider_switched(hook, hook);
+        let switched = session.binding_revision();
+        let fresh_at = hook + SWITCH_SLACK + Duration::from_secs(1);
+        let mut output = PtyOutput::default();
+        output.push(b"\x07", fresh_at);
+        session.process_drained(&output);
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+
+        let mut output = PtyOutput::default();
+        output.push(format!("\x1b]0;{fresh} | Ready\x07").as_bytes(), fresh_at);
+        session.process_drained(&output);
+        assert!(session.binding_revision() > switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&fresh.to_string())
+        );
         session.kill();
     }
 

@@ -162,15 +162,19 @@ pub(crate) struct ClaudeBinding {
 /// record is known by its nonce: one this launch hasn't seen is a switch even
 /// when it names the bound conversation, as after `/resume B` and `/resume A`
 /// between two reads. The launch's first stamped record, and a record from an
-/// older muxel's hook, switch only when they name another conversation: a
-/// resumed launch's own `SessionStart` names the conversation muxel launched.
+/// older muxel's hook, switch only when they name another conversation if the
+/// command resumed that conversation. A fresh `--session-id` launch has no
+/// startup hook, so its first stamped record is a user switch even for the
+/// same UUID.
 pub(crate) fn claude_record_switches(
     binding: &ClaudeBinding,
     seen: Option<Uuid>,
     bound: Option<&str>,
+    launch_resumed: bool,
 ) -> bool {
     match (binding.stamp, seen) {
         (Some(stamp), Some(seen)) => stamp.nonce != seen,
+        (Some(_), None) if !launch_resumed => true,
         _ => bound != Some(binding.session_id.as_str()),
     }
 }
@@ -1210,6 +1214,47 @@ mod tests {
     }
 
     #[test]
+    fn fresh_launch_first_resume_of_its_pinned_id_is_a_switch() {
+        let root = temp_dir();
+        let data = root.join("data");
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let instance_id = Uuid::new_v4();
+        let a = Uuid::new_v4().to_string();
+
+        // A fresh `--session-id A` writes no startup SessionStart record.
+        resume_hook(&data, &home, &cwd, instance_id, &a);
+        let first = read_claude_binding(&data, instance_id, &home).unwrap();
+        assert!(first.stamp.is_some());
+        assert!(claude_record_switches(
+            &first,
+            None,
+            Some(a.as_str()),
+            false
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_launch_a_to_b_to_a_before_first_poll_is_a_switch() {
+        let root = temp_dir();
+        let data = root.join("data");
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let instance_id = Uuid::new_v4();
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+
+        // Both user resumes replace a fresh `--session-id A` between polls.
+        resume_hook(&data, &home, &cwd, instance_id, &b);
+        resume_hook(&data, &home, &cwd, instance_id, &a);
+        let last = read_claude_binding(&data, instance_id, &home).unwrap();
+        assert_eq!(last.session_id, a);
+        assert!(claude_record_switches(&last, None, Some(a.as_str()), false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_to_b_to_a_between_polls_reads_as_a_switch() {
         let root = temp_dir();
         let data = root.join("data");
@@ -1226,7 +1271,12 @@ mod tests {
         let first = read_claude_binding(&data, instance_id, &home).unwrap();
         let stamp = first.stamp.expect("the hook stamps its record");
         assert!(before <= stamp.recorded_at && stamp.recorded_at <= SystemTime::now());
-        assert!(!claude_record_switches(&first, None, Some(a.as_str())));
+        assert!(!claude_record_switches(
+            &first,
+            None,
+            Some(a.as_str()),
+            true
+        ));
 
         // `/resume B` and then `/resume A`, both before muxel's next read.
         resume(&b);
@@ -1234,12 +1284,17 @@ mod tests {
         let last = read_claude_binding(&data, instance_id, &home).unwrap();
         assert_eq!(last.session_id, a);
         assert!(
-            claude_record_switches(&last, Some(stamp.nonce), Some(a.as_str())),
+            claude_record_switches(&last, Some(stamp.nonce), Some(a.as_str()), true),
             "a record muxel hasn't seen is a switch, whatever it names"
         );
         // The same record read again, because removing it failed, is not.
         let nonce = last.stamp.map(|stamp| stamp.nonce);
-        assert!(!claude_record_switches(&last, nonce, Some(a.as_str())));
+        assert!(!claude_record_switches(
+            &last,
+            nonce,
+            Some(a.as_str()),
+            true
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1276,10 +1331,16 @@ mod tests {
         assert!(!claude_record_switches(
             &binding,
             seen,
-            Some(session_id.as_str())
+            Some(session_id.as_str()),
+            true
         ));
         let other = Uuid::new_v4().to_string();
-        assert!(claude_record_switches(&binding, seen, Some(other.as_str())));
+        assert!(claude_record_switches(
+            &binding,
+            seen,
+            Some(other.as_str()),
+            true
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 
