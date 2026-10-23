@@ -724,7 +724,11 @@ feature is added or changed, update the matching entry here in the same change**
   entry, which the caller's `--cwd` could supply, still Asks under Allow.
   All literal argv, including agent argv, and shell-classified
   presets/defaults also require "Also allow typing into shell panes". Configured
-  non-literal presets not classified as shells need only the first two grants.
+  non-literal presets not classified as shells need only the first two grants for
+  creation alone. `new --prompt` also needs the shell-input grant when the new
+  pane uses a tmux client, since the prompt is typed through that client.
+  A queued tmux prompt checks that grant again before paste, Enter and any
+  Enter retry; revoking it stops the remaining startup writes.
   Literal argv and shell presets always Ask, even under Allow. All three grants
   default off; upgrades do not infer creation permission from older
   control/command grants. Users enable the required settings themselves.
@@ -796,15 +800,18 @@ feature is added or changed, update the matching entry here in the same change**
 - **Refuses what would go wrong** — `send` won't type into an agent that is
   working or waiting on a question (unless forced), `answer` only picks an option
   the prompt actually offers, and a pane that isn't running says so rather than
-  swallowing the input. Shell panes are off limits unless "Also allow typing into
-  shell panes" is on too, since typing into a shell is running commands. That
-  setting also grants `new` shell preset/default and all literal argv launches
+  swallowing the input. Shell and tmux-backed panes are off limits unless "Also
+  allow typing into shell panes" is on too. Tmux client key bindings can open a
+  shell window even from an agent pane. That setting also grants `new` shell
+  preset/default and all literal argv launches
   when the separate outside terminal-creation grant is enabled. Existing shell
   writes require global control and this command grant even when creation is off.
   Turning "Also allow typing into shell panes" off refuses subsequent control
   writes to every literal argv pane, even agent-looking or interpreter programs,
-  and panes classified as shells.
-  Configured non-literal agents remain controllable while outside control is on;
+  panes classified as shells, and tmux-backed panes.
+  For a running pane, this decision uses the transport its terminal launched
+  with, so a saved tmux name does not restrict a direct Windows SSH pane.
+  Direct non-literal agents remain controllable while outside control is on;
   disabling all outside control is a separate setting. Delayed Enter and keys
   recheck the shell-input grant and terminal/session availability before writing.
   Revocation does not stop processes

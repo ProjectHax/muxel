@@ -1,6 +1,13 @@
 //! Guards for a startup turn. PTY silence is not an application's input-ready signal.
 
-use std::{io, time::Duration};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stop {
@@ -9,6 +16,7 @@ pub(crate) enum Stop {
     NotAccepted,
     UnsupportedProvider,
     WriteFailed,
+    PermissionRevoked,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,6 +66,7 @@ pub(crate) struct Guard {
     ready_since: Option<Duration>,
     stopped: Option<Stop>,
     control_turn: Option<muxel_core::control::StartupTurnOwner>,
+    shell_grant: Option<Arc<AtomicBool>>,
 }
 
 impl Guard {
@@ -68,6 +77,7 @@ impl Guard {
             ready_since: None,
             stopped: None,
             control_turn: None,
+            shell_grant: None,
         }
     }
 
@@ -76,6 +86,11 @@ impl Guard {
         owner: Option<muxel_core::control::StartupTurnOwner>,
     ) -> Self {
         self.control_turn = owner;
+        self
+    }
+
+    pub(crate) fn with_shell_grant(mut self, grant: Option<Arc<AtomicBool>>) -> Self {
+        self.shell_grant = grant;
         self
     }
 
@@ -103,6 +118,7 @@ impl Guard {
                 Stop::NotAccepted => StartupFailure::NotAccepted,
                 Stop::WriteFailed => StartupFailure::WriteFailed,
                 Stop::UnsupportedProvider => StartupFailure::UnsupportedProvider,
+                Stop::PermissionRevoked => StartupFailure::PermissionRevoked,
                 Stop::Interrupted => return,
             };
             owner.fail(failure);
@@ -159,6 +175,14 @@ impl Guard {
         write: impl FnOnce() -> io::Result<()>,
     ) -> Result<(), Stop> {
         self.check(elapsed, revision)?;
+        if self
+            .shell_grant
+            .as_ref()
+            .is_some_and(|grant| !grant.load(Ordering::Acquire))
+        {
+            self.fail(Stop::PermissionRevoked);
+            return Err(Stop::PermissionRevoked);
+        }
         if write().is_err() {
             self.fail(Stop::WriteFailed);
             return Err(Stop::WriteFailed);
@@ -518,7 +542,15 @@ pub(crate) fn normalized(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Guard, Screen, Stop};
-    use std::{cell::Cell, io, time::Duration};
+    use std::{
+        cell::Cell,
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
@@ -553,6 +585,7 @@ mod tests {
             Some(Stop::NotAccepted),
             Some(Stop::UnsupportedProvider),
             Some(Stop::WriteFailed),
+            Some(Stop::PermissionRevoked),
         ] {
             let turn = StartupTurn::default();
             let owner = turn.claim().unwrap();
@@ -564,9 +597,11 @@ mod tests {
                     assert_eq!(guard.check(ms(1), 1), Err(Stop::Interrupted))
                 }
                 Some(Stop::NotReady) => assert_eq!(guard.check(ms(10), 0), Err(Stop::NotReady)),
-                Some(reason @ (Stop::NotAccepted | Stop::UnsupportedProvider)) => {
-                    guard.fail(reason)
-                }
+                Some(
+                    reason @ (Stop::NotAccepted
+                    | Stop::UnsupportedProvider
+                    | Stop::PermissionRevoked),
+                ) => guard.fail(reason),
                 Some(Stop::WriteFailed) => assert_eq!(
                     guard.write(ms(1), 0, || Err(io::Error::other("closed"))),
                     Err(Stop::WriteFailed)
@@ -586,6 +621,9 @@ mod tests {
                 Some(Stop::UnsupportedProvider) => StartupTurnState::Failed(
                     muxel_core::control::StartupFailure::UnsupportedProvider,
                 ),
+                Some(Stop::PermissionRevoked) => {
+                    StartupTurnState::Failed(muxel_core::control::StartupFailure::PermissionRevoked)
+                }
                 _ => StartupTurnState::Cancelled,
             };
             assert_eq!(turn.state(), expected);
@@ -598,6 +636,40 @@ mod tests {
             guard.write(ms(1), 0, || panic!("cancelled automation must not write")),
             Err(Stop::Interrupted)
         );
+    }
+    #[test]
+    fn revoked_tmux_grant_refuses_queued_paste_submit_and_retry_writes() {
+        use muxel_core::control::{StartupFailure, StartupTurn};
+
+        for admitted_writes in [0, 1, 2] {
+            let grant = Arc::new(AtomicBool::new(true));
+            let turn = StartupTurn::default();
+            let mut guard = Guard::new(0, None)
+                .with_control_turn(turn.claim())
+                .with_shell_grant(Some(grant.clone()));
+            let writes = Cell::new(0);
+            for revision in 0..admitted_writes {
+                guard
+                    .write(ms(revision + 1), revision, || {
+                        writes.set(writes.get() + 1);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            if admitted_writes == 2 {
+                guard.enter_admitted(123);
+            }
+            grant.store(false, Ordering::Release);
+            assert_eq!(
+                guard.write(ms(3), admitted_writes, || {
+                    writes.set(writes.get() + 1);
+                    Ok(())
+                }),
+                Err(Stop::PermissionRevoked)
+            );
+            assert_eq!(writes.get(), admitted_writes);
+            assert_eq!(turn.failure(), Some(StartupFailure::PermissionRevoked));
+        }
     }
     #[test]
     fn quiet_boot_does_not_authorize_input_and_deadline_never_falls_through() {

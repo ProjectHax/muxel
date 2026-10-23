@@ -22,6 +22,7 @@ pub enum StartupFailure {
     NotAccepted,
     WriteFailed,
     UnsupportedProvider,
+    PermissionRevoked,
 }
 
 impl StartupFailure {
@@ -36,6 +37,9 @@ impl StartupFailure {
             Self::WriteFailed => "Startup task could not be written to its terminal.",
             Self::UnsupportedProvider => {
                 "Startup task was not sent: this provider has no verified input and acceptance protocol. Open the pane and submit the task directly."
+            }
+            Self::PermissionRevoked => {
+                "Startup task stopped because command execution permission was revoked. Inspect the pane before sending another task."
             }
         }
     }

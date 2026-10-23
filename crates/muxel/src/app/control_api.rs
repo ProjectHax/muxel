@@ -27,12 +27,24 @@ mod new_tests;
 
 /// Shared command permission for typing into an existing terminal. This is
 /// rechecked on every write, including panes created before the opt-in was revoked.
-fn control_program_writable(inst: &Instance, allow_shells: bool) -> Result<(), String> {
-    if !allow_shells && (inst.literal_argv || !readaloud::is_agent_program(inst.program.as_deref()))
+fn control_program_writable(
+    inst: &Instance,
+    allow_shells: bool,
+    tmux_client: bool,
+) -> Result<(), String> {
+    if !allow_shells
+        && (tmux_client
+            || inst.literal_argv
+            || !readaloud::is_agent_program(inst.program.as_deref()))
     {
         let name = inst.display_name();
+        let reason = if tmux_client {
+            "Tmux client key bindings can open a shell window. "
+        } else {
+            ""
+        };
         return Err(format!(
-            "typing into '{name}' requires command execution permission in Settings > \
+            "{reason}Typing into '{name}' requires command execution permission in Settings > \
              Grok Bot > \"Also allow typing into shell panes\""
         ));
     }
@@ -128,6 +140,7 @@ pub(super) fn control_launch_spec(
     turn: Option<&ControlTurn>,
     owner: Option<ctl::StartupTurnOwner>,
     mut spec: CommandSpec,
+    shell_grant: &Arc<AtomicBool>,
 ) -> CommandSpec {
     spec.allow_shell_fallback &= !instance.is_some_and(|instance| instance.control_created);
     let owner = owner.filter(ctl::StartupTurnOwner::is_pending);
@@ -145,6 +158,9 @@ pub(super) fn control_launch_spec(
         spec.startup_input = None;
         spec.auto_mode_presses = 0;
         spec.submit = false;
+    }
+    if owner.is_some() && spec.tmux_client {
+        spec.startup_shell_grant = Some(shell_grant.clone());
     }
     spec.startup_turn = owner;
     spec
@@ -484,10 +500,11 @@ impl MuxelApp {
                             .disabled(!enabled)
                             .on_click(cx.listener(|this, c: &bool, _w, cx| {
                                 this.settings.control_allow_shells = *c;
+                                this.control_shell_grant.store(*c, Ordering::Release);
                                 this.persist_settings();
                                 cx.notify();
                             })),
-                        t("Also allow typing into shell panes. This permits writes to shell and raw-command panes. With terminal creation enabled, it also permits shell presets and all literal argv, including agent argv. Commands run as the host muxel process, outside the caller's sandbox. Configured non-literal agent presets do not need this command grant; presets are trusted configuration, not a sandbox."),
+                        t("Also allow typing into shell panes. This permits writes to shell, raw-command and tmux-backed agent panes. Tmux client key bindings can open a shell window, so those agent panes need the same grant. With terminal creation enabled, it also permits shell presets and all literal argv, including agent argv. Commands run as the host muxel process, outside the caller's sandbox. Direct non-literal agent panes do not need this command grant; presets are trusted configuration, not a sandbox."),
                     ))
                     .child(
                         div()
@@ -1111,7 +1128,7 @@ impl MuxelApp {
             ReadAloudScope::FinalMessage
         };
         let inst = self.workspace.instance(iid);
-        let site = inst.and_then(|inst| self.control_claim_site(inst));
+        let site = inst.and_then(|inst| self.control_claim_site(inst, cx));
         let activity = inst.map(|inst| inst.activity.clone()).unwrap_or_default();
         Answer::Later(Box::new(move || {
             let mut value = show_value(info, source, &visible, sent, scope);
@@ -1162,7 +1179,16 @@ impl MuxelApp {
             )
             .into());
         }
-        control_program_writable(inst, self.settings.control_allow_shells)?;
+        let session = self
+            .terminal_view(iid)
+            .map(|view| view.read(cx).session().clone());
+        control_program_writable(
+            inst,
+            self.settings.control_allow_shells,
+            session
+                .as_ref()
+                .is_some_and(|session| session.uses_tmux_client()),
+        )?;
         let refuse = |code, message: String| Err(ctl::Error::new(code, message));
         match self.control_state(inst, cx) {
             Some(AgentState::Exited) => {
@@ -1187,20 +1213,24 @@ impl MuxelApp {
             }
             _ => {}
         }
-        self.terminal_view(iid)
-            .map(|view| view.read(cx).session().clone())
-            .ok_or_else(|| {
-                ctl::Error::new(ErrorCode::NotRunning, format!("'{name}' isn't running"))
-            })
+        session.ok_or_else(|| {
+            ctl::Error::new(ErrorCode::NotRunning, format!("'{name}' isn't running"))
+        })
     }
 
     /// Where `inst`'s claim lives: its tmux session, on this machine or its host.
     /// `None` without tmux — a plain PTY is this muxel's alone.
-    fn control_claim_site(&self, inst: &Instance) -> Option<ClaimSite> {
-        if self
-            .remote_host_for_instance(inst.id)
-            .is_some_and(|host| !host.use_tmux(inst.use_tmux))
-        {
+    fn control_claim_site(&self, inst: &Instance, cx: &App) -> Option<ClaimSite> {
+        let live_tmux = self
+            .terminal_view(inst.id)
+            .map(|view| view.read(cx).session().uses_tmux_client());
+        let tmux_client = live_tmux.unwrap_or_else(|| {
+            self.remote_host_for_instance(inst.id)
+                .map_or(inst.tmux_session.is_some() || inst.use_tmux, |host| {
+                    host.use_tmux(inst.use_tmux)
+                })
+        });
+        if !tmux_client {
             return None;
         }
         Some(ClaimSite {
@@ -1230,7 +1260,7 @@ impl MuxelApp {
             iid,
             input,
             turn,
-            site: self.control_claim_site(inst),
+            site: self.control_claim_site(inst, cx),
             state: self.control_state(inst, cx),
             activity: inst.activity.clone(),
             force,
@@ -1676,6 +1706,179 @@ fn show_value(
         "last_reply": reply.map(|text| json!({ "text": text, "source": reply_from })),
         "question": question,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tmux_control_policy_tests {
+    use super::control_program_writable;
+    use muxel_core::{AgentPreset, Instance, control as ctl};
+    use muxel_terminal::{CommandSpec, PtyChunk, TerminalSession};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    #[test]
+    fn tmux_prefix_c_without_shell_grant_does_not_open_a_shell_window() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux is not installed; skipping");
+            return;
+        }
+        let id = Uuid::new_v4().simple().to_string();
+        let socket = format!("mxlctl-{}", &id[..12]);
+        let name = format!("muxel_test_{}", &id[..8]);
+        let args = vec![
+            "-L".into(),
+            socket.clone(),
+            "-f".into(),
+            "/dev/null".into(),
+            "new-session".into(),
+            "-A".into(),
+            "-s".into(),
+            name.clone(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            "sleep 120".into(),
+        ];
+        let (session, rx) = TerminalSession::spawn(
+            CommandSpec::program("tmux", args).with_tmux_client(true),
+            80,
+            24,
+        )
+        .expect("spawn tmux client");
+        let tmux = |args: &[&str]| {
+            Command::new("tmux")
+                .args(["-L", &socket, "-f", "/dev/null"])
+                .args(args)
+                .env_remove("TMUX")
+                .output()
+                .expect("run tmux")
+        };
+        let window_count = || {
+            let windows = tmux(&[
+                "list-windows",
+                "-t",
+                &format!("={name}"),
+                "-F",
+                "#{window_id}",
+            ]);
+            assert!(windows.status.success(), "tmux session disappeared");
+            String::from_utf8_lossy(&windows.stdout).lines().count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut rendered = false;
+        loop {
+            while let Ok(chunk) = rx.try_recv() {
+                if let PtyChunk::Output(bytes) = chunk {
+                    rendered |= !bytes.is_empty();
+                }
+            }
+            let attached = String::from_utf8_lossy(
+                &tmux(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &format!("={name}:"),
+                    "#{session_attached}",
+                ])
+                .stdout,
+            )
+            .trim()
+                == "1";
+            if attached && rendered {
+                break;
+            }
+            assert!(Instant::now() < deadline, "tmux client never attached");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        let mut agent = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+        agent.tmux_session = Some(name.clone());
+        let press_prefix_c = || {
+            for key in ["ctrl-b", "c"] {
+                session
+                    .try_write_input(&ctl::key_bytes(key, false).expect("ctl key"))
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(80));
+            }
+        };
+        if control_program_writable(&agent, false, session.uses_tmux_client()).is_ok() {
+            press_prefix_c();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let denied_count = loop {
+            let count = window_count();
+            if count > 1 || Instant::now() >= deadline {
+                break count;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // Positive control: the same bytes really do invoke tmux's prefix
+        // binding when the explicit command grant permits the write.
+        assert!(control_program_writable(&agent, true, true).is_ok());
+        press_prefix_c();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let allowed_count = loop {
+            let count = window_count();
+            if count >= 2 || Instant::now() >= deadline {
+                break count;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let socket_path = tmux(&["display-message", "-p", "#{socket_path}"]);
+        let socket_path = String::from_utf8_lossy(&socket_path.stdout)
+            .trim()
+            .to_string();
+        session.kill();
+        let _ = tmux(&["kill-server"]);
+        if socket_path.ends_with(&socket) {
+            let _ = std::fs::remove_file(socket_path);
+        }
+        assert_eq!(denied_count, 1, "ctl opened a new tmux shell window");
+        assert_eq!(
+            allowed_count, 2,
+            "positive control did not invoke tmux's prefix binding"
+        );
+    }
+}
+
+#[cfg(test)]
+mod control_policy_tests {
+    use super::control_program_writable;
+    use muxel_core::{AgentPreset, Instance, RemoteHost, RemoteOs};
+    use muxel_terminal::{CommandSpec, TerminalSession};
+    use uuid::Uuid;
+
+    #[test]
+    fn live_launch_transport_overrides_stale_settings_and_metadata() {
+        let mut agent = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+        let mut host = RemoteHost::new("host", "host.example");
+        agent.use_tmux = true;
+        agent.tmux_session = Some("saved-on-unix".into());
+        host.os = RemoteOs::Windows;
+        assert!(!host.use_tmux(agent.use_tmux));
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (direct, _output) = TerminalSession::spawn(spec.clone(), 80, 24).unwrap();
+        assert!(!direct.uses_tmux_client());
+        assert!(control_program_writable(&agent, false, direct.uses_tmux_client()).is_ok());
+
+        // A live client keeps its launch transport when settings change.
+        let (tmux, _output) = TerminalSession::spawn(spec.with_tmux_client(true), 80, 24).unwrap();
+        agent.tmux_session = None;
+        agent.use_tmux = false;
+        host.default_use_tmux = false;
+        assert!(!host.use_tmux(agent.use_tmux));
+        assert!(tmux.uses_tmux_client());
+        assert!(control_program_writable(&agent, false, tmux.uses_tmux_client()).is_err());
+        assert!(control_program_writable(&agent, true, tmux.uses_tmux_client()).is_ok());
+        direct.kill();
+        tmux.kill();
+    }
 }
 
 #[cfg(test)]

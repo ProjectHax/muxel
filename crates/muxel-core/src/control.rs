@@ -1094,12 +1094,13 @@ Uncoded status errors also name the id to query with `new-status`; do not repeat
 `--no-wait` returns that id for scripts; poll with `new-status REQUEST_ID`. Requests expire after 120 seconds.
 `--from` and the caller's MUXEL_INSTANCE_ID are declared labels, not verified identities.
 All raw argv (even agent argv) and shell presets/defaults ALSO require \"Also allow typing into shell panes\".
+`new --prompt` needs that grant too when the new pane uses a tmux client.
 All three grants default off; upgrades do not infer creation permission from the older grants.
 Creation opt-out or outside control off refuses all pending requests. Existing panes, admitted launches and typing permissions are unchanged; toolbar creation is unaffected.
 Outside control off stops the server; pollers report host_unavailable after their retries.
 Commands run as the host muxel process, outside the caller's sandbox; agents/presets are not a sandbox.
-Turning \"Also allow typing into shell panes\" off blocks subsequent control writes to all raw-argv panes and shell-classified panes.
-Configured non-literal agents remain controllable while outside control is on. Revocation does not stop processes or undo input.
+Turning \"Also allow typing into shell panes\" off blocks subsequent control writes to all raw-argv, shell-classified and tmux-backed panes.
+Direct non-literal agents remain controllable while outside control is on. A tmux client's prefix and root key bindings can open a shell window even from an agent pane. Revocation does not stop processes or undo input.
 Raw argv panes restore stopped; only Run again replays their saved command.
 `new` launch directories are never owned, registered or deleted by muxel.
 On Windows, raw argv requires a native executable; use --preset for batch wrappers.
@@ -1458,7 +1459,9 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   a security sandbox. Ask the user to grant authority; do not change settings.
   Turning "Also allow typing into shell panes" off also refuses later control
   writes to every raw argv pane, even agent-looking or interpreter programs, and
-  shell-classified panes. Configured non-literal agents remain controllable while
+  shell-classified and tmux-backed panes. `new --prompt` also needs that grant
+  when the new pane uses a tmux client. Tmux client key bindings can open a shell
+  window from an agent pane. Direct non-literal agents remain controllable while
   outside control is enabled. Disabling all outside control is a separate setting. Revocation
   does not stop the process or undo input already delivered; queued Enter/keys
   recheck the shell-input grant and terminal/session availability before each write.
