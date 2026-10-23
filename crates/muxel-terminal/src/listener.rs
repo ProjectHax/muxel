@@ -183,6 +183,8 @@ pub(crate) struct LifecycleEvidence {
     /// never transfer that ownership to a replacement conversation. Revision
     /// zero means its recipient was unknown and stays unknown for this run.
     first_submission: Option<u64>,
+    /// First admitted submission in this launch, captured with its evidence.
+    first_submission_at: Option<SystemTime>,
     /// What muxel knew at spawn about the conversation the launch opened. A
     /// known one is revision 1 from the start.
     launch: LaunchBinding,
@@ -267,6 +269,7 @@ impl LifecycleEvidence {
     }
 
     pub(crate) fn record_submission(&mut self, at: SystemTime) {
+        self.first_submission_at.get_or_insert(at);
         let mark = self.mark(at);
         self.submitted = Some(mark);
         self.first_submission.get_or_insert(self.binding_rev);
@@ -274,6 +277,10 @@ impl LifecycleEvidence {
 
     pub(crate) fn first_submission_binding(&self) -> Option<u64> {
         self.first_submission.filter(|rev| *rev != 0)
+    }
+
+    pub(crate) fn first_submission_at(&self) -> Option<SystemTime> {
+        self.first_submission_at
     }
 
     pub(crate) fn binding_rev(&self) -> u64 {

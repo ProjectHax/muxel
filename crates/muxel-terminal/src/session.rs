@@ -1138,6 +1138,7 @@ impl OutputReadClock {
 
 pub struct TerminalSession {
     pub id: Uuid,
+    launched_at: SystemTime,
     launch_resumed: bool,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
@@ -1351,6 +1352,14 @@ impl TerminalSession {
         self.launch_resumed
     }
 
+    pub fn launched_at(&self) -> SystemTime {
+        self.launched_at
+    }
+
+    pub fn first_submission_at(&self) -> Option<SystemTime> {
+        self.evidence.lock().first_submission_at()
+    }
+
     /// Spawn a PTY running `spec` at the given initial grid size. Returns the
     /// session plus the receiver the UI drains for output/exit events.
     pub fn spawn(spec: CommandSpec, cols: u16, rows: u16) -> Result<(Arc<Self>, PtyReceiver)> {
@@ -1405,6 +1414,7 @@ impl TerminalSession {
         instance_id: Option<uuid::Uuid>,
         tx: PtyChunkSender,
     ) -> Result<Arc<Self>> {
+        let launched_at = SystemTime::now();
         let cols = cols.max(1);
         let rows = rows.max(1);
 
@@ -1655,6 +1665,7 @@ impl TerminalSession {
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
+            launched_at,
             launch_resumed: spec.launch_resumed,
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
@@ -5906,6 +5917,7 @@ mod runtime_fact_tests {
             assert!(session.try_submit_input(b"\r").is_err());
             assert_eq!(session.input_snapshot(), pasted);
             assert!(!session.has_submitted_turn());
+            assert_eq!(session.first_submission_at(), None);
             assert!(!session.runtime_evidence(None).submitted);
             assert!(!session.submission_pending.load(Ordering::Acquire));
             assert!(events.is_empty());
@@ -5919,6 +5931,7 @@ mod runtime_fact_tests {
             session.try_submit_input(b"\r").unwrap();
             assert_eq!(session.input_snapshot(), (pasted.0 + 2, false));
             assert!(session.has_submitted_turn());
+            assert!(session.first_submission_at().is_some());
             assert!(session.runtime_evidence(None).submitted);
             assert_eq!(events.try_recv(), Ok(()));
             session.kill();
@@ -5961,6 +5974,9 @@ mod runtime_fact_tests {
         session.try_submit_input(b"\r").unwrap();
         let submitted = session.input_snapshot();
         let hook_at = hook_at.lock().expect("hook published during admission");
+        let first_submission_at = session.first_submission_at().expect("Enter submitted");
+        assert!(first_submission_at >= session.launched_at());
+        assert!(first_submission_at <= hook_at);
         // Muxel learns of the hook after the writer returns. Its timestamp,
         // not the time the report was read, decides who received the Enter.
         session.provider_switched_at(hook_at, hook_at, SystemTime::now());
@@ -5970,6 +5986,7 @@ mod runtime_fact_tests {
         // A later submission really does belong to the replacement.
         *session.writer.lock() = Box::new(std::io::sink());
         session.try_submit_input(b"\r").unwrap();
+        assert_eq!(session.first_submission_at(), Some(first_submission_at));
         let later_submitted = session.runtime_evidence(None).submitted;
         session.kill();
 

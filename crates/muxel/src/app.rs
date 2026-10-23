@@ -3533,21 +3533,32 @@ mod claude_resume_tests {
         let mut instance = Instance::from_preset(Uuid::new_v4(), &preset);
         let id = Uuid::new_v4().to_string();
         instance.session_id = Some(id.clone());
+        let launched_at = SystemTime::now();
         let receipt = crate::session_binding::ClaudeBinding {
             session_id: id.clone(),
+            from_resume: true,
             stamp: Some(crate::session_binding::ClaudeHookStamp {
                 nonce: Uuid::new_v4(),
                 recorded_at: SystemTime::now(),
             }),
         };
+        let identity = crate::session_binding::claude_hook_identity(&receipt, None, &[]);
+        let receipt_at = receipt.stamp.map(|stamp| stamp.recorded_at);
         let generated_args = vec!["--resume".into(), id.clone()];
         let generated = generated_resume_receipt(Some(&preset), Some(&generated_args));
         assert!(generated);
         assert!(!crate::session_binding::claude_record_switches(
             &receipt,
+            &identity,
             None,
             Some(&id),
-            generated,
+            crate::session_binding::claude_receipt_confirms_launch(
+                &receipt,
+                receipt_at,
+                launched_at,
+                generated,
+                None,
+            ),
         ));
 
         preset.resume_flag = None;
@@ -3570,9 +3581,16 @@ mod claude_resume_tests {
             );
             assert!(crate::session_binding::claude_record_switches(
                 &receipt,
+                &identity,
                 None,
                 Some(&id),
-                generated,
+                crate::session_binding::claude_receipt_confirms_launch(
+                    &receipt,
+                    receipt_at,
+                    launched_at,
+                    generated,
+                    None,
+                ),
             ));
         }
     }
@@ -4156,6 +4174,7 @@ mod loop_cleanup_tests {
         assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
         let hook = crate::session_binding::ClaudeBinding {
             session_id: bound.clone(),
+            from_resume: true,
             stamp: Some(crate::session_binding::ClaudeHookStamp {
                 nonce: Uuid::new_v4(),
                 recorded_at: SystemTime::now(),
@@ -4163,9 +4182,16 @@ mod loop_cleanup_tests {
         };
         assert!(crate::session_binding::claude_record_switches(
             &hook,
+            &crate::session_binding::claude_hook_identity(&hook, None, &[]),
             None,
             Some(bound.as_str()),
-            session.launch_resumed()
+            crate::session_binding::claude_receipt_confirms_launch(
+                &hook,
+                hook.stamp.map(|stamp| stamp.recorded_at),
+                session.launched_at(),
+                session.launch_resumed(),
+                session.first_submission_at(),
+            )
         ));
         let now = SystemTime::now();
         session.provider_switched(now, now);
@@ -5019,8 +5045,8 @@ pub struct MuxelApp {
     /// Keep live identity even when a workspace write is rolled back.
     #[cfg(windows)]
     grok_observations: HashMap<Uuid, session_discovery::GrokObservation>,
-    /// Per pane, the PTY launch and nonce of the last Claude hook record read.
-    claude_hook_seen: HashMap<Uuid, (Uuid, Uuid)>,
+    /// Per pane, the PTY launch and identity of the last Claude hook record read.
+    claude_hook_seen: HashMap<Uuid, (Uuid, crate::session_binding::ClaudeHookIdentity)>,
     /// Each restored Codex pane's one pre-launch history lookup (runtime only).
     codex_restore_lookups: muxel_core::session_discovery::CodexRestoreLookups,
     /// Panes whose latest launch is armed by `arms_tmux_resume_recovery`
@@ -12686,7 +12712,7 @@ impl MuxelApp {
     /// transcript path identify a direct child of Claude's own store. Resume
     /// records require a real transcript; clear/fork records may precede their
     /// first write. The cwd may differ after `/cd` or an all-project `/resume`.
-    /// `launch` is the pane's live PTY launch, if it has one; the nonce of the
+    /// `launch` is the pane's live PTY launch, if it has one; the identity of the
     /// last record read is remembered per launch. A record that doesn't
     /// validate yet, or names another pane's conversation, isn't adopted yet;
     /// any other is handled once its switch, if any, is saved.
@@ -12705,17 +12731,24 @@ impl MuxelApp {
         if session_id_bound_elsewhere(&self.workspace.instances, iid, &binding.session_id) {
             return Ok(NotYet);
         }
+        let current =
+            crate::session_binding::claude_hook_identity(&binding, record.modified, &record.bytes);
         let seen = self
             .claude_hook_seen
             .get(&iid)
             .filter(|(seen_launch, _)| Some(*seen_launch) == launch)
-            .map(|(_, nonce)| *nonce);
+            .map(|(_, identity)| identity);
         let bound = self
             .workspace
             .instance(iid)
             .and_then(|instance| instance.session_id.as_deref());
-        if !crate::session_binding::claude_record_switches(&binding, seen, bound, true) {
-            self.remember_claude_hook(iid, launch, binding.stamp);
+        // Before launch, a same-ID record is already represented by saved
+        // metadata; there is no live runtime binding to retire.
+        if launch.is_none() && bound == Some(binding.session_id.as_str()) {
+            return Ok(Handled);
+        }
+        if !crate::session_binding::claude_record_switches(&binding, &current, seen, bound, false) {
+            self.remember_claude_hook(iid, launch, current);
             return Ok(Handled);
         }
         let Some(instance) = self.workspace.instance_mut(iid) else {
@@ -12729,7 +12762,7 @@ impl MuxelApp {
         instance.auto_name = None;
         self.bump_session_binding_generation(iid);
         if self.try_persist() {
-            self.remember_claude_hook(iid, launch, binding.stamp);
+            self.remember_claude_hook(iid, launch, current);
             Ok(Handled)
         } else {
             // The claimed record stays; the next claim retries it before any
@@ -12790,16 +12823,16 @@ impl MuxelApp {
         }
     }
 
-    /// Remember the nonce of a hook record this launch has handled, so the same
+    /// Remember the identity of a hook record this launch has handled, so the same
     /// record read again (deleting it failed) isn't another switch.
     fn remember_claude_hook(
         &mut self,
         iid: Uuid,
         launch: Option<Uuid>,
-        stamp: Option<crate::session_binding::ClaudeHookStamp>,
+        identity: crate::session_binding::ClaudeHookIdentity,
     ) {
-        if let (Some(launch), Some(stamp)) = (launch, stamp) {
-            self.claude_hook_seen.insert(iid, (launch, stamp.nonce));
+        if let Some(launch) = launch {
+            self.claude_hook_seen.insert(iid, (launch, identity));
         }
     }
 
