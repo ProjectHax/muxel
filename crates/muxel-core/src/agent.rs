@@ -979,8 +979,7 @@ pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
     if !root.is_dir() {
         return None;
     }
-    let mut best: Option<(std::time::SystemTime, String)> = None;
-    let mut unresolved = None;
+    let mut rollouts = Vec::new();
     let mut unknown_time = false;
     walk_jsonl(&root, &mut |path| {
         let Ok(meta) = std::fs::metadata(path) else {
@@ -991,31 +990,21 @@ pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
             unknown_time = true;
             return true;
         };
-        let meta = match codex_session_meta(path) {
-            Ok(meta) => meta,
-            Err(_) => {
-                unresolved = Some(unresolved.map_or(mtime, |at| mtime.max(at)));
-                return false;
-            }
-        };
-        let Some((id, session_cwd)) = meta else {
-            return false;
-        };
-        if !paths_loosely_equal(Path::new(&session_cwd), cwd) {
-            return false;
-        }
-        if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
-            best = Some((mtime, id));
-        }
+        rollouts.push((mtime, codex_sessions::filename_id(path), path.to_path_buf()));
         false // scan every rollout to find the newest
     })?;
-    let (modified, id) = best?;
-    (!unknown_time && unresolved.is_none_or(|at| at < modified)).then_some(id)
+    if unknown_time {
+        return None;
+    }
+    codex_sessions::newest_matches(rollouts.into_iter(), cwd, 1, &mut || false)?
+        .into_iter()
+        .next()
+        .map(|session| session.id)
 }
 
 /// Walk Codex rollout files (`*.jsonl` and compressed `*.jsonl.zst`) under `dir`,
-/// calling `visit` on each. `visit` returns `true` to stop the walk early (used by
-/// existence checks); returns whether the walk was stopped, or `None` if any
+/// calling `visit` on each. `visit` returns `true` to stop the walk early;
+/// returns whether the walk was stopped, or `None` if any
 /// directory or entry could not be read.
 fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> Option<bool> {
     #[cfg(test)]

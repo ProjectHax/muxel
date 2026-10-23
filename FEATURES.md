@@ -173,6 +173,9 @@ feature is added or changed, update the matching entry here in the same change**
     An unreadable rollout that could change the chosen conversation leaves
     discovery unresolved, including shortened title hints and Import; confirmed
     subagent rollouts remain excluded.
+    Discovery checks equally recent candidates before binding a pane, keeps
+    verified newer conversations when an older candidate is unresolved, and can
+    use a readable copy when a compression sibling cannot be read.
     The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
     UUIDs resolve in their timestamp's local day directory, with one neighboring day
