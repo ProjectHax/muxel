@@ -275,6 +275,7 @@ final class InteropTests: XCTestCase {
         instance.sessionStarted = true
         instance.autoName = "Generated title"
         instance.customName = "Manual title"
+        instance.controlCreated = true
 
         instance.resetConversationForDuplicate()
 
@@ -283,6 +284,30 @@ final class InteropTests: XCTestCase {
         XCTAssertFalse(instance.sessionStarted)
         XCTAssertNil(instance.autoName)
         XCTAssertEqual(instance.customName, "Manual title")
+        XCTAssertFalse(instance.controlCreated)
+    }
+
+    func testDuplicateNeverCarriesAnUnconsumedCtlTask() {
+        var task = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
+        task.controlPrompt = true
+        task.systemPrompt = "deploy the branch"
+        task.resetConversationForDuplicate()
+        XCTAssertNil(task.systemPrompt)
+        var runner = Instance(id: "bbbb", projectId: "p", title: "Claude", program: "claude", args: [])
+        runner.isRunner = true
+        runner.systemPrompt = "Review the diff"
+        runner.resetConversationForDuplicate()
+        XCTAssertEqual(runner.systemPrompt, "Review the diff")
+    }
+
+    func testOutsideCreationOriginRoundTripsAndDefaultsForOlderDocuments() throws {
+        var instance = Instance(id: "aaaa", projectId: "p", title: "Claude", program: "claude", args: [])
+        instance.controlCreated = true
+        let encoded = try MuxelJSON.encoder.encode(instance)
+        let decoded = try MuxelJSON.decoder.decode(Instance.self, from: encoded)
+        XCTAssertTrue(decoded.controlCreated)
+        let legacy = Data(#"{"id":"aaaa","project_id":"p","title":"Claude"}"#.utf8)
+        XCTAssertFalse(try MuxelJSON.decoder.decode(Instance.self, from: legacy).controlCreated)
     }
 
     func testPaneNodeRoundTrips() throws {

@@ -69,14 +69,17 @@ struct Instance: Codable, Equatable, Identifiable {
     var autoName: String?
     var program: String?
     var args: [String] = []
+    var literalArgv: Bool = false
     var systemPrompt: String?
     var injection: InjectionMode = .none
+    var instructionInjection: InjectionMode?
     var preset: String = ""
     var presetId: String?
     var env: [EnvVar] = []
     var useTmux: Bool = false
     var useWorktree: Bool = false
     var tmuxSession: String?
+    var launchDir: String?
     var tmuxSocket: String?
     var worktreePath: String?
     var worktreeBranch: String?
@@ -86,6 +89,8 @@ struct Instance: Codable, Equatable, Identifiable {
     /// doesn't strip it from the peer.
     var autoContinueMessage: String?
     var isRunner: Bool = false
+    var controlPrompt: Bool = false
+    var controlCreated: Bool = false
     var autoSubmit: Bool = false
     var pinned: Bool = false
     var worktreeId: String?
@@ -105,19 +110,24 @@ struct Instance: Codable, Equatable, Identifiable {
         case customName = "custom_name"
         case autoName = "auto_name"
         case program, args
+        case literalArgv = "literal_argv"
         case systemPrompt = "system_prompt"
         case injection, preset
+        case instructionInjection = "instruction_injection"
         case presetId = "preset_id"
         case env
         case useTmux = "use_tmux"
         case useWorktree = "use_worktree"
         case tmuxSession = "tmux_session"
+        case launchDir = "launch_dir"
         case tmuxSocket = "tmux_socket"
         case worktreePath = "worktree_path"
         case worktreeBranch = "worktree_branch"
         case autoModePresses = "auto_mode_presses"
         case autoContinueMessage = "auto_continue_message"
         case isRunner = "is_runner"
+        case controlPrompt = "control_prompt"
+        case controlCreated = "control_created"
         case autoSubmit = "auto_submit"
         case pinned
         case worktreeId = "worktree_id"
@@ -149,14 +159,17 @@ struct Instance: Codable, Equatable, Identifiable {
         autoName = try c.decodeIfPresent(String.self, forKey: .autoName)
         program = try c.decodeIfPresent(String.self, forKey: .program)
         args = (try c.decodeIfPresent([String].self, forKey: .args)) ?? []
+        literalArgv = (try c.decodeIfPresent(Bool.self, forKey: .literalArgv)) ?? false
         systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt)
         injection = (try c.decodeIfPresent(InjectionMode.self, forKey: .injection)) ?? .none
+        instructionInjection = try c.decodeIfPresent(InjectionMode.self, forKey: .instructionInjection)
         preset = (try c.decodeIfPresent(String.self, forKey: .preset)) ?? ""
         presetId = try c.decodeIfPresent(String.self, forKey: .presetId)
         env = (try c.decodeIfPresent([EnvVar].self, forKey: .env)) ?? []
         useTmux = (try c.decodeIfPresent(Bool.self, forKey: .useTmux)) ?? false
         useWorktree = (try c.decodeIfPresent(Bool.self, forKey: .useWorktree)) ?? false
         tmuxSession = try c.decodeIfPresent(String.self, forKey: .tmuxSession)
+        launchDir = try c.decodeIfPresent(String.self, forKey: .launchDir)
         // An owner tmux can't use as a socket name reads as none (legacy discovery),
         // like `tmux::recorded_socket` on desktop, rather than failing the layout.
         tmuxSocket = try c.decodeIfPresent(String.self, forKey: .tmuxSocket).flatMap {
@@ -167,6 +180,8 @@ struct Instance: Codable, Equatable, Identifiable {
         autoModePresses = (try c.decodeIfPresent(Int.self, forKey: .autoModePresses)) ?? 0
         autoContinueMessage = try c.decodeIfPresent(String.self, forKey: .autoContinueMessage)
         isRunner = (try c.decodeIfPresent(Bool.self, forKey: .isRunner)) ?? false
+        controlPrompt = (try c.decodeIfPresent(Bool.self, forKey: .controlPrompt)) ?? false
+        controlCreated = (try c.decodeIfPresent(Bool.self, forKey: .controlCreated)) ?? false
         autoSubmit = (try c.decodeIfPresent(Bool.self, forKey: .autoSubmit)) ?? false
         pinned = (try c.decodeIfPresent(Bool.self, forKey: .pinned)) ?? false
         worktreeId = try c.decodeIfPresent(String.self, forKey: .worktreeId)
@@ -187,20 +202,25 @@ struct Instance: Codable, Equatable, Identifiable {
         try c.encode(autoName, forKey: .autoName)
         try c.encode(program, forKey: .program)
         try c.encode(args, forKey: .args)
+        try c.encode(literalArgv, forKey: .literalArgv)
         try c.encode(systemPrompt, forKey: .systemPrompt)
         try c.encode(injection, forKey: .injection)
+        try c.encode(instructionInjection, forKey: .instructionInjection)
         try c.encode(preset, forKey: .preset)
         try c.encode(presetId, forKey: .presetId)
         try c.encode(env, forKey: .env)
         try c.encode(useTmux, forKey: .useTmux)
         try c.encode(useWorktree, forKey: .useWorktree)
         try c.encode(tmuxSession, forKey: .tmuxSession)
+        try c.encode(launchDir, forKey: .launchDir)
         try c.encode(tmuxSocket, forKey: .tmuxSocket)
         try c.encode(worktreePath, forKey: .worktreePath)
         try c.encode(worktreeBranch, forKey: .worktreeBranch)
         try c.encode(autoModePresses, forKey: .autoModePresses)
         try c.encode(autoContinueMessage, forKey: .autoContinueMessage)
         try c.encode(isRunner, forKey: .isRunner)
+        try c.encode(controlPrompt, forKey: .controlPrompt)
+        try c.encode(controlCreated, forKey: .controlCreated)
         try c.encode(autoSubmit, forKey: .autoSubmit)
         try c.encode(pinned, forKey: .pinned)
         try c.encode(worktreeId, forKey: .worktreeId)
@@ -228,5 +248,12 @@ struct Instance: Codable, Equatable, Identifiable {
         sessionPath = nil
         sessionStarted = false
         autoName = nil
+        controlCreated = false
+        // An unconsumed `ctl new --prompt` task belongs to the request that was
+        // approved, never to a copy of its pane. Port of Rust's
+        // `reset_conversation_for_duplicate`.
+        if controlPrompt {
+            systemPrompt = nil
+        }
     }
 }

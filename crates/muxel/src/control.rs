@@ -173,17 +173,25 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
             request.version
         ));
     }
+    let status_poll = matches!(&request.command, Command::NewStatus { .. });
+    let unavailable = |message: &str| {
+        if status_poll {
+            Response::err(control::Error::new(ErrorCode::HostUnavailable, message))
+        } else {
+            Response::err(message)
+        }
+    };
     let (reply, answer) = std::sync::mpsc::channel();
     let incoming = Incoming {
         command: request.command,
         reply,
     };
     if tx.send_blocking(incoming).is_err() {
-        return Response::err("muxel is shutting down");
+        return unavailable("muxel is shutting down");
     }
     answer
         .recv_timeout(REPLY_TIMEOUT)
-        .unwrap_or_else(|_| Response::err("muxel didn't answer in time"))
+        .unwrap_or_else(|_| unavailable("muxel didn't answer in time"))
 }
 
 /// Compare secrets without leaking, through timing, how much of a guess was right.
@@ -252,6 +260,32 @@ pub fn run_cli(args: &[String]) -> i32 {
                 Ok(_) => return fail("`send AGENT -` read no text from stdin".into(), 2),
                 Err(e) => return fail(format!("reading stdin: {e}").into(), 2),
             }
+        }
+        CliCommand::Request(Command::New {
+            project,
+            mut options,
+        }) => {
+            if options.prompt.as_deref() == Some("-") {
+                let mut text = String::new();
+                match std::io::stdin().read_to_string(&mut text) {
+                    Ok(_) if !text.trim().is_empty() => {
+                        options.prompt = Some(text.trim_end_matches(['\r', '\n']).to_string())
+                    }
+                    Ok(_) => return fail("`new --prompt -` read no text from stdin".into(), 2),
+                    Err(error) => return fail(format!("reading stdin: {error}").into(), 2),
+                }
+            }
+            options.requesting_pane = std::env::var(control::INSTANCE_ID_ENV)
+                .ok()
+                .and_then(|id| id.parse().ok());
+            let no_wait = options.no_wait;
+            request(Command::New { project, options }).and_then(|value| {
+                if no_wait {
+                    Ok(value)
+                } else {
+                    wait_creation(value)
+                }
+            })
         }
         CliCommand::Request(command) => request(command),
         CliCommand::Wait {
@@ -438,16 +472,80 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
-/// One request to the running app. Only failures before the request is sent are
-/// known to have done nothing, and only those get a code here.
+/// One request to the running app. For mutations, only failures before sending
+/// are known to have done nothing. Read-only creation status can safely retry a
+/// transport failure after sending as well.
 fn request(command: Command) -> Result<Value, control::Error> {
     let path = endpoint_path()?
         .ok_or_else(|| control::Error::new(ErrorCode::HostUnavailable, "no data directory"))?;
     request_at(&path, command)
 }
 
+/// Each poll owns a fresh socket; approvals never occupy a connection slot.
+fn wait_creation(value: Value) -> Result<Value, control::Error> {
+    wait_creation_with(
+        value,
+        |request_id| request(Command::NewStatus { request_id }),
+        || std::thread::sleep(WAIT_POLL),
+    )
+}
+
+fn wait_creation_with(
+    value: Value,
+    mut status: impl FnMut(Uuid) -> Result<Value, control::Error>,
+    mut pause: impl FnMut(),
+) -> Result<Value, control::Error> {
+    if value["pending"].as_bool() != Some(true) {
+        return Ok(value);
+    }
+    let request_id = value["request_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .ok_or("muxel returned an invalid creation request id")?;
+    let mut retries = 0;
+    loop {
+        pause();
+        match status(request_id) {
+            Ok(value) if value["pending"].as_bool() != Some(true) => return Ok(value),
+            Ok(_) => retries = 0,
+            Err(error)
+                if matches!(
+                    error.code,
+                    Some(ErrorCode::HostUnavailable | ErrorCode::StaleEndpoint)
+                ) =>
+            {
+                if retries < 3 {
+                    retries += 1;
+                } else {
+                    return Err(creation_poll_error(error, request_id));
+                }
+            }
+            Err(error) if error.code.is_none() => {
+                return Err(creation_poll_error(error, request_id));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn creation_poll_error(mut error: control::Error, request_id: Uuid) -> control::Error {
+    error.message = format!(
+        "{}; query this creation with `muxel ctl new-status {request_id}` when the host is available; do not repeat `new` because the original request may still be waiting",
+        error.message,
+    );
+    error
+}
+
 /// [`request`] to the muxel whose endpoint file is `path`.
 fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
+    let status_poll = matches!(&command, Command::NewStatus { .. });
+    let transport_error = |message: String| {
+        if status_poll {
+            control::Error::new(ErrorCode::HostUnavailable, message)
+        } else {
+            message.into()
+        }
+    };
     let unavailable = |message| control::Error::new(ErrorCode::HostUnavailable, message);
     let endpoint = read_endpoint(path).ok_or_else(|| unavailable(NOT_RUNNING))?;
     if !process_alive(endpoint.pid) {
@@ -467,16 +565,16 @@ fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
     line.push('\n');
     stream
         .write_all(line.as_bytes())
-        .map_err(|e| format!("sending to muxel: {e}"))?;
+        .map_err(|e| transport_error(format!("sending to muxel: {e}")))?;
     let mut reply = String::new();
     BufReader::new(&stream)
         .read_line(&mut reply)
-        .map_err(|e| format!("reading muxel's reply: {e}"))?;
+        .map_err(|e| transport_error(format!("reading muxel's reply: {e}")))?;
     if reply.trim().is_empty() {
-        return Err(NOT_RUNNING.into());
+        return Err(transport_error(NOT_RUNNING.into()));
     }
-    let response: Response =
-        serde_json::from_str(&reply).map_err(|e| format!("unreadable reply from muxel: {e}"))?;
+    let response: Response = serde_json::from_str(&reply)
+        .map_err(|e| transport_error(format!("unreadable reply from muxel: {e}")))?;
     response.into_result()
 }
 
@@ -498,6 +596,9 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
             return Err(format!("'{agent}' is not a terminal pane").into());
         }
         let awaiting = info["awaiting_reply"].as_bool().unwrap_or(false);
+        if info["startup_error"].is_string() {
+            break WaitOutcome::SubmissionFailed;
+        }
         if let Some(outcome) = control::wait_outcome(state, awaiting) {
             break outcome;
         }
@@ -519,7 +620,10 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
 
 #[cfg(test)]
 mod tests {
-    use super::{Server, process_alive, read_endpoint, request_at, same_secret, write_endpoint};
+    use super::{
+        Server, dispatch, process_alive, read_endpoint, request_at, same_secret,
+        wait_creation_with, write_endpoint,
+    };
     use muxel_core::control::{self, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response};
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::{Ipv4Addr, TcpListener};
@@ -529,6 +633,195 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("muxel-ctl-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn approval_poll_retries_keep_the_same_id_and_reset_after_a_pending_reply() {
+        let id = uuid::Uuid::new_v4();
+        let pending = serde_json::json!({"pending":true,"request_id":id});
+        let outage = || {
+            Err(control::Error::new(
+                ErrorCode::HostUnavailable,
+                "connection lost",
+            ))
+        };
+        let mut replies = std::collections::VecDeque::from([
+            outage(),
+            outage(),
+            Ok(serde_json::json!({"pending":true,"request_id":uuid::Uuid::new_v4()})),
+            outage(),
+            outage(),
+            outage(),
+            Ok(serde_json::json!({"uuid":"created-once"})),
+        ]);
+        let mut polls = 0;
+        let mut pauses = 0;
+        let result = wait_creation_with(
+            pending,
+            |request_id| {
+                assert_eq!(request_id, id);
+                polls += 1;
+                replies.pop_front().expect("unexpected extra poll")
+            },
+            || pauses += 1,
+        )
+        .unwrap();
+        assert_eq!(result["uuid"], "created-once");
+        assert_eq!(polls, 7);
+        assert_eq!(pauses, polls);
+    }
+
+    #[test]
+    fn approval_poll_exhaustion_keeps_the_error_code_and_tells_callers_which_id_to_query() {
+        let id = uuid::Uuid::new_v4();
+        let mut polls = 0;
+        let error = wait_creation_with(
+            serde_json::json!({"pending":true,"request_id":id}),
+            |request_id| {
+                assert_eq!(request_id, id);
+                polls += 1;
+                Err(control::Error::new(
+                    ErrorCode::HostUnavailable,
+                    "outside control is off",
+                ))
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(polls, 4);
+        assert_eq!(error.code, Some(ErrorCode::HostUnavailable));
+        assert!(error.message.contains(&id.to_string()));
+        assert!(error.message.contains("new-status"));
+    }
+
+    #[test]
+    fn uncoded_approval_poll_error_keeps_the_request_id_and_recovery_guidance() {
+        let id = uuid::Uuid::new_v4();
+        let mut polls = 0;
+        let error = wait_creation_with(
+            serde_json::json!({"pending":true,"request_id":id}),
+            |request_id| {
+                assert_eq!(request_id, id);
+                polls += 1;
+                Err("muxel didn't answer in time".into())
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(polls, 1);
+        assert_eq!(error.code, None);
+        assert!(error.message.starts_with("muxel didn't answer in time"));
+        assert!(error.message.contains(&id.to_string()));
+        assert!(error.message.contains("new-status"));
+        assert!(error.message.contains("do not repeat `new`"));
+    }
+
+    #[test]
+    fn approval_poll_never_retries_a_terminal_host_refusal() {
+        for expected in [
+            control::Error::new(ErrorCode::ApprovalDenied, "denied"),
+            "unknown or expired creation request id".into(),
+        ] {
+            let mut polls = 0;
+            let id = uuid::Uuid::new_v4();
+            let error = wait_creation_with(
+                serde_json::json!({"pending":true,"request_id":id}),
+                |_| {
+                    polls += 1;
+                    Err(expected.clone())
+                },
+                || {},
+            )
+            .unwrap_err();
+            assert_eq!(polls, 1);
+            if expected.code.is_some() {
+                assert_eq!(error, expected);
+            } else {
+                assert_eq!(error.code, None);
+                assert!(error.message.starts_with(&expected.message));
+                assert!(error.message.contains(&id.to_string()));
+                assert!(error.message.contains("do not repeat `new`"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_lost_status_reply_is_retryable_without_claiming_a_mutation_did_nothing() {
+        let dir = scratch("lost-status");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let path = dir.join(control::ENDPOINT_FILE);
+        write_endpoint(
+            &path,
+            &Endpoint {
+                version: PROTOCOL_VERSION,
+                port: listener.local_addr().unwrap().port(),
+                token: "test".into(),
+                pid: std::process::id(),
+                exe: None,
+            },
+        )
+        .unwrap();
+        let host = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                // Lose the reply after receiving the entire request.
+            }
+        });
+        let ambiguous = request_at(
+            &path,
+            Command::New {
+                project: "repo".into(),
+                options: Default::default(),
+            },
+        )
+        .unwrap_err();
+        let status = request_at(
+            &path,
+            Command::NewStatus {
+                request_id: uuid::Uuid::new_v4(),
+            },
+        )
+        .unwrap_err();
+        host.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(ambiguous.code, None);
+        assert_eq!(status.code, Some(ErrorCode::HostUnavailable));
+    }
+
+    #[test]
+    fn a_disconnected_status_dispatch_is_retryable_without_reclassifying_creation() {
+        let (tx, rx) = async_channel::unbounded();
+        drop(rx);
+        for (command, expected) in [
+            (
+                Command::New {
+                    project: "repo".into(),
+                    options: Default::default(),
+                },
+                None,
+            ),
+            (
+                Command::NewStatus {
+                    request_id: uuid::Uuid::new_v4(),
+                },
+                Some(ErrorCode::HostUnavailable),
+            ),
+        ] {
+            let request = control::Request {
+                version: control::request_version(&command),
+                token: "test".into(),
+                command,
+            };
+            assert_eq!(
+                dispatch(request, "test", &tx)
+                    .into_result()
+                    .unwrap_err()
+                    .code,
+                expected
+            );
+        }
     }
 
     /// The path a refusal takes from the app to the caller: the server, the
@@ -584,7 +877,104 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_host_refuses_a_guarded_send_before_typing() {
+    fn parameterized_creation_requires_exact_version_before_mutation() {
+        let (tx, rx) = async_channel::unbounded();
+        for (version, model, effort, required) in [
+            (2, Some("sonnet"), None, 3),
+            (2, None, Some("high"), 3),
+            (3, None, None, 2),
+        ] {
+            let request: control::Request = serde_json::from_value(serde_json::json!({
+                "version":version, "token":"test", "command": {
+                    "cmd":"new", "project":"repo", "model":model, "effort":effort,
+                }
+            }))
+            .unwrap();
+            let error = dispatch(request, "test", &tx).into_result().unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains(&format!("requires control protocol v{required}"))
+            );
+            assert!(rx.is_empty(), "a mismatched request reached app mutation");
+        }
+        drop(rx);
+        for (version, model) in [(2, None), (3, Some("sonnet"))] {
+            let request: control::Request = serde_json::from_value(serde_json::json!({
+                "version":version, "token":"test", "command": {
+                    "cmd":"new", "project":"repo", "model":model,
+                }
+            }))
+            .unwrap();
+            let error = dispatch(request, "test", &tx).into_result().unwrap_err();
+            assert_eq!(
+                error.message, "muxel is shutting down",
+                "matching version was refused before app dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn a_v2_host_cannot_silently_drop_creation_parameters() {
+        let dir = scratch("v2-parameters");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let path = dir.join(control::ENDPOINT_FILE);
+        write_endpoint(
+            &path,
+            &Endpoint {
+                version: PROTOCOL_VERSION,
+                port: listener.local_addr().unwrap().port(),
+                token: "test".into(),
+                pid: std::process::id(),
+                exe: None,
+            },
+        )
+        .unwrap();
+        let legacy = std::thread::spawn(move || {
+            let mut mutations = 0;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // A v2 host ignores unknown option fields. If this client sends
+                // v2, that host would create with defaults and lose the choices.
+                let response = if request["version"] == 2 {
+                    mutations += 1;
+                    Response::ok(serde_json::json!({"created_with_defaults":true}))
+                } else {
+                    Response::err("v2 host refuses this request version")
+                };
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            mutations
+        });
+        for options in [
+            control::NewOptions {
+                model: Some("sonnet".into()),
+                ..Default::default()
+            },
+            control::NewOptions {
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+        ] {
+            let error = request_at(
+                &path,
+                Command::New {
+                    project: "repo".into(),
+                    options,
+                },
+            )
+            .unwrap_err();
+            assert!(error.message.contains("v2 host refuses"));
+        }
+        assert_eq!(legacy.join().unwrap(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_legacy_host_refuses_guarded_and_creation_requests_before_mutation() {
         let dir = scratch("legacy-guard");
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let path = dir.join(control::ENDPOINT_FILE);
@@ -599,27 +989,45 @@ mod tests {
             },
         )
         .unwrap();
-        let legacy = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            BufReader::new(&stream).read_line(&mut line).unwrap();
-            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(request["version"], 2);
-            stream
-                .write_all(b"{\"ok\":false,\"error\":\"legacy host rejects request v2\"}\n")
-                .unwrap();
-        });
-        let refused = request_at(
-            &path,
+        let commands = [
             Command::Send {
                 agent: "a".into(),
                 text: "hi".into(),
                 force: false,
                 launch_id: Some(uuid::Uuid::from_u128(42)),
             },
-        )
-        .unwrap_err();
-        assert!(refused.message.contains("legacy host rejects"));
+            Command::New {
+                project: "repo".into(),
+                options: Default::default(),
+            },
+            Command::New {
+                project: "repo".into(),
+                options: control::NewOptions {
+                    prompt: Some("task".into()),
+                    ..Default::default()
+                },
+            },
+            Command::NewStatus {
+                request_id: uuid::Uuid::new_v4(),
+            },
+        ];
+        let count = commands.len();
+        let legacy = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["version"], 2);
+                stream
+                    .write_all(b"{\"ok\":false,\"error\":\"legacy host rejects request v2\"}\n")
+                    .unwrap();
+            }
+        });
+        for command in commands {
+            let refused = request_at(&path, command).unwrap_err();
+            assert!(refused.message.contains("legacy host rejects"));
+        }
         legacy.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }

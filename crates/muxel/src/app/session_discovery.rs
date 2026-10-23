@@ -297,7 +297,9 @@ fn restore_codex_pane<'a>(
 ) -> Option<&'a Path> {
     let project = workspace.project(instance.project_id)?;
     let preset = restore_preset(presets, instance)?;
-    (project.remote.is_none()
+    // A literal pane runs its saved argv, never a resume: no history lookup.
+    (!instance.literal_argv
+        && project.remote.is_none()
         && instance.session_started
         && is_codex_program(preset.program.as_deref())
         && preset.resume_flag.is_some()
@@ -626,7 +628,10 @@ impl MuxelApp {
     ) -> Option<SessionDiscoveryKey> {
         let iid = instance.id;
         let project = self.workspace.project(instance.project_id)?;
-        if project.remote.is_some() || self.terminal_launching.contains_key(&iid) {
+        if instance.literal_argv
+            || project.remote.is_some()
+            || self.terminal_launching.contains_key(&iid)
+        {
             return None;
         }
         let view = self.discovery_terminal(iid)?.read(cx);
@@ -681,10 +686,9 @@ impl MuxelApp {
             binding: instance.session_id.clone(),
             binding_path: instance.session_path.clone(),
             cwd: instance
-                .worktree_path
-                .as_ref()
+                .working_directory()
                 .unwrap_or(&project.root_path)
-                .clone(),
+                .to_path_buf(),
             hint,
             tmux_socket: tmux_session.as_ref().and(instance.tmux_socket.clone()),
             tmux_session,
@@ -1421,6 +1425,43 @@ mod codex_restore_tests {
 
     fn later() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn restore_query_never_looks_up_history_for_a_literal_pane() {
+        let codex = AgentPreset::codex();
+        let local = Project::new("webapp", "/home/me/webapp");
+        // Stale peer metadata can make a literal pane look like a started Codex.
+        let mut literal = started(local.id, &codex, None);
+        literal.literal_argv = true;
+        literal.tmux_session = Some("muxel_webapp_1a2b3c4d".into());
+        literal.tmux_socket = Some(Socket::Private);
+        let mut resumed = literal.clone();
+        resumed.id = Uuid::new_v4();
+        resumed.session_id = Some("01a1543c-9700-7000-8000-000000000001".into());
+        let agent = started(local.id, &codex, None);
+        let ids = [literal.id, resumed.id, agent.id];
+        let workspace = Workspace {
+            projects: vec![local],
+            instances: vec![literal, resumed, agent],
+            ..Workspace::default()
+        };
+        let presets = [codex];
+        assert_eq!(
+            codex_restore_query(&workspace, &presets, ids[0], &|_| false),
+            None
+        );
+        assert_eq!(
+            codex_restore_query(&workspace, &presets, ids[1], &|_| false),
+            None
+        );
+        // Nor is it a sibling whose running session would block another pane.
+        assert!(matches!(
+            codex_restore_query(&workspace, &presets, ids[2], &|iid| iid != ids[2])
+                .map(|query| query.kind),
+            Some(CodexRestoreKind::Latest { limit: 1, sibling_sessions, .. })
+                if sibling_sessions.is_empty()
+        ));
     }
 
     #[test]

@@ -16,11 +16,25 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Endpoint and plain-request version. Guarded sends require an explicit v2.
+mod new;
+pub use new::{MAX_LABEL_CHARS, MAX_PROMPT_CHARS, NewOptions, NewPlacement, place_new_pane};
+mod startup;
+pub use startup::{StartupFailure, StartupTurn, StartupTurnOwner, StartupTurnState};
+mod card;
+pub use card::{CardPrompt, card_lines, card_prompt, card_value, is_hidden_char};
+mod approval;
+pub use approval::{
+    APPROVAL_ARM_DELAY_MS, APPROVAL_TIMEOUT_MS, ApprovalQueue, CreationDecision, CreationPolicy,
+    LaunchClass, PendingApproval, creation_decision, creation_refusal,
+};
+
+/// Endpoint and plain-request version. Guards and plain creation require v2.
 pub const PROTOCOL_VERSION: u32 = 1;
 /// An older v1 host ignores unknown fields but rejects this request version
 /// before forwarding a guarded send to the app.
 pub const GUARDED_SEND_VERSION: u32 = 2;
+/// Model/effort fields must never be silently ignored by older creation hosts.
+pub const PARAMETERIZED_NEW_VERSION: u32 = 3;
 
 /// The file, in muxel's data directory, where the running app says how to reach
 /// it. Owner-only: the token in it is the whole of the authorization.
@@ -76,6 +90,14 @@ pub enum Command {
         #[serde(default)]
         project: Option<String>,
     },
+    /// Open a terminal in a project's active tab group.
+    New {
+        project: String,
+        #[serde(flatten)]
+        options: NewOptions,
+    },
+    /// Poll a creation approval without keeping a connection open.
+    NewStatus { request_id: Uuid },
     /// One agent's state, or every agent's.
     Status {
         #[serde(default)]
@@ -111,14 +133,19 @@ pub enum Command {
     Keys { agent: String, keys: Vec<String> },
 }
 
-/// Require v2 for launch guards so older hosts refuse instead of ignoring them.
+/// Require explicit versions so older hosts refuse fields they cannot honor.
 pub fn request_version(command: &Command) -> u32 {
+    if matches!(command, Command::New { options, .. } if options.model.is_some() || options.effort.is_some())
+    {
+        return PARAMETERIZED_NEW_VERSION;
+    }
     if matches!(
         command,
         Command::Send {
             launch_id: Some(_),
             ..
-        }
+        } | Command::New { .. }
+            | Command::NewStatus { .. }
     ) {
         GUARDED_SEND_VERSION
     } else {
@@ -193,6 +220,20 @@ fn known_code<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<ErrorCod
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
+    /// Outside control was revoked before the mutation.
+    ControlDisabled,
+    /// Outside terminal creation is Off.
+    CreationDisabled,
+    /// Literal argv or a shell launch needs the shell/command grant.
+    CommandPermissionRequired,
+    /// The user denied this creation request.
+    ApprovalDenied,
+    /// No approval arrived within 120 seconds of admission.
+    ApprovalTimeout,
+    /// Only configured non-shell terminal presets accept user tasks.
+    PromptUnsupported,
+    /// A preset cannot safely express the requested model or effort override.
+    ParameterUnsupported,
     /// The agent is working: `wait` for it (or `send --force`).
     Working,
     /// The agent is waiting on a question: `answer` it, or press `keys`.
@@ -210,7 +251,8 @@ pub enum ErrorCode {
     /// The prompt was pasted but its delayed Enter was withheld.
     InputChanged,
     /// `muxel ctl` found no muxel to ask: it isn't running, outside control is
-    /// off, or its `control.json` can't be read or reached.
+    /// off, its `control.json` can't be read or reached, or a read-only creation
+    /// status cannot be answered.
     HostUnavailable,
     /// The endpoint's owner process did not pass the liveness check.
     StaleEndpoint,
@@ -332,6 +374,10 @@ pub struct AgentInfo {
     pub launch_id: Option<Uuid>,
     /// A prompt sent through `muxel ctl` whose turn hasn't ended yet.
     pub awaiting_reply: bool,
+    /// A startup task that failed before provider acceptance. The terminal itself
+    /// may still be running, for example at a folder-trust menu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_error: Option<String>,
     /// The pane the user has focused.
     pub focused: bool,
     /// The pane (tab group) it is a tab of, numbered in layout order from 1.
@@ -854,6 +900,8 @@ pub fn awaiting_reply(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitOutcome {
+    /// The startup task never obtained provider-owned acceptance.
+    SubmissionFailed,
     /// The turn ended; the reply is ready.
     Finished,
     /// The agent is asking something (see `question`).
@@ -981,6 +1029,10 @@ pub fn claim_holds(
 
 /// What `muxel ctl …` asked for.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "only one command is parsed per CLI invocation; boxing adds an allocation without reducing a collection"
+)]
 pub enum CliCommand {
     /// A request the app answers directly.
     Request(Command),
@@ -1004,6 +1056,12 @@ usage: muxel ctl <command> [args]
 
   projects                       list projects
   panes [PROJECT]                pane layout and agents (all projects, or one)
+  new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
+              [--focus] [--prompt TEXT] [--from LABEL] [--no-wait]
+              [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]
+                                 open in background; --focus selects and raises;
+                                 --background is a compatibility no-op; --prompt - reads stdin
+  new-status REQUEST_ID          poll a pending creation's final reply
   status [AGENT]                 an agent's status (or every agent's)
   show AGENT [--full]            last prompt, last reply, pending question
   screen AGENT [--lines N]       raw terminal text (default 60 lines)
@@ -1019,6 +1077,33 @@ usage: muxel ctl <command> [args]
 
 AGENT is an id from `panes`, a name, project/name, or `focused`.
 Everything after `--` is taken literally (for text that starts with --).
+For `new` without --prompt, presets/defaults keep toolbar injection, resume and hooks; raw argv bypasses them.
+ALL `new` requests require outside control AND Settings > Grok Bot > Outside terminal creation set to Ask or Allow.
+Ask requires a click for every request. Allow covers configured non-shell terminal presets.
+Literal argv and shell presets always Ask; the click card never takes keyboard focus.
+Each card disables Allow and Deny for 750 ms after appearing and ignores double-clicks.
+Both mouse-down and release must belong to that same armed card.
+`--prompt` submits a user task through the one-shot runner path, once on first launch; only non-shell terminal presets support it.
+It replaces the preset's configured system prompt with the task; preset arguments are kept.
+The typed task stays exact; automatic instructions use a separate flag/config channel when available.
+In Git Bash, set MSYS_NO_PATHCONV=1 for leading-slash prompts, or use --prompt - with stdin.
+Its task text is discarded after the first launch and is not re-typed on a later launch.
+Ask returns a pending request id immediately; the CLI polls once per second until the final reply.
+Connection and host-availability failures retry up to three times against the same id; creation is never reissued.
+Uncoded status errors also name the id to query with `new-status`; do not repeat `new` while the original may still wait.
+`--no-wait` returns that id for scripts; poll with `new-status REQUEST_ID`. Requests expire after 120 seconds.
+`--from` and the caller's MUXEL_INSTANCE_ID are declared labels, not verified identities.
+All raw argv (even agent argv) and shell presets/defaults ALSO require \"Also allow typing into shell panes\".
+All three grants default off; upgrades do not infer creation permission from the older grants.
+Creation opt-out or outside control off refuses all pending requests. Existing panes, admitted launches and typing permissions are unchanged; toolbar creation is unaffected.
+Outside control off stops the server; pollers report host_unavailable after their retries.
+Commands run as the host muxel process, outside the caller's sandbox; agents/presets are not a sandbox.
+Turning \"Also allow typing into shell panes\" off blocks subsequent control writes to all raw-argv panes and shell-classified panes.
+Configured non-literal agents remain controllable while outside control is on. Revocation does not stop processes or undo input.
+Raw argv panes restore stopped; only Run again replays their saved command.
+`new` launch directories are never owned, registered or deleted by muxel.
+On Windows, raw argv requires a native executable; use --preset for batch wrappers.
+`new` opens terminal panes; browser presets (including a browser default) are not supported yet.
 muxel must be running with Settings > Grok Bot > \"Allow outside tools to control muxel\" on.
 To reach a muxel started with --user-data-dir DIR, run `muxel --user-data-dir DIR ctl ...`;
 its own panes reach it without the flag.
@@ -1032,6 +1117,19 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     let Some((cmd, rest)) = args.split_first() else {
         return Ok(CliCommand::Help);
     };
+    if cmd == "new" {
+        return new::parse(rest);
+    }
+    if cmd == "new-status" {
+        return match rest {
+            [id] => Ok(CliCommand::Request(Command::NewStatus {
+                request_id: id
+                    .parse()
+                    .map_err(|_| "new-status needs a full request UUID")?,
+            })),
+            _ => Err("usage: muxel ctl new-status REQUEST_ID".into()),
+        };
+    }
     let mut words: Vec<String> = Vec::new();
     let mut full = false;
     let mut force = false;
@@ -1284,6 +1382,98 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   many agents are working / blocked / done / idle.
 - `muxel ctl panes [PROJECT]` - the pane layout and every agent in it: id, name,
   program, model, status, which pane it's in, and which one the user has focused.
+- `muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down]
+  [--focus] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]` - open a terminal in the
+  project's active group (a new tab by default). PROJECT resolves as for `panes`.
+  DIR must be an existing absolute directory; it defaults to the project root
+  and may be a linked worktree or another directory. A preset matches its name
+  or id; omitting both launch choices uses the toolbar's preset for that project.
+  `--model` and `--effort` override the preset's values for this pane, including
+  prompt launches; restarts retain the chosen arguments. Values must contain
+  1–64 characters from `[A-Za-z0-9._:/@+-]` with no leading `-`. Each override
+  requires its Model flag / Effort flag in Settings > Agents, and that flag must
+  be absent from Extra args. A flag containing `{}` emits one argument with the
+  value substituted; other flags emit flag then value. Existing presets are not
+  migrated; fill in their flag fields. Literal `-- PROGRAM` cannot use overrides.
+  New Codex presets use `--config=model_reasoning_effort={}`; existing `-c` or
+  `--config` arguments setting that key also conflict with an effort override.
+  Unsupported combinations receive `parameter_unsupported`. Parameterized
+  presets remain eligible for Allow; Ask shows the requested model and effort.
+  Everything after `--` is literal argv, including spaces, quotes and empty
+  arguments. `--prompt TEXT` sends a user task through the existing runner path;
+  `--prompt -` reads stdin. In Git Bash, set `MSYS_NO_PATHCONV=1` for leading-slash
+  prompts, or use stdin. This replaces the preset's configured system prompt
+  with the task; preset arguments are kept. The typed task stays exact.
+  Automatic instructions use the preset's separate flag/config transport when
+  available; they are omitted for TypeIn-only presets. The task is submitted
+  once and its text is discarded after first launch. Restart, restore and resume neither
+  re-type nor resubmit it, including launches without a resumable conversation.
+  Prompts for literal, shell and browser launches receive
+  `prompt_unsupported`. Creation preserves the selected tab, focus, project and
+  window by default, without raising the window. `--focus` selects the new pane
+  and activates its window. `--background` is accepted as a compatibility no-op,
+  including alongside `--focus`. JSON callers use `focus` (default false);
+  the legacy `background` field remains accepted and does not control focus.
+  Every `new` request requires outside control plus Settings > Grok Bot >
+  Outside terminal creation set to Ask or Allow. Ask requires a click for every
+  request; Allow permits configured non-shell terminal presets. All literal argv,
+  even an agent
+  executable, and shell presets/defaults additionally require "Also allow typing
+  into shell panes". Configured non-literal presets not classified as shells need
+  only the first two grants. Literal argv and shell presets always Ask, even
+  under Allow. The existing shell/non-shell classifier is a soft
+  policy for trusted configured presets, not an executable allowlist.
+  All three permissions default off; upgrades leave creation off even if both
+  older grants are on. Ask the user to enable the required settings themselves.
+  Ask returns `{ "pending": true, "request_id": "UUID" }` immediately, without
+  holding a connection. The CLI polls every second and prints the final reply.
+  Temporary connection and host-availability failures retry up to three times
+  against that same UUID; a successful pending reply resets the retry count.
+  The CLI never reissues `new`. If retries fail, its error names the UUID to
+  query with `new-status`. Uncoded status errors, including an older host's
+  uncoded timeout, also give that advice. Do not repeat `new` while the original
+  may still wait.
+  `--no-wait` prints the pending reply for scripts; use `ctl new-status UUID` to
+  poll it. Requests expire 120 seconds after admission, including time behind
+  another card. Each visible card disables both buttons for 750 ms and ignores
+  double-clicks. Mouse-down and release must belong to the same armed card.
+  The card offers click-only Allow once / Deny, keeps terminal
+  keyboard focus, and shows the waiting count in FIFO order. `--from LABEL` and
+  the caller's MUXEL_INSTANCE_ID are displayed as declared information, not
+  authenticated identity (the token is the whole authorization).
+  Final replies remain available for ten minutes, bounded to the latest 256;
+  up to 64 approvals may wait. Approvals are runtime-only and do not survive a
+  host restart. Plain creation and status requests use protocol v2; creation with
+  model or effort uses v3 so older hosts cannot silently discard the choices.
+  The host requires the exact command version, including for JSON callers.
+  Turning creation or outside control off refuses all pending requests. Outside
+  control off also stops the server, so pollers receive `host_unavailable`
+  after their connection retries rather than the recorded `control_disabled`.
+  Revocation leaves
+  existing panes, already admitted launches and
+  typing permissions unchanged. Deferred requests recheck current permission;
+  human toolbar creation is unaffected.
+  Commands run as the host muxel process with its permissions and environment,
+  outside the caller's sandbox. Coding agents and configurable presets are not
+  a security sandbox. Ask the user to grant authority; do not change settings.
+  Turning "Also allow typing into shell panes" off also refuses later control
+  writes to every raw argv pane, even agent-looking or interpreter programs, and
+  shell-classified panes. Configured non-literal agents remain controllable while
+  outside control is enabled. Disabling all outside control is a separate setting. Revocation
+  does not stop the process or undo input already delivered; queued Enter/keys
+  recheck the shell-input grant and terminal/session availability before each write.
+  The JSON reply contains `id` (short), `uuid` (full), `project`, `project_id`,
+  `cwd`, `program` and `args`. Without `--prompt`, presets and defaults keep toolbar
+  system-prompt injection (including TypeIn), resume and hooks; raw argv bypasses those and tmux.
+  Raw argv panes restore stopped. Project selection, Restart and wake never replay
+  their opening brief; the pane's explicit Run again action reruns the saved argv.
+  DIR is a launch directory, never an owned worktree; closing the pane does not
+  remove it and worktree migration does not register it.
+  On Windows raw argv requires a native executable; use `--preset` for batch
+  wrappers. Installed Codex resolves to its packaged native executable.
+  Remote projects are currently refused.
+  `new` opens terminal panes; browser presets, including a browser default, are
+  not supported yet and receive a refusal.
 - `muxel ctl status [AGENT]` - one agent's status, or every agent's.
 - `muxel ctl show AGENT [--full]` - the agent's last prompt, its last reply (the
   final message; `--full` for everything it wrote that turn), and, when it is
@@ -1308,8 +1498,17 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   writer, not confirmation of agent delivery. A lost reply does not make a
   retry safe; inspect the agent before typing again.
 - `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
-  ends (or it blocks on a question, or exits), then print what `show` prints plus
-  `wait.outcome`: finished, blocked, exited, not_running or timed_out. Default
+  ends (or it blocks on a question, or exits), then print what `show` prints.
+  Startup tasks stay pending until fresh provider-owned acceptance, not merely
+  our Enter. Codex may receive one extra Enter only while its exact task remains
+  on one exact ASCII row in its live idle editor, with no new user row. Wrapped
+  or ambiguous drafts get no retry; task text is never pasted again. A missing acceptance
+  within ten seconds, failed readiness or unsupported provider sets
+  `agent.startup_error` in show (or `startup_error` in status). Inspect the pane
+  before sending another task; do not repeat creation. Muse and other providers
+  without a verified startup protocol receive no task input.
+  The `wait.outcome` values are finished, blocked, exited, not_running,
+  submission_failed or timed_out. Default
   timeout 600 seconds.
 - `muxel ctl answer AGENT OPTION` - pick numbered option OPTION of the question
   the agent is blocked on.
@@ -1346,8 +1545,8 @@ and is left out while the agent is starting and once it has exited.
 
 ## Errors
 
-When `send`, `answer` or `keys` didn't type anything, or muxel couldn't be
-reached, the failure has a `code`:
+Creation permission/approval refusals, typing refusals from `send`, `answer` or
+`keys`, and host connection failures have a `code`:
 
 - `working`, `blocked`, `starting` - not now: `wait`, answer its question, or try
   again in a moment.
@@ -1357,6 +1556,13 @@ reached, the failure has a `code`:
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
+- `control_disabled` - outside control was turned off before the mutation.
+- `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
+- `command_permission_required` - literal argv or a shell launch needs the shell/command grant.
+- `approval_denied` - the user clicked Deny; nothing was created.
+- `approval_timeout` - no approval arrived within 120 seconds; nothing was created.
+- `prompt_unsupported` - prompts require a configured non-shell terminal preset.
+- `parameter_unsupported` - model/effort require a configured preset flag absent from Extra args; literal commands cannot use them.
 
 A failure without a code after the request went out (no answer came back) may or
 may not have been carried out: check `status`, `show` or `screen` before typing
@@ -1391,7 +1597,8 @@ also withhold Enter and return an error without a code; inspect the input first.
   on both, or one the other attached to). If `send` or `answer` says muxel on
   another computer is using the agent, don't `--force` it: `wait` on the agent
   and try again, or tell the user. Several of you may be driving the same agents.
-- This interface can't create, close or rearrange panes; the layout is the user's.
+- Create panes only when asked, using `new` within the user's granted authority.
+  This interface can't close or rearrange existing panes; the layout is the user's.
 "#;
 
 #[cfg(test)]
@@ -1636,6 +1843,7 @@ mod tests {
             status_since: None,
             launch_id: None,
             awaiting_reply: false,
+            startup_error: None,
             focused: false,
             pane: Some(1),
             worktree_branch: None,

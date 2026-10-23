@@ -889,6 +889,7 @@ fn coalesce_pending(
 pub struct TerminalView {
     instance_id: Uuid,
     session: Arc<TerminalSession>,
+    startup_turn: Option<muxel_core::control::StartupTurn>,
     focus_handle: FocusHandle,
     palette: TerminalPalette,
     font_family: SharedString,
@@ -958,6 +959,432 @@ pub struct TerminalView {
 /// cycle.
 pub type TerminalFocusObserver = fn(Uuid, bool, &mut Window, &mut App);
 
+fn with_startup_view<R>(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    action: impl FnOnce(&TerminalView) -> R,
+) -> Result<R, crate::startup::Stop> {
+    view.update(cx, |view, _| {
+        (!view.exited && Arc::ptr_eq(&view.session, session)).then(|| action(view))
+    })
+    .ok()
+    .flatten()
+    .ok_or(crate::startup::Stop::Interrupted)
+}
+
+fn claude_startup_ready(
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    blocked_markers: &[String],
+    empty: bool,
+) -> bool {
+    let Some(context) = screen.claude_composer_context(empty) else {
+        return false;
+    };
+    parse_agent_title(TitleProvider::Claude, title).and_then(|frame| frame.status)
+        != Some(AgentStatus::Working)
+        && provider_screen_status(TitleProvider::Claude, &context).is_none()
+        && !blocked_markers
+            .iter()
+            .any(|marker| !marker.is_empty() && context.contains(marker))
+}
+
+fn startup_ready(
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    blocked_markers: &[String],
+    empty: bool,
+) -> bool {
+    if provider == TitleProvider::Claude {
+        return claude_startup_ready(screen, title, blocked_markers, empty);
+    }
+    let context = match provider {
+        TitleProvider::Codex => screen.codex_composer_context(empty),
+        // Grok supports configurable/hidden prompt prefixes and multiline
+        // editors. Its semantic idle title, after its configured startup settle,
+        // is the supported admission signal; do not guess a universal glyph.
+        TitleProvider::Grok => Some(screen.text.clone()),
+        _ => return false,
+    };
+    let Some(context) = context else {
+        return false;
+    };
+    parse_agent_title(provider, title).and_then(|frame| frame.status) == Some(AgentStatus::Idle)
+        && provider_screen_status(provider, &context).is_none()
+        && (provider != TitleProvider::Codex
+            || ![
+                "Trust this folder?",
+                "Folder access",
+                "enter continue · esc quit",
+            ]
+            .iter()
+            .any(|chrome| context.contains(chrome)))
+        && !blocked_markers
+            .iter()
+            .any(|marker| !marker.is_empty() && context.contains(marker))
+}
+
+/// Starting/Waiting are useful display states but do not establish that a new
+/// user task was accepted. Do not use the sticky display status or our CR marker.
+fn startup_title_working(provider: TitleProvider, title: Option<&str>) -> bool {
+    if parse_agent_title(provider, title).and_then(|frame| frame.status)
+        != Some(AgentStatus::Working)
+    {
+        return false;
+    }
+    if provider == TitleProvider::Codex {
+        let Some((_, state)) = title.and_then(|title| title.rsplit_once(" | ")) else {
+            return false;
+        };
+        return matches!(
+            state
+                .split_whitespace()
+                .next()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("working" | "thinking")
+        );
+    }
+    true
+}
+
+fn startup_draft_matches(
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+    input: &str,
+) -> bool {
+    match provider {
+        TitleProvider::Claude => screen.claude_draft_matches(input),
+        TitleProvider::Codex => screen.codex_draft_matches(input),
+        _ => false,
+    }
+}
+
+fn startup_empty_composer(provider: TitleProvider, screen: &crate::startup::Screen) -> bool {
+    match provider {
+        TitleProvider::Claude => screen.claude_composer_context(true).is_some(),
+        TitleProvider::Codex => screen.codex_composer_context(true).is_some(),
+        _ => false,
+    }
+}
+
+struct StartupAttempt<'a> {
+    provider: TitleProvider,
+    input: &'a str,
+    expected_input: String,
+    before_title: u64,
+    before_prompt: Option<String>,
+    instance_id: Uuid,
+}
+
+fn startup_has_fresh_user_row(attempt: &StartupAttempt<'_>, prompt: Option<&str>) -> bool {
+    prompt.is_some_and(|prompt| {
+        crate::startup::normalized(prompt) == attempt.expected_input
+            && attempt.before_prompt.as_deref() != Some(attempt.expected_input.as_str())
+    })
+}
+
+fn startup_retry_allowed(
+    attempt: &StartupAttempt<'_>,
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    blocked_markers: &[String],
+    prompt: Option<&str>,
+) -> bool {
+    attempt.provider == TitleProvider::Codex
+        && !startup_has_fresh_user_row(attempt, prompt)
+        && screen.codex_exact_retry_draft(attempt.input)
+        && startup_ready(attempt.provider, screen, title, blocked_markers, false)
+}
+
+fn startup_provider_accepted(
+    attempt: &StartupAttempt<'_>,
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    title_generation: u64,
+    prompt: Option<&str>,
+) -> bool {
+    if startup_draft_matches(attempt.provider, screen, attempt.input) {
+        return false;
+    }
+    let fresh_user_row = startup_has_fresh_user_row(attempt, prompt)
+        && startup_empty_composer(attempt.provider, screen);
+    fresh_user_row
+        || (title_generation != attempt.before_title
+            && startup_title_working(attempt.provider, title))
+}
+
+/// The provider title a controller task's startup judges, with its change
+/// generation: a tmux-wrapped pane's title read through tmux, else the PTY's own.
+fn startup_title(
+    session: &TerminalSession,
+    probe: Option<&crate::startup::TitleProbe>,
+) -> (u64, Option<String>) {
+    match probe {
+        Some(probe) => probe.snapshot(),
+        None => session.title_snapshot(),
+    }
+}
+
+async fn confirm_startup_submission(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    guard: &mut crate::startup::Guard,
+    armed_at: Instant,
+    attempt: &StartupAttempt<'_>,
+    probe: Option<&crate::startup::TitleProbe>,
+) -> Result<(), crate::startup::Stop> {
+    use crate::startup::{Acceptance, AcceptanceAction};
+    let mut acceptance = Acceptance::default();
+    let started = Instant::now();
+    loop {
+        let (accepted, retryable) = with_startup_view(view, session, cx, |view| {
+            guard.check(armed_at.elapsed(), session.input_rev())?;
+            let (generation, title) = startup_title(session, probe);
+            let screen = session.startup_screen();
+            let history = session.recent_text(500);
+            let prompt = muxel_core::readaloud::prompt_from_screen(&history);
+            let accepted = startup_provider_accepted(
+                attempt,
+                &screen,
+                title.as_deref(),
+                generation,
+                prompt.as_deref(),
+            );
+            // Grok can restore a previously stashed draft after accepting a
+            // task. Its retained text is not a safe Enter-retry predicate.
+            let retryable = startup_retry_allowed(
+                attempt,
+                &screen,
+                title.as_deref(),
+                &view.blocked_markers,
+                prompt.as_deref(),
+            );
+            Ok::<_, crate::startup::Stop>((accepted, retryable))
+        })??;
+        match acceptance.observe(started.elapsed(), accepted, retryable) {
+            AcceptanceAction::Accepted => {
+                guard.submitted(startup_now_ms());
+                return Ok(());
+            }
+            AcceptanceAction::RetryEnter => {
+                // Recheck session, ownership and input revision on admission;
+                // never re-paste the task or retry an ambiguous provider.
+                write_startup_input(view, session, cx, guard, armed_at, true, |session| {
+                    session.try_submit_input(b"\r")
+                })?;
+                profile::startup_event(
+                    attempt.instance_id,
+                    "codex",
+                    "automation-enter-retry",
+                    armed_at.elapsed(),
+                    1,
+                );
+            }
+            AcceptanceAction::Failed => {
+                guard.fail(crate::startup::Stop::NotAccepted);
+                return Err(crate::startup::Stop::NotAccepted);
+            }
+            AcceptanceAction::Observe => {}
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+    }
+}
+
+const STARTUP_POLL_MS: u64 = 100;
+const STARTUP_SETTLE_MS: u128 = 2000;
+const STARTUP_MAX_WAIT_MS: u64 = 30_000;
+const STARTUP_KEY_GAP_MS: u64 = 150;
+const STARTUP_PRE_TYPE_MS: u64 = 300;
+// The prompt is typed in one burst; wait before the submit Enter so the agent
+// has finished ingesting the text and treats it as a deliberate submit rather
+// than a newline within a paste.
+const STARTUP_SUBMIT_DELAY_MS: u64 = 400;
+/// How long a controller task keeps checking for a ready composer after the
+/// settle cap and its own fixed pauses, before it reports `NotReady`.
+const STARTUP_READY_GRACE_MS: u64 = 5_000;
+/// How often a tmux-wrapped controller task reads its pane title through tmux.
+const STARTUP_TITLE_POLL_MS: u64 = 250;
+const SHIFT_TAB: &[u8] = b"\x1b[Z";
+
+/// A controller task's readiness deadline. The settle loop may use its whole
+/// cap (a UI that never goes quiet) and the configured delay; the auto-mode
+/// keys, the pre-type and pre-submit pauses that follow, and one readiness
+/// window must still fit, or a slow UI would always be refused at its write.
+fn controlled_startup_deadline(startup_delay_ms: u32, auto_mode_presses: u8) -> Duration {
+    let keys = match auto_mode_presses {
+        0 => 0,
+        presses => (u64::from(presses) + 1) * STARTUP_KEY_GAP_MS,
+    };
+    Duration::from_millis(
+        STARTUP_MAX_WAIT_MS
+            + u64::from(startup_delay_ms)
+            + keys
+            + STARTUP_PRE_TYPE_MS
+            + STARTUP_SUBMIT_DELAY_MS
+            + STARTUP_READY_GRACE_MS,
+    )
+}
+
+/// The terminal side of [`quiet_startup`], so its timing can be tested
+/// without a PTY.
+trait QuietStartupTarget {
+    fn has_output(&self) -> bool;
+    fn idle_for(&self) -> Duration;
+    fn write_input(&self, data: &[u8]);
+    fn paste(&self, text: &str);
+    fn mark_turn_submitted(&self);
+}
+
+impl QuietStartupTarget for TerminalSession {
+    fn has_output(&self) -> bool {
+        TerminalSession::has_output(self)
+    }
+    fn idle_for(&self) -> Duration {
+        TerminalSession::idle_for(self)
+    }
+    fn write_input(&self, data: &[u8]) {
+        TerminalSession::write_input(self, data)
+    }
+    fn paste(&self, text: &str) {
+        TerminalSession::paste(self, text)
+    }
+    fn mark_turn_submitted(&self) {
+        TerminalSession::mark_turn_submitted(self)
+    }
+}
+
+struct QuietStartup {
+    input: Option<String>,
+    auto_mode_presses: u8,
+    startup_delay_ms: u32,
+    submit: bool,
+}
+
+/// Startup automation for runners, TypeIn presets and loops — everything but a
+/// controller task, which has its own verified protocol.
+///
+/// "Ready" = the child has produced output AND has then been quiet for
+/// SETTLE_MS. This adapts to slow starters (e.g. opencode, whose first output —
+/// clearing the screen — comes early but whose input box only appears seconds
+/// later, once it stops emitting): we wait for the load output to actually stop,
+/// not a guessed delay. SETTLE_MS is generous so a brief pause mid-load isn't
+/// mistaken for ready. Capped by MAX_WAIT in case a UI never goes quiet: the
+/// input is still typed at the cap. No provider title or composer is required,
+/// so this works the same under tmux, for any agent and any Codex footer.
+async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Output = ()>>(
+    target: &T,
+    mut timer: impl FnMut(u64) -> F,
+    plan: QuietStartup,
+    mut event: impl FnMut(&'static str, usize),
+) {
+    // Wait for the agent's first output (it has started up).
+    let mut waited = 0u64;
+    while !target.has_output() && waited < STARTUP_MAX_WAIT_MS {
+        timer(STARTUP_POLL_MS).await;
+        waited += STARTUP_POLL_MS;
+    }
+    event("automation-first-output", 0);
+    if plan.startup_delay_ms > 0 {
+        // Preset-configured fixed delay after first output — for agents that
+        // keep loading well past their first draw (e.g. opencode).
+        timer(plan.startup_delay_ms as u64).await;
+    } else {
+        // Auto: wait until output goes quiet (UI finished drawing).
+        while waited < STARTUP_MAX_WAIT_MS && target.idle_for().as_millis() < STARTUP_SETTLE_MS {
+            timer(STARTUP_POLL_MS).await;
+            waited += STARTUP_POLL_MS;
+        }
+    }
+    event("automation-settled", 0);
+    for _ in 0..plan.auto_mode_presses {
+        target.write_input(SHIFT_TAB);
+        timer(STARTUP_KEY_GAP_MS).await;
+    }
+    // Confirm the mode switch with a single Enter.
+    if plan.auto_mode_presses > 0 {
+        target.write_input(b"\r");
+        timer(STARTUP_KEY_GAP_MS).await;
+    }
+    if let Some(input) = plan.input {
+        timer(STARTUP_PRE_TYPE_MS).await;
+        target.paste(&input);
+        event("automation-pasted", input.len());
+        // On restore, leave the prompt typed but unsubmitted.
+        if plan.submit {
+            timer(STARTUP_SUBMIT_DELAY_MS).await;
+            target.mark_turn_submitted();
+            target.write_input(b"\r");
+            event("automation-submitted", 1);
+        }
+    }
+}
+
+fn startup_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+async fn wait_startup_composer(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    guard: &mut crate::startup::Guard,
+    armed_at: Instant,
+    empty: bool,
+    probe: Option<&crate::startup::TitleProbe>,
+) -> Result<(), crate::startup::Stop> {
+    loop {
+        let ready = with_startup_view(view, session, cx, |view| {
+            let screen = session.startup_screen();
+            let title = startup_title(session, probe).1;
+            guard.ready(
+                armed_at.elapsed(),
+                session.input_rev(),
+                startup_ready(
+                    view.title_provider,
+                    &screen,
+                    title.as_deref(),
+                    &view.blocked_markers,
+                    empty,
+                ),
+            )
+        })??;
+        if ready {
+            return Ok(());
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+    }
+}
+
+fn write_startup_input(
+    view: &WeakEntity<TerminalView>,
+    session: &Arc<TerminalSession>,
+    cx: &mut AsyncApp,
+    guard: &mut crate::startup::Guard,
+    armed_at: Instant,
+    submit: bool,
+    write: impl FnOnce(&TerminalSession) -> std::io::Result<()>,
+) -> Result<(), crate::startup::Stop> {
+    with_startup_view(view, session, cx, |_| {
+        let admitted_at = startup_now_ms();
+        guard.write(armed_at.elapsed(), session.input_rev(), || write(session))?;
+        if submit {
+            guard.enter_admitted(admitted_at);
+        }
+        Ok(())
+    })?
+}
+
 /// Why the drain loop most recently notified GPUI to request a redraw.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalNotifyCause {
@@ -979,6 +1406,9 @@ pub struct TerminalFocusProfile {
 
 impl Drop for TerminalView {
     fn drop(&mut self) {
+        if let Some(startup) = &self.startup_turn {
+            startup.cancel();
+        }
         profile::pane_closed(self.instance_id);
     }
 }
@@ -1006,9 +1436,10 @@ struct DrainTransport {
 
 impl TerminalLaunch {
     /// Spawn `spec` at `size` (`(cols, rows)`); if it can't be launched (e.g. the
-    /// agent isn't installed), fall back to a shell that prints the error. `Err` only
-    /// when even the fallback shell can't spawn (bogus `$SHELL` and no `/bin/bash`,
-    /// fd exhaustion, …).
+    /// agent isn't installed), fall back to a shell that prints the error. Literal
+    /// commands and outside-created panes surface their error without replacing
+    /// the program. Other launches return `Err` only when even the fallback shell
+    /// can't spawn.
     ///
     /// `size` should be the grid the pane will actually render at — see
     /// [`TerminalSession::size`]. Getting it right up front is what keeps a
@@ -1042,6 +1473,7 @@ impl TerminalLaunch {
                 rx,
                 launch_error: None,
             }),
+            Err(e) if spec.literal_argv || !spec.allow_shell_fallback => Err(e),
             Err(e) => {
                 // Capture the full error (incl. the OS code) for the dev console.
                 let launch_error = format!("{e:#}");
@@ -1179,6 +1611,11 @@ impl TerminalView {
             launch_error,
         } = launch;
         let startup_input = spec.startup_input.clone();
+        let startup_owner = spec.startup_turn.clone();
+        let title_source = spec.title_source.clone();
+        let startup_turn = startup_owner
+            .as_ref()
+            .map(muxel_core::control::StartupTurnOwner::signal);
         let auto_mode_presses = spec.auto_mode_presses;
         let startup_delay_ms = spec.startup_delay_ms;
         let submit = spec.submit;
@@ -1223,13 +1660,10 @@ impl TerminalView {
         // ready, optionally send Shift+Tab a few times to reach auto-accept mode,
         // press Enter to confirm it, then type the prompt and press Enter.
         //
-        // "Ready" = the child has produced output AND has then been quiet for
-        // SETTLE_MS. This adapts to slow starters (e.g. opencode, whose first
-        // output — clearing the screen — comes early but whose input box only
-        // appears seconds later, once it stops emitting): we wait for the load
-        // output to actually stop, not a guessed delay. SETTLE_MS is generous so
-        // a brief pause mid-load isn't mistaken for ready. Capped by MAX_WAIT in
-        // case a UI never goes quiet.
+        // Runners, TypeIn presets and loops keep the quiet-then-type behavior
+        // ([`quiet_startup`]). A controller task (`ctl new --prompt`) instead
+        // needs its provider's verified composer, then independent acceptance:
+        // silence is not an editable composer.
         if let Some(input) = startup_input.as_ref() {
             profile::startup_event(
                 instance_id,
@@ -1239,85 +1673,239 @@ impl TerminalView {
                 input.len(),
             );
         }
-        if auto_mode_presses > 0 || startup_input.is_some() {
-            const POLL_MS: u64 = 100;
-            const SETTLE_MS: u128 = 2000;
-            const MAX_WAIT_MS: u64 = 30_000;
-            const KEY_GAP_MS: u64 = 150;
-            const PRE_TYPE_MS: u64 = 300;
-            // The prompt is typed in one burst; wait before the submit Enter so
-            // the agent has finished ingesting the text and treats it as a
-            // deliberate submit rather than a newline within a paste.
-            const SUBMIT_DELAY_MS: u64 = 400;
-            const SHIFT_TAB: &[u8] = b"\x1b[Z";
+        if (auto_mode_presses > 0 || startup_input.is_some())
+            && let Some(owner) = startup_owner.clone()
+        {
             let session = session.clone();
             let automation_program = startup_program.clone();
-            cx.spawn(async move |_view: WeakEntity<Self>, cx| {
-                let timer = |ms| cx.background_executor().timer(Duration::from_millis(ms));
-                // Wait for the agent's first output (it has started up).
-                let mut waited = 0u64;
-                while !session.has_output() && waited < MAX_WAIT_MS {
-                    timer(POLL_MS).await;
-                    waited += POLL_MS;
-                }
-                profile::startup_event(
-                    instance_id,
-                    &automation_program,
-                    "automation-first-output",
-                    startup_started.elapsed(),
-                    0,
-                );
-                if startup_delay_ms > 0 {
-                    // Preset-configured fixed delay after first output — for agents
-                    // that keep loading well past their first draw (e.g. opencode).
-                    timer(startup_delay_ms as u64).await;
-                } else {
-                    // Auto: wait until output goes quiet (UI finished drawing).
-                    while waited < MAX_WAIT_MS && session.idle_for().as_millis() < SETTLE_MS {
-                        timer(POLL_MS).await;
-                        waited += POLL_MS;
+            let known_provider = title_provider != TitleProvider::Other;
+            let framed_readiness =
+                matches!(title_provider, TitleProvider::Claude | TitleProvider::Codex);
+            let armed_at = Instant::now();
+            let deadline = controlled_startup_deadline(startup_delay_ms, auto_mode_presses);
+            let mut guard = crate::startup::Guard::new(session.input_rev(), Some(deadline))
+                .with_control_turn(Some(owner));
+            // Only a task that is still waiting pays for reading the title
+            // through tmux, and only until its startup settles either way.
+            let probe = title_source.map(|source| {
+                crate::startup::TitleProbe::spawn(
+                    source,
+                    Duration::from_millis(STARTUP_TITLE_POLL_MS),
+                    deadline + crate::startup::ACCEPTANCE_WINDOW + Duration::from_secs(5),
+                )
+            });
+            cx.spawn(async move |view: WeakEntity<Self>, cx| {
+                let probe = probe.as_ref();
+                let result: Result<(), crate::startup::Stop> = async {
+                    if !known_provider {
+                        guard.fail(crate::startup::Stop::UnsupportedProvider);
+                        return Err(crate::startup::Stop::UnsupportedProvider);
                     }
-                }
-                profile::startup_event(
-                    instance_id,
-                    &automation_program,
-                    "automation-settled",
-                    startup_started.elapsed(),
-                    0,
-                );
-                for _ in 0..auto_mode_presses {
-                    session.write_input(SHIFT_TAB);
-                    timer(KEY_GAP_MS).await;
-                }
-                // Confirm the mode switch with a single Enter.
-                if auto_mode_presses > 0 {
-                    session.write_input(b"\r");
-                    timer(KEY_GAP_MS).await;
-                }
-                if let Some(input) = startup_input {
-                    timer(PRE_TYPE_MS).await;
-                    session.paste(&input);
+                    // Wait for the agent's first output (it has started up).
+                    let mut waited = 0u64;
+                    loop {
+                        let has_output = with_startup_view(&view, &session, cx, |_| {
+                            guard.check(armed_at.elapsed(), session.input_rev())?;
+                            Ok::<_, crate::startup::Stop>(session.has_output())
+                        })??;
+                        if has_output || waited >= STARTUP_MAX_WAIT_MS {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(STARTUP_POLL_MS))
+                            .await;
+                        waited += STARTUP_POLL_MS;
+                    }
                     profile::startup_event(
                         instance_id,
                         &automation_program,
-                        "automation-pasted",
+                        "automation-first-output",
                         startup_started.elapsed(),
-                        input.len(),
+                        0,
                     );
-                    // On restore, leave the prompt typed but unsubmitted.
-                    if submit {
-                        timer(SUBMIT_DELAY_MS).await;
-                        session.mark_turn_submitted();
-                        session.write_input(b"\r");
+                    if startup_delay_ms > 0 {
+                        // Preset-configured fixed delay after first output — for agents
+                        // that keep loading well past their first draw (e.g. opencode).
+                        cx.background_executor()
+                            .timer(Duration::from_millis(startup_delay_ms as u64))
+                            .await;
+                    } else if !framed_readiness {
+                        // Auto: wait until output goes quiet (UI finished drawing).
+                        while waited < STARTUP_MAX_WAIT_MS
+                            && session.idle_for().as_millis() < STARTUP_SETTLE_MS
+                        {
+                            with_startup_view(&view, &session, cx, |_| {
+                                guard.check(armed_at.elapsed(), session.input_rev())
+                            })??;
+                            cx.background_executor()
+                                .timer(Duration::from_millis(STARTUP_POLL_MS))
+                                .await;
+                            waited += STARTUP_POLL_MS;
+                        }
+                    }
+                    wait_startup_composer(&view, &session, cx, &mut guard, armed_at, true, probe)
+                        .await?;
+                    profile::startup_event(
+                        instance_id,
+                        &automation_program,
+                        "automation-settled",
+                        startup_started.elapsed(),
+                        0,
+                    );
+                    for _ in 0..auto_mode_presses {
+                        write_startup_input(
+                            &view,
+                            &session,
+                            cx,
+                            &mut guard,
+                            armed_at,
+                            false,
+                            |session| session.try_write_input(SHIFT_TAB),
+                        )?;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(STARTUP_KEY_GAP_MS))
+                            .await;
+                    }
+                    // Confirm the mode switch with a single Enter.
+                    if auto_mode_presses > 0 {
+                        write_startup_input(
+                            &view,
+                            &session,
+                            cx,
+                            &mut guard,
+                            armed_at,
+                            false,
+                            |session| session.try_write_input(b"\r"),
+                        )?;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(STARTUP_KEY_GAP_MS))
+                            .await;
+                    }
+                    if let Some(input) = startup_input {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(STARTUP_PRE_TYPE_MS))
+                            .await;
+                        guard.reset_ready();
+                        wait_startup_composer(
+                            &view, &session, cx, &mut guard, armed_at, true, probe,
+                        )
+                        .await?;
+                        write_startup_input(
+                            &view,
+                            &session,
+                            cx,
+                            &mut guard,
+                            armed_at,
+                            false,
+                            |session| session.try_paste(&input),
+                        )?;
                         profile::startup_event(
                             instance_id,
                             &automation_program,
-                            "automation-submitted",
+                            "automation-pasted",
                             startup_started.elapsed(),
-                            1,
+                            input.len(),
                         );
+                        // On restore, leave the prompt typed but unsubmitted.
+                        if submit {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(STARTUP_SUBMIT_DELAY_MS))
+                                .await;
+                            guard.reset_ready();
+                            wait_startup_composer(
+                                &view, &session, cx, &mut guard, armed_at, false, probe,
+                            )
+                            .await?;
+                            let attempt = StartupAttempt {
+                                provider: title_provider,
+                                input: &input,
+                                expected_input: crate::startup::normalized(&input),
+                                before_title: startup_title(&session, probe).0,
+                                before_prompt: muxel_core::readaloud::prompt_from_screen(
+                                    &session.recent_text(500),
+                                )
+                                .map(|prompt| crate::startup::normalized(&prompt)),
+                                instance_id,
+                            };
+                            write_startup_input(
+                                &view,
+                                &session,
+                                cx,
+                                &mut guard,
+                                armed_at,
+                                true,
+                                |session| session.try_submit_input(b"\r"),
+                            )?;
+                            profile::startup_event(
+                                instance_id,
+                                &automation_program,
+                                "automation-enter-admitted",
+                                startup_started.elapsed(),
+                                1,
+                            );
+                            confirm_startup_submission(
+                                &view, &session, cx, &mut guard, armed_at, &attempt, probe,
+                            )
+                            .await?;
+                            profile::startup_event(
+                                instance_id,
+                                &automation_program,
+                                "automation-submitted",
+                                startup_started.elapsed(),
+                                0,
+                            );
+                        }
                     }
+                    Ok(())
                 }
+                .await;
+                if let Err(reason) = result {
+                    let phase = match reason {
+                        crate::startup::Stop::Interrupted => "automation-interrupted",
+                        crate::startup::Stop::NotReady => "automation-not-ready",
+                        crate::startup::Stop::NotAccepted => "automation-not-accepted",
+                        crate::startup::Stop::UnsupportedProvider => {
+                            "automation-unsupported-provider"
+                        }
+                        crate::startup::Stop::WriteFailed => "automation-write-failed",
+                    };
+                    profile::startup_event(
+                        instance_id,
+                        &automation_program,
+                        phase,
+                        startup_started.elapsed(),
+                        0,
+                    );
+                    log::warn!("terminal startup automation stopped: {reason:?}");
+                }
+            })
+            .detach();
+        } else if auto_mode_presses > 0 || startup_input.is_some() {
+            let session = session.clone();
+            let automation_program = startup_program.clone();
+            let plan = QuietStartup {
+                input: startup_input,
+                auto_mode_presses,
+                startup_delay_ms,
+                submit,
+            };
+            cx.spawn(async move |_view: WeakEntity<Self>, cx| {
+                let executor = cx.background_executor().clone();
+                quiet_startup(
+                    &*session,
+                    |ms| executor.timer(Duration::from_millis(ms)),
+                    plan,
+                    |phase, bytes| {
+                        profile::startup_event(
+                            instance_id,
+                            &automation_program,
+                            phase,
+                            startup_started.elapsed(),
+                            bytes,
+                        )
+                    },
+                )
+                .await;
             })
             .detach();
         }
@@ -1458,6 +2046,7 @@ impl TerminalView {
         Self {
             instance_id,
             session,
+            startup_turn,
             focus_handle,
             palette: TerminalPalette::default(),
             font_family: SharedString::default(),
@@ -1981,6 +2570,68 @@ mod launch_identity_tests {
     use uuid::Uuid;
 
     #[test]
+    fn outside_startup_launch_failure_refuses_a_real_fallback_and_cancels_its_task() {
+        use muxel_core::control::{StartupTurn, StartupTurnState};
+        for allow_fallback in [true, false] {
+            let marker = std::env::temp_dir().join(format!("muxel-fallback-{}", Uuid::new_v4()));
+            #[cfg(windows)]
+            let fallback = CommandSpec::program(
+                "powershell.exe",
+                vec![
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    format!(
+                        "[System.IO.File]::WriteAllText('{}', 'fallback')",
+                        marker.display().to_string().replace('\'', "''")
+                    ),
+                ],
+            );
+            #[cfg(not(windows))]
+            let fallback = CommandSpec::program(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    "printf fallback > \"$1\"".into(),
+                    "muxel-test".into(),
+                    marker.display().to_string(),
+                ],
+            );
+            let signal = StartupTurn::default();
+            let mut requested = CommandSpec::program(
+                std::env::temp_dir()
+                    .join(format!("muxel-missing-{}.exe", Uuid::new_v4()))
+                    .display()
+                    .to_string(),
+                vec![],
+            );
+            requested.allow_shell_fallback = allow_fallback;
+            if !allow_fallback {
+                requested.startup_turn = signal.claim();
+            }
+            let result = TerminalLaunch::spawn_with_fallback(requested, fallback, (80, 24), None);
+            if allow_fallback {
+                let launch = result.expect("ordinary UI preset retains its fallback");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while !marker.is_file() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                launch.session.kill();
+                assert!(marker.is_file(), "the injected fallback must really run");
+                std::fs::remove_file(&marker).unwrap();
+            } else {
+                assert!(
+                    result.is_err(),
+                    "outside-approved program failure must surface"
+                );
+                assert!(!marker.exists(), "no replacement shell may execute");
+                assert_eq!(signal.state(), StartupTurnState::Cancelled);
+            }
+        }
+    }
+
+    #[test]
     fn failed_launch_fallback_has_own_identity() {
         const CHILD: &str = "MUXEL_FALLBACK_ID_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -2091,6 +2742,28 @@ mod launch_identity_tests {
     }
 }
 
+#[cfg(test)]
+mod literal_launch_tests {
+    use super::TerminalLaunch;
+    use crate::session::CommandSpec;
+
+    #[test]
+    fn literal_failure_never_substitutes_a_fallback_program() {
+        let missing =
+            std::env::temp_dir().join(format!("muxel-missing-{}.exe", uuid::Uuid::new_v4()));
+        let fallback = CommandSpec::program(missing.display().to_string(), vec![]);
+        let literal =
+            CommandSpec::literal(missing.display().to_string(), vec!["opening brief".into()]);
+        let error = TerminalLaunch::spawn_with_fallback(literal, fallback, (80, 24), None)
+            .err()
+            .expect("literal launch must fail");
+        assert!(
+            !format!("{error:#}").contains("fallback shell"),
+            "{error:#}"
+        );
+    }
+}
+
 // Existing launch smoke tests use Unix programs.
 #[cfg(all(test, unix))]
 mod launch_tests {
@@ -2126,6 +2799,585 @@ mod launch_tests {
             .expect("spawn cat");
         assert!(launch.launch_error().is_none());
         launch.session.kill();
+    }
+}
+
+/// A controller task in a real tmux pane, on a throwaway socket no muxel
+/// profile uses. Skipped where tmux isn't installed.
+#[cfg(all(test, unix))]
+mod tmux_startup_tests {
+    use super::{TitleProvider, startup_ready};
+    use crate::session::{CommandSpec, PtyChunk, TerminalSession};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A stand-in for Codex's idle editor: its Ready title, bracketed paste, a
+    /// visible cursor at the empty prompt and a non-GPT model status line.
+    const FAKE_CODEX: &str = r#"printf '\033]2;scratch | Ready\033\\'
+printf '\033[?2004h\033[2J\033[HOpenAI Codex\r\n› Ask Codex to do anything\r\n\r\n'
+printf '  o4-mini medium · scratch\033[2;3H\033[?25h'
+sleep 30
+"#;
+
+    struct Server {
+        socket: String,
+        dir: std::path::PathBuf,
+    }
+
+    impl Server {
+        fn tmux(&self) -> Command {
+            let mut tmux = Command::new("tmux");
+            tmux.args(["-L", &self.socket, "-f", "/dev/null"])
+                .env_remove("TMUX");
+            tmux
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let path = self
+                .tmux()
+                .args(["display-message", "-p", "#{socket_path}"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+                .filter(|path| path.ends_with(&self.socket));
+            let _ = self.tmux().arg("kill-server").output();
+            if let Some(path) = path {
+                let _ = std::fs::remove_file(path);
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn a_tmux_wrapped_codex_is_ready_only_through_its_tmux_pane_title() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux is not installed; skipping");
+            return;
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let server = Server {
+            socket: format!("mxltest-{id}"),
+            dir: std::env::temp_dir().join(format!("muxel-tmux-startup-{id}")),
+        };
+        std::fs::create_dir_all(&server.dir).unwrap();
+        let script = server.dir.join("codex.sh");
+        std::fs::write(&script, FAKE_CODEX).unwrap();
+        let name = format!("muxel_startup_{}", &id[..8]);
+        let mut args: Vec<String> = ["-L", &server.socket, "-f", "/dev/null"]
+            .map(String::from)
+            .into();
+        args.extend(["new-session", "-A", "-s", &name, "--", "sh"].map(String::from));
+        args.push(script.display().to_string());
+        let mut spec = CommandSpec::program("tmux", args);
+        spec.env_remove.push("TMUX".into());
+        let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn tmux client");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let screen = loop {
+            while let Ok(chunk) = rx.try_recv() {
+                if let PtyChunk::Output(bytes) = chunk {
+                    session.process_output(&bytes);
+                }
+            }
+            let screen = session.startup_screen();
+            if screen.codex_composer_context(true).is_some() {
+                break screen;
+            }
+            if Instant::now() >= deadline {
+                session.kill();
+                panic!("the tmux client never showed the editor: {:?}", screen.text);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // tmux forwards the editor, its cursor and bracketed paste, but not the
+        // program's title: from the PTY alone, Codex could never become ready.
+        assert_ne!(session.title().as_deref(), Some("scratch | Ready"));
+        assert!(!startup_ready(
+            TitleProvider::Codex,
+            &screen,
+            session.title().as_deref(),
+            &[],
+            true
+        ));
+        // Read through tmux, as a controller task's probe reads it, it is.
+        let (socket, target) = (server.socket.clone(), name.clone());
+        let probe = crate::startup::TitleProbe::spawn(
+            crate::TitleSource::new(move || {
+                let out = Command::new("tmux")
+                    .args(["-L", &socket, "-f", "/dev/null"])
+                    .args(muxel_core::tmux::pane_title_args(&target))
+                    .env_remove("TMUX")
+                    .output()
+                    .ok()?;
+                muxel_core::tmux::parse_pane_title(&target, &String::from_utf8_lossy(&out.stdout))
+            }),
+            Duration::from_millis(50),
+            Duration::from_secs(20),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while probe.snapshot().1.as_deref() != Some("scratch | Ready") {
+            if Instant::now() >= deadline {
+                session.kill();
+                panic!("tmux never reported the title: {:?}", probe.snapshot());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(startup_ready(
+            TitleProvider::Codex,
+            &screen,
+            probe.snapshot().1.as_deref(),
+            &[],
+            true
+        ));
+        drop(probe);
+        session.kill();
+    }
+}
+
+#[cfg(test)]
+mod startup_readiness_tests {
+    use super::{
+        QuietStartup, QuietStartupTarget, SHIFT_TAB, STARTUP_KEY_GAP_MS, STARTUP_MAX_WAIT_MS,
+        STARTUP_PRE_TYPE_MS, STARTUP_SUBMIT_DELAY_MS, StartupAttempt, TitleProvider,
+        claude_startup_ready, controlled_startup_deadline, quiet_startup,
+        startup_provider_accepted, startup_ready, startup_retry_allowed,
+    };
+    use crate::startup::Screen;
+
+    fn codex_screen(draft: &str) -> Screen {
+        Screen {
+            // Codex 0.163's passive status line replaces the shortcut hint,
+            // including in the empty editor; drafts hide that hint as well.
+            text: format!(
+                "OpenAI Codex\n› {draft}\n\n  gpt-5.4 high fast · scratch · Context 0% used\n  ⚠ 1 · f2"
+            ),
+            cursor_row: 1,
+            cursor_column: if draft == "Ask Codex to do anything" {
+                2
+            } else {
+                draft.chars().count() + 2
+            },
+            cursor_visible: true,
+            bracketed_paste: true,
+        }
+    }
+
+    struct FakeUi {
+        clock: std::rc::Rc<std::cell::Cell<u64>>,
+        output_at: Option<u64>,
+        never_quiet: bool,
+        writes: std::cell::RefCell<Vec<(u64, Vec<u8>)>>,
+        submitted: std::cell::Cell<bool>,
+    }
+
+    impl QuietStartupTarget for FakeUi {
+        fn has_output(&self) -> bool {
+            self.output_at.is_some_and(|at| self.clock.get() >= at)
+        }
+        fn idle_for(&self) -> std::time::Duration {
+            match self.output_at {
+                Some(at) if !self.never_quiet => {
+                    std::time::Duration::from_millis(self.clock.get().saturating_sub(at))
+                }
+                _ => std::time::Duration::ZERO,
+            }
+        }
+        fn write_input(&self, data: &[u8]) {
+            self.writes
+                .borrow_mut()
+                .push((self.clock.get(), data.to_vec()));
+        }
+        fn paste(&self, text: &str) {
+            self.write_input(text.as_bytes());
+        }
+        fn mark_turn_submitted(&self) {
+            self.submitted.set(true);
+        }
+    }
+
+    /// Run a future whose timers are all already elapsed (the fake clock).
+    fn run_now<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => panic!("fake timers never wait"),
+        }
+    }
+
+    /// Timed writes, whether a turn was submitted, and the profile phases.
+    type QuietRun = (Vec<(u64, Vec<u8>)>, bool, Vec<&'static str>);
+
+    fn quiet_run(output_at: Option<u64>, never_quiet: bool, presses: u8, delay: u32) -> QuietRun {
+        let clock = std::rc::Rc::new(std::cell::Cell::new(0));
+        let ui = FakeUi {
+            clock: clock.clone(),
+            output_at,
+            never_quiet,
+            writes: Default::default(),
+            submitted: Default::default(),
+        };
+        let mut events = Vec::new();
+        run_now(quiet_startup(
+            &ui,
+            |ms| {
+                clock.set(clock.get() + ms);
+                std::future::ready(())
+            },
+            QuietStartup {
+                input: Some("review the diff".into()),
+                auto_mode_presses: presses,
+                startup_delay_ms: delay,
+                submit: true,
+            },
+            |phase, _| events.push(phase),
+        ));
+        (ui.writes.into_inner(), ui.submitted.get(), events)
+    }
+
+    #[test]
+    fn runner_automation_types_at_the_cap_without_any_provider_evidence() {
+        // No title, no composer, no tmux pane title: runners, TypeIn presets and
+        // loops never wait on provider evidence. A UI that never goes quiet, or
+        // never prints, still gets its task typed and submitted at the cap.
+        for output_at in [Some(500), None] {
+            let (writes, submitted, events) = quiet_run(output_at, true, 0, 0);
+            assert_eq!(
+                writes,
+                [
+                    (
+                        STARTUP_MAX_WAIT_MS + STARTUP_PRE_TYPE_MS,
+                        b"review the diff".to_vec()
+                    ),
+                    (
+                        STARTUP_MAX_WAIT_MS + STARTUP_PRE_TYPE_MS + STARTUP_SUBMIT_DELAY_MS,
+                        b"\r".to_vec()
+                    ),
+                ]
+            );
+            assert!(submitted);
+            assert_eq!(
+                events,
+                [
+                    "automation-first-output",
+                    "automation-settled",
+                    "automation-pasted",
+                    "automation-submitted"
+                ]
+            );
+        }
+        // A UI that goes quiet is typed into once it has been quiet long enough.
+        let (writes, _, _) = quiet_run(Some(1000), false, 0, 0);
+        assert_eq!(writes[0].0, 1000 + 2000 + STARTUP_PRE_TYPE_MS);
+        // Auto mode, then the configured delay instead of the quiet wait.
+        let (writes, _, _) = quiet_run(Some(1000), true, 2, 4000);
+        let sent: Vec<_> = writes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        assert_eq!(
+            sent,
+            [SHIFT_TAB, SHIFT_TAB, b"\r", b"review the diff", b"\r"]
+        );
+        assert_eq!(writes[0].0, 1000 + 4000);
+    }
+
+    #[test]
+    fn controller_deadline_leaves_room_for_the_writes_after_a_capped_settle() {
+        use crate::startup::{Guard, Stop};
+        for (delay, presses) in [(0u32, 0u8), (0, 3), (4000, 0), (4000, 3)] {
+            let deadline = controlled_startup_deadline(delay, presses);
+            let mut guard = Guard::new(0, Some(deadline));
+            // The settle loop ran to its cap (plus a second of timer slack),
+            // then readiness took a moment before the fixed pauses.
+            let mut at = STARTUP_MAX_WAIT_MS + u64::from(delay) + 1_000 + 500;
+            let mut revision = 0;
+            let mut write = |guard: &mut Guard, at: u64| {
+                let admitted =
+                    guard.write(std::time::Duration::from_millis(at), revision, || Ok(()));
+                revision += 1;
+                admitted
+            };
+            for _ in 0..presses {
+                write(&mut guard, at).unwrap();
+                at += STARTUP_KEY_GAP_MS;
+            }
+            if presses > 0 {
+                write(&mut guard, at).unwrap();
+                at += STARTUP_KEY_GAP_MS;
+            }
+            at += STARTUP_PRE_TYPE_MS;
+            write(&mut guard, at).expect("paste after a capped settle");
+            at += STARTUP_SUBMIT_DELAY_MS;
+            write(&mut guard, at).expect("Enter after a capped settle");
+            // Still a deadline: readiness never falls through to typing.
+            assert_eq!(
+                Guard::new(0, Some(deadline)).check(deadline, 0),
+                Err(Stop::NotReady)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_readiness_rejects_starting_titles_and_folder_trust() {
+        let mut screen = codex_screen("Ask Codex to do anything");
+        assert!(startup_ready(
+            TitleProvider::Codex,
+            &screen,
+            Some("scratch | Ready"),
+            &[],
+            true
+        ));
+        for title in [
+            None,
+            Some("scratch | Starting"),
+            Some("scratch | Waiting"),
+            Some("scratch | Working"),
+        ] {
+            assert!(!startup_ready(
+                TitleProvider::Codex,
+                &screen,
+                title,
+                &[],
+                true
+            ));
+        }
+        screen
+            .text
+            .insert_str(0, "Folder access\nTrust this folder?\n");
+        screen.cursor_row += 2;
+        assert!(!startup_ready(
+            TitleProvider::Codex,
+            &screen,
+            Some("scratch | Ready"),
+            &[],
+            true
+        ));
+    }
+
+    #[test]
+    fn startup_acceptance_rejects_own_echo_stale_work_and_boot_activity() {
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: "task",
+            expected_input: "task".into(),
+            before_title: 8,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        let empty = codex_screen("Ask Codex to do anything");
+        for (generation, title) in [
+            (8, "scratch | Working"),
+            (9, "scratch | Starting"),
+            (9, "scratch | Waiting"),
+        ] {
+            assert!(!startup_provider_accepted(
+                &attempt,
+                &empty,
+                Some(title),
+                generation,
+                None
+            ));
+        }
+        assert!(!startup_provider_accepted(
+            &attempt,
+            &codex_screen("task"),
+            Some("scratch | Working"),
+            9,
+            Some("task")
+        ));
+        assert!(startup_provider_accepted(
+            &attempt,
+            &empty,
+            Some("scratch | Working"),
+            9,
+            None
+        ));
+        // A fast real turn can finish before a poll; its rendered user row and
+        // cleared live editor still prove acceptance without a caught spinner.
+        assert!(startup_provider_accepted(
+            &attempt,
+            &empty,
+            Some("scratch | Ready"),
+            10,
+            Some("task")
+        ));
+        assert!(!startup_provider_accepted(
+            &attempt,
+            &empty,
+            Some("scratch | Ready"),
+            10,
+            Some("other task")
+        ));
+        let old_row = StartupAttempt {
+            before_prompt: Some("task".into()),
+            ..attempt
+        };
+        assert!(!startup_provider_accepted(
+            &old_row,
+            &empty,
+            Some("scratch | Ready"),
+            10,
+            Some("task")
+        ));
+    }
+
+    #[test]
+    fn codex_retry_refuses_any_receipt_changed_whitespace_and_unproven_editor_geometry() {
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: "a  b",
+            expected_input: "a b".into(),
+            before_title: 2,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        assert!(startup_retry_allowed(
+            &attempt,
+            &codex_screen("a  b"),
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+        assert!(!startup_retry_allowed(
+            &attempt,
+            &codex_screen("a b"),
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+        // A fresh matching user row independently forbids a second CR, even
+        // when the provider has retained or restored identical draft text.
+        assert!(!startup_retry_allowed(
+            &attempt,
+            &codex_screen("a  b"),
+            Some("scratch | Ready"),
+            &[],
+            Some("a  b")
+        ));
+        let mut suffix = codex_screen("a  b changed");
+        suffix.cursor_column = 6;
+        assert!(!startup_retry_allowed(
+            &attempt,
+            &suffix,
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+        let mut continuation = codex_screen("a  b");
+        continuation.text = continuation
+            .text
+            .replace("a  b\n\n", "a  b\n  more content\n\n");
+        assert!(!startup_retry_allowed(
+            &attempt,
+            &continuation,
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+        continuation.text = codex_screen("a  b")
+            .text
+            .replace("a  b\n\n", "a  b\n\n  hidden continuation\n\n");
+        assert!(!startup_retry_allowed(
+            &attempt,
+            &continuation,
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+        let multiline = StartupAttempt {
+            input: "a\nb",
+            ..attempt
+        };
+        assert!(!startup_retry_allowed(
+            &multiline,
+            &codex_screen("a b"),
+            Some("scratch | Ready"),
+            &[],
+            None
+        ));
+    }
+
+    #[test]
+    fn grok_task_quoting_codex_trust_text_does_not_block_its_own_first_enter() {
+        let screen = Screen { text: "Grok\n› Explain Trust this folder? and Folder access and enter continue · esc quit\n".into(),
+            cursor_row: 1, cursor_column: 80, cursor_visible: true, bracketed_paste: true };
+        assert!(startup_ready(
+            TitleProvider::Grok,
+            &screen,
+            Some("scratch - grok"),
+            &[],
+            false
+        ));
+    }
+
+    #[test]
+    fn quoted_permission_text_in_the_draft_does_not_block_its_own_submit() {
+        for (draft, cursor_row) in [
+            ("❯ Explain the wording Do you want to proceed", 2),
+            (
+                "❯ Explain the wording\n  Do you want to proceed\n  and this second line",
+                4,
+            ),
+        ] {
+            let mut screen = Screen {
+                text: format!("Claude Code\n────────────────\n{draft}\n────────────────\nmode"),
+                cursor_column: 22,
+                cursor_row,
+                cursor_visible: true,
+                bracketed_paste: true,
+            };
+            let markers = vec!["Do you want to proceed".into()];
+            assert!(claude_startup_ready(&screen, None, &markers, false));
+            assert!(!claude_startup_ready(&screen, None, &markers, true));
+            // A real permission question outside the composer still vetoes CR.
+            screen.text.insert_str(0, "Do you want to proceed\n");
+            screen.cursor_row += 1;
+            assert!(!claude_startup_ready(&screen, None, &markers, false));
+        }
+    }
+
+    #[test]
+    fn native_slash_completion_is_ready_for_submit_but_not_an_empty_startup() {
+        // The controlled native reproduction's completion menu has no permission
+        // footer. Its occupied composer must admit the first CR, never a retry.
+        let screen = Screen {
+            text: "Claude Code v2.1.304\n  ❯ /b12-ready  Reply exactly B12_READY. Do not use tools,\n                 read or write files, or call other agents…\n────────────────────────────────────────\n❯\u{a0}/b12-ready\n────────────────────────────────────────\n  Friday 0%\n  ⏵⏵ auto mode on (shift+tab to cycle)".into(),
+            cursor_column: 12, cursor_row: 4, cursor_visible: true, bracketed_paste: true,
+        };
+        assert!(claude_startup_ready(
+            &screen,
+            Some("✳ Claude Code"),
+            &[],
+            false
+        ));
+        assert!(!claude_startup_ready(&screen, None, &[], true));
+        assert!(!claude_startup_ready(
+            &screen,
+            Some("◐ Claude Code"),
+            &[],
+            false
+        ));
+        assert!(!claude_startup_ready(
+            &screen,
+            None,
+            &["manual approval".into(), "auto mode on".into()],
+            false
+        ));
+    }
+
+    #[test]
+    fn permission_chrome_vetoes_an_old_composer_even_with_idle_title() {
+        let screen = Screen {
+            text: "────────────────\n❯ task\n────────────────\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel".into(),
+            cursor_column: 6, cursor_row: 1, cursor_visible: true, bracketed_paste: true,
+        };
+        assert!(!claude_startup_ready(
+            &screen,
+            Some("✳ Claude Code"),
+            &[],
+            false
+        ));
     }
 }
 

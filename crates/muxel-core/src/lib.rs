@@ -41,8 +41,9 @@ pub use agent::{
     codex_latest_session_id, codex_latest_sessions, codex_resume_path, codex_rollout_by_walk,
     codex_session_from_hint, codex_session_hint_from_title, codex_session_id_from_hint,
     codex_session_names, codex_terminal_title_override, file_link_instruction,
-    find_claude_session_path, memory_header, memory_instruction, memory_reference,
-    muxel_file_reference, resolve_launch, resolve_launch_for_session, session_resume_args,
+    find_claude_session_path, is_known_agent_program, launches_known_agent, memory_header,
+    memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
+    resolve_launch_for_session, session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
@@ -505,12 +506,19 @@ pub struct Instance {
     pub program: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Run the saved argv unchanged, without preset injection or session rewriting.
+    #[serde(default)]
+    pub literal_argv: bool,
     /// Optional system prompt delivered to the agent on startup.
     #[serde(default)]
     pub system_prompt: Option<String>,
     /// How the system prompt is delivered.
     #[serde(default)]
     pub injection: InjectionMode,
+    /// Frozen separate transport for automatic instructions on a ctl task.
+    /// Older task records omit this and receive no extra typed instructions.
+    #[serde(default)]
+    pub instruction_injection: Option<InjectionMode>,
     /// Name of the preset this instance was created from (for display).
     #[serde(default)]
     pub preset: String,
@@ -546,7 +554,10 @@ pub struct Instance {
     /// size means nothing has to resize at all.
     #[serde(default)]
     pub grid: Option<(u16, u16)>,
-    /// Worktree directory, once created (becomes this instance's working dir).
+    /// Launch directory supplied by the caller; never owned or removed by muxel.
+    #[serde(default)]
+    pub launch_dir: Option<PathBuf>,
+    /// Owned worktree directory (including legacy worktrees before migration).
     #[serde(default)]
     pub worktree_path: Option<std::path::PathBuf>,
     /// Branch checked out in the worktree.
@@ -563,6 +574,16 @@ pub struct Instance {
     /// Created by a runner (one-off task launcher).
     #[serde(default)]
     pub is_runner: bool,
+    /// A task supplied by `ctl new --prompt`. Erase its text after building the
+    /// first launch plan so a non-resuming relaunch cannot re-type the old task.
+    /// `instruction_injection` keeps the preset's separate rules transport;
+    /// `injection` remains TypeIn for the exact typed user task.
+    #[serde(default)]
+    pub control_prompt: bool,
+    /// Outside creation must never substitute an unapproved fallback shell.
+    /// Retain the launch policy across restore and restart.
+    #[serde(default)]
+    pub control_created: bool,
     /// Press Enter to submit after typing the startup prompt. New instances set
     /// this true; a runner clears it after its first launch so reopening the app
     /// re-types the prompt but does NOT auto-submit it (defaults false for
@@ -590,7 +611,81 @@ pub struct Instance {
     pub session_started: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalLaunchReason {
+    NewPane,
+    RunAgain,
+    Restore,
+    ProjectSelection,
+    Restart,
+    Wake,
+    EnsureRunning,
+    Recovery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorktreeCleanup {
+    None,
+    Registered(Uuid),
+    Legacy(PathBuf),
+}
+
 impl Instance {
+    /// Called after the launch plan has captured its startup input, before the
+    /// updated instance is persisted. Reusable runners keep their task text.
+    pub fn consume_runner_prompt(&mut self) -> bool {
+        if !self.is_runner {
+            return false;
+        }
+        let changed = self.auto_submit || (self.control_prompt && self.system_prompt.is_some());
+        self.auto_submit = false;
+        if self.control_prompt {
+            self.system_prompt = None;
+        }
+        changed
+    }
+
+    /// Literal commands may replay an opening brief, so only creation and the
+    /// explicit Run again action can start them. Recovery must leave them stopped.
+    pub fn permits_launch(&self, reason: TerminalLaunchReason) -> bool {
+        self.kind == InstanceKind::Terminal
+            && (!self.literal_argv
+                || matches!(
+                    reason,
+                    TerminalLaunchReason::NewPane | TerminalLaunchReason::RunAgain
+                ))
+    }
+
+    pub fn working_directory(&self) -> Option<&std::path::Path> {
+        self.launch_dir.as_deref().or(self.worktree_path.as_deref())
+    }
+
+    /// An unspawned saved literal command is stopped, rather than an idle agent.
+    /// Retained views keep their lifecycle badge, including done after exit.
+    /// Do not show stopped while a user-requested launch is in flight.
+    pub fn is_stopped_literal(&self, has_terminal_view: bool, launching: bool) -> bool {
+        self.literal_argv && self.kind == InstanceKind::Terminal && !has_terminal_view && !launching
+    }
+
+    /// Capture before removing instance metadata. Launch directories never enter
+    /// this plan, even when they happen to be git worktrees of the project repo.
+    pub fn worktree_cleanup(&self) -> WorktreeCleanup {
+        match (self.worktree_id, &self.worktree_path) {
+            (Some(id), _) => WorktreeCleanup::Registered(id),
+            (None, Some(path)) => WorktreeCleanup::Legacy(path.clone()),
+            _ => WorktreeCleanup::None,
+        }
+    }
+
+    pub fn needs_peer_session(&self) -> bool {
+        self.kind == InstanceKind::Terminal
+            && !self.literal_argv
+            && self
+                .tmux_session
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+    }
+
     /// Display label precedence. Empty persisted values do not mask the next
     /// useful source.
     pub fn display_name(&self) -> &str {
@@ -624,6 +719,13 @@ impl Instance {
         self.session_path = None;
         self.session_started = false;
         self.auto_name = None;
+        // Duplication is a new local UI action, not the outside launch approval.
+        self.control_created = false;
+        // An unconsumed `ctl new --prompt` task belongs to the request that was
+        // approved, never to a copy of its pane.
+        if self.control_prompt {
+            self.system_prompt = None;
+        }
     }
 
     /// A plain shell instance.
@@ -651,6 +753,7 @@ impl Instance {
             auto_name: None,
             program: preset.program.clone(),
             args: preset.compose_args(),
+            literal_argv: false,
             system_prompt: preset.system_prompt.clone(),
             injection: preset.injection.clone(),
             preset: preset.name.clone(),
@@ -662,11 +765,15 @@ impl Instance {
             tmux_session: None,
             tmux_socket: None,
             grid: None,
+            launch_dir: None,
             worktree_path: None,
             worktree_branch: None,
             auto_mode_presses: 0,
             auto_continue_message: None,
             is_runner: false,
+            control_prompt: false,
+            instruction_injection: None,
+            control_created: false,
             // New instances submit their startup prompt; persisted ones default
             // to false (so restored runners re-type without auto-submitting).
             auto_submit: true,
@@ -716,6 +823,7 @@ impl Instance {
             auto_name: None,
             program: None,
             args: Vec::new(),
+            literal_argv: false,
             system_prompt: None,
             injection: InjectionMode::default(),
             preset: String::new(),
@@ -727,12 +835,16 @@ impl Instance {
             tmux_session: None,
             tmux_socket: None,
             grid: None,
+            launch_dir: None,
             worktree_path: None,
             worktree_branch: None,
             auto_mode_presses: 0,
             auto_continue_message: None,
             is_runner: false,
+            control_prompt: false,
+            instruction_injection: None,
             auto_submit: false,
+            control_created: false,
             pinned: false,
             worktree_id: None,
             session_id: None,
@@ -1536,6 +1648,21 @@ pub fn merge_peer_instances(
                     instance.session_path =
                         mine.session_path.clone().or(instance.session_path.take());
                 }
+                // Older peers drop the outside-creation launch policy too, which
+                // would turn a literal command back into a tmux-wrapped,
+                // auto-restored pane allowed a fallback shell. A missing value
+                // can't be told apart from a cleared one, but nothing clears
+                // these on an existing pane: they are set once at creation (a
+                // duplicate is a new id), so absent always means "not known here".
+                instance.literal_argv |= mine.literal_argv;
+                instance.control_created |= mine.control_created;
+                instance.control_prompt |= mine.control_prompt;
+                if instance.launch_dir.is_none() {
+                    instance.launch_dir = mine.launch_dir.clone();
+                }
+                if instance.instruction_injection.is_none() {
+                    instance.instruction_injection = mine.instruction_injection.clone();
+                }
             }
             instance
         })
@@ -1548,9 +1675,12 @@ pub fn merge_peer_instances(
 /// and a copy of the pane that predates it (a peer's layout, or this machine's
 /// own unpushed one) must not undo it. Undone, the pane would refuse to launch
 /// (Default is gone and `mxl` has the namesake) and closing it would kill on
-/// Default, orphaning the agent on `mxl`.
+/// Default, orphaning the agent on `mxl`. A literal pane runs no session, so
+/// its stale tmux fields never take part in a move.
 pub fn moved_off_default(stale: &Instance, moved: &Instance) -> bool {
-    stale.tmux_socket == Some(tmux::Socket::Default)
+    !stale.literal_argv
+        && !moved.literal_argv
+        && stale.tmux_socket == Some(tmux::Socket::Default)
         && moved.tmux_socket == Some(tmux::Socket::Private)
         && stale.tmux_session.is_some()
         && stale.tmux_session == moved.tmux_session
@@ -1576,10 +1706,12 @@ pub fn keep_moves_off_default(local: &mut [Instance], file: &[Instance]) -> Vec<
 
 /// The panes in both `before` and `after` whose tmux binding (session name and
 /// owner) differs between them: after a peer layout is adopted, a pane that failed
-/// to launch on its old binding can try the new one.
+/// to launch on its old binding can try the new one. A literal pane has no tmux
+/// transport, so a peer's stale binding never retries it.
 pub fn rebound_instances(before: &[Instance], after: &[Instance]) -> Vec<Uuid> {
     after
         .iter()
+        .filter(|now| !now.literal_argv)
         .filter(|now| {
             before.iter().any(|was| {
                 was.id == now.id
@@ -2481,8 +2613,17 @@ pub struct Settings {
     /// Bot) list and drive the agents through `muxel ctl`. Off by default.
     #[serde(default)]
     pub control_enabled: bool,
-    /// …including typing into shell panes, which is running commands. Off by
-    /// default: outside control reaches coding agents only.
+    /// Off / Ask / Allow for outside terminal creation. Allow opens only presets
+    /// running a known agent provider; every other program Asks. Literal argv and
+    /// shell presets always Ask and also require control_allow_shells. A bool
+    /// from a development build loads as Off / Ask. Revocation refuses pending
+    /// approvals, not existing panes.
+    #[serde(default)]
+    pub control_allow_new: control::CreationPolicy,
+    /// Also allow typing into shell panes and `ctl new` shell presets/defaults
+    /// or any literal argv. Commands run as the host muxel process, outside the
+    /// caller's sandbox. Off by default; non-literal agent writes need only global
+    /// outside control. Creation also requires a non-Off control_allow_new policy.
     #[serde(default)]
     pub control_allow_shells: bool,
     // --- Team libraries (`library`) ---
@@ -2703,6 +2844,27 @@ mod instance_tests {
         assert_eq!(instance.session_id, None);
         assert!(!instance.session_started);
     }
+
+    #[test]
+    fn duplicate_never_carries_an_unconsumed_outside_task() {
+        let mut task = Instance::shell(Uuid::new_v4());
+        task.is_runner = true;
+        task.control_prompt = true;
+        task.control_created = true;
+        task.system_prompt = Some("deploy the branch".into());
+        task.reset_conversation_for_duplicate();
+        assert_eq!(task.system_prompt, None);
+        assert!(!task.control_created);
+        // An ordinary runner's prompt is its reusable launch setting.
+        let mut runner = Instance::shell(Uuid::new_v4());
+        runner.is_runner = true;
+        runner.system_prompt = Some("Review the current changes".into());
+        runner.reset_conversation_for_duplicate();
+        assert_eq!(
+            runner.system_prompt.as_deref(),
+            Some("Review the current changes")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2789,6 +2951,7 @@ impl Default for Settings {
             read_aloud_tables: false,
             read_aloud_max_chars: 0,
             control_enabled: false,
+            control_allow_new: control::CreationPolicy::Off,
             control_allow_shells: false,
             libraries: Vec::new(),
             shared_loops: Vec::new(),
@@ -3185,11 +3348,52 @@ mod settings_tests {
         // Nothing outside muxel can drive its agents until the user says so.
         let s: Settings = serde_json::from_str("{}").expect("parse");
         assert!(!s.control_enabled);
+        assert_eq!(s.control_allow_new, control::CreationPolicy::Off);
         assert!(!s.control_allow_shells);
         assert!(!Settings::default().control_enabled);
+        assert_eq!(
+            Settings::default().control_allow_new,
+            control::CreationPolicy::Off
+        );
+        assert!(!Settings::default().control_allow_shells);
         let s: Settings = serde_json::from_str(r#"{"control_enabled": true}"#).expect("parse");
         assert!(s.control_enabled);
+        assert_eq!(s.control_allow_new, control::CreationPolicy::Off);
         assert!(!s.control_allow_shells);
+    }
+
+    #[test]
+    fn outside_terminal_creation_is_an_independent_opt_in() {
+        let legacy: Settings =
+            serde_json::from_str(r#"{"control_enabled":true,"control_allow_shells":true}"#)
+                .unwrap();
+        assert!(legacy.control_enabled);
+        assert!(legacy.control_allow_shells);
+        assert!(
+            legacy.control_allow_new == control::CreationPolicy::Off,
+            "old grants must not authorize creation on upgrade"
+        );
+        for enabled in [false, true] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "control_enabled": true, "control_allow_shells": true,
+                "control_allow_new": enabled,
+            }))
+            .unwrap();
+            let saved = serde_json::to_value(&settings).unwrap();
+            // A development build's bool never becomes Allow.
+            let policy = if enabled {
+                control::CreationPolicy::Ask
+            } else {
+                control::CreationPolicy::Off
+            };
+            assert_eq!(
+                saved["control_allow_new"],
+                if enabled { "ask" } else { "off" }
+            );
+            let restored: Settings = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.control_allow_new, policy);
+            assert!(restored.control_enabled && restored.control_allow_shells);
+        }
     }
 
     #[test]
@@ -3786,6 +3990,24 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn literal_panes_take_no_part_in_a_move_off_default() {
+        let (moved, stale) = moved_and_stale();
+        for (mut stale, mut moved, literal_moved) in
+            [(stale.clone(), moved.clone(), false), (stale, moved, true)]
+        {
+            if literal_moved {
+                moved.literal_argv = true;
+            } else {
+                stale.literal_argv = true;
+            }
+            assert!(!moved_off_default(&stale, &moved));
+            let mut local = vec![stale.clone()];
+            assert!(keep_moves_off_default(&mut local, std::slice::from_ref(&moved)).is_empty());
+            assert_eq!(local[0].tmux_socket, stale.tmux_socket);
+        }
+    }
+
+    #[test]
     fn a_peer_layout_cannot_move_a_pane_back_onto_default() {
         let (moved, stale) = moved_and_stale();
         let merged = merge_peer_instances(
@@ -3869,6 +4091,9 @@ mod remote_layout_tests {
             vec![stale.id]
         );
         assert!(rebound_instances(std::slice::from_ref(&stale), &[titled, added]).is_empty());
+        let mut literal = moved.clone();
+        literal.literal_argv = true;
+        assert!(rebound_instances(std::slice::from_ref(&stale), &[literal]).is_empty());
     }
 
     /// Reduce a desktop pane subtree to what the iOS `PaneNode` encoder writes: only
@@ -3949,6 +4174,57 @@ mod remote_layout_tests {
         assert_eq!(a2.activity.last_state, Some(AgentActivityState::Working));
         assert_eq!(a2.tmux_session, a.tmux_session);
         assert_eq!(a2.tmux_socket, a.tmux_socket);
+    }
+
+    #[test]
+    fn an_older_peer_cannot_strip_outside_creation_launch_policy() {
+        let pid = Uuid::new_v4();
+        let mut literal = Instance::shell(pid);
+        literal.program = Some("/usr/local/bin/native".into());
+        literal.args = vec!["opening brief".into(), "".into()];
+        literal.literal_argv = true;
+        literal.control_created = true;
+        literal.launch_dir = Some("/srv/external".into());
+        let mut task = Instance::from_preset(pid, &AgentPreset::claude());
+        task.control_created = true;
+        task.control_prompt = true;
+        task.instruction_injection = Some(InjectionMode::CliFlag {
+            flag: "--append-system-prompt".into(),
+        });
+        task.launch_dir = Some("/srv/external".into());
+        let local = vec![literal.clone(), task.clone()];
+        // The same panes as an older build writes them back: unknown fields gone.
+        let older: Vec<Instance> = local
+            .iter()
+            .map(|instance| {
+                let mut json = serde_json::to_value(instance).unwrap();
+                let fields = json.as_object_mut().unwrap();
+                for field in [
+                    "literal_argv",
+                    "launch_dir",
+                    "control_created",
+                    "control_prompt",
+                    "instruction_injection",
+                ] {
+                    fields.remove(field);
+                }
+                serde_json::from_value(json).unwrap()
+            })
+            .collect();
+        assert!(!older[0].literal_argv && older[0].launch_dir.is_none());
+        let merged = merge_peer_instances(&local, older, pid);
+        for (merged, mine) in merged.iter().zip(&local) {
+            assert_eq!(merged.literal_argv, mine.literal_argv);
+            assert_eq!(merged.control_created, mine.control_created);
+            assert_eq!(merged.control_prompt, mine.control_prompt);
+            assert_eq!(merged.launch_dir, mine.launch_dir);
+            assert_eq!(merged.instruction_injection, mine.instruction_injection);
+        }
+        // A pane only the peer has keeps exactly what the peer wrote.
+        let added = Instance::shell(pid);
+        let merged = merge_peer_instances(&local, vec![added.clone()], pid);
+        assert!(!merged[0].literal_argv && !merged[0].control_created);
+        assert!(merged[0].launch_dir.is_none());
     }
 
     #[test]

@@ -217,7 +217,7 @@ impl AgentPreset {
             model: None,
             model_flag: default_model_flag(),
             effort: None,
-            effort_flag: None,
+            effort_flag: Some("--effort".to_string()),
             args: Vec::new(),
             system_prompt: None,
             injection: InjectionMode::CliFlag {
@@ -437,7 +437,7 @@ impl AgentPreset {
             model: None,
             model_flag: default_model_flag(),
             effort: None,
-            effort_flag: None,
+            effort_flag: Some("--config=model_reasoning_effort={}".to_string()),
             args: Vec::new(),
             system_prompt: None,
             injection: InjectionMode::TypeIn,
@@ -510,7 +510,16 @@ impl AgentPreset {
             presets.push(Self::cmd());
             presets.push(Self::git_bash());
         }
-        presets.extend([
+        presets.extend(Self::builtin_agents());
+        presets.push(Self::browser());
+        presets
+    }
+
+    /// The built-in agent presets: every default terminal preset that runs an
+    /// agent rather than a shell. Their programs are the agent providers muxel
+    /// knows (see [`is_known_agent_program`]).
+    pub fn builtin_agents() -> [AgentPreset; 10] {
+        [
             Self::claude(),
             Self::opencode(),
             Self::amp(),
@@ -521,33 +530,92 @@ impl AgentPreset {
             Self::ollama(),
             Self::ollama_code(),
             Self::pi(),
-            Self::browser(),
-        ]);
-        presets
+        ]
     }
 
-    /// Compose the full argument list: `model_flag model`, then
-    /// `effort_flag effort`, then the extra args. Pairs are skipped unless both
-    /// the flag and the value are set (and non-empty).
+    /// Compose model, effort, then extra args. A flag containing `{}` emits one
+    /// argument with the value substituted; otherwise it emits flag then value.
     pub fn compose_args(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if let (Some(flag), Some(model)) = (
-            &self.model_flag,
-            self.model.as_ref().filter(|m| !m.is_empty()),
-        ) {
-            out.push(flag.clone());
-            out.push(model.clone());
-        }
-        if let (Some(flag), Some(effort)) = (
-            &self.effort_flag,
-            self.effort.as_ref().filter(|e| !e.is_empty()),
-        ) {
-            out.push(flag.clone());
-            out.push(effort.clone());
+        for (flag, value) in [
+            (&self.model_flag, &self.model),
+            (&self.effort_flag, &self.effort),
+        ] {
+            if let (Some(flag), Some(value)) = (
+                flag.as_ref().filter(|flag| !flag.trim().is_empty()),
+                value.as_ref().filter(|value| !value.is_empty()),
+            ) {
+                if flag.contains("{}") {
+                    out.push(flag.replace("{}", value));
+                } else {
+                    out.push(flag.clone());
+                    out.push(value.clone());
+                }
+            }
         }
         out.extend(self.args.iter().cloned());
         out
     }
+}
+
+/// Whether `program` runs one of muxel's built-in agent providers — the program
+/// of a [`AgentPreset::builtin_agents`] preset — matched on the executable's
+/// basename, ignoring its directory, a trailing `.exe` and case. Anything else
+/// (`ssh`, `wsl.exe`, `python`, a wrapper script, a shell) is not, even if a
+/// user preset runs it.
+pub fn is_known_agent_program(program: Option<&str>) -> bool {
+    fn stem(program: &str) -> Option<String> {
+        let program = program.trim();
+        let leaf = program
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(program)
+            .to_ascii_lowercase();
+        let stem = leaf.strip_suffix(".exe").unwrap_or(&leaf);
+        (!stem.is_empty()).then(|| stem.to_string())
+    }
+    let Some(name) = program.and_then(stem) else {
+        return false;
+    };
+    AgentPreset::builtin_agents()
+        .iter()
+        .filter_map(|preset| preset.program.as_deref().and_then(stem))
+        .any(|known| known == name)
+}
+
+/// Whether launching `program` runs a known agent provider
+/// ([`is_known_agent_program`]) from a place its caller can't choose: an
+/// absolute path, or a bare name that `path` (a `PATH` value) resolves through
+/// absolute entries only. A relative path, or a relative or empty `PATH` entry
+/// reached before the match, resolves against a working directory — for
+/// outside creation, the caller's `--cwd` — so it doesn't count. `found` says
+/// whether a launchable file is at a candidate path (with Windows' extensions).
+pub fn launches_known_agent(
+    program: Option<&str>,
+    path: Option<&std::ffi::OsStr>,
+    found: impl Fn(&Path) -> bool,
+) -> bool {
+    let Some(program) = program.map(str::trim).filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    if !is_known_agent_program(Some(program)) {
+        return false;
+    }
+    if program.contains(['/', '\\']) {
+        return Path::new(program).is_absolute();
+    }
+    let Some(path) = path else {
+        return false;
+    };
+    for dir in std::env::split_paths(path) {
+        if !dir.is_absolute() {
+            return false;
+        }
+        if found(&dir.join(program)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Concrete launch parameters resolved from an instance.
@@ -578,22 +646,44 @@ pub fn resolve_launch(instance: &Instance) -> ResolvedLaunch {
 /// submitting it again on process restart mutates the resumed transcript. CLI
 /// flags remain launch configuration and may need to be applied on every process.
 pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> ResolvedLaunch {
+    if instance.literal_argv {
+        return ResolvedLaunch {
+            program: instance.program.clone(),
+            args: instance.args.clone(),
+            startup_input: None,
+            auto_mode_presses: 0,
+            submit: false,
+            env: instance
+                .env
+                .iter()
+                .map(|e| (e.key.clone(), e.value.clone()))
+                .collect(),
+        };
+    }
     let mut args = instance.args.clone();
     let mut startup_input = None;
 
     if let Some(prompt) = instance.system_prompt.as_ref().filter(|p| !p.is_empty()) {
-        match &instance.injection {
-            InjectionMode::CliFlag { flag } => {
-                args.push(flag.clone());
-                args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+        if instance.control_prompt {
+            if !resuming && instance.auto_submit {
+                startup_input = Some(prompt.clone());
             }
-            InjectionMode::TypeIn if !resuming => {
-                // A raw newline is Enter in TUIs without bracketed-paste mode.
-                // Keep the instruction bundle to one startup turn everywhere.
-                startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+        } else {
+            match &instance.injection {
+                InjectionMode::CliFlag { flag } => {
+                    args.push(flag.clone());
+                    args.push(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                InjectionMode::TypeIn if !resuming => {
+                    // A raw newline is Enter in TUIs without bracketed-paste mode.
+                    // Keep the instruction bundle to one startup turn everywhere.
+                    // Consumed ctl tasks leave no text, including automatically
+                    // assembled instructions, in a later conversation's input.
+                    startup_input = Some(prompt.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                InjectionMode::TypeIn => {}
+                InjectionMode::None => {}
             }
-            InjectionMode::TypeIn => {}
-            InjectionMode::None => {}
         }
     }
 
@@ -602,12 +692,13 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
         args.push(codex_terminal_title_override().to_string());
     }
 
+    let submit = instance.auto_submit && (!instance.control_prompt || startup_input.is_some());
     ResolvedLaunch {
         program: instance.program.clone(),
         args,
         startup_input,
         auto_mode_presses: instance.auto_mode_presses,
-        submit: instance.auto_submit,
+        submit,
         env: instance
             .env
             .iter()
@@ -630,6 +721,9 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
 /// avoids a flush race for host-minted agents. When a session was genuinely
 /// deleted, the caller probes the disk and restarts cleanly.
 pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<Vec<String>> {
+    if instance.literal_argv {
+        return None;
+    }
     let resume_flag = preset.resume_flag.as_deref()?;
     if instance.session_started {
         let id = instance.session_id.as_deref()?;
@@ -1241,6 +1335,89 @@ pub fn memory_header() -> &'static str {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn known_agents_are_the_builtin_agent_programs_by_basename() {
+        for program in [
+            "claude",
+            "codex",
+            "grok",
+            "opencode",
+            "amp",
+            "muse",
+            "hermes",
+            "ollama",
+            "pi",
+            "/usr/local/bin/codex",
+            r"C:\Users\me\AppData\Roaming\npm\Claude.EXE",
+            "  GROK  ",
+        ] {
+            assert!(is_known_agent_program(Some(program)), "{program}");
+        }
+        for program in [
+            None,
+            Some(""),
+            Some("ssh"),
+            Some("wsl.exe"),
+            Some("python3"),
+            Some("node"),
+            Some("bash"),
+            Some("cmd.exe"),
+            Some("pwsh"),
+            Some("claude-wrapper"),
+            Some("codex.cmd"),
+            Some("/opt/codex/"),
+        ] {
+            assert!(!is_known_agent_program(program), "{program:?}");
+        }
+        // Only a location the caller can't choose counts: an absolute path, or
+        // a bare name found through absolute PATH entries.
+        let root = if cfg!(windows) {
+            r"C:\tools"
+        } else {
+            "/usr/local/bin"
+        };
+        let elsewhere = if cfg!(windows) {
+            r"C:\other"
+        } else {
+            "/opt/other"
+        };
+        let path = |dirs: &[&str]| std::env::join_paths(dirs).unwrap();
+        let installed = |candidate: &Path| candidate.starts_with(root);
+        let absolute = Path::new(root).join("claude");
+        for (program, dirs, expected) in [
+            (absolute.to_str().unwrap(), vec![], true),
+            ("claude", vec![elsewhere, root], true),
+            ("claude", vec![elsewhere], false),
+            ("claude", vec![".", root], false),
+            ("claude", vec!["node_modules/.bin", root], false),
+            ("claude", vec!["", root], false),
+            ("claude", vec![root, "."], true),
+            ("./node_modules/.bin/claude", vec![root], false),
+            ("bin/claude", vec![root], false),
+            ("ssh", vec![root], false),
+        ] {
+            let dirs = path(&dirs);
+            assert_eq!(
+                launches_known_agent(Some(program), Some(dirs.as_os_str()), installed),
+                expected,
+                "{program} via {dirs:?}"
+            );
+        }
+        assert!(!launches_known_agent(Some("claude"), None, installed));
+        assert!(!launches_known_agent(
+            None,
+            Some(path(&[root]).as_os_str()),
+            installed
+        ));
+
+        // The list is the seeded built-ins, not a second copy of them.
+        let defaults = AgentPreset::defaults();
+        for agent in AgentPreset::builtin_agents() {
+            assert!(defaults.iter().any(|preset| preset.name == agent.name));
+            assert!(crate::readaloud::is_agent_program(agent.program.as_deref()));
+        }
+    }
 
     fn instance(preset: &AgentPreset, prompt: Option<&str>) -> Instance {
         let mut i = Instance::from_preset(Uuid::new_v4(), preset);
@@ -1944,7 +2121,7 @@ mod tests {
 
     #[test]
     fn compose_args_skips_unset_model_and_effort() {
-        // Claude has a model_flag but no model set, and no effort_flag.
+        // Configured flags without values add no arguments.
         assert!(AgentPreset::claude().compose_args().is_empty());
     }
 

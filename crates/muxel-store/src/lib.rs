@@ -699,6 +699,25 @@ mod tests {
     }
 
     #[test]
+    fn outside_creation_policy_accepts_legacy_toml_and_saves_named_choices() {
+        use muxel_core::control::CreationPolicy;
+        // A development build's bool still loads, and never as Allow.
+        for (text, expected) in [
+            ("control_allow_new = false", CreationPolicy::Off),
+            ("control_allow_new = true", CreationPolicy::Ask),
+            ("control_allow_new = 'allow'", CreationPolicy::Allow),
+            ("control_allow_new = 'ask'", CreationPolicy::Ask),
+        ] {
+            let settings = parse_settings(text).unwrap();
+            assert_eq!(settings.control_allow_new, expected);
+            let saved = toml::to_string_pretty(&settings).unwrap();
+            assert_eq!(parse_settings(&saved).unwrap().control_allow_new, expected);
+            assert!(!saved.contains("control_allow_new = true"));
+            assert!(!saved.contains("control_allow_new = false"));
+        }
+    }
+
+    #[test]
     fn workspaces_index_round_trips() {
         let dir = std::env::temp_dir().join("muxel-store-test-workspaces-rt");
         let _ = std::fs::create_dir_all(&dir);
