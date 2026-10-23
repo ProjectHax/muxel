@@ -1005,6 +1005,10 @@ feature is added or changed, update the matching entry here in the same change**
   socket alone. Older panes resolve their owner before teardown. Claim cleanup
   includes any socket discovery in its two-second deadline and reaps timed-out
   commands before returning.
+  Recorded named sockets round-trip across desktop and phone, including names a
+  newer peer introduced, without dropping the rest of a shared layout. A restart
+  whose owner cannot be saved or confirmed stops with an error instead of silently
+  reattaching the old agent.
   A legacy close saves its selected server before the first kill and keeps that
   owner through lost replies, retries and reconnect cleanup. Only one restart
   per pane can resolve and stop a session at a time; stale completions from a
@@ -1245,8 +1249,20 @@ feature is added or changed, update the matching entry here in the same change**
   hand, use `tmux -L mxl ls` and `tmux -L mxl attach -t muxel_…`. Upgrading stops
   nothing: a pane whose session is still running on the default server from an
   earlier muxel reattaches to it there (closing the pane still stops it), and its
-  next session starts on muxel's own. A tmux session of your own that you import
-  stays on the default server too. The iOS app follows the same rule.
+  next session starts on muxel's own after both servers confirm the old session is
+  gone and `mxl` has no session of that exact name. A namesake on `mxl` is left alone
+  and the pane keeps its default-server binding but stops, then attaches by itself
+  once another muxel sharing the project's layout assigns it the new owner (or
+  after you stop that session and restart the pane); retry cannot recreate a
+  second agent on Default, and Restart checks for the namesake before it stops
+  anything. Once moved, a pane stays on `mxl` whatever an older copy of the layout
+  says. A session still running on the default server reattaches even when `mxl`
+  gives an unexpected answer. An imported session also stays on its recorded owner
+  while running.
+  Desktop and phone save an allowed migration
+  before launching; a failed probe or save cannot authorize it.
+  Reconnecting also retries pending closes on their recorded named servers;
+  absence from the standard-server inventory does not forget an unconfirmed close.
   Such a `pkill` reaches only that pane's tmux client: the session and the agent keep
   running, and muxel **reattaches the pane automatically** — you see it blink, not die.
   Local and remote alike (SSH panes and the iOS companion do the same), since a host

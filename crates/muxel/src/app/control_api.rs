@@ -1009,7 +1009,7 @@ impl MuxelApp {
         Some(ClaimSite {
             session: muxel_core::tmux::SessionTarget::new(
                 inst.tmux_session.clone()?,
-                inst.tmux_socket,
+                inst.tmux_socket.clone(),
             ),
             loc: self.repo_loc(inst.project_id)?,
         })

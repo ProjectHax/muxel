@@ -134,7 +134,7 @@ pub fn tmux_candidates(
     let owned = crate::tmux::owned_session_keys(sessions, owned);
     sessions
         .iter()
-        .filter(|s| !owned.contains(&(s.name.as_str(), s.socket)))
+        .filter(|s| !owned.contains(&(s.name.as_str(), &s.socket)))
         .map(|s| {
             let preset = preset_for_command(presets, &s.command);
             ImportCandidate {
@@ -507,7 +507,11 @@ fn key(source: &ImportSource) -> String {
     match source {
         ImportSource::TmuxSession { session } => format!(
             "{}:{}",
-            String::from(session.socket.unwrap_or(crate::tmux::Socket::Private)),
+            session
+                .socket
+                .as_ref()
+                .unwrap_or(&crate::tmux::Socket::Private)
+                .name(),
             session.name
         ),
         ImportSource::Running { pid, .. } => pid.to_string(),

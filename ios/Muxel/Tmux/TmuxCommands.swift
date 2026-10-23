@@ -108,6 +108,146 @@ enum TmuxCommands {
         var socket: String
     }
 
+    struct DefaultMigration: Equatable {
+        let recordedSession: String?
+        let sessionName: String
+    }
+
+    enum ProbeError: LocalizedError, Equatable {
+        case incomplete
+        case ownershipRefreshRequired
+
+        var errorDescription: String? {
+            switch self {
+            case .incomplete:
+                return "Couldn't confirm both tmux servers. Reconnect and try again."
+            case .ownershipRefreshRequired:
+                return "A session with this name is already running on another tmux server, so this pane was not started. Try again once another muxel sharing this project's layout has assigned that session to it, or after stopping that session."
+            }
+        }
+    }
+
+    /// Whether tmux can use `name` as `-L <name>`: a plain file name in its socket
+    /// directory, so not empty, `.` or `..`, and holding no `/` or NUL (`-L` joins
+    /// the name onto that directory, so a path would reach a server elsewhere). A
+    /// recorded owner that isn't one decodes as none (`Instance`), which means
+    /// legacy discovery. Port of `Socket::try_from` in `crates/muxel-core/src/tmux.rs`.
+    static func isSocketName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains("\0")
+    }
+
+    /// The checked listing a pane recorded on the default server needs: muxel's
+    /// own server, then the default one, each answer closed by its exit status.
+    /// Names only, one per line, so no session name is split. Port of
+    /// `ssh::list_session_names_command_on` over both servers.
+    static func confirmedTargetsCommand() -> String {
+        "export LC_ALL=C; " + [socketName, "default"].map { server in
+            commandLine(["list-sessions", "-F", "#{session_name}"], session: "", socket: server)
+                + " 2>&1; echo \"\(listingEnd)$?\""
+        }.joined(separator: "; ")
+    }
+
+    private static let listingEnd = ":muxel-listed:"
+
+    /// `confirmedTargetsCommand`'s output, one answer per server (muxel's own, then
+    /// the default one): the sessions it listed, `[]` for a server confirmed not
+    /// running, or `nil` for any other reply, one cut off before that server
+    /// answered included. A server's answer stands whatever the other said.
+    /// `complete` is whether both answered and nothing but whitespace followed.
+    ///
+    /// A listing that exited 0 holds one exact session name per line. An empty
+    /// line is no name tmux lists, so it spoils that server's answer. Lines end in
+    /// `\n` or `\r\n`, as Rust's `str::lines` reads them. Port of
+    /// `ssh::checked_session_listings_on` — keep both in step.
+    static func parseConfirmedListings(_ output: String) -> (answers: [[SessionTarget]?], complete: Bool) {
+        let servers = [socketName, "default"]
+        var answers: [[SessionTarget]?] = []
+        var listing: [String] = []
+        var complete = true
+        // "\r\n" is one Character, so it needs naming beside "\n".
+        for raw in output.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" }) {
+            let line = String(raw)
+            guard line.hasPrefix(listingEnd) else {
+                listing.append(line); continue
+            }
+            if answers.count < servers.count {
+                answers.append(checkedListing(listing, status: String(line.dropFirst(listingEnd.count)),
+                                              server: servers[answers.count]))
+            } else {
+                complete = false  // more answers than servers asked
+            }
+            listing = []
+        }
+        complete = complete && answers.count == servers.count
+            && listing.allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        while answers.count < servers.count { answers.append(nil) }
+        return (answers, complete)
+    }
+
+    private static func checkedListing(_ listing: [String], status: String, server: String) -> [SessionTarget]? {
+        let status = status.trimmingCharacters(in: .whitespacesAndNewlines)
+        if status == "0" {
+            guard !listing.contains(where: { $0.isEmpty }) else { return nil }
+            return listing.map { SessionTarget(name: $0, socket: server) }
+        }
+        // A malformed status is not a failed tmux command, even when its output
+        // resembles an absent server.
+        guard let code = UInt8(status), code != 0,
+              confirmedNoServer(listing.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        return []
+    }
+
+    /// Default migration needs both complete replies. Ordinary best-effort
+    /// discovery cannot distinguish an empty server from a permission failure.
+    /// Port of `ssh::parse_session_listings_for_migration`.
+    static func parseConfirmedTargets(_ output: String) throws -> [SessionTarget] {
+        let (answers, complete) = parseConfirmedListings(output)
+        let confirmed = answers.compactMap { $0 }
+        guard complete, confirmed.count == answers.count else { throw ProbeError.incomplete }
+        return confirmed.flatMap { $0 }
+    }
+
+    /// What a pane recorded on the default server attaches to or moves from. A
+    /// session still listed there under `name` is reattached on that answer alone,
+    /// whatever muxel's own server replied (an rc file's echo, an unfamiliar
+    /// error): only moving it off Default (`targetForNewSession`) needs both
+    /// servers' checked answers. Port of `ssh::still_on_default`.
+    static func defaultOwnerTargets(_ output: String, name: String) throws -> [SessionTarget] {
+        if let onDefault = parseConfirmedListings(output).answers[1],
+           onDefault.contains(where: { $0.name == name }) {
+            return onDefault
+        }
+        return try parseConfirmedTargets(output)
+    }
+
+    private static func confirmedNoServer(_ message: String) -> Bool {
+        guard !message.contains("\n") else { return false }
+        let absent = "no server running on "
+        if message.hasPrefix(absent) { return message.count > absent.count }
+        let connecting = "error connecting to "
+        guard message.hasPrefix(connecting) else { return false }
+        return [" (No such file or directory)", " (Connection refused)"].contains { suffix in
+            message.hasSuffix(suffix) && message.count > connecting.count + suffix.count
+        }
+    }
+
+    /// Called only after checked inventory. A Private namesake stops the plan
+    /// until saved ownership is refreshed; inventory alone cannot identify it.
+    static func targetForNewSession(_ instance: Instance, name: String, confirmedTargets: [SessionTarget])
+        throws -> (target: SessionTarget, migration: DefaultMigration?) {
+        let owner = instance.tmuxSocket ?? socketName
+        if owner == "default",
+           !confirmedTargets.contains(where: { $0.name == name && $0.socket == "default" }) {
+            guard !confirmedTargets.contains(where: { $0.name == name && $0.socket == socketName }) else {
+                throw ProbeError.ownershipRefreshRequired
+            }
+            return (.init(name: name, socket: socketName),
+                    DefaultMigration(recordedSession: instance.tmuxSession, sessionName: name))
+        }
+        return (.init(name: name, socket: owner), nil)
+    }
+
     /// Keep server identity beside every name, including duplicate names.
     static func listTargetsCommand(socket: String? = nil) -> String {
         let servers = socket.map { [$0] } ?? [socketName, "default"]

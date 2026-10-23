@@ -532,8 +532,9 @@ pub struct Instance {
     /// tmux session name, once created.
     #[serde(default)]
     pub tmux_session: Option<String>,
-    /// The server that owns the session. Absent only for older saved panes.
-    #[serde(default)]
+    /// The server that owns the session. Absent only for older saved panes (or
+    /// one recorded under a name tmux can't use, see [`tmux::recorded_socket`]).
+    #[serde(default, deserialize_with = "tmux::recorded_socket")]
     pub tmux_socket: Option<tmux::Socket>,
     /// The grid `(cols, rows)` this pane last rendered at, so it can respawn at the
     /// size it will actually be laid out at instead of the 80×24 default.
@@ -633,7 +634,7 @@ impl Instance {
     pub fn tmux_target(&self, slug: &str) -> tmux::SessionTarget {
         tmux::SessionTarget::new(
             tmux::session_for(self.tmux_session.as_deref(), slug, self.id),
-            self.tmux_socket,
+            self.tmux_socket.clone(),
         )
     }
 
@@ -1527,7 +1528,9 @@ pub fn merge_peer_instances(
                         || instance.tmux_session == mine.tmux_session)
                 {
                     instance.tmux_session = mine.tmux_session.clone();
-                    instance.tmux_socket = mine.tmux_socket;
+                    instance.tmux_socket = mine.tmux_socket.clone();
+                } else if moved_off_default(&instance, mine) {
+                    instance.tmux_socket = mine.tmux_socket.clone();
                 }
                 if instance.session_id.is_some() && instance.session_id == mine.session_id {
                     instance.session_path =
@@ -1536,6 +1539,54 @@ pub fn merge_peer_instances(
             }
             instance
         })
+        .collect()
+}
+
+/// Whether `moved` has already taken `stale`'s session off the default tmux
+/// server: both name the same session, `stale` on Default and `moved` on muxel's
+/// own. No client creates a session on Default any more, so that move is one-way,
+/// and a copy of the pane that predates it (a peer's layout, or this machine's
+/// own unpushed one) must not undo it. Undone, the pane would refuse to launch
+/// (Default is gone and `mxl` has the namesake) and closing it would kill on
+/// Default, orphaning the agent on `mxl`.
+pub fn moved_off_default(stale: &Instance, moved: &Instance) -> bool {
+    stale.tmux_socket == Some(tmux::Socket::Default)
+        && moved.tmux_socket == Some(tmux::Socket::Private)
+        && stale.tmux_session.is_some()
+        && stale.tmux_session == moved.tmux_session
+}
+
+/// Before this machine's layout (`local`) overwrites the shared file: keep every
+/// Default→`mxl` move the file records that `local` doesn't have yet (see
+/// [`moved_off_default`]). Returns the panes it moved, with their session names,
+/// for this machine to make the same move.
+pub fn keep_moves_off_default(local: &mut [Instance], file: &[Instance]) -> Vec<(Uuid, String)> {
+    let mut moved = Vec::new();
+    for instance in local {
+        if let Some(theirs) = file.iter().find(|f| f.id == instance.id)
+            && moved_off_default(instance, theirs)
+            && let Some(name) = instance.tmux_session.clone()
+        {
+            instance.tmux_socket = theirs.tmux_socket.clone();
+            moved.push((instance.id, name));
+        }
+    }
+    moved
+}
+
+/// The panes in both `before` and `after` whose tmux binding (session name and
+/// owner) differs between them: after a peer layout is adopted, a pane that failed
+/// to launch on its old binding can try the new one.
+pub fn rebound_instances(before: &[Instance], after: &[Instance]) -> Vec<Uuid> {
+    after
+        .iter()
+        .filter(|now| {
+            before.iter().any(|was| {
+                was.id == now.id
+                    && (was.tmux_session != now.tmux_session || was.tmux_socket != now.tmux_socket)
+            })
+        })
+        .map(|now| now.id)
         .collect()
 }
 
@@ -1566,7 +1617,7 @@ pub fn dedupe_instances(workspace: &mut Workspace) {
             .tmux_session
             .as_ref()
             .filter(|s| !s.is_empty())
-            .map(|s| (inst.project_id, inst.tmux_socket, s.clone()));
+            .map(|s| (inst.project_id, inst.tmux_socket.clone(), s.clone()));
         // A tmux session is claimed by exactly one instance per project.
         if claim.is_some_and(|c| !seen_sessions.insert(c)) {
             unlink.push(inst.id);
@@ -3722,6 +3773,104 @@ mod remote_layout_tests {
         assert_eq!(a.tmux_session, added.tmux_session);
     }
 
+    /// A pane this machine moved off Default (saved, not yet pushed) against a
+    /// peer layout that still has it there, and the reverse.
+    fn moved_and_stale() -> (Instance, Instance) {
+        let mut moved = Instance::shell(Uuid::new_v4());
+        moved.tmux_session = Some("muxel_proj_12345678".into());
+        moved.tmux_socket = Some(tmux::Socket::Private);
+        let mut stale = moved.clone();
+        stale.tmux_socket = Some(tmux::Socket::Default);
+        stale.custom_name = Some("Renamed by the peer".into());
+        (moved, stale)
+    }
+
+    #[test]
+    fn a_peer_layout_cannot_move_a_pane_back_onto_default() {
+        let (moved, stale) = moved_and_stale();
+        let merged = merge_peer_instances(
+            std::slice::from_ref(&moved),
+            vec![stale.clone()],
+            moved.project_id,
+        );
+        assert_eq!(merged[0].tmux_socket, Some(tmux::Socket::Private));
+        assert_eq!(merged[0].tmux_session, moved.tmux_session);
+        // The rest of the peer's copy still wins.
+        assert_eq!(merged[0].custom_name, stale.custom_name);
+
+        // The other way round the peer's move is adopted as usual.
+        let merged = merge_peer_instances(
+            std::slice::from_ref(&stale),
+            vec![moved.clone()],
+            moved.project_id,
+        );
+        assert_eq!(merged[0].tmux_socket, Some(tmux::Socket::Private));
+
+        // Only the same session moves one way: a peer that rebound the pane to
+        // another session on Default, or to another server, is adopted.
+        let mut rebound = stale.clone();
+        rebound.tmux_session = Some("imported".into());
+        let mut named = stale.clone();
+        named.tmux_socket = Some(tmux::Socket::Named("peer".into()));
+        for peer in [rebound, named] {
+            let merged = merge_peer_instances(
+                std::slice::from_ref(&moved),
+                vec![peer.clone()],
+                moved.project_id,
+            );
+            assert_eq!(merged[0].tmux_socket, peer.tmux_socket);
+            assert_eq!(merged[0].tmux_session, peer.tmux_session);
+        }
+    }
+
+    #[test]
+    fn a_push_keeps_a_move_off_default_the_file_already_has() {
+        let (moved, stale) = moved_and_stale();
+        let mut other = Instance::shell(moved.project_id);
+        other.tmux_session = Some("work".into());
+        other.tmux_socket = Some(tmux::Socket::Default);
+        let mut local = vec![stale.clone(), other.clone()];
+        let mut file_other = other.clone();
+        file_other.tmux_session = Some("elsewhere".into());
+        file_other.tmux_socket = Some(tmux::Socket::Private);
+        let ids = keep_moves_off_default(&mut local, &[moved.clone(), file_other]);
+        assert_eq!(ids, vec![(moved.id, "muxel_proj_12345678".to_string())]);
+        assert_eq!(local[0].tmux_socket, Some(tmux::Socket::Private));
+        assert_eq!(
+            local[0].custom_name, stale.custom_name,
+            "only the owner moves"
+        );
+        assert_eq!(
+            (&local[1].tmux_session, &local[1].tmux_socket),
+            (&other.tmux_session, &other.tmux_socket),
+            "a different session is not this pane's move"
+        );
+
+        // A file that predates the move changes nothing.
+        let mut local = vec![moved.clone()];
+        assert!(keep_moves_off_default(&mut local, &[stale]).is_empty());
+        assert_eq!(local[0].tmux_socket, moved.tmux_socket);
+    }
+
+    #[test]
+    fn rebound_instances_are_those_whose_session_or_owner_changed() {
+        let (moved, stale) = moved_and_stale();
+        let mut renamed = stale.clone();
+        renamed.tmux_session = Some("other".into());
+        let mut titled = stale.clone();
+        titled.custom_name = Some("only the title".into());
+        let added = Instance::shell(moved.project_id);
+        assert_eq!(
+            rebound_instances(std::slice::from_ref(&stale), std::slice::from_ref(&moved)),
+            vec![moved.id]
+        );
+        assert_eq!(
+            rebound_instances(std::slice::from_ref(&stale), &[renamed]),
+            vec![stale.id]
+        );
+        assert!(rebound_instances(std::slice::from_ref(&stale), &[titled, added]).is_empty());
+    }
+
     /// Reduce a desktop pane subtree to what the iOS `PaneNode` encoder writes: only
     /// its coding keys (no `pane_id`).
     fn as_ios_pane(node: &mut serde_json::Value) {
@@ -3855,6 +4004,63 @@ mod remote_layout_tests {
         legacy.tmux_socket = None;
         let merged = merge_peer_instances(&ws.instances, vec![legacy], a.project_id);
         assert_eq!(merged[0].tmux_target("p"), a.tmux_target("p"));
+    }
+
+    #[test]
+    fn unfamiliar_socket_owners_preserve_every_peer_pane() {
+        let mut ws = Workspace::default();
+        let mut project = remote_project("/srv/app");
+        let instances: Vec<_> = ["mxl", "default", "mxl-profile", "   ", "owner '名; $()"]
+            .into_iter()
+            .map(|name| {
+                let mut instance = Instance::shell(project.id);
+                instance.tmux_session = Some("same-name".into());
+                instance.tmux_socket = Some(tmux::Socket::try_from(name.to_string()).unwrap());
+                instance
+            })
+            .collect();
+        let ids: Vec<_> = instances.iter().map(|i| i.id).collect();
+        project.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: ids.clone(),
+            active: 0,
+        }));
+        ws.instances = instances.clone();
+        ws.projects = vec![project.clone()];
+        let doc = RemoteLayout::capture(&project, &ws, 42);
+        let parsed = RemoteLayout::parse(&doc.to_json(), "/srv/app").unwrap();
+        assert_eq!(parsed.instances.len(), instances.len());
+        assert_eq!(parsed.layout.as_ref().unwrap().collect_instances(), ids);
+        for expected in &instances {
+            let actual = parsed
+                .instances
+                .iter()
+                .find(|i| i.id == expected.id)
+                .unwrap();
+            assert_eq!(actual.tmux_target("p"), expected.tmux_target("p"));
+        }
+        assert_eq!(
+            RemoteLayout::parse(&parsed.to_json(), "/srv/app")
+                .unwrap()
+                .content_key(),
+            doc.content_key()
+        );
+        ws.instances = merge_peer_instances(&instances, parsed.instances, project.id);
+        dedupe_instances(&mut ws);
+        assert_eq!(
+            ws.instances.len(),
+            instances.len(),
+            "different owners must not collapse namesakes"
+        );
+
+        // An owner tmux can't use as a socket name costs only that owner.
+        let mut json: serde_json::Value = serde_json::from_str(&doc.to_json()).unwrap();
+        json["instances"][2]["tmux_socket"] = serde_json::json!("../elsewhere");
+        let parsed = RemoteLayout::parse(&json.to_string(), "/srv/app").unwrap();
+        assert_eq!(parsed.instances.len(), instances.len());
+        let invalid = &parsed.instances[2];
+        assert_eq!(invalid.tmux_socket, None);
+        assert_eq!(invalid.tmux_session.as_deref(), Some("same-name"));
     }
 
     #[test]

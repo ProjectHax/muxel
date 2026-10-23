@@ -354,7 +354,7 @@ pub(super) fn codex_restore_query(
                         other
                             .tmux_session
                             .as_ref()
-                            .map(|name| SessionTarget::new(name.clone(), other.tmux_socket))
+                            .map(|name| SessionTarget::new(name.clone(), other.tmux_socket.clone()))
                     })
                     .collect(),
             }
@@ -365,7 +365,7 @@ pub(super) fn codex_restore_query(
         tmux: instance
             .tmux_session
             .as_ref()
-            .map(|name| SessionTarget::new(name.clone(), instance.tmux_socket)),
+            .map(|name| SessionTarget::new(name.clone(), instance.tmux_socket.clone())),
     })
 }
 
@@ -686,7 +686,7 @@ impl MuxelApp {
                 .unwrap_or(&project.root_path)
                 .clone(),
             hint,
-            tmux_socket: tmux_session.as_ref().and(instance.tmux_socket),
+            tmux_socket: tmux_session.as_ref().and(instance.tmux_socket.clone()),
             tmux_session,
         })
     }
@@ -874,7 +874,7 @@ fn discover_sessions(
                     let hint = key.hint.clone().or_else(|| {
                         key.tmux_session
                             .as_deref()
-                            .zip(key.tmux_socket)
+                            .zip(key.tmux_socket.clone())
                             .and_then(|(session, socket)| codex_tmux_title(session, socket))
                             .and_then(|title| {
                                 muxel_core::codex_session_hint_from_title(
@@ -1160,7 +1160,7 @@ mod w8lm_tests {
         instance.tmux_socket = Some(Socket::Default);
         key.hint = None;
         key.tmux_session = codex_tmux_capture_session(&instance, key.hint.as_deref());
-        key.tmux_socket = instance.tmux_socket;
+        key.tmux_socket = instance.tmux_socket.clone();
         assert_eq!(key.tmux_session.as_deref(), Some("muxel_test_owned"));
         let _reader = inject_codex_tmux_title_reader(Arc::new(move |session, socket| {
             assert_eq!(session, "muxel_test_owned");
@@ -1206,7 +1206,7 @@ mod w8lm_tests {
         target.use_tmux = true;
         target.session_started = true;
         target.tmux_session = key.tmux_session.clone();
-        target.tmux_socket = key.tmux_socket;
+        target.tmux_socket = key.tmux_socket.clone();
         let workspace = Workspace {
             projects: vec![project],
             instances: vec![owner, target],

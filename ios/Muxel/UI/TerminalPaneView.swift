@@ -167,9 +167,21 @@ struct TerminalPaneView: View {
         do {
             let conn = state.connection(for: host)
             try await conn.connect()
-            guard let plan = try await state.prepareTmuxAttachment(instanceId: instance.id, in: project, prepare: { current in
-                let targets = TmuxCommands.parseTargets(try await conn.run(
-                    TmuxCommands.listTargetsCommand(socket: current.tmuxSocket)))
+            guard let plan = try await state.prepareTmuxAttachmentPlan(instanceId: instance.id, in: project, prepare: { current in
+                // The name a new session gets: the authoritative one recorded in the
+                // shared layout (`tmux_session`), so we converge with the name desktop
+                // uses for this instance; else one derived from the host name.
+                let name = (current.tmuxSession?.isEmpty == false)
+                    ? current.tmuxSession!
+                    : TmuxSession.name(hostName: host.name, instanceId: current.id)
+                let targets: [TmuxCommands.SessionTarget]
+                if current.tmuxSocket == "default" {
+                    targets = try TmuxCommands.defaultOwnerTargets(
+                        try await conn.run(TmuxCommands.confirmedTargetsCommand()), name: name)
+                } else {
+                    targets = TmuxCommands.parseTargets(try await conn.run(
+                        TmuxCommands.listTargetsCommand(socket: current.tmuxSocket)))
+                }
                 let command: String
                 let sessionName: String
                 let socket: String
@@ -178,6 +190,7 @@ struct TerminalPaneView: View {
                 var startupDelayMs = 0
                 var startupSubmit = false
                 var resumeSessionId: String?
+                var migration: TmuxCommands.DefaultMigration?
                 if let live = TmuxCommands.resolveTarget(current, in: targets) {
                     // A live session for this instance already exists (created by desktop or
                     // a prior attach) — attach to its real name, whatever slug it carries.
@@ -185,15 +198,12 @@ struct TerminalPaneView: View {
                     socket = live.socket
                     command = TmuxCommands.attachPTYCommand(session: live.name, socket: socket)
                 } else {
-                    // Creating it: prefer the authoritative name recorded in the shared
-                    // layout (`tmux_session`) so we converge with the name desktop uses for
-                    // this instance; fall back to deriving one from the host name.
+                    // Creating it, under `name`.
                     creating = true
-                    socket = current.tmuxSocket ?? TmuxCommands.socketName
-                    let name = (current.tmuxSession?.isEmpty == false)
-                        ? current.tmuxSession!
-                        : TmuxSession.name(hostName: host.name, instanceId: current.id)
                     sessionName = name
+                    let prepared = try TmuxCommands.targetForNewSession(current, name: name, confirmedTargets: targets)
+                    socket = prepared.target.socket
+                    migration = prepared.migration
 
                     // Resolve program/args like desktop: model/effort/extra are already in
                     // `args`; apply the system-prompt injection + prepend session-resume args.
@@ -213,11 +223,12 @@ struct TerminalPaneView: View {
                     startupSubmit = resolved.submit
                     if resumeCapable { resumeSessionId = inst.sessionId }
                 }
-                return (target: .init(name: sessionName, socket: socket),
+                return TmuxAttachmentPlan(target: .init(name: sessionName, socket: socket),
                         attachment: AttachmentPlan(command: command, sessionName: sessionName, socket: socket,
                                                    creating: creating, startupInput: startupInput,
                                                    startupDelayMs: startupDelayMs, startupSubmit: startupSubmit,
-                                                   resumeSessionId: resumeSessionId))
+                                                   resumeSessionId: resumeSessionId),
+                                          defaultMigration: migration)
             }) else { return false }
             guard !Task.isCancelled, state.selectedProject?.id == project.id,
                   let accepted = state.layout?.instances.first(where: { $0.id == instance.id }),
