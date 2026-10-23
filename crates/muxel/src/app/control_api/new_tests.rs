@@ -11,6 +11,7 @@ use muxel_terminal::CommandSpec;
 use serde_json::{Value, json};
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::{Arc, atomic::AtomicBool};
 use uuid::Uuid;
 
 #[path = "new.rs"]
@@ -452,13 +453,30 @@ fn control_new_startup_wait_is_pending_before_placement_until_actual_submission(
     let activity = muxel_core::AgentActivity::default();
     assert!(turn.awaiting_reply(Some(ctl::AgentState::Idle), &activity, 90_000));
     let owner = turn.startup.as_ref().unwrap().claim().unwrap();
+    let shell_grant = Arc::new(AtomicBool::new(true));
     let spec = control_launch_spec(
         Some(instance),
         Some(turn),
         Some(owner),
-        CommandSpec::program("codex", vec![]).with_startup_input("task"),
+        CommandSpec::program("codex", vec![])
+            .with_startup_input("task")
+            .with_tmux_client(true),
+        &shell_grant,
     );
     assert!(!spec.allow_shell_fallback);
+    assert!(Arc::ptr_eq(
+        spec.startup_shell_grant.as_ref().unwrap(),
+        &shell_grant
+    ));
+    let direct = ControlTurn::startup("direct".into());
+    let direct_spec = control_launch_spec(
+        Some(instance),
+        Some(&direct),
+        direct.startup.as_ref().unwrap().claim(),
+        CommandSpec::program("codex", vec![]).with_startup_input("direct"),
+        &shell_grant,
+    );
+    assert!(direct_spec.startup_shell_grant.is_none());
     spec.startup_turn.as_ref().unwrap().enter_admitted(90_001);
     assert!(turn.awaiting_reply(Some(ctl::AgentState::Idle), &activity, 120_000));
     spec.startup_turn.as_ref().unwrap().submitted(90_001);
@@ -538,18 +556,19 @@ fn control_new_startup_lost_owner_suppresses_input_and_controller_drop_cancels_l
         .with_auto_mode(2);
     // Even without the outside-creation marker (a duplicate drops it), a task
     // with no runtime owner is never typed by ordinary automation.
-    let unmarked = control_launch_spec(Some(&instance), None, None, ordinary.clone());
+    let shell_grant = Arc::new(AtomicBool::new(true));
+    let unmarked = control_launch_spec(Some(&instance), None, None, ordinary.clone(), &shell_grant);
     assert!(unmarked.allow_shell_fallback);
     assert!(unmarked.startup_input.is_none());
     assert!(!unmarked.submit);
     instance.control_created = true;
-    let restored = control_launch_spec(Some(&instance), None, None, ordinary.clone());
+    let restored = control_launch_spec(Some(&instance), None, None, ordinary.clone(), &shell_grant);
     assert!(
         restored.startup_input.is_none(),
         "cancelled startup must not replay after losing runtime state"
     );
     assert!(!restored.submit);
-    let cancelled = control_launch_spec(Some(&instance), Some(&turn), None, ordinary);
+    let cancelled = control_launch_spec(Some(&instance), Some(&turn), None, ordinary, &shell_grant);
     assert!(cancelled.startup_input.is_none());
     assert_eq!(cancelled.auto_mode_presses, 0);
     assert!(!cancelled.submit);
@@ -558,7 +577,7 @@ fn control_new_startup_lost_owner_suppresses_input_and_controller_drop_cancels_l
     // instructions merely because their old control-turn record still exists.
     instance.system_prompt = None;
     let ordinary = CommandSpec::program("codex", vec![]).with_startup_input("new rules");
-    let spec = control_launch_spec(Some(&instance), Some(&turn), None, ordinary);
+    let spec = control_launch_spec(Some(&instance), Some(&turn), None, ordinary, &shell_grant);
     assert_eq!(spec.startup_input.as_deref(), Some("new rules"));
     let next = ControlTurn::startup("next".into());
     let next_owner = next.startup.as_ref().unwrap().claim().unwrap();
@@ -687,14 +706,10 @@ fn control_new_policy_write_entry_points_recheck_permission() {
         .split("    fn control_claim_site(")
         .next()
         .unwrap();
-    assert!(
-        write_boundary
-            .find(
-                "control_program_writable(inst, self.settings.control_allow_shells, tmux_client)?"
-            )
-            .unwrap()
-            < write_boundary.find("self.control_state(").unwrap()
-    );
+    let gate = write_boundary.find("control_program_writable(").unwrap();
+    assert!(write_boundary[..gate].contains(".terminal_view(iid)"));
+    assert!(write_boundary[gate..].contains("uses_tmux_client()"));
+    assert!(gate < write_boundary.find("self.control_state(").unwrap());
     for (method, next) in [
         ("control_send", "control_answer"),
         ("control_answer", "control_keys"),
@@ -966,9 +981,9 @@ fn control_new_policy_production_queue_enters_the_tested_mutation_boundary() {
         .split("    fn control_claim_site(")
         .next()
         .unwrap();
-    assert!(write_boundary.contains(
-        "control_program_writable(inst, self.settings.control_allow_shells, tmux_client)?"
-    ));
+    let gate = write_boundary.find("control_program_writable(").unwrap();
+    assert!(write_boundary[..gate].contains(".terminal_view(iid)"));
+    assert!(write_boundary[gate..].contains("uses_tmux_client()"));
 }
 
 #[test]

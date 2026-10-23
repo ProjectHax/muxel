@@ -727,6 +727,8 @@ feature is added or changed, update the matching entry here in the same change**
   non-literal presets not classified as shells need only the first two grants for
   creation alone. `new --prompt` also needs the shell-input grant when the new
   pane uses a tmux client, since the prompt is typed through that client.
+  A queued tmux prompt checks that grant again before paste, Enter and any
+  Enter retry; revoking it stops the remaining startup writes.
   Literal argv and shell presets always Ask, even under Allow. All three grants
   default off; upgrades do not infer creation permission from older
   control/command grants. Users enable the required settings themselves.
@@ -807,6 +809,8 @@ feature is added or changed, update the matching entry here in the same change**
   Turning "Also allow typing into shell panes" off refuses subsequent control
   writes to every literal argv pane, even agent-looking or interpreter programs,
   panes classified as shells, and tmux-backed panes.
+  For a running pane, this decision uses the transport its terminal launched
+  with, so a saved tmux name does not restrict a direct Windows SSH pane.
   Direct non-literal agents remain controllable while outside control is on;
   disabling all outside control is a separate setting. Delayed Enter and keys
   recheck the shell-input grant and terminal/session availability before writing.

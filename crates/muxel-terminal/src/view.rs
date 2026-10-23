@@ -2255,6 +2255,7 @@ impl TerminalView {
         } = launch;
         let startup_input = spec.startup_input.clone();
         let startup_owner = spec.startup_turn.clone();
+        let startup_shell_grant = spec.startup_shell_grant.clone();
         let title_source = spec.title_source.clone();
         let startup_turn = startup_owner
             .as_ref()
@@ -2327,7 +2328,8 @@ impl TerminalView {
             let armed_at = Instant::now();
             let deadline = controlled_startup_deadline(startup_delay_ms, auto_mode_presses);
             let mut guard = crate::startup::Guard::new(session.input_rev(), Some(deadline))
-                .with_control_turn(Some(owner));
+                .with_control_turn(Some(owner))
+                .with_shell_grant(startup_shell_grant);
             // Only a task that is still waiting pays for reading the title
             // through tmux, and only until its startup settles either way.
             let probe = title_source.map(|source| {
@@ -2511,6 +2513,7 @@ impl TerminalView {
                             "automation-unsupported-provider"
                         }
                         crate::startup::Stop::WriteFailed => "automation-write-failed",
+                        crate::startup::Stop::PermissionRevoked => "automation-permission-revoked",
                     };
                     profile::startup_event(
                         instance_id,

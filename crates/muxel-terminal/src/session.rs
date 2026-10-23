@@ -692,6 +692,9 @@ pub struct CommandSpec {
     pub startup_input: Option<String>,
     /// Runtime lease for the first task created through outside control.
     pub startup_turn: Option<muxel_core::control::StartupTurnOwner>,
+    /// Live shell-input grant sampled for each outside-control startup write
+    /// when this launch uses an attached tmux client.
+    pub startup_shell_grant: Option<Arc<AtomicBool>>,
     /// Where that task's startup reads the provider's title when the PTY can't
     /// see it (a tmux-wrapped pane). Unused by any other automation.
     pub title_source: Option<TitleSource>,
@@ -711,6 +714,9 @@ pub struct CommandSpec {
     pub startup_delay_ms: u32,
     /// The provider conversation this launch opens, if muxel knows it.
     pub binding: LaunchBinding,
+    /// Whether this command attaches a tmux client, decided while constructing
+    /// the actual launch rather than from persisted pane metadata.
+    pub tmux_client: bool,
 }
 
 impl CommandSpec {
@@ -734,12 +740,14 @@ impl CommandSpec {
             startup_input: None,
             auto_mode_presses: 0,
             startup_turn: None,
+            startup_shell_grant: None,
             title_source: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
+            tmux_client: false,
         }
     }
 
@@ -759,12 +767,14 @@ impl CommandSpec {
             startup_input: None,
             auto_mode_presses: 0,
             startup_turn: None,
+            startup_shell_grant: None,
             title_source: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
+            tmux_client: false,
         }
     }
 
@@ -830,6 +840,11 @@ impl CommandSpec {
 
     pub fn with_binding(mut self, binding: LaunchBinding) -> Self {
         self.binding = binding;
+        self
+    }
+
+    pub fn with_tmux_client(mut self, tmux_client: bool) -> Self {
+        self.tmux_client = tmux_client;
         self
     }
 
@@ -997,6 +1012,7 @@ pub(crate) struct PointerHit {
 
 pub struct TerminalSession {
     pub id: Uuid,
+    tmux_client: bool,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
     writer: SharedWriter,
@@ -1202,6 +1218,11 @@ pub(crate) struct PaintDrawList {
 }
 
 impl TerminalSession {
+    /// Transport of the PTY child that successfully launched for this session.
+    pub fn uses_tmux_client(&self) -> bool {
+        self.tmux_client
+    }
+
     /// Spawn a PTY running `spec` at the given initial grid size. Returns the
     /// session plus the receiver the UI drains for output/exit events.
     pub fn spawn(spec: CommandSpec, cols: u16, rows: u16) -> Result<(Arc<Self>, PtyReceiver)> {
@@ -1506,6 +1527,7 @@ impl TerminalSession {
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
+            tmux_client: spec.tmux_client,
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
             writer,
