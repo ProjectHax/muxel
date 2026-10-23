@@ -6,12 +6,14 @@ use crate::colors::TerminalPalette;
 use crate::element::TerminalElement;
 use crate::keymap::{KeyModifiers, key_to_bytes};
 use crate::profile;
-use crate::session::{CommandSpec, ProfiledPtyChunk, ProfiledPtyReceiver, TerminalSession};
+use crate::session::{
+    CommandSpec, ProfiledPtyChunk, ProfiledPtyReceiver, PtyOutput, TerminalSession,
+};
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
 use gpui::*;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 /// Stop draining after this many bytes in a single turn so one noisy terminal
@@ -50,6 +52,10 @@ const CURSOR_HIDE_HOLD: Duration = Duration::from_millis(80);
 /// observation through a brief missing frame so a repaint cannot forge a
 /// Working→Done→Working lifecycle and duplicate completion notifications.
 const GROK_SCREEN_WORKING_HOLD: Duration = Duration::from_secs(2);
+
+/// Visible lifecycle parsing is independent from paint cadence, but it still
+/// must not allocate a full grid string for every PTY read under stream load.
+const STATUS_SCREEN_SCAN_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Pure paint-priority policy (see `docs/terminal-paint-architecture.md`).
 /// Extracted so we can unit-test without a full GPUI window.
@@ -94,6 +100,43 @@ fn next_paint_schedule(
     }
 }
 
+/// The `(min_interval, defer)` an output batch asks [`next_paint_schedule`] for.
+/// A runtime status change drops the throttle so it paints ahead of it, but
+/// waits out a cursor-hide hold: this batch's own, or (`held_for`) an earlier
+/// batch's still pending while the cursor stays hidden. The facts are already
+/// current for readers (`ctl`, the sidebar's next read), and painting now would
+/// draw the cursorless mid-redraw frame that [`CURSOR_HIDE_HOLD`] exists to skip.
+fn paint_request(
+    runtime_changed: bool,
+    throttle: Duration,
+    batch_hold: Duration,
+    held_for: Duration,
+) -> (Duration, Duration) {
+    if runtime_changed {
+        (Duration::ZERO, batch_hold.max(held_for))
+    } else {
+        (throttle, batch_hold)
+    }
+}
+
+/// The cursor-hide hold left armed once a paint is scheduled: the deadline of a
+/// pending paint that a hold set, or `None` when no such paint is pending. A
+/// later batch that replaces the held paint ends the hold, as does any paint.
+fn hold_after(schedule: PaintSchedule, defer: Duration, held: Option<Instant>) -> Option<Instant> {
+    match schedule {
+        PaintSchedule::Now => None,
+        PaintSchedule::At(deadline) => (!defer.is_zero()).then_some(deadline),
+        PaintSchedule::KeepPending => held,
+    }
+}
+
+/// How long a status repaint found off the output path (the runtime deadline
+/// timer, a runtime event) must wait: until the held paint, which then draws
+/// the change, or not at all.
+fn status_paint_defer(held: Option<Instant>, now: Instant) -> Duration {
+    held.map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
+}
+
 /// A small margin between the terminal grid and the pane edge. The grid (and so
 /// the reported size) is computed from the inset area, giving a TUI that renders
 /// wider than expected some breathing room from the border/scrollbar instead of
@@ -125,6 +168,400 @@ pub enum AgentStatus {
     Blocked,
     /// Finished a turn (rang the bell) or the process exited.
     Done,
+}
+
+/// Strongest visible fact behind the current lifecycle badge. This is evidence,
+/// not a decision: without provider hooks, nothing here covers hidden work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalStatusReason {
+    ProcessExit,
+    BlockedMarker,
+    WorkingMarker,
+    ProviderTitle,
+    ProviderScreen,
+    Bell,
+    RecentOutput,
+    Quiet,
+}
+
+/// Scope of the no-hook evidence used by the runtime reducer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalStatusCoverage {
+    /// Only PTY activity/bell/exit is available; quiet does not prove no work.
+    ActivityOnly,
+    /// Configured markers add visible-grid semantics, but not hidden-work proof.
+    VisibleMarkers,
+    /// A provider-owned title/screen contract is active, still visible-only.
+    ProviderVisible,
+}
+
+/// Immutable per-launch facts. Reads never scan the grid or advance lifecycle
+/// state; output/input/resize/deadline events reconcile the owning view first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalRuntimeSnapshot {
+    pub status: AgentStatus,
+    pub attributable: bool,
+    pub reason: TerminalStatusReason,
+    pub coverage: TerminalStatusCoverage,
+    pub launch_id: Uuid,
+    pub binding_rev: u64,
+    pub snapshot_seq: u64,
+    pub input_rev: u64,
+    pub draft_latched: bool,
+    pub completion_ready: bool,
+}
+
+impl TerminalRuntimeSnapshot {
+    /// A switch invalidates the cached facts before its queued reconciliation.
+    pub fn is_attributable_to(&self, binding_rev: u64) -> bool {
+        self.attributable && self.binding_rev == binding_rev
+    }
+}
+
+struct RuntimeStatusState {
+    status: AgentStatus,
+    reason: TerminalStatusReason,
+    /// See [`status_is_attributable`].
+    attributable: bool,
+    /// See [`screen_hold_after`].
+    screen_held: bool,
+    coverage: TerminalStatusCoverage,
+    snapshot_seq: u64,
+    binding_rev: u64,
+    /// Last title edge read from the session; `None` replays the current
+    /// binding's edges from its start.
+    title_cursor: Option<u64>,
+    content_generation: u64,
+    last_screen_capture: Option<Instant>,
+    working_marker: bool,
+    blocked_marker: bool,
+    provider_screen: Option<AgentStatus>,
+    prev_raw: Option<AgentStatus>,
+    done_latch: bool,
+    completion_armed: bool,
+    provider_settled: bool,
+    completion_ready: bool,
+    semantic_title_status: Option<AgentStatus>,
+    grok_blocked_at: Option<Instant>,
+    grok_screen_working_at: Option<Instant>,
+    deadline: Option<Instant>,
+    timer_generation: u64,
+}
+
+impl RuntimeStatusState {
+    fn new(coverage: TerminalStatusCoverage) -> Self {
+        Self {
+            status: AgentStatus::Idle,
+            reason: TerminalStatusReason::Quiet,
+            attributable: true,
+            screen_held: false,
+            coverage,
+            snapshot_seq: 0,
+            binding_rev: 0,
+            title_cursor: None,
+            content_generation: 0,
+            last_screen_capture: None,
+            working_marker: false,
+            blocked_marker: false,
+            provider_screen: None,
+            prev_raw: None,
+            done_latch: false,
+            completion_armed: false,
+            provider_settled: false,
+            completion_ready: false,
+            semantic_title_status: None,
+            grok_blocked_at: None,
+            grok_screen_working_at: None,
+            deadline: None,
+            timer_generation: 0,
+        }
+    }
+
+    fn snapshot(&self, session: &TerminalSession) -> TerminalRuntimeSnapshot {
+        let (input_rev, draft_latched) = session.input_snapshot();
+        let current_binding = self.binding_rev == session.binding_revision();
+        TerminalRuntimeSnapshot {
+            status: self.status,
+            attributable: self.attributable && current_binding,
+            reason: self.reason,
+            coverage: self.coverage,
+            launch_id: session.id,
+            binding_rev: self.binding_rev,
+            snapshot_seq: self.snapshot_seq,
+            input_rev,
+            draft_latched,
+            completion_ready: self.completion_ready && current_binding,
+        }
+    }
+
+    /// Reconcile parser evidence and visible state; the view schedules the returned deadline.
+    fn reconcile(
+        &mut self,
+        session: &TerminalSession,
+        title_provider: TitleProvider,
+        working_markers: &[String],
+        blocked_markers: &[String],
+        exited: bool,
+        now: Instant,
+    ) -> (bool, Option<Instant>) {
+        let binding_rev = session.binding_revision();
+        let binding_changed = binding_rev != self.binding_rev;
+        if binding_changed {
+            // A new provider conversation cannot inherit lifecycle evidence or
+            // visible facts from the retired binding. The current generation is
+            // recaptured below; the current semantic title is handled separately.
+            self.semantic_title_status = None;
+            self.prev_raw = None;
+            self.done_latch = false;
+            self.completion_armed = false;
+            self.provider_settled = false;
+            self.grok_blocked_at = None;
+            self.grok_screen_working_at = None;
+            self.last_screen_capture = None;
+            self.working_marker = false;
+            self.blocked_marker = false;
+            self.provider_screen = None;
+            // Read the new binding's title edges from its start: from the
+            // title that began it, or after everything recorded before a
+            // switch reported out of band (all of it ambiguous).
+            self.title_cursor = None;
+            // The retired conversation's bell was cleared where the binding
+            // advanced (listener title bump or `provider_switched`), in order
+            // with any bell the new binding has rung since; one read inside a
+            // switch window never rang.
+        }
+
+        // Evidence is timed on the wall clock. Read it at the time `now` stands
+        // for, so a deadline the caller's clock has reached has passed there too.
+        let wall = wall_time_at(now);
+        let evidence = session.runtime_evidence_at(self.title_cursor, wall);
+        self.title_cursor = Some(evidence.cursor);
+        // An uncertain level state settles at a deadline of its own, in case
+        // no fresh evidence ever comes; just after it, so it has passed.
+        let settle_deadline = evidence
+            .settles_at
+            .map(|at| now + at.duration_since(wall).unwrap_or_default() + Duration::from_millis(1));
+        let (title_events, title_overflowed) = (evidence.titles, evidence.overflowed);
+        let (_, title_text) = session.title_snapshot();
+        let observed_title =
+            title_status(title_provider, title_text.as_deref(), session.title_age());
+        // Only a submission in the current binding arms its completion: the
+        // Enter that picked a conversation in `/resume` ran no turn in it.
+        let submitted_turn = evidence.submitted;
+        let settling = evidence.settling;
+        if binding_changed {
+            // A switch reported out of band starts the screen hold; the
+            // capture below, and later ones, decide when it ends.
+            self.screen_held = evidence.windowed;
+        }
+        if title_overflowed {
+            // Missing an ordered title edge invalidates this source. Rebuild from
+            // the retained final title without manufacturing a completion edge.
+            self.semantic_title_status = None;
+            self.prev_raw = None;
+        }
+
+        let mut working_to_nonworking = false;
+        if !title_overflowed {
+            let statuses = title_status_trace(title_provider, &title_events);
+            working_to_nonworking = has_working_to_nonworking_edge(&statuses);
+            for status in statuses {
+                self.provider_settled = provider_settled_after_title(
+                    self.provider_settled,
+                    Some(status),
+                    submitted_turn,
+                );
+                self.semantic_title_status = Some(status);
+            }
+        }
+        let fresh_title = observed_title.filter(|_| !settling);
+        self.provider_settled =
+            provider_settled_after_title(self.provider_settled, fresh_title, submitted_turn);
+        if let Some(status) = fresh_title {
+            self.semantic_title_status = Some(status);
+        }
+        if working_to_nonworking {
+            // The parser may receive several OSC title frames in one coalesced
+            // PTY batch. Retain the semantic Working edge so the final Idle can
+            // complete an armed turn instead of disappearing into the batch.
+            self.prev_raw = Some(AgentStatus::Working);
+            self.done_latch = false;
+        }
+        let mut title = sticky_title_status(self.semantic_title_status, observed_title);
+
+        let needs_provider_screen_scan =
+            matches!(title_provider, TitleProvider::Claude | TitleProvider::Grok);
+        let content_generation = session.content_generation();
+        let has_visible_sources = !working_markers.is_empty()
+            || !blocked_markers.is_empty()
+            || needs_provider_screen_scan;
+        let mut next_deadline = None;
+        match status_screen_capture_plan(
+            self.content_generation,
+            content_generation,
+            has_visible_sources,
+            self.last_screen_capture,
+            now,
+        ) {
+            StatusScreenCapture::Now => {
+                self.content_generation = content_generation;
+                self.last_screen_capture = Some(now);
+                let screen = session.visible_text();
+                self.working_marker = working_markers.iter().any(|marker| screen.contains(marker));
+                self.blocked_marker = blocked_markers.iter().any(|marker| screen.contains(marker));
+                self.provider_screen = provider_screen_status(title_provider, &screen);
+            }
+            StatusScreenCapture::At(deadline) => next_deadline = Some(deadline),
+            StatusScreenCapture::None if !has_visible_sources => {
+                // Keep the generation current without allocating a screen snapshot;
+                // this prevents a later unrelated event from treating it as new.
+                self.content_generation = content_generation;
+                self.working_marker = false;
+                self.blocked_marker = false;
+                self.provider_screen = None;
+            }
+            StatusScreenCapture::None => {}
+        }
+        let bell = session.has_bell();
+        let idle = session.idle_for();
+        let base = classify_facts(
+            exited,
+            self.working_marker,
+            self.blocked_marker,
+            bell,
+            title_provider == TitleProvider::Other && working_markers.is_empty(),
+            idle,
+        );
+        let provider_screen = self.provider_screen;
+        let working_marker = self.working_marker;
+        let blocked_marker = self.blocked_marker;
+        let mut screen_working = working_marker || provider_screen == Some(AgentStatus::Working);
+        let screen_marker = provider_screen
+            .or(blocked_marker.then_some(AgentStatus::Blocked))
+            .or(working_marker.then_some(AgentStatus::Working));
+        // Only a title read after the window can confirm a held marker; one
+        // the settle deadline accepted may be the old conversation's too.
+        self.screen_held = screen_hold_after(
+            self.screen_held,
+            screen_marker,
+            fresh_title.filter(|_| evidence.title_fresh),
+        );
+
+        if title_provider == TitleProvider::Grok {
+            // Debounces retain only attributable source evidence. The current
+            // uncertain title/row can still show as level state, without a hold.
+            if fresh_title == Some(AgentStatus::Blocked) {
+                self.grok_blocked_at = Some(now);
+            } else {
+                let blocked_age = self
+                    .grok_blocked_at
+                    .map(|at| now.saturating_duration_since(at));
+                title = hold_grok_blocked(title, blocked_age);
+                if title == Some(AgentStatus::Blocked)
+                    && let Some(at) = self.grok_blocked_at
+                {
+                    let deadline = at + Duration::from_millis(751);
+                    next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
+                }
+                if matches!(title, Some(AgentStatus::Idle))
+                    || blocked_age.is_some_and(|age| age > Duration::from_millis(750))
+                {
+                    self.grok_blocked_at = None;
+                }
+            }
+
+            let (working, last_seen, hold_deadline) = grok_screen_working_state(
+                screen_working,
+                provider_screen == Some(AgentStatus::Working) && !settling && !self.screen_held,
+                self.grok_screen_working_at,
+                now,
+            );
+            screen_working = working;
+            self.grok_screen_working_at = last_seen;
+            if let Some(deadline) = hold_deadline {
+                next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
+            }
+        }
+        if title != Some(AgentStatus::Blocked) && provider_screen == Some(AgentStatus::Blocked) {
+            title = provider_screen;
+        }
+
+        let raw = combine_title_status(exited, base, title, screen_working);
+        let can_latch = can_latch_completion(
+            !working_markers.is_empty(),
+            self.semantic_title_status.is_some(),
+        );
+        let raw_reason = status_reason(
+            raw,
+            exited,
+            bell,
+            title,
+            provider_screen,
+            working_marker,
+            blocked_marker,
+        );
+        let raw_attributable = status_is_attributable(settling, self.screen_held, raw_reason);
+        let (status, latch, armed) = if raw_attributable {
+            latch_done_after_readiness(
+                self.prev_raw,
+                raw,
+                self.done_latch,
+                can_latch,
+                self.completion_armed,
+                submitted_turn,
+            )
+        } else {
+            // An old screen marker must not start an edge which completes when
+            // it disappears. Keep the new binding's explicit submission only.
+            (raw, false, submitted_turn)
+        };
+        self.prev_raw = raw_attributable.then_some(raw);
+        self.done_latch = latch;
+        self.completion_armed = armed;
+
+        if let Some(deadline) = fallback_status_deadline(
+            now,
+            idle,
+            status,
+            title_provider,
+            !working_markers.is_empty(),
+        )
+        .into_iter()
+        .chain(settle_deadline)
+        .min()
+        {
+            next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
+        }
+
+        let reason = status_reason(
+            status,
+            exited,
+            bell,
+            title,
+            provider_screen,
+            working_marker,
+            blocked_marker,
+        );
+        let attributable = status_is_attributable(settling, self.screen_held, reason);
+        if exited {
+            next_deadline = None;
+        }
+        let completion_ready = self.provider_settled || submitted_turn;
+        let public_changed = status != self.status
+            || reason != self.reason
+            || attributable != self.attributable
+            || binding_changed
+            || completion_ready != self.completion_ready;
+        if public_changed {
+            self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
+        }
+        self.status = status;
+        self.reason = reason;
+        self.attributable = attributable;
+        self.binding_rev = binding_rev;
+        self.completion_ready = completion_ready;
+        (public_changed, next_deadline)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,6 +750,24 @@ fn title_status(
     _age: Option<Duration>,
 ) -> Option<AgentStatus> {
     parse_agent_title(provider, title).and_then(|frame| frame.status)
+}
+
+fn title_status_trace(provider: TitleProvider, titles: &[Option<String>]) -> Vec<AgentStatus> {
+    titles
+        .iter()
+        .filter_map(|title| title_status(provider, title.as_deref(), None))
+        .collect()
+}
+
+fn has_working_to_nonworking_edge(statuses: &[AgentStatus]) -> bool {
+    let mut saw_working = false;
+    for status in statuses {
+        if saw_working && *status != AgentStatus::Working {
+            return true;
+        }
+        saw_working |= *status == AgentStatus::Working;
+    }
+    false
 }
 
 /// Once a provider proves its semantic title protocol, an unrelated OSC title
@@ -715,6 +1170,24 @@ fn hold_grok_screen_working(observed: bool, last_seen_age: Option<Duration>) -> 
     observed || last_seen_age.is_some_and(|age| age <= GROK_SCREEN_WORKING_HOLD)
 }
 
+fn grok_screen_working_state(
+    base_working: bool,
+    provider_working: bool,
+    last_seen: Option<Instant>,
+    now: Instant,
+) -> (bool, Option<Instant>, Option<Instant>) {
+    if provider_working {
+        return (true, Some(now), None);
+    }
+    let age = last_seen.map(|at| now.saturating_duration_since(at));
+    if hold_grok_screen_working(false, age) {
+        let deadline = last_seen.map(|at| at + GROK_SCREEN_WORKING_HOLD + Duration::from_millis(1));
+        (true, last_seen, deadline)
+    } else {
+        (base_working, None, None)
+    }
+}
+
 /// Remove provider lifecycle decoration before a title is considered for the
 /// pane's persisted automatic name. A title containing only state is not a name.
 pub fn clean_agent_title(program: &str, title: &str) -> Option<String> {
@@ -728,6 +1201,7 @@ pub fn clean_agent_title(program: &str, title: &str) -> Option<String> {
 /// exit wins; then on-screen markers (working spinner, blocked prompt); then a
 /// rung bell means a finished turn; then recent output is an opt-in fallback
 /// for unknown terminals only.
+#[cfg(test)]
 fn classify(
     exited: bool,
     screen: &str,
@@ -737,15 +1211,33 @@ fn classify(
     activity_fallback: bool,
     idle: Duration,
 ) -> AgentStatus {
+    classify_facts(
+        exited,
+        working.iter().any(|m| screen.contains(m)),
+        blocked.iter().any(|m| screen.contains(m)),
+        bell,
+        activity_fallback && working.is_empty(),
+        idle,
+    )
+}
+
+fn classify_facts(
+    exited: bool,
+    working: bool,
+    blocked: bool,
+    bell: bool,
+    activity_fallback: bool,
+    idle: Duration,
+) -> AgentStatus {
     if exited {
         return AgentStatus::Done;
     }
-    if blocked.iter().any(|m| screen.contains(m)) {
+    if blocked {
         return AgentStatus::Blocked;
     }
     // User-actionable input wins when a provider leaves its working marker on
     // screen behind an approval prompt.
-    if working.iter().any(|m| screen.contains(m)) {
+    if working {
         return AgentStatus::Working;
     }
     if bell {
@@ -753,7 +1245,7 @@ fn classify(
     }
     // Raw PTY churn is useful only for unknown terminals. Known providers own
     // semantic signals; using echoed typing here would forge Working.
-    if activity_fallback && working.is_empty() && idle < Duration::from_secs(2) {
+    if activity_fallback && idle < Duration::from_secs(2) {
         return AgentStatus::Working;
     }
     AgentStatus::Idle
@@ -761,7 +1253,7 @@ fn classify(
 
 /// Promote a working→idle transition to `Done`, latching it until the agent works
 /// again. Returns `(displayed status, new latch state)`.
-/// Pure half of [`TerminalView::status`]'s done-latch, so a finished turn shows
+/// Pure half of the runtime reducer's done-latch, so a finished turn shows
 /// Done even when the agent never rang the bell.
 ///
 /// `can_latch` gates the mechanism to agents whose `Working` state has reliable
@@ -818,6 +1310,166 @@ fn provider_settled_after_title(
     settled || submitted || observed_title == Some(AgentStatus::Idle)
 }
 
+fn status_reason(
+    status: AgentStatus,
+    exited: bool,
+    bell: bool,
+    title: Option<AgentStatus>,
+    provider_screen: Option<AgentStatus>,
+    working_marker: bool,
+    blocked_marker: bool,
+) -> TerminalStatusReason {
+    if exited {
+        return TerminalStatusReason::ProcessExit;
+    }
+    match status {
+        AgentStatus::Blocked if provider_screen == Some(AgentStatus::Blocked) => {
+            TerminalStatusReason::ProviderScreen
+        }
+        AgentStatus::Blocked if title == Some(AgentStatus::Blocked) => {
+            TerminalStatusReason::ProviderTitle
+        }
+        AgentStatus::Blocked if blocked_marker => TerminalStatusReason::BlockedMarker,
+        AgentStatus::Working if provider_screen == Some(AgentStatus::Working) => {
+            TerminalStatusReason::ProviderScreen
+        }
+        AgentStatus::Working if working_marker => TerminalStatusReason::WorkingMarker,
+        AgentStatus::Working if title == Some(AgentStatus::Working) => {
+            TerminalStatusReason::ProviderTitle
+        }
+        AgentStatus::Working => TerminalStatusReason::RecentOutput,
+        AgentStatus::Done if bell => TerminalStatusReason::Bell,
+        AgentStatus::Done if title.is_some() => TerminalStatusReason::ProviderTitle,
+        AgentStatus::Idle if title.is_some() => TerminalStatusReason::ProviderTitle,
+        AgentStatus::Done | AgentStatus::Idle => TerminalStatusReason::Quiet,
+        AgentStatus::Blocked => TerminalStatusReason::BlockedMarker,
+    }
+}
+
+/// Whether the status can be attributed to the current provider binding, so
+/// the app may notify for it and record it as the last status seen. While a
+/// switch reported out of band settles, the status still shows level state,
+/// but that may be the old conversation's: a blocked title or prompt read just
+/// before or after the switch. A process exit is this launch's own fact, and
+/// a bell rings only for output read after the switch window. A status read
+/// from a screen marker stays non-attributable while `screen_held`, which
+/// starts at the switch, however fresh the output around it.
+fn status_is_attributable(settling: bool, screen_held: bool, reason: TerminalStatusReason) -> bool {
+    match reason {
+        TerminalStatusReason::ProcessExit | TerminalStatusReason::Bell => true,
+        TerminalStatusReason::ProviderScreen
+        | TerminalStatusReason::BlockedMarker
+        | TerminalStatusReason::WorkingMarker
+            if screen_held =>
+        {
+            false
+        }
+        _ => !settling,
+    }
+}
+
+/// Whether status read from a screen marker is still held as possibly the old
+/// conversation's. The hold starts when a binding switches out of band; the
+/// screen isn't captured at that moment, so later captures decide. Fresh bytes
+/// alone don't make an unchanged prompt the new conversation's; the hold ends
+/// the first time a screen capture shows no marker, or when a title read after
+/// the switch window reports the state the screen shows.
+fn screen_hold_after(
+    held: bool,
+    screen: Option<AgentStatus>,
+    fresh_title: Option<AgentStatus>,
+) -> bool {
+    held && screen.is_some() && fresh_title != screen
+}
+
+fn status_coverage(
+    provider: TitleProvider,
+    working_markers: &[String],
+    blocked_markers: &[String],
+) -> TerminalStatusCoverage {
+    if provider != TitleProvider::Other {
+        TerminalStatusCoverage::ProviderVisible
+    } else if !working_markers.is_empty() || !blocked_markers.is_empty() {
+        TerminalStatusCoverage::VisibleMarkers
+    } else {
+        TerminalStatusCoverage::ActivityOnly
+    }
+}
+
+fn should_capture_status_screen(
+    previous_generation: u64,
+    current_generation: u64,
+    has_visible_sources: bool,
+) -> bool {
+    has_visible_sources && previous_generation != current_generation
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusScreenCapture {
+    None,
+    Now,
+    At(Instant),
+}
+
+fn status_screen_capture_plan(
+    previous_generation: u64,
+    current_generation: u64,
+    has_visible_sources: bool,
+    last_capture: Option<Instant>,
+    now: Instant,
+) -> StatusScreenCapture {
+    if !should_capture_status_screen(previous_generation, current_generation, has_visible_sources) {
+        return StatusScreenCapture::None;
+    }
+    if let Some(deadline) = last_capture.map(|at| at + STATUS_SCREEN_SCAN_INTERVAL)
+        && now < deadline
+    {
+        return StatusScreenCapture::At(deadline);
+    }
+    StatusScreenCapture::Now
+}
+
+fn fallback_status_deadline(
+    now: Instant,
+    idle: Duration,
+    status: AgentStatus,
+    provider: TitleProvider,
+    has_working_markers: bool,
+) -> Option<Instant> {
+    (status == AgentStatus::Working
+        && provider == TitleProvider::Other
+        && !has_working_markers
+        && idle < Duration::from_secs(2))
+    .then(|| now + (Duration::from_secs(2) - idle))
+}
+
+/// The wall-clock time `at` stands for.
+fn wall_time_at(at: Instant) -> SystemTime {
+    let (now, wall) = (Instant::now(), SystemTime::now());
+    if at >= now {
+        wall.checked_add(at - now).unwrap_or(wall)
+    } else {
+        wall.checked_sub(now - at).unwrap_or(wall)
+    }
+}
+
+fn runtime_timer_is_current(current: u64, callback: u64) -> bool {
+    current == callback
+}
+
+/// How long to wait for a runtime deadline. One that already passed (typically
+/// while the refresh that computed it was still running) fires at once rather
+/// than being dropped: a pending screen capture or fallback expiry must still be
+/// serviced. Every deadline is computed strictly after its refresh's `now`, so a
+/// zero-delay refresh makes progress instead of rescheduling itself.
+fn runtime_timer_delay(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
+}
+
+fn is_submission_input(bytes: &[u8]) -> bool {
+    bytes == b"\r"
+}
+
 /// How the mouse copies/pastes in a terminal pane (a global setting parsed from
 /// `Settings.terminal_mouse`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -856,16 +1508,20 @@ struct ExitInfo {
 fn coalesce_pending(
     rx: &ProfiledPtyReceiver,
     instance_id: Uuid,
-    output: &mut Vec<u8>,
+    output: &mut PtyOutput,
     exit: &mut Option<ExitInfo>,
 ) {
     while let Ok(more) = rx.try_recv() {
         match more {
-            ProfiledPtyChunk::Output { bytes, timing } => {
+            ProfiledPtyChunk::Output {
+                bytes,
+                timing,
+                read_at,
+            } => {
                 if let Some(timing) = timing {
                     profile::output_drained(instance_id, timing, rx.take_profile_peak());
                 }
-                output.extend_from_slice(&bytes);
+                output.push(&bytes, read_at);
             }
             ProfiledPtyChunk::Exit {
                 code,
@@ -915,27 +1571,7 @@ pub struct TerminalView {
     working_markers: Vec<String>,
     blocked_markers: Vec<String>,
     title_provider: TitleProvider,
-    /// Latches `Done` from a working→finished transition so a completed turn shows
-    /// Done (and notifies) even when the agent didn't ring the bell. `prev_raw` is
-    /// the previous *raw* classification; the latch clears when the agent works
-    /// again.
-    prev_raw: std::cell::Cell<Option<AgentStatus>>,
-    done_latch: std::cell::Cell<bool>,
-    /// Ready/Idle must be observed once, or a turn submitted, before a
-    /// Working→Idle edge can mean Done. This rejects startup spinners.
-    completion_armed: std::cell::Cell<bool>,
-    /// A provider-owned Ready/Idle title, unlike fallback PTY quiet, proves the
-    /// restored CLI has finished booting. This bounds startup-state suppression.
-    provider_settled: std::cell::Cell<bool>,
-    /// Last provider-owned title state. Foreign OSC titles cannot erase it or
-    /// reactivate the weak PTY activity fallback.
-    semantic_title_status: std::cell::Cell<Option<AgentStatus>>,
-    /// Grok's action-required title item intentionally blinks when unfocused.
-    /// Retain the last positive edge briefly so the sidebar does not blink too.
-    grok_blocked_at: std::cell::Cell<Option<std::time::Instant>>,
-    /// Grok redraws its exact foreground background-work row. Retain a positive
-    /// observation briefly so an off-frame cannot forge completion.
-    grok_screen_working_at: std::cell::Cell<Option<std::time::Instant>>,
+    runtime: RuntimeStatusState,
     /// Last time we `cx.notify()`'d a paint from the drain loop (background throttle).
     last_paint_notify: std::cell::Cell<std::time::Instant>,
     /// Profiler correlation only: advances once per output-driven `cx.notify()`.
@@ -948,9 +1584,12 @@ pub struct TerminalView {
     /// brings the deadline forward.
     pending_paint_deadline: std::cell::Cell<Option<std::time::Instant>>,
     paint_timer_generation: std::cell::Cell<u64>,
-    /// Cached agent status for the current grid and OSC-title generations.
-    status_cache: std::cell::Cell<Option<(u64, u64, AgentStatus)>>,
+    /// The deadline of a pending paint that a cursor-hide hold
+    /// ([`CURSOR_HIDE_HOLD`]) set, while it is pending. A status repaint from
+    /// any path waits for it too, so it can't draw the frame the hold skips.
+    paint_hold_until: std::cell::Cell<Option<std::time::Instant>>,
     _drain: Task<()>,
+    _runtime_events: Task<()>,
 }
 
 /// Optional app-owned diagnostic invoked at the existing GPUI terminal focus
@@ -1521,13 +2160,16 @@ impl TerminalView {
     /// presenting, so a frame we schedule but never mark stays off-screen.
     fn schedule_paint(&mut self, min_interval: Duration, defer: Duration, cx: &mut Context<Self>) {
         let now = Instant::now();
-        let deadline = match next_paint_schedule(
+        let schedule = next_paint_schedule(
             self.last_paint_notify.get(),
             self.pending_paint_deadline.get(),
             now,
             min_interval,
             defer,
-        ) {
+        );
+        self.paint_hold_until
+            .set(hold_after(schedule, defer, self.paint_hold_until.get()));
+        let deadline = match schedule {
             PaintSchedule::Now => {
                 self.pending_paint_deadline.set(None);
                 self.paint_timer_generation
@@ -1563,6 +2205,7 @@ impl TerminalView {
                     return;
                 }
                 view.pending_paint_deadline.set(None);
+                view.paint_hold_until.set(None);
                 view.last_paint_notify.set(Instant::now());
                 if view.profile_focus {
                     view.profile_notify_generation
@@ -1923,10 +2566,14 @@ impl TerminalView {
                     Err(_) => break,
                 };
 
-                let mut output: Vec<u8> = Vec::new();
+                let mut output = PtyOutput::default();
                 let mut exit: Option<ExitInfo> = None;
                 match chunk {
-                    ProfiledPtyChunk::Output { bytes, timing } => {
+                    ProfiledPtyChunk::Output {
+                        bytes,
+                        timing,
+                        read_at,
+                    } => {
                         if let Some(timing) = timing {
                             profile::output_drained(
                                 instance_id,
@@ -1934,7 +2581,7 @@ impl TerminalView {
                                 transport.rx.take_profile_peak(),
                             );
                         }
-                        output.extend_from_slice(&bytes);
+                        output.push(&bytes, read_at);
                     }
                     ProfiledPtyChunk::Exit {
                         code,
@@ -1984,14 +2631,14 @@ impl TerminalView {
                 let stop = view
                     .update(cx, |view, cx| {
                         let focused = view.session.is_focused();
-                        // Sampled around `process_output` so only the *transition*
+                        // Sampled around `process_drained` so only the *transition*
                         // to hidden defers: a program that keeps its cursor hidden
                         // throughout is never slowed down.
                         let cursor_was_visible = view.session.cursor_visible();
                         if !output.is_empty() {
                             profile::output_update_started(instance_id);
                             let t0 = Instant::now();
-                            view.session.process_output(&output);
+                            view.session.process_drained(&output);
                             if !view.has_visible_content
                                 && !view.session.visible_text().trim().is_empty()
                             {
@@ -2020,6 +2667,7 @@ impl TerminalView {
                             view.exit_signal = info.signal;
                             view.exit_read_error = info.read_error;
                         }
+                        let runtime_changed = view.update_runtime(cx);
                         // Priority scheduler (see docs/terminal-paint-architecture.md):
                         // Recent input ≫ stream; every throttled batch gets one
                         // trailing-edge notify if no later output arrives.
@@ -2033,6 +2681,15 @@ impl TerminalView {
                         } else {
                             Duration::ZERO
                         };
+                        // An earlier batch's hold still matters while the cursor
+                        // it hid stays hidden; once shown, there's no frame to skip.
+                        let held_for = if view.session.cursor_visible() {
+                            Duration::ZERO
+                        } else {
+                            status_paint_defer(view.paint_hold_until.get(), Instant::now())
+                        };
+                        let (min_interval, defer) =
+                            paint_request(runtime_changed, min_interval, defer, held_for);
                         view.schedule_paint(min_interval, defer, cx);
                         stop
                     })
@@ -2043,7 +2700,20 @@ impl TerminalView {
             }
         });
 
-        Self {
+        let runtime_events = session.runtime_events();
+        let runtime_event_task = cx.spawn(async move |view: WeakEntity<Self>, cx| {
+            while runtime_events.recv().await.is_ok() {
+                if view
+                    .update(cx, |view, cx| view.refresh_runtime(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let coverage = status_coverage(title_provider, &working_markers, &blocked_markers);
+        let mut view = Self {
             instance_id,
             session,
             startup_turn,
@@ -2061,22 +2731,19 @@ impl TerminalView {
             working_markers,
             blocked_markers,
             title_provider,
-            prev_raw: std::cell::Cell::new(None),
-            done_latch: std::cell::Cell::new(false),
-            completion_armed: std::cell::Cell::new(false),
-            provider_settled: std::cell::Cell::new(false),
-            semantic_title_status: std::cell::Cell::new(None),
-            grok_blocked_at: std::cell::Cell::new(None),
-            grok_screen_working_at: std::cell::Cell::new(None),
+            runtime: RuntimeStatusState::new(coverage),
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
             profile_notify_generation: std::cell::Cell::new(0),
             profile_last_notify_cause: std::cell::Cell::new(None),
             profile_focus: focus_observer.is_some(),
             pending_paint_deadline: std::cell::Cell::new(None),
             paint_timer_generation: std::cell::Cell::new(0),
-            status_cache: std::cell::Cell::new(None),
+            paint_hold_until: std::cell::Cell::new(None),
             _drain: drain,
-        }
+            _runtime_events: runtime_event_task,
+        };
+        view.refresh_runtime(cx);
+        view
     }
 
     pub fn session(&self) -> &Arc<TerminalSession> {
@@ -2132,128 +2799,89 @@ impl TerminalView {
         }
     }
 
-    /// The agent's lifecycle state, from its per-agent on-screen markers, the
-    /// bell, output activity, and process exit (see [`classify`]). Agents with no
-    /// markers fall back to the bell + activity heuristic.
-    pub fn status(&self) -> AgentStatus {
-        // Cache against content gen so sidebar/tick don't re-scan the grid every
-        // frame while the agent is idle. Bell and idle-time still force a recheck.
-        let content_gen = self.session.content_generation();
-        let (title_gen, title_text) = self.session.title_snapshot();
-        let bell = self.session.has_bell();
-        if !bell
-            && let Some((cached_gen, cached_title_gen, cached)) = self.status_cache.get()
-            && cached_gen == content_gen
-            && cached_title_gen == title_gen
-            && !self.exited
-        {
-            // Idle duration can advance Working→Idle without a content gen bump
-            // (no new output). Recompute when the activity heuristic might flip.
-            if !matches!(cached, AgentStatus::Working) {
-                return cached;
-            }
+    /// Reconcile runtime state at an actual observation edge, and repaint when
+    /// the public snapshot changed: at once, ahead of the throttle, unless a
+    /// cursor-hide hold is pending, whose paint then draws the change.
+    fn refresh_runtime(&mut self, cx: &mut Context<Self>) {
+        if self.update_runtime(cx) {
+            let defer = status_paint_defer(self.paint_hold_until.get(), Instant::now());
+            self.schedule_paint(Duration::ZERO, defer, cx);
         }
+    }
 
-        let observed_title = title_status(
+    /// Reconcile runtime state at an actual observation edge. This is the only
+    /// place that scans the visible grid or advances the lifecycle reducer. The
+    /// facts are current for readers on return; the caller decides when to paint.
+    /// Returns whether the public snapshot changed.
+    fn update_runtime(&mut self, cx: &mut Context<Self>) -> bool {
+        let binding_changed = self.runtime.binding_rev != self.session.binding_revision();
+        let (changed, deadline) = self.runtime.reconcile(
+            &self.session,
             self.title_provider,
-            title_text.as_deref(),
-            self.session.title_age(),
-        );
-        let submitted_turn = self.session.has_submitted_turn();
-        self.provider_settled.set(provider_settled_after_title(
-            self.provider_settled.get(),
-            observed_title,
-            submitted_turn,
-        ));
-        if let Some(status) = observed_title {
-            self.semantic_title_status.set(Some(status));
-        }
-        let mut title = sticky_title_status(self.semantic_title_status.get(), observed_title);
-        // Provider-owned titles and visible UI are independent strong evidence.
-        // Titles prevent PTY noise from forging state; they do not suppress a
-        // current permission form or background-work row.
-        let working_markers = self.working_markers.as_slice();
-        // Claude's title does not distinguish Idle from a visible permission
-        // prompt. Claude and Grok can both retain Idle titles while their
-        // foreground UI reports live background work.
-        let needs_provider_screen_scan = matches!(
-            self.title_provider,
-            TitleProvider::Claude | TitleProvider::Grok
-        );
-        let screen = if working_markers.is_empty()
-            && self.blocked_markers.is_empty()
-            && !needs_provider_screen_scan
-        {
-            String::new()
-        } else {
-            self.session.visible_text()
-        };
-        let base = classify(
-            self.exited,
-            &screen,
-            working_markers,
+            &self.working_markers,
             &self.blocked_markers,
-            bell,
-            self.title_provider == TitleProvider::Other,
-            self.session.idle_for(),
+            self.exited,
+            Instant::now(),
         );
-        let provider_screen = provider_screen_status(self.title_provider, &screen);
-        let mut screen_working = working_markers.iter().any(|marker| screen.contains(marker))
-            || provider_screen == Some(AgentStatus::Working);
-        if self.title_provider == TitleProvider::Grok {
-            if title == Some(AgentStatus::Blocked) {
-                self.grok_blocked_at.set(Some(std::time::Instant::now()));
-            } else {
-                let blocked_age = self.grok_blocked_at.get().map(|at| at.elapsed());
-                title = hold_grok_blocked(title, blocked_age);
-                if matches!(title, Some(AgentStatus::Idle))
-                    || blocked_age.is_some_and(|age| age > Duration::from_millis(750))
-                {
-                    self.grok_blocked_at.set(None);
-                }
-            }
+        self.schedule_runtime_deadline(deadline, binding_changed, cx);
+        changed
+    }
 
-            if provider_screen == Some(AgentStatus::Working) {
-                self.grok_screen_working_at
-                    .set(Some(std::time::Instant::now()));
-            } else {
-                let working_age = self.grok_screen_working_at.get().map(|at| at.elapsed());
-                screen_working = hold_grok_screen_working(screen_working, working_age);
-                if !screen_working {
-                    self.grok_screen_working_at.set(None);
-                }
+    fn schedule_runtime_deadline(
+        &mut self,
+        deadline: Option<Instant>,
+        identity_changed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !identity_changed {
+            match (self.runtime.deadline, deadline) {
+                (current, next) if current == next => return,
+                (Some(current), Some(next)) if current <= next => return,
+                _ => {}
             }
         }
-        if title != Some(AgentStatus::Blocked) && provider_screen == Some(AgentStatus::Blocked) {
-            title = provider_screen;
-        }
-        let raw = combine_title_status(self.exited, base, title, screen_working);
-        // Marker-less providers may latch only after proving that their semantic
-        // title protocol is live. Older/custom CLIs otherwise infer Working from
-        // typing echo and turn two seconds of quiet into a false completion.
-        let can_latch = can_latch_completion(
-            !self.working_markers.is_empty(),
-            self.semantic_title_status.get().is_some(),
-        );
-        let (status, latch, armed) = latch_done_after_readiness(
-            self.prev_raw.replace(Some(raw)),
-            raw,
-            self.done_latch.get(),
-            can_latch,
-            self.completion_armed.get(),
-            submitted_turn,
-        );
-        self.done_latch.set(latch);
-        self.completion_armed.set(armed);
-        self.status_cache
-            .set(Some((content_gen, title_gen, status)));
-        status
+        self.runtime.timer_generation = self.runtime.timer_generation.wrapping_add(1);
+        let generation = self.runtime.timer_generation;
+        self.runtime.deadline = deadline;
+        let Some(deadline) = deadline else {
+            return;
+        };
+        let delay = runtime_timer_delay(deadline, Instant::now());
+        cx.spawn(async move |view: WeakEntity<Self>, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = view.update(cx, |view, cx| {
+                if !runtime_timer_is_current(view.runtime.timer_generation, generation) {
+                    return;
+                }
+                view.runtime.deadline = None;
+                view.refresh_runtime(cx);
+            });
+        })
+        .detach();
+    }
+
+    pub fn runtime_snapshot(&self) -> TerminalRuntimeSnapshot {
+        self.runtime.snapshot(&self.session)
+    }
+
+    /// Pure immutable projection used by render/sidebar callers.
+    pub fn status(&self) -> AgentStatus {
+        self.runtime.status
+    }
+
+    /// Whether [`Self::status`] can be attributed to the current provider
+    /// conversation. It can't while a binding switched out of band settles and
+    /// the status rests on evidence that may be the old conversation's; the
+    /// app then neither notifies for it nor records it as the last status seen.
+    pub fn status_attributable(&self) -> bool {
+        self.runtime_snapshot()
+            .is_attributable_to(self.session.binding_revision())
     }
 
     /// Whether this terminal has observed provider-owned Ready/Idle or a
     /// submitted turn. Fallback PTY quiet is not startup-readiness evidence.
     pub fn completion_ready(&self) -> bool {
-        self.provider_settled.get() || self.session.has_submitted_turn()
+        self.runtime_snapshot().completion_ready
     }
 
     /// Whether `needle` appears in the current visible grid — used by the app to
@@ -2278,8 +2906,9 @@ impl TerminalView {
         self.session.title()
     }
 
-    pub fn clear_title(&self) {
-        self.session.clear_title();
+    /// See [`TerminalSession::provider_switched`].
+    pub fn provider_switched(&self, from: std::time::SystemTime, to: std::time::SystemTime) {
+        self.session.provider_switched(from, to);
     }
 
     pub fn session_id_hint(&self) -> Option<String> {
@@ -2418,7 +3047,7 @@ impl TerminalView {
             // selection was actually cleared. This halves repaints when a key is
             // held down (e.g. Enter), keeping output smooth.
             let cleared = self.session.clear_selection();
-            if event.keystroke.key.eq_ignore_ascii_case("enter") {
+            if is_submission_input(&bytes) {
                 self.session.mark_turn_submitted();
             }
             profile::key_started(self.instance_id, t0);
@@ -3387,16 +4016,136 @@ mod tests {
     // macro, not gpui's glob-imported `test` attribute.
     use super::{
         AgentStatus, BACKGROUND_PAINT_INTERVAL, CURSOR_HIDE_HOLD, FOCUSED_INTERACTION_INTERVAL,
-        FOCUSED_STREAM_INTERVAL, PaintSchedule, TerminalMouseMode, TitleProvider,
-        can_latch_completion, classify, clean_agent_title, combine_title_status, hold_grok_blocked,
-        hold_grok_screen_working, latch_done, latch_done_after_readiness, next_paint_schedule,
-        paint_min_interval, provider_screen_status, provider_settled_after_title,
-        sticky_title_status, title_status,
+        FOCUSED_STREAM_INTERVAL, GROK_SCREEN_WORKING_HOLD, PaintSchedule,
+        STATUS_SCREEN_SCAN_INTERVAL, StatusScreenCapture, TerminalMouseMode,
+        TerminalStatusCoverage, TerminalStatusReason, TitleProvider, can_latch_completion,
+        classify, clean_agent_title, combine_title_status, fallback_status_deadline,
+        grok_screen_working_state, has_working_to_nonworking_edge, hold_after, hold_grok_blocked,
+        hold_grok_screen_working, is_submission_input, latch_done, latch_done_after_readiness,
+        next_paint_schedule, paint_min_interval, paint_request, provider_screen_status,
+        provider_settled_after_title, runtime_timer_delay, runtime_timer_is_current,
+        should_capture_status_screen, status_coverage, status_paint_defer, status_reason,
+        status_screen_capture_plan, sticky_title_status, title_status, title_status_trace,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn m(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn activity_fallback_has_one_exact_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            fallback_status_deadline(
+                now,
+                Duration::from_millis(1250),
+                AgentStatus::Working,
+                TitleProvider::Other,
+                false,
+            ),
+            Some(now + Duration::from_millis(750))
+        );
+        assert_eq!(
+            fallback_status_deadline(
+                now,
+                Duration::from_secs(2),
+                AgentStatus::Working,
+                TitleProvider::Other,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            fallback_status_deadline(
+                now,
+                Duration::ZERO,
+                AgentStatus::Working,
+                TitleProvider::Claude,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn superseded_runtime_timer_is_rejected() {
+        assert!(runtime_timer_is_current(9, 9));
+        assert!(!runtime_timer_is_current(10, 9));
+        let now = Instant::now();
+        assert_eq!(runtime_timer_delay(now, now), Duration::ZERO);
+        // A deadline that passed while its refresh ran fires at once, never dropped.
+        assert_eq!(
+            runtime_timer_delay(now - Duration::from_millis(1), now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            runtime_timer_delay(now + Duration::from_millis(1), now),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn expired_grok_provider_hold_does_not_schedule_behind_a_working_marker() {
+        let now = Instant::now();
+        let last_seen = now - GROK_SCREEN_WORKING_HOLD - Duration::from_millis(1);
+        let (working, retained_at, deadline) =
+            grok_screen_working_state(true, false, Some(last_seen), now);
+        assert!(working, "the configured marker remains valid evidence");
+        assert_eq!(retained_at, None, "the expired provider hold is retired");
+        assert_eq!(deadline, None, "no past timer may be re-armed");
+    }
+
+    #[test]
+    fn only_plain_enter_marks_a_submission() {
+        assert!(is_submission_input(b"\r"));
+        assert!(!is_submission_input(b"\x1b\r"));
+        assert!(!is_submission_input(b"\n"));
+    }
+
+    #[test]
+    fn unchanged_runtime_generation_never_recaptures_the_screen() {
+        assert!(should_capture_status_screen(8, 9, true));
+        assert!(!should_capture_status_screen(9, 9, true));
+        assert!(!should_capture_status_screen(8, 9, false));
+
+        let now = Instant::now();
+        assert_eq!(
+            status_screen_capture_plan(8, 9, true, Some(now), now),
+            StatusScreenCapture::At(now + STATUS_SCREEN_SCAN_INTERVAL)
+        );
+        assert_eq!(
+            status_screen_capture_plan(8, 9, true, Some(now - STATUS_SCREEN_SCAN_INTERVAL), now,),
+            StatusScreenCapture::Now
+        );
+    }
+
+    #[test]
+    fn snapshot_evidence_does_not_claim_hidden_work_coverage() {
+        assert_eq!(
+            status_coverage(TitleProvider::Other, &[], &[]),
+            TerminalStatusCoverage::ActivityOnly
+        );
+        assert_eq!(
+            status_coverage(TitleProvider::Other, &m(&["busy"]), &[]),
+            TerminalStatusCoverage::VisibleMarkers
+        );
+        assert_eq!(
+            status_coverage(TitleProvider::Codex, &[], &[]),
+            TerminalStatusCoverage::ProviderVisible
+        );
+        assert_eq!(
+            status_reason(
+                AgentStatus::Working,
+                false,
+                false,
+                Some(AgentStatus::Working),
+                None,
+                false,
+                false,
+            ),
+            TerminalStatusReason::ProviderTitle
+        );
     }
 
     #[test]
@@ -3921,6 +4670,61 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_title_frames_keep_the_working_to_idle_edge() {
+        let titles = vec![
+            Some("Thread | Working ⠋".to_string()),
+            Some("Thread | Ready".to_string()),
+        ];
+        let statuses = title_status_trace(TitleProvider::Codex, &titles);
+        assert_eq!(statuses, vec![AgentStatus::Working, AgentStatus::Idle]);
+        assert!(has_working_to_nonworking_edge(&statuses));
+    }
+
+    #[test]
+    fn a_submission_before_a_resume_does_not_complete_the_resumed_conversation() {
+        use crate::session::{CommandSpec, TerminalSession};
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, _output) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+
+        // Enter picks a conversation in Codex's `/resume` list, in the old binding.
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        // The resumed conversation boots: Starting then Ready, in one drained batch.
+        let resumed = "019f95d7-db31-7db0-904d-9e08330e0001";
+        session.process_probe_output(
+            format!("\x1b]0;{resumed} | Starting\x07\x1b]0;{resumed} | Ready\x07").as_bytes(),
+        );
+
+        // What `update_runtime` feeds the reducer after the binding reset.
+        let evidence = session.runtime_evidence(None);
+        assert!(!evidence.overflowed);
+        let statuses = title_status_trace(TitleProvider::Codex, &evidence.titles);
+        assert!(has_working_to_nonworking_edge(&statuses));
+        let submitted = evidence.submitted;
+        let (status, _, armed) = latch_done_after_readiness(
+            Some(AgentStatus::Working),
+            AgentStatus::Idle,
+            false,
+            true,
+            false,
+            submitted,
+        );
+        assert_eq!(
+            status,
+            AgentStatus::Idle,
+            "no turn ran in this conversation"
+        );
+        assert!(armed, "its Ready title arms the next turn");
+        session.kill();
+    }
+
+    #[test]
     fn foreign_titles_never_become_lifecycle_state() {
         for provider in [
             TitleProvider::Claude,
@@ -4394,5 +5198,1012 @@ mod tests {
         // under the frame budget a viewer would notice as lag.
         assert!(CURSOR_HIDE_HOLD > FOCUSED_STREAM_INTERVAL);
         assert!(CURSOR_HIDE_HOLD <= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_status_change_in_a_batch_that_hid_the_cursor_waits_for_the_held_paint() {
+        // A status edge often lands in the batch where the agent starts
+        // redrawing. Repainting for it at once would draw the cursorless frame
+        // the hold skips; the held paint carries the change instead.
+        let last = std::time::Instant::now();
+        let now = last + Duration::from_secs(5);
+        let none = Duration::ZERO;
+        let (min, defer) = paint_request(true, FOCUSED_STREAM_INTERVAL, CURSOR_HIDE_HOLD, none);
+        assert_eq!(
+            next_paint_schedule(last, None, now, min, defer),
+            PaintSchedule::At(now + CURSOR_HIDE_HOLD)
+        );
+        // Without a hold the change paints at once, even inside the throttle.
+        let just_painted = now - Duration::from_millis(1);
+        let (min, defer) = paint_request(true, BACKGROUND_PAINT_INTERVAL, none, none);
+        assert_eq!(
+            next_paint_schedule(just_painted, None, now, min, defer),
+            PaintSchedule::Now
+        );
+        // Output alone still waits for the throttle.
+        let (min, defer) = paint_request(false, BACKGROUND_PAINT_INTERVAL, none, none);
+        assert_eq!(
+            next_paint_schedule(just_painted, None, now, min, defer),
+            PaintSchedule::At(just_painted + BACKGROUND_PAINT_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn a_status_change_in_a_later_batch_of_a_split_waits_for_the_pending_hold() {
+        // The redraw arrives in two reads: the first hid the cursor and armed the
+        // hold; the second still has it hidden and carries a status edge (an OSC
+        // title, say). The edge must not paint the frame the hold is skipping.
+        let last = std::time::Instant::now();
+        let first = last + Duration::from_secs(5);
+        let hold = Some(first + CURSOR_HIDE_HOLD);
+        let second = first + Duration::from_millis(10);
+        let held_for = status_paint_defer(hold, second);
+        let (min, defer) = paint_request(true, FOCUSED_STREAM_INTERVAL, Duration::ZERO, held_for);
+        assert_eq!(
+            next_paint_schedule(last, hold, second, min, defer),
+            PaintSchedule::KeepPending
+        );
+        // Output without a status change keeps upstream's schedule.
+        let (min, defer) = paint_request(false, FOCUSED_STREAM_INTERVAL, Duration::ZERO, held_for);
+        assert_eq!((min, defer), (FOCUSED_STREAM_INTERVAL, Duration::ZERO));
+    }
+
+    #[test]
+    fn a_status_change_found_later_still_waits_for_a_pending_hold() {
+        // The scan throttle means the runtime timer, not the batch, usually finds
+        // the status edge, tens of milliseconds into the hold. It must ride the
+        // held paint, not draw the cursorless frame itself.
+        let last = std::time::Instant::now();
+        let now = last + Duration::from_secs(5);
+        let held = next_paint_schedule(last, None, now, FOCUSED_STREAM_INTERVAL, CURSOR_HIDE_HOLD);
+        let hold = hold_after(held, CURSOR_HIDE_HOLD, None);
+        assert_eq!(hold, Some(now + CURSOR_HIDE_HOLD));
+
+        let later = now + Duration::from_millis(30);
+        let defer = status_paint_defer(hold, later);
+        assert_eq!(defer, CURSOR_HIDE_HOLD - Duration::from_millis(30));
+        assert_eq!(
+            next_paint_schedule(last, hold, later, Duration::ZERO, defer),
+            PaintSchedule::KeepPending,
+            "the held paint draws the change"
+        );
+        assert_eq!(
+            hold_after(PaintSchedule::KeepPending, defer, hold),
+            hold,
+            "and the hold stays armed until it does"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_replaces_the_held_paint_ends_the_hold() {
+        // A cursor-show batch reschedules the paint on the throttle alone; from
+        // then on a status change has no hold to wait for.
+        let now = std::time::Instant::now();
+        let hold = Some(now + CURSOR_HIDE_HOLD);
+        let replaced = PaintSchedule::At(now + FOCUSED_STREAM_INTERVAL);
+        assert_eq!(hold_after(replaced, Duration::ZERO, hold), None);
+        assert_eq!(hold_after(PaintSchedule::Now, Duration::ZERO, hold), None);
+        assert_eq!(status_paint_defer(None, now), Duration::ZERO);
+        // A hold that has run out never delays anything.
+        assert_eq!(
+            status_paint_defer(hold, now + CURSOR_HIDE_HOLD * 2),
+            Duration::ZERO
+        );
+    }
+}
+
+#[cfg(test)]
+mod provider_switch_tests {
+    // Import specifically: see `tests`.
+    use super::{
+        AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TerminalStatusReason,
+        TitleProvider, screen_hold_after, status_is_attributable, title_status_trace, wall_time_at,
+    };
+    use crate::listener::{SWITCH_SETTLE, SWITCH_SLACK};
+    use crate::session::{CommandSpec, PtyOutput, TerminalSession};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime};
+
+    fn fixture() -> (Arc<TerminalSession>, crate::session::PtyReceiver) {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        TerminalSession::spawn(spec, 80, 24).expect("spawn fixture")
+    }
+
+    fn drained(reads: &[(&str, SystemTime)]) -> PtyOutput {
+        let mut output = PtyOutput::default();
+        for (bytes, read_at) in reads {
+            output.push(bytes.as_bytes(), *read_at);
+        }
+        output
+    }
+
+    #[test]
+    fn a_switch_with_no_fresh_evidence_settles_at_its_deadline_without_completing() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let clock = Instant::now();
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let learned = SystemTime::now() + Duration::from_secs(1);
+        session.mark_turn_submitted();
+        session.provider_switched_at(hook, hook, learned);
+        assert_eq!(session.first_submission_binding(), None);
+        session.process_drained(&drained(&[
+            (
+                "\x1b]0;\u{25d0} Task\x07",
+                learned - Duration::from_millis(20),
+            ),
+            (
+                "\x1b]0;\u{2733} Task\x07",
+                learned - Duration::from_millis(10),
+            ),
+        ]));
+        // No more output arrives, as from an idle Claude after `/clear`.
+        let (_, deadline) =
+            runtime.reconcile(&session, TitleProvider::Claude, &[], &[], false, clock);
+        let snapshot = runtime.snapshot(&session);
+        assert!(
+            !snapshot.attributable,
+            "the final title was read in the window"
+        );
+        assert!(
+            snapshot.completion_ready,
+            "input after the hook still arms a turn"
+        );
+        // The reducer wakes itself when the window has been closed for
+        // SWITCH_SETTLE; it doesn't wait for output that may never come.
+        let deadline = deadline.expect("a settle deadline");
+        let settles = learned + SWITCH_SETTLE;
+        let due = Instant::now() + settles.duration_since(SystemTime::now()).unwrap();
+        assert!(
+            deadline + Duration::from_millis(100) >= due
+                && deadline <= due + Duration::from_millis(100)
+        );
+        let mut earlier = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        earlier.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            deadline - Duration::from_millis(500),
+        );
+        assert!(!earlier.snapshot(&session).attributable);
+        for elapsed in [Duration::ZERO, Duration::from_secs(30 * 60)] {
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &[],
+                &[],
+                false,
+                deadline + elapsed,
+            );
+            let snapshot = runtime.snapshot(&session);
+            assert!(snapshot.attributable, "ctl may send to an idle pane again");
+            assert_eq!(snapshot.status, AgentStatus::Idle);
+            assert!(snapshot.completion_ready);
+            // The turn finished inside the window: settling forms no edge.
+            assert_ne!(snapshot.status, AgentStatus::Done);
+        }
+        // A later turn in the new conversation completes as usual.
+        let later = settles + Duration::from_secs(1);
+        session.mark_turn_submitted();
+        session.process_drained(&drained(&[("\x1b]0;\u{25d0} Next\x07", later)]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            deadline + Duration::from_secs(2),
+        );
+        assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+        session.process_drained(&drained(&[(
+            "\x1b]0;\u{2733} Next\x07",
+            later + Duration::from_millis(10),
+        )]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            deadline + Duration::from_secs(3),
+        );
+        let done = runtime.snapshot(&session);
+        assert_eq!(done.status, AgentStatus::Done);
+        assert!(done.attributable);
+        session.kill();
+    }
+
+    #[test]
+    fn replacement_before_first_uuid_cannot_complete_the_unidentified_submission() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let clock = Instant::now();
+        let read_at = SystemTime::now();
+        let first = uuid::Uuid::new_v4();
+        session.mark_turn_submitted();
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{first} | Working\x07"),
+            read_at,
+        )]));
+        runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, clock);
+        let working = runtime.snapshot(&session);
+        assert_eq!(working.status, AgentStatus::Working);
+        assert!(working.attributable);
+        assert_eq!(session.first_submission_binding(), None);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{first} | Ready\x07"),
+            read_at + Duration::from_millis(10),
+        )]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            clock + Duration::from_millis(10),
+        );
+        let done = runtime.snapshot(&session);
+        assert_eq!(done.status, AgentStatus::Idle);
+        assert!(done.attributable);
+        assert!(done.completion_ready);
+        assert_eq!(session.first_submission_binding(), None);
+        session.kill();
+    }
+
+    #[test]
+    fn production_reducer_does_not_complete_when_a_held_working_marker_clears() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::VisibleMarkers);
+        let markers = vec!["WORKING_MARKER".to_string()];
+        let hook = SystemTime::now() - Duration::from_secs(10);
+        let clock = Instant::now();
+        session.process_drained(&drained(&[(
+            "WORKING_MARKER",
+            hook - Duration::from_secs(3),
+        )]));
+        runtime.reconcile(&session, TitleProvider::Other, &markers, &[], false, clock);
+        assert_eq!(runtime.status, AgentStatus::Working);
+
+        session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Other,
+            &markers,
+            &[],
+            false,
+            clock + Duration::from_millis(60),
+        );
+        session.mark_turn_submitted();
+        let fresh = hook + SWITCH_SLACK + Duration::from_millis(1);
+        session.process_drained(&drained(&[("\r\nfresh bytes", fresh)]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Other,
+            &markers,
+            &[],
+            false,
+            clock + Duration::from_millis(120),
+        );
+        assert!(!session.runtime_evidence(None).settling);
+        assert!(runtime.screen_held);
+        assert!(!runtime.attributable);
+        assert_eq!(runtime.prev_raw, None);
+        assert!(
+            runtime.completion_armed,
+            "the new submission survives the hold"
+        );
+
+        session.process_drained(&drained(&[(
+            "\x1b[2J\x1b[H",
+            fresh + Duration::from_millis(1),
+        )]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Other,
+            &markers,
+            &[],
+            false,
+            clock + Duration::from_millis(180),
+        );
+        assert!(!runtime.screen_held);
+        assert!(runtime.attributable);
+        assert_eq!(
+            runtime.status,
+            AgentStatus::Idle,
+            "retiring old Working cannot complete a new turn"
+        );
+        assert!(!runtime.done_latch);
+        assert!(runtime.completion_armed);
+
+        // A later attributable Working really can complete the submitted turn.
+        session.process_drained(&drained(&[(
+            "WORKING_MARKER",
+            fresh + Duration::from_millis(2),
+        )]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Other,
+            &markers,
+            &[],
+            false,
+            clock + Duration::from_millis(240),
+        );
+        assert_eq!(runtime.prev_raw, Some(AgentStatus::Working));
+        session.process_drained(&drained(&[(
+            "\x1b[2J\x1b[H",
+            fresh + Duration::from_millis(3),
+        )]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Other,
+            &markers,
+            &[],
+            false,
+            clock + Duration::from_millis(300),
+        );
+        assert_eq!(runtime.status, AgentStatus::Done);
+        assert!(runtime.attributable);
+    }
+
+    #[test]
+    fn production_snapshot_rejects_a_switch_before_the_queued_reconcile() {
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = SystemTime::now();
+        session.mark_turn_submitted();
+        session.process_drained(&drained(&[(
+            "\x1b]0;\u{280b} Old\x07\x1b]0;\u{2733} Old\x07",
+            now,
+        )]));
+        runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            Instant::now(),
+        );
+        let cached = runtime.snapshot(&session);
+        assert_eq!(cached.status, AgentStatus::Done);
+        assert!(cached.attributable);
+
+        session.provider_switched(now, now);
+        // Do not receive the runtime event or reconcile: this is the adoption tick.
+        assert!(!cached.is_attributable_to(session.binding_revision()));
+        let current_read = runtime.snapshot(&session);
+        assert_eq!(current_read.status, AgentStatus::Done);
+        assert!(!current_read.attributable);
+        assert!(!current_read.completion_ready);
+    }
+
+    #[test]
+    fn grok_working_hold_uses_only_attributable_rows() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Grok);
+        let clock = viewer.clock;
+        let hook = SystemTime::now() - Duration::from_secs(10);
+        let row = "◎ 1 command still running · send a message to interrupt";
+        session.process_drained(&drained(&[(row, hook - Duration::from_secs(3))]));
+        session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+        let (snapshot, _) = viewer.sample_at(&session, clock);
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(!snapshot.attributable);
+        assert_eq!(viewer.runtime.grok_screen_working_at, None);
+
+        session.mark_turn_submitted();
+        let fresh = hook + SWITCH_SLACK + Duration::from_millis(100);
+        session.process_drained(&drained(&[("\x1b]0;New - grok\x07", fresh)]));
+        let (snapshot, _) = viewer.sample_at(&session, clock + Duration::from_millis(60));
+        assert!(!session.runtime_evidence(None).settling);
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(
+            !snapshot.attributable,
+            "the fresh Idle title cannot adopt the old row"
+        );
+        assert_eq!(viewer.runtime.grok_screen_working_at, None);
+
+        session.process_drained(&drained(&[(
+            "\x1b[2J\x1b[H",
+            fresh + Duration::from_millis(1),
+        )]));
+        // Removal arrives before the next permitted capture. Reconcile at its
+        // returned deadline, just as the view's runtime timer does.
+        let (snapshot, deadline) = viewer.sample_at(&session, clock + Duration::from_millis(80));
+        assert!(!snapshot.attributable);
+        let deadline = deadline.expect("trailing screen capture");
+        assert_eq!(deadline, clock + Duration::from_millis(110));
+        let (snapshot, _) = viewer.sample_at(&session, deadline);
+        assert_eq!(snapshot.status, AgentStatus::Idle);
+        assert!(snapshot.attributable);
+        assert!(!viewer.runtime.done_latch);
+        assert!(
+            viewer.runtime.completion_armed,
+            "the explicit submission survives"
+        );
+        let (snapshot, _) = viewer.sample_at(&session, clock + Duration::from_secs(3));
+        assert_eq!(
+            snapshot.status,
+            AgentStatus::Idle,
+            "no old hold expires into Done"
+        );
+
+        // A newly drawn row is attributable and retains the original two-second
+        // repaint hold; its eventual absence may complete this submitted turn.
+        session.process_drained(&drained(&[(row, fresh + Duration::from_millis(2))]));
+        let seen_at = clock + Duration::from_secs(4);
+        let (snapshot, _) = viewer.sample_at(&session, seen_at);
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(snapshot.attributable);
+        assert_eq!(viewer.runtime.grok_screen_working_at, Some(seen_at));
+        session.process_drained(&drained(&[(
+            "\x1b[2J\x1b[H",
+            fresh + Duration::from_millis(3),
+        )]));
+        let (snapshot, deadline) = viewer.sample_at(&session, seen_at + Duration::from_millis(60));
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(snapshot.attributable);
+        let deadline = deadline.expect("attributable Working hold");
+        assert_eq!(
+            deadline,
+            seen_at + super::GROK_SCREEN_WORKING_HOLD + Duration::from_millis(1)
+        );
+        let (snapshot, _) = viewer.sample_at(&session, seen_at + super::GROK_SCREEN_WORKING_HOLD);
+        assert_eq!(
+            snapshot.status,
+            AgentStatus::Working,
+            "the inclusive hold boundary remains"
+        );
+        let (snapshot, _) = viewer.sample_at(&session, deadline);
+        assert_eq!(snapshot.status, AgentStatus::Done);
+        assert!(snapshot.attributable);
+    }
+
+    #[test]
+    fn grok_blocked_hold_uses_only_attributable_titles() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Grok);
+        let clock = viewer.clock;
+        // Recent enough that the window's settle deadline is still ahead.
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let blocked = "\x1b]0;\u{26a0} Action Required - \u{280b} - Preparing question\u{2026} - Topic - grok\x07";
+        let working = "\x1b]0;\u{2839} - Responding - Topic - grok\x07";
+        session.process_drained(&drained(&[(blocked, hook + Duration::from_millis(100))]));
+        session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+        let (snapshot, _) = viewer.sample_at(&session, clock);
+        assert_eq!(snapshot.status, AgentStatus::Blocked);
+        assert!(!snapshot.attributable);
+        assert_eq!(viewer.runtime.grok_blocked_at, None);
+
+        let fresh = hook + SWITCH_SLACK + Duration::from_millis(100);
+        session.process_drained(&drained(&[(working, fresh)]));
+        let (snapshot, _) = viewer.sample_at(&session, clock + Duration::from_millis(60));
+        assert_eq!(
+            snapshot.status,
+            AgentStatus::Working,
+            "old Blocked cannot override fresh Working"
+        );
+        assert!(snapshot.attributable);
+        assert_eq!(viewer.runtime.grok_blocked_at, None);
+
+        // A fresh Blocked observation still survives the documented blink and
+        // releases Working at its original 750 ms boundary.
+        session.process_drained(&drained(&[(blocked, fresh + Duration::from_millis(1))]));
+        let blocked_at = clock + Duration::from_millis(120);
+        let (snapshot, _) = viewer.sample_at(&session, blocked_at);
+        assert_eq!(snapshot.status, AgentStatus::Blocked);
+        assert!(snapshot.attributable);
+        assert_eq!(viewer.runtime.grok_blocked_at, Some(blocked_at));
+        session.process_drained(&drained(&[(working, fresh + Duration::from_millis(2))]));
+        let (snapshot, deadline) =
+            viewer.sample_at(&session, blocked_at + Duration::from_millis(60));
+        assert_eq!(snapshot.status, AgentStatus::Blocked);
+        assert!(snapshot.attributable);
+        let deadline = deadline.expect("attributable Blocked hold");
+        assert_eq!(deadline, blocked_at + Duration::from_millis(751));
+        let (snapshot, _) = viewer.sample_at(&session, blocked_at + Duration::from_millis(750));
+        assert_eq!(
+            snapshot.status,
+            AgentStatus::Blocked,
+            "the inclusive hold boundary remains"
+        );
+        let (snapshot, _) = viewer.sample_at(&session, deadline);
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(snapshot.attributable);
+        assert_eq!(viewer.runtime.grok_blocked_at, None);
+    }
+
+    #[test]
+    fn uncertain_titles_do_not_seed_sticky_status_or_readiness() {
+        for (old_title, old_status) in [
+            ("\x1b]0;\u{280b} Old\x07", AgentStatus::Working),
+            ("\x1b]0;\u{2733} Old\x07", AgentStatus::Idle),
+        ] {
+            let (session, _receiver) = fixture();
+            let mut viewer = Viewer::new(TitleProvider::Claude);
+            // Recent enough that the window's settle deadline is still ahead.
+            let hook = SystemTime::now() - Duration::from_secs(1);
+            session.process_drained(&drained(&[(old_title, hook + Duration::from_millis(100))]));
+            session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+            assert_eq!(viewer.sample(&session), (old_status, false));
+            assert_eq!(viewer.runtime.semantic_title_status, None);
+            assert!(!viewer.runtime.provider_settled);
+            assert!(!viewer.runtime.completion_ready);
+
+            let fresh = hook + SWITCH_SLACK + Duration::from_millis(100);
+            session.process_drained(&drained(&[("\x1b]0;shell banner\x07", fresh)]));
+            assert_eq!(viewer.sample(&session), (AgentStatus::Idle, true));
+            assert_eq!(viewer.runtime.semantic_title_status, None);
+            assert!(!viewer.runtime.provider_settled);
+            session.mark_turn_submitted();
+            session.process_drained(&drained(&[(
+                "\x1b]0;\u{2733} New\x07",
+                fresh + Duration::from_millis(1),
+            )]));
+            assert_eq!(viewer.sample(&session), (AgentStatus::Idle, true));
+            assert_eq!(
+                viewer.runtime.semantic_title_status,
+                Some(AgentStatus::Idle)
+            );
+            assert!(viewer.runtime.provider_settled);
+            // Once observed freshly, semantic state remains sticky through an
+            // unrelated title, as it does outside a provider switch.
+            session.process_drained(&drained(&[(
+                "\x1b]0;shell banner\x07",
+                fresh + Duration::from_millis(2),
+            )]));
+            assert_eq!(viewer.sample(&session), (AgentStatus::Idle, true));
+            assert_eq!(
+                viewer.runtime.semantic_title_status,
+                Some(AgentStatus::Idle)
+            );
+            session.process_drained(&drained(&[(
+                "\x1b]0;\u{280b} New\x07",
+                fresh + Duration::from_millis(3),
+            )]));
+            assert_eq!(viewer.sample(&session), (AgentStatus::Working, true));
+            session.process_drained(&drained(&[(
+                "\x1b]0;shell banner\x07",
+                fresh + Duration::from_millis(4),
+            )]));
+            assert_eq!(viewer.sample(&session), (AgentStatus::Working, true));
+            session.process_drained(&drained(&[(
+                "\x1b]0;\u{2733} New\x07",
+                fresh + Duration::from_millis(5),
+            )]));
+            assert_eq!(viewer.sample(&session), (AgentStatus::Done, true));
+        }
+    }
+
+    #[test]
+    fn automated_submissions_complete_once_per_turn_without_marking_human_activity() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Claude);
+        let mut last_status = AgentStatus::Idle;
+        let mut completions = 0;
+        let mut sample = || {
+            let (status, _) = viewer.sample(&session);
+            if status == AgentStatus::Done && last_status != AgentStatus::Done {
+                completions += 1;
+            }
+            last_status = status;
+            (status, completions)
+        };
+
+        let working = "\x1b]0;\u{280b} Topic\x07";
+        let idle = "\x1b]0;\u{2733} Topic\x07";
+        session.process_drained(&drained(&[(working, SystemTime::now())]));
+        assert_eq!(sample(), (AgentStatus::Working, 0));
+
+        // Auto types its configurable message, then deliberately submits it.
+        // That arms even a pane which has not yet shown a startup Idle.
+        session.write_input(b"please continue the remaining work");
+        assert!(session.input_snapshot().1);
+        assert!(!session.runtime_evidence(None).submitted);
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        assert!(!session.input_snapshot().1);
+        assert_eq!(session.last_user_input(), None);
+        session.process_drained(&drained(&[(idle, SystemTime::now())]));
+        assert_eq!(sample(), (AgentStatus::Done, 1));
+        assert_eq!(sample(), (AgentStatus::Done, 1));
+
+        // A later automated turn has its own Working and completion. The
+        // repeated Idle after it remains the same completion.
+        session.write_input(b"continue");
+        assert!(session.input_snapshot().1);
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        assert!(!session.input_snapshot().1);
+        session.process_drained(&drained(&[(working, SystemTime::now())]));
+        assert_eq!(sample(), (AgentStatus::Working, 1));
+        session.process_drained(&drained(&[(idle, SystemTime::now())]));
+        assert_eq!(sample(), (AgentStatus::Done, 2));
+        assert_eq!(sample(), (AgentStatus::Done, 2));
+        assert_eq!(session.last_user_input(), None);
+        session.kill();
+    }
+
+    /// Drives the production reducer with observation times far enough apart
+    /// to permit the same screen captures as distinct UI drain turns.
+    struct Viewer {
+        provider: TitleProvider,
+        runtime: RuntimeStatusState,
+        clock: Instant,
+    }
+
+    impl Viewer {
+        fn new(provider: TitleProvider) -> Self {
+            Self {
+                provider,
+                runtime: RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible),
+                clock: Instant::now(),
+            }
+        }
+
+        fn sample(&mut self, session: &TerminalSession) -> (AgentStatus, bool) {
+            let (snapshot, _) = self.sample_at(session, self.clock);
+            (snapshot.status, snapshot.attributable)
+        }
+
+        fn sample_at(
+            &mut self,
+            session: &TerminalSession,
+            now: Instant,
+        ) -> (super::TerminalRuntimeSnapshot, Option<Instant>) {
+            let (_, deadline) =
+                self.runtime
+                    .reconcile(session, self.provider, &[], &[], false, now);
+            self.clock = now + Duration::from_millis(60);
+            (self.runtime.snapshot(session), deadline)
+        }
+
+        fn completion(
+            &mut self,
+            session: &TerminalSession,
+        ) -> (AgentStatus, Option<AgentStatus>, bool) {
+            let (status, _) = self.sample(session);
+            (status, self.runtime.prev_raw, self.runtime.completion_armed)
+        }
+    }
+
+    #[test]
+    fn while_a_switch_settles_only_an_exit_or_a_fresh_bell_is_attributable() {
+        use TerminalStatusReason::*;
+        for reason in [
+            ProcessExit,
+            BlockedMarker,
+            WorkingMarker,
+            ProviderTitle,
+            ProviderScreen,
+            Bell,
+            RecentOutput,
+            Quiet,
+        ] {
+            assert!(status_is_attributable(false, false, reason), "{reason:?}");
+            assert_eq!(
+                status_is_attributable(true, false, reason),
+                matches!(reason, ProcessExit | Bell),
+                "{reason:?}"
+            );
+            // A held screen marker stays the old conversation's after the
+            // window too.
+            assert_eq!(
+                status_is_attributable(false, true, reason),
+                !matches!(reason, ProviderScreen | BlockedMarker | WorkingMarker),
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_old_blocked_title_around_a_switch_shows_but_is_not_attributable() {
+        let (session, _receiver) = fixture();
+        let registered = SystemTime::now() - Duration::from_secs(1);
+        // Grok's old conversation asked for approval just before it switched.
+        session.process_drained(&drained(&[(
+            "\x1b]0;\u{26a0} Action Required - \u{280b} - Preparing question\u{2026} - Old - grok\x07",
+            registered - Duration::from_millis(500),
+        )]));
+        let mut viewer = Viewer::new(TitleProvider::Grok);
+        session.provider_switched_at(registered, registered, SystemTime::now());
+
+        assert!(session.runtime_evidence(None).settling);
+        assert_eq!(
+            viewer.sample(&session),
+            (AgentStatus::Blocked, false),
+            "shown as level state, but no notification can come of it"
+        );
+
+        // The new conversation asks for approval, read after the window.
+        session.process_drained(&drained(&[(
+            "\x1b]0;\u{26a0} Action Required - \u{280b} - Preparing question\u{2026} - New - grok\x07",
+            registered + SWITCH_SLACK + Duration::from_millis(100),
+        )]));
+        assert!(!session.runtime_evidence(None).settling);
+        assert_eq!(
+            viewer.sample(&session),
+            (AgentStatus::Blocked, true),
+            "a Blocked from fresh evidence notifies"
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn an_old_blocked_prompt_around_a_switch_shows_but_is_not_attributable() {
+        let (session, _receiver) = fixture();
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let prompt = "Do you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. Yes, and don't ask again\r\n  3. No\r\nEsc to cancel";
+        // The old conversation's permission prompt, drawn just before Claude
+        // switched; no title.
+        session.process_drained(&drained(&[(prompt, hook - Duration::from_millis(500))]));
+        let mut viewer = Viewer::new(TitleProvider::Claude);
+        session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+
+        assert!(session.runtime_evidence(None).settling);
+        assert_eq!(
+            viewer.sample(&session),
+            (AgentStatus::Blocked, false),
+            "the prompt still shows, but no notification can come of it"
+        );
+
+        // Harmless output read after the window (the cursor hidden and shown
+        // again) ends settling but leaves the old prompt on screen.
+        let fresh = hook + SWITCH_SLACK + Duration::from_millis(100);
+        session.process_drained(&drained(&[("\x1b[?25l\x1b[?25h", fresh)]));
+        assert!(!session.runtime_evidence(None).settling);
+        assert_eq!(
+            viewer.sample(&session),
+            (AgentStatus::Blocked, false),
+            "fresh bytes don't make an unchanged prompt the new conversation's"
+        );
+
+        // The prompt goes, then the new conversation draws its own.
+        session.process_drained(&drained(&[(
+            "\x1b[2J\x1b[H",
+            fresh + Duration::from_millis(100),
+        )]));
+        assert_eq!(viewer.sample(&session), (AgentStatus::Idle, true));
+        session.process_drained(&drained(&[(prompt, fresh + Duration::from_millis(200))]));
+        assert_eq!(
+            viewer.sample(&session),
+            (AgentStatus::Blocked, true),
+            "a prompt drawn after the old one went notifies"
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn the_settle_deadline_does_not_release_a_held_screen_marker() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Grok);
+        let clock = viewer.clock;
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let row = "◎ 1 command still running · send a message to interrupt";
+        let working = "\x1b]0;\u{2839} - Responding - Topic - grok\x07";
+        // A running row and a Working title, both read inside the window.
+        session.process_drained(&drained(&[
+            (row, hook + Duration::from_millis(100)),
+            (working, hook + Duration::from_millis(110)),
+        ]));
+        session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+        let (snapshot, deadline) = viewer.sample_at(&session, clock);
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(!snapshot.attributable);
+        // Past the settle deadline the title is level state, but it was read
+        // inside the window: it can't confirm the old row as the new one's.
+        let late = deadline.expect("a settle deadline") + Duration::from_secs(5);
+        let (snapshot, _) = viewer.sample_at(&session, late);
+        assert!(
+            !session
+                .runtime_evidence_at(None, wall_time_at(late))
+                .settling
+        );
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(!snapshot.attributable, "the row is still held");
+        assert!(viewer.runtime.screen_held);
+        // A title read after the window that agrees ends the hold.
+        let fresh = hook + SWITCH_SLACK + SWITCH_SETTLE + Duration::from_secs(1);
+        session.process_drained(&drained(&[(working, fresh)]));
+        let (snapshot, _) = viewer.sample_at(&session, late + Duration::from_millis(60));
+        assert!(!viewer.runtime.screen_held);
+        assert!(snapshot.attributable);
+        session.kill();
+    }
+
+    #[test]
+    fn a_screen_hold_ends_when_the_marker_goes_or_a_fresh_title_agrees() {
+        use AgentStatus::*;
+        assert!(screen_hold_after(true, Some(Blocked), None));
+        assert!(screen_hold_after(true, Some(Blocked), Some(Idle)));
+        assert!(!screen_hold_after(true, None, None), "the marker went");
+        assert!(
+            !screen_hold_after(true, Some(Working), Some(Working)),
+            "a title read after the window agrees"
+        );
+        assert!(
+            !screen_hold_after(false, Some(Blocked), None),
+            "once ended, a marker that reappears is the new conversation's"
+        );
+    }
+
+    #[test]
+    fn a_fresh_bell_while_a_switch_settles_is_attributable() {
+        let (session, _receiver) = fixture();
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        session.process_drained(&drained(&[(
+            "\x1b]0;\u{2733} Topic\x07",
+            hook + Duration::from_millis(200),
+        )]));
+        let mut viewer = Viewer::new(TitleProvider::Claude);
+        session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+        // The title read inside the window is still current, but the bell
+        // was read after it: the new conversation rang it.
+        session.process_drained(&drained(&[(
+            "\x07",
+            hook + SWITCH_SLACK + Duration::from_millis(100),
+        )]));
+        assert!(session.runtime_evidence(None).settling);
+        assert!(session.has_bell());
+        assert_eq!(viewer.sample(&session), (AgentStatus::Done, true));
+        session.kill();
+    }
+
+    #[test]
+    fn an_enter_before_a_whole_second_registration_ends_never_arms() {
+        let (session, _receiver) = fixture();
+        // Grok registered the resumed session in the second that began at
+        // `second` and wrote that second whole; it switched later in it. The
+        // old conversation's Enter came before the switch.
+        let second = SystemTime::now() - Duration::from_millis(300);
+        session.mark_turn_submitted();
+        // muxel reports the switch as that whole second, up to its last instant.
+        session.provider_switched_at(second, second + Duration::from_secs(1), SystemTime::now());
+        assert!(
+            !session.runtime_evidence(None).submitted,
+            "the Enter went to the old conversation"
+        );
+
+        // The new conversation works and finishes, read after the window.
+        let fresh = second + Duration::from_secs(1) + SWITCH_SLACK + Duration::from_millis(100);
+        session.process_drained(&drained(&[
+            ("\x1b]0;\u{2839} - Responding - Review - grok\x07", fresh),
+            (
+                "\x1b]0;Review - grok\x07",
+                fresh + Duration::from_millis(10),
+            ),
+        ]));
+        let (status, _, _) = Viewer::new(TitleProvider::Grok).completion(&session);
+        assert_eq!(status, AgentStatus::Idle, "no completion for the old Enter");
+        session.kill();
+    }
+
+    #[test]
+    fn a_turn_queued_before_a_switch_never_completes_after_it() {
+        let (session, _receiver) = fixture();
+        // Claude's hook ran at `hook`; muxel read its record at `learned`.
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let learned = hook + Duration::from_millis(400);
+        session.provider_switched_at(hook, hook, learned);
+        // The old conversation's last turn ended as Claude switched: Working,
+        // Idle and its bell, read just after the hook ran and drained only now.
+        session.process_drained(&drained(&[
+            (
+                "\x1b]0;\u{25d0} Old topic\x07",
+                hook + Duration::from_millis(20),
+            ),
+            (
+                "\x1b]0;\u{2733} Old topic\x07\x07",
+                hook + Duration::from_millis(30),
+            ),
+        ]));
+
+        assert!(!session.has_bell(), "its bell rings for no binding");
+        let evidence = session.runtime_evidence(None);
+        assert!(evidence.titles.is_empty(), "no edge to complete");
+        assert!(evidence.settling);
+        // The current title still shows, as level state.
+        assert_eq!(session.title().as_deref(), Some("\u{2733} Old topic"));
+        let mut viewer = Viewer::new(TitleProvider::Claude);
+        let (status, prev_raw, armed) = viewer.completion(&session);
+        assert_eq!(status, AgentStatus::Idle, "no Done, so no notification");
+        assert_eq!((prev_raw, armed), (None, false), "nor a Done later");
+        session.kill();
+    }
+
+    #[test]
+    fn a_switch_keeps_the_new_title_and_waits_for_fresh_evidence() {
+        let (session, _receiver) = fixture();
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let learned = hook + Duration::from_millis(800);
+        session.process_drained(&drained(&[
+            // Long before the switch: the old conversation's title.
+            (
+                "\x1b]0;\u{2733} Old topic\x07",
+                hook - Duration::from_secs(10),
+            ),
+            // After the hook ran, before muxel's tick read its record: the
+            // new conversation's.
+            (
+                "\x1b]0;\u{2733} New topic\x07",
+                hook + Duration::from_millis(200),
+            ),
+        ]));
+        session.provider_switched_at(hook, hook, learned);
+        assert_eq!(
+            session.title().as_deref(),
+            Some("\u{2733} New topic"),
+            "new output before the tick is kept"
+        );
+        let evidence = session.runtime_evidence(None);
+        assert!(evidence.titles.is_empty());
+        assert!(evidence.settling);
+        let mut viewer = Viewer::new(TitleProvider::Claude);
+        let (status, prev_raw, armed) = viewer.completion(&session);
+        assert_eq!((status, prev_raw, armed), (AgentStatus::Idle, None, false));
+
+        // A turn submitted after the switch, its frames read after the window.
+        session.mark_turn_submitted();
+        session.write_input(b"\r");
+        let fresh = hook + SWITCH_SLACK + Duration::from_millis(100);
+        session.process_drained(&drained(&[
+            ("\x1b]0;\u{25d0} New topic\x07", fresh),
+            (
+                "\x1b]0;\u{2733} New topic\x07",
+                fresh + Duration::from_millis(10),
+            ),
+        ]));
+        let evidence = session.runtime_evidence(None);
+        assert!(!evidence.settling);
+        assert!(evidence.submitted);
+        assert_eq!(
+            title_status_trace(TitleProvider::Claude, &evidence.titles),
+            vec![AgentStatus::Working, AgentStatus::Idle]
+        );
+        let (status, _, _) = viewer.completion(&session);
+        assert_eq!(status, AgentStatus::Done, "the new conversation's turn");
+        session.kill();
+    }
+
+    #[test]
+    fn a_legacy_grok_switch_keeps_new_evidence_and_completes_nothing() {
+        let (session, _receiver) = fixture();
+        let scanned_at = SystemTime::now();
+        let previous_scan = scanned_at - Duration::from_secs(1);
+        // Between two registry reads, the resumed conversation works,
+        // finishes and rings.
+        session.process_drained(&drained(&[
+            (
+                "\x1b]0;\u{2839} - Responding - Review - grok\x07",
+                previous_scan + Duration::from_millis(300),
+            ),
+            (
+                "\x1b]0;Review - grok\x07\x07",
+                previous_scan + Duration::from_millis(600),
+            ),
+        ]));
+        // The second read finds a row with no registration time.
+        session.provider_switched_at(previous_scan, scanned_at, scanned_at);
+
+        assert_eq!(
+            session.title().as_deref(),
+            Some("Review - grok"),
+            "the new conversation's title is not retired"
+        );
+        assert!(!session.has_bell());
+        let evidence = session.runtime_evidence(None);
+        assert!(evidence.titles.is_empty());
+        assert!(evidence.settling);
+        let (status, prev_raw, armed) = Viewer::new(TitleProvider::Grok).completion(&session);
+        assert_eq!(status, AgentStatus::Idle, "no fabricated completion");
+        assert_eq!((prev_raw, armed), (None, false));
+        session.kill();
     }
 }

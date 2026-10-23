@@ -292,6 +292,7 @@ mod tests {
             let replies = Arc::new(Replies::new(Arc::new(Mutex::new(Box::new(sent.clone())))));
             let listener = MuxelListener {
                 replies: replies.clone(),
+                evidence: Default::default(),
                 title: Default::default(),
                 title_generation: Default::default(),
                 title_changed_at: Default::default(),

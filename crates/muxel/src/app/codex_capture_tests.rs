@@ -208,7 +208,7 @@ fn remote_codex_resume_does_not_touch_the_local_session_store() {
                     host_id: Uuid::new_v4(),
                     remote_root: "/remote/project".into(),
                 });
-                let (args, _) = app.session_resume_for(pane).unwrap();
+                let (args, _) = app.session_resume_for(pane).unwrap().unwrap();
                 assert_eq!(args, vec!["resume", id]);
                 assert_eq!(
                     app.workspace.instance(pane).unwrap().session_id.as_deref(),
@@ -240,7 +240,7 @@ fn exact_codex_identity_is_resumed_and_its_path_is_persisted() {
         window
             .update(cx, |app, _, _| {
                 app.workspace.instance_mut(pane).unwrap().session_id = Some(id.into());
-                let (args, _) = app.session_resume_for(pane).unwrap();
+                let (args, _) = app.session_resume_for(pane).unwrap().unwrap();
                 assert_eq!(args, vec!["resume", id]);
                 assert_eq!(
                     app.workspace.instance(pane).unwrap().session_path.as_ref(),
@@ -273,7 +273,7 @@ fn codex_store_error_keeps_the_saved_resume_identity() {
         window
             .update(cx, |app, _, _| {
                 app.workspace.instance_mut(pane).unwrap().session_id = Some(id.into());
-                let (args, _) = app.session_resume_for(pane).unwrap();
+                let (args, _) = app.session_resume_for(pane).unwrap().unwrap();
                 assert_eq!(args, vec!["resume", id]);
                 assert!(app.workspace.instance(pane).unwrap().session_started);
             })
@@ -290,7 +290,7 @@ fn inconclusive_codex_resume_survives_unrelated_early_exit_recovery() {
         let document = window
             .update(cx, |app, _, _| {
                 app.workspace.instance_mut(pane).unwrap().session_id = Some(id.into());
-                let (args, _) = app.session_resume_for(pane).unwrap();
+                let (args, _) = app.session_resume_for(pane).unwrap().unwrap();
                 assert_eq!(args, vec!["resume", id]);
                 // This is the decision used by tick after a direct resume exits
                 // nonzero within ten seconds for an unrelated reason.
@@ -387,7 +387,7 @@ fn inconclusive_codex_lookups_keep_the_saved_resume_identity() {
                     instance.session_id = Some(id.into());
                     instance.session_path = path.clone();
                     instance.session_started = true;
-                    let (args, _) = app.session_resume_for(pane).unwrap();
+                    let (args, _) = app.session_resume_for(pane).unwrap().unwrap();
                     assert_eq!(args, vec!["resume", id]);
                     assert_eq!(
                         app.workspace.instance(pane).unwrap().session_id.as_deref(),
@@ -418,7 +418,7 @@ fn disappeared_saved_codex_path_clears_the_binding() {
                 instance.session_id = Some(id.into());
                 instance.session_path = Some(path);
                 instance.session_started = true;
-                assert!(app.session_resume_for(pane).is_none());
+                assert!(app.session_resume_for(pane).unwrap().is_none());
                 let instance = app.workspace.instance(pane).unwrap();
                 assert!(instance.session_id.is_none());
                 assert!(!instance.session_started);

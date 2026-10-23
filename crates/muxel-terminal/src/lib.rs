@@ -26,12 +26,13 @@ pub use links::{FileLinkTarget, file_target_from_uri, file_uri, path_from_file_u
 pub use present_flag::{mark_present_needed, take_present_needed};
 pub use profile::startup_event;
 pub use session::{
-    CommandSpec, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY, PtyChunk,
-    PtyOutputQueueStats, PtyReceiver, TerminalSession, TitleSource, literal_program_for_spawn,
+    CommandSpec, LaunchBinding, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
+    PtyChunk, PtyOutputQueueStats, PtyReceiver, TerminalSession, TitleSource,
+    literal_program_for_spawn,
 };
 pub use view::{
     AgentStatus, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
     PathPasteErrorHandler, TerminalFocusObserver, TerminalFocusProfile, TerminalLaunch,
-    TerminalMouseMode, TerminalNotifyCause, TerminalView, clean_agent_title,
-    paste_clipboard_into_session,
+    TerminalMouseMode, TerminalNotifyCause, TerminalRuntimeSnapshot, TerminalStatusCoverage,
+    TerminalStatusReason, TerminalView, clean_agent_title, paste_clipboard_into_session,
 };
