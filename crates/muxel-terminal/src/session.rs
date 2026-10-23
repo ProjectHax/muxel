@@ -4312,7 +4312,7 @@ mod profiler_transport_tests {
 
 #[cfg(all(test, windows))]
 mod windows_child_exit_tests {
-    use super::{CommandSpec, PtyChunk, RESIZE_SETTLE, TerminalSession};
+    use super::{CommandSpec, PtyChunk, TerminalSession};
     use std::io::Write;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -4332,13 +4332,24 @@ mod windows_child_exit_tests {
     }
 
     fn wait_ready(session: &TerminalSession, rx: &super::PtyReceiver) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        wait_output(session, rx, "FIXTURE_READY", Duration::from_secs(10));
+    }
+
+    fn wait_output(
+        session: &TerminalSession,
+        rx: &super::PtyReceiver,
+        marker: &str,
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
         while Instant::now() < deadline {
             match rx.try_recv() {
                 Ok(PtyChunk::Output(bytes)) => {
                     session.process_output(&bytes);
-                    if session.visible_text().contains("FIXTURE_READY") {
-                        return;
+                    output.extend_from_slice(&bytes);
+                    if session.visible_text().contains(marker) {
+                        return output;
                     }
                 }
                 Ok(PtyChunk::Exit { .. }) => panic!("fixture exited before becoming ready"),
@@ -4348,7 +4359,15 @@ mod windows_child_exit_tests {
                 }
             }
         }
-        panic!("fixture never became ready");
+        panic!(
+            "fixture did not produce {marker}: input_closed={}, reader_finished={}, monitor_finished={}, output={:?}",
+            session
+                .input_closed
+                .load(std::sync::atomic::Ordering::Acquire),
+            session._reader.is_finished(),
+            session._monitor.is_finished(),
+            String::from_utf8_lossy(&output),
+        );
     }
 
     #[test]
@@ -4402,9 +4421,18 @@ mod windows_child_exit_tests {
     }
 
     fn wait_exit(session: &TerminalSession, rx: &super::PtyReceiver) -> (Option<i32>, Vec<u8>) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        wait_exit_with_timeout(session, rx, Duration::from_secs(10))
+    }
+
+    fn wait_exit_with_timeout(
+        session: &TerminalSession,
+        rx: &super::PtyReceiver,
+        shutdown_timeout: Duration,
+    ) -> (Option<i32>, Vec<u8>) {
+        let shutdown_deadline = Instant::now() + shutdown_timeout;
+        let mut exit_deadline = None;
         let mut output = Vec::new();
-        while Instant::now() < deadline {
+        loop {
             match rx.try_recv() {
                 Ok(PtyChunk::Output(bytes)) => {
                     // Feed the parser as the GUI does, including terminal replies.
@@ -4431,8 +4459,25 @@ mod windows_child_exit_tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
+            // Both the process monitor and the reader can close input. Exit
+            // follows final output and status collection, so give its delivery
+            // a separate bounded window after input shutdown.
+            let input_closed = session
+                .input_closed
+                .load(std::sync::atomic::Ordering::Acquire);
+            let deadline = if input_closed {
+                *exit_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(10))
+            } else {
+                shutdown_deadline
+            };
+            assert!(
+                Instant::now() < deadline,
+                "child exit was not reported: input_closed={input_closed}, reader_finished={}, monitor_finished={}, output={:?}",
+                session._reader.is_finished(),
+                session._monitor.is_finished(),
+                String::from_utf8_lossy(&output),
+            );
         }
-        panic!("child exit was not reported while its terminal session stayed alive");
     }
 
     #[test]
@@ -4582,16 +4627,26 @@ mod windows_child_exit_tests {
     #[test]
     fn a_live_child_still_receives_input_and_resizes() {
         let (session, rx) = spawn(
-            "[Console]::WriteLine('FIXTURE_READY'); $null = [Console]::ReadLine(); [Console]::WriteLine(('WIDTH_' + [Console]::WindowWidth)); exit 0",
+            "[Console]::WriteLine('FIXTURE_READY'); while ([Console]::WindowWidth -ne 101) { Start-Sleep -Milliseconds 5 }; [Console]::WriteLine(('WIDTH_' + [Console]::WindowWidth)); $line = [Console]::ReadLine(); [Console]::WriteLine(('INPUT_' + $line)); exit 0",
         );
-        wait_ready(&session, &rx);
+        // These are wall-clock scheduling backstops for real PowerShell/ConPTY
+        // work on loaded CI; readiness comes from the child's output below.
+        let process_timeout = Duration::from_secs(30);
+        wait_output(&session, &rx, "FIXTURE_READY", process_timeout);
         assert!(session.resize(101, 24));
-        std::thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
+        let resize_deadline = Instant::now() + process_timeout;
+        while session.resize(101, 24) {
+            assert!(Instant::now() < resize_deadline, "resize did not settle");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(!session.resize(101, 24));
+        let mut output = wait_output(&session, &rx, "WIDTH_101", process_timeout);
         session.write_input(b"finish\r");
-        let (code, output) = wait_exit(&session, &rx);
+        let (code, final_output) = wait_exit_with_timeout(&session, &rx, process_timeout);
+        output.extend_from_slice(&final_output);
         assert_eq!(code, Some(0));
         assert!(output.windows(9).any(|bytes| bytes == b"WIDTH_101"));
+        assert!(output.windows(12).any(|bytes| bytes == b"INPUT_finish"));
     }
 }
 

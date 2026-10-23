@@ -1,4 +1,5 @@
 use super::MuxelApp;
+use super::conpty_test_support::ChildHandle;
 use super::session_discovery::{
     CodexRestoreFound, CodexRestoreKind, inject_codex_launch_lookup, inject_codex_restore_lookup,
     inject_codex_resume_lookup,
@@ -314,8 +315,10 @@ fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
         let pane = codex_pane(cx, window);
         let id = "01a1543c-9700-7000-8000-000000000001";
         let _lookup = inject_codex_resume_lookup(Arc::new(|_, _, _| Ok(CodexResumePath::Unknown)));
-        let document = window
+        let (document, process) = window
             .update(cx, |app, window, cx| {
+                // This test calls tick explicitly after the terminal exits.
+                app._status_timer = gpui::Task::ready(());
                 app.workspace.instance_mut(pane).unwrap().session_id = Some(id.into());
                 let (meta, spec, size) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
                 assert!(meta.was_resume);
@@ -326,11 +329,19 @@ fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
                 let command = CommandSpec::program("/bin/sh", vec!["-c".into(), "exit 37".into()]);
                 let launch = TerminalLaunch::spawn_for_instance(command, size, pane).unwrap();
                 app.finish_terminal_spawn(meta, Ok(launch), window, cx);
-                muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap()
+                (
+                    muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap(),
+                    ChildHandle::new(app.terminals.get(&pane).unwrap().read(cx).session()),
+                )
             })
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // OS startup uses wall time; Exit delivery also needs the virtual output
+        // coalescer timer. Bound these separate phases instead of sleeping on a
+        // frozen GPUI clock and mistaking a queued Exit for a running child.
+        let process_deadline = Instant::now() + Duration::from_secs(30);
+        let mut exit_deadline = None;
         loop {
+            cx.executor().advance_clock(Duration::from_millis(10));
             cx.run_until_parked();
             let exited = window
                 .update(cx, |app, _, cx| {
@@ -340,11 +351,31 @@ fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
             if exited {
                 break;
             }
-            assert!(Instant::now() < deadline, "test child did not exit");
+            let running = process.running();
+            let deadline = if running {
+                process_deadline
+            } else {
+                *exit_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(10))
+            };
+            assert!(
+                Instant::now() < deadline,
+                "test child did not exit: process_running={running}, output={:?}",
+                window
+                    .update(cx, |app, _, cx| {
+                        app.terminals.get(&pane).unwrap().read(cx).visible_text()
+                    })
+                    .unwrap()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         window
-            .update(cx, |app, window, cx| app.tick(window, cx))
+            .update(cx, |app, window, cx| {
+                // Keep early-exit recovery eligible even after a slow OS exit.
+                let (launched_at, was_resume) = app.terminal_launches.get_mut(&pane).unwrap();
+                assert!(*was_resume);
+                *launched_at = Instant::now();
+                app.tick(window, cx);
+            })
             .unwrap();
         let saved = muxel_store::load_workspace_from(&document).unwrap();
         assert_eq!(
