@@ -56,6 +56,7 @@ const GROK_SCREEN_WORKING_HOLD: Duration = Duration::from_secs(2);
 /// Visible lifecycle parsing is independent from paint cadence, but it still
 /// must not allocate a full grid string for every PTY read under stream load.
 const STATUS_SCREEN_SCAN_INTERVAL: Duration = Duration::from_millis(50);
+const SILENT_SWITCH_SETTLE: Duration = Duration::from_secs(5);
 
 /// Pure paint-priority policy (see `docs/terminal-paint-architecture.md`).
 /// Extracted so we can unit-test without a full GPUI window.
@@ -251,6 +252,9 @@ struct RuntimeStatusState {
     /// Latest state reported by Muse's root-session hooks.
     muse_hook_state: Option<muxel_core::muse::MuseState>,
     deadline: Option<Instant>,
+    /// Independent of the evidence window, which can settle before an old
+    /// Working title has had enough quiet time to retire.
+    silent_switch_until: Option<Instant>,
     timer_generation: u64,
 }
 
@@ -281,6 +285,7 @@ impl RuntimeStatusState {
             muse_cwd_label: None,
             muse_hook_state: None,
             deadline: None,
+            silent_switch_until: None,
             timer_generation: 0,
         }
     }
@@ -333,6 +338,7 @@ impl RuntimeStatusState {
             // title that began it, or after everything recorded before a
             // switch reported out of band (all of it ambiguous).
             self.title_cursor = None;
+            self.silent_switch_until = None;
             // The retired conversation's bell was cleared where the binding
             // advanced (listener title bump or `provider_switched`), in order
             // with any bell the new binding has rung since; one read inside a
@@ -365,6 +371,14 @@ impl RuntimeStatusState {
             // A switch reported out of band starts the screen hold; the
             // capture below, and later ones, decide when it ends.
             self.screen_held = evidence.windowed;
+            if evidence.windowed {
+                self.silent_switch_until = Some(now + SILENT_SWITCH_SETTLE);
+            }
+        }
+        if submitted_turn || evidence.title_fresh {
+            // New work and a title actually read after the switch window own
+            // their state, even if they subsequently remain quiet.
+            self.silent_switch_until = None;
         }
         if title_overflowed {
             // Missing an ordered title edge invalidates this source. Rebuild from
@@ -467,6 +481,34 @@ impl RuntimeStatusState {
             screen_marker,
             fresh_title.filter(|_| evidence.title_fresh),
         );
+        // The two-second evidence settle accepts uncertain titles as level
+        // state; it does not make an unchanged Working title new work. Give
+        // that title five seconds from observing the switch and five seconds
+        // of PTY quiet, without releasing the newer policy's screen hold.
+        let hook = (title_provider == TitleProvider::Muse && !exited)
+            .then(|| muse_hook_status(self.muse_hook_state, title, screen_working))
+            .flatten();
+        let stale_busy_title = matches!(title, Some(AgentStatus::Working | AgentStatus::Blocked));
+        let silent_switch_settled = !settling
+            && hook.is_none()
+            && self.silent_switch_until.is_some_and(|until| now >= until)
+            && stale_busy_title
+            && idle >= SILENT_SWITCH_SETTLE
+            && screen_marker.is_none()
+            && !exited
+            && !bell;
+        if !silent_switch_settled
+            && stale_busy_title
+            && !exited
+            && !bell
+            && screen_marker.is_none()
+            && let Some(until) = self.silent_switch_until
+        {
+            let deadline = until
+                .max(now + SILENT_SWITCH_SETTLE.saturating_sub(idle))
+                .max(settle_deadline.unwrap_or(now));
+            next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
+        }
 
         if title_provider == TitleProvider::Grok {
             // Debounces retain only attributable source evidence. The current
@@ -507,15 +549,20 @@ impl RuntimeStatusState {
             title = provider_screen;
         }
 
-        let hook = (title_provider == TitleProvider::Muse && !exited)
-            .then(|| muse_hook_status(self.muse_hook_state, title, screen_working))
-            .flatten();
-        let raw = hook.unwrap_or_else(|| combine_title_status(exited, base, title, screen_working));
+        let raw = hook.unwrap_or_else(|| {
+            if silent_switch_settled {
+                AgentStatus::Idle
+            } else {
+                combine_title_status(exited, base, title, screen_working)
+            }
+        });
         let can_latch = can_latch_completion(
             !working_markers.is_empty(),
             self.semantic_title_status.is_some(),
         );
-        let raw_reason = if hook == Some(raw) {
+        let raw_reason = if silent_switch_settled {
+            TerminalStatusReason::Quiet
+        } else if hook == Some(raw) {
             TerminalStatusReason::ProviderHook
         } else {
             status_reason(
@@ -529,7 +576,12 @@ impl RuntimeStatusState {
             )
         };
         let raw_attributable = status_is_attributable(settling, self.screen_held, raw_reason);
-        let (status, latch, armed) = if raw_attributable {
+        let (status, latch, armed) = if silent_switch_settled {
+            // Retiring stale level state is neither a finish nor readiness
+            // evidence for a turn in the replacement conversation.
+            self.provider_settled = false;
+            (raw, false, false)
+        } else if raw_attributable {
             latch_done_after_readiness(
                 self.prev_raw,
                 raw,
@@ -543,7 +595,7 @@ impl RuntimeStatusState {
             // it disappears. Keep the new binding's explicit submission only.
             (raw, false, submitted_turn)
         };
-        self.prev_raw = raw_attributable.then_some(raw);
+        self.prev_raw = (raw_attributable && !silent_switch_settled).then_some(raw);
         self.done_latch = latch;
         self.completion_armed = armed;
 
@@ -555,7 +607,9 @@ impl RuntimeStatusState {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
 
-        let reason = if hook == Some(status) {
+        let reason = if silent_switch_settled {
+            TerminalStatusReason::Quiet
+        } else if hook == Some(status) {
             TerminalStatusReason::ProviderHook
         } else {
             status_reason(
@@ -6526,6 +6580,85 @@ mod provider_switch_tests {
         assert_eq!(done.status, AgentStatus::Done);
         assert!(done.attributable);
         session.kill();
+    }
+
+    #[test]
+    fn a_silent_switch_retires_an_old_working_title_without_completing() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Claude);
+        session.mark_turn_submitted();
+        session.process_output("\x1b]0;\u{25d0} Old task\x07".as_bytes());
+        assert_eq!(viewer.sample(&session).0, AgentStatus::Working);
+
+        let hook = SystemTime::now();
+        session.provider_switched_at(hook, hook, hook);
+        let switched_at = viewer.clock;
+        let (snapshot, deadline) = viewer.sample_at(&session, switched_at);
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(!snapshot.attributable);
+        assert!(!snapshot.completion_ready);
+        assert!(deadline.is_some(), "the silent switch schedules a check");
+
+        // The newer evidence window ends sooner than the five-second quiet
+        // allowance. Ending that window must not discard the retirement timer.
+        session.set_idle_for_test(Duration::from_secs(6));
+        let (snapshot, deadline) = viewer.sample_at(&session, switched_at + Duration::from_secs(3));
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert_eq!(deadline, Some(switched_at + Duration::from_secs(5)));
+        session.set_idle_for_test(Duration::from_secs(1));
+        let (snapshot, deadline) = viewer.sample_at(&session, switched_at + Duration::from_secs(6));
+        assert_eq!(
+            snapshot.status,
+            AgentStatus::Working,
+            "PTY output delays retirement"
+        );
+        assert!(deadline.is_some_and(|at| at > switched_at + Duration::from_secs(9)));
+        session.set_idle_for_test(Duration::from_secs(6));
+        for elapsed in [11, 60] {
+            let (snapshot, _) =
+                viewer.sample_at(&session, switched_at + Duration::from_secs(elapsed));
+            assert_eq!(snapshot.status, AgentStatus::Idle);
+            assert_eq!(snapshot.reason, TerminalStatusReason::Quiet);
+            assert!(snapshot.attributable);
+            assert!(!snapshot.completion_ready);
+            assert!(!viewer.runtime.done_latch);
+            assert!(!viewer.runtime.completion_armed);
+            assert_eq!(viewer.runtime.prev_raw, None);
+        }
+        session.kill();
+    }
+
+    #[test]
+    fn a_silent_switch_keeps_new_submitted_or_fresh_titled_work() {
+        for submitted in [false, true] {
+            let (session, _receiver) = fixture();
+            let mut viewer = Viewer::new(TitleProvider::Claude);
+            session.process_output("\x1b]0;\u{25d0} Old task\x07".as_bytes());
+            viewer.sample(&session);
+            let hook = SystemTime::now();
+            session.provider_switched_at(hook, hook, hook);
+            let switched_at = viewer.clock;
+            viewer.sample_at(&session, switched_at);
+            if submitted {
+                session.mark_turn_submitted();
+            } else {
+                session.process_drained(&drained(&[(
+                    "\x1b]0;\u{25d0} New task\x07",
+                    hook + SWITCH_SLACK + Duration::from_millis(100),
+                )]));
+            }
+            session.set_idle_for_test(Duration::from_secs(6));
+            let (snapshot, _) = viewer.sample_at(&session, switched_at + Duration::from_secs(6));
+            assert_eq!(
+                snapshot.status,
+                AgentStatus::Working,
+                "submitted={submitted}"
+            );
+            assert!(snapshot.attributable, "submitted={submitted}");
+            assert!(!viewer.runtime.done_latch);
+            assert!(viewer.runtime.silent_switch_until.is_none());
+            session.kill();
+        }
     }
 
     #[test]
