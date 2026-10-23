@@ -80,6 +80,19 @@ impl MuxelApp {
                     .unwrap_or(0)
             };
         let instance = options.instance(project, &self.presets, default_index)?;
+        // `new --prompt` sends caller text through a tmux client during startup.
+        // A root or prefix binding can replace the agent pane with a shell there,
+        // just as it can for `send` and `keys` after startup.
+        if options.prompt.is_some()
+            && self.use_tmux
+            && self.tmux_available
+            && !self.settings.control_allow_shells
+        {
+            return Err(ctl::Error::new(
+                ErrorCode::CommandPermissionRequired,
+                "typing a new prompt into a tmux-backed pane requires Settings > Grok Bot > \"Also allow typing into shell panes\"",
+            ));
+        }
         if let ctl::CreationDecision::Refuse(code) = self.creation_decision(&instance) {
             return Err(ctl::creation_refusal(code));
         }

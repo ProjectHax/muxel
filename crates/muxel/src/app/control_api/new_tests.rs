@@ -56,6 +56,8 @@ struct MuxelApp {
     workspace: Workspace,
     presets: Vec<AgentPreset>,
     current_preset: usize,
+    use_tmux: bool,
+    tmux_available: bool,
     current_workspace: Option<Uuid>,
     workspace_busy: Option<Uuid>,
     confirm_quit: bool,
@@ -93,6 +95,8 @@ impl MuxelApp {
             },
             presets: vec![AgentPreset::shell(), AgentPreset::codex()],
             current_preset: 0,
+            use_tmux: false,
+            tmux_available: false,
             current_workspace: Some(Uuid::new_v4()),
             workspace_busy: None,
             confirm_quit: false,
@@ -273,6 +277,42 @@ fn control_new_parameters_validate_before_mutation_and_preserve_allow_policy() {
 }
 
 const COMMAND_SETTING: &str = "Also allow typing into shell panes";
+
+#[test]
+fn control_new_prompt_into_tmux_requires_command_grant_before_placement() {
+    let mut app = MuxelApp::fixture();
+    app.use_tmux = true;
+    app.tmux_available = true;
+    let options = ctl::NewOptions {
+        preset: Some("Codex".into()),
+        prompt: Some("a task".into()),
+        ..Default::default()
+    };
+    app.refuses_without_mutation(options.clone(), COMMAND_SETTING);
+    assert_eq!(
+        app.prepare_control_new(app.workspace.projects[0].id, &options)
+            .unwrap_err()
+            .code,
+        Some(ErrorCode::CommandPermissionRequired)
+    );
+    app.settings.control_allow_shells = true;
+    assert!(
+        app.prepare_control_new(app.workspace.projects[0].id, &options)
+            .is_ok()
+    );
+    app.settings.control_allow_shells = false;
+    app.use_tmux = false;
+    assert!(
+        app.prepare_control_new(app.workspace.projects[0].id, &options)
+            .is_ok()
+    );
+    app.use_tmux = true;
+    app.tmux_available = false;
+    assert!(
+        app.prepare_control_new(app.workspace.projects[0].id, &options)
+            .is_ok()
+    );
+}
 
 fn target_project(app: &mut MuxelApp, empty: bool) -> (Uuid, Option<Uuid>) {
     let mut project = Project::new("other", std::env::current_dir().unwrap());
@@ -597,9 +637,11 @@ fn control_new_policy_raw_write_revocation() {
         let instance = argv(program).instance(project, &[], 0).unwrap();
         let before = serde_json::to_value(&instance).unwrap();
         app.settings.control_allow_shells = true;
-        assert!(control_program_writable(&instance, app.settings.control_allow_shells).is_ok());
+        assert!(
+            control_program_writable(&instance, app.settings.control_allow_shells, false).is_ok()
+        );
         app.settings.control_allow_shells = false;
-        let error = control_program_writable(&instance, app.settings.control_allow_shells)
+        let error = control_program_writable(&instance, app.settings.control_allow_shells, false)
             .expect_err("raw-command write permission revoked");
         assert!(
             error.contains(COMMAND_SETTING),
@@ -621,7 +663,7 @@ fn control_new_policy_configured_agent_writes_survive_shell_opt_out() {
     assert!(!app.settings.control_allow_shells);
     let instance = Instance::from_preset(app.workspace.projects[0].id, &AgentPreset::codex());
     assert!(!instance.literal_argv);
-    assert!(control_program_writable(&instance, app.settings.control_allow_shells).is_ok());
+    assert!(control_program_writable(&instance, app.settings.control_allow_shells, false).is_ok());
     app.settings.control_allow_shells = true;
     for instance in [
         Instance::shell(app.workspace.projects[0].id),
@@ -629,7 +671,9 @@ fn control_new_policy_configured_agent_writes_survive_shell_opt_out() {
             .instance(&app.workspace.projects[0], &[], 0)
             .unwrap(),
     ] {
-        assert!(control_program_writable(&instance, app.settings.control_allow_shells).is_ok());
+        assert!(
+            control_program_writable(&instance, app.settings.control_allow_shells, false).is_ok()
+        );
     }
 }
 
@@ -645,7 +689,9 @@ fn control_new_policy_write_entry_points_recheck_permission() {
         .unwrap();
     assert!(
         write_boundary
-            .find("control_program_writable(inst, self.settings.control_allow_shells)?")
+            .find(
+                "control_program_writable(inst, self.settings.control_allow_shells, tmux_client)?"
+            )
             .unwrap()
             < write_boundary.find("self.control_state(").unwrap()
     );
@@ -735,9 +781,9 @@ fn control_new_policy_shell_classification_refuses_writes_after_opt_out() {
                 .unwrap();
             // This is the program metadata a preset/literal shell retains after
             // creation. control_writable invokes this same policy on every write.
-            assert!(control_program_writable(&instance, true).is_ok());
-            let error =
-                control_program_writable(&instance, false).expect_err("shell permission revoked");
+            assert!(control_program_writable(&instance, true, false).is_ok());
+            let error = control_program_writable(&instance, false, false)
+                .expect_err("shell permission revoked");
             assert!(
                 error.contains(COMMAND_SETTING),
                 "unexpected refusal: {error}"
@@ -920,10 +966,9 @@ fn control_new_policy_production_queue_enters_the_tested_mutation_boundary() {
         .split("    fn control_claim_site(")
         .next()
         .unwrap();
-    assert!(
-        write_boundary
-            .contains("control_program_writable(inst, self.settings.control_allow_shells)?")
-    );
+    assert!(write_boundary.contains(
+        "control_program_writable(inst, self.settings.control_allow_shells, tmux_client)?"
+    ));
 }
 
 #[test]

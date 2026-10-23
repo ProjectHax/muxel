@@ -2620,10 +2620,11 @@ pub struct Settings {
     /// approvals, not existing panes.
     #[serde(default)]
     pub control_allow_new: control::CreationPolicy,
-    /// Also allow typing into shell panes and `ctl new` shell presets/defaults
-    /// or any literal argv. Commands run as the host muxel process, outside the
-    /// caller's sandbox. Off by default; non-literal agent writes need only global
-    /// outside control. Creation also requires a non-Off control_allow_new policy.
+    /// Also allow typing into shell, literal-argv and tmux-backed panes, and
+    /// `ctl new` shell presets/defaults or any literal argv. Tmux client bindings
+    /// can open a shell window even from an agent pane. Off by default; direct
+    /// non-literal agent writes need only global outside control. Creation also
+    /// requires a non-Off control_allow_new policy.
     #[serde(default)]
     pub control_allow_shells: bool,
     // --- Team libraries (`library`) ---
