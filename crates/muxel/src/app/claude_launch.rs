@@ -1368,6 +1368,9 @@ mod tests {
                     )
                 })
                 .unwrap();
+            let record =
+                crate::session_binding::claude_binding_path(&muxel_store::data_dir().unwrap(), id);
+            let first_modified = std::fs::metadata(&record).unwrap().modified().unwrap();
             let token = pending.request.key.token;
             let resolution = w8lm_resolve(&mut pending, &home);
             window
@@ -1403,13 +1406,20 @@ mod tests {
                     );
                 })
                 .unwrap();
-            let record =
-                crate::session_binding::claude_binding_path(&muxel_store::data_dir().unwrap(), id);
             assert!(
                 !record.exists(),
                 "master's launch recovery acknowledged the hook"
             );
             w8lm_hook(&home, id, &announced, "resume", true);
+            std::fs::File::options()
+                .write(true)
+                .open(&record)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(first_modified + std::time::Duration::from_secs(1)),
+                )
+                .unwrap();
             let mut resumed = window
                 .update(cx, |app, _, _| {
                     app.prepare_claude_launch(id, token)
