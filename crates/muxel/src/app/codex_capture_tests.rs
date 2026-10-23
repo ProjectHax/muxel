@@ -22,7 +22,7 @@ impl Drop for TempRoot {
     }
 }
 
-fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
+pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
     let root = std::env::temp_dir().join(format!("muxel-codex-capture-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
@@ -85,7 +85,11 @@ fn codex_launch_preparation_does_not_wait_for_slow_discovery() {
         }));
         window
             .update(cx, |app, window, cx| {
-                let (meta, spec, _) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                let (meta, spec, _) = app
+                    .prepare_terminal_spawn(pane, window, cx)
+                    .unwrap()
+                    .ready_parts()
+                    .unwrap();
                 assert!(!meta.was_resume);
                 assert!(!spec.args.iter().any(|arg| arg == "resume"));
                 assert!(app.workspace.instance(pane).unwrap().session_id.is_none());
@@ -148,7 +152,11 @@ fn unbound_codex_restore_lookup_runs_on_a_worker_once_and_binds_before_launch() 
                 let instance = app.workspace.instance(pane).unwrap();
                 assert_eq!(instance.session_id.as_deref(), Some(id));
                 assert_eq!(instance.session_path.as_ref(), Some(&path));
-                let (meta, spec, _) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                let (meta, spec, _) = app
+                    .prepare_terminal_spawn(pane, window, cx)
+                    .unwrap()
+                    .ready_parts()
+                    .unwrap();
                 assert!(meta.was_resume);
                 assert!(spec.args.iter().any(|arg| arg == id));
                 // One lookup per pane in a run, even if it would qualify again.
@@ -176,7 +184,11 @@ fn codex_restore_lookup_landing_after_launch_preparation_is_dropped() {
             .update(cx, |app, window, cx| {
                 app.begin_codex_restore_lookup(pane, cx);
                 // An immediate launch went ahead before the worker landed.
-                let (meta, _, _) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                let (meta, _, _) = app
+                    .prepare_terminal_spawn(pane, window, cx)
+                    .unwrap()
+                    .ready_parts()
+                    .unwrap();
                 assert!(!meta.was_resume);
             })
             .unwrap();
@@ -317,7 +329,11 @@ fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
         let document = window
             .update(cx, |app, window, cx| {
                 app.workspace.instance_mut(pane).unwrap().session_id = Some(id.into());
-                let (meta, spec, size) = app.prepare_terminal_spawn(pane, window, cx).unwrap();
+                let (meta, spec, size) = app
+                    .prepare_terminal_spawn(pane, window, cx)
+                    .unwrap()
+                    .ready_parts()
+                    .unwrap();
                 assert!(meta.was_resume);
                 assert!(spec.args.iter().any(|arg| arg == "resume"));
                 #[cfg(windows)]

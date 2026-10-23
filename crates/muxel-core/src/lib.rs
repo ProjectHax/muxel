@@ -34,13 +34,14 @@ pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
-    ACCOMPLISHMENTS_FILE, AgentPreset, CodexHintMiss, CodexResumePath, CodexSession,
-    CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
-    accomplishments_header, accomplishments_instruction, append_agent_instruction,
-    claude_session_cwd, claude_session_path, codex_developer_instructions_override,
-    codex_latest_session_id, codex_latest_sessions, codex_resume_path, codex_rollout_by_walk,
-    codex_session_from_hint, codex_session_hint_from_title, codex_session_id_from_hint,
-    codex_session_names, codex_terminal_title_override, file_link_instruction,
+    ACCOMPLISHMENTS_FILE, AgentPreset, ClaudeSession, ClaudeSessionRequest, CodexHintMiss,
+    CodexResumePath, CodexSession, CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR,
+    MEMORY_FILE, PresetKind, ResolvedLaunch, accomplishments_header, accomplishments_instruction,
+    append_agent_instruction, claude_session_cwd, claude_session_cwd_with_len, claude_session_path,
+    codex_developer_instructions_override, codex_latest_session_id, codex_latest_sessions,
+    codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
+    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
+    codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
     find_claude_session_path, is_known_agent_program, launches_known_agent, memory_header,
     memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
     resolve_launch_for_session, session_resume_args,
@@ -605,6 +606,10 @@ pub struct Instance {
     /// Validated provider transcript/rollout path for the saved session id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_path: Option<PathBuf>,
+    /// Last consumed Claude hook receipt. Retain it across same-pane fresh
+    /// starts so a retained hook cannot restore a discarded conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_hook_record: Option<String>,
     /// Whether this instance's session has been launched at least once, so a
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
@@ -717,6 +722,7 @@ impl Instance {
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
         self.session_path = None;
+        self.claude_hook_record = None;
         self.session_started = false;
         self.auto_name = None;
         // Duplication is a new local UI action, not the outside launch approval.
@@ -781,6 +787,7 @@ impl Instance {
             worktree_id: None,
             session_id: None,
             session_path: None,
+            claude_hook_record: None,
             session_started: false,
         }
     }
@@ -849,6 +856,7 @@ impl Instance {
             worktree_id: None,
             session_id: None,
             session_path: None,
+            claude_hook_record: None,
             session_started: false,
         }
     }
@@ -1533,6 +1541,7 @@ impl RemoteLayout {
                     instance.tmux_socket = None;
                     instance.session_id = None;
                     instance.session_path = None;
+                    instance.claude_hook_record = None;
                     instance.session_started = false;
                     instance.auto_submit = false;
                 }
@@ -2835,6 +2844,7 @@ mod instance_tests {
         instance.custom_name = Some("Manual name".into());
         instance.auto_name = Some("Generated title".into());
         instance.session_id = Some(Uuid::new_v4().to_string());
+        instance.claude_hook_record = Some("consumed receipt".into());
         instance.session_started = true;
 
         instance.reset_conversation_for_duplicate();
@@ -2842,6 +2852,7 @@ mod instance_tests {
         assert_eq!(instance.custom_name.as_deref(), Some("Manual name"));
         assert_eq!(instance.auto_name, None);
         assert_eq!(instance.session_id, None);
+        assert_eq!(instance.claude_hook_record, None);
         assert!(!instance.session_started);
     }
 
@@ -3862,6 +3873,7 @@ mod remote_layout_tests {
         ws.instances[1].tmux_session = Some("muxel_proj_1a2b3c4d".into());
         ws.instances[1].tmux_socket = Some(tmux::Socket::Default);
         ws.instances[1].session_id = Some(Uuid::new_v4().to_string());
+        ws.instances[1].claude_hook_record = Some("consumed receipt".into());
         ws.instances[1].session_started = true;
         let bound = RemoteLayout::capture(&proj, &ws, 1);
         assert_ne!(bound.content_key(), before.content_key());

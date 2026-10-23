@@ -58,6 +58,9 @@ use uuid::Uuid;
 
 mod accomplishments_ui;
 #[cfg(all(test, windows))]
+mod claude_capture_tests;
+mod claude_launch;
+#[cfg(all(test, windows))]
 mod codex_capture_tests;
 mod control_api;
 mod hotbar;
@@ -69,6 +72,7 @@ mod popout_lifecycle_tests;
 mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
+use claude_launch::TerminalPreparation;
 mod tmux_install_modal;
 mod upkeep;
 
@@ -3315,52 +3319,9 @@ fn is_claude_program(program: Option<&str>) -> bool {
     )
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ClaudeSessionState {
-    NotClaude,
-    Found { cwd: Option<PathBuf> },
-    Missing,
-    Unknown,
-}
-
-/// Locate a Claude transcript and recover the cwd Claude recorded in it.
-/// Claude refuses to resume a conversation from another directory, so finding
-/// the UUID alone is insufficient after `/cd` or a worktree move. An I/O failure
-/// is not evidence of deletion and preserves the saved resume id.
-fn claude_session_state(
-    preset: &muxel_core::AgentPreset,
-    cwd: Option<&std::path::Path>,
-    session_id: &str,
-) -> ClaudeSessionState {
-    if !is_claude_program(preset.program.as_deref()) {
-        return ClaudeSessionState::NotClaude;
-    }
-    let Some(home) = home_dir() else {
-        return ClaudeSessionState::Unknown;
-    };
-    match muxel_core::find_claude_session_path(&home, cwd, session_id) {
-        Ok(Some(path)) => match muxel_core::claude_session_cwd(&path) {
-            Ok(Some(cwd)) if cwd.is_dir() => ClaudeSessionState::Found { cwd: Some(cwd) },
-            Ok(Some(cwd)) => {
-                log::warn!(
-                    "Claude session recorded a cwd that is no longer a directory: {}",
-                    cwd.display()
-                );
-                ClaudeSessionState::Found { cwd: None }
-            }
-            Ok(None) => ClaudeSessionState::Found { cwd: None },
-            Err(error) => {
-                log::warn!("could not read Claude session cwd before resume: {error}");
-                ClaudeSessionState::Found { cwd: None }
-            }
-        },
-        Ok(None) => ClaudeSessionState::Missing,
-        Err(error) => {
-            log::warn!("could not scan Claude sessions before resume: {error}");
-            ClaudeSessionState::Unknown
-        }
-    }
-}
+#[cfg(test)]
+static CLAUDE_LAUNCH_TEST_LOOKUP: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
 
 /// What a launch knows at spawn about the conversation it opens. Session
 /// flags pin it (`resume_args`: the flag, then the id). Without them, an agent
@@ -4777,7 +4738,6 @@ struct TerminalSpawnMeta {
 }
 
 type SessionResume = (Vec<String>, Option<PathBuf>);
-type PreparedTerminalSpawn = (TerminalSpawnMeta, CommandSpec, (u16, u16));
 
 pub struct MuxelApp {
     workspace: Workspace,
@@ -7889,9 +7849,8 @@ impl MuxelApp {
     ///   (`begin_codex_restore_lookup`), which may already have bound it, saved
     ///   its rollout path, or confirmed its rollout missing.
     ///
-    /// This launch-time check still performs synchronous store I/O (one stat,
-    /// or a dated directory listing), including when tick recovery reaches it.
-    /// Walks and recurring discovery use background workers.
+    /// Claude transcript lookup runs in its launch worker. Codex checks its
+    /// saved path or UUID day directory here.
     fn session_resume_for(&mut self, iid: Uuid) -> anyhow::Result<Option<SessionResume>> {
         let started = ui_profile::is_enabled().then(Instant::now);
         self.bump_session_binding_generation(iid);
@@ -7967,6 +7926,7 @@ impl MuxelApp {
         })() else {
             return Ok(None);
         };
+        let mut recovered_cwd = None;
         // Claude can replace its conversation inside the same PTY. A process-local
         // SessionStart hook leaves an exact binding file; consume it before choosing
         // this launch's `--resume` id so even an immediate app restart is correct.
@@ -7986,7 +7946,14 @@ impl MuxelApp {
                             session_discovery::tmux_session_running,
                         )
                     },
-                    |record| self.adopt_claude_session_record(iid, None, record, &home),
+                    |record| {
+                        let (outcome, cwd) =
+                            self.adopt_claude_session_record(iid, None, record, &home)?;
+                        if cwd.is_some() {
+                            recovered_cwd = cwd;
+                        }
+                        Ok(outcome)
+                    },
                 )
                 .with_context(|| t("Could not recover this conversation before launch."))?;
             }
@@ -7996,7 +7963,7 @@ impl MuxelApp {
         };
         let previous_session_path = inst.session_path.clone();
         let host_minted = preset.session_id_flag.is_some();
-        let mut resume_cwd = None;
+        let resume_cwd = recovered_cwd;
         // `codex resume <id>` without a rollout this check could confirm.
         let mut unconfirmed_resume = false;
         if host_minted {
@@ -8004,29 +7971,16 @@ impl MuxelApp {
                 inst.session_id = Some(Uuid::new_v4().to_string());
                 inst.session_path = None;
             }
-            // Proactive resume: if we'd `--resume` an already-started session but its
-            // transcript is gone from disk (deleted/expired), start a *fresh* session
-            // instead of a doomed resume that just hangs. Local projects only: a
-            // remote agent's transcript is on its host, so its absence from this disk
-            // says nothing — checking here reset every remote pane's conversation.
+            // Claude preflight has already resolved the exact identity off UI.
+            // A first launch has a predictable path and needs no provider read.
             if local
-                && inst.session_started
-                && let Some(sid) = inst.session_id.clone()
+                && is_claude_program(preset.program.as_deref())
+                && !inst.session_started
+                && inst.session_path.is_none()
+                && let (Some(home), Some(id), Some(cwd)) =
+                    (home_dir(), inst.session_id.as_deref(), cwd.as_deref())
             {
-                let state = {
-                    let _phase =
-                        ui_profile::phase("activation", "claude-session-exists", Some(iid));
-                    claude_session_state(&preset, cwd.as_deref(), &sid)
-                };
-                match state {
-                    ClaudeSessionState::Found { cwd } => resume_cwd = cwd,
-                    ClaudeSessionState::Missing => {
-                        inst.session_id = Some(Uuid::new_v4().to_string());
-                        inst.session_path = None;
-                        inst.session_started = false;
-                    }
-                    ClaudeSessionState::NotClaude | ClaudeSessionState::Unknown => {}
-                }
+                inst.session_path = Some(muxel_core::claude_session_path(&home, cwd, id));
             }
         } else if inst.session_started {
             if inst.session_id.is_none() {
@@ -8073,7 +8027,11 @@ impl MuxelApp {
         Ok(result)
     }
 
-    fn command_for(&mut self, instance_id: Uuid) -> anyhow::Result<CommandSpec> {
+    fn command_for(
+        &mut self,
+        instance_id: Uuid,
+        resume_cwd: Option<PathBuf>,
+    ) -> anyhow::Result<CommandSpec> {
         let _phase = ui_profile::phase("activation", "command-for", Some(instance_id));
         // Literal commands bypass every transport, prompt and resume wrapper,
         // including stale tmux metadata adopted from a shared layout.
@@ -8089,7 +8047,12 @@ impl MuxelApp {
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
         // resolve the --session-id / --resume flag *before* anything borrows the
         // instance. Mutates + persists the instance's session bookkeeping.
-        let session_resume = self.session_resume_for(instance_id)?;
+        let mut session_resume = self.session_resume_for(instance_id)?;
+        if let (Some((_, cwd)), Some(resolved)) = (&mut session_resume, resume_cwd)
+            && cwd.is_none()
+        {
+            *cwd = Some(resolved);
+        }
         let resume_args = session_resume.as_ref().map(|(args, _)| args);
         // Seat a remote pane on one of its host's masters before anything borrows
         // the workspace.
@@ -8427,6 +8390,12 @@ impl MuxelApp {
         // its PTY. Its token will fail validation and dropping it kills the child.
         self.terminal_launching.remove(&instance_id);
         self.reset_terminal_runtime(instance_id);
+        if self.needs_claude_preflight(instance_id) {
+            self.terminals.remove(&instance_id);
+            self.failed_launches.remove(&instance_id);
+            self.spawn_terminal_deferred(instance_id, reason, window, cx);
+            return;
+        }
         // A remote password host with no saved/session password: prompt for it
         // first (storing it in memory), then this spawn is retried via
         // `ensure_project_terminals`. Avoids `sshpass -e` with an empty $SSHPASS.
@@ -8447,7 +8416,7 @@ impl MuxelApp {
         }
         // Whether this launch will `--resume` a saved session (true on every
         // launch after the first, for resume-capable agents).
-        let spec = match self.command_for(instance_id) {
+        let spec = match self.command_for(instance_id, None) {
             Ok(spec) => spec,
             Err(error) => {
                 self.refuse_terminal_launch(instance_id, error.to_string(), cx);
@@ -8516,15 +8485,15 @@ impl MuxelApp {
         }
     }
 
-    /// Prepare the stateful/UI half of a deferred terminal launch. The returned
-    /// spec can be spawned on a worker; completion must come back through
-    /// `finish_deferred_terminal_spawn`.
+    /// Reserve and capture the UI half of a deferred launch. Claude preparation
+    /// waits for a worker result before command construction; other providers
+    /// return an owned command immediately. Completion uses finish_terminal_spawn.
     fn prepare_terminal_spawn(
         &mut self,
         instance_id: Uuid,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<PreparedTerminalSpawn> {
+    ) -> Option<TerminalPreparation> {
         let token = self.reserve_terminal_spawn(
             instance_id,
             muxel_core::TerminalLaunchReason::Restore,
@@ -8776,7 +8745,25 @@ impl MuxelApp {
         token: u64,
         reason: muxel_core::TerminalLaunchReason,
         cx: &mut Context<Self>,
-    ) -> Option<PreparedTerminalSpawn> {
+    ) -> Option<TerminalPreparation> {
+        if !launch_token_current(&self.terminal_launching, instance_id, token) {
+            return None;
+        }
+        if let Some(pending) = self.prepare_claude_launch_with_reason(instance_id, token, reason) {
+            return Some(pending);
+        }
+        self.prepare_resolved_terminal_spawn(instance_id, token, reason, None, cx)
+            .map(TerminalPreparation::ready)
+    }
+
+    fn prepare_resolved_terminal_spawn(
+        &mut self,
+        instance_id: Uuid,
+        token: u64,
+        reason: muxel_core::TerminalLaunchReason,
+        resume_cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
         let _phase =
             ui_profile::phase("activation", "prepare-reserved-terminal", Some(instance_id));
         if !launch_token_current(&self.terminal_launching, instance_id, token) {
@@ -8791,7 +8778,8 @@ impl MuxelApp {
         if !self.prepare_local_tmux_owner(instance_id) {
             return None;
         }
-        let spec = match self.command_for(instance_id) {
+        let started = self.terminal_launching.get(&instance_id)?.since;
+        let spec = match self.command_for(instance_id, resume_cwd) {
             Ok(spec) => spec,
             Err(error) => {
                 self.refuse_terminal_launch(instance_id, error.to_string(), cx);
@@ -8810,13 +8798,8 @@ impl MuxelApp {
             program,
             cwd,
             was_resume,
-            started: Instant::now(),
+            started,
         };
-        // Both callers hand the command to its worker as soon as this returns,
-        // so the launch's admission deadline counts from here.
-        if let Some(launch) = self.terminal_launching.get_mut(&instance_id) {
-            launch.since = meta.started;
-        }
         let size = self
             .workspace
             .instance(instance_id)
@@ -8883,7 +8866,7 @@ impl MuxelApp {
                 .timer(Duration::from_millis(1))
                 .await;
             Self::await_codex_restore_lookup(&this, instance_id, cx).await;
-            let Some((meta, spec, size)) = this
+            let Some(prepared) = this
                 .update(cx, |this, cx| {
                     this.prepare_reserved_terminal_spawn(instance_id, token, reason, cx)
                 })
@@ -8892,10 +8875,13 @@ impl MuxelApp {
             else {
                 return;
             };
-            let result = cx
-                .background_executor()
-                .spawn(async move { TerminalLaunch::spawn_for_instance(spec, size, instance_id) })
-                .await;
+            let mut preparations = vec![prepared];
+            claude_launch::start_batch(&mut preparations, cx.background_executor());
+            let Some((meta, result)) =
+                Self::run_terminal_preparation(&this, preparations.pop().unwrap(), cx).await
+            else {
+                return;
+            };
             // Install in the window showing the pane's project: the terminal view
             // listens for focus in the window it is created in. A launch for a
             // project no window shows still installs, in the main window.
@@ -10085,7 +10071,8 @@ impl MuxelApp {
                 let Some(wave_end) = wave_end else {
                     break;
                 };
-                let mut launches = Vec::new();
+                let mut preparations = Vec::new();
+                let mut order = Vec::new();
                 let mut cancelled = false;
                 for (index, iid) in instances[wave_start..wave_end]
                     .iter()
@@ -10113,21 +10100,33 @@ impl MuxelApp {
                         cancelled = true;
                         break;
                     };
-                    if let Some((meta, spec, size)) = prepared {
-                        owned_tokens.push((iid, meta.token));
-                        let task = cx.background_executor().spawn(async move {
-                            TerminalLaunch::spawn_for_instance(spec, size, iid)
-                        });
-                        launches.push((index, iid, meta, task));
+                    if let Some(prepared) = prepared {
+                        owned_tokens.push((iid, prepared.meta.token));
+                        order.push((index, iid));
+                        preparations.push(prepared);
                     }
                 }
+                claude_launch::start_batch(&mut preparations, cx.background_executor());
+                let launches = order
+                    .into_iter()
+                    .zip(preparations)
+                    .map(|((index, iid), prepared)| {
+                        let token = prepared.meta.token;
+                        let started = prepared.meta.started;
+                        let this = this.clone();
+                        let task = cx.spawn(async move |cx| {
+                            Self::run_terminal_preparation(&this, prepared, cx).await
+                        });
+                        (index, iid, token, started, task)
+                    })
+                    .collect::<Vec<_>>();
                 // The wave's workers are already running. Await every one, even
                 // after a cancel or a re-activation: dropping a handle does not
                 // stop ConPTY creation, it only frees the pane to be started a
                 // second time beside it. Awaiting in pane order controls
                 // admission/focus order, not concurrency.
-                for (index, iid, meta, task) in launches {
-                    let remaining = TERMINAL_LAUNCH_DEADLINE.saturating_sub(meta.started.elapsed());
+                for (index, iid, token, started, task) in launches {
+                    let remaining = TERMINAL_LAUNCH_DEADLINE.saturating_sub(started.elapsed());
                     // Boxed so the handle can move to a task of its own if the
                     // deadline passes first.
                     let mut task = Box::pin(task);
@@ -10139,13 +10138,24 @@ impl MuxelApp {
                         // Past its deadline the launch stops holding admission,
                         // so the restore goes on without it. It keeps running: a
                         // task of its own lands it when the worker returns.
-                        owned_tokens.retain(|&owned| owned != (iid, meta.token));
+                        owned_tokens.retain(|&owned| owned != (iid, token));
                         let this = this.clone();
                         cx.spawn(async move |cx| {
-                            let result = task.await;
-                            Self::land_restored_launch(&this, pid, index == 0, meta, result, cx);
+                            if let Some((meta, result)) = task.await {
+                                Self::land_restored_launch(
+                                    &this,
+                                    pid,
+                                    index == 0,
+                                    meta,
+                                    result,
+                                    cx,
+                                );
+                            }
                         })
                         .detach();
+                        continue;
+                    };
+                    let Some((meta, result)) = result else {
                         continue;
                     };
                     let current =
@@ -12345,15 +12355,19 @@ impl MuxelApp {
         launch: Option<Uuid>,
         record: &crate::session_binding::ClaimedClaudeRecord,
         home: &std::path::Path,
-    ) -> anyhow::Result<crate::session_binding::RecoveredClaudeRecord> {
+    ) -> anyhow::Result<(
+        crate::session_binding::RecoveredClaudeRecord,
+        Option<PathBuf>,
+    )> {
         use crate::session_binding::RecoveredClaudeRecord::{Handled, NotYet};
         let Some(binding) = crate::session_binding::claude_binding_from_record(&record.bytes, home)
         else {
-            return Ok(NotYet);
+            return Ok((NotYet, None));
         };
         if session_id_bound_elsewhere(&self.workspace.instances, iid, &binding.session_id) {
-            return Ok(NotYet);
+            return Ok((NotYet, None));
         }
+        let cwd = Some(binding.cwd.clone());
         let seen = self
             .claude_hook_seen
             .get(&iid)
@@ -12365,21 +12379,23 @@ impl MuxelApp {
             .and_then(|instance| instance.session_id.as_deref());
         if !crate::session_binding::claude_record_switches(&binding, seen, bound) {
             self.remember_claude_hook(iid, launch, binding.stamp);
-            return Ok(Handled);
+            return Ok((Handled, cwd));
         }
         let Some(instance) = self.workspace.instance_mut(iid) else {
-            return Ok(Handled);
+            return Ok((Handled, cwd));
         };
         let previous_session_id = instance.session_id.clone();
+        let previous_session_path = instance.session_path.clone();
         let previous_session_started = instance.session_started;
         let previous_auto_name = instance.auto_name.clone();
         instance.session_id = Some(binding.session_id);
+        instance.session_path = Some(binding.path);
         instance.session_started = true;
         instance.auto_name = None;
         self.bump_session_binding_generation(iid);
         if self.try_persist() {
             self.remember_claude_hook(iid, launch, binding.stamp);
-            Ok(Handled)
+            Ok((Handled, cwd))
         } else {
             // The claimed record stays; the next claim retries it before any
             // record the hook has written since.
@@ -12388,6 +12404,7 @@ impl MuxelApp {
                 .instance_mut(iid)
                 .expect("Claude binding owner disappeared during persistence");
             instance.session_id = previous_session_id;
+            instance.session_path = previous_session_path;
             instance.session_started = previous_session_started;
             instance.auto_name = previous_auto_name;
             self.bump_session_binding_generation(iid);
@@ -20401,16 +20418,7 @@ impl MuxelApp {
         let project = self.workspace.project(inst.project_id)?;
         let local = project.remote.is_none();
         let transcript = if local && is_claude_program(inst.program.as_deref()) {
-            let cwd = inst
-                .working_directory()
-                .unwrap_or(project.root_path.as_path());
-            home_dir()
-                .zip(inst.session_id.as_deref())
-                .and_then(|(home, id)| {
-                    muxel_core::find_claude_session_path(&home, Some(cwd), id)
-                        .ok()
-                        .flatten()
-                })
+            inst.session_path.clone()
         } else {
             None
         };

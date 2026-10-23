@@ -25,6 +25,8 @@ anyhow.workspace = true
 log.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
+# Stable receipt identities; already resolved through the webview dependencies.
+sha2 = "0.10"
 # `muxel ctl` requests reach the UI thread over this (already in the tree via
 # muxel-terminal).
 async-channel = "2.3"
