@@ -369,7 +369,13 @@ fn exited_codex_terminal_keeps_inconclusive_resume_through_tick() {
             std::thread::sleep(Duration::from_millis(10));
         }
         window
-            .update(cx, |app, window, cx| app.tick(window, cx))
+            .update(cx, |app, window, cx| {
+                // Keep early-exit recovery eligible even after a slow OS exit.
+                let (launched_at, was_resume) = app.terminal_launches.get_mut(&pane).unwrap();
+                assert!(*was_resume);
+                *launched_at = Instant::now();
+                app.tick(window, cx);
+            })
             .unwrap();
         let saved = muxel_store::load_workspace_from(&document).unwrap();
         assert_eq!(
