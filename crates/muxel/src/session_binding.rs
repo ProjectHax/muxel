@@ -921,7 +921,7 @@ pub(crate) struct ClaudeBinding {
 /// Stamped invocations use their nonce; an older hook's exact bytes and
 /// preserved write time distinguish a new receipt from an acknowledgement retry.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ClaudeHookIdentity {
+pub(crate) enum ClaudeReceiptIdentity {
     Stamped(Uuid),
     Legacy {
         modified: Option<SystemTime>,
@@ -929,17 +929,17 @@ pub(crate) enum ClaudeHookIdentity {
     },
 }
 
-pub(crate) fn claude_hook_identity(
+pub(crate) fn claude_receipt_identity(
     binding: &ClaudeBinding,
     modified: Option<SystemTime>,
     bytes: &[u8],
-) -> ClaudeHookIdentity {
+) -> ClaudeReceiptIdentity {
     binding.stamp.map_or_else(
-        || ClaudeHookIdentity::Legacy {
+        || ClaudeReceiptIdentity::Legacy {
             modified,
             bytes: bytes.to_vec(),
         },
-        |stamp| ClaudeHookIdentity::Stamped(stamp.nonce),
+        |stamp| ClaudeReceiptIdentity::Stamped(stamp.nonce),
     )
 }
 
@@ -947,8 +947,8 @@ pub(crate) fn claude_hook_identity(
 /// proven startup receipt for this launch. Retrying the same receipt never does.
 pub(crate) fn claude_record_switches(
     binding: &ClaudeBinding,
-    current: &ClaudeHookIdentity,
-    seen: Option<&ClaudeHookIdentity>,
+    current: &ClaudeReceiptIdentity,
+    seen: Option<&ClaudeReceiptIdentity>,
     bound: Option<&str>,
     confirms_launch: bool,
 ) -> bool {
@@ -2022,7 +2022,7 @@ mod tests {
         assert!(first.stamp.is_some());
         assert!(claude_record_switches(
             &first,
-            &claude_hook_identity(&first, None, &[]),
+            &claude_receipt_identity(&first, None, &[]),
             None,
             Some(a.as_str()),
             false
@@ -2047,7 +2047,7 @@ mod tests {
         assert_eq!(last.session_id, a);
         assert!(claude_record_switches(
             &last,
-            &claude_hook_identity(&last, None, &[]),
+            &claude_receipt_identity(&last, None, &[]),
             None,
             Some(a.as_str()),
             false,
@@ -2071,7 +2071,7 @@ mod tests {
         resume(&a);
         let first = read_claude_binding(&data, instance_id, &home).unwrap();
         let stamp = first.stamp.expect("the hook stamps its record");
-        let first_identity = claude_hook_identity(&first, None, &[]);
+        let first_identity = claude_receipt_identity(&first, None, &[]);
         assert!(before <= stamp.recorded_at && stamp.recorded_at <= SystemTime::now());
         assert!(!claude_record_switches(
             &first,
@@ -2086,7 +2086,7 @@ mod tests {
         resume(&a);
         let last = read_claude_binding(&data, instance_id, &home).unwrap();
         assert_eq!(last.session_id, a);
-        let last_identity = claude_hook_identity(&last, None, &[]);
+        let last_identity = claude_receipt_identity(&last, None, &[]);
         assert!(
             claude_record_switches(
                 &last,
@@ -2121,7 +2121,7 @@ mod tests {
                 recorded_at: receipt_at,
             }),
         };
-        let identity = claude_hook_identity(&binding, None, &[]);
+        let identity = claude_receipt_identity(&binding, None, &[]);
         for (receipt, resumed, submission, expected) in [
             (Some(receipt_at), true, None, true),
             (Some(receipt_at), true, Some(submitted_at), true),
@@ -2193,7 +2193,7 @@ mod tests {
         assert_eq!(record.modified, Some(written));
         let binding = claude_binding_from_record(&record.bytes, &home).unwrap();
         assert_eq!(binding.stamp, None);
-        let current = claude_hook_identity(&binding, record.modified, &record.bytes);
+        let current = claude_receipt_identity(&binding, record.modified, &record.bytes);
         // Legacy receipts now retire a same-ID binding too. Retrying that
         // exact claimed record after a failed acknowledgement must not do so again.
         assert!(claude_record_switches(
@@ -2212,7 +2212,7 @@ mod tests {
         ));
         let retry = claim_claude_binding(&data, instance_id).unwrap();
         let retry_binding = claude_binding_from_record(&retry.bytes, &home).unwrap();
-        let retry_identity = claude_hook_identity(&retry_binding, retry.modified, &retry.bytes);
+        let retry_identity = claude_receipt_identity(&retry_binding, retry.modified, &retry.bytes);
         assert!(!claude_record_switches(
             &retry_binding,
             &retry_identity,
@@ -2227,7 +2227,7 @@ mod tests {
         std::fs::write(&path, format!("{event}\n")).unwrap();
         let next = claim_claude_binding(&data, instance_id).unwrap();
         let next_binding = claude_binding_from_record(&next.bytes, &home).unwrap();
-        let next_identity = claude_hook_identity(&next_binding, next.modified, &next.bytes);
+        let next_identity = claude_receipt_identity(&next_binding, next.modified, &next.bytes);
         assert!(claude_record_switches(
             &next_binding,
             &next_identity,

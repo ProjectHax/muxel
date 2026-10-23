@@ -3831,7 +3831,7 @@ mod claude_resume_tests {
                 recorded_at: SystemTime::now(),
             }),
         };
-        let identity = crate::session_binding::claude_hook_identity(&receipt, None, &[]);
+        let identity = crate::session_binding::claude_receipt_identity(&receipt, None, &[]);
         let receipt_at = receipt.stamp.map(|stamp| stamp.recorded_at);
         let generated_args = vec!["--resume".into(), id.clone()];
         let generated = generated_resume_receipt(Some(&preset), Some(&generated_args));
@@ -4472,7 +4472,7 @@ mod loop_cleanup_tests {
         };
         assert!(crate::session_binding::claude_record_switches(
             &hook,
-            &crate::session_binding::claude_hook_identity(&hook, None, &[]),
+            &crate::session_binding::claude_receipt_identity(&hook, None, &[]),
             None,
             Some(bound.as_str()),
             crate::session_binding::claude_receipt_confirms_launch(
@@ -5338,7 +5338,7 @@ pub struct MuxelApp {
     #[cfg(windows)]
     grok_observations: HashMap<Uuid, session_discovery::GrokObservation>,
     /// Per pane, the PTY launch and identity of the last Claude hook record read.
-    claude_hook_seen: HashMap<Uuid, (Uuid, crate::session_binding::ClaudeHookIdentity)>,
+    claude_hook_seen: HashMap<Uuid, (Uuid, crate::session_binding::ClaudeReceiptIdentity)>,
     /// Each restored Codex pane's one pre-launch history lookup (runtime only).
     codex_restore_lookups: muxel_core::session_discovery::CodexRestoreLookups,
     /// Panes whose latest launch is armed by `arms_tmux_resume_recovery`
@@ -13023,8 +13023,11 @@ impl MuxelApp {
         if session_id_bound_elsewhere(&self.workspace.instances, iid, &binding.session_id) {
             return Ok(NotYet);
         }
-        let current =
-            crate::session_binding::claude_hook_identity(&binding, record.modified, &record.bytes);
+        let current = crate::session_binding::claude_receipt_identity(
+            &binding,
+            record.modified,
+            &record.bytes,
+        );
         let seen = self
             .claude_hook_seen
             .get(&iid)
@@ -13121,7 +13124,7 @@ impl MuxelApp {
         &mut self,
         iid: Uuid,
         launch: Option<Uuid>,
-        identity: crate::session_binding::ClaudeHookIdentity,
+        identity: crate::session_binding::ClaudeReceiptIdentity,
     ) {
         if let Some(launch) = launch {
             self.claude_hook_seen.insert(iid, (launch, identity));

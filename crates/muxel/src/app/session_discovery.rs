@@ -587,7 +587,7 @@ impl GrokObservation {
 struct ClaudeCommit {
     record: session_binding::ClaimedClaudeRecord,
     launch: Uuid,
-    identity: session_binding::ClaudeHookIdentity,
+    identity: session_binding::ClaudeReceiptIdentity,
 }
 
 struct SessionBindingUpdate {
@@ -1189,7 +1189,7 @@ impl MuxelApp {
             )
         };
         let current =
-            session_binding::claude_hook_identity(&binding, record.modified, &record.bytes);
+            session_binding::claude_receipt_identity(&binding, record.modified, &record.bytes);
         let seen = self
             .claude_hook_seen
             .get(&iid)
