@@ -20,6 +20,21 @@ per 50 ms with one exact trailing deadline; unchanged generations and ordinary
 reads never scan the grid. Render therefore cannot manufacture a lifecycle
 transition by polling more often.
 
+The captured screen includes cursor and bracketed-paste metadata. Status sources
+exclude recognized Claude and Codex composer rows, including empty editors and
+drafts. Status recognition may locate that editor while a repaint hides or moves
+the cursor; this does not authorize startup input, whose stricter cursor guards
+are unchanged. A real dialog without a composer keeps the full screen.
+
+Claude's built-in marker strings yield to its strict permission and live-work
+parsers. Custom markers still match outside the composer. Codex's current live
+Working row and question form, and Grok's current unanswered question card, also
+supply provider-screen evidence. After readiness, a reliable provider-screen
+Working-to-Idle edge can latch Done even when the title contains only a UUID.
+Codex's screen-only edge requires its live editor to return. Unknown modals or
+incomplete repaints keep a busy turn Working, and its captured command-approval
+form reports Blocked.
+
 ## Snapshot fields
 
 `TerminalRuntimeSnapshot` holds:

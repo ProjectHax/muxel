@@ -12,6 +12,7 @@ use crate::session::{
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
 use gpui::*;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
@@ -238,6 +239,7 @@ struct RuntimeStatusState {
     working_marker: bool,
     blocked_marker: bool,
     provider_screen: Option<AgentStatus>,
+    composer_present: bool,
     prev_raw: Option<AgentStatus>,
     done_latch: bool,
     completion_armed: bool,
@@ -270,6 +272,7 @@ impl RuntimeStatusState {
             working_marker: false,
             blocked_marker: false,
             provider_screen: None,
+            composer_present: false,
             prev_raw: None,
             done_latch: false,
             completion_armed: false,
@@ -323,6 +326,7 @@ impl RuntimeStatusState {
             self.done_latch = false;
             self.completion_armed = false;
             self.provider_settled = false;
+            self.composer_present = false;
             self.grok_blocked_at = None;
             self.grok_screen_working_at = None;
             self.last_screen_capture = None;
@@ -401,8 +405,10 @@ impl RuntimeStatusState {
         }
         let mut title = sticky_title_status(self.semantic_title_status, observed_title);
 
-        let needs_provider_screen_scan =
-            matches!(title_provider, TitleProvider::Claude | TitleProvider::Grok);
+        let needs_provider_screen_scan = matches!(
+            title_provider,
+            TitleProvider::Claude | TitleProvider::Codex | TitleProvider::Grok
+        );
         let content_generation = session.content_generation();
         let has_visible_sources = !working_markers.is_empty()
             || !blocked_markers.is_empty()
@@ -418,9 +424,13 @@ impl RuntimeStatusState {
             StatusScreenCapture::Now => {
                 self.content_generation = content_generation;
                 self.last_screen_capture = Some(now);
-                let screen = session.visible_text();
-                self.working_marker = working_markers.iter().any(|marker| screen.contains(marker));
-                self.blocked_marker = blocked_markers.iter().any(|marker| screen.contains(marker));
+                let captured = session.startup_screen();
+                let (screen, composer_present) = status_screen_context(title_provider, &captured);
+                self.composer_present = composer_present;
+                self.working_marker =
+                    status_marker_matches(title_provider, working_markers, &screen);
+                self.blocked_marker =
+                    status_marker_matches(title_provider, blocked_markers, &screen);
                 self.provider_screen = provider_screen_status(title_provider, &screen);
             }
             StatusScreenCapture::At(deadline) => next_deadline = Some(deadline),
@@ -431,6 +441,7 @@ impl RuntimeStatusState {
                 self.working_marker = false;
                 self.blocked_marker = false;
                 self.provider_screen = None;
+                self.composer_present = false;
             }
             StatusScreenCapture::None => {}
         }
@@ -510,11 +521,29 @@ impl RuntimeStatusState {
         let hook = (title_provider == TitleProvider::Muse && !exited)
             .then(|| muse_hook_status(self.muse_hook_state, title, screen_working))
             .flatten();
-        let raw = hook.unwrap_or_else(|| combine_title_status(exited, base, title, screen_working));
+        let mut raw =
+            hook.unwrap_or_else(|| combine_title_status(exited, base, title, screen_working));
+        let codex_idle_confirmed = title_provider != TitleProvider::Codex
+            || self.semantic_title_status.is_some()
+            || self.composer_present;
+        if !codex_idle_confirmed
+            && !exited
+            && provider_screen.is_none()
+            && matches!(raw, AgentStatus::Idle | AgentStatus::Done)
+            && (submitted_turn
+                || matches!(
+                    self.prev_raw,
+                    Some(AgentStatus::Working | AgentStatus::Blocked)
+                ))
+        {
+            // An unknown modal or partial repaint cannot finish a live Codex
+            // turn. Keep it busy until its editor or owned status returns.
+            raw = AgentStatus::Working;
+        }
         let can_latch = can_latch_completion(
             !working_markers.is_empty(),
-            self.semantic_title_status.is_some(),
-        );
+            self.semantic_title_status.is_some() || needs_provider_screen_scan,
+        ) && codex_idle_confirmed;
         let raw_reason = if hook == Some(raw) {
             TerminalStatusReason::ProviderHook
         } else {
@@ -859,6 +888,35 @@ fn sticky_title_status(
     observed.or(previous)
 }
 
+/// Exclude the provider's input region before any screen-based status source runs.
+fn status_screen_context(
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+) -> (Cow<'_, str>, bool) {
+    let context = match provider {
+        TitleProvider::Claude => screen.claude_status_context(),
+        TitleProvider::Codex => screen.codex_status_context(),
+        _ => None,
+    };
+    let composer_present = context.is_some();
+    (
+        context.map_or_else(|| Cow::Borrowed(screen.text.as_str()), Cow::Owned),
+        composer_present,
+    )
+}
+
+fn status_marker_matches(provider: TitleProvider, markers: &[String], screen: &str) -> bool {
+    markers.iter().any(|marker| {
+        // Claude's built-ins predate the strict UI parser. Quoted prose is not chrome.
+        !(provider == TitleProvider::Claude
+            && matches!(
+                marker.as_str(),
+                "esc to interrupt" | "❯ 1." | "Do you want to proceed"
+            ))
+            && screen.contains(marker)
+    })
+}
+
 /// Provider-owned visible UI that adds state not carried by the terminal title.
 fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<AgentStatus> {
     match provider {
@@ -866,6 +924,11 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
         TitleProvider::Claude if claude_screen_has_current_work(screen) => {
             Some(AgentStatus::Working)
         }
+        TitleProvider::Codex if is_codex_question(screen) || is_codex_approval(screen) => {
+            Some(AgentStatus::Blocked)
+        }
+        TitleProvider::Codex if codex_screen_has_current_work(screen) => Some(AgentStatus::Working),
+        TitleProvider::Grok if is_grok_question(screen) => Some(AgentStatus::Blocked),
         TitleProvider::Grok
             if screen.lines().any(|line| {
                 is_live_background_row(
@@ -880,6 +943,116 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
         }
         _ => None,
     }
+}
+
+fn codex_screen_has_current_work(screen: &str) -> bool {
+    let mut rows = screen.lines().rev().filter(|line| !line.trim().is_empty());
+    let Some(footer) = rows.next() else {
+        return false;
+    };
+    if !crate::startup::codex_footer(footer) {
+        return false;
+    }
+    rows.next().is_some_and(|line| {
+        let Some(body) = line.strip_prefix("• ").or_else(|| line.strip_prefix("◦ ")) else {
+            return false;
+        };
+        let Some(elapsed) = body
+            .trim_end()
+            .strip_prefix("Working (")
+            .and_then(|body| body.strip_suffix(" • esc to interrupt)"))
+        else {
+            return false;
+        };
+        is_claude_elapsed(elapsed)
+    })
+}
+
+fn is_codex_question(screen: &str) -> bool {
+    let rows: Vec<_> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if rows.last() != Some(&"tab to add notes | enter to submit answer | esc to interrupt") {
+        return false;
+    }
+    let rows = &rows[rows.len().saturating_sub(16)..];
+    let header = rows.iter().any(|row| {
+        let Some((position, pending)) = row.strip_prefix("Question ").and_then(|row| row.split_once(" (")) else { return false; };
+        let Some((index, total)) = position.split_once('/') else { return false; };
+        let Some(pending) = pending.strip_suffix(" unanswered)") else { return false; };
+        matches!((index.parse::<usize>(), total.parse::<usize>(), pending.parse::<usize>()),
+            (Ok(index), Ok(total), Ok(pending)) if index > 0 && index <= total && pending > 0 && pending <= total)
+    });
+    header
+        && rows
+            .iter()
+            .filter(|row| {
+                let row = row.trim_start_matches('›').trim();
+                row.split_once(". ").is_some_and(|(number, label)| {
+                    number.parse::<usize>().is_ok_and(|number| number > 0)
+                        && !label.trim().is_empty()
+                })
+            })
+            .count()
+            >= 2
+}
+
+fn is_codex_approval(screen: &str) -> bool {
+    let rows: Vec<_> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    rows.last() == Some(&"Press enter to confirm or esc to cancel")
+        && rows.contains(&"Would you like to run the following command?")
+        && rows.iter().any(|row| row.starts_with("$ "))
+        && rows.iter().any(|row| {
+            row.trim_start_matches('›')
+                .trim()
+                .starts_with("1. Yes, proceed")
+        })
+        && rows.iter().any(|row| {
+            row.trim_start_matches('›')
+                .trim()
+                .starts_with("2. No, and tell Codex")
+        })
+}
+
+fn is_grok_question(screen: &str) -> bool {
+    let rows: Vec<_> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let Some(footer) = rows.last() else {
+        return false;
+    };
+    if !footer.starts_with("Tab:next answer")
+        || !footer.contains("Esc:scrollback")
+        || !footer.ends_with("Shift+x:dismiss")
+    {
+        return false;
+    }
+    rows.iter()
+        .any(|row| row.starts_with("♦ Waiting on answers for "))
+        && rows
+            .iter()
+            .any(|row| row.contains("↑/↓ navigate · y copy") && row.contains("Enter:submit"))
+        && rows
+            .iter()
+            .filter(|row| {
+                let row = row.trim_start_matches('│').trim();
+                row.split_once(" (○) ")
+                    .or_else(|| row.split_once(" (●) "))
+                    .is_some_and(|(number, label)| {
+                        number.parse::<usize>().is_ok_and(|number| number > 0)
+                            && !label.trim().is_empty()
+                    })
+            })
+            .count()
+            >= 2
 }
 
 fn claude_screen_has_current_work(screen: &str) -> bool {
@@ -6225,6 +6398,367 @@ mod provider_switch_tests {
         #[cfg(unix)]
         let spec = CommandSpec::program("/bin/cat", vec![]);
         TerminalSession::spawn(spec, 80, 24).expect("spawn fixture")
+    }
+
+    mod status_user_text_tests {
+        use super::{
+            AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TitleProvider, fixture,
+        };
+        use std::time::Instant;
+
+        fn claude_sample(text: &str, cursor_row: usize, cursor_column: usize) -> AgentStatus {
+            let (session, _receiver) = fixture();
+            session.process_output(
+                format!(
+                    "\x1b[2J\x1b[H\x1b]0;✳ Test pane\x07\x1b[?2004h{}\x1b[{};{}H\x1b[?25h",
+                    text.replace('\n', "\r\n"),
+                    cursor_row + 1,
+                    cursor_column + 1,
+                )
+                .as_bytes(),
+            );
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &["esc to interrupt".to_string()],
+                &["❯ 1.".to_string(), "Do you want to proceed".to_string()],
+                false,
+                Instant::now(),
+            );
+            let status = runtime.snapshot(&session).status;
+            session.kill();
+            status
+        }
+
+        #[test]
+        fn pasted_permission_transcript_in_composer_is_not_blocked() {
+            let text = "Claude Code\n────────────\n❯ Do you want to proceed?\n  1. Yes\n  3. No\n  Esc to cancel\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(text, 5, 15), AgentStatus::Idle);
+        }
+
+        #[test]
+        fn quoted_permission_question_in_prompt_is_not_blocked() {
+            let text = "Reply quoted: Do you want to proceed?\n────────────\n❯ Explain the phrase Do you want to proceed\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(text, 2, 43), AgentStatus::Idle);
+        }
+
+        #[test]
+        fn real_permission_dialog_still_blocks() {
+            let text = "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\nEsc to cancel";
+            assert_eq!(claude_sample(text, 1, 2), AgentStatus::Blocked);
+        }
+
+        #[test]
+        fn hidden_composers_cannot_supply_status_or_authorize_input() {
+            use crate::startup::Screen;
+            use crate::view::{
+                provider_screen_status, status_marker_matches, status_screen_context,
+            };
+            for (provider, text, cursor_row) in [
+                (
+                    TitleProvider::Claude,
+                    "Previous output\n────────────\n❯ Do you want to proceed?\n  1. Yes\n  3. No\n  Esc to cancel\n────────────\n? for shortcuts",
+                    5,
+                ),
+                (
+                    TitleProvider::Codex,
+                    "Previous output\n› Do you want to proceed?\n  • Working (0s • esc to interrupt)\n  custom blocked\n\n  Daybreak Blue low · [project]",
+                    3,
+                ),
+            ] {
+                let screen = Screen {
+                    text: text.to_string(),
+                    cursor_row,
+                    cursor_column: 15,
+                    cursor_visible: false,
+                    bracketed_paste: true,
+                };
+                let (context, composer_present) = status_screen_context(provider, &screen);
+                assert!(composer_present);
+                assert!(!context.contains("Do you want to proceed"));
+                assert_eq!(provider_screen_status(provider, &context), None);
+                assert!(!status_marker_matches(
+                    provider,
+                    &["custom blocked".to_string()],
+                    &context
+                ));
+                assert!(screen.claude_composer_context(false).is_none());
+                assert!(screen.codex_composer_context(false).is_none());
+            }
+        }
+
+        #[test]
+        fn claude_builtin_marker_in_a_reply_is_not_activity() {
+            let text = "The quoted phrase is esc to interrupt\n────────────\n❯ Explain that phrase\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(text, 2, 20), AgentStatus::Idle);
+        }
+
+        #[test]
+        fn custom_markers_remain_available_outside_the_composer() {
+            use crate::startup::Screen;
+            use crate::view::{status_marker_matches, status_screen_context};
+            let screen = Screen {
+                text: "custom busy\n────────────\n❯ custom blocked\n────────────\n? for shortcuts"
+                    .to_string(),
+                cursor_row: 2,
+                cursor_column: 16,
+                cursor_visible: true,
+                bracketed_paste: true,
+            };
+            let (context, _) = status_screen_context(TitleProvider::Claude, &screen);
+            assert!(status_marker_matches(
+                TitleProvider::Claude,
+                &["custom busy".to_string()],
+                &context
+            ));
+            assert!(!status_marker_matches(
+                TitleProvider::Claude,
+                &["custom blocked".to_string()],
+                &context
+            ));
+        }
+
+        #[test]
+        fn quoted_question_cards_above_an_idle_composer_do_not_block() {
+            use crate::startup::Screen;
+            use crate::view::{provider_screen_status, status_screen_context};
+            let data: serde_json::Value =
+                serde_json::from_str(include_str!("fixtures/provider-state-screens.json")).unwrap();
+            for (provider, kind) in [
+                ("codex", TitleProvider::Codex),
+                ("grok", TitleProvider::Grok),
+            ] {
+                let samples = &data["providers"][provider];
+                let quote = samples["blocked"]["text"].as_str().unwrap();
+                let idle = &samples["idle"];
+                let lines = quote.lines().count() + 1;
+                let screen = Screen {
+                    text: format!("{quote}\n\n{}", idle["text"].as_str().unwrap()),
+                    cursor_row: idle["cursor_row"].as_i64().unwrap() as i32 + lines as i32,
+                    cursor_column: idle["cursor_column"].as_u64().unwrap() as usize,
+                    cursor_visible: true,
+                    bracketed_paste: true,
+                };
+                let (context, _) = status_screen_context(kind, &screen);
+                assert_eq!(provider_screen_status(kind, &context), None, "{provider}");
+            }
+        }
+
+        fn provider_fixture(provider: &str, state: &str, expected: AgentStatus) {
+            provider_fixture_with_overlay(provider, state, expected, None);
+        }
+
+        fn provider_fixture_with_overlay(
+            provider: &str,
+            state: &str,
+            expected: AgentStatus,
+            overlay: Option<&str>,
+        ) {
+            use crate::session::{CommandSpec, LaunchBinding, TerminalSession};
+            use std::time::Duration;
+            let data: serde_json::Value =
+                serde_json::from_str(include_str!("fixtures/provider-state-screens.json")).unwrap();
+            let provider_kind = match provider {
+                "claude" => TitleProvider::Claude,
+                "codex" => TitleProvider::Codex,
+                "grok" => TitleProvider::Grok,
+                _ => unreachable!(),
+            };
+            let samples = &data["providers"][provider];
+            #[cfg(windows)]
+            let command = CommandSpec::program(
+                "cmd.exe",
+                vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+            );
+            #[cfg(unix)]
+            let command = CommandSpec::program("/bin/cat", vec![]);
+            let known = (provider == "codex")
+                .then(|| samples["idle"]["title"].as_str().unwrap().to_string());
+            let (session, _receiver) =
+                TerminalSession::spawn(command.with_binding(LaunchBinding::Known(known)), 120, 40)
+                    .unwrap();
+            let draw = |sample: &serde_json::Value| {
+                let mut wire = format!(
+                    "\x1b[2J\x1b[H\x1b]0;{}\x07",
+                    sample["title"].as_str().unwrap()
+                );
+                for (row, line) in sample["text"].as_str().unwrap().lines().enumerate() {
+                    wire.push_str(&format!("\x1b[{};1H{line}", row + 1));
+                }
+                wire.push_str(if sample["bracketed_paste"].as_bool().unwrap() {
+                    "\x1b[?2004h"
+                } else {
+                    "\x1b[?2004l"
+                });
+                wire.push_str(&format!(
+                    "\x1b[{};{}H",
+                    sample["cursor_row"].as_i64().unwrap() + 1,
+                    sample["cursor_column"].as_u64().unwrap() + 1
+                ));
+                wire.push_str(if sample["cursor_visible"].as_bool().unwrap() {
+                    "\x1b[?25h"
+                } else {
+                    "\x1b[?25l"
+                });
+                session.process_output(wire.as_bytes());
+            };
+            let (working, blocked) = if provider == "claude" {
+                (
+                    vec!["esc to interrupt".to_string()],
+                    vec!["❯ 1.".to_string(), "Do you want to proceed".to_string()],
+                )
+            } else {
+                (vec![], vec![])
+            };
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let now = Instant::now();
+            draw(&samples["idle"]);
+            runtime.reconcile(&session, provider_kind, &working, &blocked, false, now);
+            if state != "idle" {
+                session.mark_turn_submitted();
+                draw(
+                    &samples[if matches!(state, "done" | "approval") {
+                        "working"
+                    } else {
+                        state
+                    }],
+                );
+                runtime.reconcile(
+                    &session,
+                    provider_kind,
+                    &working,
+                    &blocked,
+                    false,
+                    now + Duration::from_millis(100),
+                );
+            }
+            if matches!(state, "done" | "approval") {
+                if let Some(text) = overlay {
+                    // A DEC 2026 repaint hides even its clearing operations
+                    // until commit. Neither that boundary nor an empty next
+                    // frame can manufacture completion before the editor returns.
+                    session.process_output(b"\x1b[?2026h\x1b[2J");
+                    runtime.reconcile(
+                        &session,
+                        provider_kind,
+                        &working,
+                        &blocked,
+                        false,
+                        now + Duration::from_millis(150),
+                    );
+                    assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+                    session.process_output(b"\x1b[?2026l");
+                    runtime.reconcile(
+                        &session,
+                        provider_kind,
+                        &working,
+                        &blocked,
+                        false,
+                        now + Duration::from_millis(175),
+                    );
+                    assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+                    let mut sample = samples["done"].clone();
+                    sample["text"] = serde_json::json!(text);
+                    sample["cursor_visible"] = serde_json::json!(false);
+                    draw(&sample);
+                } else {
+                    draw(&samples[state]);
+                }
+                runtime.reconcile(
+                    &session,
+                    provider_kind,
+                    &working,
+                    &blocked,
+                    false,
+                    now + Duration::from_millis(200),
+                );
+            }
+            let snapshot = runtime.snapshot(&session);
+            assert_eq!(snapshot.status, expected, "{provider} {state}");
+            if state == "done" {
+                assert!(snapshot.completion_ready);
+            }
+            if overlay.is_some() {
+                session.process_output(b"\x07");
+                runtime.reconcile(
+                    &session,
+                    provider_kind,
+                    &working,
+                    &blocked,
+                    false,
+                    now + Duration::from_millis(250),
+                );
+                assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+                draw(&samples["done"]);
+                runtime.reconcile(
+                    &session,
+                    provider_kind,
+                    &working,
+                    &blocked,
+                    false,
+                    now + Duration::from_millis(350),
+                );
+                assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
+            }
+            session.kill();
+        }
+
+        #[test]
+        fn codex_unknown_modal_is_not_completion() {
+            provider_fixture_with_overlay(
+                "codex",
+                "done",
+                AgentStatus::Working,
+                Some("An unrecognized approval or authentication form\nContinue?"),
+            );
+        }
+
+        #[test]
+        fn codex_named_model_fast_footer_keeps_the_live_input_guard() {
+            use crate::startup::Screen;
+            let data: serde_json::Value =
+                serde_json::from_str(include_str!("fixtures/provider-state-screens.json")).unwrap();
+            let idle = &data["providers"]["codex"]["idle"];
+            let mut screen = Screen {
+                text: idle["text"]
+                    .as_str()
+                    .unwrap()
+                    .replace("Daybreak Blue low", "Daybreak Blue low fast"),
+                cursor_row: idle["cursor_row"].as_i64().unwrap() as i32,
+                cursor_column: idle["cursor_column"].as_u64().unwrap() as usize,
+                cursor_visible: true,
+                bracketed_paste: true,
+            };
+            assert!(screen.codex_composer_context(true).is_some());
+            screen.text = screen.text.replace(
+                "Daybreak Blue low fast",
+                "Daybreak Blue low fast · enter continue",
+            );
+            assert!(screen.codex_composer_context(true).is_none());
+        }
+
+        macro_rules! fixture_test {
+            ($name:ident, $provider:literal, $state:literal, $expected:ident) => {
+                #[test]
+                fn $name() {
+                    provider_fixture($provider, $state, AgentStatus::$expected);
+                }
+            };
+        }
+        fixture_test!(claude_idle_fixture, "claude", "idle", Idle);
+        fixture_test!(claude_working_fixture, "claude", "working", Working);
+        fixture_test!(claude_blocked_fixture, "claude", "blocked", Blocked);
+        fixture_test!(claude_done_fixture, "claude", "done", Done);
+        fixture_test!(codex_idle_fixture, "codex", "idle", Idle);
+        fixture_test!(codex_working_fixture, "codex", "working", Working);
+        fixture_test!(codex_blocked_fixture, "codex", "blocked", Blocked);
+        fixture_test!(codex_done_fixture, "codex", "done", Done);
+        fixture_test!(codex_command_approval_fixture, "codex", "approval", Blocked);
+        fixture_test!(grok_idle_fixture, "grok", "idle", Idle);
+        fixture_test!(grok_working_fixture, "grok", "working", Working);
+        fixture_test!(grok_blocked_fixture, "grok", "blocked", Blocked);
+        fixture_test!(grok_done_fixture, "grok", "done", Done);
     }
 
     fn drained(reads: &[(&str, SystemTime)]) -> PtyOutput {

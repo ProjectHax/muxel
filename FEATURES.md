@@ -403,7 +403,9 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots. A marker-based agent whose turn finishes
+  icon, dashboard, and notification dots. Screen checks exclude Claude and Codex
+  drafts; current Codex and Grok question cards report **blocked**. A marker-based
+  agent whose turn finishes
   is held at **done** until the agent works again — even if it never rang the bell —
   and that completion survives a muxel restart. Focusing the pane marks its
   notification read without rewriting lifecycle state or age. Sidebar badges include
