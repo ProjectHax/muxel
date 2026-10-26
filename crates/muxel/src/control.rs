@@ -46,6 +46,7 @@ const NOT_RUNNING: &str = "muxel isn't running, or outside control is off: open 
 /// A request on its way to the app, with where its reply goes.
 pub struct Incoming {
     pub command: Command,
+    pub caller_instance_id: Option<Uuid>,
     pub reply: std::sync::mpsc::Sender<Response>,
 }
 
@@ -184,6 +185,7 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
     let (reply, answer) = std::sync::mpsc::channel();
     let incoming = Incoming {
         command: request.command,
+        caller_instance_id: request.caller_instance_id,
         reply,
     };
     if tx.send_blocking(incoming).is_err() {
@@ -235,8 +237,13 @@ pub fn run_cli(args: &[String]) -> i32 {
         Err(error) => return fail(error.into(), 2),
     };
     let result = match command {
-        CliCommand::Help => {
-            emit(control::USAGE);
+        CliCommand::Help(command) => {
+            emit(
+                command
+                    .as_deref()
+                    .and_then(control::command_help)
+                    .unwrap_or(control::USAGE),
+            );
             return 0;
         }
         CliCommand::Skill => {
@@ -559,6 +566,9 @@ fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
     let mut line = serde_json::to_string(&Request {
         version: control::request_version(&command),
         token: endpoint.token,
+        caller_instance_id: std::env::var(control::INSTANCE_ID_ENV)
+            .ok()
+            .and_then(|id| id.parse().ok()),
         command,
     })
     .map_err(|e| e.to_string())?;
@@ -812,6 +822,7 @@ mod tests {
             let request = control::Request {
                 version: control::request_version(&command),
                 token: "test".into(),
+                caller_instance_id: None,
                 command,
             };
             assert_eq!(

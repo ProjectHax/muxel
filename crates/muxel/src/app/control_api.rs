@@ -202,6 +202,13 @@ struct Typing {
     reply: Value,
 }
 
+#[derive(Clone, Copy)]
+struct SendAdmission {
+    state: Option<AgentState>,
+    just_submitted: bool,
+    force: bool,
+}
+
 /// This muxel process, as its claims name it. Random, not secret.
 fn owner_id() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -259,9 +266,16 @@ fn runtime_control_state(
     }
 }
 
-fn check_send_state(state: Option<AgentState>, force: bool) -> CtlResult<()> {
-    if !force {
-        match state {
+fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
+    if !admission.force {
+        if admission.just_submitted {
+            return Err(ctl::Error::new(
+                ErrorCode::Working,
+                "a control turn was just submitted: `wait` for its reply before sending again (or pass --force)",
+            )
+            .with_reason("just_submitted"));
+        }
+        match admission.state {
             Some(AgentState::Working) => {
                 return Err(ctl::Error::new(
                     ErrorCode::Working,
@@ -687,12 +701,16 @@ impl MuxelApp {
     }
 
     fn answer_control(&mut self, incoming: crate::control::Incoming, cx: &mut Context<Self>) {
-        let crate::control::Incoming { command, reply } = incoming;
+        let crate::control::Incoming {
+            command,
+            caller_instance_id,
+            reply,
+        } = incoming;
         let respond = |result: CtlResult<Value>| match result {
             Ok(value) => ctl::Response::ok(value),
             Err(error) => ctl::Response::err(error),
         };
-        match self.control_command(command, cx) {
+        match self.control_command(command, caller_instance_id, cx) {
             Answer::Open { project, options } => {
                 self.admit_control_new(project, options, reply, cx);
             }
@@ -746,7 +764,7 @@ impl MuxelApp {
                                 Ok(pressed) => pressed.await,
                                 Err(_) => Err("muxel is shutting down".into()),
                             };
-                            if sent.is_err() {
+                            if sent.as_ref().err().is_some_and(release_claim_after_failure) {
                                 cx.background_executor()
                                     .spawn(async move { release_claim(&site, &claim) })
                                     .await;
@@ -762,7 +780,12 @@ impl MuxelApp {
         }
     }
 
-    fn control_command(&mut self, command: Command, cx: &mut Context<Self>) -> Answer {
+    fn control_command(
+        &mut self,
+        command: Command,
+        caller_instance_id: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) -> Answer {
         self.sync_control_approvals(cx);
         if let Command::NewStatus { request_id } = &command {
             return Answer::Now(self.control_approvals.status(*request_id));
@@ -823,16 +846,20 @@ impl MuxelApp {
                 text,
                 force,
                 launch_id,
-            } => match self.control_resolve(&agent) {
+            } => match self.control_resolve_for_typing(&agent, caller_instance_id, force) {
                 Ok(iid) => typed(self.control_send(iid, text, force, launch_id, cx)),
                 Err(error) => Answer::Now(Err(error)),
             },
-            Command::Answer { agent, option } => typed(
-                self.control_resolve(&agent)
+            Command::Answer {
+                agent,
+                option,
+                force,
+            } => typed(
+                self.control_resolve_for_typing(&agent, caller_instance_id, force)
                     .and_then(|iid| self.control_answer(iid, &option, cx)),
             ),
-            Command::Keys { agent, keys } => typed(
-                self.control_resolve(&agent)
+            Command::Keys { agent, keys, force } => typed(
+                self.control_resolve_for_typing(&agent, caller_instance_id, force)
                     .and_then(|iid| self.control_keys(iid, &keys, cx)),
             ),
         }
@@ -886,6 +913,17 @@ impl MuxelApp {
             })
             .collect();
         ctl::resolve_agent(query, &entries, self.active_instance).map_err(Into::into)
+    }
+
+    fn control_resolve_for_typing(
+        &self,
+        query: &str,
+        caller_instance_id: Option<Uuid>,
+        force: bool,
+    ) -> CtlResult<Uuid> {
+        let iid = self.control_resolve(query)?;
+        ctl::check_self_target(caller_instance_id, iid, force)?;
+        Ok(iid)
     }
 
     /// What a terminal pane is doing. `None` for editors, diffs and browsers.
@@ -1245,6 +1283,21 @@ impl MuxelApp {
         })
     }
 
+    fn control_send_admission(&self, iid: Uuid, force: bool, cx: &App) -> SendAdmission {
+        let inst = self.workspace.instance(iid);
+        let state = inst.and_then(|inst| self.control_state(inst, cx));
+        let just_submitted = inst.is_some_and(|inst| {
+            self.control_turns
+                .get(&iid)
+                .is_some_and(|turn| turn.awaiting_reply(state, &inst.activity, now_ms()))
+        });
+        SendAdmission {
+            state,
+            just_submitted,
+            force,
+        }
+    }
+
     fn control_send(
         &mut self,
         iid: Uuid,
@@ -1258,11 +1311,7 @@ impl MuxelApp {
         if text.trim().is_empty() {
             return Err("nothing to send".into());
         }
-        let state = self
-            .workspace
-            .instance(iid)
-            .and_then(|inst| self.control_state(inst, cx));
-        check_send_state(state, force)?;
+        check_send_state(self.control_send_admission(iid, force, cx))?;
         let turn = Turn {
             prompt: Some(text.clone()),
             grace_ms: ctl::REPLY_GRACE_MS,
@@ -1391,15 +1440,19 @@ impl MuxelApp {
             turn,
             reply,
             launch_id,
+            force,
             ..
         } = typing;
         match typing.input {
             Input::Prompt(text) => {
+                // This is the same UI update as local keyboard input and PTY
+                // draining. Re-read after the asynchronous tmux claim settle.
+                let admission = self.control_send_admission(iid, force, cx);
                 let attempt = self
                     .terminals
                     .get(&iid)
                     .and_then(|view| view.read(cx).begin_prompt_submission(&text));
-                let mut reply = match paste_prompt(&session, iid, &text, launch_id) {
+                let mut reply = match paste_prompt(&session, iid, &text, launch_id, admission) {
                     Ok(reply) => reply,
                     Err(error) => return Task::ready(Err(error)),
                 };
@@ -1417,7 +1470,7 @@ impl MuxelApp {
                                     == muxel_terminal::PromptSubmissionState::Interrupted
                             })
                         }) {
-                            return Err("the provider conversation changed after the paste, so Enter was withheld: check its `screen`".into());
+                            return Err(ctl::Error::from("the provider conversation changed after the paste, so Enter was withheld: check its `screen`").after_paste());
                         }
                         press_prompt_enter(&session, pasted)?;
                         // Claim timestamps predict settlement. Local wait starts
@@ -1425,7 +1478,7 @@ impl MuxelApp {
                         app.note_control_turn(iid, turn, now_ms());
                         Ok(session.input_rev())
                     })
-                    .unwrap_or_else(|_| Err("muxel is shutting down".into()))?;
+                    .unwrap_or_else(|_| Err(ctl::Error::from("muxel is shutting down").after_paste()))?;
                     let Some(attempt) = attempt else {
                         reply["submission_confirmed"] = Value::Null;
                         reply["enter_retries"] = json!(0);
@@ -1442,10 +1495,10 @@ impl MuxelApp {
                                 revision,
                                 session.input_rev(),
                             )?;
-                            let view = app.terminals.get(&iid).ok_or("that agent has just closed")?;
+                            let view = app.terminals.get(&iid).ok_or_else(|| ctl::Error::from("that agent has just closed").after_paste())?;
                             let observation = view.read(cx).observe_prompt_submission(&attempt);
                             if observation == muxel_terminal::PromptSubmissionState::Interrupted {
-                                return Err("the provider conversation changed while checking submission; no further Enter will be sent: check its `screen`".into());
+                                return Err(ctl::Error::from("the provider conversation changed while checking submission; no further Enter will be sent: check its `screen`").after_paste());
                             }
                             let action = confirmation.observe(started.elapsed(), observation);
                             if action == PromptConfirmationAction::RetryEnter {
@@ -1592,18 +1645,20 @@ fn confirmation_verdict<T>(
     current: u64,
 ) -> CtlResult<()> {
     if !live.as_ref().is_ok_and(|live| Arc::ptr_eq(live, original)) {
-        return Err("the pane closed, restarted or lost control permission after Enter; no further Enter will be sent: check its `screen`".into());
+        return Err(ctl::Error::from("the pane closed, restarted or lost control permission after Enter; no further Enter will be sent: check its `screen`").after_paste());
     }
     if current != expected {
         return Err(ctl::Error::new(
             ErrorCode::InputChanged,
             "input changed after Enter; submission checking stopped without further Enter: check its `screen` before sending again",
-        ));
+        )
+        .after_paste());
     }
     Ok(())
 }
 
 fn submission_check_error(mut error: ctl::Error, enter_retries: u8) -> ctl::Error {
+    error = error.after_paste();
     error.message.push_str(&format!(
         " (prompt pasted, Enter admitted, enter_retries: {enter_retries}, submission unconfirmed)"
     ));
@@ -1625,14 +1680,15 @@ fn enter_verdict<T>(
 ) -> CtlResult<()> {
     match live {
         Ok(live) if Arc::ptr_eq(&live, pasted_into) => {}
-        Ok(_) => return Err("the pane restarted after the prompt was pasted, so Enter wasn't pressed: check its `screen`".into()),
-        Err(why) => return Err(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`").into()),
+        Ok(_) => return Err(ctl::Error::from("the pane restarted after the prompt was pasted, so Enter wasn't pressed: check its `screen`").after_paste()),
+        Err(why) => return Err(ctl::Error::from(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`")).after_paste()),
     }
     if now != pasted {
         return Err(ctl::Error::new(
             ErrorCode::InputChanged,
             "local input changed after the prompt was pasted, so Enter wasn't pressed: check its `screen` before sending again",
-        ));
+        )
+        .after_paste());
     }
     Ok(())
 }
@@ -1642,20 +1698,30 @@ fn paste_prompt(
     pane: Uuid,
     text: &str,
     expected_launch: Option<Uuid>,
+    admission: SendAdmission,
 ) -> CtlResult<Value> {
+    check_send_state(admission)?;
     ctl::check_launch_id(expected_launch, Some(session.id))?;
-    session
-        .try_paste(text)
-        .map_err(|error| format!("couldn't admit the prompt to the PTY writer: {error}"))?;
+    session.try_paste(text).map_err(|error| {
+        ctl::Error::from(format!(
+            "couldn't finish pasting the prompt ({error}); input may be partial: check its `screen`"
+        ))
+        .after_paste()
+    })?;
     Ok(ctl::pasted_prompt_receipt(pane, session.id))
+}
+
+fn release_claim_after_failure(error: &ctl::Error) -> bool {
+    error.pasted != Some(true)
 }
 
 fn press_prompt_enter(session: &Arc<TerminalSession>, pasted: u64) -> CtlResult<()> {
     enter_verdict(Ok(session.clone()), session, pasted, session.input_rev())?;
     session.try_submit_input(b"\r").map_err(|error| {
-        format!(
+        ctl::Error::from(format!(
             "the prompt was pasted but Enter couldn't be admitted ({error}): check its `screen`"
-        )
+        ))
+        .after_paste()
     })?;
     Ok(())
 }
@@ -1805,8 +1871,8 @@ fn show_value(
 #[cfg(test)]
 mod prompt_submission_tests {
     use super::{
-        PromptConfirmation, PromptConfirmationAction, confirmation_verdict, enter_verdict,
-        paste_prompt, press_prompt_enter, submission_check_error,
+        PromptConfirmation, PromptConfirmationAction, SendAdmission, confirmation_verdict,
+        enter_verdict, paste_prompt, press_prompt_enter, submission_check_error,
     };
     use muxel_core::control::ErrorCode;
     use muxel_terminal::{CommandSpec, PromptSubmissionState, TerminalSession};
@@ -1823,19 +1889,55 @@ mod prompt_submission_tests {
         let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
         let pane = Uuid::new_v4();
         let before = session.input_rev();
-        let refusal = paste_prompt(&session, pane, "prompt", Some(Uuid::new_v4())).unwrap_err();
+        let admission = SendAdmission {
+            state: Some(super::AgentState::Idle),
+            just_submitted: false,
+            force: false,
+        };
+        let refusal =
+            paste_prompt(&session, pane, "prompt", Some(Uuid::new_v4()), admission).unwrap_err();
         assert_eq!(refusal.code, Some(ErrorCode::LaunchMismatch));
         assert_eq!(
             session.input_rev(),
             before,
             "a refused launch must type nothing"
         );
-        let receipt = paste_prompt(&session, pane, "prompt", Some(session.id)).unwrap();
+        let receipt = paste_prompt(&session, pane, "prompt", Some(session.id), admission).unwrap();
         let revision = session.input_rev();
         session.kill();
         assert_ne!(revision, before);
         assert_eq!(receipt["pasted"], true);
         assert_eq!(receipt["launch_id"], session.id.to_string());
+    }
+
+    #[test]
+    fn paste_rechecks_working_after_claim_settle() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
+        let before = session.input_rev();
+        let refused = paste_prompt(
+            &session,
+            Uuid::new_v4(),
+            "late prompt",
+            None,
+            SendAdmission {
+                state: Some(super::AgentState::Working),
+                just_submitted: false,
+                force: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, Some(ErrorCode::Working));
+        assert_eq!(
+            session.input_rev(),
+            before,
+            "late working state typed bytes"
+        );
+        session.kill();
     }
 
     #[test]
@@ -1907,6 +2009,28 @@ mod prompt_submission_tests {
     }
 
     #[test]
+    fn post_paste_failures_carry_pasted_field() {
+        let session = Arc::new(1_u8);
+        let error = enter_verdict(Ok(Arc::new(1)), &session, 7, 7).unwrap_err();
+        let response = muxel_core::control::Response::err(error);
+        assert_eq!(serde_json::to_value(response).unwrap()["pasted"], true);
+
+        let error = confirmation_verdict(Ok(session.clone()), &session, 7, 8).unwrap_err();
+        let response = muxel_core::control::Response::err(submission_check_error(error, 0));
+        assert_eq!(serde_json::to_value(response).unwrap()["pasted"], true);
+    }
+
+    #[test]
+    fn claim_survives_failure_after_enter_admitted() {
+        let failure =
+            muxel_core::control::Error::new(ErrorCode::InputChanged, "submission checking stopped")
+                .after_paste();
+        assert!(!super::release_claim_after_failure(&failure));
+        let before_paste = muxel_core::control::Error::new(ErrorCode::Working, "busy");
+        assert!(super::release_claim_after_failure(&before_paste));
+    }
+
+    #[test]
     fn submission_retry_needs_positive_proof_and_can_happen_only_once() {
         use PromptConfirmationAction::{Confirmed, Observe, RetryEnter, Unconfirmed};
         use PromptSubmissionState::{Accepted, Retryable, Unconfirmed as Unknown};
@@ -1955,7 +2079,9 @@ mod prompt_submission_tests {
 
 #[cfg(test)]
 mod runtime_control_tests {
-    use super::{AgentState, AgentStatus, check_send_state, ctl, runtime_control_state};
+    use super::{
+        AgentState, AgentStatus, SendAdmission, check_send_state, ctl, runtime_control_state,
+    };
     use muxel_core::AgentActivity;
     use muxel_terminal::{
         CommandSpec, TerminalRuntimeSnapshot, TerminalSession, TerminalStatusCoverage,
@@ -1965,6 +2091,13 @@ mod runtime_control_tests {
 
     #[test]
     fn ordinary_send_and_wait_reject_old_binding_idle_and_done() {
+        let send = |state, force| {
+            check_send_state(SendAdmission {
+                state: Some(state),
+                just_submitted: false,
+                force,
+            })
+        };
         #[cfg(windows)]
         let spec = CommandSpec::program(
             "cmd.exe",
@@ -1995,7 +2128,7 @@ mod runtime_control_tests {
                 ..cached
             };
             let before = runtime_control_state(runtime, revision);
-            assert!(check_send_state(Some(before), false).is_ok());
+            assert!(send(before, false).is_ok());
             assert_eq!(
                 ctl::wait_outcome(Some(before), false),
                 Some(ctl::WaitOutcome::Finished)
@@ -2005,8 +2138,8 @@ mod runtime_control_tests {
             // even before the runtime event has been processed.
             let state = runtime_control_state(runtime, session.binding_revision());
             assert_eq!(state, AgentState::Working);
-            assert!(check_send_state(Some(state), false).is_err());
-            assert!(check_send_state(Some(state), true).is_ok());
+            assert!(send(state, false).is_err());
+            assert!(send(state, true).is_ok());
             let awaiting = ctl::awaiting_reply(
                 Some(100),
                 ctl::REPLY_GRACE_MS,
@@ -2031,7 +2164,7 @@ mod runtime_control_tests {
                 ..cached
             };
             let state = runtime_control_state(runtime, session.binding_revision());
-            assert!(check_send_state(Some(state), false).is_err());
+            assert!(send(state, false).is_err());
             assert_eq!(ctl::wait_outcome(Some(state), false), None);
         }
         let fresh = TerminalRuntimeSnapshot {
@@ -2040,10 +2173,49 @@ mod runtime_control_tests {
         };
         let state = runtime_control_state(fresh, session.binding_revision());
         assert_eq!(state, AgentState::Done);
-        assert!(check_send_state(Some(state), false).is_ok());
+        assert!(send(state, false).is_ok());
         assert_eq!(
             ctl::wait_outcome(Some(state), false),
             Some(ctl::WaitOutcome::Finished)
+        );
+    }
+
+    #[test]
+    fn send_refuses_just_submitted_turn_with_reason() {
+        let turn = super::ControlTurn {
+            prompt: Some("first turn".into()),
+            sent_at: 100,
+            grace_ms: ctl::REPLY_GRACE_MS,
+            startup: None,
+        };
+        let activity = AgentActivity::default();
+        assert!(turn.awaiting_reply(Some(AgentState::Idle), &activity, 101));
+        let error = check_send_state(SendAdmission {
+            state: Some(AgentState::Idle),
+            just_submitted: true,
+            force: false,
+        })
+        .unwrap_err();
+        assert_eq!(error.code, Some(ctl::ErrorCode::Working));
+        assert_eq!(
+            serde_json::to_value(ctl::Response::err(error)).unwrap()["reason"],
+            "just_submitted"
+        );
+        let working = SendAdmission {
+            state: Some(AgentState::Working),
+            just_submitted: true,
+            force: false,
+        };
+        assert_eq!(
+            check_send_state(working).unwrap_err().reason.as_deref(),
+            Some("just_submitted")
+        );
+        assert!(
+            check_send_state(SendAdmission {
+                force: true,
+                ..working
+            })
+            .is_ok()
         );
     }
 }

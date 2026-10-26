@@ -794,7 +794,10 @@ feature is added or changed, update the matching entry here in the same change**
   returns the same, so a caller can `send` then `wait` without polling. An answer
   to a question counts as a turn too, so `answer` then `wait` works the same way.
 - **Refuses what would go wrong** — `send` won't type into an agent that is
-  working or waiting on a question (unless forced), `answer` only picks an option
+  working, waiting on a question, or still in the grace after a submitted control
+  turn (unless forced). It checks again at paste after the shared tmux claim settles.
+  `send`, `answer`, and `keys` also refuse a call from the target pane itself unless
+  forced. An older host ignores the caller ID. `answer` only picks an option
   the prompt actually offers, and a pane that isn't running says so rather than
   swallowing the input. Shell panes are off limits unless "Also allow typing into
   shell panes" is on too, since typing into a shell is running commands. That
@@ -810,9 +813,10 @@ feature is added or changed, update the matching entry here in the same change**
   Revocation does not stop processes
   or undo input already delivered.
   `send` waits for its delayed Enter and withholds it if local input changes or
-  the pane closes or restarts. A withheld send fails and attempts to release only
-  its own tmux claim; timeout, command failure or older tmux can leave the claim
-  in place under its existing aging rules.
+  the pane closes or restarts. A failure before a paste attempt releases only its
+  own tmux claim; after a paste attempt it keeps the claim under the normal aging
+  rules, since the prompt may have reached the agent. Timeout, command failure or
+  older tmux can also leave the claim in place.
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
@@ -825,6 +829,11 @@ feature is added or changed, update the matching entry here in the same change**
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
   receipt confirms writer admission with `pasted: true`.
+  A send failure after a paste attempt reports `pasted: true`; a writer failure
+  may have left partial input. `working` with `reason: just_submitted` identifies
+  the prior turn's grace. `ctl help COMMAND` and `COMMAND -h` show command help;
+  `--` before literal text keeps `-h` and `--help` as prompt text. Unknown verbs
+  suggest a nearby command.
   Codex, Claude and Grok sends then observe fresh provider acceptance for up to
   ten seconds and report `submission_confirmed` and `enter_retries`. Unknown
   acceptance is reported as false; unsupported providers report null. Only

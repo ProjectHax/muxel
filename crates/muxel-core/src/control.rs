@@ -76,6 +76,10 @@ pub struct Endpoint {
 pub struct Request {
     pub version: u32,
     pub token: String,
+    /// The calling pane, if this client runs inside one. A declared label,
+    /// not an authenticated identity; older hosts ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_instance_id: Option<Uuid>,
     pub command: Command,
 }
 
@@ -128,9 +132,25 @@ pub enum Command {
         launch_id: Option<Uuid>,
     },
     /// Pick a numbered option of the question the agent is blocked on.
-    Answer { agent: String, option: String },
+    Answer {
+        agent: String,
+        option: String,
+        /// Override the caller's own-pane guard only.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+    },
     /// Press keys (see [`key_bytes`]).
-    Keys { agent: String, keys: Vec<String> },
+    Keys {
+        agent: String,
+        keys: Vec<String>,
+        /// Override the caller's own-pane guard only.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Require explicit versions so older hosts refuse fields they cannot honor.
@@ -166,6 +186,12 @@ pub struct Response {
         deserialize_with = "known_code"
     )]
     pub code: Option<ErrorCode>,
+    /// A stable detail of a refusal, when its code alone is too broad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Present and true after a paste attempt. A writer error may leave partial input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pasted: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -176,6 +202,8 @@ impl Response {
             ok: true,
             result: Some(result),
             code: None,
+            reason: None,
+            pasted: None,
             error: None,
         }
     }
@@ -186,6 +214,8 @@ impl Response {
             ok: false,
             result: None,
             code: error.code,
+            reason: error.reason,
+            pasted: error.pasted,
             error: Some(error.message),
         }
     }
@@ -197,6 +227,8 @@ impl Response {
         }
         Err(Error {
             code: self.code,
+            reason: self.reason,
+            pasted: self.pasted,
             message: self
                 .error
                 .unwrap_or_else(|| "muxel refused the request".into()),
@@ -250,6 +282,8 @@ pub enum ErrorCode {
     LaunchMismatch,
     /// The prompt was pasted but its delayed Enter was withheld.
     InputChanged,
+    /// The caller selected its own pane without explicitly forcing the action.
+    SelfTarget,
     /// `muxel ctl` found no muxel to ask: it isn't running, outside control is
     /// off, its `control.json` can't be read or reached, or a read-only creation
     /// status cannot be answered.
@@ -262,6 +296,8 @@ pub enum ErrorCode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     pub code: Option<ErrorCode>,
+    pub reason: Option<String>,
+    pub pasted: Option<bool>,
     pub message: String,
 }
 
@@ -269,8 +305,20 @@ impl Error {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code: Some(code),
+            reason: None,
+            pasted: None,
             message: message.into(),
         }
+    }
+
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    pub fn after_paste(mut self) -> Self {
+        self.pasted = Some(true);
+        self
     }
 }
 
@@ -278,6 +326,8 @@ impl From<String> for Error {
     fn from(message: String) -> Self {
         Self {
             code: None,
+            reason: None,
+            pasted: None,
             message,
         }
     }
@@ -306,6 +356,18 @@ pub fn check_launch_id(expected: Option<Uuid>, current: Option<Uuid>) -> Result<
             format!(
                 "the agent's terminal was replaced since you saw launch_id {expected}: check `status` before sending again"
             ),
+        ));
+    }
+    Ok(())
+}
+
+/// A pane cannot direct input at itself by accident. This uses the caller's
+/// declared environment value for convenience, not as an authorization check.
+pub fn check_self_target(caller: Option<Uuid>, target: Uuid, force: bool) -> Result<(), Error> {
+    if caller == Some(target) && !force {
+        return Err(Error::new(
+            ErrorCode::SelfTarget,
+            "this command targets your own pane; pass --force if you mean to type into it",
         ));
     }
     Ok(())
@@ -1044,7 +1106,7 @@ pub enum CliCommand {
     },
     /// Print the instructions for an orchestrating agent.
     Skill,
-    Help,
+    Help(Option<String>),
 }
 
 /// `wait`'s default patience.
@@ -1070,13 +1132,15 @@ usage: muxel ctl <command> [args]
                                  --launch-id refuses a replaced terminal
   wait AGENT [--timeout SECS] [--full]
                                  wait for the turn to end, then show it
-  answer AGENT OPTION            pick a numbered option of a pending question
-  keys AGENT KEY...              press keys: enter esc tab shift-tab up down
+  answer AGENT OPTION [--force]  pick a numbered option of a pending question
+  keys AGENT KEY... [--force]    press keys: enter esc tab shift-tab up down
                                  left right backspace space ctrl-c, or a character
   skill                          instructions for an orchestrating agent
+  help [COMMAND]                 show general or command-specific help
 
 AGENT is an id from `panes`, a name, project/name, or `focused`.
-Everything after `--` is taken literally (for text that starts with --).
+send, answer and keys refuse the caller's own pane unless --force is explicit.
+Everything after `--` is taken literally (for text that starts with -).
 For `new` without --prompt, presets/defaults keep toolbar injection, resume and hooks; raw argv bypasses them.
 ALL `new` requests require outside control AND Settings > Grok Bot > Outside terminal creation set to Ask or Allow.
 Ask requires a click for every request. Allow covers configured non-shell terminal presets.
@@ -1112,11 +1176,118 @@ Replies are JSON. A failure is {\"ok\": false, \"error\": ...}, with a \"code\" 
 script can act on it (see `muxel ctl skill`). Exit status: 0 success,
 1 request failure (including no running muxel), 2 invalid command line or stdin.";
 
+pub fn command_help(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "projects" => "usage: muxel ctl projects\nList every project and its agent counts.",
+        "panes" => {
+            "usage: muxel ctl panes [PROJECT]\nShow pane layout and agents in all projects or one project."
+        }
+        "new" => {
+            "usage: muxel ctl new PROJECT [--cwd DIR] [--name TEXT] [--tab | --split right|down] [--focus] [--prompt TEXT] [--from LABEL] [--no-wait] [--preset NAME] [--model MODEL] [--effort LEVEL] [-- PROGRAM [ARGS...]]\nOpen a terminal. --prompt - reads stdin; -- starts literal program arguments. Creation permissions apply."
+        }
+        "new-status" => {
+            "usage: muxel ctl new-status REQUEST_ID\nPoll a pending creation by its full request UUID."
+        }
+        "status" => {
+            "usage: muxel ctl status [AGENT]\nShow one agent's status or every agent's status."
+        }
+        "show" => {
+            "usage: muxel ctl show AGENT [--full]\nShow the last prompt, reply and pending question; --full includes the whole reply."
+        }
+        "screen" => {
+            "usage: muxel ctl screen AGENT [--lines N]\nShow raw terminal text; default 60 lines, maximum 2000."
+        }
+        "send" => {
+            "usage: muxel ctl send AGENT TEXT [--force] [--launch-id ID]\nPaste TEXT and press Enter. '-' reads stdin; `--` makes following text literal, including -h and --help. --force overrides busy and own-pane refusal, but never a launch mismatch."
+        }
+        "wait" => {
+            "usage: muxel ctl wait AGENT [--timeout SECS] [--full]\nWait for the turn to finish, block, exit or time out, then show its result."
+        }
+        "answer" => {
+            "usage: muxel ctl answer AGENT OPTION [--force]\nPick a numbered option of a pending question. --force permits your own pane."
+        }
+        "keys" => {
+            "usage: muxel ctl keys AGENT KEY... [--force]\nPress keys such as enter, esc, tab, arrows, backspace and ctrl-c. --force permits your own pane."
+        }
+        "skill" => "usage: muxel ctl skill\nPrint instructions for an orchestrating agent.",
+        "help" => {
+            "usage: muxel ctl help [COMMAND]\nShow general or command-specific help. Use `--` before literal prompt text that starts with -."
+        }
+        _ => return None,
+    })
+}
+
+fn unknown_command_error(command: &str) -> String {
+    let suggestion = if command == "list" {
+        Some("panes")
+    } else {
+        const VERBS: &[&str] = &[
+            "projects",
+            "panes",
+            "new",
+            "new-status",
+            "status",
+            "show",
+            "screen",
+            "send",
+            "wait",
+            "answer",
+            "keys",
+            "skill",
+            "help",
+        ];
+        VERBS
+            .iter()
+            .map(|verb| (*verb, edit_distance(command, verb)))
+            .min_by_key(|(_, distance)| *distance)
+            .filter(|(_, distance)| *distance <= 3)
+            .map(|(verb, _)| verb)
+    };
+    let hint = suggestion.map_or(String::new(), |verb| format!("\ndid you mean `{verb}`?"));
+    format!("unknown command '{command}'{hint}\n\n{USAGE}")
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (row, ch) in left.chars().enumerate() {
+        let mut current = vec![row + 1; right.len() + 1];
+        for (col, other) in right.iter().enumerate() {
+            current[col + 1] = (previous[col + 1] + 1)
+                .min(current[col] + 1)
+                .min(previous[col] + usize::from(ch != *other));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
 /// Parse the arguments after `muxel ctl`.
 pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
     let Some((cmd, rest)) = args.split_first() else {
-        return Ok(CliCommand::Help);
+        return Ok(CliCommand::Help(None));
     };
+    if matches!(cmd.as_str(), "help" | "-h" | "--help") {
+        return match rest {
+            [] => Ok(CliCommand::Help(None)),
+            [target] if command_help(target).is_some() => {
+                Ok(CliCommand::Help(Some(target.clone())))
+            }
+            [target] => Err(unknown_command_error(target)),
+            _ => Err("usage: muxel ctl help [COMMAND]".into()),
+        };
+    }
+    if rest
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        return if command_help(cmd).is_some() {
+            Ok(CliCommand::Help(Some(cmd.clone())))
+        } else {
+            Err(unknown_command_error(cmd))
+        };
+    }
     if cmd == "new" {
         return new::parse(rest);
     }
@@ -1224,7 +1395,11 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
                 .get(1)
                 .cloned()
                 .ok_or("`answer` needs the OPTION number to pick")?;
-            Command::Answer { agent, option }
+            Command::Answer {
+                agent,
+                option,
+                force,
+            }
         }
         "keys" => {
             let agent = agent(&words)?;
@@ -1235,7 +1410,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             if let Some(bad) = keys.iter().find(|k| key_bytes(k, false).is_none()) {
                 return Err(format!("unknown key '{bad}'"));
             }
-            Command::Keys { agent, keys }
+            Command::Keys { agent, keys, force }
         }
         "wait" => {
             at_most(1)?;
@@ -1246,8 +1421,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
             });
         }
         "skill" => return Ok(CliCommand::Skill),
-        "help" | "-h" | "--help" => return Ok(CliCommand::Help),
-        other => return Err(format!("unknown command '{other}'\n\n{USAGE}")),
+        other => return Err(unknown_command_error(other)),
     };
     Ok(CliCommand::Request(command))
 }
@@ -1483,9 +1657,11 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
 - `muxel ctl screen AGENT [--lines N]` - the raw text of the agent's terminal.
   Use it when `show` doesn't explain what's on screen.
 - `muxel ctl send AGENT TEXT` - type TEXT into the agent and press Enter. Refused
-  while the agent is working or blocked, or while muxel on another computer is
-  mid-turn with it. For long or multi-line text, pass `-` and pipe the text on
-  stdin.
+  while the agent is working, blocked, or still in the grace after a submitted
+  control turn, or while muxel on another computer is mid-turn with it. For long
+  or multi-line text, pass `-` and pipe the text on stdin. Use `--` before
+  literal prompt text that starts with `-`; `-h` and `--help` before `--` show
+  command help and are never typed. `muxel ctl help COMMAND` also shows it.
   The reply waits for Enter. If keys, pastes, mouse or wheel reports reach the
   pane after the paste, Enter is withheld and `send` fails with the prompt left
   in its input. A closed or restarted terminal also withholds Enter. Check
@@ -1496,7 +1672,10 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   asynchronous claim work, and `--force` never bypasses it. A successful reply
   includes the actual `launch_id` and `"pasted": true` for admission to the PTY
   writer, not confirmation of agent delivery. A lost reply does not make a
-  retry safe; inspect the agent before typing again.
+  retry safe; inspect the agent before typing again. A failure with `pasted: true`
+  means a paste was attempted and the input may be partial. Check `screen` before
+  retrying. A `working` error with `reason: just_submitted` means the prior
+  control turn is still in its grace; `wait` for its reply.
   Codex, Claude and Grok sends also observe provider acceptance for up to ten
   seconds. `submission_confirmed` is true only for a fresh provider receipt,
   false when acceptance remains unknown, and null for an unsupported provider.
@@ -1533,8 +1712,9 @@ a project usually show its agents under the same ids, but each command only
 reaches the muxel on the computer it runs on.
 
 If you are running in a muxel pane yourself, the environment variable
-`MUXEL_INSTANCE_ID` holds your own pane's `uuid`, which works as AGENT: never
-`send` to it, since that types into your own input.
+`MUXEL_INSTANCE_ID` holds your own pane's `uuid`, which works as AGENT. `send`,
+`answer`, and `keys` refuse that pane unless you pass `--force`. Older muxel
+hosts ignore this caller ID, so check the target when driving one.
 
 ## Statuses
 
@@ -1567,6 +1747,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `input_changed` - input intervened before Enter or during submission checking.
   No further Enter is sent. Inspect
   `screen` before sending more input.
+- `self_target` - this command would type into its caller's own pane; select a
+  different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
 - `control_disabled` - outside control was turned off before the mutation.
 - `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
@@ -1685,6 +1867,7 @@ mod tests {
         let req = Request {
             version: 1,
             token: "t".into(),
+            caller_instance_id: None,
             command: Command::Show {
                 agent: "claude".into(),
                 full: true,
@@ -1697,6 +1880,7 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"token":"t","command":{"cmd":"projects"}}"#)
                 .unwrap();
         assert_eq!(unit.command, Command::Projects);
+        assert_eq!(unit.caller_instance_id, None);
         let defaults: Request = serde_json::from_str(
             r#"{"version":1,"token":"t","command":{"cmd":"send","agent":"a","text":"hi"}}"#,
         )
@@ -1713,6 +1897,19 @@ mod tests {
         // No launch guard: older requests retain their original shape.
         let line = serde_json::to_string(&defaults).unwrap();
         assert!(!line.contains("launch_id"), "{line}");
+        assert!(!line.contains("caller_instance_id"), "{line}");
+        let caller = Request {
+            caller_instance_id: Some(id(7)),
+            command: Command::Keys {
+                agent: "self".into(),
+                keys: vec!["esc".into()],
+                force: true,
+            },
+            ..req
+        };
+        let line = serde_json::to_string(&caller).unwrap();
+        assert!(line.contains("caller_instance_id"), "{line}");
+        assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), caller);
     }
 
     #[test]
@@ -1742,6 +1939,14 @@ mod tests {
             serde_json::from_str(r#"{"ok":false,"code":"from_later","error":"x"}"#).unwrap();
         assert_eq!(newer.code, None);
         assert_eq!(newer.error.as_deref(), Some("x"));
+        let uncertain = Response::err(
+            Error::new(ErrorCode::Working, "check screen")
+                .with_reason("just_submitted")
+                .after_paste(),
+        );
+        let back: Response = serde_json::from_str(&line(&uncertain)).unwrap();
+        assert_eq!(back.reason.as_deref(), Some("just_submitted"));
+        assert_eq!(back.pasted, Some(true));
         for (code, word) in [
             (ErrorCode::Working, "working"),
             (ErrorCode::Blocked, "blocked"),
@@ -1751,6 +1956,7 @@ mod tests {
             (ErrorCode::ClaimedElsewhere, "claimed_elsewhere"),
             (ErrorCode::LaunchMismatch, "launch_mismatch"),
             (ErrorCode::InputChanged, "input_changed"),
+            (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
             (ErrorCode::StaleEndpoint, "stale_endpoint"),
         ] {
@@ -2259,7 +2465,7 @@ Steps:
 
     #[test]
     fn cli_parses_commands_flags_and_literal_text() {
-        assert_eq!(parse_cli(&[]), Ok(CliCommand::Help));
+        assert_eq!(parse_cli(&[]), Ok(CliCommand::Help(None)));
         assert_eq!(
             parse_cli(&words(&["panes"])),
             Ok(CliCommand::Request(Command::Panes { project: None }))
@@ -2311,6 +2517,47 @@ Steps:
         assert!(parse_cli(&words(&["show", "a", "--nope"])).is_err());
         assert!(parse_cli(&words(&["frobnicate"])).is_err());
         assert!(parse_cli(&words(&["status", "a", "b"])).is_err());
+    }
+
+    #[test]
+    fn dash_h_after_command_shows_help_and_types_nothing() {
+        for args in [
+            words(&["send", "agent", "-h"]),
+            words(&["send", "--help"]),
+            words(&["keys", "agent", "enter", "--help"]),
+            words(&["new", "project", "-h"]),
+        ] {
+            assert_eq!(
+                parse_cli(&args),
+                Ok(CliCommand::Help(Some(args[0].clone()))),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            parse_cli(&words(&["help", "send"])),
+            Ok(CliCommand::Help(Some("send".into())))
+        );
+        assert!(super::command_help("send").unwrap().contains("--force"));
+        assert!(matches!(
+            parse_cli(&words(&["send", "agent", "--", "-h"])),
+            Ok(CliCommand::Request(Command::Send { text, .. })) if text == "-h"
+        ));
+    }
+
+    #[test]
+    fn unknown_command_suggests_nearest_verb() {
+        let error = parse_cli(&words(&["list"])).unwrap_err();
+        assert!(error.contains("did you mean `panes`?"), "{error}");
+    }
+
+    #[test]
+    fn send_to_own_pane_is_refused() {
+        let me = id(7);
+        let error = super::check_self_target(Some(me), me, false).unwrap_err();
+        assert_eq!(error.code, Some(ErrorCode::SelfTarget));
+        assert_eq!(super::check_self_target(Some(me), me, true), Ok(()));
+        assert_eq!(super::check_self_target(Some(me), id(8), false), Ok(()));
+        assert_eq!(super::check_self_target(None, me, false), Ok(()));
     }
 
     #[test]
