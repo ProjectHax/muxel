@@ -10,6 +10,14 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Panes & layout
 
+- **Hotbar** — a bar along the bottom of the main window opens full views in place
+  of the panes: **Dashboard** (every agent's status), **Changes** (the active
+  project's git changes, with commit), **Memory** (its shared memory), **Files** (its
+  file tree), and **Accomplishments** (every project's log). A view fills everything
+  right of the project sidebar (docked panels and the git-diff panel step aside);
+  switching projects in the sidebar retargets Changes, Memory, and Files. The active
+  button is drawn filled with an accent bar above it, the bar names what's showing,
+  and clicking the button again returns to the panes.
 - **Recursive split layout** — panes form a horizontal/vertical split tree; any
   pane can be split again, nesting freely.
 - **Resizable splits** — drag the divider between panes; sizes persist per project.
@@ -77,7 +85,9 @@ feature is added or changed, update the matching entry here in the same change**
   palette's *Restart agent*) stops the pane's process *and* its tmux session,
   local or remote, then relaunches in place in a fresh session. A resume-capable
   agent comes back on its saved conversation, so an updated harness binary takes
-  effect without losing it; a shell or other program starts over.
+  effect without losing it; a shell or other program starts over. On Windows,
+  a Grok restart first saves any newly discovered conversation. If that save
+  fails, the pane keeps running and reports the error.
 - **Tab cycling** — keyboard shortcuts cycle to the next/previous tab.
 
 ## Pop-out windows
@@ -86,9 +96,12 @@ feature is added or changed, update the matching entry here in the same change**
   Terminals and editors move across; a browser pane is re-created in the new window
   at the same URL (a native webview belongs to the window that built it).
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
-  button returns it to its original location.
+  button returns it to its original location. Re-docking a working agent clears
+  that pane's stale finished or needs-input card.
 - **Close terminates** — closing a pop-out window kills its terminal (with a
   confirmation). Editors and browser panes just close.
+- **Workspace changes** — switching workspaces closes the previous workspace's
+  pop-out and per-monitor project windows without interrupting the switch.
 
 ## Agents
 
@@ -115,7 +128,10 @@ feature is added or changed, update the matching entry here in the same change**
   Local retained sessions bind to their pane through Muse's root lifecycle
   hooks and resume the exact conversation after restart, including panes in
   the same folder. The status dot follows Muse's spinner and completion title,
-  with permission notifications marking a blocked turn. SessionStart context
+  with permission notifications marking a blocked turn. Where the title can't
+  be read (under tmux, or on a remote host) the dot follows output activity,
+  and local hooks still mark blocked and finished turns. Hook records are read
+  in the background. SessionStart context
   delivers file-link, memory and custom instructions without submitting a turn.
   Hooks are configured per launch outside the project; existing user, project
   and managed hooks are preserved. Only permission notifications invoke the
@@ -147,21 +163,47 @@ feature is added or changed, update the matching entry here in the same change**
   to a shell showing the underlying error instead of crashing. If even the
   fallback shell can't start, the pane shows the failure in place (the toolbar
   Restart retries) and the error lands in the NOTIFICATIONS feed.
+  Outside-created panes show the requested program's launch failure directly;
+  their approved command is never replaced with a shell.
 - **Session resume** — resume-capable agents reopen their prior conversation after
   a muxel restart. Two shapes, both configurable per preset:
   - **Host-minted** (Claude, Grok): `session_id_flag` + `resume_flag` — muxel
     launches with `--session-id` the first time and `--resume` on restart.
   - **Agent-minted** (Codex): only `resume_flag` (`resume`) — first launch is bare;
-    muxel captures the UUID Codex publishes for that pane, validates it against
-    `~/.codex/sessions` before restart, and relaunches as `codex resume <id>`. The immutable
+    muxel captures the UUID Codex publishes for that pane and stores its rollout path.
+    Local tmux panes read their own `pane_title` from the recorded tmux socket on a
+    background worker because tmux does not forward that title to the terminal view.
+    Before relaunch, muxel checks a saved rollout path and uses `codex resume <id>`.
+    A restored pane that needs history gets one background lookup before its
+    launch, never on the UI thread and never twice per pane in a run: a saved
+    UUID with no saved path is confirmed by its dated directory, then by one walk
+    of `~/.codex/sessions`; a started pane without a UUID binds the newest rollout
+    recorded in its directory that no other pane owns, unless its own tmux
+    session still runs (title capture binds that one exactly) or an unbound
+    sibling in that directory still runs, in this app or in tmux, since that
+    sibling's conversation would look like the newest one. The launch waits for
+    the lookup at most two seconds; an unbound pane whose lookup finds nothing,
+    is skipped, or runs out of time starts fresh, and Import can still find an
+    older conversation.
+    An unreadable rollout that could change the chosen conversation leaves
+    discovery unresolved, including shortened title hints and Import; confirmed
+    subagent rollouts remain excluded. In restore and Import, a confirmed
+    subagent also excludes its unreadable compression siblings.
+    Discovery checks equally recent candidates before binding a pane, keeps
+    verified newer conversations when an older candidate is unresolved, and can
+    use a readable copy when a compression sibling cannot be read.
+    The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
-    UUIDs resolve only when exactly one rollout matches the pane's directory. Multiple Codex
+    UUIDs resolve in their timestamp's local day directory, with one neighboring day
+    checked near a date boundary. Only matching filenames are opened to validate the
+    pane's directory and top-level thread identity; subagent rollouts never rebind
+    a pane. Multiple Codex
     panes can share a project without resuming one another's conversations.
   **Conversation switches stick** — an agent can swap its conversation inside a live
   pane (`/resume`, `/clear`, a fork) without restarting the PTY, and muxel rebinds the
   pane to what's actually on screen instead of the conversation it launched. Local
   Claude panes learn the switch from a process-local `SessionStart` hook keyed to the
-  pane; Codex panes learn it from a later OSC title. Both are accepted only after the
+  pane; directly launched Codex panes learn it from a later OSC title. Both are accepted only after the
   new UUID's own on-disk session proves it real and no sibling pane already owns it —
   terminal titles carry no sender identity, so an unverified one cannot rebind a pane.
   A Claude conversation is matched by UUID across Claude's whole store rather than only
@@ -170,9 +212,49 @@ feature is added or changed, update the matching entry here in the same change**
   directly inside that store, which is what stops a stray path from rebinding a pane,
   and `/clear` or a fork may announce its new UUID before Claude has written the first
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
-  starter binding. A saved conversation is abandoned only once muxel has confirmed it
-  is really gone — a session store it couldn't read leaves the pane's resume id alone —
-  and the pane then quietly starts fresh.
+  starter binding. Recurring Codex rollout discovery and Claude hook validation run
+  in the background, alongside Grok's process lookup. Each pane keeps one pending
+  lookup across pop-out and docking. Failed Codex hints retry with a delay that
+  grows from one to thirty seconds, even while the day directory changes.
+  A sibling-owned tmux title is reread under backoff so a later unowned title
+  can bind; its rollout validation is cached only while the same sibling owns
+  it. Other sibling-owned hints wait until ownership or binding changes. Launch,
+  directory, hint or binding changes reset the delay. The name index is reread
+  in full on a worker when its size or modification time changes; unchanged
+  indexes take one stat. Claude and Grok retry unresolved results with backoff.
+  Discovery continues in popped-out terminals. A result applies only when
+  the pane still has the same launch, binding and directory, and no sibling owns it.
+  On Windows, an accepted Grok conversation stays reserved to its pane even
+  while its metadata save is pending.
+  A saved Claude conversation is abandoned only once muxel has confirmed its
+  transcript is really gone — a session store it couldn't read leaves the pane's
+  resume id alone — and the pane then quietly starts fresh.
+  A saved Codex conversation is abandoned when its validated saved rollout
+  path and compression sibling are both absent or non-files, when a complete walk
+  of the rollout store does not find it, or when Codex itself reports that the
+  exact resumed ID is missing soon after launch. Under local tmux that message
+  leaves with tmux's screen, so a `codex resume` whose rollout muxel could not
+  confirm, launched into a tmux session that was not running, counts as failed
+  when its client exits cleanly within ten seconds: the pane starts fresh
+  instead of closing. Such an early exit cannot be told from any other early
+  Codex exit there, so it gives up the unconfirmed id. Reattaching a running
+  session, a confirmed rollout, and remote panes keep close-on-exit; a remote
+  resume is never checked locally, and telling its failure from a quick quit
+  would need another round trip to the host. An invalid path, unreadable or
+  missing store, unfinished walk, or other early failure keeps the id and
+  attempts resume.
+  Remote Codex panes never check the local session store. Archived Codex sessions
+  require unarchiving in Codex before they can resume.
+  Before a local Claude relaunch, pending hook records are handled through the
+  newest binding before resume arguments are chosen. If a recovered binding
+  cannot be saved, or a pending record cannot be read, launch stops and the
+  record remains available for retry; failing only to remove a record whose
+  binding was saved is logged and the pane launches, unless a newer record waits
+  behind it. A record that can't be adopted yet (a `/clear` before Claude
+  creates its project directory) is kept and retried until it validates or a
+  newer one replaces it, as long as the process that wrote it runs: a relaunch
+  that starts a new process drops it, while reattaching a live tmux session
+  keeps it.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
 - **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to
@@ -263,18 +345,50 @@ feature is added or changed, update the matching entry here in the same change**
   Settings → Projects); a memory button on the project row opens the manager. Plain
   shells are skipped.
 - **Self-maintaining memory** — each fact is one `##` section carrying a machine
-  meta line (id, dates, tags). muxel keeps the file **most-relevant-first** (recently
-  used entries and 📌 pinned ones rise to the top), **timestamps** every entry,
-  **auto-purges** un-pinned entries unused for 30 days, and **caps** it at 40
-  un-pinned entries (evicting the least-recently-used) — so it stays small and
-  greppable and never needs hand-pruning. A legacy flat `MEMORY.md` is imported, not
-  lost, on first open.
+  meta line (id, dates, tags). muxel maintains the file **on its own**, with or
+  without the memory panel open: a section an agent adds is stamped within about a
+  minute of being written (local projects; remote ones within ~10 minutes of an
+  agent's turn ending, or at the daily pass), and every memory-enabled project is
+  maintained once a day. It keeps the file **newest-first** (📌 pinned entries on
+  top) and **auto-purges** un-pinned entries 30 days after they were added; a safety
+  cap of 200 un-pinned entries evicts the oldest first, never an arbitrary pick among
+  same-day entries. A file that can't be read is reported, never treated as empty,
+  so nothing is saved over it. A legacy flat `MEMORY.md` is imported, not lost, on
+  first open.
 - **Memory panel** — the project row's memory button toggles a docked, resizable
   second-sidebar panel (like the file browser, sharing its slot; width persists per
   workspace): search/grep the entries, add one (title + note + tags), pin/unpin
   (pinned entries are exempt from purge and cap), delete (with confirm), or open the
-  raw `MEMORY.md` in the editor. Entries load and persist over SSH for remote
-  projects too.
+  raw `MEMORY.md` in the editor. Each change is applied to the file as it is on disk
+  when saved, so sections agents added while the panel was open are kept. Entries
+  load and persist over SSH for remote projects too.
+- **Accomplishment log** — opt-in per project (sidebar right-click or Settings →
+  Projects): agents are told to append one line to `.muxel/ACCOMPLISHMENTS.md` each
+  time they finish a feature, fix, refactor, or perf/docs/test improvement —
+  `- date | type | summary | agent | #key` — with a shell append, **never reading the
+  file**, so logging costs agents almost nothing. **Entries can be corrected**: if a
+  result later changes (more got fixed, part was reverted), the agent appends a
+  line with the same `#key` (grepping for it if needed, still not reading the file)
+  and muxel folds it into the original, which keeps its date and shows "updated"
+  with the correction's day. muxel fills in the agent's name, stamps undated lines,
+  keys unkeyed ones (so any entry can be corrected), drops duplicates, and prunes
+  entries whose last change is older than the history window
+  (**14 days** by default, 1–90 in Settings → Projects) **on its own**: a background
+  pass maintains every log-enabled project once a day (at startup and after each day
+  rollover), with or without a view open, and changing the window re-prunes them
+  all. Remote projects are maintained once their host is connected (pruning never
+  opens a connection by itself). muxel rewrites the file only when something
+  actually changes. Works for local and remote SSH projects; local agents also get
+  the path in `MUXEL_ACCOMPLISHMENTS_FILE`.
+- **Accomplishments panel** — a check button on the project row opens a docked,
+  resizable panel (sharing the file-browser/memory slot) listing the log by day,
+  newest first, with colored type tags, per-type totals, search, delete, and a
+  quick-add box (`fix: what was done`). It updates live while open: local logs are
+  watched by file stamp, and remote ones refresh when an agent finishes a turn.
+- **All-projects accomplishments** — the title-bar check button (or the palette's
+  "Show accomplishments") swaps the pane area for an overview of every log-enabled
+  project, grouped by day and then project, with type and project filters and
+  search. It can **pop out** into its own window, to keep on another monitor.
 
 ## Agent status
 
@@ -297,7 +411,8 @@ feature is added or changed, update the matching entry here in the same change**
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
   active work. Local Codex `/rename` values are read
-  from its session index by the pane's captured session UUID, so child commands
+  from its session index by the pane's captured session UUID. The index is checked
+  for changes and reread in full when it changes; truncating it rebuilds the names. Child commands
   such as `npm` cannot replace the session name or forge a title-derived state
   transition. Remote Codex panes retain the provider's structural title fallback.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
@@ -307,6 +422,25 @@ feature is added or changed, update the matching entry here in the same change**
   activity. They reach **done** only from the bell or process exit, never from a
   quiet spell — so an incidental redraw (e.g. a focus repaint when you click the
   pane) can't fake a finished turn.
+- **Event-driven status snapshots** — terminal output, semantic titles, bells,
+  process exit, resize invalidation, and exact quiet/debounce deadlines update one
+  per-launch runtime snapshot. Sidebar and render reads never rescan the terminal
+  or mutate lifecycle state. When an agent switches conversations in place (a
+  `/resume`), evidence from around the switch can't complete a turn or notify:
+  the pane shows the agent's current state until the new conversation's own
+  evidence arrives, and the Enter that picked the conversation doesn't count as
+  a turn in it. During uncertainty, `ctl` treats the pane as Working: ordinary
+  sends are refused and `wait` keeps waiting; `send --force` retains its override.
+  An agent that prints nothing more after the switch settles a couple of seconds
+  later, on a timer, so an idle pane accepts sends again; an old prompt or
+  activity row still on screen stays uncertain until it goes or a new title
+  confirms it.
+  A Grok conversation switch releases old loop ownership even if saving fails.
+  Each pane uses its own discovery history, so another pane's refresh cannot
+  discard its valid current title.
+  The snapshot carries a launch id and
+  provider-binding, input and sequence revisions; without provider hooks its coverage remains
+  explicitly limited to visible terminal evidence.
 - **Auto-continue** — an agent that lays out a multi-phase plan sometimes finishes
   the first phase and just stops, waiting, with the todo list still half-unchecked.
   Each agent pane has an **Auto** toggle in its header: while it's on, muxel watches
@@ -368,6 +502,13 @@ feature is added or changed, update the matching entry here in the same change**
 - **One-click task launchers** — predefined runners (e.g. Review, Security Review)
   spawn an agent that auto-types a task prompt. The toolbar "Run task" dropdown
   lists them; click to run, or the pencil to edit one in Settings → Runners.
+- **Built-in reviews that don't edit unasked** — the built-in Review and Security
+  Review prompts tell the agent not to edit, stage, or commit; cover staged,
+  unstaged, and untracked work (or the branch's own commits when the tree is
+  clean); and ask for verified findings, worst first, with file:line, a failure or
+  attack scenario, and a fix. Security Review ranks its findings in a table with a
+  recommendation for each, suggests which to fix, and asks you — then fixes only
+  the ones you pick. An upgrade refreshes only prompts you never edited.
 - **Templated prompts** — `{{input}}` is substituted with run-time details.
 - **Auto mode** — send a configurable number of Shift+Tab presses (then Enter) at
   startup to reach auto-accept mode.
@@ -405,9 +546,44 @@ feature is added or changed, update the matching entry here in the same change**
   sends auto-mode Shift+Tab presses, and respects the agent's startup delay (so
   opencode and Grok work). The pane is **visible but not focused** and never switches your
   active project — a loop firing on a timer can't interrupt what you're typing.
+- **Provider startup input** — runners, TypeIn presets and loops type their
+  task once the agent's output has gone quiet (or after the preset's startup
+  delay), and at the 30-second cap if it never does, for any agent.
+  A `ctl new --prompt` task is stricter: it waits for Claude's editable
+  composer and bracketed-paste mode, Codex's live editor (under its model
+  status line, `? for shortcuts` or context-left footer; a status line whose
+  model name has no digit and no `gpt-`/`codex-` prefix isn't recognised
+  without one of the other two) and Ready title, or
+  Grok's semantic idle state after its configured startup delay. In a tmux
+  pane, which forwards no program titles unless tmux's own `set-titles` is on,
+  muxel reads the provider's title through tmux (`#{pane_title}`) while that
+  task waits; it never changes tmux options. Codex folder-trust menus receive no
+  task input; readiness failure leaves the provider running and reports
+  `startup_error` through `ctl status` and `show`.
+  Permission text inside Claude's pasted task does not block its submission.
+  `ctl wait` keeps a newly created task pending through startup and paste, then
+  confirms submission only from a fresh provider turn or rendered user row.
+  Enter admission alone stays pending. Codex can receive one extra Enter after
+  five seconds only if the exact task is visible on one ASCII editor row with
+  its cursor at the end and no new user row; ambiguous reflow gets no retry. Task text
+  is never pasted twice. Grok and Claude do not inherit that retry. After ten
+  seconds without acceptance, `ctl wait` reports `submission_failed`, with an
+  explanation in `startup_error`. Providers without a verified input/acceptance
+  protocol (including Muse) refuse controller startup tasks without typing.
+  A task's input stops if the pane is replaced, someone types, the writer fails,
+  or readiness times out; it never replays a submitted task automatically.
 - **Post-run policy** — leave the agent running, or exit it once it finishes its
   turn (with a max-runtime safety cap). A still-running loop won't stack a second
-  copy.
+  copy. Cleanup requires current attributable evidence from the launch and
+  conversation known before the first submitted turn: the one muxel launched
+  the pane into (a Claude loop's minted session id), or the first one an agent
+  such as Codex names. A later first identity cannot establish which
+  conversation received that prompt. Switching conversations or reopening
+  its pane stops tracking the old run without closing the new one. At the
+  runtime cap, uncertain or unidentified runs stop tracking without closing the
+  pane, so later scheduled runs can fire. If a prompt preceded the agent naming
+  its conversation, even an Exit-policy loop leaves its pane open for a human
+  to close.
 - **Managed from the main window** — a toolbar "Loops" dropdown lists your loops:
   click one to run it now, the pencil to edit it in Settings → Loops, or "New
   loop…" to create one. Schedules survive restarts (a daily-at whose time passed
@@ -518,6 +694,120 @@ feature is added or changed, update the matching entry here in the same change**
   status (working / blocked / done / idle / exited), read its last prompt and last
   reply, send it a prompt, answer the question it is blocked on, and press keys.
   Every command prints JSON.
+- **Open panes from another tool** — `muxel ctl new PROJECT` opens a tab using
+  that project's toolbar preset. `--model M` and `--effort E` select per-pane values for
+  plain and prompt launches, retained on restart. The preset needs Model flag /
+  Effort flag configured and absent from Extra args; literal argv cannot use
+  these options (`parameter_unsupported`). Values are 1–64 characters from
+  `[A-Za-z0-9._:/@+-]` without a leading `-`. Ask displays the choices before
+  directory details; preset overrides remain Allow-eligible. Flag templates
+  containing `{}` substitute
+  the value into one argument. New Claude presets use `--effort`; new Codex
+  presets use `--config=model_reasoning_effort={}`. Existing presets are unchanged.
+  Parameterized creation uses control protocol v3 so older hosts refuse it;
+  plain creation and status polling remain v2. Hosts require the exact command version.
+  Choose `--preset NAME` (or its id), or pass
+  `-- PROGRAM ARGS...` to launch literal argv, including spaces, quotes and empty
+  arguments. `--prompt TEXT` (or `--prompt -` for stdin) submits a user task
+  through the existing one-shot runner path for a configured non-shell terminal
+  preset. This replaces the preset's configured system prompt with the task;
+  preset arguments are kept. The typed first turn is exactly the task, without
+  trailing whitespace (at most 10,000 characters, so the approval card can show
+  all of it). Automatic
+  file-link and memory instructions use the preset's separate flag/config
+  transport when available, and are omitted for TypeIn-only presets.
+  The task text is discarded after first launch.
+  Restart, restore and resume neither re-type nor resubmit it, including launches without a resumable
+  conversation. A duplicate of the pane starts without it, and the phone never
+  types or submits it. Literal, shell and browser launches refuse prompts with
+  `prompt_unsupported`. `--cwd`
+  accepts an existing absolute directory, including a linked worktree outside
+  the project root; it defaults to the root. Automatic memory and accomplishments
+  instructions still address the project's files when the launch directory differs.
+  `--name` names the tab (1–100 visible characters; `--from` likewise), and
+  `--split right|down` creates a pane. Both refuse control, bidi, zero-width and
+  line-separator characters.
+  Creation preserves the selected tab, focus,
+  project and window by default, without raising the window. `--focus` selects
+  the new pane, its project and window only when the request was approved with
+  a click; under Allow the pane opens in the background as usual, so a request
+  can't move keystrokes the user is typing into it, and the reply's `focused`
+  says which happened. `--background` remains accepted as a
+  compatibility no-op. JSON uses `focus` (default false); the legacy `background`
+  field is accepted and ignored. The JSON reply identifies the pane and launch.
+  ALL outside creation requires both "Allow outside tools to control muxel" and
+  the separate **Outside terminal creation** policy in Settings → Grok Bot.
+  It defaults to **Off**. **Ask** requires a click for each request; **Allow**
+  opens only presets whose program is a known agent provider (the built-in agent
+  presets' programs — Claude, Codex, Grok, opencode, Amp, Muse, Hermes, Ollama,
+  pi — by executable name) without a click, when it is given as an absolute
+  path or found through absolute `PATH` entries. Any other program, such as
+  `ssh host`, `wsl.exe`, `python` or `node`, and a relative path or `PATH`
+  entry, which the caller's `--cwd` could supply, still Asks under Allow.
+  All literal argv, including agent argv, and shell-classified
+  presets/defaults also require "Also allow typing into shell panes". Configured
+  non-literal presets not classified as shells need only the first two grants.
+  Literal argv and shell presets always Ask, even under Allow. All three grants
+  default off; upgrades do not infer creation permission from older
+  control/command grants. Users enable the required settings themselves.
+  The existing shell/non-shell classifier is a soft policy for trusted configured
+  presets, not an executable allowlist.
+  Commands run as the host muxel process with its permissions and environment,
+  outside the caller's sandbox; coding agents and configurable presets are not a
+  security sandbox. Creation is checked at admission and rechecked at mutation
+  time before executable discovery, placement, persistence or spawning.
+  Quitting, deletion and remote projects refuse
+  creation. Literal launches on Windows require a native executable (installed
+  Codex resolves to its packaged executable); batch wrappers cannot preserve
+  arbitrary argv. Literal launches bypass preset rewriting and tmux wrapping.
+  Built-in output markers still track work and permission prompts without
+  modifying the command or injecting startup input.
+  They restore stopped; project selection, Restart and wake never replay their
+  opening brief. The pane's explicit **Run again** action reruns the saved argv.
+  The sidebar labels an unspawned restored literal pane as **stopped**. Retained
+  exited terminals keep their **done** badge and completion age.
+  Literal panes never claim or clean up tmux sessions, including stale peer
+  metadata. A layout written back by an older peer that doesn't know them
+  cannot clear a pane's literal argv, launch directory or outside-creation
+  marks. Phone duplicates keep them stopped without assigning a tmux session;
+  closing them still removes their layout entry and owned worktree normally.
+  Launch directories are stored separately from owned worktrees, so closing a
+  pane never deletes its cwd and migration never registers it as owned.
+  Without `--prompt`, preset and default launches keep toolbar injection, resume and hooks.
+  `new` opens terminal panes; browser presets (including a browser default) are
+  not supported yet and receive a refusal.
+  Ask answers admission immediately with a pending request UUID; the CLI polls
+  once a second and prints the final reply. `--no-wait` returns the pending ID for
+  scripts to poll with `ctl new-status ID`. The floating card shows declared
+  caller/pane information (`--from LABEL` and `MUXEL_INSTANCE_ID`), the
+  destination project, preset with the program and arguments it runs, cwd,
+  pane name and the whole prompt, or full literal argv. Long details scroll,
+  with arguments shown one per line, including empty arguments. Every value
+  shows control, bidi and zero-width characters as visible escapes
+  (`\u{202e}`); leading or repeated blank lines, long blank runs and stacked
+  combining marks in the prompt are counted (`\n×3`) rather than drawn.
+  Labels are not authenticated identities. **Allow once** / **Deny** require
+  mouse clicks. Both buttons stay disabled for 750 ms after each card appears,
+  and double-clicks are ignored. Mouse-down and release must belong to the same
+  armed card, so a held press cannot transfer across expiry. Scrolling stays in
+  the card; keyboard input remains in the terminal. Cards appear in FIFO order
+  with a waiting count and an OS
+  notification, and native browser views yield to them.
+  Approvals expire 120 seconds after admission (`approval_timeout`), including
+  time behind another card; denial returns `approval_denied`. Turning creation
+  or outside control off refuses every pending request and removes its card.
+  Outside control off also stops the server, so polling callers receive
+  `host_unavailable` after connection retries. Connection and host-availability
+  failures retry up to three times against the same UUID; the CLI never reissues creation.
+  Exhausted retries and uncoded status errors name the UUID to query with
+  `new-status` and advise against repeating `new` while the original may still wait.
+  Finished replies remain available for ten minutes (latest 256); at most 64
+  approvals wait, and approvals do not survive a host restart. Creation requests
+  use protocol v2, or v3 when selecting model/effort, so older hosts refuse
+  unsupported fields.
+  Turning creation off leaves existing panes and typing permissions unchanged
+  and does not cancel launches already admitted for spawning. Deferred requests
+  still recheck the current grant. Human toolbar creation is unaffected.
 - **Reads what the agent actually said** — `show` returns the last prompt and the
   model's last reply the way read-aloud finds them (a local Claude pane's session
   transcript, otherwise the pane's scrollback), and for a blocked
@@ -529,11 +819,56 @@ feature is added or changed, update the matching entry here in the same change**
   working or waiting on a question (unless forced), `answer` only picks an option
   the prompt actually offers, and a pane that isn't running says so rather than
   swallowing the input. Shell panes are off limits unless "Also allow typing into
-  shell panes" is on too, since typing into a shell is running commands.
+  shell panes" is on too, since typing into a shell is running commands. That
+  setting also grants `new` shell preset/default and all literal argv launches
+  when the separate outside terminal-creation grant is enabled. Existing shell
+  writes require global control and this command grant even when creation is off.
+  Turning "Also allow typing into shell panes" off refuses subsequent control
+  writes to every literal argv pane, even agent-looking or interpreter programs,
+  and every program outside the known built-in agent providers, including SSH
+  and WSL shell presets. Existing-pane writes recognize known agents by executable
+  name, including custom paths and agents in remote projects.
+  An agent that falls back to a shell after a failed launch requires the same
+  shell-input grant, including restored panes. A successful agent relaunch uses
+  the agent policy again.
+  Configured non-literal known agents remain controllable while outside control is on;
+  disabling all outside control is a separate setting. Delayed Enter and keys
+  recheck the shell-input grant and terminal/session availability before writing.
+  Revocation does not stop processes
+  or undo input already delivered.
   `send` waits for its delayed Enter and withholds it if local input changes or
   the pane closes or restarts. A withheld send fails and attempts to release only
   its own tmux claim; timeout, command failure or older tmux can leave the claim
   in place under its existing aging rules.
+- **Popped-out terminals** — `ctl` keeps reading their status and screen and can
+  send input when they move to a separate window or dock again. Their activity
+  timestamps stay current, so `wait` recognizes completed or blocked turns.
+  Activity and attendance follow the same conversation attribution as docked
+  terminals; redocking uncertain state preserves existing attention cards.
+  On Windows, Grok conversation discovery follows the live terminal in either
+  window.
+  Scheduled loops stay tracked across popout and redock.
+  Restart docks a popped-out terminal before replacing its process.
+- **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
+  `send --launch-id ID` checks the launch again before pasting. Its success
+  receipt confirms writer admission with `pasted: true`.
+  Codex, Claude and Grok sends then observe fresh provider acceptance for about
+  ten seconds (three more after a retry) and report `submission_confirmed` and
+  `enter_retries`. Unknown acceptance is reported as false with an
+  `unconfirmed_reason` (`timed_out`, `input_changed` or `interrupted`); once
+  Enter is in, the reply is always this receipt, never an error. muxel doesn't
+  wait when the pane can't show a receipt — an unsupported provider, or no
+  readable idle status title (tmux hides titles) with a Grok, multi-paragraph or
+  repeated prompt — and reports null. Turning outside control off stops the
+  later Enters and keys of `send`, `answer` and `keys`. Only Windows Codex may
+  receive one extra Enter after five seconds, with the same launch, permission
+  and input guards and an exact fully visible ASCII prose draft in its idle
+  composer. A compact composer frame captured before paste and an added blank
+  cursor line must prove that its first Enter was consumed, with no resize or
+  title change. Wrapped prose is supported; clipped, multiline, Unicode,
+  completion or ambiguous drafts are left for inspection. Claude and Grok get no
+  automatic retry. Text is never pasted again, and an unconfirmed receipt does
+  not authorize resending it.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It
@@ -547,7 +882,7 @@ feature is added or changed, update the matching entry here in the same change**
   computer, including shells, receive `MUXEL_INSTANCE_ID` set to the pane's id,
   which `muxel ctl` takes as AGENT. An agent or script inside a pane
   can check its own status or read its own screen without guessing at its name.
-  If a requested command cannot start, its local fallback shell receives the same
+  If a local UI command cannot start, its fallback shell receives the same
   pane id without copying the failed command's transport variables.
   A pane kept in tmux gets it when muxel creates its session, from tmux 3.2 on
   (which can hand a new session's program a variable). On older tmux it goes
@@ -614,6 +949,20 @@ feature is added or changed, update the matching entry here in the same change**
 ## Terminal
 
 - **alacritty-based emulator** — full VTE terminal with truecolor support.
+- **Bounded output backpressure** — each pane's reader-to-UI queue admits at most
+  256 KiB / 64 chunks. A noisy child pauses at that boundary and resumes as the
+  pane drains. While the pane is open (its session lives and the pane keeps
+  reading), terminal bytes and the final exit event stay in order and none are
+  dropped to protect memory. The UI separately holds one bounded drain batch
+  while parsing it. Closing a pane never waits on its queue, and output not yet
+  shown is discarded. Failed Windows launches also release output backpressure
+  before closing their terminal. On macOS and Linux muxel sends the program one
+  SIGHUP.
+  If the pane was still reading the program's terminal when it closed, muxel
+  kills a program still running about five seconds after that SIGHUP. A program
+  that had already closed its terminal is not force-killed, as before. The
+  operating system's own hangup when the pane's terminal closes is separate and
+  outside muxel's control, so a program is not guaranteed those five seconds.
 - **Selection & clipboard** — mouse text selection and copy/paste (`⌘C`/`⌘V` on
   macOS, `Ctrl+Shift+C`/`Ctrl+Shift+V` elsewhere). A global Settings → Behavior
   choice picks the mouse copy/paste style: **right-click copy/paste** (default —
@@ -709,6 +1058,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Key routing** — `Tab` / `Shift+Tab` go to the focused terminal rather than
   moving UI focus. `Shift+Enter` / `Alt+Enter` send `ESC CR` so agent TUIs
   (Grok, etc.) can insert a soft newline; plain `Enter` stays CR (submit).
+  `Alt/Option+Backspace` sends `ESC DEL` (delete word), `Ctrl+Backspace` sends
+  `Ctrl+W` (delete word) and `Cmd+Backspace` (macOS) sends `Ctrl+U` (delete to
+  line start), matching iTerm2's natural text editing and Warp.
 - **Agent-first plain Ctrl+letter** — muxel app shortcuts that are plain
   `Ctrl+A`…`Ctrl+Z` (no Shift) do **not** fire while a terminal is focused, so
   agents receive them as normal C0 chords (Claude `Ctrl+S` stash, shell
@@ -893,6 +1245,26 @@ feature is added or changed, update the matching entry here in the same change**
   close is still remembered for the rest of the run, so a connect that listed the
   host's sessions a moment before the kill landed can't bring the pane back either.
   Unconfirmed closes are listed in the developer log.
+  Discovery and import retain the session's socket as well as its name. Attach,
+  restart, close and quit use that owner, leaving a same-named session on another
+  socket alone. Older panes resolve their owner before teardown. Claim cleanup
+  includes any socket discovery in its two-second deadline and reaps timed-out
+  commands before returning.
+  Recorded named sockets round-trip across desktop and phone, including names a
+  newer peer introduced, without dropping the rest of a shared layout. A restart
+  whose owner cannot be saved or confirmed stops with an error instead of silently
+  reattaching the old agent.
+  A legacy close saves its selected server before the first kill and keeps that
+  owner through lost replies, retries and reconnect cleanup. Only one restart
+  per pane can resolve and stop a session at a time; stale completions from a
+  closed pane or a previous workspace cannot overwrite its new owner. A pending
+  restart follows its project back to the main window if its original window
+  closes. The iOS companion serializes all layout changes with ownership binding,
+  verifies saved pane membership before attachment even for an unchanged owner,
+  preserves an already saved owner when a stale attachment disagrees, and rebuilds
+  that attachment once from the refreshed layout. It discards stale publication
+  after a project switch. Its host status sweep
+  includes recorded named sockets and uses the same session as attachment.
 - **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
   speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
   layout sync, the memory file, project scan, remote git, and the connection test
@@ -965,7 +1337,10 @@ feature is added or changed, update the matching entry here in the same change**
   and muxel keeps retrying on its own — backing off to one attempt every 30s, for as
   long as the outage lasts — until the host is reachable and reattaches the agent
   right where it left off. Resuming a laptop whose Wi-Fi isn't up yet just costs a
-  retry or two. The notification feed reports an outage once per host, not per pane:
+  retry or two. An owner lookup or terminal launch already recovering a pane keeps
+  its place across retry ticks; an attempt still pending after 60 seconds yields
+  to a new attempt so a hung worker cannot stall recovery forever.
+  The notification feed reports an outage once per host, not per pane:
   one entry counts the panes still reconnecting and turns into "reconnected" when
   they're all back, so waking with a dozen agents running is one line, not two dozen
   (dismiss it and it stays dismissed until the next outage). On a laptop, a drop
@@ -1039,6 +1414,36 @@ feature is added or changed, update the matching entry here in the same change**
   (even a crash), so no stale lock blocks the next launch.
 - **Full restore** — pane layout, split sizes, window geometry, and sidebar width
   are persisted and restored on launch.
+- **Separate user data dir** — `muxel --user-data-dir DIR` puts settings in
+  `DIR/config`, state and the control endpoint in `DIR/data`, and credentials in
+  a separate keychain service on Windows, macOS and Linux. This separates Muxel
+  profiles for testing or a second instance; it is not a security sandbox.
+  `DIR` holds the control bearer token, workspace and settings and must be private
+  to the intended OS account. On Windows, these files inherit `DIR`'s ACL;
+  `--user-data-dir` does not impose an owner-only ACL.
+  Outside tools pass the same flag before `ctl`, and panes
+  inherit the root even when a preset sets empty or foreign profile variables.
+  AppImage cleanup retains the selected root even when its path shares the
+  runtime mount's prefix.
+  An isolated run refuses a foreign `MUXEL_CONTROL` endpoint. Browser website
+  data persists under `DIR/data/webview2` on Windows; isolated macOS and Linux
+  browser views use nonpersistent storage, discarded when each view closes.
+  If Linux's browser helper cannot start, links, browser presets and restored
+  browser panes report failure instead of opening the system browser.
+  Local tmux panes require tmux 3.2+ to pass the root and endpoint per session;
+  older versions show an upgrade error without launching a fallback shell.
+  Restarting the pane after upgrading tmux checks support again.
+  Each isolated root uses its own tmux socket locally and over SSH. Discovery,
+  reattachment, claims, restart, close and quit stay on that socket, including
+  when older or peer metadata names another server. The regular profile keeps the `mxl` socket and reattaches legacy
+  default-socket sessions. Version and help exit without initializing a profile.
+  Relative paths and `--user-data-dir=DIR` work; empty, repeated or malformed
+  forms are refused before startup. The flag can also precede Linux browser-helper
+  commands. Child agents still use their normal
+  login/config and project files; profiler paths retain their usual locations.
+  Credentials are not migrated from the default profile; if a root cannot be
+  resolved when first used, its fallback keychain name may differ from a later
+  resolved name.
 
 ## Settings & theming
 
@@ -1083,19 +1488,40 @@ feature is added or changed, update the matching entry here in the same change**
   Its socket is named `mxl` rather than `muxel` for the same reason: a `pkill -f
   muxel` stops muxel's windows but leaves the agents running in tmux.
 - **A tmux server of its own** — muxel keeps its sessions on a private tmux socket
-  (`tmux -L mxl`), on this computer and on remote hosts alike, so nothing that runs
-  a bare `tmux` command can reach them: not your own tmux, and not another tool's
-  `tmux capture-pane`, which on builds that abort on it (RHEL 10's stock tmux) used to
-  take down the server and every agent in it. To look at a session by hand, use
-  `tmux -L mxl ls` and `tmux -L mxl attach -t muxel_…`. Upgrading stops nothing: a
-  pane whose session is still running on the default server from an earlier muxel
-  reattaches to it there (closing the pane still stops it), and its next session
-  starts on muxel's own. A tmux session of your own that you import stays on the
-  default server too. The iOS app follows the same rule.
+  (`tmux -L mxl`), on this computer and on remote hosts alike, so nothing outside
+  muxel that runs a bare `tmux` command can reach them: not your own tmux, and not
+  another tool's `tmux capture-pane`, which on builds that abort on it (RHEL 10's
+  stock tmux) used to take down the server and every agent in it. A command run
+  *inside* a muxel pane is different: tmux points every pane at its own server, so a
+  bare `tmux kill-server` typed there still stops muxel's. To look at a session by
+  hand, use `tmux -L mxl ls` and `tmux -L mxl attach -t muxel_…`. Upgrading stops
+  nothing: a pane whose session is still running on the default server from an
+  earlier muxel reattaches to it there (closing the pane still stops it), and its
+  next session starts on muxel's own after both servers confirm the old session is
+  gone and `mxl` has no session of that exact name. A namesake on `mxl` is left alone
+  and the pane keeps its default-server binding but stops, then attaches by itself
+  once another muxel sharing the project's layout assigns it the new owner (or
+  after you stop that session and restart the pane); retry cannot recreate a
+  second agent on Default, and Restart checks for the namesake before it stops
+  anything. Once moved, a pane stays on `mxl` whatever an older copy of the layout
+  says. A session still running on the default server reattaches even when `mxl`
+  gives an unexpected answer. An imported session also stays on its recorded owner
+  while running.
+  Desktop and phone save an allowed migration
+  before launching; a failed probe or save cannot authorize it.
+  Reconnecting also retries pending closes on their recorded named servers;
+  absence from the standard-server inventory does not forget an unconfirmed close.
   Such a `pkill` reaches only that pane's tmux client: the session and the agent keep
   running, and muxel **reattaches the pane automatically** — you see it blink, not die.
   Local and remote alike (SSH panes and the iOS companion do the same), since a host
   has one tmux server shared by every session on it.
+- **New panes start from muxel's environment** — a tmux pane's program starts from
+  the tmux server's environment, which tmux copies from whatever started the server.
+  When that isn't muxel (an agent that kills the server and then runs `tmux
+  new-session` to try something, say), muxel notices before opening a pane there and
+  gives the server muxel's own environment back, so new panes don't inherit that
+  command's home directory, editor setting, or agent variables. The event log notes
+  what was removed. Local panes, with tmux 3.1 or newer.
 - **Killed tmux sessions come back** — if the tmux session (or the whole server) dies
   anyway, the pane doesn't tombstone: muxel recreates the session and relaunches the
   agent with `--resume`, so a resume-capable agent picks its conversation back up where
@@ -1124,6 +1550,10 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Platform & distribution
 
+- **Opt-in session diagnostics** — `MUXEL_PROFILE=1` records background
+  session lookup durations and outcomes, plus the remaining launch-time resume
+  lookup. Records contain fixed labels, timings and short pane ids, with no
+  terminal content, session ids, titles or paths.
 - **Opt-in focus diagnostics** — the UI profiler correlates GPUI focus-path
   loss with redraw requests and native Windows ownership. WebView children
   must descend from a registered Muxel window; unrelated WRY apps remain
@@ -1131,6 +1561,10 @@ feature is added or changed, update the matching entry here in the same change**
   with no terminal text, URLs, titles, or paths.
 - **Cross-platform** — Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and
   Windows (x86_64 + arm64).
+- **One title bar on every Linux desktop** — muxel's windows draw their own title
+  bar, window controls, resize border, and shadow (client-side decorations), so an
+  X11 window manager or a decorating Wayland compositor (such as KDE) doesn't add a
+  second title bar above muxel's.
 - **macOS menu bar** — the **muxel** application menu has Services, Hide muxel
   (`Cmd+H`), Hide Others (`Option+Cmd+H`), Show All, and Quit muxel (`Cmd+Q`).
   Quit asks for confirmation just like `Cmd+Q`, raising the window first so the

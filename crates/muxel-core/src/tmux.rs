@@ -2,7 +2,27 @@
 //! the binary runs the actual `tmux` process.
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
+
+/// Bind peer terminal metadata without converting a literal command into a tmux
+/// command. Literal panes remain stopped until their explicit Run again action.
+pub fn bind_peer_sessions(
+    project: &str,
+    instances: &mut [crate::Instance],
+    sessions: &[RemoteSession],
+    new_socket: Socket,
+) {
+    for instance in instances.iter_mut().filter(|i| i.needs_peer_session()) {
+        instance.use_tmux = true;
+    }
+    bind_session_owners(
+        project,
+        instances.iter_mut().filter(|i| i.needs_peer_session()),
+        sessions,
+        new_socket,
+    );
+}
 
 /// A stable tmux session name for an instance, e.g. `muxel_myproj_1a2b3c4d`.
 pub fn session_name(project: &str, instance: Uuid) -> String {
@@ -28,7 +48,10 @@ const SESSION_PREFIX: &str = "muxel_";
 /// tmux and with every tool that runs a bare `tmux …`, and any of them could take
 /// that server down with every agent in it. RHEL 10's tmux 3.3a aborts in
 /// `capture-pane`, so an outside tool merely *reading* a muxel pane killed every
-/// session muxel had. Only a command that names this socket reaches muxel's server.
+/// session muxel had. From outside muxel, only a command that names this socket
+/// reaches muxel's server. Inside a pane, a bare `tmux …` reaches it too, because
+/// tmux sets `TMUX` in every pane to that pane's own server (see
+/// [`SERVER_MARK_ENV`]).
 ///
 /// Not `muxel`: the server keeps the command line of the client that started it
 /// (see [`start_server_args`]), which names this socket, so a socket called `muxel`
@@ -41,7 +64,8 @@ const SESSION_PREFIX: &str = "muxel_";
 pub const SOCKET_NAME: &str = "mxl";
 
 /// Which tmux server a command talks to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub enum Socket {
     /// muxel's own server ([`SOCKET_NAME`]). Every session muxel creates goes here.
     Private,
@@ -50,24 +74,195 @@ pub enum Socket {
     /// running and is nowhere else — a pane from an earlier muxel, or a session the
     /// user imported.
     Default,
+    /// An isolated profile's server, locally or over SSH. No legacy fallback.
+    Isolated(u64),
+    /// A recorded server supplied by another muxel version or profile. Keep its
+    /// identity intact; an unfamiliar owner is never legacy discovery metadata.
+    Named(String),
+}
+
+impl From<Socket> for String {
+    fn from(socket: Socket) -> Self {
+        match socket {
+            Socket::Private => SOCKET_NAME.to_string(),
+            Socket::Default => "default".to_string(),
+            Socket::Isolated(hash) => format!("mxl-{hash:016x}"),
+            Socket::Named(name) => name,
+        }
+    }
+}
+
+impl TryFrom<String> for Socket {
+    type Error = String;
+
+    /// Any name tmux can use as `-L <name>`. A name that isn't a plain file name
+    /// (empty, `.`, `..`, or holding a `/` or NUL) is refused: `-L` joins it onto
+    /// tmux's socket directory, so a path in it would reach a server outside that
+    /// directory. A recorded owner like that reads as no owner
+    /// ([`recorded_socket`]). Ported to Swift as `TmuxCommands.isSocketName`.
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        match name.as_str() {
+            SOCKET_NAME => Ok(Self::Private),
+            "default" => Ok(Self::Default),
+            "" | "." | ".." => Err("not a tmux socket name".to_string()),
+            _ if name.contains(['/', '\0']) => Err("not a tmux socket name".to_string()),
+            _ => name
+                .strip_prefix("mxl-")
+                .filter(|hash| {
+                    hash.len() == 16
+                        && hash
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+                .and_then(|hash| u64::from_str_radix(hash, 16).ok())
+                .map(Self::Isolated)
+                .map(Ok)
+                .unwrap_or_else(|| Ok(Self::Named(name))),
+        }
+    }
+}
+
+/// `deserialize_with` for a recorded owner (`Option<Socket>`). A name that isn't
+/// a socket name ([`Socket::try_from`]) reads as no owner, so its pane goes
+/// through legacy discovery instead of failing the whole document. Ported to
+/// Swift in `Instance`'s decoder.
+pub fn recorded_socket<'de, D>(deserializer: D) -> Result<Option<Socket>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.and_then(|name| Socket::try_from(name).ok()))
+}
+
+/// A session name and the server that owns it. `None` is legacy metadata whose
+/// location must be resolved once before operating on it; it never means both.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionTarget {
+    pub name: String,
+    pub socket: Option<Socket>,
+}
+
+impl SessionTarget {
+    pub fn new(name: impl Into<String>, socket: Option<Socket>) -> Self {
+        Self {
+            name: name.into(),
+            socket,
+        }
+    }
+
+    /// An explicit profile root always owns its own socket, regardless of older
+    /// or peer metadata. The regular profile retains its recorded owner.
+    pub fn for_profile(&self, root: Option<&std::path::Path>) -> Self {
+        Self::new(
+            self.name.clone(),
+            root.filter(|root| !root.as_os_str().is_empty())
+                .map(Socket::isolated)
+                .or_else(|| self.socket.clone()),
+        )
+    }
+
+    /// A recorded default owner can move only after both its session and an
+    /// exact-name private collision have been confirmed absent. The caller's
+    /// probe must check this target's exact name on the supplied server.
+    /// `None` means an absent Default has a Private namesake: stop and refresh
+    /// saved ownership rather than creating on Default or adopting that name.
+    pub fn for_respawn<E>(
+        &self,
+        mut probe: impl FnMut(&Socket) -> Result<bool, E>,
+    ) -> Result<Option<Self>, E> {
+        if self.socket != Some(Socket::Default) || probe(&Socket::Default)? {
+            return Ok(Some(self.clone()));
+        }
+        if probe(&Socket::Private)? {
+            return Ok(None);
+        }
+        Ok(Some(Self::new(self.name.clone(), Some(Socket::Private))))
+    }
+}
+
+impl std::fmt::Display for SessionTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.socket {
+            Some(socket) => write!(f, "{} ({})", self.name, socket.name()),
+            None => f.write_str(&self.name),
+        }
+    }
+}
+
+impl From<&str> for SessionTarget {
+    fn from(name: &str) -> Self {
+        Self::new(name, None)
+    }
+}
+
+impl From<String> for SessionTarget {
+    fn from(name: String) -> Self {
+        Self::new(name, None)
+    }
 }
 
 impl Socket {
     /// Both servers, muxel's own first: the order a session is looked for in.
     pub const BOTH: [Socket; 2] = [Socket::Private, Socket::Default];
 
+    /// The persisted socket name, including unfamiliar names exactly as received.
+    pub fn name(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Private => SOCKET_NAME.into(),
+            Self::Default => "default".into(),
+            Self::Isolated(hash) => format!("mxl-{hash:016x}").into(),
+            Self::Named(name) => name.as_str().into(),
+        }
+    }
+
     /// The client flags selecting this server. Like `-u`, they go before the first
     /// command of a `tmux …` argv.
-    pub fn args(self) -> &'static [&'static str] {
+    pub fn args(&self) -> Vec<String> {
         match self {
-            Socket::Private => &["-L", SOCKET_NAME],
-            Socket::Default => &[],
+            Socket::Private => vec!["-L".into(), SOCKET_NAME.into()],
+            Socket::Default => vec![],
+            Socket::Isolated(hash) => vec!["-L".into(), format!("mxl-{hash:016x}")],
+            Socket::Named(name) => vec!["-L".into(), name.clone()],
+        }
+    }
+
+    /// Stable per-root name without putting the profile path in process argv.
+    pub fn isolated(root: &std::path::Path) -> Self {
+        // FNV-1a is specified here rather than DefaultHasher, whose output may
+        // change with Rust releases and strand existing sessions after upgrades.
+        let hash = root
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+        Self::Isolated(hash)
+    }
+
+    /// Servers this profile's discovery, existence checks and cleanup may touch,
+    /// on this machine or its SSH hosts.
+    pub fn local(root: Option<&std::path::Path>) -> Vec<Self> {
+        match root.filter(|root| !root.as_os_str().is_empty()) {
+            Some(root) => vec![Self::isolated(root)],
+            None => Self::BOTH.to_vec(),
+        }
+    }
+
+    /// Isolated profiles do not probe either real-profile socket, even when the
+    /// requested session is absent. Regular profiles retain legacy reattachment.
+    pub fn locate_local(
+        root: Option<&std::path::Path>,
+        has_session: impl FnMut(Self) -> bool,
+    ) -> Self {
+        match root.filter(|root| !root.as_os_str().is_empty()) {
+            Some(root) => Self::isolated(root),
+            None => Self::locate(has_session),
         }
     }
 
     /// The argv for `tmux …` running `args` on this server.
-    pub fn argv(self, args: Vec<String>) -> Vec<String> {
-        let mut v: Vec<String> = self.args().iter().map(|a| a.to_string()).collect();
+    pub fn argv(&self, args: Vec<String>) -> Vec<String> {
+        let mut v = self.args();
         v.extend(args);
         v
     }
@@ -86,6 +281,18 @@ impl Socket {
             Socket::Default
         } else {
             Socket::Private
+        }
+    }
+
+    /// A failed or timed-out probe cannot authorize probing or mutating another
+    /// server. Callers retain the error and their original deadline.
+    pub fn try_locate<E>(
+        mut has_session: impl FnMut(Socket) -> Result<bool, E>,
+    ) -> Result<Socket, E> {
+        if !has_session(Socket::Private)? && has_session(Socket::Default)? {
+            Ok(Socket::Default)
+        } else {
+            Ok(Socket::Private)
         }
     }
 }
@@ -109,10 +316,45 @@ pub fn no_server(stderr: &str) -> bool {
     stderr.contains("no server running") || stderr.contains("error connecting to")
 }
 
+/// Whether a failed (exit 1) [`has_session_args`] said the session isn't there:
+/// the server has no session of that name, has no sessions at all (tmux then
+/// finds no "current target" before it gets to the name; muxel's own server
+/// keeps running empty, `exit-empty off`), or isn't running
+/// ([`confirmed_no_server`]). Any other failure is no answer.
+pub fn has_session_absent(stderr: &str) -> bool {
+    let message = stderr.trim();
+    message.starts_with("can't find session:")
+        || message == "no current target"
+        || confirmed_no_server(message)
+}
+
+/// Only a definite absent server can authorize owner migration. In particular,
+/// permission failures and incomplete listings are not evidence of absence.
+pub fn confirmed_no_server(stderr: &str) -> bool {
+    let message = stderr.trim();
+    if message.lines().count() != 1 {
+        return false;
+    }
+    if let Some(path) = message.strip_prefix("no server running on ") {
+        return !path.is_empty();
+    }
+    let Some(error) = message.strip_prefix("error connecting to ") else {
+        return false;
+    };
+    [" (No such file or directory)", " (Connection refused)"]
+        .iter()
+        .any(|suffix| {
+            error
+                .strip_suffix(suffix)
+                .is_some_and(|path| !path.is_empty())
+        })
+}
+
 /// A tmux session living on a host, as reported by [`list_sessions_args`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteSession {
     pub name: String,
+    pub socket: Socket,
     /// The directory the session was started in. This — not the name — is what
     /// attributes a session to a project: the name's slug is the *project's* when
     /// the session came from a recorded name, but the *host's* when it was derived,
@@ -126,6 +368,57 @@ pub struct RemoteSession {
     /// without reading its screen — and reading the screen means `capture-pane`,
     /// which muxel does not do. Empty when tmux reported no title.
     pub title: String,
+}
+
+impl RemoteSession {
+    pub fn target(&self) -> SessionTarget {
+        SessionTarget::new(self.name.clone(), Some(self.socket.clone()))
+    }
+}
+
+/// Record the exact owner before spawning restored panes. Discovery order is
+/// the legacy preference, while a known owner never migrates to another server.
+pub fn bind_session_owners<'a>(
+    slug: &str,
+    instances: impl IntoIterator<Item = &'a mut crate::Instance>,
+    sessions: &[RemoteSession],
+    new_socket: Socket,
+) {
+    let mut by_name = HashMap::new();
+    let mut by_suffix = HashMap::new();
+    for session in sessions {
+        for socket in [None, Some(&session.socket)] {
+            by_name
+                .entry((socket, session.name.as_str()))
+                .or_insert(session);
+            if session.name.starts_with(SESSION_PREFIX)
+                && let Some((_, suffix)) = session.name.rsplit_once('_')
+            {
+                by_suffix.entry((socket, suffix)).or_insert(session);
+            }
+        }
+    }
+    for instance in instances {
+        if matches!(new_socket, Socket::Isolated(_)) {
+            instance.tmux_socket = Some(new_socket.clone());
+        }
+        let suffix = instance.id.simple().to_string();
+        let found = instance
+            .tmux_session
+            .as_deref()
+            .and_then(|name| by_name.get(&(instance.tmux_socket.as_ref(), name)))
+            .or_else(|| by_suffix.get(&(instance.tmux_socket.as_ref(), &suffix[..8])))
+            .copied();
+        let name = found
+            .map(|session| session.name.clone())
+            .unwrap_or_else(|| session_for(instance.tmux_session.as_deref(), slug, instance.id));
+        instance.tmux_session = Some(name);
+        instance.tmux_socket.get_or_insert_with(|| {
+            found
+                .map(|session| session.socket.clone())
+                .unwrap_or_else(|| new_socket.clone())
+        });
+    }
 }
 
 /// `tmux …` args listing one line per pane: session, start dir, running command
@@ -149,18 +442,26 @@ pub fn list_sessions_args() -> Vec<String> {
 /// first pane winning. Malformed lines are skipped rather than failing the lot: a
 /// host is free to have sessions muxel knows nothing about.
 pub fn parse_sessions(out: &str) -> Vec<RemoteSession> {
+    parse_sessions_on(out, Socket::Private)
+}
+
+/// Parse one server's listing, retaining its identity even when another server
+/// contains a session with the same name.
+pub fn parse_sessions_on(out: &str, socket: Socket) -> Vec<RemoteSession> {
     let mut sessions: Vec<RemoteSession> = Vec::new();
+    let mut seen = HashSet::new();
     for line in out.lines() {
         let mut fields = line.splitn(4, '|');
         let (Some(name), Some(path), Some(command)) = (fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
-        if name.is_empty() || sessions.iter().any(|s| s.name == name) {
+        if name.is_empty() || !seen.insert(name) {
             continue;
         }
         sessions.push(RemoteSession {
             name: name.to_string(),
+            socket: socket.clone(),
             path: path.to_string(),
             command: command.to_string(),
             // Absent from a line written before the title joined the format, and
@@ -170,6 +471,30 @@ pub fn parse_sessions(out: &str) -> Vec<RemoteSession> {
         });
     }
     sessions
+}
+
+/// Resolve old name-only owners against discovery's preference order, while
+/// keeping explicitly owned sessions on the exact server that was attached.
+pub fn owned_session_keys<'a>(
+    sessions: &'a [RemoteSession],
+    owned: &'a [SessionTarget],
+) -> HashSet<(&'a str, &'a Socket)> {
+    let mut preferred = HashMap::new();
+    for session in sessions {
+        preferred
+            .entry(session.name.as_str())
+            .or_insert(&session.socket);
+    }
+    owned
+        .iter()
+        .filter_map(|target| {
+            target
+                .socket
+                .as_ref()
+                .or_else(|| preferred.get(target.name.as_str()).copied())
+                .map(|socket| (target.name.as_str(), socket))
+        })
+        .collect()
 }
 
 /// muxel's sessions under `project_root` that **no instance owns** — agents still
@@ -191,15 +516,21 @@ pub fn parse_sessions(out: &str) -> Vec<RemoteSession> {
 pub fn orphan_sessions(
     sessions: &[RemoteSession],
     project_root: &str,
-    owned: &[String],
+    owned: &[SessionTarget],
     closed: &[ClosedSession],
 ) -> Vec<RemoteSession> {
+    let owned = owned_session_keys(sessions, owned);
+    let closed: HashSet<_> = closed
+        .iter()
+        .filter_map(|c| live_closed_session(sessions, c))
+        .map(|s| (s.name.as_str(), &s.socket))
+        .collect();
     sessions
         .iter()
         .filter(|s| s.name.starts_with(SESSION_PREFIX))
         .filter(|s| in_tree(&s.path, project_root))
-        .filter(|s| !owned.iter().any(|o| o == &s.name))
-        .filter(|s| !closed.iter().any(|c| c.matches(s)))
+        .filter(|s| !owned.contains(&(s.name.as_str(), &s.socket)))
+        .filter(|s| !closed.contains(&(s.name.as_str(), &s.socket)))
         .cloned()
         .collect()
 }
@@ -232,6 +563,8 @@ fn instance_suffix(instance: Uuid) -> String {
 pub struct ClosedSession {
     /// The session name the closed pane was launched with.
     pub name: String,
+    #[serde(default, deserialize_with = "recorded_socket")]
+    pub socket: Option<Socket>,
     /// The closed instance. The name is derived from a slug that can change under
     /// muxel's feet (a renamed host, a session a peer created under its own slug),
     /// so the instance's `_<uuid8>` suffix is the durable half of the match.
@@ -239,24 +572,67 @@ pub struct ClosedSession {
 }
 
 impl ClosedSession {
+    pub fn target(&self) -> SessionTarget {
+        SessionTarget::new(self.name.clone(), self.socket.clone())
+    }
+
+    /// Bind a legacy close before its first mutation. Keep this result in both
+    /// ledgers and across retries, even when the chosen session disappears.
+    pub fn resolve_owner(&self, sessions: &[RemoteSession], new_socket: Socket) -> Self {
+        let mut resolved = self.clone();
+        if matches!(new_socket, Socket::Isolated(_)) {
+            resolved.socket = Some(new_socket.clone());
+        }
+        if let Some(live) = live_closed_session(sessions, &resolved) {
+            resolved.name = live.name.clone();
+            resolved.socket = Some(live.socket.clone());
+        } else {
+            resolved.socket = resolved.socket.or(Some(new_socket));
+        }
+        resolved
+    }
+
+    /// A missing row confirms absence only for a server the inventory queried.
+    /// Unqueried recorded owners need a direct, owner-pinned kill/confirmation.
+    pub fn retry_after_inventory(
+        &self,
+        sessions: &[RemoteSession],
+        listed_sockets: &[Socket],
+    ) -> Option<SessionTarget> {
+        if let Some(live) = live_closed_session(sessions, self) {
+            return Some(live.target());
+        }
+        match self.socket.as_ref() {
+            Some(socket) if listed_sockets.contains(socket) => None,
+            _ => Some(self.target()),
+        }
+    }
+
     /// Whether `session` is the one this close was meant to reap.
     pub fn matches(&self, session: &RemoteSession) -> bool {
-        session.name == self.name || session.name.ends_with(&instance_suffix(self.instance))
+        self.socket
+            .as_ref()
+            .is_none_or(|socket| socket == &session.socket)
+            && (session.name == self.name
+                || (session.name.starts_with(SESSION_PREFIX)
+                    && session.name.ends_with(&instance_suffix(self.instance))))
     }
 }
 
 /// The session a remembered close still has running on the host, if any.
 ///
-/// `None` means the kill landed (or the session was never there) and the entry can
-/// be forgotten. `Some` carries the session under **its own** name, which is what a
-/// retry must target — a derived name can have drifted since the pane launched.
+/// `None` means only that these rows contain no match; it does not prove the
+/// recorded server was queried. Reconnect uses [`ClosedSession::retry_after_inventory`]
+/// before forgetting a close. `Some` carries the session under its own name,
+/// which may have drifted since the pane launched.
 pub fn live_closed_session<'a>(
     sessions: &'a [RemoteSession],
     closed: &ClosedSession,
 ) -> Option<&'a RemoteSession> {
     sessions
         .iter()
-        .find(|s| s.name.starts_with(SESSION_PREFIX) && closed.matches(s))
+        .find(|s| closed.matches(s) && s.name == closed.name)
+        .or_else(|| sessions.iter().find(|s| closed.matches(s)))
 }
 
 /// The tmux session an instance uses: the name **recorded on the instance** wins;
@@ -275,7 +651,7 @@ pub fn live_closed_session<'a>(
 /// Ported to Swift as the `instance.tmuxSession ?? TmuxSession.name(…)` resolution
 /// in `TerminalPaneView` — keep both in step.
 pub fn session_for(recorded: Option<&str>, slug: &str, instance: Uuid) -> String {
-    match recorded.map(str::trim).filter(|s| !s.is_empty()) {
+    match recorded.filter(|s| !s.is_empty()) {
         Some(recorded) => recorded.to_string(),
         None => session_name(slug, instance),
     }
@@ -325,6 +701,171 @@ pub fn restore_exit_empty_args() -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// Set on the client that runs [`start_server_args`] locally, so muxel can tell its
+/// own server from one that something else started on the same socket.
+///
+/// tmux copies the environment of the client that *starts* a server into that
+/// server's global environment, and never takes a later client's. So the marker is
+/// there only if muxel's own `start-server` created the server. A process inside a
+/// pane reaches muxel's server with a bare `tmux` (tmux points every pane at its
+/// server through `TMUX`), and one that kills the server and then runs `tmux
+/// new-session` starts a new one with its own environment: its `HOME`, its
+/// `GIT_EDITOR`, its agent's variables. Every pane muxel opened there would start
+/// from that environment. [`server_origin_args`] then flags the marker removed, so
+/// no pane inherits it and hands it on to a server muxel didn't start.
+///
+/// An environment variable, not part of the command line: the server keeps the
+/// command line of the client that started it, and that must not name muxel (see
+/// [`start_server_args`]).
+pub const SERVER_MARK_ENV: &str = "MUXEL_TMUX_SERVER";
+
+/// Arguments for `tmux …` that print [`SERVER_MARK_ENV`] (read it with
+/// [`ServerOrigin::from_probe`]) and then flag it removed, run right after
+/// [`start_server_args`]. On a server muxel didn't start there is no marker to
+/// print, and tmux skips the rest of a command sequence after a failed command, so
+/// that server stays unmarked until [`reseed_environment_script`] has given it
+/// muxel's environment.
+pub fn server_origin_args() -> Vec<String> {
+    [
+        "show-environment",
+        "-g",
+        SERVER_MARK_ENV,
+        ";",
+        "set-environment",
+        "-g",
+        "-r",
+        SERVER_MARK_ENV,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Arguments for `tmux …` that mark a server as muxel's without touching the rest
+/// of its environment. For a tmux too old to run [`reseed_environment_script`]:
+/// trying again on the same server would only fail again on every pane.
+pub fn mark_server_args() -> Vec<String> {
+    ["set-environment", "-g", "-r", SERVER_MARK_ENV]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Who started a tmux server, as [`server_origin_args`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerOrigin {
+    /// muxel's `start-server` just started it.
+    Started,
+    /// muxel started it before, or has since given it muxel's environment.
+    Muxel,
+    /// Something else started it, or an earlier muxel that didn't mark its server.
+    /// Its global environment is whatever that process had.
+    Foreign,
+}
+
+impl ServerOrigin {
+    /// Read [`server_origin_args`]' output: `NAME=1` while the marker is fresh,
+    /// `-NAME` once it is flagged removed, and nothing (just an error) on a server
+    /// muxel didn't start.
+    pub fn from_probe(stdout: &[u8]) -> Self {
+        let removed = format!("-{SERVER_MARK_ENV}");
+        let set = format!("{SERVER_MARK_ENV}=");
+        let mut lines = stdout.split(|&b| b == b'\n');
+        if lines.clone().any(|line| line == removed.as_bytes()) {
+            ServerOrigin::Muxel
+        } else if lines.any(|line| line.starts_with(set.as_bytes())) {
+            ServerOrigin::Started
+        } else {
+            ServerOrigin::Foreign
+        }
+    }
+}
+
+/// The variable names in `tmux show-environment -g` output (`NAME=value` lines),
+/// leaving out the ones flagged removed (`-NAME`). A value containing a newline
+/// carries on onto the next line, which can then look like a variable of its own.
+/// That costs nothing in [`reseed_environment_script`]: unsetting a variable that
+/// isn't there does nothing.
+pub fn environment_names(show_environment: &[u8]) -> Vec<&[u8]> {
+    show_environment
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.starts_with(b"-"))
+        .filter_map(|line| line.iter().position(|&b| b == b'=').map(|eq| &line[..eq]))
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// A script for `tmux source-file -` that makes a server's global environment
+/// `wanted`, the environment muxel would have started that server with. It unsets
+/// every variable in `current` (see [`environment_names`]) that `wanted` lacks, sets
+/// everything in `wanted`, and last marks the server as muxel's
+/// ([`SERVER_MARK_ENV`]). `PWD` is left as it is, because tmux sets it itself when
+/// it starts.
+///
+/// It goes in through stdin because these values must not appear in a command line,
+/// where any process can read them. Each name and value is a double-quoted string
+/// with every byte outside a small safe set written as an octal escape, so nothing
+/// in it can expand (`$`, `~`), end the string, or start another command, and a
+/// value that isn't UTF-8 arrives byte for byte. Octal escapes need tmux 3.0 and a
+/// script on stdin needs 3.1. Older tmux runs none of the script (see
+/// [`mark_server_args`]).
+///
+/// Variables a `tmux.conf` sets on the server can't be told apart from the starting
+/// process's, so the script replaces them too. This only happens on a server muxel
+/// didn't start, and they come back the next time that server starts.
+pub fn reseed_environment_script(current: &[&[u8]], wanted: &[(&[u8], &[u8])]) -> String {
+    use std::fmt::Write as _;
+    let mut script = String::new();
+    for name in environment_extras(current, wanted) {
+        let _ = writeln!(script, "set-environment -g -u -- {}", tmux_string(name));
+    }
+    for &(name, value) in wanted {
+        if !reseed_skips(name) {
+            let _ = writeln!(
+                script,
+                "set-environment -g -- {} {}",
+                tmux_string(name),
+                tmux_string(value)
+            );
+        }
+    }
+    let _ = writeln!(script, "set-environment -g -r -- {SERVER_MARK_ENV}");
+    script
+}
+
+/// The variables [`reseed_environment_script`] unsets: those in `current` that
+/// `wanted` lacks, once each, in order.
+pub fn environment_extras<'a>(current: &[&'a [u8]], wanted: &[(&[u8], &[u8])]) -> Vec<&'a [u8]> {
+    let keep: HashSet<&[u8]> = wanted.iter().map(|(name, _)| *name).collect();
+    let mut seen = HashSet::new();
+    current
+        .iter()
+        .copied()
+        .filter(|name| !reseed_skips(name) && !keep.contains(name) && seen.insert(*name))
+        .collect()
+}
+
+fn reseed_skips(name: &[u8]) -> bool {
+    name.is_empty() || name == b"PWD" || name == SERVER_MARK_ENV.as_bytes()
+}
+
+/// `bytes` as a double-quoted string in tmux's command syntax, with every byte
+/// outside `[A-Za-z0-9_./:,+@=-]` as a three-digit octal escape (tmux 3.0+).
+fn tmux_string(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('"');
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || b"_./:,+@=-".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "\\{b:03o}");
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Arguments for `tmux …` to create-or-attach (`-A`) a session named `session`,
@@ -415,9 +956,16 @@ pub fn launch_session_args_with_env(
     }
     let mut new = new_session_args(session, cwd, program, args);
     // With `new-session`'s other options: after `-A -s NAME`, before `--`.
-    let options = env
-        .iter()
-        .flat_map(|(name, value)| ["-e".to_string(), format!("{name}={value}")]);
+    let options = env.iter().flat_map(|(name, value)| {
+        let mut setting = format!("{name}={value}");
+        // tmux's argv parser treats a trailing semicolon as a command separator,
+        // even inside a single argument. Escape it for tmux, which removes this
+        // one backslash before setting the session environment.
+        if setting.ends_with(';') {
+            setting.insert(setting.len() - 1, '\\');
+        }
+        ["-e".to_string(), setting]
+    });
     new.splice(4..4, options);
     v.extend(new);
     v
@@ -455,6 +1003,34 @@ pub fn show_option_args(session: &str, option: &str) -> Vec<String> {
         format!("={session}:"),
         option.to_string(),
     ]
+}
+
+/// Arguments for `tmux …` printing the title of a session's active pane — what
+/// the program in it last set with OSC 0/2 — which a tmux client never forwards
+/// to its own terminal unless `set-titles` is on. `=name:` is the exact-match
+/// session's current window, so `muxel_p_1` never reads `muxel_p_12`. Read the
+/// output with [`parse_pane_title`]. Reading the title never needs, and must
+/// never use, `capture-pane`.
+pub fn pane_title_args(session: &str) -> Vec<String> {
+    vec![
+        "display-message".to_string(),
+        "-p".to_string(),
+        "-t".to_string(),
+        format!("={session}:"),
+        "#{session_name}:#{pane_title}".to_string(),
+    ]
+}
+
+/// The title in [`pane_title_args`]' output, only when it is `session`'s own.
+/// `display-message` may not fail on a target it can't find: it formats with
+/// no target instead and succeeds, so the output names its session, and tmux
+/// session names cannot contain `:`.
+pub fn parse_pane_title(session: &str, out: &str) -> Option<String> {
+    let line = out.strip_suffix('\n').unwrap_or(out);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    line.strip_prefix(session)?
+        .strip_prefix(':')
+        .map(str::to_string)
 }
 
 /// Arguments for `tmux …` to set a session's user option (`@name`).
@@ -630,6 +1206,95 @@ mod tests {
     }
 
     #[test]
+    fn the_origin_probe_reads_the_marker_then_flags_it_removed() {
+        assert_eq!(
+            server_origin_args(),
+            [
+                "show-environment",
+                "-g",
+                "MUXEL_TMUX_SERVER",
+                ";",
+                "set-environment",
+                "-g",
+                "-r",
+                "MUXEL_TMUX_SERVER"
+            ]
+        );
+        assert_eq!(
+            mark_server_args(),
+            ["set-environment", "-g", "-r", "MUXEL_TMUX_SERVER"]
+        );
+        assert_eq!(
+            ServerOrigin::from_probe(b"MUXEL_TMUX_SERVER=1\n"),
+            ServerOrigin::Started
+        );
+        assert_eq!(
+            ServerOrigin::from_probe(b"-MUXEL_TMUX_SERVER\n"),
+            ServerOrigin::Muxel
+        );
+        // A server muxel didn't start has no marker: tmux prints only an error, to
+        // stderr.
+        assert_eq!(ServerOrigin::from_probe(b""), ServerOrigin::Foreign);
+        assert_eq!(
+            ServerOrigin::from_probe(b"MUXEL_TMUX_SERVER_OTHER=1\n"),
+            ServerOrigin::Foreign
+        );
+    }
+
+    #[test]
+    fn environment_names_skip_removed_variables() {
+        let out = b"HOME=/home/u\n-GONE\nEMPTY=\nF%%=() {  echo hi\n}\nPATH=/bin:/usr/bin\n";
+        assert_eq!(
+            environment_names(out),
+            [&b"HOME"[..], b"EMPTY", b"F%%", b"PATH"]
+        );
+    }
+
+    #[test]
+    fn the_reseed_script_unsets_extras_sets_muxels_environment_and_marks_last() {
+        let current: [&[u8]; 6] = [
+            b"HOME",
+            b"GIT_EDITOR",
+            b"PWD",
+            b"MUXEL_TMUX_SERVER",
+            b"GIT_EDITOR",
+            b"AGENT",
+        ];
+        let wanted: [(&[u8], &[u8]); 3] = [
+            (b"HOME", b"/home/u"),
+            (b"PWD", b"/elsewhere"),
+            (b"LANG", b"en_US.UTF-8"),
+        ];
+        assert_eq!(
+            environment_extras(&current, &wanted),
+            [&b"GIT_EDITOR"[..], b"AGENT"]
+        );
+        assert_eq!(
+            reseed_environment_script(&current, &wanted),
+            "set-environment -g -u -- \"GIT_EDITOR\"\n\
+             set-environment -g -u -- \"AGENT\"\n\
+             set-environment -g -- \"HOME\" \"/home/u\"\n\
+             set-environment -g -- \"LANG\" \"en_US.UTF-8\"\n\
+             set-environment -g -r -- MUXEL_TMUX_SERVER\n"
+        );
+    }
+
+    #[test]
+    fn tmux_strings_cannot_expand_end_early_or_start_a_command() {
+        assert_eq!(
+            tmux_string(b"/usr/bin:/a-b_c.d,e+f@g=h"),
+            "\"/usr/bin:/a-b_c.d,e+f@g=h\""
+        );
+        assert_eq!(
+            tmux_string(b"$HOME ~\"\\;#{x}\n"),
+            "\"\\044HOME\\040\\176\\042\\134\\073\\043\\173x\\175\\012\""
+        );
+        assert_eq!(tmux_string("é".as_bytes()), "\"\\303\\251\"");
+        assert_eq!(tmux_string(b"\xff"), "\"\\377\"");
+        assert_eq!(tmux_string(b""), "\"\"");
+    }
+
+    #[test]
     fn kill_uses_exact_match_target() {
         assert_eq!(kill_session_args("s"), vec!["kill-session", "-t", "=s"]);
         assert_eq!(has_session_args("s"), vec!["has-session", "-t", "=s"]);
@@ -662,6 +1327,8 @@ mod tests {
             Socket::locate(|s| match s {
                 Socket::Private => private,
                 Socket::Default => default,
+                Socket::Isolated(_) => panic!("legacy lookup probed an isolated socket"),
+                Socket::Named(_) => unreachable!("locate only probes the standard servers"),
             })
         };
         assert_eq!(on(true, false), Socket::Private);
@@ -691,6 +1358,44 @@ mod tests {
     }
 
     #[test]
+    fn isolated_local_sockets_never_probe_list_or_kill_regular_profile_sessions() {
+        use std::path::Path;
+        assert_eq!(Socket::local(None), Socket::BOTH);
+        assert_eq!(Socket::local(Some(Path::new(""))), Socket::BOTH);
+        let one = Path::new("/profile-one");
+        let two = Path::new("/profile-two");
+        let socket = Socket::isolated(one);
+        assert_ne!(socket, Socket::isolated(two));
+        assert_eq!(Socket::local(Some(one)), std::slice::from_ref(&socket));
+        assert_eq!(
+            Socket::locate_local(Some(one), |_| panic!("foreign socket probe")),
+            socket
+        );
+        let mut probes = Vec::new();
+        assert_eq!(
+            Socket::locate_local(None, |socket| {
+                probes.push(socket.clone());
+                socket == Socket::Default
+            }),
+            Socket::Default
+        );
+        assert_eq!(probes, Socket::BOTH);
+        for args in [
+            start_server_args(),
+            restore_exit_empty_args(),
+            list_sessions_args(),
+            has_session_args("same"),
+            kill_session_args("same"),
+        ] {
+            let args = socket.argv(args);
+            assert_eq!(&args[..2], socket.args());
+            assert_eq!(args[0], "-L");
+            assert_ne!(args[1], SOCKET_NAME);
+            assert!(!args[1].contains("profile-one"));
+        }
+    }
+
+    #[test]
     fn only_a_missing_server_counts_as_no_sessions() {
         assert!(no_server("no server running on /tmp/tmux-1000/default\n"));
         assert!(no_server(
@@ -698,6 +1403,250 @@ mod tests {
         ));
         assert!(!no_server("sh: tmux: command not found\n"));
         assert!(!no_server(""));
+    }
+
+    #[test]
+    fn respawn_migrates_only_after_two_confirmed_absences() {
+        let target = SessionTarget::new("exact recorded name", Some(Socket::Default));
+        for (default, private, expected, probes) in [
+            (true, false, Some(Socket::Default), vec![Socket::Default]),
+            (true, true, Some(Socket::Default), vec![Socket::Default]),
+            (false, true, None, vec![Socket::Default, Socket::Private]),
+            (
+                false,
+                false,
+                Some(Socket::Private),
+                vec![Socket::Default, Socket::Private],
+            ),
+        ] {
+            let mut asked = Vec::new();
+            let resolved = target
+                .for_respawn(|socket| {
+                    asked.push(socket.clone());
+                    Ok::<_, ()>(if socket == &Socket::Default {
+                        default
+                    } else {
+                        private
+                    })
+                })
+                .unwrap();
+            assert_eq!(
+                resolved,
+                expected.map(|socket| SessionTarget::new(&target.name, Some(socket)))
+            );
+            assert_eq!(asked, probes);
+        }
+        // The probe failed, rather than proving either server absent.
+        for failing in [Socket::Default, Socket::Private] {
+            let mut asked = Vec::new();
+            assert_eq!(
+                target.for_respawn(|socket| {
+                    asked.push(socket.clone());
+                    if socket == &failing {
+                        Err("probe failed")
+                    } else {
+                        Ok(false)
+                    }
+                }),
+                Err("probe failed")
+            );
+            assert_eq!(asked.last(), Some(&failing));
+        }
+        assert_eq!(
+            target.socket,
+            Some(Socket::Default),
+            "decision does not mutate its input"
+        );
+    }
+
+    #[test]
+    fn respawn_never_probes_private_named_or_unresolved_owners() {
+        for socket in [
+            None,
+            Some(Socket::Private),
+            Some(Socket::Named("mxl-profile".into())),
+        ] {
+            let target = SessionTarget::new("work", socket);
+            let result = target.for_respawn::<()>(|_| panic!("only Default may migrate"));
+            assert_eq!(result, Ok(Some(target)));
+        }
+    }
+
+    #[test]
+    fn peer_restarts_cannot_recreate_default_after_private_migration() {
+        let mut first = crate::Instance::shell(Uuid::new_v4());
+        first.tmux_session = Some("owned".into());
+        first.tmux_socket = Some(Socket::Default);
+        // Independent clients admitted their restart while both knew Default.
+        let second = first.clone();
+        let stale_saved = serde_json::to_string(&second).unwrap();
+        let mut running = HashSet::from([Socket::Default]);
+
+        assert!(running.remove(&Socket::Default));
+        let next = first
+            .tmux_target("host")
+            .for_respawn::<()>(|socket| Ok(running.contains(socket)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.socket, Some(Socket::Private));
+        first.tmux_socket = next.socket;
+        assert!(running.insert(Socket::Private));
+
+        // B's delayed teardown succeeds because Default is already gone. Its
+        // local generation is still valid, but A's replacement must stop it.
+        assert!(!running.remove(&Socket::Default));
+        let second_plan = second
+            .tmux_target("host")
+            .for_respawn::<()>(|socket| Ok(running.contains(socket)))
+            .unwrap();
+        assert_eq!(second_plan, None, "no Default create or Private adoption");
+        assert_eq!(serde_json::to_string(&second).unwrap(), stale_saved);
+        assert_eq!(running, HashSet::from([Socket::Private]));
+
+        // Ordinary retry or app restart with stale saved ownership cannot
+        // bypass the refusal. Inventory alone never proves a new binding.
+        let mut reloaded: crate::Instance = serde_json::from_str(&stale_saved).unwrap();
+        assert!(
+            reloaded
+                .tmux_target("host")
+                .for_respawn::<()>(|socket| Ok(running.contains(socket)))
+                .unwrap()
+                .is_none()
+        );
+        // A separately refreshed, same-pane binding can attach to A's agent.
+        assert_eq!(reloaded.id, first.id);
+        reloaded.tmux_socket = first.tmux_socket.clone();
+        assert_eq!(
+            reloaded
+                .tmux_target("host")
+                .for_respawn::<()>(|_| panic!("recorded Private is already authoritative"))
+                .unwrap()
+                .unwrap()
+                .socket,
+            Some(Socket::Private)
+        );
+        assert_eq!(running.len(), 1);
+    }
+
+    #[test]
+    fn has_session_absent_reads_only_tmuxs_answers_of_absence() {
+        for message in [
+            "can't find session: work\n",
+            "no current target\n",
+            "no server running on /tmp/tmux-1000/mxl\n",
+            "error connecting to /tmp/tmux-1000/mxl (No such file or directory)\n",
+        ] {
+            assert!(has_session_absent(message), "{message}");
+        }
+        for message in [
+            "",
+            "lost server",
+            "server exited unexpectedly",
+            "error connecting to /tmp/tmux-1000/mxl (Permission denied)",
+            "no current target\nPermission denied",
+            "warning: no current target",
+        ] {
+            assert!(!has_session_absent(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn migration_requires_specific_single_line_absence_errors() {
+        for message in [
+            "no server running on /tmp/tmux-1000/default\n",
+            "error connecting to /tmp/tmux-1000/mxl (No such file or directory)\n",
+            "error connecting to /tmp/tmux-1000/mxl (Connection refused)\r\n",
+        ] {
+            assert!(confirmed_no_server(message), "{message}");
+        }
+        for message in [
+            "",
+            "no server running",
+            "no server running on ",
+            "error connecting to /tmp/tmux-1000/mxl (Permission denied)",
+            "error connecting to /tmp/tmux-1000/mxl (unknown error)",
+            "error connecting to /tmp/tmux-1000/mxl",
+            "warning\nno server running on /tmp/tmux-1000/default",
+            "no server running on /tmp/tmux-1000/default\nPermission denied",
+        ] {
+            assert!(!confirmed_no_server(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn named_owner_roundtrips_without_becoming_legacy() {
+        for name in [
+            "   ",
+            "...",
+            ".hidden",
+            "mxl-profile",
+            "default ",
+            "MXL",
+            "socket '名; $()",
+            "mxl-0",
+            "mxl-zzzzzzzzzzzzzzzz",
+            "mxl-0000000000000000; echo bad",
+            "mxl-0123456789ABCDEF",
+            "MXL-0123456789abcdef",
+        ] {
+            let socket: Socket = serde_json::from_value(serde_json::json!(name)).unwrap();
+            assert_eq!(socket, Socket::Named(name.into()));
+            assert_eq!(socket.name(), name);
+            assert_eq!(socket.args(), vec!["-L", name]);
+            assert_eq!(
+                socket.argv(has_session_args("work")),
+                vec!["-L", name, "has-session", "-t", "=work"]
+            );
+            let closed = ClosedSession {
+                name: "work".into(),
+                socket: Some(socket),
+                instance: Uuid::new_v4(),
+            };
+            let json = serde_json::to_string(&closed).unwrap();
+            let restored: ClosedSession = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, closed);
+            assert!(restored.socket.is_some());
+            assert_eq!(serde_json::to_value(restored).unwrap()["socket"], name);
+        }
+        for (name, expected) in [("mxl", Socket::Private), ("default", Socket::Default)] {
+            assert_eq!(
+                serde_json::from_value::<Socket>(serde_json::json!(name)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    /// `tmux -L` joins the name onto its socket directory, so a recorded name that
+    /// isn't a plain file name could reach a server somewhere else. It reads as no
+    /// owner (legacy discovery on muxel's own servers) and the rest of the document
+    /// still loads.
+    #[test]
+    fn a_recorded_owner_that_is_not_a_socket_name_reads_as_none() {
+        for name in ["", ".", "..", "/tmp/elsewhere", "../mxl", "a/b", "nul\0x"] {
+            let name = name.to_string();
+            assert!(Socket::try_from(name.clone()).is_err(), "{name:?}");
+            let closed: ClosedSession = serde_json::from_value(serde_json::json!({
+                "name": "work",
+                "socket": name,
+                "instance": Uuid::nil(),
+            }))
+            .unwrap();
+            assert_eq!(closed.socket, None, "{name:?}");
+            let mut instance =
+                serde_json::to_value(crate::Instance::shell(Uuid::new_v4())).unwrap();
+            instance["tmux_session"] = serde_json::json!("work");
+            instance["tmux_socket"] = serde_json::json!(name);
+            let instance: crate::Instance = serde_json::from_value(instance).unwrap();
+            assert_eq!(instance.tmux_socket, None, "{name:?}");
+            assert_eq!(instance.tmux_session.as_deref(), Some("work"));
+        }
+        let closed: ClosedSession = serde_json::from_value(serde_json::json!({
+            "name": "work",
+            "socket": null,
+            "instance": Uuid::nil(),
+        }))
+        .unwrap();
+        assert_eq!(closed.socket, None);
     }
 
     /// The recorded name wins. muxel writes `muxel_<project>_<id>` onto an instance
@@ -708,9 +1657,39 @@ mod tests {
     fn a_recorded_session_wins_over_a_recomputed_one() {
         let id = Uuid::from_u128(0x1a2b3c4d_0000_0000_0000_000000000000);
         assert_eq!(
-            session_for(Some("muxel_sro_client_1a2b3c4d"), "rhel", id),
-            "muxel_sro_client_1a2b3c4d"
+            session_for(Some("muxel_webapp_1a2b3c4d"), "rhel", id),
+            "muxel_webapp_1a2b3c4d"
         );
+    }
+
+    #[test]
+    fn recorded_session_names_remain_exact_before_migration() {
+        let mut instance = crate::Instance::shell(Uuid::new_v4());
+        instance.tmux_socket = Some(Socket::Default);
+        for name in [" owned|with|pipes ", "   "] {
+            instance.tmux_session = Some(name.into());
+            let target = instance.tmux_target("host");
+            assert_eq!(
+                target.name, name,
+                "a recorded name is an identity, not user input to trim"
+            );
+            let rows = crate::ssh::parse_session_listings_for_migration(&format!(
+                ":muxel-listed:0\n{name}\n:muxel-listed:0\n"
+            ))
+            .unwrap();
+            let prepared = target
+                .for_respawn::<()>(|socket| {
+                    Ok(rows
+                        .iter()
+                        .any(|row| &row.socket == socket && row.name == target.name))
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                prepared, target,
+                "the live Default owner must survive launch preparation"
+            );
+        }
     }
 
     /// With nothing recorded — the common remote case, where tmux comes from the
@@ -720,16 +1699,15 @@ mod tests {
         let id = Uuid::from_u128(0x1a2b3c4d_0000_0000_0000_000000000000);
         assert_eq!(session_for(None, "rhel", id), "muxel_rhel_1a2b3c4d");
         assert_eq!(session_for(Some(""), "rhel", id), "muxel_rhel_1a2b3c4d");
-        assert_eq!(session_for(Some("   "), "rhel", id), "muxel_rhel_1a2b3c4d");
     }
 
     fn sessions() -> Vec<RemoteSession> {
         parse_sessions(concat!(
-            "muxel_sro_client_90f9def0|/home/ryan/Projects/sro_client|claude\n",
-            "muxel_sro_client_d0d464c4|/home/ryan/Projects/sro_client|claude\n",
-            "muxel_rhel_ae15cabf|/home/ryan/Projects/Bot/Manager|claude\n",
-            "muxel_codem_6b80c97f|/home/ryan/Projects/codem|claude\n",
-            "work|/home/ryan|zsh\n",
+            "muxel_webapp_90f9def0|/home/me/Projects/webapp|claude\n",
+            "muxel_webapp_d0d464c4|/home/me/Projects/webapp|claude\n",
+            "muxel_rhel_ae15cabf|/home/me/Projects/work/api|claude\n",
+            "muxel_notes_6b80c97f|/home/me/Projects/notes|claude\n",
+            "work|/home/me|zsh\n",
         ))
     }
 
@@ -742,14 +1720,243 @@ mod tests {
         assert_eq!(s[1].path, "/q");
     }
 
+    #[test]
+    fn ownership_survives_duplicate_names_and_workspace_roundtrip() {
+        let mut found = parse_sessions_on("work|/p|claude|\n", Socket::Private);
+        found.extend(parse_sessions_on("work|/q|zsh|\n", Socket::Default));
+        let mut instance = crate::Instance::shell(Uuid::new_v4());
+        instance.tmux_session = Some("work".into());
+        instance.tmux_socket = Some(Socket::Default);
+        bind_session_owners("p", [&mut instance], &found, Socket::Private);
+        let saved = serde_json::to_string(&instance).unwrap();
+        assert!(saved.contains("\"tmux_socket\":\"default\""));
+        let restored: crate::Instance = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.tmux_target("p"), found[1].target());
+        // Disappearance on the owned socket never migrates the pane to its namesake.
+        bind_session_owners("p", [&mut instance], &found[..1], Socket::Private);
+        assert_eq!(instance.tmux_target("p"), found[1].target());
+        // A legacy instance binds once, using discovery's documented preference.
+        instance.tmux_socket = None;
+        bind_session_owners("p", [&mut instance], &found, Socket::Private);
+        assert_eq!(instance.tmux_target("p"), found[0].target());
+    }
+
+    #[test]
+    fn an_isolated_profile_overrides_foreign_owners_and_roundtrips_its_socket() {
+        let root = std::path::Path::new("/isolated-test");
+        let socket = Socket::isolated(root);
+        let encoded = serde_json::to_string(&socket).unwrap();
+        assert_eq!(serde_json::from_str::<Socket>(&encoded).unwrap(), socket);
+        for prior in [
+            None,
+            Some(Socket::Private),
+            Some(Socket::Default),
+            Some(Socket::Isolated(1)),
+            Some(Socket::Named("peer '名".into())),
+        ] {
+            let target = SessionTarget::new("work", prior.clone());
+            let isolated = target.for_profile(Some(root));
+            assert_eq!(isolated, SessionTarget::new("work", Some(socket.clone())));
+            assert_eq!(
+                isolated
+                    .for_respawn::<()>(|_| panic!("isolated respawn must not probe global servers"))
+                    .unwrap(),
+                Some(isolated)
+            );
+            assert_eq!(target.for_profile(None), target);
+            assert_eq!(target.for_profile(Some(std::path::Path::new(""))), target);
+            let mut instance = crate::Instance::shell(Uuid::new_v4());
+            instance.tmux_session = Some("work".into());
+            instance.tmux_socket = prior.clone();
+            let mut found = parse_sessions_on("work|/real|claude|\n", Socket::Private);
+            found.extend(parse_sessions_on("work|/isolated|zsh|\n", socket.clone()));
+            bind_session_owners("p", [&mut instance], &found, socket.clone());
+            assert_eq!(instance.tmux_target("p"), found[1].target());
+            let closed = ClosedSession {
+                name: "work".into(),
+                socket: prior,
+                instance: instance.id,
+            };
+            assert_eq!(
+                closed.resolve_owner(&found, socket.clone()).target(),
+                found[1].target()
+            );
+            let pending = closed.resolve_owner(&[], socket.clone());
+            assert!(pending.retry_after_inventory(&[], &Socket::BOTH).is_some());
+            assert!(
+                pending
+                    .retry_after_inventory(&[], std::slice::from_ref(&socket))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_and_closed_sessions_exclude_only_their_socket() {
+        let name = "muxel_p_12345678";
+        let mut found = parse_sessions_on(&format!("{name}|/p|claude|\n"), Socket::Private);
+        found.extend(parse_sessions_on(
+            &format!("{name}|/p|zsh|\n"),
+            Socket::Default,
+        ));
+        let owned = [found[0].target()];
+        assert_eq!(orphan_sessions(&found, "/p", &owned, &[]), found[1..]);
+        let closed = ClosedSession {
+            name: name.into(),
+            socket: Some(Socket::Private),
+            instance: Uuid::nil(),
+        };
+        assert_eq!(
+            orphan_sessions(&found, "/p", &[], std::slice::from_ref(&closed)),
+            found[1..]
+        );
+        assert!(live_closed_session(&found[1..], &closed).is_none());
+        let legacy = ClosedSession {
+            socket: None,
+            ..closed
+        };
+        assert_eq!(orphan_sessions(&found, "/p", &[], &[legacy]), found[1..]);
+    }
+
+    #[test]
+    fn imported_non_muxel_sessions_can_be_reaped_by_exact_name() {
+        let found = parse_sessions_on("work|/p|claude|\n", Socket::Default);
+        let closed = ClosedSession {
+            name: "work".into(),
+            socket: Some(Socket::Default),
+            instance: Uuid::nil(),
+        };
+        assert_eq!(live_closed_session(&found, &closed), Some(&found[0]));
+    }
+
+    #[test]
+    fn legacy_close_retains_its_owner_after_a_lost_reply_and_workspace_reload() {
+        let mut sessions = parse_sessions_on("work|/p|claude|\n", Socket::Private);
+        sessions.extend(parse_sessions_on("work|/p|zsh|\n", Socket::Default));
+        let pending = ClosedSession {
+            name: "work".into(),
+            socket: None,
+            instance: Uuid::new_v4(),
+        };
+        let resolved = pending.resolve_owner(&sessions, Socket::Private);
+        let mut project = crate::Project::new("p", "/p");
+        project.remember_closed_session(resolved.target(), pending.instance);
+        let saved = serde_json::to_string(&project).unwrap();
+        let restored: crate::Project = serde_json::from_str(&saved).unwrap();
+        // The kill landed on mxl, but its reply was lost. Only default:work remains.
+        let retry = restored.closed_sessions[0].resolve_owner(&sessions[1..], Socket::Private);
+        assert_eq!(retry.target(), sessions[0].target());
+        assert!(live_closed_session(&sessions[1..], &retry).is_none());
+        let command = crate::ssh::kill_and_confirm_command(&retry.target());
+        assert_eq!(
+            command.matches("has-session").count(),
+            1,
+            "no new owner discovery: {command}"
+        );
+        assert!(command.contains("; set -- -L mxl;"));
+    }
+
+    #[test]
+    fn reconnect_retries_named_owner_after_persisted_failed_close() {
+        let socket = Socket::Named("mxl-profile".into());
+        let live = parse_sessions_on("owned|/p|claude|\n", socket.clone());
+        let iid = Uuid::new_v4();
+        let mut project = crate::Project::new("p", "/p");
+        project.remember_closed_session(live[0].target(), iid);
+        // The SSH close failed; its durable ledger is all a restarted client has.
+        let saved = serde_json::to_string(&project).unwrap();
+        let restored: crate::Project = serde_json::from_str(&saved).unwrap();
+        let mut discovery = parse_sessions_on("owned|/p|zsh|\n", Socket::Private);
+        discovery.extend(parse_sessions_on("owned|/p|vim|\n", Socket::Default));
+        let pending = restored.closed_sessions[0].resolve_owner(&discovery, Socket::Private);
+        assert_eq!(pending.socket, Some(socket.clone()));
+        let retry = pending.retry_after_inventory(&discovery, &Socket::BOTH);
+        assert_eq!(retry, Some(live[0].target()), "unqueried is not gone");
+        assert_eq!(restored.closed_sessions.len(), 1);
+        let command = crate::ssh::kill_and_confirm_command(&retry.unwrap());
+        assert!(command.contains("mxl-profile"));
+        assert_eq!(command.matches("has-session").count(), 1);
+        assert!(pending.retry_after_inventory(&[], &Socket::BOTH).is_some());
+        let unresolved = ClosedSession {
+            socket: None,
+            ..pending.clone()
+        };
+        assert!(
+            unresolved
+                .retry_after_inventory(&[], &Socket::BOTH)
+                .is_some()
+        );
+        // A complete inventory of the recorded owner may confirm its absence.
+        assert!(pending.retry_after_inventory(&[], &[socket]).is_none());
+    }
+
+    #[test]
+    fn confirmed_legacy_close_does_not_reap_a_namesake_on_reconnect() {
+        let name = "muxel_p_12345678";
+        let mut sessions = parse_sessions_on(&format!("{name}|/p|claude|\n"), Socket::Private);
+        sessions.extend(parse_sessions_on(
+            &format!("{name}|/p|zsh|\n"),
+            Socket::Default,
+        ));
+        let legacy = ClosedSession {
+            name: name.into(),
+            socket: None,
+            instance: Uuid::nil(),
+        };
+        // This resolved record is retained in the in-memory confirmed-close ledger.
+        let reaped = legacy.resolve_owner(&sessions, Socket::Private);
+        assert!(live_closed_session(&sessions[1..], &reaped).is_none());
+        assert_eq!(
+            reaped.resolve_owner(&sessions[1..], Socket::Private),
+            reaped
+        );
+        assert_eq!(
+            orphan_sessions(&sessions[1..], "/p", &[], &[reaped]),
+            sessions[1..]
+        );
+    }
+
+    #[test]
+    fn an_absent_legacy_close_still_remembers_one_owner() {
+        let legacy = ClosedSession {
+            name: "work".into(),
+            socket: None,
+            instance: Uuid::nil(),
+        };
+        let reaped = legacy.resolve_owner(&[], Socket::Private);
+        assert_eq!(reaped.socket, Some(Socket::Private));
+        let later = parse_sessions_on("work|/p|zsh|\n", Socket::Default);
+        assert!(live_closed_session(&later, &reaped).is_none());
+        assert_eq!(reaped.resolve_owner(&later, Socket::Private), reaped);
+    }
+
+    #[test]
+    fn a_legacy_close_prefers_its_exact_name_before_a_uuid_suffix() {
+        let id = Uuid::parse_str("12345678-0000-4000-8000-000000000000").unwrap();
+        let mut sessions = parse_sessions_on("muxel_old_12345678|/p|claude|\n", Socket::Private);
+        sessions.extend(parse_sessions_on(
+            "muxel_new_12345678|/p|zsh|\n",
+            Socket::Default,
+        ));
+        let legacy = ClosedSession {
+            name: "muxel_new_12345678".into(),
+            socket: None,
+            instance: id,
+        };
+        assert_eq!(
+            legacy.resolve_owner(&sessions, Socket::Private).target(),
+            sessions[1].target()
+        );
+    }
+
     /// The whole point: sessions still running in this project that nothing owns.
     #[test]
     fn orphans_are_this_projects_unowned_muxel_sessions() {
-        let owned = vec!["muxel_sro_client_d0d464c4".to_string()];
-        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/sro_client", &owned, &[]);
+        let owned = vec!["muxel_webapp_d0d464c4".into()];
+        let orphans = orphan_sessions(&sessions(), "/home/me/Projects/webapp", &owned, &[]);
         assert_eq!(
             orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["muxel_sro_client_90f9def0"],
+            ["muxel_webapp_90f9def0"],
             "an owned session, another project's, and a non-muxel session are all left alone"
         );
         assert_eq!(orphans[0].command, "claude");
@@ -759,7 +1966,7 @@ mod tests {
     /// started in — the path decides, not the slug.
     #[test]
     fn a_host_named_session_is_attributed_by_its_path() {
-        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/Bot/Manager", &[], &[]);
+        let orphans = orphan_sessions(&sessions(), "/home/me/Projects/work/api", &[], &[]);
         assert_eq!(
             orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["muxel_rhel_ae15cabf"]
@@ -771,10 +1978,10 @@ mod tests {
     #[test]
     fn the_project_tree_includes_worktrees_but_not_prefix_siblings() {
         let s = parse_sessions(concat!(
-            "muxel_p_00000001|/home/ryan/Projects/app/.worktrees/feat|claude\n",
-            "muxel_p_00000002|/home/ryan/Projects/app-other|claude\n",
+            "muxel_p_00000001|/home/me/Projects/app/.worktrees/feat|claude\n",
+            "muxel_p_00000002|/home/me/Projects/app-other|claude\n",
         ));
-        let orphans = orphan_sessions(&s, "/home/ryan/Projects/app", &[], &[]);
+        let orphans = orphan_sessions(&s, "/home/me/Projects/app", &[], &[]);
         assert_eq!(
             orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["muxel_p_00000001"]
@@ -784,13 +1991,14 @@ mod tests {
     /// muxel adopts only its own sessions — never the user's own tmux.
     #[test]
     fn a_users_own_session_is_never_adopted() {
-        let s = parse_sessions("work|/home/ryan/Projects/app|vim\n");
-        assert!(orphan_sessions(&s, "/home/ryan/Projects/app", &[], &[]).is_empty());
+        let s = parse_sessions("work|/home/me/Projects/app|vim\n");
+        assert!(orphan_sessions(&s, "/home/me/Projects/app", &[], &[]).is_empty());
     }
 
     fn closed(name: &str, id: Uuid) -> ClosedSession {
         ClosedSession {
             name: name.to_string(),
+            socket: None,
             instance: id,
         }
     }
@@ -800,11 +2008,11 @@ mod tests {
     #[test]
     fn a_session_whose_close_is_unconfirmed_is_never_adopted_back() {
         let id = Uuid::parse_str("90f9def0-0000-4000-8000-000000000000").unwrap();
-        let c = [closed("muxel_sro_client_90f9def0", id)];
-        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/sro_client", &[], &c);
+        let c = [closed("muxel_webapp_90f9def0", id)];
+        let orphans = orphan_sessions(&sessions(), "/home/me/Projects/webapp", &[], &c);
         assert_eq!(
             orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["muxel_sro_client_d0d464c4"],
+            ["muxel_webapp_d0d464c4"],
             "only the session nobody closed comes back"
         );
     }
@@ -820,9 +2028,7 @@ mod tests {
             Some("muxel_rhel_ae15cabf"),
             "a retry must target the name the session actually has"
         );
-        assert!(
-            orphan_sessions(&sessions(), "/home/ryan/Projects/Bot/Manager", &[], &[c]).is_empty()
-        );
+        assert!(orphan_sessions(&sessions(), "/home/me/Projects/work/api", &[], &[c]).is_empty());
     }
 
     /// Once the host no longer lists it, the close is finished and forgettable.
@@ -836,7 +2042,7 @@ mod tests {
     #[test]
     fn a_close_never_matches_a_users_own_session() {
         let id = Uuid::parse_str("00000001-0000-4000-8000-000000000000").unwrap();
-        let s = parse_sessions("work_00000001|/home/ryan|vim\n");
+        let s = parse_sessions("work_00000001|/home/me|vim\n");
         assert!(live_closed_session(&s, &closed("muxel_p_00000001", id)).is_none());
     }
 
@@ -901,6 +2107,27 @@ mod tests {
     }
 
     #[test]
+    fn session_environment_escapes_trailing_semicolons() {
+        let env = vec![
+            ("ROOT".into(), "/isolated;".into()),
+            ("BACKSLASH".into(), r"/isolated\;".into()),
+            ("MIDDLE".into(), "/isolated;other".into()),
+        ];
+        let args = launch_session_args_with_env("s", None, None, &[], &env, &[]);
+        assert_eq!(
+            &args[10..],
+            [
+                "-e",
+                r"ROOT=/isolated\;",
+                "-e",
+                r"BACKSLASH=/isolated\\;",
+                "-e",
+                "MIDDLE=/isolated;other"
+            ]
+        );
+    }
+
+    #[test]
     fn session_variables_need_tmux_3_2() {
         for yes in [
             "tmux 3.2",
@@ -922,6 +2149,45 @@ mod tests {
             "tmux",
         ] {
             assert!(!session_env_supported(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn pane_title_is_read_from_the_exact_session_without_capturing_it() {
+        let args = pane_title_args("muxel_p_1");
+        assert_eq!(
+            args,
+            [
+                "display-message",
+                "-p",
+                "-t",
+                "=muxel_p_1:",
+                "#{session_name}:#{pane_title}"
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.contains("capture")));
+        assert_eq!(
+            parse_pane_title("muxel_p_1", "muxel_p_1:scratch | Ready\n").as_deref(),
+            Some("scratch | Ready")
+        );
+        // A title may itself contain the separator or be empty.
+        assert_eq!(
+            parse_pane_title("muxel_p_1", "muxel_p_1:a: b\n").as_deref(),
+            Some("a: b")
+        );
+        assert_eq!(
+            parse_pane_title("muxel_p_1", "muxel_p_1:\n").as_deref(),
+            Some("")
+        );
+        // A missing target formats with no session; another session is not ours.
+        for out in [
+            "\n",
+            ":\n",
+            "",
+            "muxel_p_12:scratch | Ready\n",
+            "other:muxel_p_1:x\n",
+        ] {
+            assert_eq!(parse_pane_title("muxel_p_1", out), None, "{out:?}");
         }
     }
 
@@ -959,6 +2225,7 @@ s3|/work|zsh
         let id = Uuid::parse_str("1a2b3c4d-0000-4000-8000-000000000000").unwrap();
         let session = |name: &str| RemoteSession {
             name: name.into(),
+            socket: Socket::Private,
             path: "/work".into(),
             command: "claude".into(),
             title: String::new(),

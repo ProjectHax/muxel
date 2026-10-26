@@ -211,7 +211,7 @@ some.AppImage /tmp/.mount_someAB fuse.some.AppImage ro 0 0";
     fn requires_appimage_mount_dir_shape() {
         // A muxel-named FUSE mount that isn't a `.mount_…` AppImage dir (e.g. a
         // bind of the project) is not an AppImage leftover and is left alone.
-        let odd = "muxel /home/ryan/muxel fuse.muxel rw 0 0";
+        let odd = "muxel /home/me/muxel fuse.muxel rw 0 0";
         assert!(foreign_muxel_appimage_mounts(odd, None).is_empty());
     }
 

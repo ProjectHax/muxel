@@ -17,10 +17,57 @@ use crate::i18n::t;
 use gpui::*;
 use gpui_component::{ActiveTheme as _, v_flex};
 
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) enum LinuxBrowserRequest<'a> {
+    Preset(&'a str),
+    Restored(&'a str),
+    Link(&'a str),
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LinuxBrowserDispatch {
+    Helper,
+    SystemBrowser,
+    Refused,
+}
+
+/// All Linux built-in browser entry points share one fallback policy.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn dispatch_linux_browser(
+    request: LinuxBrowserRequest<'_>,
+    isolated: bool,
+    spawn: impl FnOnce(&str) -> bool,
+    open_system: impl FnOnce(&str),
+) -> LinuxBrowserDispatch {
+    let url = match request {
+        LinuxBrowserRequest::Preset(url) => {
+            let url = muxel_core::normalize_url(url);
+            std::borrow::Cow::Owned(if url.is_empty() {
+                "https://duckduckgo.com".into()
+            } else {
+                url
+            })
+        }
+        LinuxBrowserRequest::Restored(url) | LinuxBrowserRequest::Link(url) => {
+            std::borrow::Cow::Borrowed(url)
+        }
+    };
+    if spawn(&url) {
+        LinuxBrowserDispatch::Helper
+    } else if isolated {
+        LinuxBrowserDispatch::Refused
+    } else {
+        open_system(&url);
+        LinuxBrowserDispatch::SystemBrowser
+    }
+}
+
 /// Spawn the separate Linux browser window (`muxel --browser <url>`), returning
-/// whether the helper was launched (false → caller falls back to the OS browser).
+/// whether the helper was launched. Only normal profiles fall back to the OS
+/// browser on spawn failure; an isolated profile reports the failure.
 #[cfg(target_os = "linux")]
-pub fn spawn_browser_window(url: &str) -> bool {
+fn spawn_browser_window(url: &str) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
@@ -29,6 +76,19 @@ pub fn spawn_browser_window(url: &str) -> bool {
         .arg(url)
         .spawn()
         .is_ok()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_linux_browser(
+    request: LinuxBrowserRequest<'_>,
+    cx: &mut App,
+) -> LinuxBrowserDispatch {
+    dispatch_linux_browser(
+        request,
+        crate::user_data_dir::is_isolated(),
+        spawn_browser_window,
+        |url| cx.open_url(url),
+    )
 }
 
 /// A short label for a browser tab: the URL's host (falls back to the URL).
@@ -76,6 +136,90 @@ fn should_sample_native_visibility(
 #[cfg(test)]
 mod tests {
     use super::{should_publish_url, should_sample_native_visibility, tab_label};
+
+    #[test]
+    fn linux_browser_preset_failure_refuses_isolated_and_preserves_normal_fallback() {
+        use super::{LinuxBrowserDispatch, LinuxBrowserRequest, dispatch_linux_browser};
+        for isolated in [true, false] {
+            let mut opened = Vec::new();
+            let result = dispatch_linux_browser(
+                LinuxBrowserRequest::Preset("example.test"),
+                isolated,
+                |url| {
+                    assert_eq!(url, "https://example.test");
+                    false
+                },
+                |url| opened.push(url.to_string()),
+            );
+            assert_eq!(
+                result,
+                if isolated {
+                    LinuxBrowserDispatch::Refused
+                } else {
+                    LinuxBrowserDispatch::SystemBrowser
+                }
+            );
+            assert_eq!(
+                opened,
+                if isolated {
+                    vec![]
+                } else {
+                    vec!["https://example.test"]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn linux_restored_browser_failure_refuses_isolated_and_preserves_normal_fallback() {
+        use super::{LinuxBrowserDispatch, LinuxBrowserRequest, dispatch_linux_browser};
+        let restored = "https://example.test/path?restored=1#fragment";
+        for isolated in [true, false] {
+            let mut opened = Vec::new();
+            let result = dispatch_linux_browser(
+                LinuxBrowserRequest::Restored(restored),
+                isolated,
+                |url| {
+                    assert_eq!(url, restored);
+                    false
+                },
+                |url| opened.push(url.to_string()),
+            );
+            assert_eq!(
+                result,
+                if isolated {
+                    LinuxBrowserDispatch::Refused
+                } else {
+                    LinuxBrowserDispatch::SystemBrowser
+                }
+            );
+            assert_eq!(opened, if isolated { vec![] } else { vec![restored] });
+        }
+    }
+
+    #[test]
+    fn linux_browser_success_and_link_failure_use_the_same_dispatch_policy() {
+        use super::{LinuxBrowserDispatch, LinuxBrowserRequest, dispatch_linux_browser};
+        for request in [
+            LinuxBrowserRequest::Preset(""),
+            LinuxBrowserRequest::Restored("about:blank"),
+            LinuxBrowserRequest::Link("https://example.test"),
+        ] {
+            assert_eq!(
+                dispatch_linux_browser(request, true, |_| true, |_| panic!("helper succeeded")),
+                LinuxBrowserDispatch::Helper
+            );
+        }
+        assert_eq!(
+            dispatch_linux_browser(
+                LinuxBrowserRequest::Link("https://example.test"),
+                true,
+                |_| false,
+                |_| panic!("isolated link must refuse")
+            ),
+            LinuxBrowserDispatch::Refused
+        );
+    }
 
     #[test]
     fn local_file_tab_uses_decoded_filename() {
@@ -303,12 +447,11 @@ mod imp {
 
             cx.spawn_in(window, async move |this, cx| {
                 #[cfg(target_os = "windows")]
-                let mut web_context = muxel_store::data_dir().and_then(|dir| {
-                    let dir = dir.join("webview2");
-                    std::fs::create_dir_all(&dir)
-                        .ok()
-                        .map(|()| wry::WebContext::new(Some(dir)))
-                });
+                let mut web_context =
+                    crate::browser_storage::windows_context_dir(muxel_store::data_dir())
+                        .map(|dir| wry::WebContext::new(Some(dir)))
+                        .map_err(|error| log::warn!("could not prepare browser storage: {error}"))
+                        .ok();
 
                 let built = match parent.as_ref() {
                     Some(parent) => {
@@ -324,7 +467,11 @@ mod imp {
                             return;
                         };
                         #[cfg(target_os = "macos")]
-                        let builder = wry::WebViewBuilder::new();
+                        let builder = wry::WebViewBuilder::new_with_attributes(
+                            crate::browser_storage::unix_attributes(
+                                crate::user_data_dir::is_isolated(),
+                            ),
+                        );
 
                         let builder = builder
                             .with_url(&requested)
@@ -802,6 +949,7 @@ mod imp {
     pub struct BrowserView {
         focus_handle: FocusHandle,
         url: String,
+        launch_failed: bool,
     }
 
     impl BrowserView {
@@ -815,6 +963,7 @@ mod imp {
             Self {
                 focus_handle: cx.focus_handle(),
                 url,
+                launch_failed: false,
             }
         }
 
@@ -885,11 +1034,17 @@ mod imp {
                     Button::new("browser-open-window")
                         .primary()
                         .label(t("Open in browser window"))
-                        .on_click(cx.listener(move |_this, _e, _w, cx| {
-                            if !super::spawn_browser_window(&url) {
-                                cx.open_url(&url);
-                            }
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.launch_failed = super::launch_linux_browser(
+                                super::LinuxBrowserRequest::Restored(&url),
+                                cx,
+                            ) == super::LinuxBrowserDispatch::Refused;
+                            cx.notify();
                         })),
+                )
+                .children(
+                    self.launch_failed
+                        .then(|| div().child(t("Couldn't start the isolated browser window."))),
                 )
         }
     }

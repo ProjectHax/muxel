@@ -12,8 +12,8 @@
 use gtk::prelude::*;
 
 /// Run one browser window on the current thread until it's closed. Never
-/// returns; exits the process (non-zero when GTK/WebKit can't start, so the
-/// spawner can fall back to the system browser).
+/// returns; exits the process non-zero when GTK/WebKit can't start. Never
+/// substitute a default persistent context when isolated construction fails.
 pub fn run(url: &str) -> ! {
     // NVIDIA (proprietary driver) + WebKitGTK on Wayland kills the process with
     // "Error 71 (Protocol error) dispatching to Wayland display" the moment the
@@ -48,7 +48,11 @@ pub fn run(url: &str) -> ! {
 
     // The webview is created as a child of the GTK window and fills it.
     use wry::WebViewBuilderExtUnix as _;
-    let webview = wry::WebViewBuilder::new().with_url(url).build_gtk(&window);
+    let webview = wry::WebViewBuilder::new_with_attributes(
+        crate::browser_storage::unix_attributes(crate::user_data_dir::is_isolated()),
+    )
+    .with_url(url)
+    .build_gtk(&window);
     let _webview = match webview {
         Ok(wv) => wv,
         Err(e) => {

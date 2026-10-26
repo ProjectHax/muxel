@@ -80,7 +80,7 @@ pub(crate) enum DiskChange {
     Unavailable { stamp: DiskStamp },
 }
 
-fn disk_stamp(path: &Path) -> Option<DiskStamp> {
+pub(crate) fn disk_stamp(path: &Path) -> Option<DiskStamp> {
     let metadata = std::fs::metadata(path).ok()?;
     Some(DiskStamp {
         modified: metadata.modified().ok(),

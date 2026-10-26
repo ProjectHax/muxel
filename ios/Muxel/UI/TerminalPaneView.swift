@@ -27,10 +27,41 @@ struct TerminalPaneView: View {
     @State private var retryTask: Task<Void, Never>?
 
     enum Status: Equatable {
+        case stopped
         case attaching
         case live
         case reconnecting(attempt: Int)
         case unreachable(String)
+    }
+
+    private struct AttachmentPlan {
+        let command: String
+        let sessionName: String
+        let socket: String
+        let creating: Bool
+        let startupInput: String?
+        let startupDelayMs: Int
+        let startupSubmit: Bool
+        let resumeSessionId: String?
+    }
+
+    private var currentInstance: Instance? {
+        guard state.selectedProject?.id == project.id else { return nil }
+        return state.layout?.instances.first { $0.id == instance.id }
+    }
+
+    /// A peer may replace the captured pane metadata while attachment is awaiting
+    /// SSH. Literal commands stay stopped on the phone, including an old grid.
+    @discardableResult
+    private func stopIfLiteral() -> Bool {
+        guard currentInstance?.literalArgv == true else { return false }
+        retryTask?.cancel()
+        retryTask = nil
+        state.terminals.disconnect(instance.id)
+        session = nil
+        state.clearDead(instance.id)
+        status = .stopped
+        return true
     }
 
     /// The terminal is dimmed (and non-interactive) whenever an overlay covers it but a
@@ -38,7 +69,7 @@ struct TerminalPaneView: View {
     private var dimmed: Bool {
         switch status {
         case .reconnecting, .unreachable: return session != nil
-        case .attaching, .live: return false
+        case .stopped, .attaching, .live: return false
         }
     }
 
@@ -63,11 +94,16 @@ struct TerminalPaneView: View {
         .onChange(of: state.deadPanes.contains(instance.id)) { dead in
             if dead { beginReconnect() }
         }
+        .onChange(of: currentInstance?.literalArgv) { literal in
+            if literal == true { stopIfLiteral() }
+        }
         .onDisappear { retryTask?.cancel(); retryTask = nil }
     }
 
     @ViewBuilder private var overlay: some View {
         switch status {
+        case .stopped:
+            CenteredState(spinner: false, title: "Command stopped. Run again on desktop.")
         case .attaching:
             if session == nil {
                 CenteredState(spinner: true, title: "attaching to \(host.name)…")
@@ -86,17 +122,18 @@ struct TerminalPaneView: View {
     }
 
     private func initialAttach() async {
+        guard !stopIfLiteral() else { return }
         status = .attaching
         if await resolve(announce: true) {
             status = .live
-        } else if session == nil {
+        } else if status != .stopped, session == nil {
             status = .unreachable(lastError ?? "Couldn't reach \(host.name).")
         }
     }
 
     /// Start (or continue) the backoff reconnect loop for a dropped live session.
     private func beginReconnect() {
-        guard retryTask == nil else { return }
+        guard !stopIfLiteral(), retryTask == nil else { return }
         status = .reconnecting(attempt: 1)
         retryTask = Task { await reconnectLoop() }
     }
@@ -105,6 +142,7 @@ struct TerminalPaneView: View {
         let delaysSecs: [UInt64] = [1, 2, 4, 8, 15]
         for (i, secs) in delaysSecs.enumerated() {
             if Task.isCancelled { retryTask = nil; return }
+            if stopIfLiteral() { return }
             status = .reconnecting(attempt: i + 1)
             try? await Task.sleep(nanoseconds: secs * 1_000_000_000)
             if Task.isCancelled { retryTask = nil; return }
@@ -116,6 +154,7 @@ struct TerminalPaneView: View {
                 retryTask = nil
                 return
             }
+            if status == .stopped { retryTask = nil; return }
         }
         // Exhausted — settle into unreachable; clearing the dead flag stops it from
         // immediately re-triggering the loop. The user can Try again from the overlay.
@@ -127,12 +166,14 @@ struct TerminalPaneView: View {
     private func retryNow() {
         retryTask?.cancel()
         retryTask = nil
+        guard !stopIfLiteral() else { return }
         Task {
+            guard !stopIfLiteral() else { return }
             status = .reconnecting(attempt: 1)
             if await resolve(announce: true) {
                 state.clearDead(instance.id)
                 status = .live
-            } else {
+            } else if status != .stopped {
                 beginReconnect()
             }
         }
@@ -146,6 +187,9 @@ struct TerminalPaneView: View {
     /// prompt) on the first/manual attempt but stays quiet during silent backoff.
     @discardableResult
     private func resolve(announce: Bool) async -> Bool {
+        guard !Task.isCancelled, state.selectedProject?.id == project.id,
+              state.layout?.instances.contains(where: { $0.id == instance.id }) == true else { return false }
+        guard !stopIfLiteral() else { return false }
         if let live = state.terminals.existing(instance.id) {
             live.onFocusRequested = onFocus
             session = live
@@ -154,68 +198,98 @@ struct TerminalPaneView: View {
         do {
             let conn = state.connection(for: host)
             try await conn.connect()
-            let names = try await listSessionNames(conn)
-            let command: String
-            let sessionName: String
-            var creating = false
-            var startupInput: String?
-            var startupDelayMs = 0
-            var startupSubmit = false
-            var resumeSessionId: String?
-            if let live = names.first(where: { TmuxSession.session($0, matchesInstanceId: instance.id) }) {
-                // A live session for this instance already exists (created by desktop or
-                // a prior attach) — attach to its real name, whatever slug it carries.
-                sessionName = live
-                command = TmuxCommands.attachPTYCommand(session: live)
-            } else {
-                // Creating it: prefer the authoritative name recorded in the shared
-                // layout (`tmux_session`) so we converge with the name desktop uses for
-                // this instance; fall back to deriving one from the host name.
-                creating = true
-                // Fork the server off a project-less command line first, or the
-                // `new-session` below (the first client on a host with no server) hands
-                // its own argv to the long-lived server — and a `pkill -f <project>` on
-                // that host then kills every session on it. Idempotent and cheap; a
-                // failure here is not fatal (tmux may already be running).
-                _ = try? await conn.tmux(TmuxCommands.startServer())
-                let name = (instance.tmuxSession?.isEmpty == false)
-                    ? instance.tmuxSession!
-                    : TmuxSession.name(hostName: host.name, instanceId: instance.id)
-                sessionName = name
-
-                // Resolve program/args like desktop: model/effort/extra are already in
-                // `args`; apply the system-prompt injection + prepend session-resume args.
-                var inst = instance
-                let preset = AgentLaunch.builtinPreset(for: inst)
-                let resumeCapable = preset?.sessionIdFlag != nil && preset?.resumeFlag != nil
-                if resumeCapable, inst.sessionId == nil {
-                    inst.sessionId = UUID().uuidString.lowercased()  // backfill (e.g. a duplicate)
+            guard let plan = try await state.prepareTmuxAttachmentPlan(instanceId: instance.id, in: project, prepare: { current in
+                // The name a new session gets: the authoritative one recorded in the
+                // shared layout (`tmux_session`), so we converge with the name desktop
+                // uses for this instance; else one derived from the host name.
+                let name = (current.tmuxSession?.isEmpty == false)
+                    ? current.tmuxSession!
+                    : TmuxSession.name(hostName: host.name, instanceId: current.id)
+                let targets: [TmuxCommands.SessionTarget]
+                if current.tmuxSocket == "default" {
+                    targets = try TmuxCommands.defaultOwnerTargets(
+                        try await conn.run(TmuxCommands.confirmedTargetsCommand()), name: name)
+                } else {
+                    targets = TmuxCommands.parseTargets(try await conn.run(
+                        TmuxCommands.listTargetsCommand(socket: current.tmuxSocket)))
                 }
-                let resolved = AgentLaunch.resolveLaunch(inst)
-                let resumeArgs = preset.flatMap { AgentLaunch.sessionResumeArgs(preset: $0, instance: inst) } ?? []
-                command = TmuxCommands.newAttachedPTYCommand(
-                    session: name, cwd: inst.worktreePath ?? project.remoteRoot,
-                    program: resolved.program, args: resumeArgs + resolved.args)
-                startupInput = resolved.startupInput
-                startupDelayMs = preset?.startupDelayMs ?? 0
-                startupSubmit = resolved.submit
-                if resumeCapable { resumeSessionId = inst.sessionId }
+                let command: String
+                let sessionName: String
+                let socket: String
+                var creating = false
+                var startupInput: String?
+                var startupDelayMs = 0
+                var startupSubmit = false
+                var resumeSessionId: String?
+                var migration: TmuxCommands.DefaultMigration?
+                if let live = TmuxCommands.resolveTarget(current, in: targets) {
+                    // A live session for this instance already exists (created by desktop or
+                    // a prior attach) — attach to its real name, whatever slug it carries.
+                    sessionName = live.name
+                    socket = live.socket
+                    command = TmuxCommands.attachPTYCommand(session: live.name, socket: socket)
+                } else {
+                    // Creating it, under `name`.
+                    creating = true
+                    sessionName = name
+                    let prepared = try TmuxCommands.targetForNewSession(current, name: name, confirmedTargets: targets)
+                    socket = prepared.target.socket
+                    migration = prepared.migration
+
+                    // Resolve program/args like desktop: model/effort/extra are already in
+                    // `args`; apply the system-prompt injection + prepend session-resume args.
+                    var inst = current
+                    let preset = AgentLaunch.builtinPreset(for: inst)
+                    let resumeCapable = preset?.sessionIdFlag != nil && preset?.resumeFlag != nil
+                    if resumeCapable, inst.sessionId == nil {
+                        inst.sessionId = UUID().uuidString.lowercased()  // backfill (e.g. a duplicate)
+                    }
+                    let resolved = AgentLaunch.resolveLaunch(inst)
+                    let resumeArgs = preset.flatMap { AgentLaunch.sessionResumeArgs(preset: $0, instance: inst) } ?? []
+                    command = TmuxCommands.newAttachedPTYCommand(
+                        session: name, cwd: inst.launchDir ?? inst.worktreePath ?? project.remoteRoot,
+                        program: resolved.program, args: resumeArgs + resolved.args, socket: socket)
+                    startupInput = resolved.startupInput
+                    startupDelayMs = preset?.startupDelayMs ?? 0
+                    startupSubmit = resolved.submit
+                    if resumeCapable { resumeSessionId = inst.sessionId }
+                }
+                return TmuxAttachmentPlan(target: .init(name: sessionName, socket: socket),
+                        attachment: AttachmentPlan(command: command, sessionName: sessionName, socket: socket,
+                                                   creating: creating, startupInput: startupInput,
+                                                   startupDelayMs: startupDelayMs, startupSubmit: startupSubmit,
+                                                   resumeSessionId: resumeSessionId),
+                                          defaultMigration: migration)
+            }) else { stopIfLiteral(); return false }
+            guard !Task.isCancelled, state.selectedProject?.id == project.id,
+                  let accepted = state.layout?.instances.first(where: { $0.id == instance.id }),
+                  !accepted.literalArgv, accepted.tmuxSocket == plan.socket,
+                  accepted.tmuxSession == plan.sessionName else { stopIfLiteral(); return false }
+            // Prewarm only the accepted owner, from a project-less command line,
+            // so the server does not retain a project's argv. Best-effort: another
+            // client may already have started it.
+            if plan.creating, plan.socket != "default" {
+                _ = try? await conn.tmux(TmuxCommands.startServer(), session: "", socket: plan.socket)
             }
+            guard !Task.isCancelled, state.selectedProject?.id == project.id,
+                  let current = state.layout?.instances.first(where: { $0.id == instance.id }),
+                  !current.literalArgv, current.tmuxSocket == plan.socket,
+                  current.tmuxSession == plan.sessionName else { stopIfLiteral(); return false }
             let s = state.terminals.session(
-                for: instance.id, hostId: host.id, connection: conn, command: command)
+                for: instance.id, hostId: host.id, connection: conn, command: plan.command)
             s.onFocusRequested = onFocus
             session = s
 
-            if creating {
+            if plan.creating {
                 // Persist that a resume-capable session has started (+ backfill its id).
-                if let sid = resumeSessionId {
+                if let sid = plan.resumeSessionId {
                     state.markSessionStarted(instance.id, sessionId: sid, in: project)
                 }
                 // TypeIn agents: type the system prompt once the agent is ready.
-                if let input = startupInput {
-                    state.scheduleStartupInjection(instanceId: instance.id, sessionName: sessionName,
+                if let input = plan.startupInput {
+                    state.scheduleStartupInjection(instanceId: instance.id, sessionName: plan.sessionName, socket: plan.socket,
                                                    host: host, text: input,
-                                                   delayMs: startupDelayMs, submit: startupSubmit)
+                                                   delayMs: plan.startupDelayMs, submit: plan.startupSubmit)
                 }
             }
             // Enable tmux mouse mode so a touch drag scrolls the pane's scrollback
@@ -224,11 +298,13 @@ struct TerminalPaneView: View {
             // it; a freshly-created session may not exist yet when this runs, but it
             // has no history to scroll anyway and picks it up on the next open.
             Task {
-                _ = try? await conn.tmux(TmuxCommands.setMouseOn(session: sessionName), session: sessionName)
-                _ = try? await conn.tmux(TmuxCommands.setClipboardOn(), session: sessionName)
+                _ = try? await conn.tmux(TmuxCommands.setMouseOn(session: plan.sessionName), session: plan.sessionName, socket: plan.socket)
+                _ = try? await conn.tmux(TmuxCommands.setClipboardOn(), session: plan.sessionName, socket: plan.socket)
             }
             return true
         } catch {
+            guard !Task.isCancelled, state.selectedProject?.id == project.id else { return false }
+            guard !stopIfLiteral() else { return false }
             lastError = error.localizedDescription
             // A changed host key needs the trust-prompt sheet, not just inline text.
             if announce { state.surface(error, host: host) }
@@ -236,13 +312,4 @@ struct TerminalPaneView: View {
         }
     }
 
-    /// Every session on both of the host's servers, muxel's own first (a pane from
-    /// before muxel had its own server is still on the default one). A server that
-    /// isn't running — any server, before its first session — lists nothing rather
-    /// than failing (`commandLineOnBothServers`). Real SSH / auth / transport errors,
-    /// and a host with no tmux, still propagate so the pane can surface them.
-    private func listSessionNames(_ conn: SSHConnection) async throws -> [String] {
-        let out = try await conn.tmuxOnBothServers(TmuxCommands.listSessions())
-        return out.split(separator: "\n").map(String.init)
-    }
 }

@@ -92,12 +92,13 @@ pub fn is_agent_program(program: Option<&str>) -> bool {
     let Some(program) = program.map(str::trim).filter(|p| !p.is_empty()) else {
         return false;
     };
-    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    let name = name
-        .strip_suffix(".exe")
-        .unwrap_or(name)
+    let name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
         .to_ascii_lowercase();
-    !SHELLS.contains(&name.as_str())
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    !SHELLS.contains(&name)
 }
 
 // --- The reply, from a Claude transcript -------------------------------------
@@ -1306,6 +1307,44 @@ mod tests {
             "C:\\Program Files\\Git\\bin\\bash.exe"
         )));
         assert!(!is_agent_program(Some("pwsh.exe")));
+    }
+
+    #[test]
+    fn shell_classification_rejects_mixed_case_executables() {
+        for program in [
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.EXE",
+            r"C:\Windows\System32\CmD.ExE",
+            "/usr/local/bin/PwSh.eXe",
+            r"C:\Program Files\Git\bin\BaSh.EXe",
+            "/bin/ZsH.EXE",
+            "PoWeRsHeLl",
+            "  CMD.EXE  ",
+        ] {
+            assert!(
+                !is_agent_program(Some(program)),
+                "shell classified as agent: {program}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_classification_preserves_non_shell_semantics() {
+        for program in [
+            "claude",
+            "/usr/local/bin/CoDeX.EXE",
+            r"C:\agents\CustomTool.ExE",
+            "unknown-program",
+            "cmd.exe.wrapper",
+            "/bin/bash.custom",
+        ] {
+            assert!(
+                is_agent_program(Some(program)),
+                "non-shell changed: {program}"
+            );
+        }
+        for program in [None, Some(""), Some(" \t ")] {
+            assert!(!is_agent_program(program));
+        }
     }
 
     #[test]

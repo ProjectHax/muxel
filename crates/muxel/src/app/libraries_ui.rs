@@ -650,9 +650,10 @@ pub(super) fn active_loop_ids(running: &HashMap<Uuid, LoopRun>) -> HashSet<Uuid>
 
 /// Track a shared loop run as `fire_loop` does a private one; without it
 /// `post_run = exit` would never close the pane and runs would stack.
-pub(super) fn loop_run_for(fire: &SharedFire) -> LoopRun {
+pub(super) fn loop_run_for(fire: &SharedFire, launch: Option<Uuid>) -> LoopRun {
     LoopRun {
         loop_id: fire.run_id,
+        launch,
         seen_working: false,
         started: std::time::Instant::now(),
         post_run: fire.content.post_run,
@@ -1304,7 +1305,11 @@ impl MuxelApp {
             return;
         };
         if let Some(iid) = self.spawn_loop_agent(&fire.to_runtime_loop(), &preset, window, cx) {
-            self.running_loops.insert(iid, loop_run_for(&fire));
+            let launch = self
+                .terminals
+                .get(&iid)
+                .map(|view| view.read(cx).session().id);
+            self.running_loops.insert(iid, loop_run_for(&fire, launch));
             let project = self
                 .workspace
                 .project(fire.project_id)
@@ -3597,8 +3602,10 @@ mod shared_loop_tests {
             .expect("an on loop runs on click");
         assert_eq!(fire.content.prompt, "go");
         assert_eq!(fire.preset_id, id(C));
-        let run = loop_run_for(&fire);
+        let launch = id(0x1E);
+        let run = loop_run_for(&fire, Some(launch));
         assert_eq!(run.loop_id, fire.run_id);
+        assert_eq!(run.launch, Some(launch));
         assert_eq!(run.post_run, PostRunAction::Exit);
         assert!(!run.seen_working);
         running.insert(id(0x1D), run);

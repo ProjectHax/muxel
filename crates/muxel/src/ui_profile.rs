@@ -65,7 +65,87 @@ const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PENDING_RECORDS: usize = 4096;
 const SLOW_RENDER_US: u64 = 50_000;
 
+#[derive(Clone, Copy)]
+pub(crate) enum SessionLookupKind {
+    Discovery,
+    Launch,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SessionLookupOutcome {
+    Found,
+    Unresolved,
+    Resume,
+    Fresh,
+    NoResume,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+struct SessionLookupRecord {
+    kind: SessionLookupKind,
+    provider: Option<muxel_core::session_discovery::SessionProvider>,
+    pane: Uuid,
+    elapsed_us: u64,
+    outcome: SessionLookupOutcome,
+}
+
+fn session_lookup_line(record: SessionLookupRecord) -> String {
+    use muxel_core::session_discovery::SessionProvider;
+    let kind = match record.kind {
+        SessionLookupKind::Discovery => "background-discovery",
+        SessionLookupKind::Launch => "launch-resume",
+    };
+    let provider = match record.provider {
+        Some(SessionProvider::Codex) => "codex",
+        Some(SessionProvider::Claude) => "claude",
+        Some(SessionProvider::Grok) => "grok",
+        Some(SessionProvider::Muse) => "muse",
+        None => "other",
+    };
+    let outcome = match record.outcome {
+        SessionLookupOutcome::Found => "found",
+        SessionLookupOutcome::Unresolved => "unresolved",
+        SessionLookupOutcome::Resume => "resume",
+        SessionLookupOutcome::Fresh => "fresh",
+        SessionLookupOutcome::NoResume => "no-resume",
+        SessionLookupOutcome::Failed => "failed",
+    };
+    format!(
+        "ui-session-lookup[v1] kind={kind} provider={provider} pane={} elapsed_us={} outcome={outcome}",
+        &record.pane.to_string()[..8],
+        record.elapsed_us,
+    )
+}
+
+pub(crate) fn session_lookup_finished(
+    kind: SessionLookupKind,
+    provider: Option<muxel_core::session_discovery::SessionProvider>,
+    pane: Uuid,
+    elapsed: Duration,
+    outcome: SessionLookupOutcome,
+) {
+    if !is_enabled() {
+        return;
+    }
+    ensure_flusher();
+    defer_record(DeferredRecord::SessionLookup {
+        at: SystemTime::now(),
+        record: SessionLookupRecord {
+            kind,
+            provider,
+            pane,
+            elapsed_us: elapsed.as_micros() as u64,
+            outcome,
+        },
+    });
+}
+
 enum DeferredRecord {
+    SessionLookup {
+        at: SystemTime,
+        record: SessionLookupRecord,
+    },
     Line {
         at: SystemTime,
         line: String,
@@ -783,6 +863,9 @@ fn deferred_writer(rx: Receiver<DeferredRecord>) {
         match record {
             DeferredRecord::Line { at, line } => emit_at(at, &line),
             DeferredRecord::StaticLine { at, line } => emit_at(at, line),
+            DeferredRecord::SessionLookup { at, record } => {
+                emit_at(at, &session_lookup_line(record))
+            }
             DeferredRecord::Phase {
                 at,
                 boundary,

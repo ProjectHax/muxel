@@ -56,8 +56,8 @@ extension SSHConnection {
 
     /// Run a `tmux …` command line on the server holding `session` (muxel's own, or
     /// the default one for a session from before muxel had its own).
-    func tmux(_ args: [String], session: String) async throws -> String {
-        try await run(TmuxCommands.commandLine(args, session: session))
+    func tmux(_ args: [String], session: String, socket: String? = nil) async throws -> String {
+        try await run(TmuxCommands.commandLine(args, session: session, socket: socket))
     }
 
     /// Run a `tmux …` command line on both servers, muxel's own first.

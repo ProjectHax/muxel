@@ -11,26 +11,164 @@
 
 use super::*;
 use muxel_core::ReadAloudScope;
-use muxel_core::control::{self as ctl, AgentEntry, AgentInfo, AgentState, Command};
+use muxel_core::control::{self as ctl, AgentEntry, AgentInfo, AgentState, Command, ErrorCode};
 use muxel_core::readaloud;
 use serde_json::{Value, json};
 
-/// A prompt (or answer) typed through `muxel ctl`: what it was, and when it was
-/// submitted, so `wait` knows which turn it is waiting for. Runtime-only.
+/// What a request comes to: its reply, or why there is none.
+type CtlResult<T> = Result<T, ctl::Error>;
+
+mod approval;
+mod new;
+pub(super) use approval::PreparedCreation;
+#[cfg(test)]
+#[path = "control_api/new_tests.rs"]
+mod new_tests;
+
+/// Shared command permission for typing into an existing terminal. This is
+/// rechecked on every write, including panes created before the opt-in was revoked.
+fn control_program_writable(
+    inst: &Instance,
+    allow_shells: bool,
+    fallback_shell: bool,
+) -> Result<(), String> {
+    // Existing panes may run remotely. Match the provider name without
+    // resolving local executables on the UI thread.
+    if !allow_shells
+        && (fallback_shell
+            || inst.literal_argv
+            || !muxel_core::is_known_agent_program(inst.program.as_deref()))
+    {
+        let name = inst.display_name();
+        return Err(format!(
+            "typing into '{name}' requires command execution permission in Settings > \
+             Grok Bot > \"Also allow typing into shell panes\""
+        ));
+    }
+    Ok(())
+}
+
+/// A task queued by outside creation, or a prompt/answer typed through `ctl`.
+/// Runtime-only ownership tells `wait` when submission is still pending and
+/// which submitted turn it is waiting for.
 pub(super) struct ControlTurn {
     prompt: Option<String>,
     sent_at: i64,
     /// How long `wait` expects the agent to take to show it started
     /// (`REPLY_GRACE_MS` for a prompt, `ANSWER_GRACE_MS` for an answer).
     grace_ms: i64,
+    startup: Option<ctl::StartupTurn>,
+}
+
+impl ControlTurn {
+    fn startup_error(&self) -> Option<String> {
+        self.startup
+            .as_ref()
+            .and_then(ctl::StartupTurn::failure)
+            .map(|failure| failure.message().to_owned())
+    }
+
+    fn startup(prompt: String) -> Self {
+        Self {
+            prompt: Some(prompt),
+            sent_at: 0,
+            grace_ms: ctl::REPLY_GRACE_MS,
+            startup: Some(ctl::StartupTurn::default()),
+        }
+    }
+
+    fn awaiting_reply(
+        &self,
+        status: Option<AgentState>,
+        activity: &muxel_core::AgentActivity,
+        now: i64,
+    ) -> bool {
+        match &self.startup {
+            Some(startup) => startup.awaiting_reply(status, activity, now),
+            None => ctl::awaiting_reply(Some(self.sent_at), self.grace_ms, status, activity, now),
+        }
+    }
+}
+
+impl Drop for ControlTurn {
+    fn drop(&mut self) {
+        if let Some(startup) = &self.startup {
+            startup.cancel();
+        }
+    }
+}
+
+/// [`muxel_core::launches_known_agent`] for `instance`'s program, through the
+/// `PATH` it would be found by: its preset's own, else muxel's.
+fn launches_known_agent(instance: &Instance) -> bool {
+    let path = instance
+        .env
+        .iter()
+        .rev()
+        .find(|var| var.key.eq_ignore_ascii_case("PATH"))
+        .map(|var| std::ffi::OsString::from(&var.value))
+        .or_else(|| std::env::var_os("PATH"));
+    muxel_core::launches_known_agent(instance.program.as_deref(), path.as_deref(), launchable)
+}
+
+/// Whether a PATH search would launch `candidate`: an executable file, or on
+/// Windows one with an extension it tries.
+fn launchable(candidate: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(candidate)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        ["", ".exe", ".cmd", ".bat", ".com"].iter().any(|ext| {
+            let mut path = candidate.as_os_str().to_owned();
+            path.push(ext);
+            Path::new(&path).is_file()
+        })
+    }
+}
+
+/// Apply outside creation's launch policy after all program/transport wrappers.
+/// A missing startup owner must not silently become ordinary runner automation.
+pub(super) fn control_launch_spec(
+    instance: Option<&Instance>,
+    turn: Option<&ControlTurn>,
+    owner: Option<ctl::StartupTurnOwner>,
+    mut spec: CommandSpec,
+) -> CommandSpec {
+    spec.allow_shell_fallback &= !instance.is_some_and(|instance| instance.control_created);
+    let owner = owner.filter(ctl::StartupTurnOwner::is_pending);
+    // Keyed on the task, not on `control_created`: a duplicate drops that
+    // approval marker, and must still never type a task nobody owns.
+    if owner.is_none()
+        && instance
+            .is_some_and(|instance| instance.control_prompt && instance.system_prompt.is_some())
+    {
+        if let Some(startup) = turn.and_then(|turn| turn.startup.as_ref()) {
+            startup.cancel();
+        }
+        // Runtime ownership cannot survive a workspace/app restart. A task
+        // cancelled before installation must not replay from saved metadata.
+        spec.startup_input = None;
+        spec.auto_mode_presses = 0;
+        spec.submit = false;
+    }
+    spec.startup_turn = owner;
+    spec
 }
 
 /// A reply ready now, work to finish off the UI thread first, or typing to do
 /// once any other muxel's claim on the agent has been checked.
 enum Answer {
-    Now(Result<Value, String>),
-    Later(Box<dyn FnOnce() -> Result<Value, String> + Send>),
+    Now(CtlResult<Value>),
+    Later(Box<dyn FnOnce() -> CtlResult<Value> + Send>),
     Type(Box<Typing>),
+    Open {
+        project: String,
+        options: ctl::NewOptions,
+    },
 }
 
 /// What `send`, `answer` and `keys` type.
@@ -54,7 +192,7 @@ struct Turn {
 /// and so where its claim is kept.
 struct ClaimSite {
     loc: integrations::RepoLoc,
-    session: String,
+    session: muxel_core::tmux::SessionTarget,
 }
 
 /// Typing into an agent, already checked against the agent's own state.
@@ -68,6 +206,8 @@ struct Typing {
     activity: AgentActivity,
     /// `send --force`: type even over another muxel's claim.
     force: bool,
+    /// `send --launch-id`: checked again immediately before the paste.
+    launch_id: Option<Uuid>,
     reply: Value,
 }
 
@@ -80,9 +220,16 @@ fn owner_id() -> &'static str {
 /// Shortest wait between writing a claim and reading it back.
 const CLAIM_SETTLE_MIN: Duration = Duration::from_millis(200);
 
-/// Matches the startup prompt's pause before its Enter: the agent has taken in
-/// the pasted text, so the Enter submits it instead of adding a line to it.
+/// Give the child a head start before its first Enter. This pause does not
+/// establish consumption; provider acceptance is checked separately below.
 const SUBMIT_DELAY_MS: u64 = 400;
+/// These are observation allowances, not a bound on the child's input queue.
+/// Codex 0.163's Windows detector needs >60ms of processed-character quiet;
+/// sleeping before a pipe write cannot establish that. Retry only visible proof.
+const SUBMISSION_RETRY_MS: u64 = 5_000;
+const SUBMISSION_CONFIRM_MS: u64 = 10_000;
+const SUBMISSION_RETRY_GRACE_MS: u64 = 3_000;
+const SUBMISSION_POLL_MS: u64 = 100;
 /// Pause between the keys of one `keys` request.
 const KEY_GAP_MS: u64 = 80;
 
@@ -106,10 +253,50 @@ fn state_name(state: AgentState) -> String {
         .unwrap_or_default()
 }
 
+/// Control decisions use live facts, never the attention record held through a switch.
+fn runtime_control_state(
+    runtime: muxel_terminal::TerminalRuntimeSnapshot,
+    binding_rev: u64,
+) -> AgentState {
+    if !runtime.is_attributable_to(binding_rev) {
+        return AgentState::Working;
+    }
+    match runtime.status {
+        AgentStatus::Working => AgentState::Working,
+        AgentStatus::Idle => AgentState::Idle,
+        AgentStatus::Blocked => AgentState::Blocked,
+        AgentStatus::Done => AgentState::Done,
+    }
+}
+
+fn check_send_state(state: Option<AgentState>, force: bool) -> CtlResult<()> {
+    if !force {
+        match state {
+            Some(AgentState::Working) => {
+                return Err(ctl::Error::new(
+                    ErrorCode::Working,
+                    "the agent is working: `wait` for it to finish (or pass --force to \
+                     type the prompt anyway)",
+                ));
+            }
+            Some(AgentState::Blocked) => {
+                return Err(ctl::Error::new(
+                    ErrorCode::Blocked,
+                    "the agent is waiting on a question: see `show`, then `answer` it or \
+                     press `keys`",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl MuxelApp {
     /// Start or stop the control server to match the setting. Idempotent; called
     /// each tick (so a settings Cancel is honored too) and by the checkbox.
     pub(super) fn sync_control(&mut self, cx: &mut Context<Self>) {
+        self.sync_control_approvals(cx);
         let want = self.settings.control_enabled;
         if want && self.control.is_none() && !self.control_failed {
             let (tx, rx) = async_channel::unbounded();
@@ -288,6 +475,25 @@ impl MuxelApp {
                             })),
                         t("Allow outside tools to control muxel"),
                     ))
+                    .child(self.settings_label(&t("Outside terminal creation"), cx))
+                    .child(div().flex().gap_2().children([
+                        (ctl::CreationPolicy::Off, t("Off")),
+                        (ctl::CreationPolicy::Ask, t("Ask")),
+                        (ctl::CreationPolicy::Allow, t("Allow")),
+                    ].into_iter().map(|(policy, label)| {
+                        Button::new(SharedString::from(format!("grok-control-new-{policy:?}")))
+                            .ghost().label(label).selected(self.settings.control_allow_new == policy)
+                            .disabled(!enabled)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.settings.control_allow_new = policy;
+                                this.persist_settings();
+                                this.sync_control_approvals(cx);
+                                cx.notify();
+                            }))
+                    })))
+                    .child(hint(t(
+                        "Off by default, including upgrades. Ask requires a click for each request. Allow opens presets that run a known agent (Claude, Codex, Grok, opencode, Amp, …) from an absolute path or PATH entry without a click; any other program, such as ssh, wsl or python, and any relative path still Asks. Literal commands and shell presets always Ask and also require the shell/command permission below. Approvals expire after 120 seconds. Turning creation or outside control off refuses all pending requests. Outside control off also stops the control server. Existing panes, admitted launches and typing permissions are unchanged. Toolbar creation is unaffected.",
+                    )))
                     .child(check(
                         Checkbox::new("grok-control-shells")
                             .checked(self.settings.control_allow_shells)
@@ -297,7 +503,7 @@ impl MuxelApp {
                                 this.persist_settings();
                                 cx.notify();
                             })),
-                        t("Also allow typing into shell panes. Leave this off unless you want Grok Bot to run commands in your shells; it can always use your coding agents."),
+                        t("Also allow typing into shell panes. This permits writes to shell and raw-command panes. With terminal creation enabled, it also permits shell presets and all literal argv, including agent argv. Commands run as the host muxel process, outside the caller's sandbox. Configured non-literal agent presets do not need this command grant; presets are trusted configuration, not a sandbox."),
                     ))
                     .child(
                         div()
@@ -492,11 +698,14 @@ impl MuxelApp {
 
     fn answer_control(&mut self, incoming: crate::control::Incoming, cx: &mut Context<Self>) {
         let crate::control::Incoming { command, reply } = incoming;
-        let respond = |result: Result<Value, String>| match result {
+        let respond = |result: CtlResult<Value>| match result {
             Ok(value) => ctl::Response::ok(value),
             Err(error) => ctl::Response::err(error),
         };
         match self.control_command(command, cx) {
+            Answer::Open { project, options } => {
+                self.admit_control_new(project, options, reply, cx);
+            }
             Answer::Now(result) => {
                 let _ = reply.send(respond(result));
             }
@@ -564,6 +773,25 @@ impl MuxelApp {
     }
 
     fn control_command(&mut self, command: Command, cx: &mut Context<Self>) -> Answer {
+        self.sync_control_approvals(cx);
+        if let Command::NewStatus { request_id } = &command {
+            return Answer::Now(self.control_approvals.status(*request_id));
+        }
+        if matches!(
+            &command,
+            Command::New { .. }
+                | Command::Send { .. }
+                | Command::Answer { .. }
+                | Command::Keys { .. }
+        ) && !self.settings.control_enabled
+        {
+            return Answer::Now(Err(ctl::creation_refusal(ErrorCode::ControlDisabled)));
+        }
+        if matches!(&command, Command::New { .. })
+            && self.settings.control_allow_new == ctl::CreationPolicy::Off
+        {
+            return Answer::Now(Err(ctl::creation_refusal(ErrorCode::CreationDisabled)));
+        }
         if self.current_workspace.is_none() {
             return Answer::Now(Err(
                 "no workspace is open in muxel yet: pick one in its workspace selector".into(),
@@ -573,6 +801,8 @@ impl MuxelApp {
         self.control_turns.retain(|id, _| live.contains(id));
         let now = now_ms();
         match command {
+            Command::New { project, options } => Answer::Open { project, options },
+            Command::NewStatus { .. } => unreachable!("handled before workspace lookup"),
             Command::Projects => Answer::Now(Ok(self.control_projects(cx))),
             Command::Panes { project } => {
                 Answer::Now(self.control_panes(project.as_deref(), now, cx))
@@ -598,10 +828,15 @@ impl MuxelApp {
                 Ok(iid) => self.control_screen(iid, lines, cx),
                 Err(error) => Answer::Now(Err(error)),
             },
-            Command::Send { agent, text, force } => typed(
-                self.control_resolve(&agent)
-                    .and_then(|iid| self.control_send(iid, text, force, cx)),
-            ),
+            Command::Send {
+                agent,
+                text,
+                force,
+                launch_id,
+            } => match self.control_resolve(&agent) {
+                Ok(iid) => typed(self.control_send(iid, text, force, launch_id, cx)),
+                Err(error) => Answer::Now(Err(error)),
+            },
             Command::Answer { agent, option } => typed(
                 self.control_resolve(&agent)
                     .and_then(|iid| self.control_answer(iid, &option, cx)),
@@ -611,6 +846,16 @@ impl MuxelApp {
                     .and_then(|iid| self.control_keys(iid, &keys, cx)),
             ),
         }
+    }
+
+    fn control_new_destination(&self, query: &str) -> Result<Uuid, String> {
+        let named: Vec<_> = self
+            .workspace
+            .projects
+            .iter()
+            .map(|p| (p.id, p.name.as_str()))
+            .collect();
+        ctl::resolve_project(query, &named, self.workspace.active_project)
     }
 
     // --- What is there ---------------------------------------------------------
@@ -637,7 +882,7 @@ impl MuxelApp {
         out
     }
 
-    fn control_resolve(&self, query: &str) -> Result<Uuid, String> {
+    fn control_resolve(&self, query: &str) -> CtlResult<Uuid> {
         let instances = self.control_instances();
         let entries: Vec<AgentEntry> = instances
             .iter()
@@ -650,7 +895,7 @@ impl MuxelApp {
                     .map_or("", |p| p.name.as_str()),
             })
             .collect();
-        ctl::resolve_agent(query, &entries, self.active_instance)
+        ctl::resolve_agent(query, &entries, self.active_instance).map_err(Into::into)
     }
 
     /// What a terminal pane is doing. `None` for editors, diffs and browsers.
@@ -661,25 +906,14 @@ impl MuxelApp {
         let id = inst.id;
         Some(if self.failed_launches.contains_key(&id) {
             AgentState::Failed
-        } else if let Some(view) = self.terminals.get(&id) {
+        } else if let Some(view) = self.terminal_view(id) {
             let view = view.read(cx);
             if self.reconnecting.contains_key(&id) {
                 AgentState::Starting
             } else if view.exited() {
                 AgentState::Exited
             } else {
-                // The status the sidebar shows (refreshed each tick).
-                match self
-                    .last_status
-                    .get(&id)
-                    .copied()
-                    .unwrap_or_else(|| view.status())
-                {
-                    AgentStatus::Working => AgentState::Working,
-                    AgentStatus::Idle => AgentState::Idle,
-                    AgentStatus::Blocked => AgentState::Blocked,
-                    AgentStatus::Done => AgentState::Done,
-                }
+                runtime_control_state(view.runtime_snapshot(), view.session().binding_revision())
             }
         } else if self.terminal_launching.contains_key(&id) {
             AgentState::Starting
@@ -696,7 +930,7 @@ impl MuxelApp {
             .unwrap_or_default()
     }
 
-    fn control_info_of(&self, iid: Uuid, now: i64, cx: &App) -> Result<AgentInfo, String> {
+    fn control_info_of(&self, iid: Uuid, now: i64, cx: &App) -> CtlResult<AgentInfo> {
         let inst = self
             .workspace
             .instance(iid)
@@ -733,8 +967,7 @@ impl MuxelApp {
             None => p.root_path.to_string_lossy().into_owned(),
         });
         let cwd = inst
-            .worktree_path
-            .as_ref()
+            .working_directory()
             .map(|p| p.to_string_lossy().into_owned())
             .or(root);
         AgentInfo {
@@ -751,15 +984,20 @@ impl MuxelApp {
                 && readaloud::is_agent_program(inst.program.as_deref()),
             status,
             status_since: ctl::status_since(&inst.activity),
-            awaiting_reply: ctl::awaiting_reply(
-                self.control_turns.get(&inst.id).map(|turn| turn.sent_at),
-                self.control_turns
-                    .get(&inst.id)
-                    .map_or(ctl::REPLY_GRACE_MS, |turn| turn.grace_ms),
+            launch_id: ctl::launch_id(
                 status,
-                &inst.activity,
-                now,
+                self.terminals
+                    .get(&inst.id)
+                    .map(|view| view.read(cx).session().id),
             ),
+            awaiting_reply: self
+                .control_turns
+                .get(&inst.id)
+                .is_some_and(|turn| turn.awaiting_reply(status, &inst.activity, now)),
+            startup_error: self
+                .control_turns
+                .get(&inst.id)
+                .and_then(ControlTurn::startup_error),
             focused: self.active_instance == Some(inst.id),
             pane,
             worktree_branch: inst.worktree_branch.clone(),
@@ -815,7 +1053,7 @@ impl MuxelApp {
         json!({ "projects": projects })
     }
 
-    fn control_panes(&self, project: Option<&str>, now: i64, cx: &App) -> Result<Value, String> {
+    fn control_panes(&self, project: Option<&str>, now: i64, cx: &App) -> CtlResult<Value> {
         let pids: Vec<Uuid> = match project {
             Some(query) => {
                 let named: Vec<(Uuid, &str)> = self
@@ -880,8 +1118,7 @@ impl MuxelApp {
             })));
         };
         let visible = self
-            .terminals
-            .get(&iid)
+            .terminal_view(iid)
             .map(|view| view.read(cx).visible_text())
             .unwrap_or_default();
         let scope = if full {
@@ -924,7 +1161,11 @@ impl MuxelApp {
     // --- Typing into an agent ----------------------------------------------------
 
     /// The session outside control may type into, or why it may not.
-    fn control_writable(&self, iid: Uuid, cx: &App) -> Result<Arc<TerminalSession>, String> {
+    fn control_writable(&self, iid: Uuid, cx: &App) -> CtlResult<Arc<TerminalSession>> {
+        // Admission checked this too, but delayed Enters and keys write later.
+        if !self.settings.control_enabled {
+            return Err(ctl::creation_refusal(ErrorCode::ControlDisabled));
+        }
         let inst = self
             .workspace
             .instance(iid)
@@ -938,41 +1179,61 @@ impl MuxelApp {
                     InstanceKind::Diff => "a diff",
                     _ => "a browser",
                 }
-            ));
+            )
+            .into());
         }
-        if !readaloud::is_agent_program(inst.program.as_deref())
-            && !self.settings.control_allow_shells
-        {
-            return Err(format!(
-                "'{name}' is a shell, and muxel only lets outside tools type into coding \
-                 agents unless Settings > Grok Bot > \"Also allow typing into shell panes\" \
-                 is on"
-            ));
-        }
+        // A failed agent launch leaves its saved program intact while a shell
+        // runs instead. Check the current launch at every write, including the
+        // delayed Enter/key callbacks, so a relaunch cannot retain an old grant.
+        let fallback_shell = self
+            .terminal_view(iid)
+            .is_some_and(|view| view.read(cx).launch_error().is_some());
+        control_program_writable(inst, self.settings.control_allow_shells, fallback_shell)?;
+        let refuse = |code, message: String| Err(ctl::Error::new(code, message));
         match self.control_state(inst, cx) {
-            Some(AgentState::Exited) => return Err(format!("'{name}' has exited")),
-            Some(AgentState::Failed) => return Err(format!("'{name}' failed to start")),
+            Some(AgentState::Exited) => {
+                return refuse(ErrorCode::Exited, format!("'{name}' has exited"));
+            }
+            Some(AgentState::Failed) => {
+                return refuse(ErrorCode::NotRunning, format!("'{name}' failed to start"));
+            }
             Some(AgentState::NotRunning) => {
-                return Err(format!(
-                    "'{name}' isn't running this session: the user has to open it in muxel"
-                ));
+                return refuse(
+                    ErrorCode::NotRunning,
+                    format!(
+                        "'{name}' isn't running this session: the user has to open it in muxel"
+                    ),
+                );
             }
             Some(AgentState::Starting) => {
-                return Err(format!("'{name}' is still starting: try again in a moment"));
+                return refuse(
+                    ErrorCode::Starting,
+                    format!("'{name}' is still starting: try again in a moment"),
+                );
             }
             _ => {}
         }
-        self.terminals
-            .get(&iid)
+        self.terminal_view(iid)
             .map(|view| view.read(cx).session().clone())
-            .ok_or_else(|| format!("'{name}' isn't running"))
+            .ok_or_else(|| {
+                ctl::Error::new(ErrorCode::NotRunning, format!("'{name}' isn't running"))
+            })
     }
 
     /// Where `inst`'s claim lives: its tmux session, on this machine or its host.
     /// `None` without tmux — a plain PTY is this muxel's alone.
     fn control_claim_site(&self, inst: &Instance) -> Option<ClaimSite> {
+        if self
+            .remote_host_for_instance(inst.id)
+            .is_some_and(|host| !host.use_tmux(inst.use_tmux))
+        {
+            return None;
+        }
         Some(ClaimSite {
-            session: inst.tmux_session.clone()?,
+            session: {
+                let tmux = InstanceTmux::capture(inst)?;
+                muxel_core::tmux::SessionTarget::new(tmux.recorded_session?, tmux.socket)
+            },
             loc: self.repo_loc(inst.project_id)?,
         })
     }
@@ -986,7 +1247,7 @@ impl MuxelApp {
         force: bool,
         reply: Value,
         cx: &App,
-    ) -> Result<Typing, String> {
+    ) -> CtlResult<Typing> {
         let inst = self
             .workspace
             .instance(iid)
@@ -999,6 +1260,7 @@ impl MuxelApp {
             state: self.control_state(inst, cx),
             activity: inst.activity.clone(),
             force,
+            launch_id: None,
             reply,
         })
     }
@@ -1008,9 +1270,11 @@ impl MuxelApp {
         iid: Uuid,
         text: String,
         force: bool,
+        launch_id: Option<Uuid>,
         cx: &mut Context<Self>,
-    ) -> Result<Typing, String> {
-        self.control_writable(iid, cx)?;
+    ) -> CtlResult<Typing> {
+        let session = self.control_writable(iid, cx)?;
+        ctl::check_launch_id(launch_id, Some(session.id))?;
         if text.trim().is_empty() {
             return Err("nothing to send".into());
         }
@@ -1018,21 +1282,7 @@ impl MuxelApp {
             .workspace
             .instance(iid)
             .and_then(|inst| self.control_state(inst, cx));
-        if !force {
-            match state {
-                Some(AgentState::Working) => {
-                    return Err("the agent is working: `wait` for it to finish (or pass \
-                                --force to type the prompt anyway)"
-                        .into());
-                }
-                Some(AgentState::Blocked) => {
-                    return Err("the agent is waiting on a question: see `show`, then \
-                                `answer` it or press `keys`"
-                        .into());
-                }
-                _ => {}
-            }
-        }
+        check_send_state(state, force)?;
         let turn = Turn {
             prompt: Some(text.clone()),
             grace_ms: ctl::REPLY_GRACE_MS,
@@ -1040,8 +1290,13 @@ impl MuxelApp {
             // typing echo as work must not look finished before it was sent.
             lead_ms: SUBMIT_DELAY_MS as i64,
         };
-        let reply = json!({ "sent": true, "agent": ctl::short_id(iid) });
-        self.control_typing(iid, Input::Prompt(text), Some(turn), force, reply, cx)
+        // The paste boundary builds the receipt from the terminal it admits to.
+        let typing =
+            self.control_typing(iid, Input::Prompt(text), Some(turn), force, Value::Null, cx)?;
+        Ok(Typing {
+            launch_id,
+            ..typing
+        })
     }
 
     fn control_answer(
@@ -1049,7 +1304,7 @@ impl MuxelApp {
         iid: Uuid,
         option: &str,
         cx: &mut Context<Self>,
-    ) -> Result<Typing, String> {
+    ) -> CtlResult<Typing> {
         self.control_writable(iid, cx)?;
         let state = self
             .workspace
@@ -1059,11 +1314,11 @@ impl MuxelApp {
             return Err(format!(
                 "the agent isn't waiting on a question (it is {}): use `send` for a new prompt",
                 state.map(state_name).unwrap_or_default()
-            ));
+            )
+            .into());
         }
         let screen = self
-            .terminals
-            .get(&iid)
+            .terminal_view(iid)
             .map(|view| view.read(cx).visible_text())
             .unwrap_or_default();
         let question = ctl::pending_question(&screen).ok_or("couldn't read the question")?;
@@ -1072,13 +1327,14 @@ impl MuxelApp {
             return Err(if question.options.is_empty() {
                 "the question has no numbered options: see `show` or `screen`, and use \
                  `keys` (for example `keys AGENT y`)"
-                    .to_string()
+                    .into()
             } else {
                 let keys: Vec<&str> = question.options.iter().map(|o| o.key.as_str()).collect();
                 format!(
                     "there is no option '{key}': pick one of {}",
                     keys.join(", ")
                 )
+                .into()
             });
         };
         let reply = json!({
@@ -1100,7 +1356,7 @@ impl MuxelApp {
         iid: Uuid,
         keys: &[String],
         cx: &mut Context<Self>,
-    ) -> Result<Typing, String> {
+    ) -> CtlResult<Typing> {
         let session = self.control_writable(iid, cx)?;
         let app_cursor = session.is_app_cursor_mode();
         let presses: Vec<(Vec<u8>, bool)> = keys
@@ -1137,54 +1393,137 @@ impl MuxelApp {
     }
 
     /// Type `typing` into its agent, and note the turn it starts at `at` (when a
-    /// claim fixed it) or when its Enter lands. The reply to a prompt comes once
-    /// its Enter is written, or withheld.
+    /// claim fixed it) or when its Enter lands. Known providers then get a
+    /// bounded acceptance check; a writer receipt never proves consumption.
     fn control_press(
         &mut self,
         typing: Typing,
         at: Option<i64>,
         cx: &mut Context<Self>,
-    ) -> Task<Result<Value, String>> {
+    ) -> Task<CtlResult<Value>> {
         // The pane may have closed while another muxel's claim was checked.
         let session = match self.control_writable(typing.iid, cx) {
             Ok(session) => session,
             Err(error) => return Task::ready(Err(error)),
         };
         let Typing {
-            iid, turn, reply, ..
+            iid,
+            turn,
+            reply,
+            launch_id,
+            ..
         } = typing;
         match typing.input {
             Input::Prompt(text) => {
-                session.paste(&text);
+                let attempt = self
+                    .terminal_view(iid)
+                    .and_then(|view| view.read(cx).begin_prompt_submission(&text));
+                let mut reply = match paste_prompt(&session, iid, &text, launch_id) {
+                    Ok(reply) => reply,
+                    Err(error) => return Task::ready(Err(error)),
+                };
                 let pasted = session.input_rev();
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     cx.background_executor()
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                         .await;
-                    this.update(cx, |app, cx| {
+                    let mut revision = this.update(cx, |app, cx| -> CtlResult<u64> {
                         let live = app.control_writable(iid, cx);
                         enter_verdict(live, &session, pasted, session.input_rev())?;
+                        if attempt.as_ref().is_some_and(|attempt| {
+                            app.terminal_view(iid).is_none_or(|view| {
+                                view.read(cx).observe_prompt_submission(attempt)
+                                    == muxel_terminal::PromptSubmissionState::Interrupted
+                            })
+                        }) {
+                            return Err("the provider conversation changed after the paste, so Enter was withheld: check its `screen`".into());
+                        }
                         press_prompt_enter(&session, pasted)?;
                         // Claim timestamps predict settlement. Local wait starts
                         // at the actual Enter admission, never at the prediction.
                         app.note_control_turn(iid, turn, now_ms());
-                        Ok(reply)
+                        Ok(session.input_rev())
                     })
-                    .unwrap_or_else(|_| Err("muxel is shutting down".into()))
+                    .unwrap_or_else(|_| Err("muxel is shutting down".into()))?;
+                    // Enter is in. Whatever happens next, the reply is this
+                    // receipt: an error would read as "Enter withheld".
+                    let Some(attempt) = attempt.filter(|attempt| attempt.observable()) else {
+                        submission_receipt(&mut reply, None, 0);
+                        return Ok(reply);
+                    };
+                    let started = std::time::Instant::now();
+                    let mut confirmation = PromptConfirmation::default();
+                    let mut retries = 0_u8;
+                    loop {
+                        let action = this
+                            .update(cx, |app, cx| -> Result<_, Unconfirmed> {
+                                confirmation_verdict(
+                                    app.control_writable(iid, cx),
+                                    &session,
+                                    revision,
+                                    session.input_rev(),
+                                )?;
+                                let view = app.terminal_view(iid).ok_or(Unconfirmed::Interrupted)?;
+                                let observation = view.read(cx).observe_prompt_submission(&attempt);
+                                if observation == muxel_terminal::PromptSubmissionState::Interrupted {
+                                    return Err(Unconfirmed::Interrupted);
+                                }
+                                let action = confirmation.observe(started.elapsed(), observation);
+                                if action == PromptConfirmationAction::RetryEnter {
+                                    // Observation and admission share this UI turn. The
+                                    // same permission, launch and input guards still apply.
+                                    press_prompt_enter(&session, revision)
+                                        .map_err(|_| Unconfirmed::Interrupted)?;
+                                    revision = session.input_rev();
+                                    retries += 1;
+                                }
+                                Ok(action)
+                            })
+                            .unwrap_or(Err(Unconfirmed::Interrupted));
+                        let outcome = match action {
+                            Ok(PromptConfirmationAction::Confirmed) => Ok(()),
+                            Ok(PromptConfirmationAction::Unconfirmed) => Err(Unconfirmed::TimedOut),
+                            Ok(PromptConfirmationAction::Observe | PromptConfirmationAction::RetryEnter) => {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(SUBMISSION_POLL_MS))
+                                    .await;
+                                continue;
+                            }
+                            Err(stop) => Err(stop),
+                        };
+                        submission_receipt(&mut reply, Some(outcome), retries);
+                        return Ok(reply);
+                    }
                 })
             }
             Input::Keys(presses) => {
-                cx.spawn(async move |_this: WeakEntity<Self>, cx| {
+                cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     for (i, (bytes, submit)) in presses.into_iter().enumerate() {
                         if i > 0 {
                             cx.background_executor()
                                 .timer(Duration::from_millis(KEY_GAP_MS))
                                 .await;
                         }
-                        if submit {
-                            session.mark_turn_submitted();
+                        // Recheck each key after its delay. A restarted pane
+                        // must not receive input meant for its previous session.
+                        let wrote = this
+                            .update(cx, |app, cx| {
+                                let Ok(current_session) = app.control_writable(iid, cx) else {
+                                    return false;
+                                };
+                                if !Arc::ptr_eq(&session, &current_session) {
+                                    return false;
+                                }
+                                if submit {
+                                    session.mark_turn_submitted();
+                                }
+                                session.write_input(&bytes);
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !wrote {
+                            break;
                         }
-                        session.write_input(&bytes);
                     }
                 })
                 .detach();
@@ -1203,16 +1542,128 @@ impl MuxelApp {
             prompt: None,
             sent_at,
             grace_ms: turn.grace_ms,
+            startup: None,
         });
+        if let Some(startup) = entry.startup.take() {
+            startup.cancel();
+        }
         entry.sent_at = sent_at;
         entry.grace_ms = turn.grace_ms;
         if turn.prompt.is_some() {
             entry.prompt = turn.prompt;
         }
     }
+
+    pub(super) fn cancel_control_startup(&self, iid: Uuid) {
+        if let Some(startup) = self
+            .control_turns
+            .get(&iid)
+            .and_then(|turn| turn.startup.as_ref())
+        {
+            startup.cancel();
+        }
+    }
+
+    pub(super) fn claim_control_startup(&self, iid: Uuid) -> Option<ctl::StartupTurnOwner> {
+        self.control_turns
+            .get(&iid)
+            .and_then(|turn| turn.startup.as_ref())?
+            .claim()
+    }
 }
 
-fn typed(typing: Result<Typing, String>) -> Answer {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptConfirmationAction {
+    Observe,
+    RetryEnter,
+    Confirmed,
+    Unconfirmed,
+}
+
+#[derive(Default)]
+struct PromptConfirmation {
+    retried_at: Option<Duration>,
+}
+
+impl PromptConfirmation {
+    fn observe(
+        &mut self,
+        elapsed: Duration,
+        observation: muxel_terminal::PromptSubmissionState,
+    ) -> PromptConfirmationAction {
+        use muxel_terminal::PromptSubmissionState;
+        if observation == PromptSubmissionState::Accepted {
+            return PromptConfirmationAction::Confirmed;
+        }
+        // A late retry still gets time to show its receipt.
+        let confirm = Duration::from_millis(SUBMISSION_CONFIRM_MS);
+        let deadline = self.retried_at.map_or(confirm, |at| {
+            confirm.max(at + Duration::from_millis(SUBMISSION_RETRY_GRACE_MS))
+        });
+        if elapsed >= deadline {
+            return PromptConfirmationAction::Unconfirmed;
+        }
+        if elapsed >= Duration::from_millis(SUBMISSION_RETRY_MS)
+            && self.retried_at.is_none()
+            && observation == PromptSubmissionState::Retryable
+        {
+            self.retried_at = Some(elapsed);
+            return PromptConfirmationAction::RetryEnter;
+        }
+        PromptConfirmationAction::Observe
+    }
+}
+
+/// Why checking ended without a provider receipt. Enter was already admitted,
+/// so each of these is reported in the receipt, never as an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unconfirmed {
+    TimedOut,
+    /// Other input reached the pane; no further Enter is sent.
+    InputChanged,
+    /// The pane closed, restarted, switched conversation or lost permission.
+    Interrupted,
+}
+
+impl Unconfirmed {
+    fn code(self) -> &'static str {
+        match self {
+            Self::TimedOut => "timed_out",
+            Self::InputChanged => "input_changed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+fn confirmation_verdict<T>(
+    live: CtlResult<Arc<T>>,
+    original: &Arc<T>,
+    expected: u64,
+    current: u64,
+) -> Result<(), Unconfirmed> {
+    if !live.as_ref().is_ok_and(|live| Arc::ptr_eq(live, original)) {
+        return Err(Unconfirmed::Interrupted);
+    }
+    if current != expected {
+        return Err(Unconfirmed::InputChanged);
+    }
+    Ok(())
+}
+
+/// `outcome` is `None` when this pane can show no receipt, so none was awaited.
+fn submission_receipt(
+    reply: &mut Value,
+    outcome: Option<Result<(), Unconfirmed>>,
+    enter_retries: u8,
+) {
+    reply["submission_confirmed"] = outcome.map_or(Value::Null, |outcome| json!(outcome.is_ok()));
+    reply["enter_retries"] = json!(enter_retries);
+    if let Some(Err(reason)) = outcome {
+        reply["unconfirmed_reason"] = json!(reason.code());
+    }
+}
+
+fn typed(typing: CtlResult<Typing>) -> Answer {
     match typing {
         Ok(typing) => Answer::Type(Box::new(typing)),
         Err(error) => Answer::Now(Err(error)),
@@ -1220,30 +1671,45 @@ fn typed(typing: Result<Typing, String>) -> Answer {
 }
 
 fn enter_verdict<T>(
-    live: Result<Arc<T>, String>,
+    live: CtlResult<Arc<T>>,
     pasted_into: &Arc<T>,
     pasted: u64,
     now: u64,
-) -> Result<(), String> {
+) -> CtlResult<()> {
     match live {
         Ok(live) if Arc::ptr_eq(&live, pasted_into) => {}
         Ok(_) => return Err("the pane restarted after the prompt was pasted, so Enter wasn't pressed: check its `screen`".into()),
-        Err(why) => return Err(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`")),
+        Err(why) => return Err(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`").into()),
     }
     if now != pasted {
-        return Err("something else was typed, clicked or scrolled into the agent after the prompt was pasted, so Enter wasn't pressed: check its `screen` before sending again".into());
+        return Err(ctl::Error::new(
+            ErrorCode::InputChanged,
+            "local input changed after the prompt was pasted, so Enter wasn't pressed: check its `screen` before sending again",
+        ));
     }
     Ok(())
 }
 
-fn press_prompt_enter(session: &Arc<TerminalSession>, pasted: u64) -> Result<(), String> {
+fn paste_prompt(
+    session: &TerminalSession,
+    pane: Uuid,
+    text: &str,
+    expected_launch: Option<Uuid>,
+) -> CtlResult<Value> {
+    ctl::check_launch_id(expected_launch, Some(session.id))?;
+    session
+        .try_paste(text)
+        .map_err(|error| format!("couldn't admit the prompt to the PTY writer: {error}"))?;
+    Ok(ctl::pasted_prompt_receipt(pane, session.id))
+}
+
+fn press_prompt_enter(session: &Arc<TerminalSession>, pasted: u64) -> CtlResult<()> {
     enter_verdict(Ok(session.clone()), session, pasted, session.input_rev())?;
-    session.try_write_input(b"\r").map_err(|error| {
+    session.try_submit_input(b"\r").map_err(|error| {
         format!(
             "the prompt was pasted but Enter couldn't be admitted ({error}): check its `screen`"
         )
     })?;
-    session.mark_turn_submitted();
     Ok(())
 }
 
@@ -1281,14 +1747,17 @@ fn claim_agent(
     can_force: bool,
     state: Option<AgentState>,
     activity: &AgentActivity,
-) -> Result<ctl::Claim, String> {
+) -> CtlResult<ctl::Claim> {
     let busy = |claim: &ctl::Claim, how: &str| {
         let hint = if can_force {
             "`wait` on the agent and try again (or pass --force to send anyway)"
         } else {
             "`wait` on the agent and try again"
         };
-        format!("muxel on {} {how}: {hint}", claim.host)
+        ctl::Error::new(
+            ErrorCode::ClaimedElsewhere,
+            format!("muxel on {} {how}: {hint}", claim.host),
+        )
     };
     let asked = Instant::now();
     let theirs = read_claim(site);
@@ -1388,9 +1857,40 @@ fn show_value(
 
 #[cfg(test)]
 mod prompt_submission_tests {
-    use super::{enter_verdict, press_prompt_enter};
-    use muxel_terminal::{CommandSpec, TerminalSession};
-    use std::sync::Arc;
+    use super::{
+        PromptConfirmation, PromptConfirmationAction, Unconfirmed, confirmation_verdict,
+        enter_verdict, paste_prompt, press_prompt_enter, submission_receipt,
+    };
+    use muxel_core::control::ErrorCode;
+    use muxel_terminal::{CommandSpec, PromptSubmissionState, TerminalSession};
+    use serde_json::json;
+    use std::{sync::Arc, time::Duration};
+    use uuid::Uuid;
+
+    #[test]
+    fn a_launch_guard_refuses_before_pasting_and_receipts_use_the_admitted_launch() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
+        let pane = Uuid::new_v4();
+        let before = session.input_rev();
+        let refusal = paste_prompt(&session, pane, "prompt", Some(Uuid::new_v4())).unwrap_err();
+        assert_eq!(refusal.code, Some(ErrorCode::LaunchMismatch));
+        assert_eq!(
+            session.input_rev(),
+            before,
+            "a refused launch must type nothing"
+        );
+        let receipt = paste_prompt(&session, pane, "prompt", Some(session.id)).unwrap();
+        let revision = session.input_rev();
+        session.kill();
+        assert_ne!(revision, before);
+        assert_eq!(receipt["pasted"], true);
+        assert_eq!(receipt["launch_id"], session.id.to_string());
+    }
 
     #[test]
     fn a_prompt_enter_is_withheld_after_intervening_input() {
@@ -1416,11 +1916,247 @@ mod prompt_submission_tests {
     }
 
     #[test]
+    fn a_successful_prompt_enter_notifies_runtime_and_leaves_the_next_key_as_draft() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
+        let events = session.runtime_events();
+        session.paste("prompt");
+        let pasted = session.input_rev();
+        assert_eq!(session.input_snapshot(), (pasted, true));
+        assert!(events.is_empty());
+
+        let entered = press_prompt_enter(&session, pasted);
+        let submitted = session.input_snapshot();
+        let notified = events.try_recv();
+        let has_submitted = session.has_submitted_turn();
+        session.try_write_input(b"x").unwrap();
+        let next_draft = session.input_snapshot();
+        session.kill();
+
+        assert_eq!(entered, Ok(()));
+        assert_eq!(submitted, (pasted + 1, false));
+        assert_eq!(notified, Ok(()));
+        assert!(has_submitted);
+        assert_eq!(next_draft, (pasted + 2, true));
+        assert!(events.is_empty(), "ordinary typing must not submit a turn");
+    }
+
+    #[test]
     fn enter_rejects_closed_or_replaced_panes_and_accepts_unchanged_input() {
         let original = Arc::new(1_u8);
         assert_eq!(enter_verdict(Ok(original.clone()), &original, 7, 7), Ok(()));
-        assert!(enter_verdict(Err("closed".into()), &original, 7, 7).is_err());
-        assert!(enter_verdict(Ok(Arc::new(1)), &original, 7, 7).is_err());
-        assert!(enter_verdict(Ok(original.clone()), &original, 7, 8).is_err());
+        let closed = enter_verdict(Err("closed".into()), &original, 7, 7).unwrap_err();
+        assert_eq!(
+            closed.code, None,
+            "a post-paste failure must not imply nothing was typed"
+        );
+        let replaced = enter_verdict(Ok(Arc::new(1)), &original, 7, 7).unwrap_err();
+        assert_eq!(replaced.code, None);
+        let changed = enter_verdict(Ok(original.clone()), &original, 7, 8).unwrap_err();
+        assert_eq!(changed.code, Some(ErrorCode::InputChanged));
+    }
+
+    #[test]
+    fn submission_retry_needs_positive_proof_and_can_happen_only_once() {
+        use PromptConfirmationAction::{Confirmed, Observe, RetryEnter, Unconfirmed};
+        use PromptSubmissionState::{Accepted, Retryable, Unconfirmed as Unknown};
+        let mut confirm = PromptConfirmation::default();
+        assert_eq!(
+            confirm.observe(Duration::from_millis(4_999), Retryable),
+            Observe
+        );
+        assert_eq!(confirm.observe(Duration::from_secs(5), Unknown), Observe);
+        assert_eq!(
+            confirm.observe(Duration::from_secs(6), Retryable),
+            RetryEnter
+        );
+        assert_eq!(confirm.observe(Duration::from_secs(7), Retryable), Observe);
+        assert_eq!(
+            confirm.observe(Duration::from_secs(10), Retryable),
+            Unconfirmed
+        );
+        // A genuine receipt is still usable when it arrives at the deadline.
+        assert_eq!(
+            confirm.observe(Duration::from_secs(10), Accepted),
+            Confirmed
+        );
+        let mut fast = PromptConfirmation::default();
+        assert_eq!(fast.observe(Duration::ZERO, Accepted), Confirmed);
+    }
+
+    #[test]
+    fn a_late_retry_keeps_time_to_confirm() {
+        use PromptConfirmationAction::{Observe, RetryEnter, Unconfirmed};
+        use PromptSubmissionState::{Retryable, Unconfirmed as Unknown};
+        let mut confirm = PromptConfirmation::default();
+        assert_eq!(
+            confirm.observe(Duration::from_millis(9_900), Retryable),
+            RetryEnter
+        );
+        assert_eq!(confirm.observe(Duration::from_secs(12), Unknown), Observe);
+        assert_eq!(
+            confirm.observe(Duration::from_millis(12_900), Unknown),
+            Unconfirmed
+        );
+    }
+
+    #[test]
+    fn confirmation_stops_after_intervening_input_permission_loss_or_replacement() {
+        let session = Arc::new(1_u8);
+        assert_eq!(
+            confirmation_verdict(Ok(session.clone()), &session, 9, 9),
+            Ok(())
+        );
+        assert_eq!(
+            confirmation_verdict(Ok(session.clone()), &session, 9, 10),
+            Err(Unconfirmed::InputChanged)
+        );
+        assert_eq!(
+            confirmation_verdict(Err("permission revoked".into()), &session, 9, 9),
+            Err(Unconfirmed::Interrupted)
+        );
+        assert_eq!(
+            confirmation_verdict(Ok(Arc::new(1)), &session, 9, 9),
+            Err(Unconfirmed::Interrupted)
+        );
+    }
+
+    #[test]
+    fn delayed_writes_recheck_that_outside_control_is_still_on() {
+        // Enters and keys run on timers after admission, through this gate.
+        let gate = include_str!("control_api.rs")
+            .split("    fn control_writable(")
+            .nth(1)
+            .unwrap();
+        assert!(
+            gate.find("if !self.settings.control_enabled").unwrap()
+                < gate.find("let inst = self").unwrap()
+        );
+    }
+
+    #[test]
+    fn checking_after_enter_only_ever_extends_the_success_receipt() {
+        let pasted = json!({"pasted": true, "launch_id": "L"});
+        let mut unwatched = pasted.clone();
+        submission_receipt(&mut unwatched, None, 0);
+        assert_eq!(
+            unwatched,
+            json!({"pasted": true, "launch_id": "L", "submission_confirmed": null, "enter_retries": 0})
+        );
+        let mut confirmed = pasted.clone();
+        submission_receipt(&mut confirmed, Some(Ok(())), 1);
+        assert_eq!(confirmed["submission_confirmed"], json!(true));
+        assert_eq!(confirmed["enter_retries"], json!(1));
+        assert!(confirmed.get("unconfirmed_reason").is_none());
+        for (reason, code) in [
+            (Unconfirmed::TimedOut, "timed_out"),
+            (Unconfirmed::InputChanged, "input_changed"),
+            (Unconfirmed::Interrupted, "interrupted"),
+        ] {
+            let mut stopped = pasted.clone();
+            submission_receipt(&mut stopped, Some(Err(reason)), 0);
+            assert_eq!(stopped["pasted"], json!(true));
+            assert_eq!(stopped["submission_confirmed"], json!(false));
+            assert_eq!(stopped["unconfirmed_reason"], json!(code));
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_control_tests {
+    use super::{AgentState, AgentStatus, check_send_state, ctl, runtime_control_state};
+    use muxel_core::AgentActivity;
+    use muxel_terminal::{
+        CommandSpec, TerminalRuntimeSnapshot, TerminalSession, TerminalStatusCoverage,
+        TerminalStatusReason,
+    };
+    use std::time::SystemTime;
+
+    #[test]
+    fn ordinary_send_and_wait_reject_old_binding_idle_and_done() {
+        #[cfg(windows)]
+        let spec = CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = CommandSpec::program("/bin/cat", vec![]);
+        let (session, _receiver) = TerminalSession::spawn(spec, 80, 24).expect("spawn fixture");
+        let revision = session.binding_revision();
+        let activity = AgentActivity::default();
+        let cached = TerminalRuntimeSnapshot {
+            status: AgentStatus::Done,
+            attributable: true,
+            reason: TerminalStatusReason::Quiet,
+            coverage: TerminalStatusCoverage::ProviderVisible,
+            launch_id: session.id,
+            binding_rev: revision,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: true,
+        };
+        let now = SystemTime::now();
+        session.provider_switched(now, now);
+        for old_status in [AgentStatus::Idle, AgentStatus::Done] {
+            let runtime = TerminalRuntimeSnapshot {
+                status: old_status,
+                ..cached
+            };
+            let before = runtime_control_state(runtime, revision);
+            assert!(check_send_state(Some(before), false).is_ok());
+            assert_eq!(
+                ctl::wait_outcome(Some(before), false),
+                Some(ctl::WaitOutcome::Finished)
+            );
+
+            // The same facts cannot authorize send or finish wait after adoption,
+            // even before the runtime event has been processed.
+            let state = runtime_control_state(runtime, session.binding_revision());
+            assert_eq!(state, AgentState::Working);
+            assert!(check_send_state(Some(state), false).is_err());
+            assert!(check_send_state(Some(state), true).is_ok());
+            let awaiting = ctl::awaiting_reply(
+                Some(100),
+                ctl::REPLY_GRACE_MS,
+                Some(state),
+                &activity,
+                100_000,
+            );
+            assert!(awaiting);
+            assert_eq!(ctl::wait_outcome(Some(state), awaiting), None);
+            assert_eq!(ctl::wait_outcome(Some(state), false), None);
+        }
+        // A reconciled but uncertain level state is equally conservative.
+        for status in [
+            AgentStatus::Working,
+            AgentStatus::Blocked,
+            AgentStatus::Idle,
+        ] {
+            let runtime = TerminalRuntimeSnapshot {
+                status,
+                attributable: false,
+                binding_rev: session.binding_revision(),
+                ..cached
+            };
+            let state = runtime_control_state(runtime, session.binding_revision());
+            assert!(check_send_state(Some(state), false).is_err());
+            assert_eq!(ctl::wait_outcome(Some(state), false), None);
+        }
+        let fresh = TerminalRuntimeSnapshot {
+            binding_rev: session.binding_revision(),
+            ..cached
+        };
+        let state = runtime_control_state(fresh, session.binding_revision());
+        assert_eq!(state, AgentState::Done);
+        assert!(check_send_state(Some(state), false).is_ok());
+        assert_eq!(
+            ctl::wait_outcome(Some(state), false),
+            Some(ctl::WaitOutcome::Finished)
+        );
     }
 }

@@ -1,7 +1,6 @@
 # Terminal input lag under multi-agent load — post-mortem
 
-Branch: `fix-terminal-input-lag-under-load` (2026-07-22). Symptom: with several
-agent panes visible, holding a key froze the focused pane for 5–15 seconds; it
+With several agent panes visible, holding a key froze the focused pane for 5–15 seconds; it
 caught up the instant the key was released. Typing at normal speed stuttered.
 
 ## Root causes (two, both fixed)
@@ -52,7 +51,7 @@ gpui bug worth upstreaming (any gpui app on Windows with background entity
 notifies during sustained typing hits it).
 
 **Removable when fixed:** `present_pump` + `present_flag` are temporary. Exit
-criteria are in the `present_pump.rs` module docs (zed#61469 in our gpui pin +
+criteria are in the `present_pump.rs` module docs (zed#61469 in the pinned GPUI revision +
 `MUXEL_NO_PRESENT_PUMP=1` regression green).
 
 ## Fixed along the way
@@ -105,6 +104,45 @@ any saturation as `deferred_dropped=`.
 channel drain, intentional coalescing, UI-update queueing, notify, and paint. A
 `term-write[v1]` line names the pane when queueing or the ConPTY write itself
 exceeds 50 ms.
+
+The reader-to-UI queue is bounded independently per pane at 256 KiB and 64
+events. The PTY reader waits when either limit is full, propagating pressure to
+the child instead of retaining unlimited output in Muxel. The UI may separately
+hold one drain batch (256 KiB plus at most one 64 KiB read) while parsing it.
+Dequeueing returns the exact byte permit. While both the session and a
+receiver draining it are live, no terminal bytes are merged or dropped, and
+Exit stays behind all preceding output. Teardown never waits on the queue.
+Dropping the last receiver ends delivery even while the session lives. On Windows
+this cannot wake a silent reader. When a streaming reader observes delivery end,
+it kills the child and drains the remaining pseudoconsole output; session teardown
+also kills the child independently. Once the
+session is dropped, a full queue ends the stream (without Exit) so a Windows
+reader can keep draining the pseudoconsole while it closes. A Unix reader stops
+reading at once and discards PTY output it has not read, even when the queue
+has room, since a descendant that ignores SIGHUP can hold the PTY open with no
+EOF to come. Ending the stream does not end the child at once. Muxel sends a
+Unix child one SIGHUP, from whichever of `TerminalSession::kill`, the session's
+Drop or the stopping reader comes first; a repeat could abort a handler still
+saving. When teardown stops a reader that is still reading, the reader releases
+its PTY descriptors, ends the stream, and SIGKILLs the child only if it is
+still running five seconds (`CHILD_HANGUP_GRACE`) after that SIGHUP was
+claimed; the claim is stamped just before the signal is sent. A reader that
+already reached EOF or a read error, because the child closed its PTY handles,
+arms no SIGKILL, so such a child keeps running as it did before this change.
+The five seconds are muxel's delay, not a guaranteed cleanup window: when the
+last PTY master closes, the kernel hangs the terminal up and signals the child
+itself, outside muxel's control.
+
+If Windows child-monitor thread creation fails after the reader starts, cleanup
+closes queue admission before closing the pseudoconsole. The receiver is still
+held by the spawn caller at that point, so it cannot drain a full queue while
+`ClosePseudoConsole` waits for the reader.
+
+`queue_high=<bytes>B/<chunks>chunks` in `term-prof[v8]` reports the largest
+occupancy any pane's queue reached during that log interval. Each queue records
+its peak when it admits a read, so a prompt dequeue cannot hide it. The public
+`PtyReceiver::stats()` and `TerminalSession::output_queue_stats()` expose current
+and high-water occupancy to diagnostics without terminal content.
 
 **UI log** (`ui-prof`): present-pump cost, UI-queue probe RTT, coalesce rate,
 and 1m / 15m / hourly snapshots (working set). Use this for settings typing and

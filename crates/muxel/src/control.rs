@@ -2,18 +2,21 @@
 //!
 //! While Settings → Grok Bot → "Allow outside tools to control muxel" is on, the
 //! app listens on `127.0.0.1:<random port>` and writes the port and a fresh random
-//! token to `<data dir>/control.json`, readable only by its owner. `muxel ctl …` —
-//! this same binary, run with those arguments — reads that file, connects, sends
-//! one JSON request line and prints the reply. Knowing the token is the whole of
-//! the authorization, so only the user running muxel (and what they run) gets in.
+//! token to `<data dir>/control.json`. Unix creates the file with mode 0600;
+//! Windows inherits the parent directory's ACL, so the user data directory must
+//! be private to the intended OS account. `--user-data-dir` does not impose an
+//! owner-only ACL. `muxel ctl …` — this same binary, run with those arguments —
+//! reads that file, connects, sends one JSON request line and prints the reply.
+//! Knowing the token is the whole of the authorization; anyone able to read it
+//! can exercise the enabled control authority.
 //!
 //! The protocol and the decisions in it live in `muxel_core::control`; the app
 //! answers requests in `app/control_api.rs`. This file is only sockets and files.
 
 use anyhow::{Context as _, Result};
 use muxel_core::control::{
-    self, AgentState, CliCommand, Command, Endpoint, PROTOCOL_VERSION, Request, Response,
-    WaitOutcome,
+    self, AgentState, CliCommand, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Request,
+    Response, WaitOutcome,
 };
 use serde_json::{Value, json};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -60,7 +63,12 @@ impl Server {
     /// each authorized request to `tx`.
     pub fn start(tx: async_channel::Sender<Incoming>) -> Result<Self> {
         let dir = muxel_store::data_dir().context("no data directory")?;
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        Self::start_in(&dir, tx)
+    }
+
+    /// [`Self::start`], publishing the endpoint file in `dir`.
+    fn start_in(dir: &Path, tx: async_channel::Sender<Incoming>) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("opening a loopback port")?;
         let port = listener.local_addr()?.port();
@@ -157,24 +165,33 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
     if !same_secret(request.token.as_bytes(), token.as_bytes()) {
         return Response::err("wrong token: run `muxel ctl` as the user running muxel");
     }
-    if request.version != PROTOCOL_VERSION {
+    let version = control::request_version(&request.command);
+    if request.version != version {
         return Response::err(format!(
-            "this muxel speaks control protocol v{PROTOCOL_VERSION}, the command sent \
+            "this command requires control protocol v{version}, the command sent \
              v{}: run the muxel binary that is running",
             request.version
         ));
     }
+    let status_poll = matches!(&request.command, Command::NewStatus { .. });
+    let unavailable = |message: &str| {
+        if status_poll {
+            Response::err(control::Error::new(ErrorCode::HostUnavailable, message))
+        } else {
+            Response::err(message)
+        }
+    };
     let (reply, answer) = std::sync::mpsc::channel();
     let incoming = Incoming {
         command: request.command,
         reply,
     };
     if tx.send_blocking(incoming).is_err() {
-        return Response::err("muxel is shutting down");
+        return unavailable("muxel is shutting down");
     }
     answer
         .recv_timeout(REPLY_TIMEOUT)
-        .unwrap_or_else(|_| Response::err("muxel didn't answer in time"))
+        .unwrap_or_else(|_| unavailable("muxel didn't answer in time"))
 }
 
 /// Compare secrets without leaking, through timing, how much of a guess was right.
@@ -182,7 +199,9 @@ fn same_secret(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Write the endpoint file atomically, readable only by its owner.
+/// Write the endpoint file atomically. Unix creates mode 0600; Windows inherits
+/// the parent ACL, so the user data directory must be private to the intended
+/// account.
 fn write_endpoint(path: &Path, endpoint: &Endpoint) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     let _ = std::fs::remove_file(&tmp);
@@ -208,12 +227,12 @@ fn read_endpoint(path: &Path) -> Option<Endpoint> {
 // --- The client: `muxel ctl …` -------------------------------------------------
 
 /// Run `muxel ctl <args>` against the running app, print the result as JSON, and
-/// return the process exit code: 0 on success, 1 when muxel refused or couldn't be
-/// reached, 2 for a bad command line.
+/// return the process exit code: 0 on success, 1 for a request failure (including
+/// no running muxel), 2 for an invalid command line or stdin.
 pub fn run_cli(args: &[String]) -> i32 {
     let command = match control::parse_cli(args) {
         Ok(command) => command,
-        Err(error) => return fail(error, 2),
+        Err(error) => return fail(error.into(), 2),
     };
     let result = match command {
         CliCommand::Help => {
@@ -224,17 +243,49 @@ pub fn run_cli(args: &[String]) -> i32 {
             emit(control::skill(&exe_path()).trim_end());
             return 0;
         }
-        CliCommand::Request(Command::Send { agent, text, force }) if text == "-" => {
+        CliCommand::Request(Command::Send {
+            agent,
+            text,
+            force,
+            launch_id,
+        }) if text == "-" => {
             let mut text = String::new();
             match std::io::stdin().read_to_string(&mut text) {
                 Ok(_) if !text.trim().is_empty() => request(Command::Send {
                     agent,
                     text: text.trim_end_matches(['\r', '\n']).to_string(),
                     force,
+                    launch_id,
                 }),
                 Ok(_) => return fail("`send AGENT -` read no text from stdin".into(), 2),
-                Err(e) => return fail(format!("reading stdin: {e}"), 2),
+                Err(e) => return fail(format!("reading stdin: {e}").into(), 2),
             }
+        }
+        CliCommand::Request(Command::New {
+            project,
+            mut options,
+        }) => {
+            if options.prompt.as_deref() == Some("-") {
+                let mut text = String::new();
+                match std::io::stdin().read_to_string(&mut text) {
+                    Ok(_) if !text.trim().is_empty() => {
+                        options.prompt = Some(text.trim_end_matches(['\r', '\n']).to_string())
+                    }
+                    Ok(_) => return fail("`new --prompt -` read no text from stdin".into(), 2),
+                    Err(error) => return fail(format!("reading stdin: {error}").into(), 2),
+                }
+            }
+            options.requesting_pane = std::env::var(control::INSTANCE_ID_ENV)
+                .ok()
+                .and_then(|id| id.parse().ok());
+            let no_wait = options.no_wait;
+            request(Command::New { project, options }).and_then(|value| {
+                if no_wait {
+                    Ok(value)
+                } else {
+                    wait_creation(value)
+                }
+            })
         }
         CliCommand::Request(command) => request(command),
         CliCommand::Wait {
@@ -287,9 +338,13 @@ pub fn attach_parent_console() {
     }
 }
 
-fn fail(error: String, code: i32) -> i32 {
-    emit(&with_host(json!({ "ok": false, "error": error })).to_string());
-    code
+fn fail(error: control::Error, status: i32) -> i32 {
+    let reply = match error.code {
+        Some(code) => json!({ "ok": false, "code": code, "error": error.message }),
+        None => json!({ "ok": false, "error": error.message }),
+    };
+    emit(&with_host(reply).to_string());
+    status
 }
 
 /// Print one reply. A reader that stops early (`muxel ctl panes | head`, `grep
@@ -347,14 +402,36 @@ pub fn exe_path() -> String {
         .unwrap_or_else(|| "muxel".to_string())
 }
 
-/// Where the running app's endpoint file is: `$MUXEL_CONTROL` when set — for an
-/// agent whose environment gives it a different home or `XDG_DATA_HOME` than the
-/// app has — else `control.json` in muxel's data directory.
-fn endpoint_path() -> Option<PathBuf> {
-    std::env::var_os("MUXEL_CONTROL")
+/// Names the running app's endpoint file, for a `muxel ctl` whose environment
+/// gives it a different home or `XDG_DATA_HOME` than the app has.
+/// Without an isolated root it overrides the platform endpoint. With a root it
+/// must name that root's endpoint; GUI runs clear it before starting panes.
+pub const CONTROL_ENV: &str = "MUXEL_CONTROL";
+
+/// An isolated root never routes control to a foreign endpoint.
+fn endpoint_path() -> Result<Option<PathBuf>, String> {
+    let default = muxel_store::data_dir().map(|dir| dir.join(control::ENDPOINT_FILE));
+    let supplied = std::env::var_os(CONTROL_ENV)
         .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| Some(muxel_store::data_dir()?.join(control::ENDPOINT_FILE)))
+        .map(PathBuf::from);
+    let isolated =
+        std::env::var_os(muxel_store::USER_DATA_DIR_ENV).is_some_and(|root| !root.is_empty());
+    let (default, supplied) = if isolated {
+        (
+            default.map(normalize_endpoint_path),
+            supplied.map(normalize_endpoint_path),
+        )
+    } else {
+        (default, supplied)
+    };
+    muxel_core::isolated_root::select_control_endpoint(default, isolated, supplied)
+        .map_err(|error| error.to_string())
+}
+
+fn normalize_endpoint_path(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path)
+        .or_else(|_| std::path::absolute(&path))
+        .unwrap_or(path)
 }
 
 /// Whether the muxel that wrote the endpoint file is still running. A killed app
@@ -395,19 +472,92 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
-/// One request to the running app.
-fn request(command: Command) -> Result<Value, String> {
-    let path = endpoint_path().ok_or("no data directory")?;
-    let endpoint = read_endpoint(&path)
-        .filter(|e| process_alive(e.pid))
-        .ok_or(NOT_RUNNING)?;
+/// One request to the running app. For mutations, only failures before sending
+/// are known to have done nothing. Read-only creation status can safely retry a
+/// transport failure after sending as well.
+fn request(command: Command) -> Result<Value, control::Error> {
+    let path = endpoint_path()?
+        .ok_or_else(|| control::Error::new(ErrorCode::HostUnavailable, "no data directory"))?;
+    request_at(&path, command)
+}
+
+/// Each poll owns a fresh socket; approvals never occupy a connection slot.
+fn wait_creation(value: Value) -> Result<Value, control::Error> {
+    wait_creation_with(
+        value,
+        |request_id| request(Command::NewStatus { request_id }),
+        || std::thread::sleep(WAIT_POLL),
+    )
+}
+
+fn wait_creation_with(
+    value: Value,
+    mut status: impl FnMut(Uuid) -> Result<Value, control::Error>,
+    mut pause: impl FnMut(),
+) -> Result<Value, control::Error> {
+    if value["pending"].as_bool() != Some(true) {
+        return Ok(value);
+    }
+    let request_id = value["request_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .ok_or("muxel returned an invalid creation request id")?;
+    let mut retries = 0;
+    loop {
+        pause();
+        match status(request_id) {
+            Ok(value) if value["pending"].as_bool() != Some(true) => return Ok(value),
+            Ok(_) => retries = 0,
+            Err(error)
+                if matches!(
+                    error.code,
+                    Some(ErrorCode::HostUnavailable | ErrorCode::StaleEndpoint)
+                ) =>
+            {
+                if retries < 3 {
+                    retries += 1;
+                } else {
+                    return Err(creation_poll_error(error, request_id));
+                }
+            }
+            Err(error) if error.code.is_none() => {
+                return Err(creation_poll_error(error, request_id));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn creation_poll_error(mut error: control::Error, request_id: Uuid) -> control::Error {
+    error.message = format!(
+        "{}; query this creation with `muxel ctl new-status {request_id}` when the host is available; do not repeat `new` because the original request may still be waiting",
+        error.message,
+    );
+    error
+}
+
+/// [`request`] to the muxel whose endpoint file is `path`.
+fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
+    let status_poll = matches!(&command, Command::NewStatus { .. });
+    let transport_error = |message: String| {
+        if status_poll {
+            control::Error::new(ErrorCode::HostUnavailable, message)
+        } else {
+            message.into()
+        }
+    };
+    let unavailable = |message| control::Error::new(ErrorCode::HostUnavailable, message);
+    let endpoint = read_endpoint(path).ok_or_else(|| unavailable(NOT_RUNNING))?;
+    if !process_alive(endpoint.pid) {
+        return Err(control::Error::new(ErrorCode::StaleEndpoint, NOT_RUNNING));
+    }
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, endpoint.port));
-    let mut stream =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|_| NOT_RUNNING)?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|_| unavailable(NOT_RUNNING))?;
     let _ = stream.set_read_timeout(Some(REPLY_TIMEOUT + IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let mut line = serde_json::to_string(&Request {
-        version: PROTOCOL_VERSION,
+        version: control::request_version(&command),
         token: endpoint.token,
         command,
     })
@@ -415,28 +565,22 @@ fn request(command: Command) -> Result<Value, String> {
     line.push('\n');
     stream
         .write_all(line.as_bytes())
-        .map_err(|e| format!("sending to muxel: {e}"))?;
+        .map_err(|e| transport_error(format!("sending to muxel: {e}")))?;
     let mut reply = String::new();
     BufReader::new(&stream)
         .read_line(&mut reply)
-        .map_err(|e| format!("reading muxel's reply: {e}"))?;
+        .map_err(|e| transport_error(format!("reading muxel's reply: {e}")))?;
     if reply.trim().is_empty() {
-        return Err(NOT_RUNNING.to_string());
+        return Err(transport_error(NOT_RUNNING.into()));
     }
-    let response: Response =
-        serde_json::from_str(&reply).map_err(|e| format!("unreadable reply from muxel: {e}"))?;
-    if response.ok {
-        Ok(response.result.unwrap_or(Value::Null))
-    } else {
-        Err(response
-            .error
-            .unwrap_or_else(|| "muxel refused the request".into()))
-    }
+    let response: Response = serde_json::from_str(&reply)
+        .map_err(|e| transport_error(format!("unreadable reply from muxel: {e}")))?;
+    response.into_result()
 }
 
 /// `wait`: check on the agent until its turn ends (it finishes, blocks on a
 /// question or exits) or `timeout` passes, then show it.
-fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, String> {
+fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Error> {
     let started = Instant::now();
     // Pin the agent by uuid: its name follows its title, which can change mid-turn.
     let mut target = agent.to_string();
@@ -449,9 +593,12 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, String> {
         }
         let state: Option<AgentState> = serde_json::from_value(info["status"].clone()).ok();
         if state.is_none() {
-            return Err(format!("'{agent}' is not a terminal pane"));
+            return Err(format!("'{agent}' is not a terminal pane").into());
         }
         let awaiting = info["awaiting_reply"].as_bool().unwrap_or(false);
+        if info["startup_error"].is_string() {
+            break WaitOutcome::SubmissionFailed;
+        }
         if let Some(outcome) = control::wait_outcome(state, awaiting) {
             break outcome;
         }
@@ -473,8 +620,455 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{process_alive, read_endpoint, same_secret, write_endpoint};
-    use muxel_core::control::Endpoint;
+    use super::{
+        Server, dispatch, process_alive, read_endpoint, request_at, same_secret,
+        wait_creation_with, write_endpoint,
+    };
+    use muxel_core::control::{self, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response};
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("muxel-ctl-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn approval_poll_retries_keep_the_same_id_and_reset_after_a_pending_reply() {
+        let id = uuid::Uuid::new_v4();
+        let pending = serde_json::json!({"pending":true,"request_id":id});
+        let outage = || {
+            Err(control::Error::new(
+                ErrorCode::HostUnavailable,
+                "connection lost",
+            ))
+        };
+        let mut replies = std::collections::VecDeque::from([
+            outage(),
+            outage(),
+            Ok(serde_json::json!({"pending":true,"request_id":uuid::Uuid::new_v4()})),
+            outage(),
+            outage(),
+            outage(),
+            Ok(serde_json::json!({"uuid":"created-once"})),
+        ]);
+        let mut polls = 0;
+        let mut pauses = 0;
+        let result = wait_creation_with(
+            pending,
+            |request_id| {
+                assert_eq!(request_id, id);
+                polls += 1;
+                replies.pop_front().expect("unexpected extra poll")
+            },
+            || pauses += 1,
+        )
+        .unwrap();
+        assert_eq!(result["uuid"], "created-once");
+        assert_eq!(polls, 7);
+        assert_eq!(pauses, polls);
+    }
+
+    #[test]
+    fn approval_poll_exhaustion_keeps_the_error_code_and_tells_callers_which_id_to_query() {
+        let id = uuid::Uuid::new_v4();
+        let mut polls = 0;
+        let error = wait_creation_with(
+            serde_json::json!({"pending":true,"request_id":id}),
+            |request_id| {
+                assert_eq!(request_id, id);
+                polls += 1;
+                Err(control::Error::new(
+                    ErrorCode::HostUnavailable,
+                    "outside control is off",
+                ))
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(polls, 4);
+        assert_eq!(error.code, Some(ErrorCode::HostUnavailable));
+        assert!(error.message.contains(&id.to_string()));
+        assert!(error.message.contains("new-status"));
+    }
+
+    #[test]
+    fn uncoded_approval_poll_error_keeps_the_request_id_and_recovery_guidance() {
+        let id = uuid::Uuid::new_v4();
+        let mut polls = 0;
+        let error = wait_creation_with(
+            serde_json::json!({"pending":true,"request_id":id}),
+            |request_id| {
+                assert_eq!(request_id, id);
+                polls += 1;
+                Err("muxel didn't answer in time".into())
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(polls, 1);
+        assert_eq!(error.code, None);
+        assert!(error.message.starts_with("muxel didn't answer in time"));
+        assert!(error.message.contains(&id.to_string()));
+        assert!(error.message.contains("new-status"));
+        assert!(error.message.contains("do not repeat `new`"));
+    }
+
+    #[test]
+    fn approval_poll_never_retries_a_terminal_host_refusal() {
+        for expected in [
+            control::Error::new(ErrorCode::ApprovalDenied, "denied"),
+            "unknown or expired creation request id".into(),
+        ] {
+            let mut polls = 0;
+            let id = uuid::Uuid::new_v4();
+            let error = wait_creation_with(
+                serde_json::json!({"pending":true,"request_id":id}),
+                |_| {
+                    polls += 1;
+                    Err(expected.clone())
+                },
+                || {},
+            )
+            .unwrap_err();
+            assert_eq!(polls, 1);
+            if expected.code.is_some() {
+                assert_eq!(error, expected);
+            } else {
+                assert_eq!(error.code, None);
+                assert!(error.message.starts_with(&expected.message));
+                assert!(error.message.contains(&id.to_string()));
+                assert!(error.message.contains("do not repeat `new`"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_lost_status_reply_is_retryable_without_claiming_a_mutation_did_nothing() {
+        let dir = scratch("lost-status");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let path = dir.join(control::ENDPOINT_FILE);
+        write_endpoint(
+            &path,
+            &Endpoint {
+                version: PROTOCOL_VERSION,
+                port: listener.local_addr().unwrap().port(),
+                token: "test".into(),
+                pid: std::process::id(),
+                exe: None,
+            },
+        )
+        .unwrap();
+        let host = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                // Lose the reply after receiving the entire request.
+            }
+        });
+        let ambiguous = request_at(
+            &path,
+            Command::New {
+                project: "repo".into(),
+                options: Default::default(),
+            },
+        )
+        .unwrap_err();
+        let status = request_at(
+            &path,
+            Command::NewStatus {
+                request_id: uuid::Uuid::new_v4(),
+            },
+        )
+        .unwrap_err();
+        host.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(ambiguous.code, None);
+        assert_eq!(status.code, Some(ErrorCode::HostUnavailable));
+    }
+
+    #[test]
+    fn a_disconnected_status_dispatch_is_retryable_without_reclassifying_creation() {
+        let (tx, rx) = async_channel::unbounded();
+        drop(rx);
+        for (command, expected) in [
+            (
+                Command::New {
+                    project: "repo".into(),
+                    options: Default::default(),
+                },
+                None,
+            ),
+            (
+                Command::NewStatus {
+                    request_id: uuid::Uuid::new_v4(),
+                },
+                Some(ErrorCode::HostUnavailable),
+            ),
+        ] {
+            let request = control::Request {
+                version: control::request_version(&command),
+                token: "test".into(),
+                command,
+            };
+            assert_eq!(
+                dispatch(request, "test", &tx)
+                    .into_result()
+                    .unwrap_err()
+                    .code,
+                expected
+            );
+        }
+    }
+
+    /// The path a refusal takes from the app to the caller: the server, the
+    /// socket and `muxel ctl`'s reading of the reply.
+    #[test]
+    fn a_refusal_reaches_the_caller_with_its_code() {
+        let dir = scratch("refusal");
+        let (tx, rx) = async_channel::unbounded();
+        let server = Server::start_in(&dir, tx).unwrap();
+        // Stands in for the app: refuse the first send with a code, as a send to
+        // a working agent is, then return an admitted paste receipt.
+        let app = std::thread::spawn(move || {
+            let first = rx.recv_blocking().unwrap();
+            assert!(matches!(
+                &first.command,
+                Command::Send { launch_id: Some(launch), .. } if *launch == uuid::Uuid::from_u128(42)
+            ));
+            let busy = control::Error::new(ErrorCode::Working, "the agent is working");
+            first.reply.send(Response::err(busy)).unwrap();
+            let second = rx.recv_blocking().unwrap();
+            let receipt =
+                control::pasted_prompt_receipt(uuid::Uuid::from_u128(7), uuid::Uuid::from_u128(42));
+            second.reply.send(Response::ok(receipt)).unwrap();
+            let third = rx.recv_blocking().unwrap();
+            assert!(matches!(third.command, Command::Projects));
+            third
+                .reply
+                .send(Response::ok(serde_json::Value::Null))
+                .unwrap();
+        });
+        let path = dir.join(control::ENDPOINT_FILE);
+        let send = || Command::Send {
+            agent: "claude".into(),
+            text: "hi".into(),
+            force: false,
+            launch_id: Some(uuid::Uuid::from_u128(42)),
+        };
+        let refused = request_at(&path, send()).unwrap_err();
+        assert_eq!(refused.code, Some(ErrorCode::Working));
+        let receipt = request_at(&path, send()).unwrap();
+        assert_eq!(receipt["pasted"], true);
+        assert_eq!(receipt["launch_id"], uuid::Uuid::from_u128(42).to_string());
+        assert_eq!(
+            request_at(&path, Command::Projects).unwrap(),
+            serde_json::Value::Null
+        );
+        app.join().unwrap();
+        // Closing removes the file: there is no muxel to ask, and the code says so.
+        drop(server);
+        let gone = request_at(&path, Command::Projects).unwrap_err();
+        assert_eq!(gone.code, Some(ErrorCode::HostUnavailable));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parameterized_creation_requires_exact_version_before_mutation() {
+        let (tx, rx) = async_channel::unbounded();
+        for (version, model, effort, required) in [
+            (2, Some("sonnet"), None, 3),
+            (2, None, Some("high"), 3),
+            (3, None, None, 2),
+        ] {
+            let request: control::Request = serde_json::from_value(serde_json::json!({
+                "version":version, "token":"test", "command": {
+                    "cmd":"new", "project":"repo", "model":model, "effort":effort,
+                }
+            }))
+            .unwrap();
+            let error = dispatch(request, "test", &tx).into_result().unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains(&format!("requires control protocol v{required}"))
+            );
+            assert!(rx.is_empty(), "a mismatched request reached app mutation");
+        }
+        drop(rx);
+        for (version, model) in [(2, None), (3, Some("sonnet"))] {
+            let request: control::Request = serde_json::from_value(serde_json::json!({
+                "version":version, "token":"test", "command": {
+                    "cmd":"new", "project":"repo", "model":model,
+                }
+            }))
+            .unwrap();
+            let error = dispatch(request, "test", &tx).into_result().unwrap_err();
+            assert_eq!(
+                error.message, "muxel is shutting down",
+                "matching version was refused before app dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn a_v2_host_cannot_silently_drop_creation_parameters() {
+        let dir = scratch("v2-parameters");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let path = dir.join(control::ENDPOINT_FILE);
+        write_endpoint(
+            &path,
+            &Endpoint {
+                version: PROTOCOL_VERSION,
+                port: listener.local_addr().unwrap().port(),
+                token: "test".into(),
+                pid: std::process::id(),
+                exe: None,
+            },
+        )
+        .unwrap();
+        let legacy = std::thread::spawn(move || {
+            let mut mutations = 0;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // A v2 host ignores unknown option fields. If this client sends
+                // v2, that host would create with defaults and lose the choices.
+                let response = if request["version"] == 2 {
+                    mutations += 1;
+                    Response::ok(serde_json::json!({"created_with_defaults":true}))
+                } else {
+                    Response::err("v2 host refuses this request version")
+                };
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            mutations
+        });
+        for options in [
+            control::NewOptions {
+                model: Some("sonnet".into()),
+                ..Default::default()
+            },
+            control::NewOptions {
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+        ] {
+            let error = request_at(
+                &path,
+                Command::New {
+                    project: "repo".into(),
+                    options,
+                },
+            )
+            .unwrap_err();
+            assert!(error.message.contains("v2 host refuses"));
+        }
+        assert_eq!(legacy.join().unwrap(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_legacy_host_refuses_guarded_and_creation_requests_before_mutation() {
+        let dir = scratch("legacy-guard");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let path = dir.join(control::ENDPOINT_FILE);
+        write_endpoint(
+            &path,
+            &Endpoint {
+                version: 1,
+                port: listener.local_addr().unwrap().port(),
+                token: "t".into(),
+                pid: std::process::id(),
+                exe: None,
+            },
+        )
+        .unwrap();
+        let commands = [
+            Command::Send {
+                agent: "a".into(),
+                text: "hi".into(),
+                force: false,
+                launch_id: Some(uuid::Uuid::from_u128(42)),
+            },
+            Command::New {
+                project: "repo".into(),
+                options: Default::default(),
+            },
+            Command::New {
+                project: "repo".into(),
+                options: control::NewOptions {
+                    prompt: Some("task".into()),
+                    ..Default::default()
+                },
+            },
+            Command::NewStatus {
+                request_id: uuid::Uuid::new_v4(),
+            },
+        ];
+        let count = commands.len();
+        let legacy = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["version"], 2);
+                stream
+                    .write_all(b"{\"ok\":false,\"error\":\"legacy host rejects request v2\"}\n")
+                    .unwrap();
+            }
+        });
+        for command in commands {
+            let refused = request_at(&path, command).unwrap_err();
+            assert!(refused.message.contains("legacy host rejects"));
+        }
+        legacy.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_left_by_a_muxel_that_exited_reaches_no_one() {
+        let dir = scratch("stale");
+        let mut gone = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit"])
+                .spawn()
+        } else {
+            std::process::Command::new("true").spawn()
+        }
+        .unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let path = dir.join(control::ENDPOINT_FILE);
+        let endpoint = Endpoint {
+            version: PROTOCOL_VERSION,
+            port,
+            token: "t".into(),
+            pid,
+            exe: None,
+        };
+        write_endpoint(&path, &endpoint).unwrap();
+        let error = request_at(&path, Command::Projects).unwrap_err();
+        // Both supported process checks reject the exited owner before connecting.
+        let expected = if cfg!(any(unix, windows)) {
+            ErrorCode::StaleEndpoint
+        } else {
+            ErrorCode::HostUnavailable
+        };
+        assert_eq!(error.code, Some(expected));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_running_process_is_alive_and_an_exited_one_is_not() {

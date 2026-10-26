@@ -7,7 +7,262 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitStopReason {
+    Deadline,
+    Exited,
+    PollError,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GitTimingReceipt {
+    pub pid: u32,
+    pub deadline: Instant,
+    pub spawn_started: Instant,
+    pub spawn_finished: Instant,
+    pub wait_entered: Instant,
+    pub stop: GitStopReason,
+    pub stop_observed: Instant,
+    pub kill_started: Option<Instant>,
+    pub kill_finished: Option<Instant>,
+    pub wait_finished: Instant,
+    pub wait_succeeded: bool,
+}
+
+#[derive(Default)]
+pub struct GitTimings {
+    pub job_starts: Vec<Instant>,
+    pub children: Vec<GitTimingReceipt>,
+}
+
+// Process creation and tree termination can each take seconds on a loaded
+// Windows host. They are measured separately; application delay is still
+// charged against these fixed allowances, rather than a larger wall ceiling.
+const TIMEOUT_RECOGNITION_ALLOWANCE: Duration = Duration::from_secs(1);
+const TIMEOUT_CLEANUP_ALLOWANCE: Duration = Duration::from_secs(1);
+
+fn validate_git_timeout(
+    receipts: &[GitTimingReceipt],
+    expected_deadline: Instant,
+    operation_finished: Instant,
+    spawned: usize,
+    reaped_ids: &[u32],
+) -> Result<(), String> {
+    if spawned == 0 || receipts.len() != spawned || reaped_ids.len() != spawned {
+        return Err("every spawned child must have a receipt and be reaped".into());
+    }
+    let mut remaining: std::collections::HashSet<_> = reaped_ids.iter().copied().collect();
+    if remaining.len() != spawned {
+        return Err("reaped child IDs must be unique".into());
+    }
+    let mut os_time = Duration::ZERO;
+    for receipt in receipts {
+        if !remaining.remove(&receipt.pid) {
+            return Err("receipt must identify its reaped child exactly once".into());
+        }
+        if receipt.deadline != expected_deadline {
+            return Err("the requested absolute deadline changed".into());
+        }
+        if receipt.stop != GitStopReason::Deadline {
+            return Err("the deadline branch must cause termination".into());
+        }
+        if !receipt.wait_succeeded {
+            return Err("the explicit child wait must succeed".into());
+        }
+        let (Some(kill_started), Some(kill_finished)) =
+            (receipt.kill_started, receipt.kill_finished)
+        else {
+            return Err("deadline termination must have a measured OS kill interval".into());
+        };
+        if !(receipt.spawn_started <= receipt.spawn_finished
+            && receipt.spawn_finished <= receipt.wait_entered
+            && receipt.wait_entered <= receipt.stop_observed
+            && expected_deadline <= receipt.stop_observed
+            && receipt.stop_observed <= kill_started
+            && kill_started <= kill_finished
+            && kill_finished <= receipt.wait_finished
+            && receipt.wait_finished <= operation_finished)
+        {
+            return Err("timeout receipt timestamps are out of order".into());
+        }
+        // A blocked spawn cannot be interrupted by the polling loop. Once it
+        // returns, neither stderr setup nor late loop entry gets a free pass.
+        let recognition = receipt
+            .stop_observed
+            .duration_since(expected_deadline.max(receipt.spawn_finished));
+        if recognition > TIMEOUT_RECOGNITION_ALLOWANCE {
+            return Err(format!("deadline recognition was late by {recognition:?}"));
+        }
+        os_time += receipt
+            .spawn_finished
+            .saturating_duration_since(expected_deadline.max(receipt.spawn_started));
+        os_time += kill_finished.duration_since(kill_started);
+    }
+    // Exclude only actual overdue process creation and OS termination calls.
+    // Child waiting, pre-spawn work, temp cleanup and library rereads remain
+    // visible, including when startup itself outlasted the deadline.
+    let charged_lateness = operation_finished
+        .saturating_duration_since(expected_deadline)
+        .saturating_sub(os_time);
+    if charged_lateness > TIMEOUT_RECOGNITION_ALLOWANCE + TIMEOUT_CLEANUP_ALLOWANCE {
+        return Err(format!(
+            "non-OS timeout work was late by {charged_lateness:?}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn git_job_deadline(env: &crate::integrations::GitEnv, timeout: Duration) -> Instant {
+    let timings = env
+        .timings
+        .as_ref()
+        .expect("enable timing receipts")
+        .lock()
+        .unwrap();
+    assert_eq!(timings.job_starts.len(), 1, "one independently timed job");
+    timings.job_starts[0] + timeout
+}
+
+pub fn assert_git_timeout(
+    env: &crate::integrations::GitEnv,
+    expected_deadline: Instant,
+    operation_finished: Instant,
+) {
+    let timings = env
+        .timings
+        .as_ref()
+        .expect("enable timing receipts")
+        .lock()
+        .unwrap();
+    let reaped = env
+        .reaped
+        .as_ref()
+        .expect("track reaped children")
+        .lock()
+        .unwrap();
+    let reaped_ids: Vec<_> = reaped.iter().map(std::process::Child::id).collect();
+    if let Err(reason) = validate_git_timeout(
+        &timings.children,
+        expected_deadline,
+        operation_finished,
+        env.spawned.load(Ordering::SeqCst),
+        &reaped_ids,
+    ) {
+        panic!("{reason}; receipts: {:?}", timings.children);
+    }
+}
+
+#[cfg(test)]
+mod git_timeout_budget_tests {
+    use super::{GitStopReason, GitTimingReceipt, validate_git_timeout};
+    use std::time::{Duration, Instant};
+
+    fn receipt(start: Instant) -> GitTimingReceipt {
+        GitTimingReceipt {
+            pid: 1,
+            deadline: start + Duration::from_secs(2),
+            spawn_started: start,
+            spawn_finished: start + Duration::from_secs(12),
+            wait_entered: start + Duration::from_millis(12_010),
+            stop: GitStopReason::Deadline,
+            stop_observed: start + Duration::from_millis(12_020),
+            kill_started: Some(start + Duration::from_millis(12_020)),
+            kill_finished: Some(start + Duration::from_millis(42_020)),
+            wait_finished: start + Duration::from_millis(42_030),
+            wait_succeeded: true,
+        }
+    }
+
+    fn check(receipt: GitTimingReceipt, deadline: Instant) -> Result<(), String> {
+        validate_git_timeout(
+            &[receipt],
+            deadline,
+            receipt.wait_finished + Duration::from_millis(10),
+            1,
+            &[1],
+        )
+    }
+
+    #[test]
+    fn long_os_calls_do_not_hide_a_prompt_absolute_deadline() {
+        let start = Instant::now();
+        assert!(check(receipt(start), start + Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn restarted_deadline_or_wrong_stop_or_missing_wait_is_rejected() {
+        let start = Instant::now();
+        let original = receipt(start);
+        for changed in [
+            GitTimingReceipt {
+                deadline: original.spawn_finished + Duration::from_secs(2),
+                ..original
+            },
+            GitTimingReceipt {
+                stop: GitStopReason::PollError,
+                ..original
+            },
+            GitTimingReceipt {
+                stop: GitStopReason::Exited,
+                ..original
+            },
+            GitTimingReceipt {
+                wait_succeeded: false,
+                ..original
+            },
+        ] {
+            assert!(check(changed, original.deadline).is_err());
+        }
+    }
+
+    #[test]
+    fn late_recognition_and_late_wait_entry_are_both_rejected() {
+        let original = receipt(Instant::now());
+        for late_entry in [false, true] {
+            let mut changed = original;
+            let delay = Duration::from_secs(2);
+            if late_entry {
+                changed.wait_entered += delay;
+            }
+            changed.stop_observed += delay;
+            changed.kill_started = changed.kill_started.map(|at| at + delay);
+            changed.kill_finished = changed.kill_finished.map(|at| at + delay);
+            changed.wait_finished += delay;
+            assert!(check(changed, original.deadline).is_err());
+        }
+    }
+
+    #[test]
+    fn child_wait_and_pre_spawn_delay_remain_charged() {
+        let original = receipt(Instant::now());
+        let mut slow_wait = original;
+        slow_wait.wait_finished += Duration::from_secs(3);
+        assert!(check(slow_wait, original.deadline).is_err());
+        let mut slow_setup = original;
+        slow_setup.spawn_started += Duration::from_secs(6);
+        assert!(check(slow_setup, original.deadline).is_err());
+    }
+
+    #[test]
+    fn missing_receipts_or_unreaped_children_are_rejected() {
+        let original = receipt(Instant::now());
+        assert!(
+            validate_git_timeout(&[], original.deadline, original.wait_finished, 1, &[1]).is_err()
+        );
+        assert!(
+            validate_git_timeout(
+                &[original],
+                original.deadline,
+                original.wait_finished,
+                1,
+                &[]
+            )
+            .is_err()
+        );
+    }
+}
 
 /// How a [`TestServer`] treats each connection it accepts.
 #[derive(Clone, Copy)]
@@ -135,6 +390,10 @@ pub fn git_out(dir: &Path, args: &[&str]) -> String {
             "user.email=muxel-test@example.invalid",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
         ])
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")

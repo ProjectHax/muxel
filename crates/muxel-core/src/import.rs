@@ -22,7 +22,7 @@
 
 use crate::PresetKind;
 use crate::agent::AgentPreset;
-use crate::tmux::RemoteSession;
+use crate::tmux::{RemoteSession, SessionTarget};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -32,7 +32,7 @@ pub enum ImportSource {
     /// A live tmux session: attach to it. The agent is untouched.
     TmuxSession {
         /// The session's own name, which the pane attaches to verbatim.
-        session: String,
+        session: SessionTarget,
     },
     /// A process running outside tmux. Its conversation can be resumed, but the
     /// process itself keeps running — `session_id` is `None` when muxel couldn't
@@ -127,18 +127,19 @@ fn basename(command: &str) -> &str {
 /// panes on one session.
 pub fn tmux_candidates(
     sessions: &[RemoteSession],
-    owned: &[String],
+    owned: &[SessionTarget],
     root: &str,
     presets: &[AgentPreset],
 ) -> Vec<ImportCandidate> {
+    let owned = crate::tmux::owned_session_keys(sessions, owned);
     sessions
         .iter()
-        .filter(|s| !owned.iter().any(|o| o == &s.name))
+        .filter(|s| !owned.contains(&(s.name.as_str(), &s.socket)))
         .map(|s| {
             let preset = preset_for_command(presets, &s.command);
             ImportCandidate {
                 source: ImportSource::TmuxSession {
-                    session: s.name.clone(),
+                    session: s.target(),
                 },
                 program: Some(s.command.clone()),
                 preset_id: preset.map(|p| p.id),
@@ -504,7 +505,15 @@ fn recency(source: &ImportSource) -> i64 {
 /// A stable tiebreak, so equal rows keep a fixed order across refreshes.
 fn key(source: &ImportSource) -> String {
     match source {
-        ImportSource::TmuxSession { session } => session.clone(),
+        ImportSource::TmuxSession { session } => format!(
+            "{}:{}",
+            session
+                .socket
+                .as_ref()
+                .unwrap_or(&crate::tmux::Socket::Private)
+                .name(),
+            session.name
+        ),
         ImportSource::Running { pid, .. } => pid.to_string(),
         ImportSource::Conversation { session_id, .. } => session_id.clone(),
     }
@@ -518,7 +527,7 @@ mod tests {
         preset_for_command, process_candidates, process_probe_command, sort_candidates,
     };
     use crate::agent::AgentPreset;
-    use crate::tmux::RemoteSession;
+    use crate::tmux::{RemoteSession, SessionTarget};
     use std::path::Path;
 
     fn presets() -> Vec<AgentPreset> {
@@ -532,6 +541,7 @@ mod tests {
     fn session(name: &str, path: &str, command: &str) -> RemoteSession {
         RemoteSession {
             name: name.to_string(),
+            socket: crate::tmux::Socket::Private,
             path: path.to_string(),
             command: command.to_string(),
             title: String::new(),
@@ -563,16 +573,12 @@ mod tests {
             session("muxel_proj_1a2b3c4d", "/home/u/proj", "claude"),
         ];
         // The muxel-owned one is already a pane; the user's own is the point.
-        let got = tmux_only(
-            &sessions,
-            &["muxel_proj_1a2b3c4d".to_string()],
-            "/home/u/proj",
-        );
+        let got = tmux_only(&sessions, &["muxel_proj_1a2b3c4d".into()], "/home/u/proj");
         assert_eq!(got.len(), 1);
         assert_eq!(
             got[0].source,
             ImportSource::TmuxSession {
-                session: "work".to_string()
+                session: SessionTarget::new("work", Some(crate::tmux::Socket::Private))
             }
         );
         assert!(got[0].in_tree);
@@ -587,7 +593,30 @@ mod tests {
         assert!(!got[0].in_tree);
     }
 
-    fn tmux_only(sessions: &[RemoteSession], owned: &[String], root: &str) -> Vec<ImportCandidate> {
+    #[test]
+    fn importing_one_socket_keeps_the_namesake_on_the_other_available() {
+        let private = session("work", "/home/u/proj", "claude");
+        let mut default = private.clone();
+        default.socket = crate::tmux::Socket::Default;
+        let got = tmux_only(
+            &[private.clone(), default.clone()],
+            &[private.target()],
+            "/home/u/proj",
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].source,
+            ImportSource::TmuxSession {
+                session: default.target()
+            }
+        );
+    }
+
+    fn tmux_only(
+        sessions: &[RemoteSession],
+        owned: &[SessionTarget],
+        root: &str,
+    ) -> Vec<ImportCandidate> {
         super::tmux_candidates(sessions, owned, root, &presets())
     }
 
@@ -835,11 +864,7 @@ nonsense
     #[test]
     fn a_shells_prompt_is_not_a_summary_but_a_colon_in_real_work_is() {
         assert_eq!(
-            informative_title(
-                "ryan@zen-rhel:~/Projects/Bot/cloud-app",
-                Some("zsh"),
-                "Shell"
-            ),
+            informative_title("me@devbox:~/Projects/work/site", Some("zsh"), "Shell"),
             None
         );
         assert_eq!(
@@ -901,7 +926,7 @@ nonsense
         let order: Vec<String> = rows.iter().map(|r| super::key(&r.source)).collect();
         assert_eq!(
             order,
-            vec!["mine", "new", "old", "outside"],
+            vec!["mxl:mine", "new", "old", "mxl:outside"],
             "in-tree first, attachable before resumable, newest conversation first"
         );
     }
