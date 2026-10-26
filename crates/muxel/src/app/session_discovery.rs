@@ -1421,7 +1421,8 @@ fn claim_validated_claude_record(
 mod grok_regressions {
     use super::super::{
         AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopRun, MuxelApp,
-        PostRunAction, grok_switch_interval, popout_lifecycle_tests::with_app,
+        PostRunAction, conpty_test_support::ChildHandle, grok_switch_interval,
+        popout_lifecycle_tests::with_app,
     };
     use super::{DiscoveryBatch, DiscoveryCandidate, SessionCandidate};
     use gpui::{AppContext as _, Context, TestAppContext, Window, WindowHandle};
@@ -1433,48 +1434,11 @@ mod grok_regressions {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
     use uuid::Uuid;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-    };
 
     struct StopChild(Arc<TerminalSession>);
     impl Drop for StopChild {
         fn drop(&mut self) {
             self.0.kill();
-        }
-    }
-
-    struct ChildHandle(HANDLE);
-    impl ChildHandle {
-        fn new(session: &TerminalSession) -> Self {
-            // SAFETY: this is the PTY created by this fixture. Retain the handle
-            // before Restart so PID reuse cannot satisfy a liveness assertion.
-            Self(unsafe {
-                OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                    false,
-                    session.child_pid().unwrap(),
-                )
-                .unwrap()
-            })
-        }
-
-        fn running(&self) -> bool {
-            // SAFETY: the retained handle stays open until this guard drops.
-            let status = unsafe { WaitForSingleObject(self.0, 0) };
-            if status == WAIT_TIMEOUT {
-                true
-            } else {
-                assert_eq!(status, WAIT_OBJECT_0);
-                false
-            }
-        }
-    }
-    impl Drop for ChildHandle {
-        fn drop(&mut self) {
-            // SAFETY: this guard exclusively owns the retained process handle.
-            let _ = unsafe { CloseHandle(self.0) };
         }
     }
 
@@ -1555,10 +1519,13 @@ mod grok_regressions {
     #[test]
     fn gasq_restart_preserves_unsaved_grok_and_then_resumes_its_accepted_identity() {
         with_app(|cx, window| {
-            let (old_process, replacement, report, identity) = checked_update(
+            let (old_process, replacement, report, identity, pane) = checked_update(
                 window,
                 cx,
                 |app, window, cx| {
+                    // Pump terminal replies below without polling real provider
+                    // registries or running unrelated status ticks.
+                    app._status_timer = gpui::Task::ready(());
                     app.current_workspace = Some(Uuid::new_v4());
                     app.use_tmux = false;
                     app.use_worktree = false;
@@ -1628,33 +1595,40 @@ mod grok_regressions {
                         saved.instance(id).unwrap().session_id.as_deref(),
                         Some(identity.as_str())
                     );
-                    (old_process, replacement, report, identity)
+                    (old_process, replacement, report, identity, id)
                 },
             );
-            let cap = Instant::now() + Duration::from_secs(10);
-            let mut cursor_reply = Instant::now() - Duration::from_secs(1);
+            let replacement_process = ChildHandle::new(&replacement.0);
+            // PowerShell and the batch fixture are real OS processes; the
+            // virtual GPUI clock cannot accelerate their startup on loaded CI.
+            let cap = Instant::now() + Duration::from_secs(30);
             loop {
-                let selected = std::fs::read_to_string(&report).unwrap_or_default();
+                cx.executor().advance_clock(Duration::from_millis(10));
+                cx.run_until_parked();
+                let selected = std::fs::read_to_string(&report);
                 if !old_process.running()
-                    && selected.lines().collect::<Vec<_>>() == ["--resume", identity.as_str()]
+                    && selected
+                        .as_ref()
+                        .is_ok_and(|selected| selected.lines().eq(["--resume", identity.as_str()]))
                 {
                     break;
                 }
-                // Headless ConPTY can wait for a cursor-position response before
-                // starting cmd. Supply the same reply as the batch-runner test
-                // without pumping the app's provider-registry polling tasks.
-                if selected.is_empty() && cursor_reply.elapsed() >= Duration::from_millis(100) {
-                    replacement.0.write_input(b"\x1b[1;1R");
-                    cursor_reply = Instant::now();
-                }
                 assert!(
                     Instant::now() < cap,
-                    "Restart fixture did not select the accepted identity at {}: {selected:?}",
-                    report.display()
+                    "Restart fixture did not select the accepted identity at {}: {selected:?}; old_running={}, replacement_running={}, output={:?}",
+                    report.display(),
+                    old_process.running(),
+                    replacement_process.running(),
+                    window
+                        .update(cx, |app, _, cx| {
+                            app.terminal_view(pane)
+                                .map(|view| view.read(cx).visible_text())
+                        })
+                        .unwrap(),
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(replacement.0.child_pid().is_some());
+            assert!(replacement_process.running());
         });
     }
 

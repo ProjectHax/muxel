@@ -59,6 +59,8 @@ use uuid::Uuid;
 mod accomplishments_ui;
 #[cfg(all(test, windows))]
 mod codex_capture_tests;
+#[cfg(all(test, windows))]
+mod conpty_test_support;
 mod control_api;
 mod hotbar;
 mod libraries_ui;
