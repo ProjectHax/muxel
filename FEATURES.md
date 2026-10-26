@@ -825,17 +825,23 @@ feature is added or changed, update the matching entry here in the same change**
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
   receipt confirms writer admission with `pasted: true`.
-  Codex, Claude and Grok sends then observe fresh provider acceptance for up to
-  ten seconds and report `submission_confirmed` and `enter_retries`. Unknown
-  acceptance is reported as false; unsupported providers report null. Only
-  Windows Codex may receive one extra Enter after five seconds, with the same
-  launch, permission and input guards and an exact fully visible ASCII prose
-  draft in its idle composer. A compact composer frame captured before paste
-  and an added blank cursor line must prove that its first Enter was consumed,
-  with no resize or title change. Wrapped prose is
-  supported; clipped, multiline, Unicode, completion or ambiguous drafts are
-  left for inspection. Claude and Grok get no automatic retry. Text is never
-  pasted again, and an unconfirmed receipt does not authorize resending it.
+  Codex, Claude and Grok sends then observe fresh provider acceptance for about
+  ten seconds (three more after a retry) and report `submission_confirmed` and
+  `enter_retries`. Unknown acceptance is reported as false with an
+  `unconfirmed_reason` (`timed_out`, `input_changed` or `interrupted`); once
+  Enter is in, the reply is always this receipt, never an error. muxel doesn't
+  wait when the pane can't show a receipt — an unsupported provider, or no
+  readable idle status title (tmux hides titles) with a Grok, multi-paragraph or
+  repeated prompt — and reports null. Turning outside control off stops the
+  later Enters and keys of `send`, `answer` and `keys`. Only Windows Codex may
+  receive one extra Enter after five seconds, with the same launch, permission
+  and input guards and an exact fully visible ASCII prose draft in its idle
+  composer. A compact composer frame captured before paste and an added blank
+  cursor line must prove that its first Enter was consumed, with no resize or
+  title change. Wrapped prose is supported; clipped, multiline, Unicode,
+  completion or ambiguous drafts are left for inspection. Claude and Grok get no
+  automatic retry. Text is never pasted again, and an unconfirmed receipt does
+  not authorize resending it.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It

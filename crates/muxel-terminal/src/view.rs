@@ -1611,6 +1611,15 @@ pub struct PromptSubmission {
     allow_working_title: bool,
     before_prompt: Option<String>,
     origin: Option<PromptOriginProof>,
+    observable: bool,
+}
+
+impl PromptSubmission {
+    /// Whether this pane can show a receipt for this prompt at all. Without
+    /// one, waiting for confirmation only delays the caller.
+    pub fn observable(&self) -> bool {
+        self.observable
+    }
 }
 
 struct PromptOriginProof {
@@ -1815,6 +1824,28 @@ fn ctl_title_can_confirm(
             provider_screen_status(provider, &screen.text),
             Some(AgentStatus::Working | AgentStatus::Blocked)
         )
+}
+
+/// A ctl receipt is either a working title after an idle one, which needs a
+/// provider status title muxel can read (tmux hides OSC titles), or a fresh
+/// transcript row beside an empty composer. Those readers stop at the first
+/// blank line, so only a prompt without one can match; a row repeating the
+/// previous prompt is never fresh; and Grok's composer is never known empty.
+fn ctl_acceptance_observable(
+    provider: TitleProvider,
+    title: Option<&str>,
+    allow_working_title: bool,
+    input: &str,
+    before_prompt: Option<&str>,
+) -> bool {
+    let title_receipt = allow_working_title
+        && parse_agent_title(provider, title)
+            .and_then(|frame| frame.status)
+            .is_some();
+    let transcript_receipt = matches!(provider, TitleProvider::Claude | TitleProvider::Codex)
+        && !input.trim().lines().any(|line| line.trim().is_empty())
+        && before_prompt != Some(crate::startup::normalized(input).as_str());
+    title_receipt || transcript_receipt
 }
 
 fn prompt_submission_state(
@@ -2951,6 +2982,14 @@ impl TerminalView {
         } else {
             None
         };
+        let observable = origin.is_some()
+            || ctl_acceptance_observable(
+                self.title_provider,
+                title.as_deref(),
+                allow_working_title,
+                text,
+                before_prompt.as_deref(),
+            );
         // Preserve this generation even if it changes while reading history.
         // Returning None would incorrectly downgrade a switch to an unsupported
         // provider and skip the caller's pre-Enter interruption check.
@@ -2965,6 +3004,7 @@ impl TerminalView {
             allow_working_title,
             before_prompt,
             origin,
+            observable,
         })
     }
 
@@ -3843,8 +3883,8 @@ mod startup_readiness_tests {
         PromptOriginProof, PromptSubmissionState, QuietStartup, QuietStartupTarget, SHIFT_TAB,
         STARTUP_KEY_GAP_MS, STARTUP_MAX_WAIT_MS, STARTUP_PRE_TYPE_MS, STARTUP_SUBMIT_DELAY_MS,
         StartupAttempt, TitleProvider, claude_startup_ready, codex_ctl_ready,
-        controlled_startup_deadline, ctl_title_can_confirm, ctl_transcript_prompt,
-        prompt_submission_state, quiet_startup, startup_has_fresh_user_row,
+        controlled_startup_deadline, ctl_acceptance_observable, ctl_title_can_confirm,
+        ctl_transcript_prompt, prompt_submission_state, quiet_startup, startup_has_fresh_user_row,
         startup_provider_accepted, startup_ready, startup_retry_allowed,
     };
     use crate::startup::Screen;
@@ -4113,6 +4153,52 @@ mod startup_readiness_tests {
                 status
             ));
         }
+    }
+
+    #[test]
+    fn ctl_send_waits_only_where_a_receipt_can_be_seen() {
+        let multi = "first paragraph\n\nsecond paragraph";
+        for (provider, idle) in [
+            (TitleProvider::Codex, "scratch | Ready"),
+            (TitleProvider::Claude, "✳ scratch"),
+            (TitleProvider::Grok, "scratch - grok"),
+        ] {
+            // A readable status title confirms any prompt sent while idle.
+            assert!(ctl_acceptance_observable(
+                provider,
+                Some(idle),
+                true,
+                multi,
+                Some("first paragraph")
+            ));
+            // tmux hides the title and a busy pane can't use it either; then
+            // only a fresh transcript row the readers return whole can confirm.
+            for (title, allow) in [(None, true), (Some(idle), false)] {
+                assert!(!ctl_acceptance_observable(
+                    provider, title, allow, multi, None
+                ));
+                assert_eq!(
+                    ctl_acceptance_observable(provider, title, allow, "one\nparagraph\n", None),
+                    provider != TitleProvider::Grok
+                );
+                // The same prompt again leaves the newest row unchanged.
+                assert!(!ctl_acceptance_observable(
+                    provider,
+                    title,
+                    allow,
+                    "continue ",
+                    Some("continue")
+                ));
+            }
+        }
+        // A Codex thread-only title carries no run state to watch.
+        assert!(!ctl_acceptance_observable(
+            TitleProvider::Codex,
+            Some("scratch"),
+            true,
+            multi,
+            None
+        ));
     }
 
     #[test]
