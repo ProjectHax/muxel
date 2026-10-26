@@ -9366,18 +9366,7 @@ impl MuxelApp {
                             // not adopted a second time.
                             if let Some(sessions) = sessions {
                                 if let Some(host) = this.remote_host_for_project(pid) {
-                                    let instances =
-                                        this.workspace.instances.iter_mut().filter(|instance| {
-                                            instance.project_id == pid
-                                                && instance.kind == InstanceKind::Terminal
-                                                && host.use_tmux(instance.use_tmux)
-                                        });
-                                    muxel_core::tmux::bind_session_owners(
-                                        &host.name,
-                                        instances,
-                                        &sessions,
-                                        integrations::profile_tmux_socket(),
-                                    );
+                                    this.bind_connect_session_owners(pid, &host, &sessions);
                                     this.persist();
                                 }
                                 // Finish any close whose kill never landed *first*,
@@ -9919,6 +9908,63 @@ impl MuxelApp {
             .iter()
             .find(|h| h.id == r.host_id)
             .map(|h| h.effective(&self.identities))
+    }
+
+    fn bind_connect_session_owners(
+        &mut self,
+        pid: Uuid,
+        host: &RemoteHost,
+        sessions: &[muxel_core::tmux::RemoteSession],
+    ) {
+        let eligible = |instance: &Instance| {
+            instance.project_id == pid
+                && instance.kind == InstanceKind::Terminal
+                && host.use_tmux(instance.use_tmux)
+        };
+        let before: Vec<_> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|instance| eligible(instance))
+            .map(|instance| {
+                (
+                    instance.id,
+                    instance.tmux_session.clone(),
+                    instance.tmux_socket.clone(),
+                )
+            })
+            .collect();
+        let instances = self
+            .workspace
+            .instances
+            .iter_mut()
+            .filter(|instance| eligible(instance));
+        muxel_core::tmux::bind_session_owners(
+            &host.name,
+            instances,
+            sessions,
+            integrations::profile_tmux_socket(),
+        );
+        // Connection inventory can establish a new owner without changing the
+        // peer layout. A restart still targeting the old owner must give up its
+        // lease before the connection attempts to spawn this pane.
+        let changed: Vec<_> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|instance| eligible(instance))
+            .zip(before)
+            .filter_map(|(now, (iid, old_session, old_socket))| {
+                debug_assert_eq!(now.id, iid);
+                (!now.literal_argv
+                    && (now.tmux_session != old_session || now.tmux_socket != old_socket))
+                    .then_some(iid)
+            })
+            .collect();
+        for iid in changed {
+            self.terminal_restarts.owner_changed(iid);
+            self.failed_launches.remove(&iid);
+        }
     }
 
     /// Spawn any missing terminals/editors for a project's panes (no remote
@@ -12280,6 +12326,8 @@ impl MuxelApp {
     /// pane can now attach to. Restart would instead kill what the peer started.
     fn retry_rebound_launches(&mut self, before: &[Instance], after: &[Instance]) {
         for iid in muxel_core::rebound_instances(before, after) {
+            // The old restart no longer owns the peer's new session.
+            self.terminal_restarts.owner_changed(iid);
             self.failed_launches.remove(&iid);
         }
     }
@@ -16738,6 +16786,8 @@ impl MuxelApp {
                 continue;
             }
             instance.tmux_socket = Some(Socket::Private);
+            // Free launch admission before trying to attach to the peer's owner.
+            self.terminal_restarts.owner_changed(iid);
             self.bump_session_binding_generation(iid);
             self.failed_launches.remove(&iid);
             changed = true;
@@ -19307,6 +19357,7 @@ impl MuxelApp {
         if !inst.permits_launch(muxel_core::TerminalLaunchReason::Restart) {
             return;
         }
+        let owner_generation = self.terminal_restarts.owner_generation(iid);
         let Some(restart) = self.terminal_restarts.begin(inst) else {
             return;
         };
@@ -19402,7 +19453,9 @@ impl MuxelApp {
                 Ok(closed) => {
                     let saved = this
                         .update(cx, |this, _| {
-                            if this.current_workspace != workspace {
+                            if this.current_workspace != workspace
+                                || this.terminal_restarts.owner_generation(iid) != owner_generation
+                            {
                                 return false;
                             }
                             if !this.terminal_restarts.record_owner(
@@ -19439,8 +19492,11 @@ impl MuxelApp {
                         match prepared {
                             Ok(next) => this
                                 .update(cx, |this, _| {
-                                    if this.current_workspace != workspace {
-                                        anyhow::bail!("workspace changed during restart");
+                                    if this.current_workspace != workspace
+                                        || this.terminal_restarts.owner_generation(iid)
+                                            != owner_generation
+                                    {
+                                        anyhow::bail!("the pane's binding changed during restart");
                                     }
                                     this.save_restart_migration(iid, restart, &expected, &next)
                                 })
@@ -19464,6 +19520,7 @@ impl MuxelApp {
                     project,
                     workspace,
                     token: restart,
+                    owner_generation,
                     host: host_name,
                     session: label,
                     killed,
@@ -19531,6 +19588,7 @@ impl MuxelApp {
             project,
             workspace,
             token: restart,
+            owner_generation,
             host: host_name,
             session: label,
             killed,
@@ -19540,11 +19598,15 @@ impl MuxelApp {
             .err()
             .map(|error| format!("{label}: {error:#}"));
         let completed = Self::in_project_or_main(this, Some(project), cx, |this, window, cx| {
-            if this.current_workspace != workspace
-                || !this.terminal_restarts.finish(iid, restart)
+            if this.current_workspace != workspace {
+                return;
+            }
+            let same_binding = this.terminal_restarts.owner_generation(iid) == owner_generation;
+            if !this.terminal_restarts.finish(iid, restart)
+                || !same_binding
                 || this.workspace.instance(iid).is_none()
             {
-                return; // closed while the kill was in flight
+                return; // closed or rebound while the kill was in flight
             }
             if let Err(e) = killed {
                 this.fail_restart(
@@ -19575,9 +19637,12 @@ impl MuxelApp {
             // whichever window now shows the project.
             let project = this
                 .update(cx, |this, cx| {
-                    if this.current_workspace != workspace
-                        || !this.terminal_restarts.finish(iid, restart)
-                    {
+                    if this.current_workspace != workspace {
+                        return None;
+                    }
+                    let same_binding =
+                        this.terminal_restarts.owner_generation(iid) == owner_generation;
+                    if !this.terminal_restarts.finish(iid, restart) || !same_binding {
                         return None;
                     }
                     if let Some(error) = &failure {
