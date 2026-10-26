@@ -10,6 +10,766 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
+use muxel_core::muse::HOOK_FLAG as MUSE_HOOK_FLAG;
+const MUSE_BINDING_DIR: &str = "provider-session-bindings/muse";
+const MUSE_HOOK_WORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MuseLaunch {
+    #[serde(default)]
+    launch_id: Uuid,
+    #[serde(default)]
+    session_root: PathBuf,
+    #[serde(default)]
+    context: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MuseBinding {
+    #[serde(default)]
+    launch_id: Uuid,
+    #[serde(default)]
+    metadata: muxel_core::muse::MuseMetadata,
+}
+
+fn muse_pane_dir(data_dir: &Path, instance_id: Uuid) -> PathBuf {
+    data_dir
+        .join(MUSE_BINDING_DIR)
+        .join(instance_id.to_string())
+}
+
+fn write_muse_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let parent = path.parent().context("Muse binding has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    replace_muse_json(path, value)
+}
+
+fn replace_muse_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    std::fs::write(&temp, serde_json::to_vec(value)?)?;
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn muse_env(name: &str, env: &[(String, String)]) -> Option<OsString> {
+    env.iter()
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| OsString::from(value))
+        .or_else(|| std::env::var_os(name))
+        .filter(|value| !value.is_empty())
+}
+
+fn muse_home(env: &[(String, String)]) -> Option<PathBuf> {
+    muse_env("HOME", env)
+        .or_else(|| muse_env("USERPROFILE", env))
+        .map(PathBuf::from)
+}
+
+pub(crate) fn muse_data_dir(env: &[(String, String)]) -> Option<PathBuf> {
+    muse_env("XDG_DATA_HOME", env)
+        .map(PathBuf::from)
+        .or_else(|| muse_home(env).map(|home| home.join(".local/share")))
+        .map(|root| root.join("muse"))
+}
+
+/// Read directory names and stat one exact UUID candidate per date. Never open
+/// session.jsonl or pick a sibling conversation by cwd, title or timestamp.
+pub(crate) fn muse_session_exists(root: &Path, session_id: &str) -> std::io::Result<bool> {
+    if Uuid::parse_str(session_id).is_err() {
+        return Ok(false);
+    }
+    fn date_dirs(root: &Path, digits: usize) -> std::io::Result<Vec<PathBuf>> {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut dirs = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_name().to_str().is_some_and(|name| {
+                name.len() == digits && name.bytes().all(|b| b.is_ascii_digit())
+            }) && entry.file_type()?.is_dir()
+            {
+                dirs.push(entry.path());
+            }
+        }
+        Ok(dirs)
+    }
+    let store = root.join("sessions");
+    for year in date_dirs(&store, 4)? {
+        for month in date_dirs(&year, 2)? {
+            for day in date_dirs(&month, 2)? {
+                let candidate = day.join(session_id).join("session.jsonl");
+                let exists = match std::fs::metadata(&candidate) {
+                    Ok(metadata) => metadata.is_file(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error),
+                };
+                if exists
+                    && let Ok(relative) = candidate.strip_prefix(&store)
+                    && muxel_core::muse::session_log(session_id, &[relative.to_path_buf()])
+                        .is_some()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// A separate managed source leaves native user/project hook loading intact.
+/// Existing managed handlers are copied verbatim before adding our handlers.
+pub(crate) fn prepare_muse_hooks(
+    data_dir: &Path,
+    instance_id: Uuid,
+    env: &[(String, String)],
+    args: &[String],
+    context: Option<&str>,
+    reattaching: bool,
+) -> Option<String> {
+    let prepared = prepare_muse_hooks_inner(data_dir, instance_id, env, args, context, reattaching);
+    if !reattaching && !matches!(&prepared, Ok(Some(_))) {
+        // A plain replacement process cannot produce the previous launch's
+        // hooks. Do not let its old metadata masquerade as a current binding.
+        invalidate_muse_launch(data_dir, instance_id);
+    }
+    match prepared {
+        Ok(argument) => argument,
+        Err(error) => {
+            log::warn!("Muse pane session hooks unavailable: {error:#}");
+            None
+        }
+    }
+}
+
+fn prepare_muse_hooks_inner(
+    data_dir: &Path,
+    instance_id: Uuid,
+    env: &[(String, String)],
+    args: &[String],
+    context: Option<&str>,
+    reattaching: bool,
+) -> Result<Option<String>> {
+    let pane_dir = muse_pane_dir(data_dir, instance_id);
+    let hooks_path = pane_dir.join("hooks.json");
+    let previous_nonce = reattaching
+        .then(|| {
+            serde_json::from_slice::<MuseLaunch>(&std::fs::read(pane_dir.join("launch.json")).ok()?)
+                .ok()
+                .map(|launch| launch.launch_id)
+        })
+        .flatten();
+    match muxel_core::muse::hook_launch(reattaching, previous_nonce) {
+        muxel_core::muse::HookLaunch::Reattach(_) => {
+            if !hooks_path.is_file() {
+                bail!(
+                    "surviving Muse tmux process has no managed hook file; leaving its launch unchanged"
+                );
+            }
+            // tmux -A ignores this command when attaching. Preserve the exact
+            // launch, context, managed file and nonce already held by Muse.
+            return Ok(Some(muse_hook_argument(&hooks_path)?));
+        }
+        muxel_core::muse::HookLaunch::Unmanaged => {
+            bail!(
+                "surviving Muse tmux process has no known hook launch; cannot install hooks by reattaching"
+            );
+        }
+        muxel_core::muse::HookLaunch::Start => {}
+    }
+    // A custom invocation may replace the same source. Preserve its meaning
+    // rather than silently winning a duplicate -c override.
+    if muxel_core::muse::has_hook_override(args) {
+        return Ok(None);
+    }
+    let config = muse_env("XDG_CONFIG_HOME", env)
+        .map(PathBuf::from)
+        .or_else(|| muse_home(env).map(|home| home.join(".config")))
+        .context("could not resolve Muse configuration root")?;
+    let settings_path = config.join("muse/settings.json");
+    let settings: Value = match std::fs::read(&settings_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("parsing Muse settings")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error).context("reading Muse settings"),
+    };
+    let prior = match settings
+        .get("managed_hooks_path")
+        .filter(|value| !value.is_null())
+    {
+        Some(value) => {
+            let path = PathBuf::from(
+                value
+                    .as_str()
+                    .context("managed_hooks_path must be a string")?,
+            );
+            let path = if path.is_absolute() {
+                path
+            } else {
+                settings_path.parent().unwrap().join(path)
+            };
+            serde_json::from_slice(
+                &std::fs::read(path).context("reading existing managed Muse hooks")?,
+            )
+            .context("parsing existing managed Muse hooks")?
+        }
+        None => json!({}),
+    };
+    let executable = std::env::current_exe()?;
+    let exe = executable
+        .to_str()
+        .context("Muse hook executable path is not UTF-8")?;
+    let data = data_dir
+        .to_str()
+        .context("Muse hook data path is not UTF-8")?;
+    let nonce = Uuid::new_v4();
+    let command = muxel_core::muse::hook_command(exe, data, instance_id, nonce, cfg!(windows));
+    let document = muxel_core::muse::merge_hook_document(prior, &command)
+        .map_err(|error| anyhow::anyhow!(match error {
+            muxel_core::muse::HookDocumentError::StrictSchema =>
+                "existing managed Muse hooks use the strict name/timeout_ms schema; launching without Muxel hook integration",
+            muxel_core::muse::HookDocumentError::Malformed =>
+                "existing managed Muse hook document is malformed",
+        }))?;
+    let launch = MuseLaunch {
+        launch_id: nonce,
+        session_root: muse_data_dir(env).context("could not resolve Muse session root")?,
+        context: context.map(str::to_string),
+    };
+    write_muse_json(&pane_dir.join("launch.json"), &launch)?;
+    write_muse_json(&hooks_path, &document)?;
+    cleanup_muse_launch_files(&pane_dir, Some(nonce))?;
+    Ok(Some(muse_hook_argument(&hooks_path)?))
+}
+
+fn muse_hook_argument(path: &Path) -> Result<String> {
+    Ok(format!(
+        "managed_hooks_path={}",
+        serde_json::to_string(path)?
+    ))
+}
+
+fn cleanup_muse_launch_files(pane_dir: &Path, current: Option<Uuid>) -> Result<()> {
+    for entry in std::fs::read_dir(pane_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let stale_nonce = path.extension().is_some_and(|ext| ext == "json")
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| Uuid::parse_str(stem).ok())
+                .is_some_and(|nonce| Some(nonce) != current);
+        if stale_nonce || path.extension().is_some_and(|ext| ext == "tmp") {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn invalidate_muse_launch(data_dir: &Path, instance_id: Uuid) {
+    let pane = muse_pane_dir(data_dir, instance_id);
+    // A user may explicitly reuse the generated hooks file as a managed source.
+    // Declining that source must keep it intact; only launch metadata is ours
+    // to invalidate here. Permanent pane closure removes the whole directory.
+    let result = (|| -> Result<()> {
+        match std::fs::remove_file(pane.join("launch.json")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        cleanup_muse_launch_files(&pane, None)
+    })();
+    if let Err(error) = result {
+        log::warn!(
+            "could not invalidate Muse pane launch {}: {error:#}",
+            pane.display()
+        );
+    }
+}
+
+/// Remove only the permanently closed pane's provider directory.
+pub(crate) fn clear_muse_binding(data_dir: &Path, instance_id: Uuid) {
+    let path = muse_pane_dir(data_dir, instance_id);
+    if let Err(error) = std::fs::remove_dir_all(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!(
+            "could not remove closed Muse pane bindings {}: {error}",
+            path.display()
+        );
+    }
+}
+
+/// Early CLI route; never initializes GPUI, even for malformed hook arguments.
+/// The caller must exit immediately when this returns true. All hook I/O,
+/// including stdin/stdout and filesystem access, runs in the bounded worker.
+/// A stalled worker is abandoned by process::exit, never joined during shutdown.
+pub(crate) fn run_muse_hook_from_args(args: &[OsString]) -> bool {
+    if args.first().is_none_or(|arg| arg != MUSE_HOOK_FLAG) {
+        return false;
+    }
+    // Only Unicode arguments can name the pane, data directory and launch.
+    let args: Option<Vec<String>> = args
+        .iter()
+        .map(|arg| arg.to_str().map(str::to_string))
+        .collect();
+    wait_for_muse_hook(MUSE_HOOK_WORK_TIMEOUT, move || {
+        // These observation/context hooks must not turn provider I/O errors
+        // into a failed hook or add unbounded stderr writes to the exit path.
+        if let Some(args) = args {
+            let _ = run_muse_hook(&args);
+        }
+    });
+    true
+}
+
+fn wait_for_muse_hook(
+    timeout: std::time::Duration,
+    action: impl FnOnce() + Send + 'static,
+) -> bool {
+    let (finished, completion) = std::sync::mpsc::channel();
+    if std::thread::Builder::new()
+        .name("muse-hook".into())
+        .spawn(move || {
+            action();
+            let _ = finished.send(());
+        })
+        .is_err()
+    {
+        return false;
+    }
+    completion.recv_timeout(timeout).is_ok()
+}
+
+fn run_muse_hook(args: &[String]) -> Result<()> {
+    if args.len() != 4 {
+        bail!("{MUSE_HOOK_FLAG} requires pane UUID, data directory and launch UUID");
+    }
+    let instance = Uuid::parse_str(&args[1])?;
+    let data = Path::new(&args[2]);
+    if !data.is_absolute() {
+        bail!("Muse hook data directory must be absolute");
+    }
+    let nonce = Uuid::parse_str(&args[3])?;
+    let Some(root) = std::env::var_os("MUSE_SESSION_ID").and_then(|s| s.into_string().ok()) else {
+        return Ok(());
+    };
+    if let Some(context) =
+        write_muse_binding_from_reader(data, instance, nonce, &root, std::io::stdin().lock())?
+    {
+        println!(
+            "{}",
+            json!({"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":context}})
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn write_muse_binding_from_reader(
+    data: &Path,
+    instance: Uuid,
+    nonce: Uuid,
+    root: &str,
+    reader: impl std::io::Read,
+) -> Result<Option<String>> {
+    let pane = muse_pane_dir(data, instance);
+    let launch: MuseLaunch = serde_json::from_slice(&std::fs::read(pane.join("launch.json"))?)?;
+    if launch.launch_id != nonce {
+        return Ok(None);
+    }
+    let event: muxel_core::muse::MuseEvent = serde_json::from_reader(reader.take(1024 * 1024))?;
+    let Some(metadata) = muxel_core::muse::metadata(event, root) else {
+        return Ok(None);
+    };
+    if !metadata.cwd.is_absolute() {
+        bail!("Muse hook cwd must be absolute");
+    }
+    let start = metadata.state == muxel_core::muse::MuseState::Idle;
+    // A late old process writes only its own launch file, never the replacement's.
+    // Only allowlisted metadata is serialized, never raw hook input.
+    // A pane can close while the helper reads stdin. Do not recreate its
+    // removed directory when that late handler finishes.
+    replace_muse_json(
+        &pane.join(format!("{nonce}.json")),
+        &MuseBinding {
+            launch_id: nonce,
+            metadata,
+        },
+    )?;
+    Ok(if start { launch.context } else { None })
+}
+
+/// The current launch's latest hook metadata and when it was recorded. A new
+/// conversation must exist in the launch's session store.
+pub(crate) fn read_muse_binding(
+    data_dir: &Path,
+    instance_id: Uuid,
+    current: Option<&str>,
+) -> Option<(muxel_core::muse::MuseMetadata, Option<SystemTime>)> {
+    let pane = muse_pane_dir(data_dir, instance_id);
+    let launch: MuseLaunch =
+        serde_json::from_slice(&std::fs::read(pane.join("launch.json")).ok()?).ok()?;
+    let mut record = std::fs::File::open(pane.join(format!("{}.json", launch.launch_id))).ok()?;
+    let modified = record.metadata().and_then(|meta| meta.modified()).ok();
+    let mut bytes = Vec::new();
+    record.read_to_end(&mut bytes).ok()?;
+    let binding: MuseBinding = serde_json::from_slice(&bytes).ok()?;
+    (launch.launch_id == binding.launch_id
+        && !launch.launch_id.is_nil()
+        && Uuid::parse_str(&binding.metadata.session_id).is_ok()
+        && (current == Some(binding.metadata.session_id.as_str())
+            || muse_session_exists(&launch.session_root, &binding.metadata.session_id).ok()?))
+    .then_some((binding.metadata, modified))
+}
+
+#[cfg(test)]
+mod muse_tests {
+    use super::{
+        MuseBinding, MuseLaunch, clear_muse_binding, muse_pane_dir, muse_session_exists,
+        prepare_muse_hooks, prepare_muse_hooks_inner, read_muse_binding, wait_for_muse_hook,
+        write_muse_binding_from_reader, write_muse_json,
+    };
+    use muxel_core::muse::MuseState;
+    use serde_json::json;
+    use std::io::Cursor;
+    use uuid::Uuid;
+
+    fn hook_fixture() -> (std::path::PathBuf, Uuid, Vec<(String, String)>) {
+        let root = std::env::temp_dir().join(format!("muxel-muse-lifecycle-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("config/muse")).unwrap();
+        let env = vec![
+            (
+                "XDG_CONFIG_HOME".into(),
+                root.join("config").to_string_lossy().into_owned(),
+            ),
+            (
+                "XDG_DATA_HOME".into(),
+                root.join("data").to_string_lossy().into_owned(),
+            ),
+        ];
+        (root, Uuid::new_v4(), env)
+    }
+
+    #[test]
+    fn muse_strict_managed_schema_launches_plainly_without_changing_sources() {
+        for marker in [json!({"name":"policy"}), json!({"timeout_ms":5000})] {
+            let (root, pane, env) = hook_fixture();
+            let settings_path = root.join("config/muse/settings.json");
+            let managed_path = root.join("config/muse/managed.json");
+            let settings =
+                json!({"managed_hooks_path":"managed.json", "hooks":{"Stop":[]}}).to_string();
+            std::fs::write(&settings_path, &settings).unwrap();
+            std::fs::write(&managed_path, "{}").unwrap();
+            assert!(prepare_muse_hooks(&root, pane, &env, &[], None, false).is_some());
+            let mut handler = json!({"type":"command", "command":"policy-hook"});
+            handler
+                .as_object_mut()
+                .unwrap()
+                .extend(marker.as_object().unwrap().clone());
+            let strict = json!({"hooks":{"SessionStart":[{"hooks":[handler]}]}}).to_string();
+            std::fs::write(&managed_path, &strict).unwrap();
+            let error = prepare_muse_hooks_inner(&root, pane, &env, &[], None, false).unwrap_err();
+            assert!(error.to_string().contains("strict name/timeout_ms schema"));
+            assert!(prepare_muse_hooks(&root, pane, &env, &[], None, false).is_none());
+            assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), settings);
+            assert_eq!(std::fs::read_to_string(&managed_path).unwrap(), strict);
+            assert!(
+                !muse_pane_dir(&root, pane).join("launch.json").exists(),
+                "plain launch retained a stale binding"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn muse_strict_hook_source_in_its_provider_directory_is_preserved_when_declined() {
+        let (root, pane, env) = hook_fixture();
+        prepare_muse_hooks(&root, pane, &env, &[], None, false).unwrap();
+        let dir = muse_pane_dir(&root, pane);
+        let source = dir.join("hooks.json");
+        let strict = json!({"hooks":{"SessionStart":[{"hooks":[{"name":"policy", "timeout_ms":5000, "command":"policy-hook"}]}]}}).to_string();
+        std::fs::write(&source, &strict).unwrap();
+        let settings = json!({"managed_hooks_path":source}).to_string();
+        std::fs::write(root.join("config/muse/settings.json"), &settings).unwrap();
+        assert!(prepare_muse_hooks(&root, pane, &env, &[], None, false).is_none());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), strict);
+        assert!(!dir.join("launch.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn muse_tmux_reattach_keeps_nonce_context_and_accepts_surviving_hooks() {
+        let (root, pane, env) = hook_fixture();
+        let argument =
+            prepare_muse_hooks(&root, pane, &env, &[], Some("original context"), false).unwrap();
+        let dir = muse_pane_dir(&root, pane);
+        let launch_bytes = std::fs::read(dir.join("launch.json")).unwrap();
+        let hooks_bytes = std::fs::read(dir.join("hooks.json")).unwrap();
+        let launch: MuseLaunch = serde_json::from_slice(&launch_bytes).unwrap();
+        // A reattach must not reinterpret settings changed since Muse started.
+        std::fs::write(root.join("config/muse/settings.json"), "not JSON").unwrap();
+        assert_eq!(
+            prepare_muse_hooks(&root, pane, &env, &[], Some("replacement context"), true),
+            Some(argument)
+        );
+        assert_eq!(
+            std::fs::read(dir.join("launch.json")).unwrap(),
+            launch_bytes
+        );
+        assert_eq!(std::fs::read(dir.join("hooks.json")).unwrap(), hooks_bytes);
+        let session = Uuid::new_v4().to_string();
+        let event = json!({"session_id":session, "cwd":root, "hook_event_name":"Notification", "notification_type":"permission_prompt"});
+        write_muse_binding_from_reader(
+            &root,
+            pane,
+            launch.launch_id,
+            &session,
+            Cursor::new(event.to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_muse_binding(&root, pane, Some(&session))
+                .unwrap()
+                .0
+                .state,
+            MuseState::Blocked
+        );
+        let unknown = Uuid::new_v4();
+        assert!(prepare_muse_hooks(&root, unknown, &env, &[], None, true).is_none());
+        assert!(!muse_pane_dir(&root, unknown).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn muse_new_process_rotates_nonce_and_cleans_only_its_owned_records() {
+        let (root, pane, env) = hook_fixture();
+        prepare_muse_hooks(&root, pane, &env, &[], None, false).unwrap();
+        let dir = muse_pane_dir(&root, pane);
+        let old: MuseLaunch =
+            serde_json::from_slice(&std::fs::read(dir.join("launch.json")).unwrap()).unwrap();
+        let old_record = dir.join(format!("{}.json", old.launch_id));
+        std::fs::write(&old_record, "{}").unwrap();
+        std::fs::write(dir.join("interrupted.tmp"), "{}").unwrap();
+        let sibling = Uuid::new_v4();
+        prepare_muse_hooks(&root, sibling, &env, &[], None, false).unwrap();
+        let sibling_hooks = muse_pane_dir(&root, sibling).join("hooks.json");
+        let sibling_bytes = std::fs::read(&sibling_hooks).unwrap();
+        prepare_muse_hooks(&root, pane, &env, &[], None, false).unwrap();
+        let new: MuseLaunch =
+            serde_json::from_slice(&std::fs::read(dir.join("launch.json")).unwrap()).unwrap();
+        assert_ne!(old.launch_id, new.launch_id);
+        assert!(!old_record.exists());
+        assert!(!dir.join("interrupted.tmp").exists());
+        assert!(dir.join("hooks.json").is_file());
+        assert_eq!(std::fs::read(&sibling_hooks).unwrap(), sibling_bytes);
+        clear_muse_binding(&root, pane);
+        assert!(!dir.exists());
+        assert_eq!(std::fs::read(&sibling_hooks).unwrap(), sibling_bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn muse_late_hook_cannot_recreate_a_permanently_closed_pane_directory() {
+        struct CloseOnRead {
+            pane: Option<std::path::PathBuf>,
+            input: Cursor<String>,
+        }
+        impl std::io::Read for CloseOnRead {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(pane) = self.pane.take() {
+                    std::fs::remove_dir_all(pane)?;
+                }
+                std::io::Read::read(&mut self.input, bytes)
+            }
+        }
+        let (root, pane, env) = hook_fixture();
+        prepare_muse_hooks(&root, pane, &env, &[], None, false).unwrap();
+        let dir = muse_pane_dir(&root, pane);
+        let launch: MuseLaunch =
+            serde_json::from_slice(&std::fs::read(dir.join("launch.json")).unwrap()).unwrap();
+        let session = Uuid::new_v4().to_string();
+        let event = json!({"session_id":session, "cwd":root, "hook_event_name":"Stop"});
+        let reader = CloseOnRead {
+            pane: Some(dir.clone()),
+            input: Cursor::new(event.to_string()),
+        };
+        assert!(
+            write_muse_binding_from_reader(&root, pane, launch.launch_id, &session, reader)
+                .is_err()
+        );
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn muse_hook_deadline_returns_before_a_blocked_worker_finishes() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, completion) = std::sync::mpsc::channel();
+        assert!(!wait_for_muse_hook(
+            std::time::Duration::from_millis(20),
+            move || {
+                blocked.recv().unwrap();
+                finished.send(()).unwrap();
+            }
+        ));
+        assert!(completion.try_recv().is_err());
+        release.send(()).unwrap();
+        completion
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+    }
+
+    #[test]
+    fn muse_fixture_store_binds_two_panes_and_ignores_transcript_contents() {
+        let root = std::env::temp_dir().join(format!("muxel-muse-test-{}", Uuid::new_v4()));
+        let cwd = root.join("same-folder");
+        std::fs::create_dir_all(&cwd).unwrap();
+        for _ in 0..2 {
+            let pane = Uuid::new_v4();
+            let session = Uuid::new_v4().to_string();
+            let nonce = Uuid::new_v4();
+            let pane_dir = muse_pane_dir(&root, pane);
+            let store = root.join("muse");
+            write_muse_json(
+                &pane_dir.join("launch.json"),
+                &MuseLaunch {
+                    launch_id: nonce,
+                    session_root: store.clone(),
+                    context: Some("launch context".into()),
+                },
+            )
+            .unwrap();
+            let transcript = store
+                .join("sessions/2026/10/15")
+                .join(&session)
+                .join("session.jsonl");
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(
+                &transcript,
+                "deliberately not JSON; only the filename matters",
+            )
+            .unwrap();
+            let event = json!({"hook_event_name":"SessionStart","session_id":session,"cwd":cwd,"prompt":"do not retain this content"});
+            let context = write_muse_binding_from_reader(
+                &root,
+                pane,
+                nonce,
+                &session,
+                Cursor::new(event.to_string()),
+            )
+            .unwrap();
+            assert_eq!(context.as_deref(), Some("launch context"));
+            let (binding, recorded) = read_muse_binding(&root, pane, None).unwrap();
+            assert!(recorded.is_some());
+            assert_eq!(binding.session_id, session);
+            assert_eq!(binding.state, MuseState::Idle);
+            let stored = std::fs::read_to_string(pane_dir.join(format!("{nonce}.json"))).unwrap();
+            assert!(!stored.contains("do not retain"));
+            assert!(!stored.contains("prompt"));
+            assert!(muse_session_exists(&store, &session).unwrap());
+            std::fs::remove_file(transcript).unwrap();
+            assert!(read_muse_binding(&root, pane, None).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn muse_replaced_launch_rejects_delayed_old_hook_and_binding() {
+        let root = std::env::temp_dir().join(format!("muxel-muse-stale-{}", Uuid::new_v4()));
+        let pane = Uuid::new_v4();
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        let dir = muse_pane_dir(&root, pane);
+        write_muse_json(
+            &dir.join("launch.json"),
+            &MuseLaunch {
+                launch_id: new,
+                session_root: root.join("muse"),
+                context: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            write_muse_binding_from_reader(
+                &root,
+                pane,
+                old,
+                "invalid",
+                Cursor::new("must not even parse this")
+            )
+            .unwrap()
+            .is_none()
+        );
+        write_muse_json(
+            &dir.join(format!("{old}.json")),
+            &MuseBinding {
+                launch_id: old,
+                metadata: Default::default(),
+            },
+        )
+        .unwrap();
+        assert!(read_muse_binding(&root, pane, None).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn muse_per_run_file_preserves_user_and_managed_hooks_without_global_writes() {
+        let root = std::env::temp_dir().join(format!("muxel-muse-hooks-{}", Uuid::new_v4()));
+        let config = root.join("config");
+        std::fs::create_dir_all(config.join("muse")).unwrap();
+        let managed = config.join("muse/managed.json");
+        let prior =
+            json!({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"existing-managed"}]}]}});
+        std::fs::write(&managed, prior.to_string()).unwrap();
+        let settings=json!({"managed_hooks_path":"managed.json","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"existing-user"}]}]}}).to_string();
+        let settings_path = config.join("muse/settings.json");
+        std::fs::write(&settings_path, &settings).unwrap();
+        let pane = Uuid::new_v4();
+        let env = vec![
+            (
+                "XDG_CONFIG_HOME".into(),
+                config.to_string_lossy().into_owned(),
+            ),
+            (
+                "XDG_DATA_HOME".into(),
+                root.join("data").to_string_lossy().into_owned(),
+            ),
+        ];
+        let argument = prepare_muse_hooks(&root, pane, &env, &[], Some("context"), false).unwrap();
+        assert!(argument.starts_with("managed_hooks_path="));
+        let generated: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(muse_pane_dir(&root, pane).join("hooks.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(generated["hooks"]["Stop"][0], prior["hooks"]["Stop"][0]);
+        assert_eq!(std::fs::read_to_string(settings_path).unwrap(), settings);
+        assert_eq!(std::fs::read_to_string(managed).unwrap(), prior.to_string());
+        assert!(
+            prepare_muse_hooks(
+                &root,
+                pane,
+                &env,
+                &["-c".into(), "hooks={}".into()],
+                None,
+                false
+            )
+            .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 const CLAUDE_BINDING_DIR: &str = "provider-session-bindings/claude";
 const CLAUDE_SETTINGS_DIR: &str = "provider-session-bindings/claude/settings";
 const CLAUDE_HOOK_FLAG: &str = "--claude-session-hook";

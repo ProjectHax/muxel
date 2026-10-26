@@ -100,6 +100,7 @@ fn session_lookup_line(record: SessionLookupRecord) -> String {
         Some(SessionProvider::Codex) => "codex",
         Some(SessionProvider::Claude) => "claude",
         Some(SessionProvider::Grok) => "grok",
+        Some(SessionProvider::Muse) => "muse",
         None => "other",
     };
     let outcome = match record.outcome {

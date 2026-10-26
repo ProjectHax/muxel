@@ -180,6 +180,8 @@ pub enum TerminalStatusReason {
     ProviderTitle,
     ProviderScreen,
     Bell,
+    /// A provider's own lifecycle hook (Muse's root-session hooks).
+    ProviderHook,
     RecentOutput,
     Quiet,
 }
@@ -244,6 +246,10 @@ struct RuntimeStatusState {
     semantic_title_status: Option<AgentStatus>,
     grok_blocked_at: Option<Instant>,
     grok_screen_working_at: Option<Instant>,
+    /// Muse titles name the pane's working directory; a hook can report a new one.
+    muse_cwd_label: Option<String>,
+    /// Latest state reported by Muse's root-session hooks.
+    muse_hook_state: Option<muxel_core::muse::MuseState>,
     deadline: Option<Instant>,
     timer_generation: u64,
 }
@@ -272,6 +278,8 @@ impl RuntimeStatusState {
             semantic_title_status: None,
             grok_blocked_at: None,
             grok_screen_working_at: None,
+            muse_cwd_label: None,
+            muse_hook_state: None,
             deadline: None,
             timer_generation: 0,
         }
@@ -343,8 +351,12 @@ impl RuntimeStatusState {
             .map(|at| now + at.duration_since(wall).unwrap_or_default() + Duration::from_millis(1));
         let (title_events, title_overflowed) = (evidence.titles, evidence.overflowed);
         let (_, title_text) = session.title_snapshot();
-        let observed_title =
-            title_status(title_provider, title_text.as_deref(), session.title_age());
+        let muse_cwd_label = self.muse_cwd_label.as_deref();
+        let observed_title = if title_provider == TitleProvider::Muse {
+            muse_title_status(title_text.as_deref(), muse_cwd_label)
+        } else {
+            title_status(title_provider, title_text.as_deref(), session.title_age())
+        };
         // Only a submission in the current binding arms its completion: the
         // Enter that picked a conversation in `/resume` ran no turn in it.
         let submitted_turn = evidence.submitted;
@@ -363,7 +375,7 @@ impl RuntimeStatusState {
 
         let mut working_to_nonworking = false;
         if !title_overflowed {
-            let statuses = title_status_trace(title_provider, &title_events);
+            let statuses = title_status_trace(title_provider, muse_cwd_label, &title_events);
             working_to_nonworking = has_working_to_nonworking_edge(&statuses);
             for status in statuses {
                 self.provider_settled = provider_settled_after_title(
@@ -424,12 +436,21 @@ impl RuntimeStatusState {
         }
         let bell = session.has_bell();
         let idle = session.idle_for();
+        // Until Muse's own title is read (never, on a remote or tmux pane), it
+        // is judged by output activity like an unknown terminal. Its hooks
+        // still report blocked and finished turns.
+        let activity_fallback = working_markers.is_empty()
+            && match title_provider {
+                TitleProvider::Other => true,
+                TitleProvider::Muse => self.semantic_title_status.is_none(),
+                _ => false,
+            };
         let base = classify_facts(
             exited,
             self.working_marker,
             self.blocked_marker,
             bell,
-            title_provider == TitleProvider::Other && working_markers.is_empty(),
+            activity_fallback,
             idle,
         );
         let provider_screen = self.provider_screen;
@@ -486,20 +507,27 @@ impl RuntimeStatusState {
             title = provider_screen;
         }
 
-        let raw = combine_title_status(exited, base, title, screen_working);
+        let hook = (title_provider == TitleProvider::Muse && !exited)
+            .then(|| muse_hook_status(self.muse_hook_state, title, screen_working))
+            .flatten();
+        let raw = hook.unwrap_or_else(|| combine_title_status(exited, base, title, screen_working));
         let can_latch = can_latch_completion(
             !working_markers.is_empty(),
             self.semantic_title_status.is_some(),
         );
-        let raw_reason = status_reason(
-            raw,
-            exited,
-            bell,
-            title,
-            provider_screen,
-            working_marker,
-            blocked_marker,
-        );
+        let raw_reason = if hook == Some(raw) {
+            TerminalStatusReason::ProviderHook
+        } else {
+            status_reason(
+                raw,
+                exited,
+                bell,
+                title,
+                provider_screen,
+                working_marker,
+                blocked_marker,
+            )
+        };
         let raw_attributable = status_is_attributable(settling, self.screen_held, raw_reason);
         let (status, latch, armed) = if raw_attributable {
             latch_done_after_readiness(
@@ -519,29 +547,27 @@ impl RuntimeStatusState {
         self.done_latch = latch;
         self.completion_armed = armed;
 
-        if let Some(deadline) = fallback_status_deadline(
-            now,
-            idle,
-            status,
-            title_provider,
-            !working_markers.is_empty(),
-        )
-        .into_iter()
-        .chain(settle_deadline)
-        .min()
+        if let Some(deadline) = fallback_status_deadline(now, idle, status, activity_fallback)
+            .into_iter()
+            .chain(settle_deadline)
+            .min()
         {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
 
-        let reason = status_reason(
-            status,
-            exited,
-            bell,
-            title,
-            provider_screen,
-            working_marker,
-            blocked_marker,
-        );
+        let reason = if hook == Some(status) {
+            TerminalStatusReason::ProviderHook
+        } else {
+            status_reason(
+                status,
+                exited,
+                bell,
+                title,
+                provider_screen,
+                working_marker,
+                blocked_marker,
+            )
+        };
         let attributable = status_is_attributable(settling, self.screen_held, reason);
         if exited {
             next_deadline = None;
@@ -569,6 +595,7 @@ enum TitleProvider {
     Claude,
     Codex,
     Grok,
+    Muse,
     Other,
 }
 
@@ -579,6 +606,12 @@ struct AgentTitleFrame {
 }
 
 impl TitleProvider {
+    /// Whether a `ctl new --prompt` task may be typed: only these providers
+    /// have a verified readiness and acceptance protocol.
+    fn has_startup_protocol(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Grok)
+    }
+
     fn from_program(program: &str) -> Self {
         let leaf = program
             .trim()
@@ -595,6 +628,7 @@ impl TitleProvider {
             "claude" => Self::Claude,
             "codex" => Self::Codex,
             "grok" => Self::Grok,
+            "muse" => Self::Muse,
             _ => Self::Other,
         }
     }
@@ -697,6 +731,17 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
                 name: (!name.is_empty()).then_some(name),
             })
         }
+        TitleProvider::Muse => {
+            let name = title
+                .split_once(' ')
+                .filter(|(spinner, _)| is_codex_spinner(spinner))
+                .map(|(_, name)| name)
+                .unwrap_or(title);
+            (!name.is_empty() && !name.contains(['/', '\\', ':'])).then(|| AgentTitleFrame {
+                status: None,
+                name: Some(name.to_string()),
+            })
+        }
         TitleProvider::Other => None,
     }
 }
@@ -752,11 +797,46 @@ fn title_status(
     parse_agent_title(provider, title).and_then(|frame| frame.status)
 }
 
-fn title_status_trace(provider: TitleProvider, titles: &[Option<String>]) -> Vec<AgentStatus> {
+fn title_status_trace(
+    provider: TitleProvider,
+    muse_cwd_label: Option<&str>,
+    titles: &[Option<String>],
+) -> Vec<AgentStatus> {
     titles
         .iter()
-        .filter_map(|title| title_status(provider, title.as_deref(), None))
+        .filter_map(|title| match provider {
+            TitleProvider::Muse => muse_title_status(title.as_deref(), muse_cwd_label),
+            provider => title_status(provider, title.as_deref(), None),
+        })
         .collect()
+}
+
+/// Muse's title carries state only as the pane's cwd label, spinner-prefixed
+/// while working; any other title says nothing about this pane.
+fn muse_title_status(title: Option<&str>, cwd_label: Option<&str>) -> Option<AgentStatus> {
+    match muxel_core::muse::title_state(title?, cwd_label?)? {
+        muxel_core::muse::MuseState::Working => Some(AgentStatus::Working),
+        _ => Some(AgentStatus::Idle),
+    }
+}
+
+/// Muse's root-session hooks. A permission prompt outranks Muse's
+/// still-spinning title, and a finished turn stays Done until a title or the
+/// screen shows new work. Hooked work adds nothing: an interrupted turn fires
+/// no hook, so titles or output activity tell when work stops.
+fn muse_hook_status(
+    hook: Option<muxel_core::muse::MuseState>,
+    title: Option<AgentStatus>,
+    screen_working: bool,
+) -> Option<AgentStatus> {
+    use muxel_core::muse::MuseState;
+    match hook? {
+        MuseState::Blocked => Some(AgentStatus::Blocked),
+        MuseState::Done if !screen_working && title != Some(AgentStatus::Working) => {
+            Some(AgentStatus::Done)
+        }
+        MuseState::Idle | MuseState::Working | MuseState::Done => None,
+    }
 }
 
 fn has_working_to_nonworking_edge(statuses: &[AgentStatus]) -> bool {
@@ -1429,18 +1509,16 @@ fn status_screen_capture_plan(
     StatusScreenCapture::Now
 }
 
+/// When Working read from recent output expires, for a terminal judged by
+/// output activity.
 fn fallback_status_deadline(
     now: Instant,
     idle: Duration,
     status: AgentStatus,
-    provider: TitleProvider,
-    has_working_markers: bool,
+    activity_fallback: bool,
 ) -> Option<Instant> {
-    (status == AgentStatus::Working
-        && provider == TitleProvider::Other
-        && !has_working_markers
-        && idle < Duration::from_secs(2))
-    .then(|| now + (Duration::from_secs(2) - idle))
+    (status == AgentStatus::Working && activity_fallback && idle < Duration::from_secs(2))
+        .then(|| now + (Duration::from_secs(2) - idle))
 }
 
 /// The wall-clock time `at` stands for.
@@ -2449,6 +2527,12 @@ impl TerminalView {
         let startup_program = spec.program.clone();
         let title_provider =
             TitleProvider::from_program(spec.status_program.as_deref().unwrap_or(&startup_program));
+        let muse_cwd_label = spec
+            .cwd
+            .as_deref()
+            .filter(|_| title_provider == TitleProvider::Muse)
+            .and_then(|cwd| muxel_core::muse::cwd_label(std::path::Path::new(cwd)))
+            .map(str::to_string);
         let focus_handle = cx.focus_handle();
 
         // Forward focus in/out to the PTY (DECSET 1004) so agents like Claude
@@ -2503,7 +2587,7 @@ impl TerminalView {
         {
             let session = session.clone();
             let automation_program = startup_program.clone();
-            let known_provider = title_provider != TitleProvider::Other;
+            let known_provider = title_provider.has_startup_protocol();
             let framed_readiness =
                 matches!(title_provider, TitleProvider::Claude | TitleProvider::Codex);
             let armed_at = Instant::now();
@@ -2914,7 +2998,10 @@ impl TerminalView {
             working_markers,
             blocked_markers,
             title_provider,
-            runtime: RuntimeStatusState::new(coverage),
+            runtime: RuntimeStatusState {
+                muse_cwd_label,
+                ..RuntimeStatusState::new(coverage)
+            },
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
             profile_notify_generation: std::cell::Cell::new(0),
             profile_last_notify_cause: std::cell::Cell::new(None),
@@ -3193,6 +3280,21 @@ impl TerminalView {
     /// submitted turn. Fallback PTY quiet is not startup-readiness evidence.
     pub fn completion_ready(&self) -> bool {
         self.runtime_snapshot().completion_ready
+    }
+
+    /// Report the latest hook from this Muse pane's root session.
+    pub fn set_muse_hook_state(
+        &mut self,
+        metadata: &muxel_core::muse::MuseMetadata,
+        cx: &mut Context<Self>,
+    ) {
+        let label = muxel_core::muse::cwd_label(&metadata.cwd).map(str::to_string);
+        let state = Some(metadata.state);
+        if self.runtime.muse_cwd_label != label || self.runtime.muse_hook_state != state {
+            self.runtime.muse_cwd_label = label;
+            self.runtime.muse_hook_state = state;
+            self.refresh_runtime(cx);
+        }
     }
 
     /// Whether `needle` appears in the current visible grid — used by the app to
@@ -4864,33 +4966,15 @@ mod tests {
     fn activity_fallback_has_one_exact_deadline() {
         let now = Instant::now();
         assert_eq!(
-            fallback_status_deadline(
-                now,
-                Duration::from_millis(1250),
-                AgentStatus::Working,
-                TitleProvider::Other,
-                false,
-            ),
+            fallback_status_deadline(now, Duration::from_millis(1250), AgentStatus::Working, true,),
             Some(now + Duration::from_millis(750))
         );
         assert_eq!(
-            fallback_status_deadline(
-                now,
-                Duration::from_secs(2),
-                AgentStatus::Working,
-                TitleProvider::Other,
-                false,
-            ),
+            fallback_status_deadline(now, Duration::from_secs(2), AgentStatus::Working, true,),
             None
         );
         assert_eq!(
-            fallback_status_deadline(
-                now,
-                Duration::ZERO,
-                AgentStatus::Working,
-                TitleProvider::Claude,
-                false,
-            ),
+            fallback_status_deadline(now, Duration::ZERO, AgentStatus::Working, false,),
             None
         );
     }
@@ -5502,7 +5586,7 @@ mod tests {
             Some("Thread | Working ⠋".to_string()),
             Some("Thread | Ready".to_string()),
         ];
-        let statuses = title_status_trace(TitleProvider::Codex, &titles);
+        let statuses = title_status_trace(TitleProvider::Codex, None, &titles);
         assert_eq!(statuses, vec![AgentStatus::Working, AgentStatus::Idle]);
         assert!(has_working_to_nonworking_edge(&statuses));
     }
@@ -5531,7 +5615,7 @@ mod tests {
         // What `update_runtime` feeds the reducer after the binding reset.
         let evidence = session.runtime_evidence(None);
         assert!(!evidence.overflowed);
-        let statuses = title_status_trace(TitleProvider::Codex, &evidence.titles);
+        let statuses = title_status_trace(TitleProvider::Codex, None, &evidence.titles);
         assert!(has_working_to_nonworking_edge(&statuses));
         let submitted = evidence.submitted;
         let (status, _, armed) = latch_done_after_readiness(
@@ -6124,7 +6208,8 @@ mod provider_switch_tests {
     // Import specifically: see `tests`.
     use super::{
         AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TerminalStatusReason,
-        TitleProvider, screen_hold_after, status_is_attributable, title_status_trace, wall_time_at,
+        TitleProvider, muse_title_status, screen_hold_after, status_is_attributable,
+        title_status_trace, wall_time_at,
     };
     use crate::listener::{SWITCH_SETTLE, SWITCH_SLACK};
     use crate::session::{CommandSpec, PtyOutput, TerminalSession};
@@ -6148,6 +6233,105 @@ mod provider_switch_tests {
             output.push(bytes.as_bytes(), *read_at);
         }
         output
+    }
+
+    #[test]
+    fn only_providers_with_a_startup_protocol_receive_a_ctl_task() {
+        for program in ["claude", "codex.exe", "grok"] {
+            assert!(TitleProvider::from_program(program).has_startup_protocol());
+        }
+        for program in ["muse", "muse.cmd", "opencode", "bash"] {
+            assert!(!TitleProvider::from_program(program).has_startup_protocol());
+        }
+    }
+
+    #[test]
+    fn muse_titles_count_only_as_this_panes_cwd_label() {
+        use AgentStatus::{Idle, Working};
+        assert_eq!(muse_title_status(Some("repo"), Some("repo")), Some(Idle));
+        assert_eq!(
+            muse_title_status(Some("\u{280b} repo"), Some("repo")),
+            Some(Working)
+        );
+        assert_eq!(
+            muse_title_status(Some("\u{280b} other"), Some("repo")),
+            None
+        );
+        assert_eq!(
+            muse_title_status(Some("C:/bin/muse.exe"), Some("repo")),
+            None
+        );
+        assert_eq!(muse_title_status(Some("repo"), None), None);
+        let trace = title_status_trace(
+            TitleProvider::Muse,
+            Some("repo"),
+            &[
+                Some("\u{280b} repo".into()),
+                Some("elsewhere".into()),
+                Some("repo".into()),
+            ],
+        );
+        assert_eq!(trace, vec![Working, Idle]);
+    }
+
+    #[test]
+    fn muse_hooks_mark_permission_and_completion_while_activity_tells_hidden_work() {
+        use AgentStatus::{Blocked, Done, Working};
+        use TerminalStatusReason::{ProviderHook, RecentOutput};
+        use muxel_core::muse::MuseState;
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState {
+            muse_cwd_label: Some("repo".into()),
+            ..RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible)
+        };
+        let observe = |runtime: &mut RuntimeStatusState, hook| {
+            runtime.muse_hook_state = Some(hook);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Muse,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            (runtime.status, runtime.reason)
+        };
+        // No title reaches a tmux or remote pane's view. Output activity tells
+        // work, since an interrupted turn fires no hook; hooks report blocked
+        // and finished turns.
+        assert_eq!(
+            observe(&mut runtime, MuseState::Working),
+            (Working, RecentOutput)
+        );
+        assert_eq!(
+            observe(&mut runtime, MuseState::Blocked),
+            (Blocked, ProviderHook)
+        );
+        assert_eq!(observe(&mut runtime, MuseState::Done), (Done, ProviderHook));
+        // A spinning title is new work after a finished turn, but Muse keeps
+        // spinning through a permission prompt.
+        session.process_drained(&drained(&[("\x1b]0;\u{280b} repo\x07", SystemTime::now())]));
+        assert_eq!(observe(&mut runtime, MuseState::Done).0, Working);
+        assert_eq!(
+            observe(&mut runtime, MuseState::Blocked),
+            (Blocked, ProviderHook)
+        );
+        // Once titles arrive they, not output, tell work.
+        session.process_drained(&drained(&[("\x1b]0;repo\x07", SystemTime::now())]));
+        assert_eq!(observe(&mut runtime, MuseState::Done), (Done, ProviderHook));
+        let (_, reason) = observe(&mut runtime, MuseState::Working);
+        assert!(!matches!(reason, ProviderHook | RecentOutput), "{reason:?}");
+        // A process exit outranks every hook.
+        runtime.reconcile(
+            &session,
+            TitleProvider::Muse,
+            &[],
+            &[],
+            true,
+            Instant::now(),
+        );
+        assert_eq!(runtime.reason, TerminalStatusReason::ProcessExit);
+        session.kill();
     }
 
     #[test]
@@ -6807,6 +6991,7 @@ mod provider_switch_tests {
             ProviderTitle,
             ProviderScreen,
             Bell,
+            ProviderHook,
             RecentOutput,
             Quiet,
         ] {
@@ -7133,7 +7318,7 @@ mod provider_switch_tests {
         assert!(!evidence.settling);
         assert!(evidence.submitted);
         assert_eq!(
-            title_status_trace(TitleProvider::Claude, &evidence.titles),
+            title_status_trace(TitleProvider::Claude, None, &evidence.titles),
             vec![AgentStatus::Working, AgentStatus::Idle]
         );
         let (status, _, _) = viewer.completion(&session);

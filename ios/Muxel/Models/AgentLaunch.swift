@@ -49,7 +49,7 @@ enum AgentLaunch {
                 args.append(prompt)
             case .typeIn:
                 startupInput = prompt
-            case .none:
+            case .none, .sessionHook, .unknown:
                 break
             }
         }
