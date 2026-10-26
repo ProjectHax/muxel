@@ -270,7 +270,40 @@ pub(crate) struct Screen {
     pub bracketed_paste: bool,
 }
 
+/// An empty-looking, unclipped one-row origin, captured before ctl paste.
+/// Character snapshots cannot distinguish spaces at Home or a typed copy of
+/// the placeholder from actual empty input; this does not claim zero text.
+pub(crate) struct CodexCtlOrigin {
+    columns: usize,
+    rows: usize,
+    top: usize,
+    footer: usize,
+    prefix: usize,
+    footer_row: String,
+}
+
+struct CodexCtlDraft {
+    columns: usize,
+    rows: usize,
+    top: usize,
+    footer: usize,
+    prefix: usize,
+    end_row: usize,
+}
+
 impl Screen {
+    // Master can render a model row followed by a shortcuts footer. The
+    // generic composer scan uses the last footer; ctl's geometry proof pins
+    // the earlier model row when both are present.
+    fn codex_ctl_footer(rows: &[&str], end: usize) -> Option<usize> {
+        let last = rows.get(end)?.trim_start();
+        if last.starts_with("? for shortcuts") && end > 0 && codex_footer(rows[end - 1]) {
+            Some(end - 1)
+        } else {
+            Some(end)
+        }
+    }
+
     /// Codex's unframed editor. A passive model/cwd status line can replace the
     /// shortcut hint even with empty input; a draft hides that hint as well.
     /// A trust/choice menu also uses `›`, but has no composer status footer.
@@ -285,6 +318,30 @@ impl Screen {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
+    }
+
+    /// Ctl receipts must exclude the geometry-proven live composer regardless
+    /// of its height. The general read-aloud scan has a bounded footer reach;
+    /// a long retained draft must never become its own submitted-user receipt.
+    pub(crate) fn codex_ctl_transcript_prompt(&self) -> Option<String> {
+        let rows: Vec<_> = self.text.lines().collect();
+        let region = self
+            .codex_composer_rows(&rows, true)
+            .or_else(|| self.codex_composer_rows(&rows, false))?;
+        let transcript = &rows[..region.start];
+        let start = transcript
+            .iter()
+            .rposition(|row| row.trim_start().strip_prefix("› ").is_some())?;
+        let first = transcript[start].trim_start().strip_prefix("› ")?.trim();
+        let mut parts = vec![first];
+        for row in &transcript[start + 1..] {
+            if row.trim().is_empty() || !row.starts_with(' ') {
+                break;
+            }
+            parts.push(row.trim());
+        }
+        let prompt = parts.join(" ");
+        (!prompt.is_empty()).then_some(prompt)
     }
 
     /// Retry only a completely visible single-row ASCII task with its cursor at
@@ -327,6 +384,155 @@ impl Screen {
                 .collect::<String>()
                 == input
             && rows[top].chars().skip(end).all(char::is_whitespace)
+    }
+
+    pub(crate) fn codex_ctl_origin(&self) -> Option<CodexCtlOrigin> {
+        if self.text.contains(['↑', '↓']) {
+            return None;
+        }
+        let rows: Vec<_> = self.text.lines().collect();
+        let region = self.codex_composer_rows(&rows, true)?;
+        let footer = Self::codex_ctl_footer(&rows, region.end)?;
+        let columns = rows.first()?.chars().count();
+        if rows.iter().any(|row| row.chars().count() != columns)
+            || region.start == 0
+            || footer != region.start + 2
+            || !rows[region.start - 1].bytes().all(|byte| byte == b' ')
+            || !rows[region.start + 1].bytes().all(|byte| byte == b' ')
+        {
+            return None;
+        }
+        let prompt = rows[region.start];
+        let indent = prompt.bytes().take_while(|byte| *byte == b' ').count();
+        let content = prompt[indent..].strip_prefix("› ")?.trim_end_matches(' ');
+        if !matches!(content, "" | "Ask Codex to do anything") {
+            return None;
+        }
+        Some(CodexCtlOrigin {
+            columns,
+            rows: rows.len(),
+            top: region.start,
+            footer,
+            prefix: indent + 2,
+            footer_row: rows[footer].to_owned(),
+        })
+    }
+
+    /// A retained end cursor is not enough: the first CR might still be queued.
+    /// From a compact LF-free origin, require the complete LF-free task followed
+    /// by one new blank editor line, bottom anchored at the original cursor row.
+    pub(crate) fn codex_ctl_retry_draft(&self, input: &str, origin: &CodexCtlOrigin) -> bool {
+        self.codex_ctl_draft_frame(input).is_some_and(|frame| {
+            usize::try_from(self.cursor_row).ok() == Some(frame.end_row + 1)
+                && frame.end_row + 1 == origin.top
+                && self.cursor_column == origin.prefix
+                && frame.columns == origin.columns
+                && frame.rows == origin.rows
+                && frame.footer == origin.footer
+                && frame.prefix == origin.prefix
+                && frame.top < origin.top
+                && self.text.lines().nth(frame.footer) == Some(origin.footer_row.as_str())
+        })
+    }
+
+    /// Match the entire visible ASCII task across word-boundary wraps. Never
+    /// infer a missing prefix/suffix or allow completion-owned Enter semantics.
+    fn codex_ctl_draft_frame(&self, input: &str) -> Option<CodexCtlDraft> {
+        if input.is_empty()
+            || !input.is_ascii()
+            || input.trim() != input
+            || input.bytes().any(|byte| byte.is_ascii_control())
+            || input.contains("  ")
+            // Completion and shell syntax can give Enter a different owner,
+            // even when the editor itself still contains the exact task.
+            || input.starts_with('!')
+            || input.contains('@')
+            || input.contains('$')
+            || input.split(' ').any(|word| word.starts_with('/'))
+        {
+            return None;
+        }
+        if self.text.contains(['↑', '↓']) {
+            return None;
+        }
+        let rows: Vec<_> = self.text.lines().collect();
+        let region = self.codex_composer_rows(&rows, false)?;
+        let footer = Self::codex_ctl_footer(&rows, region.end)?;
+        let columns = rows.first()?.chars().count();
+        if rows.iter().any(|row| row.chars().count() != columns) {
+            return None;
+        }
+        // A top-edge editor can be a vertically clipped draft. Refuse it even
+        // if its remaining text happens to resemble the requested task.
+        if region.start == 0
+            || !rows[region.start - 1].bytes().all(|byte| byte == b' ')
+            || !rows[footer - 1].bytes().all(|byte| byte == b' ')
+        {
+            return None;
+        }
+        let mut context = rows[..region.start].iter().chain(rows[region.end..].iter());
+        if context.any(|row| {
+            let row = row.to_ascii_lowercase();
+            [
+                "↑",
+                "↓",
+                "enter to select",
+                "enter to confirm",
+                "tab to select",
+                "esc to cancel",
+                "esc to dismiss",
+                "type to filter",
+            ]
+            .iter()
+            .any(|hint| row.contains(hint))
+        }) {
+            return None;
+        }
+        let top = rows[region.start];
+        let indent = top.bytes().take_while(|byte| *byte == b' ').count();
+        let first = top[indent..].strip_prefix("› ")?;
+        let prefix = indent + 2;
+        let mut pieces = vec![first.trim_end_matches(' ')];
+        let mut last = region.start;
+        let mut ended = false;
+        for (index, row) in rows.iter().enumerate().take(footer).skip(region.start + 1) {
+            if row.bytes().all(|byte| byte == b' ') {
+                ended = true;
+                continue;
+            }
+            if ended
+                || !row
+                    .as_bytes()
+                    .get(..prefix)
+                    .is_some_and(|s| s.iter().all(|b| *b == b' '))
+            {
+                return None;
+            }
+            let piece = row[prefix..].trim_end_matches(' ');
+            pieces.push(piece);
+            last = index;
+        }
+        if pieces.iter().any(|piece| {
+            piece.is_empty()
+                || !piece.is_ascii()
+                || piece.starts_with(' ')
+                || piece.bytes().any(|byte| byte.is_ascii_control())
+        }) || pieces.join(" ") != input
+        {
+            return None;
+        }
+        let end_column = prefix + pieces.last()?.len();
+        if end_column >= columns.saturating_sub(2) {
+            return None;
+        }
+        Some(CodexCtlDraft {
+            columns,
+            rows: rows.len(),
+            top: region.start,
+            footer,
+            prefix,
+            end_row: last,
+        })
     }
 
     fn codex_composer_rows(&self, rows: &[&str], empty: bool) -> Option<std::ops::Range<usize>> {
@@ -666,6 +872,248 @@ mod tests {
         );
         assert!(!residual_menu.codex_draft_matches("task"));
     }
+
+    fn ctl_screen(draft: &[&str], consumed: bool) -> Screen {
+        let mut rows = vec![String::new(); 51];
+        rows[0] = "OpenAI Codex".into();
+        let top = 49 - 1 - draft.len() - usize::from(consumed);
+        for (index, piece) in draft.iter().enumerate() {
+            rows[top + index] = format!("{}{piece}", if index == 0 { "› " } else { "  " });
+        }
+        rows[49] = "  GPT-6.1-Sol · scratch".into();
+        rows[50] = "  ? for shortcuts".into();
+        let text = rows
+            .iter()
+            .map(|row| format!("{row}{}", " ".repeat(41 - row.chars().count())))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen(
+            &text,
+            (top + draft.len() - usize::from(!consumed)) as i32,
+            if consumed {
+                2
+            } else {
+                2 + draft.last().unwrap().chars().count()
+            },
+        )
+    }
+
+    fn ctl_origin(text: &str) -> Screen {
+        let mut sample = ctl_screen(&[text], false);
+        sample.cursor_column = 2;
+        sample
+    }
+
+    fn ctl_set_row(sample: &mut Screen, index: usize, text: &str) {
+        let mut rows = sample.text.lines().map(str::to_owned).collect::<Vec<_>>();
+        rows[index] = format!("{text}{}", " ".repeat(41 - text.chars().count()));
+        sample.text = rows.join("\n");
+    }
+
+    #[test]
+    fn ctl_codex_origin_requires_compact_empty_looking_editor() {
+        for text in ["", "Ask Codex to do anything", "   "] {
+            assert!(ctl_origin(text).codex_ctl_origin().is_some(), "{text:?}");
+        }
+        // Character-only snapshots cannot distinguish typed placeholder text
+        // or spaces at Home. Exact post-paste matching still rejects leftovers.
+        for text in [
+            "old task",
+            "Ask Codex to do something",
+            " Ask Codex to do anything",
+        ] {
+            assert!(ctl_origin(text).codex_ctl_origin().is_none(), "{text:?}");
+        }
+        for count in [2, 18] {
+            let mut multiline = ctl_screen(&vec![""; count], false);
+            multiline.cursor_row = (48 - count) as i32;
+            multiline.cursor_column = 2;
+            assert!(multiline.codex_composer_context(true).is_some());
+            assert!(
+                multiline.codex_ctl_origin().is_none(),
+                "blank multiline at Home"
+            );
+        }
+        for (row, text) in [
+            (0, "↑ more above"),
+            (48, "↓ more below"),
+            (46, "not padding"),
+            (48, "not padding"),
+        ] {
+            let mut sample = ctl_origin("");
+            ctl_set_row(&mut sample, row, text);
+            assert!(sample.codex_ctl_origin().is_none(), "{row}: {text}");
+        }
+        let mut sample = ctl_origin("");
+        sample.cursor_column = 3;
+        assert!(sample.codex_ctl_origin().is_none());
+        sample.cursor_column = 2;
+        sample.cursor_visible = false;
+        assert!(sample.codex_ctl_origin().is_none());
+        sample.cursor_visible = true;
+        sample.bracketed_paste = false;
+        assert!(sample.codex_ctl_origin().is_none());
+    }
+
+    #[test]
+    fn ctl_codex_retry_requires_one_consumed_newline_from_origin() {
+        let origin = ctl_origin("").codex_ctl_origin().unwrap();
+        let task = "Reply with exactly copper lantern.";
+        let pending = ctl_screen(&[task], false);
+        assert!(
+            !pending.codex_ctl_retry_draft(task, &origin),
+            "first CR may still be queued"
+        );
+        let mut consumed = ctl_screen(&[task], true);
+        assert!(consumed.codex_ctl_retry_draft(task, &origin));
+        assert!(
+            !consumed.codex_exact_retry_draft(task),
+            "startup stays single-row strict"
+        );
+        ctl_set_row(&mut consumed, 50, "  draft shortcut hint");
+        assert!(
+            consumed.codex_ctl_retry_draft(task, &origin),
+            "draft hint legitimately changes"
+        );
+        consumed.cursor_row += 1;
+        assert!(
+            !consumed.codex_ctl_retry_draft(task, &origin),
+            "two added blank rows"
+        );
+        consumed.cursor_row -= 1;
+        consumed.cursor_column = 3;
+        assert!(!consumed.codex_ctl_retry_draft(task, &origin));
+    }
+
+    #[test]
+    fn ctl_codex_retry_matches_complete_eighteen_row_task_from_origin() {
+        let origin = ctl_origin("Ask Codex to do anything")
+            .codex_ctl_origin()
+            .unwrap();
+        let words: Vec<_> = (0..18)
+            .map(|i| format!("segment{i:02}abcdefghijklmnopqrstuv"))
+            .collect();
+        let pieces = words.iter().map(String::as_str).collect::<Vec<_>>();
+        let task = words.join(" ");
+        let retained = ctl_screen(&pieces, true);
+        assert_eq!(retained.cursor_row, 47);
+        assert!(retained.codex_ctl_retry_draft(&task, &origin));
+        assert!(!ctl_screen(&pieces, false).codex_ctl_retry_draft(&task, &origin));
+        assert!(!retained.codex_exact_retry_draft(&task));
+    }
+
+    #[test]
+    fn ctl_codex_retry_refuses_content_completion_clips_and_hidden_continuation() {
+        let origin = ctl_origin("").codex_ctl_origin().unwrap();
+        for task in [
+            "",
+            " task",
+            "task ",
+            "two  words",
+            "two\twords",
+            "two\nwords",
+            "café",
+            "/review",
+            "run /review",
+            "read @file",
+            "use $skill",
+            "read (@file)",
+            "use ($skill)",
+            "mail a@b",
+            "!echo task",
+        ] {
+            let sample = ctl_screen(&[task], true);
+            assert!(!sample.codex_ctl_retry_draft(task, &origin), "{task:?}");
+        }
+        let task = "Reply with exactly copper lantern.";
+        for pieces in [
+            vec!["exactly copper lantern."],
+            vec!["Reply with exactly", "copper lantern. changed"],
+            vec![
+                "Reply with exactly",
+                "copper lantern.",
+                "",
+                "hidden continuation",
+            ],
+            vec!["Reply with exactly", "copper lantern. ↓"],
+            vec!["↑ Reply with exactly", "copper lantern."],
+        ] {
+            assert!(
+                !ctl_screen(&pieces, true).codex_ctl_retry_draft(task, &origin),
+                "{pieces:?}"
+            );
+        }
+        for (row, text) in [
+            (0, "Enter to select"),
+            (0, "↑/↓ to navigate"),
+            (0, "Type to filter"),
+            (45, "unexpected top padding"),
+            (48, "hidden continuation"),
+        ] {
+            let mut sample = ctl_screen(&[task], true);
+            ctl_set_row(&mut sample, row, text);
+            assert!(
+                !sample.codex_ctl_retry_draft(task, &origin),
+                "{row}: {text}"
+            );
+        }
+        let mut sample = ctl_screen(&["Reply with exactly", "copper lantern."], true);
+        ctl_set_row(&mut sample, 46, "copper lantern.");
+        assert!(
+            !sample.codex_ctl_retry_draft(task, &origin),
+            "lost continuation prefix"
+        );
+        let mut sample = ctl_screen(&[task], true);
+        sample.cursor_visible = false;
+        assert!(!sample.codex_ctl_retry_draft(task, &origin));
+        sample.cursor_visible = true;
+        sample.bracketed_paste = false;
+        assert!(!sample.codex_ctl_retry_draft(task, &origin));
+        let margin = "x".repeat(38);
+        assert!(
+            !ctl_screen(&[&margin], true).codex_ctl_retry_draft(&margin, &origin),
+            "natural soft-wrap blank ambiguity"
+        );
+        // Sufficiently tall drafts touch the viewport edge and cannot prove a full prefix.
+        let pieces = vec!["x"; 47];
+        assert!(!ctl_screen(&pieces, true).codex_ctl_retry_draft(&pieces.join(" "), &origin));
+    }
+
+    #[test]
+    fn ctl_codex_retry_refuses_changed_grid_and_model_footer() {
+        let origin = ctl_origin("").codex_ctl_origin().unwrap();
+        let mut sample = ctl_screen(&["task"], true);
+        ctl_set_row(&mut sample, 49, "  GPT-6.1-Sol · other project");
+        assert!(!sample.codex_ctl_retry_draft("task", &origin));
+        let mut sample = ctl_screen(&["task"], true);
+        sample.text = sample
+            .text
+            .lines()
+            .map(|row| format!("{row} "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !sample.codex_ctl_retry_draft("task", &origin),
+            "changed column count"
+        );
+        let mut sample = ctl_screen(&["task"], true);
+        sample.text.push_str(&format!("\n{}", " ".repeat(41)));
+        assert!(
+            !sample.codex_ctl_retry_draft("task", &origin),
+            "changed row count"
+        );
+        let mut sample = ctl_screen(&["task"], true);
+        ctl_set_row(&mut sample, 49, "");
+        ctl_set_row(&mut sample, 50, "  GPT-6.1-Sol · scratch");
+        assert!(
+            !sample.codex_ctl_retry_draft("task", &origin),
+            "moved footer"
+        );
+        let mut sample = ctl_origin("");
+        sample.text.push(' ');
+        assert!(sample.codex_ctl_origin().is_none(), "nonuniform grid");
+    }
+
     #[test]
     fn codex_editor_accepts_non_gpt_models_and_the_shortcut_footer_but_no_menu() {
         for footer in [

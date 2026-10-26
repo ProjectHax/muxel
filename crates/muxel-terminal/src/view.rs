@@ -1598,6 +1598,44 @@ pub struct TerminalView {
 /// cycle.
 pub type TerminalFocusObserver = fn(Uuid, bool, &mut Window, &mut App);
 
+/// Provider evidence for one ctl paste-and-submit operation. Capture before
+/// pasting; the caller owns deadlines, input-revision guards and the one retry.
+pub struct PromptSubmission {
+    session: std::sync::Weak<TerminalSession>,
+    binding_revision: u64,
+    provider: TitleProvider,
+    instance_id: Uuid,
+    input: String,
+    expected_input: String,
+    before_title: u64,
+    allow_working_title: bool,
+    before_prompt: Option<String>,
+    origin: Option<PromptOriginProof>,
+    observable: bool,
+}
+
+impl PromptSubmission {
+    /// Whether this pane can show a receipt for this prompt at all. Without
+    /// one, waiting for confirmation only delays the caller.
+    pub fn observable(&self) -> bool {
+        self.observable
+    }
+}
+
+struct PromptOriginProof {
+    frame: crate::startup::CodexCtlOrigin,
+    title_generation: u64,
+    resize_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptSubmissionState {
+    Accepted,
+    Retryable,
+    Unconfirmed,
+    Interrupted,
+}
+
 fn with_startup_view<R>(
     view: &WeakEntity<TerminalView>,
     session: &Arc<TerminalSession>,
@@ -1714,6 +1752,9 @@ struct StartupAttempt<'a> {
     input: &'a str,
     expected_input: String,
     before_title: u64,
+    // ctl sends begun during an existing turn need matching transcript proof.
+    // Startup attempts keep their existing title-based confirmation.
+    allow_working_title: bool,
     before_prompt: Option<String>,
     instance_id: Uuid,
 }
@@ -1751,7 +1792,8 @@ fn startup_provider_accepted(
     let fresh_user_row = startup_has_fresh_user_row(attempt, prompt)
         && startup_empty_composer(attempt.provider, screen);
     fresh_user_row
-        || (title_generation != attempt.before_title
+        || (attempt.allow_working_title
+            && title_generation != attempt.before_title
             && startup_title_working(attempt.provider, title))
 }
 
@@ -1764,6 +1806,146 @@ fn startup_title(
     match probe {
         Some(probe) => probe.snapshot(),
         None => session.title_snapshot(),
+    }
+}
+
+fn ctl_title_can_confirm(
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    status: AgentStatus,
+) -> bool {
+    matches!(status, AgentStatus::Idle | AgentStatus::Done)
+        && !matches!(
+            parse_agent_title(provider, title).and_then(|frame| frame.status),
+            Some(AgentStatus::Working | AgentStatus::Blocked)
+        )
+        && !matches!(
+            provider_screen_status(provider, &screen.text),
+            Some(AgentStatus::Working | AgentStatus::Blocked)
+        )
+}
+
+/// A ctl receipt is either a working title after an idle one, which needs a
+/// provider status title muxel can read (tmux hides OSC titles), or a fresh
+/// transcript row beside an empty composer. Those readers stop at the first
+/// blank line, so only a prompt without one can match; a row repeating the
+/// previous prompt is never fresh; and Grok's composer is never known empty.
+fn ctl_acceptance_observable(
+    provider: TitleProvider,
+    title: Option<&str>,
+    allow_working_title: bool,
+    input: &str,
+    before_prompt: Option<&str>,
+) -> bool {
+    let title_receipt = allow_working_title
+        && parse_agent_title(provider, title)
+            .and_then(|frame| frame.status)
+            .is_some();
+    let transcript_receipt = matches!(provider, TitleProvider::Claude | TitleProvider::Codex)
+        && !input.trim().lines().any(|line| line.trim().is_empty())
+        && before_prompt != Some(crate::startup::normalized(input).as_str());
+    title_receipt || transcript_receipt
+}
+
+fn prompt_submission_state(
+    attempt: &StartupAttempt<'_>,
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    title_generation: u64,
+    prompt: Option<&str>,
+    marker_sets: [&[String]; 2],
+    origin: Option<&PromptOriginProof>,
+) -> PromptSubmissionState {
+    if startup_provider_accepted(attempt, screen, title, title_generation, prompt) {
+        PromptSubmissionState::Accepted
+    } else if cfg!(windows)
+        && attempt.provider == TitleProvider::Codex
+        && !startup_has_fresh_user_row(attempt, prompt)
+        && origin.is_some_and(|proof| {
+            proof.title_generation == title_generation
+                && screen.codex_ctl_retry_draft(attempt.input, &proof.frame)
+        })
+        && codex_ctl_ready(screen, title, marker_sets, false)
+    {
+        PromptSubmissionState::Retryable
+    } else {
+        PromptSubmissionState::Unconfirmed
+    }
+}
+
+/// Existing panes may deliberately publish only their thread name. A strict
+/// ctl editor proof does not require a semantic Idle title, but positive work,
+/// permission and menu evidence must still veto the retry.
+fn codex_ctl_ready(
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    marker_sets: [&[String]; 2],
+    empty: bool,
+) -> bool {
+    let Some(context) = screen.codex_composer_context(empty) else {
+        return false;
+    };
+    if matches!(
+        parse_agent_title(TitleProvider::Codex, title).and_then(|frame| frame.status),
+        Some(AgentStatus::Working | AgentStatus::Blocked)
+    ) {
+        return false;
+    }
+    if title.is_some_and(|title| {
+        matches!(
+            title.trim().to_ascii_lowercase().as_str(),
+            "working" | "thinking" | "starting" | "waiting" | "blocked" | "action required"
+        )
+    }) {
+        return false;
+    }
+    if title
+        .and_then(|title| title.rsplit_once(" | "))
+        .is_some_and(|(_, state)| {
+            let state = state.trim().to_ascii_lowercase();
+            matches!(
+                state.split_whitespace().next(),
+                Some("working" | "thinking" | "starting" | "waiting" | "blocked")
+            ) || state.starts_with("action required")
+        })
+    {
+        return false;
+    }
+    let lower = context.to_ascii_lowercase();
+    ![
+        "esc to interrupt",
+        "esc interrupt",
+        "ctrl+c to interrupt",
+        "trust this folder?",
+        "folder access",
+        "enter continue · esc quit",
+        "↑",
+        "↓",
+        "enter to select",
+        "enter to confirm",
+        "tab to select",
+        "esc to cancel",
+        "esc to dismiss",
+        "type to filter",
+    ]
+    .iter()
+    .any(|chrome| lower.contains(chrome))
+        && !marker_sets
+            .into_iter()
+            .flatten()
+            .any(|marker| !marker.is_empty() && context.contains(marker))
+}
+
+fn ctl_transcript_prompt(
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+    history: impl FnOnce() -> String,
+) -> Option<String> {
+    if provider == TitleProvider::Codex {
+        screen.codex_ctl_transcript_prompt()
+    } else {
+        muxel_core::readaloud::prompt_from_screen(&history())
     }
 }
 
@@ -2464,6 +2646,7 @@ impl TerminalView {
                                 input: &input,
                                 expected_input: crate::startup::normalized(&input),
                                 before_title: startup_title(&session, probe).0,
+                                allow_working_title: true,
                                 before_prompt: muxel_core::readaloud::prompt_from_screen(
                                     &session.recent_text(500),
                                 )
@@ -2748,6 +2931,134 @@ impl TerminalView {
 
     pub fn session(&self) -> &Arc<TerminalSession> {
         &self.session
+    }
+
+    /// Snapshot evidence before the caller pastes. This never marks a turn as
+    /// submitted and does not authorize any subsequent write.
+    pub fn begin_prompt_submission(&self, text: &str) -> Option<PromptSubmission> {
+        if self.exited
+            || !matches!(
+                self.title_provider,
+                TitleProvider::Codex | TitleProvider::Claude | TitleProvider::Grok
+            )
+            || text.trim().is_empty()
+        {
+            return None;
+        }
+        let binding_revision = self.session.binding_revision();
+        let resize_revision = self.session.resize_revision();
+        let (before_title, title) = self.session.title_snapshot();
+        let screen = self.session.startup_screen();
+        let allow_working_title = ctl_title_can_confirm(
+            self.title_provider,
+            &screen,
+            title.as_deref(),
+            self.status(),
+        );
+        let before_prompt = ctl_transcript_prompt(self.title_provider, &screen, || {
+            self.session.recent_text(500)
+        })
+        .map(|prompt| crate::startup::normalized(&prompt));
+        let origin = if cfg!(windows)
+            && self.title_provider == TitleProvider::Codex
+            && codex_ctl_ready(
+                &screen,
+                title.as_deref(),
+                [&self.working_markers, &self.blocked_markers],
+                true,
+            ) {
+            screen
+                .codex_ctl_origin()
+                .filter(|_| {
+                    before_title == self.session.title_snapshot().0
+                        && resize_revision == self.session.resize_revision()
+                        && binding_revision == self.session.binding_revision()
+                })
+                .map(|frame| PromptOriginProof {
+                    frame,
+                    title_generation: before_title,
+                    resize_revision,
+                })
+        } else {
+            None
+        };
+        let observable = origin.is_some()
+            || ctl_acceptance_observable(
+                self.title_provider,
+                title.as_deref(),
+                allow_working_title,
+                text,
+                before_prompt.as_deref(),
+            );
+        // Preserve this generation even if it changes while reading history.
+        // Returning None would incorrectly downgrade a switch to an unsupported
+        // provider and skip the caller's pre-Enter interruption check.
+        Some(PromptSubmission {
+            session: Arc::downgrade(&self.session),
+            binding_revision,
+            provider: self.title_provider,
+            instance_id: self.instance_id,
+            input: text.to_owned(),
+            expected_input: crate::startup::normalized(text),
+            before_title,
+            allow_working_title,
+            before_prompt,
+            origin,
+            observable,
+        })
+    }
+
+    /// Observe real provider receipts. Retryable is only a Windows Codex draft
+    /// proof; the app must still recheck lifetime, permissions and input revision.
+    pub fn observe_prompt_submission(&self, snapshot: &PromptSubmission) -> PromptSubmissionState {
+        let current = || {
+            !self.exited
+                && snapshot.instance_id == self.instance_id
+                && snapshot.provider == self.title_provider
+                && snapshot.session.ptr_eq(&Arc::downgrade(&self.session))
+                && snapshot.binding_revision == self.session.binding_revision()
+        };
+        if !current() {
+            return PromptSubmissionState::Interrupted;
+        }
+        let resize_revision = self.session.resize_revision();
+        let (generation, title) = self.session.title_snapshot();
+        let screen = self.session.startup_screen();
+        let prompt = ctl_transcript_prompt(self.title_provider, &screen, || {
+            self.session.recent_text(500)
+        });
+        let attempt = StartupAttempt {
+            provider: snapshot.provider,
+            input: &snapshot.input,
+            expected_input: snapshot.expected_input.clone(),
+            before_title: snapshot.before_title,
+            allow_working_title: snapshot.allow_working_title,
+            before_prompt: snapshot.before_prompt.clone(),
+            instance_id: snapshot.instance_id,
+        };
+        let observed = prompt_submission_state(
+            &attempt,
+            &screen,
+            title.as_deref(),
+            generation,
+            prompt.as_deref(),
+            [&self.working_markers, &self.blocked_markers],
+            snapshot
+                .origin
+                .as_ref()
+                .filter(|proof| proof.resize_revision == resize_revision),
+        );
+        if current()
+            && observed == PromptSubmissionState::Retryable
+            && (resize_revision != self.session.resize_revision()
+                || generation != self.session.title_snapshot().0)
+        {
+            PromptSubmissionState::Unconfirmed
+        } else if current() {
+            observed
+        } else {
+            PromptSubmissionState::Interrupted
+        }
     }
 
     pub fn exited(&self) -> bool {
@@ -3603,9 +3914,11 @@ sleep 30
 #[cfg(test)]
 mod startup_readiness_tests {
     use super::{
-        QuietStartup, QuietStartupTarget, SHIFT_TAB, STARTUP_KEY_GAP_MS, STARTUP_MAX_WAIT_MS,
-        STARTUP_PRE_TYPE_MS, STARTUP_SUBMIT_DELAY_MS, StartupAttempt, TitleProvider,
-        claude_startup_ready, controlled_startup_deadline, quiet_startup,
+        PromptOriginProof, PromptSubmissionState, QuietStartup, QuietStartupTarget, SHIFT_TAB,
+        STARTUP_KEY_GAP_MS, STARTUP_MAX_WAIT_MS, STARTUP_PRE_TYPE_MS, STARTUP_SUBMIT_DELAY_MS,
+        StartupAttempt, TitleProvider, claude_startup_ready, codex_ctl_ready,
+        controlled_startup_deadline, ctl_acceptance_observable, ctl_title_can_confirm,
+        ctl_transcript_prompt, prompt_submission_state, quiet_startup, startup_has_fresh_user_row,
         startup_provider_accepted, startup_ready, startup_retry_allowed,
     };
     use crate::startup::Screen;
@@ -3819,12 +4132,491 @@ mod startup_readiness_tests {
     }
 
     #[test]
+    fn ctl_busy_send_cannot_confirm_from_a_previous_turns_title() {
+        use super::AgentStatus;
+
+        // A paste can still be invisible while an earlier turn publishes work.
+        let empty = codex_screen("Ask Codex to do anything");
+        for (provider, working) in [
+            (TitleProvider::Codex, "scratch | Working"),
+            (TitleProvider::Claude, "◐ scratch"),
+            (TitleProvider::Grok, "⠋ - Thinking - scratch - grok"),
+        ] {
+            for status in [AgentStatus::Working, AgentStatus::Blocked] {
+                assert!(!ctl_title_can_confirm(provider, &empty, None, status));
+            }
+            assert!(!ctl_title_can_confirm(
+                provider,
+                &empty,
+                Some(working),
+                AgentStatus::Idle
+            ));
+            let attempt = StartupAttempt {
+                provider,
+                input: "task",
+                expected_input: "task".into(),
+                before_title: 8,
+                allow_working_title: false,
+                before_prompt: None,
+                instance_id: uuid::Uuid::new_v4(),
+            };
+            assert_eq!(
+                prompt_submission_state(&attempt, &empty, Some(working), 9, None, [&[], &[]], None),
+                PromptSubmissionState::Unconfirmed
+            );
+            if provider == TitleProvider::Codex {
+                assert_eq!(
+                    prompt_submission_state(
+                        &attempt,
+                        &empty,
+                        Some(working),
+                        9,
+                        Some("task"),
+                        [&[], &[]],
+                        None
+                    ),
+                    PromptSubmissionState::Accepted
+                );
+            }
+        }
+        for status in [AgentStatus::Idle, AgentStatus::Done] {
+            assert!(ctl_title_can_confirm(
+                TitleProvider::Codex,
+                &empty,
+                Some("scratch | Ready"),
+                status
+            ));
+        }
+    }
+
+    #[test]
+    fn ctl_send_waits_only_where_a_receipt_can_be_seen() {
+        let multi = "first paragraph\n\nsecond paragraph";
+        for (provider, idle) in [
+            (TitleProvider::Codex, "scratch | Ready"),
+            (TitleProvider::Claude, "✳ scratch"),
+            (TitleProvider::Grok, "scratch - grok"),
+        ] {
+            // A readable status title confirms any prompt sent while idle.
+            assert!(ctl_acceptance_observable(
+                provider,
+                Some(idle),
+                true,
+                multi,
+                Some("first paragraph")
+            ));
+            // tmux hides the title and a busy pane can't use it either; then
+            // only a fresh transcript row the readers return whole can confirm.
+            for (title, allow) in [(None, true), (Some(idle), false)] {
+                assert!(!ctl_acceptance_observable(
+                    provider, title, allow, multi, None
+                ));
+                assert_eq!(
+                    ctl_acceptance_observable(provider, title, allow, "one\nparagraph\n", None),
+                    provider != TitleProvider::Grok
+                );
+                // The same prompt again leaves the newest row unchanged.
+                assert!(!ctl_acceptance_observable(
+                    provider,
+                    title,
+                    allow,
+                    "continue ",
+                    Some("continue")
+                ));
+            }
+        }
+        // A Codex thread-only title carries no run state to watch.
+        assert!(!ctl_acceptance_observable(
+            TitleProvider::Codex,
+            Some("scratch"),
+            true,
+            multi,
+            None
+        ));
+    }
+
+    #[test]
+    fn ctl_prompt_confirmation_requires_fresh_provider_evidence() {
+        let empty = codex_screen("Ask Codex to do anything");
+        for (provider, working) in [
+            (TitleProvider::Codex, "scratch | Working"),
+            (TitleProvider::Claude, "◐ scratch"),
+            (TitleProvider::Grok, "⠋ - Thinking - scratch - grok"),
+        ] {
+            let attempt = StartupAttempt {
+                provider,
+                input: "task",
+                expected_input: "task".into(),
+                before_title: 8,
+                allow_working_title: true,
+                before_prompt: None,
+                instance_id: uuid::Uuid::new_v4(),
+            };
+            assert_eq!(
+                prompt_submission_state(&attempt, &empty, Some(working), 8, None, [&[], &[]], None),
+                PromptSubmissionState::Unconfirmed
+            );
+            assert_eq!(
+                prompt_submission_state(&attempt, &empty, Some(working), 9, None, [&[], &[]], None),
+                PromptSubmissionState::Accepted
+            );
+        }
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: "task",
+            expected_input: "task".into(),
+            before_title: 8,
+            allow_working_title: true,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(
+            prompt_submission_state(
+                &attempt,
+                &empty,
+                Some("scratch | Ready"),
+                9,
+                Some("task"),
+                [&[], &[]],
+                None
+            ),
+            PromptSubmissionState::Accepted
+        );
+        let repeated = StartupAttempt {
+            before_prompt: Some("task".into()),
+            ..attempt
+        };
+        assert_eq!(
+            prompt_submission_state(
+                &repeated,
+                &empty,
+                Some("scratch | Ready"),
+                9,
+                Some("task"),
+                [&[], &[]],
+                None
+            ),
+            PromptSubmissionState::Unconfirmed
+        );
+    }
+
+    fn ctl_grid(draft: &[&str], consumed: bool) -> Screen {
+        let mut rows = vec![String::new(); 51];
+        rows[0] = "OpenAI Codex".into();
+        let top = 49 - 1 - draft.len() - usize::from(consumed);
+        for (index, piece) in draft.iter().enumerate() {
+            rows[top + index] = format!("{}{piece}", if index == 0 { "› " } else { "  " });
+        }
+        rows[49] = "  GPT-6.1-Sol · scratch".into();
+        rows[50] = "  ? for shortcuts".into();
+        Screen {
+            text: rows
+                .iter()
+                .map(|row| format!("{row}{}", " ".repeat(41 - row.chars().count())))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            cursor_row: (top + draft.len() - usize::from(!consumed)) as i32,
+            cursor_column: if consumed {
+                2
+            } else {
+                2 + draft.last().unwrap().chars().count()
+            },
+            cursor_visible: true,
+            bracketed_paste: true,
+        }
+    }
+
+    fn ctl_set_row(screen: &mut Screen, index: usize, text: &str) {
+        let mut rows = screen.text.lines().map(str::to_owned).collect::<Vec<_>>();
+        rows[index] = format!("{text}{}", " ".repeat(41 - text.chars().count()));
+        screen.text = rows.join("\n");
+    }
+
+    fn ctl_origin_proof() -> PromptOriginProof {
+        let mut empty = ctl_grid(&["Ask Codex to do anything"], false);
+        empty.cursor_column = 2;
+        assert!(codex_ctl_ready(&empty, None, [&[], &[]], true));
+        PromptOriginProof {
+            frame: empty.codex_ctl_origin().unwrap(),
+            title_generation: 8,
+            resize_revision: 0,
+        }
+    }
+
+    #[test]
+    fn ctl_prompt_retry_is_windows_codex_only_and_fresh_receipts_veto_it() {
+        let proof = ctl_origin_proof();
+        let retained = ctl_grid(&["task"], true);
+        let pending = ctl_grid(&["task"], false);
+        for (provider, title) in [
+            (TitleProvider::Codex, "scratch | Ready"),
+            (TitleProvider::Claude, "✳ scratch"),
+            (TitleProvider::Grok, "scratch - grok"),
+        ] {
+            let attempt = StartupAttempt {
+                provider,
+                input: "task",
+                expected_input: "task".into(),
+                before_title: 8,
+                allow_working_title: true,
+                before_prompt: None,
+                instance_id: uuid::Uuid::new_v4(),
+            };
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &pending,
+                    Some(title),
+                    8,
+                    None,
+                    [&[], &[]],
+                    Some(&proof)
+                ),
+                PromptSubmissionState::Unconfirmed,
+                "end cursor does not prove the first CR was read"
+            );
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &retained,
+                    Some(title),
+                    8,
+                    None,
+                    [&[], &[]],
+                    Some(&proof)
+                ),
+                if cfg!(windows) && provider == TitleProvider::Codex {
+                    PromptSubmissionState::Retryable
+                } else {
+                    PromptSubmissionState::Unconfirmed
+                }
+            );
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &retained,
+                    Some(title),
+                    8,
+                    Some("task"),
+                    [&[], &[]],
+                    Some(&proof)
+                ),
+                PromptSubmissionState::Unconfirmed,
+                "fresh matching user receipt vetoes retry"
+            );
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &retained,
+                    Some(title),
+                    8,
+                    None,
+                    [&[], &[]],
+                    None
+                ),
+                PromptSubmissionState::Unconfirmed,
+                "no compact initial origin proof"
+            );
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &retained,
+                    Some(title),
+                    9,
+                    None,
+                    [&[], &[]],
+                    Some(&proof)
+                ),
+                PromptSubmissionState::Unconfirmed,
+                "any title-generation change vetoes retry"
+            );
+        }
+    }
+
+    fn long_codex_ctl_screen() -> (String, Screen) {
+        // One 31-column word per 38-column textarea row; eighteen rows exceed
+        // the general read-aloud scan's bounded composer reach.
+        let words: Vec<_> = (0..18)
+            .map(|index| format!("segment{index:02}abcdefghijklmnopqrstuv"))
+            .collect();
+        let pieces = words.iter().map(String::as_str).collect::<Vec<_>>();
+        (words.join(" "), ctl_grid(&pieces, true))
+    }
+
+    #[test]
+    fn ctl_codex_no_title_long_own_composer_is_not_a_transcript_receipt() {
+        let (task, retained) = long_codex_ctl_screen();
+        let generic = muxel_core::readaloud::prompt_from_screen(&retained.text).unwrap();
+        assert_eq!(
+            crate::startup::normalized(&generic),
+            task,
+            "reproduce generic long-composer echo"
+        );
+        assert_eq!(
+            ctl_transcript_prompt(TitleProvider::Codex, &retained, || retained.text.clone()),
+            None
+        );
+        let proof = ctl_origin_proof();
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: &task,
+            expected_input: task.clone(),
+            before_title: 8,
+            allow_working_title: true,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        for title in [
+            None,
+            Some("a thread name without semantic status"),
+            Some("scratch | Ready"),
+        ] {
+            assert!(codex_ctl_ready(&retained, title, [&[], &[]], false));
+            assert!(
+                !startup_ready(TitleProvider::Codex, &retained, None, &[], false),
+                "startup title admission stays unchanged"
+            );
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &retained,
+                    title,
+                    8,
+                    None,
+                    [&[], &[]],
+                    Some(&proof)
+                ),
+                if cfg!(windows) {
+                    PromptSubmissionState::Retryable
+                } else {
+                    PromptSubmissionState::Unconfirmed
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn ctl_codex_readiness_vetoes_explicit_work_chrome_and_both_marker_sets() {
+        let (_, retained) = long_codex_ctl_screen();
+        for title in [
+            "scratch | Working",
+            "scratch | Starting",
+            "scratch | Waiting",
+            "scratch | Blocked",
+            "scratch | Action Required",
+            "[ ! ] Action Required | scratch",
+            "Working",
+            "Blocked",
+        ] {
+            assert!(
+                !codex_ctl_ready(&retained, Some(title), [&[], &[]], false),
+                "{title}"
+            );
+        }
+        // Only provider chrome owns configured markers, not a quoted task.
+        let quoted = vec!["segment07".into()];
+        assert!(codex_ctl_ready(&retained, None, [&quoted, &quoted], false));
+        let custom = vec!["OpenAI Codex".into()];
+        assert!(!codex_ctl_ready(&retained, None, [&custom, &[]], false));
+        assert!(!codex_ctl_ready(&retained, None, [&[], &custom], false));
+        for chrome in [
+            "esc to interrupt",
+            "Trust this folder?",
+            "Enter to select",
+            "Type to filter",
+        ] {
+            let mut blocked = long_codex_ctl_screen().1;
+            ctl_set_row(&mut blocked, 0, chrome);
+            assert!(
+                !codex_ctl_ready(&blocked, None, [&[], &[]], false),
+                "{chrome}"
+            );
+            let mut origin = ctl_grid(&[""], false);
+            ctl_set_row(&mut origin, 0, chrome);
+            assert!(
+                !codex_ctl_ready(&origin, None, [&[], &[]], true),
+                "origin: {chrome}"
+            );
+        }
+        let origin = ctl_grid(&[""], false);
+        assert!(!codex_ctl_ready(&origin, Some("Working"), [&[], &[]], true));
+        assert!(!codex_ctl_ready(&origin, None, [&custom, &[]], true));
+        assert!(!codex_ctl_ready(&origin, None, [&[], &custom], true));
+    }
+
+    #[test]
+    fn ctl_codex_fresh_rendered_transcript_vetoes_retry_and_can_confirm_empty_editor() {
+        let (task, mut retained) = long_codex_ctl_screen();
+        let proof = ctl_origin_proof();
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: &task,
+            expected_input: task.clone(),
+            before_title: 8,
+            allow_working_title: true,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        for (index, word) in task.split(' ').enumerate() {
+            ctl_set_row(
+                &mut retained,
+                index + 1,
+                &format!("{}{word}", if index == 0 { "› " } else { "  " }),
+            );
+        }
+        let prompt =
+            ctl_transcript_prompt(TitleProvider::Codex, &retained, || retained.text.clone());
+        assert_eq!(prompt.as_deref(), Some(task.as_str()));
+        assert!(startup_has_fresh_user_row(&attempt, prompt.as_deref()));
+        assert_eq!(
+            prompt_submission_state(
+                &attempt,
+                &retained,
+                None,
+                8,
+                prompt.as_deref(),
+                [&[], &[]],
+                Some(&proof)
+            ),
+            PromptSubmissionState::Unconfirmed
+        );
+        let mut empty = ctl_grid(&["Ask Codex to do anything"], false);
+        empty.cursor_column = 2;
+        ctl_set_row(&mut empty, 1, "› task");
+        ctl_set_row(&mut empty, 2, "Assistant reply");
+        let prompt = ctl_transcript_prompt(TitleProvider::Codex, &empty, || empty.text.clone());
+        assert_eq!(prompt.as_deref(), Some("task"));
+        let small_attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: "task",
+            expected_input: "task".into(),
+            before_title: 8,
+            allow_working_title: true,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(
+            prompt_submission_state(
+                &small_attempt,
+                &empty,
+                None,
+                8,
+                prompt.as_deref(),
+                [&[], &[]],
+                None
+            ),
+            PromptSubmissionState::Accepted
+        );
+    }
+
+    #[test]
     fn startup_acceptance_rejects_own_echo_stale_work_and_boot_activity() {
         let attempt = StartupAttempt {
             provider: TitleProvider::Codex,
             input: "task",
             expected_input: "task".into(),
             before_title: 8,
+            allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),
         };
@@ -3892,6 +4684,7 @@ mod startup_readiness_tests {
             input: "a  b",
             expected_input: "a b".into(),
             before_title: 2,
+            allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),
         };

@@ -220,9 +220,16 @@ fn owner_id() -> &'static str {
 /// Shortest wait between writing a claim and reading it back.
 const CLAIM_SETTLE_MIN: Duration = Duration::from_millis(200);
 
-/// Matches the startup prompt's pause before its Enter: the agent has taken in
-/// the pasted text, so the Enter submits it instead of adding a line to it.
+/// Give the child a head start before its first Enter. This pause does not
+/// establish consumption; provider acceptance is checked separately below.
 const SUBMIT_DELAY_MS: u64 = 400;
+/// These are observation allowances, not a bound on the child's input queue.
+/// Codex 0.163's Windows detector needs >60ms of processed-character quiet;
+/// sleeping before a pipe write cannot establish that. Retry only visible proof.
+const SUBMISSION_RETRY_MS: u64 = 5_000;
+const SUBMISSION_CONFIRM_MS: u64 = 10_000;
+const SUBMISSION_RETRY_GRACE_MS: u64 = 3_000;
+const SUBMISSION_POLL_MS: u64 = 100;
 /// Pause between the keys of one `keys` request.
 const KEY_GAP_MS: u64 = 80;
 
@@ -1155,6 +1162,10 @@ impl MuxelApp {
 
     /// The session outside control may type into, or why it may not.
     fn control_writable(&self, iid: Uuid, cx: &App) -> CtlResult<Arc<TerminalSession>> {
+        // Admission checked this too, but delayed Enters and keys write later.
+        if !self.settings.control_enabled {
+            return Err(ctl::creation_refusal(ErrorCode::ControlDisabled));
+        }
         let inst = self
             .workspace
             .instance(iid)
@@ -1382,8 +1393,8 @@ impl MuxelApp {
     }
 
     /// Type `typing` into its agent, and note the turn it starts at `at` (when a
-    /// claim fixed it) or when its Enter lands. The reply to a prompt comes once
-    /// its Enter is written, or withheld.
+    /// claim fixed it) or when its Enter lands. Known providers then get a
+    /// bounded acceptance check; a writer receipt never proves consumption.
     fn control_press(
         &mut self,
         typing: Typing,
@@ -1404,7 +1415,10 @@ impl MuxelApp {
         } = typing;
         match typing.input {
             Input::Prompt(text) => {
-                let reply = match paste_prompt(&session, iid, &text, launch_id) {
+                let attempt = self
+                    .terminal_view(iid)
+                    .and_then(|view| view.read(cx).begin_prompt_submission(&text));
+                let mut reply = match paste_prompt(&session, iid, &text, launch_id) {
                     Ok(reply) => reply,
                     Err(error) => return Task::ready(Err(error)),
                 };
@@ -1413,16 +1427,73 @@ impl MuxelApp {
                     cx.background_executor()
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                         .await;
-                    this.update(cx, |app, cx| {
+                    let mut revision = this.update(cx, |app, cx| -> CtlResult<u64> {
                         let live = app.control_writable(iid, cx);
                         enter_verdict(live, &session, pasted, session.input_rev())?;
+                        if attempt.as_ref().is_some_and(|attempt| {
+                            app.terminal_view(iid).is_none_or(|view| {
+                                view.read(cx).observe_prompt_submission(attempt)
+                                    == muxel_terminal::PromptSubmissionState::Interrupted
+                            })
+                        }) {
+                            return Err("the provider conversation changed after the paste, so Enter was withheld: check its `screen`".into());
+                        }
                         press_prompt_enter(&session, pasted)?;
                         // Claim timestamps predict settlement. Local wait starts
                         // at the actual Enter admission, never at the prediction.
                         app.note_control_turn(iid, turn, now_ms());
-                        Ok(reply)
+                        Ok(session.input_rev())
                     })
-                    .unwrap_or_else(|_| Err("muxel is shutting down".into()))
+                    .unwrap_or_else(|_| Err("muxel is shutting down".into()))?;
+                    // Enter is in. Whatever happens next, the reply is this
+                    // receipt: an error would read as "Enter withheld".
+                    let Some(attempt) = attempt.filter(|attempt| attempt.observable()) else {
+                        submission_receipt(&mut reply, None, 0);
+                        return Ok(reply);
+                    };
+                    let started = std::time::Instant::now();
+                    let mut confirmation = PromptConfirmation::default();
+                    let mut retries = 0_u8;
+                    loop {
+                        let action = this
+                            .update(cx, |app, cx| -> Result<_, Unconfirmed> {
+                                confirmation_verdict(
+                                    app.control_writable(iid, cx),
+                                    &session,
+                                    revision,
+                                    session.input_rev(),
+                                )?;
+                                let view = app.terminal_view(iid).ok_or(Unconfirmed::Interrupted)?;
+                                let observation = view.read(cx).observe_prompt_submission(&attempt);
+                                if observation == muxel_terminal::PromptSubmissionState::Interrupted {
+                                    return Err(Unconfirmed::Interrupted);
+                                }
+                                let action = confirmation.observe(started.elapsed(), observation);
+                                if action == PromptConfirmationAction::RetryEnter {
+                                    // Observation and admission share this UI turn. The
+                                    // same permission, launch and input guards still apply.
+                                    press_prompt_enter(&session, revision)
+                                        .map_err(|_| Unconfirmed::Interrupted)?;
+                                    revision = session.input_rev();
+                                    retries += 1;
+                                }
+                                Ok(action)
+                            })
+                            .unwrap_or(Err(Unconfirmed::Interrupted));
+                        let outcome = match action {
+                            Ok(PromptConfirmationAction::Confirmed) => Ok(()),
+                            Ok(PromptConfirmationAction::Unconfirmed) => Err(Unconfirmed::TimedOut),
+                            Ok(PromptConfirmationAction::Observe | PromptConfirmationAction::RetryEnter) => {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(SUBMISSION_POLL_MS))
+                                    .await;
+                                continue;
+                            }
+                            Err(stop) => Err(stop),
+                        };
+                        submission_receipt(&mut reply, Some(outcome), retries);
+                        return Ok(reply);
+                    }
                 })
             }
             Input::Keys(presses) => {
@@ -1498,6 +1569,97 @@ impl MuxelApp {
             .get(&iid)
             .and_then(|turn| turn.startup.as_ref())?
             .claim()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptConfirmationAction {
+    Observe,
+    RetryEnter,
+    Confirmed,
+    Unconfirmed,
+}
+
+#[derive(Default)]
+struct PromptConfirmation {
+    retried_at: Option<Duration>,
+}
+
+impl PromptConfirmation {
+    fn observe(
+        &mut self,
+        elapsed: Duration,
+        observation: muxel_terminal::PromptSubmissionState,
+    ) -> PromptConfirmationAction {
+        use muxel_terminal::PromptSubmissionState;
+        if observation == PromptSubmissionState::Accepted {
+            return PromptConfirmationAction::Confirmed;
+        }
+        // A late retry still gets time to show its receipt.
+        let confirm = Duration::from_millis(SUBMISSION_CONFIRM_MS);
+        let deadline = self.retried_at.map_or(confirm, |at| {
+            confirm.max(at + Duration::from_millis(SUBMISSION_RETRY_GRACE_MS))
+        });
+        if elapsed >= deadline {
+            return PromptConfirmationAction::Unconfirmed;
+        }
+        if elapsed >= Duration::from_millis(SUBMISSION_RETRY_MS)
+            && self.retried_at.is_none()
+            && observation == PromptSubmissionState::Retryable
+        {
+            self.retried_at = Some(elapsed);
+            return PromptConfirmationAction::RetryEnter;
+        }
+        PromptConfirmationAction::Observe
+    }
+}
+
+/// Why checking ended without a provider receipt. Enter was already admitted,
+/// so each of these is reported in the receipt, never as an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unconfirmed {
+    TimedOut,
+    /// Other input reached the pane; no further Enter is sent.
+    InputChanged,
+    /// The pane closed, restarted, switched conversation or lost permission.
+    Interrupted,
+}
+
+impl Unconfirmed {
+    fn code(self) -> &'static str {
+        match self {
+            Self::TimedOut => "timed_out",
+            Self::InputChanged => "input_changed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+fn confirmation_verdict<T>(
+    live: CtlResult<Arc<T>>,
+    original: &Arc<T>,
+    expected: u64,
+    current: u64,
+) -> Result<(), Unconfirmed> {
+    if !live.as_ref().is_ok_and(|live| Arc::ptr_eq(live, original)) {
+        return Err(Unconfirmed::Interrupted);
+    }
+    if current != expected {
+        return Err(Unconfirmed::InputChanged);
+    }
+    Ok(())
+}
+
+/// `outcome` is `None` when this pane can show no receipt, so none was awaited.
+fn submission_receipt(
+    reply: &mut Value,
+    outcome: Option<Result<(), Unconfirmed>>,
+    enter_retries: u8,
+) {
+    reply["submission_confirmed"] = outcome.map_or(Value::Null, |outcome| json!(outcome.is_ok()));
+    reply["enter_retries"] = json!(enter_retries);
+    if let Some(Err(reason)) = outcome {
+        reply["unconfirmed_reason"] = json!(reason.code());
     }
 }
 
@@ -1695,10 +1857,14 @@ fn show_value(
 
 #[cfg(test)]
 mod prompt_submission_tests {
-    use super::{enter_verdict, paste_prompt, press_prompt_enter};
+    use super::{
+        PromptConfirmation, PromptConfirmationAction, Unconfirmed, confirmation_verdict,
+        enter_verdict, paste_prompt, press_prompt_enter, submission_receipt,
+    };
     use muxel_core::control::ErrorCode;
-    use muxel_terminal::{CommandSpec, TerminalSession};
-    use std::sync::Arc;
+    use muxel_terminal::{CommandSpec, PromptSubmissionState, TerminalSession};
+    use serde_json::json;
+    use std::{sync::Arc, time::Duration};
     use uuid::Uuid;
 
     #[test]
@@ -1792,6 +1958,111 @@ mod prompt_submission_tests {
         assert_eq!(replaced.code, None);
         let changed = enter_verdict(Ok(original.clone()), &original, 7, 8).unwrap_err();
         assert_eq!(changed.code, Some(ErrorCode::InputChanged));
+    }
+
+    #[test]
+    fn submission_retry_needs_positive_proof_and_can_happen_only_once() {
+        use PromptConfirmationAction::{Confirmed, Observe, RetryEnter, Unconfirmed};
+        use PromptSubmissionState::{Accepted, Retryable, Unconfirmed as Unknown};
+        let mut confirm = PromptConfirmation::default();
+        assert_eq!(
+            confirm.observe(Duration::from_millis(4_999), Retryable),
+            Observe
+        );
+        assert_eq!(confirm.observe(Duration::from_secs(5), Unknown), Observe);
+        assert_eq!(
+            confirm.observe(Duration::from_secs(6), Retryable),
+            RetryEnter
+        );
+        assert_eq!(confirm.observe(Duration::from_secs(7), Retryable), Observe);
+        assert_eq!(
+            confirm.observe(Duration::from_secs(10), Retryable),
+            Unconfirmed
+        );
+        // A genuine receipt is still usable when it arrives at the deadline.
+        assert_eq!(
+            confirm.observe(Duration::from_secs(10), Accepted),
+            Confirmed
+        );
+        let mut fast = PromptConfirmation::default();
+        assert_eq!(fast.observe(Duration::ZERO, Accepted), Confirmed);
+    }
+
+    #[test]
+    fn a_late_retry_keeps_time_to_confirm() {
+        use PromptConfirmationAction::{Observe, RetryEnter, Unconfirmed};
+        use PromptSubmissionState::{Retryable, Unconfirmed as Unknown};
+        let mut confirm = PromptConfirmation::default();
+        assert_eq!(
+            confirm.observe(Duration::from_millis(9_900), Retryable),
+            RetryEnter
+        );
+        assert_eq!(confirm.observe(Duration::from_secs(12), Unknown), Observe);
+        assert_eq!(
+            confirm.observe(Duration::from_millis(12_900), Unknown),
+            Unconfirmed
+        );
+    }
+
+    #[test]
+    fn confirmation_stops_after_intervening_input_permission_loss_or_replacement() {
+        let session = Arc::new(1_u8);
+        assert_eq!(
+            confirmation_verdict(Ok(session.clone()), &session, 9, 9),
+            Ok(())
+        );
+        assert_eq!(
+            confirmation_verdict(Ok(session.clone()), &session, 9, 10),
+            Err(Unconfirmed::InputChanged)
+        );
+        assert_eq!(
+            confirmation_verdict(Err("permission revoked".into()), &session, 9, 9),
+            Err(Unconfirmed::Interrupted)
+        );
+        assert_eq!(
+            confirmation_verdict(Ok(Arc::new(1)), &session, 9, 9),
+            Err(Unconfirmed::Interrupted)
+        );
+    }
+
+    #[test]
+    fn delayed_writes_recheck_that_outside_control_is_still_on() {
+        // Enters and keys run on timers after admission, through this gate.
+        let gate = include_str!("control_api.rs")
+            .split("    fn control_writable(")
+            .nth(1)
+            .unwrap();
+        assert!(
+            gate.find("if !self.settings.control_enabled").unwrap()
+                < gate.find("let inst = self").unwrap()
+        );
+    }
+
+    #[test]
+    fn checking_after_enter_only_ever_extends_the_success_receipt() {
+        let pasted = json!({"pasted": true, "launch_id": "L"});
+        let mut unwatched = pasted.clone();
+        submission_receipt(&mut unwatched, None, 0);
+        assert_eq!(
+            unwatched,
+            json!({"pasted": true, "launch_id": "L", "submission_confirmed": null, "enter_retries": 0})
+        );
+        let mut confirmed = pasted.clone();
+        submission_receipt(&mut confirmed, Some(Ok(())), 1);
+        assert_eq!(confirmed["submission_confirmed"], json!(true));
+        assert_eq!(confirmed["enter_retries"], json!(1));
+        assert!(confirmed.get("unconfirmed_reason").is_none());
+        for (reason, code) in [
+            (Unconfirmed::TimedOut, "timed_out"),
+            (Unconfirmed::InputChanged, "input_changed"),
+            (Unconfirmed::Interrupted, "interrupted"),
+        ] {
+            let mut stopped = pasted.clone();
+            submission_receipt(&mut stopped, Some(Err(reason)), 0);
+            assert_eq!(stopped["pasted"], json!(true));
+            assert_eq!(stopped["submission_confirmed"], json!(false));
+            assert_eq!(stopped["unconfirmed_reason"], json!(code));
+        }
     }
 }
 
