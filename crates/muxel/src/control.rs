@@ -346,12 +346,14 @@ pub fn attach_parent_console() {
 }
 
 fn fail(error: control::Error, status: i32) -> i32 {
-    let reply = match error.code {
-        Some(code) => json!({ "ok": false, "code": code, "error": error.message }),
-        None => json!({ "ok": false, "error": error.message }),
-    };
-    emit(&with_host(reply).to_string());
+    emit(&failure_body(error).to_string());
     status
+}
+
+fn failure_body(error: control::Error) -> Value {
+    let reply = serde_json::to_value(control::Response::err(error))
+        .expect("control errors have a JSON representation");
+    with_host(reply)
 }
 
 /// Print one reply. A reader that stops early (`muxel ctl panes | head`, `grep
@@ -631,7 +633,7 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
 #[cfg(test)]
 mod tests {
     use super::{
-        Server, dispatch, process_alive, read_endpoint, request_at, same_secret,
+        Server, dispatch, failure_body, process_alive, read_endpoint, request_at, same_secret,
         wait_creation_with, write_endpoint,
     };
     use muxel_core::control::{self, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response};
@@ -643,6 +645,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("muxel-ctl-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn cli_failure_body_keeps_reason_and_pasted() {
+        let busy = failure_body(
+            control::Error::new(ErrorCode::Working, "prior turn is open")
+                .with_reason("just_submitted"),
+        );
+        assert_eq!(busy["ok"], false);
+        assert_eq!(busy["code"], "working");
+        assert_eq!(busy["reason"], "just_submitted");
+        assert!(busy.get("pasted").is_none());
+        assert!(busy["host"].is_string());
+
+        let pasted = failure_body(
+            control::Error::new(ErrorCode::InputChanged, "Enter withheld").after_paste(),
+        );
+        assert_eq!(pasted["pasted"], true);
+        assert_eq!(pasted["error"], "Enter withheld");
+    }
+
+    #[test]
+    fn trailing_help_flag_is_a_cli_refusal() {
+        let args = ["send", "agent", "prompt", "-h"].map(str::to_string);
+        assert_eq!(super::run_cli(&args), 2);
     }
 
     #[test]

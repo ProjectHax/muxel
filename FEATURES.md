@@ -843,9 +843,11 @@ feature is added or changed, update the matching entry here in the same change**
   receipt confirms writer admission with `pasted: true`.
   A send failure after a paste attempt reports `pasted: true`; a writer failure
   may have left partial input. `working` with `reason: just_submitted` identifies
-  the prior turn's grace. `ctl help COMMAND` and `COMMAND -h` show command help;
-  `--` before literal text keeps `-h` and `--help` as prompt text. Unknown verbs
-  suggest a nearby command.
+  the prior turn's grace when the pane has a provider status or configured screen
+  marker. Activity-only panes can accept consecutive sends. `ctl help COMMAND`
+  shows command help; `-h` and `--help` after a command refuse with exit 2 so a
+  script cannot mistake help for a sent prompt. `--` before literal text keeps
+  those words as prompt text. Unknown verbs suggest a nearby command.
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
   ten seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an

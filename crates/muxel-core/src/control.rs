@@ -1283,7 +1283,9 @@ pub fn parse_cli(args: &[String]) -> Result<CliCommand, String> {
         .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
     {
         return if command_help(cmd).is_some() {
-            Ok(CliCommand::Help(Some(cmd.clone())))
+            Err(format!(
+                "{cmd} was not run: use `muxel ctl help {cmd}` for help, or `--` before literal -h/--help text"
+            ))
         } else {
             Err(unknown_command_error(cmd))
         };
@@ -1660,8 +1662,8 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   while the agent is working, blocked, or still in the grace after a submitted
   control turn, or while muxel on another computer is mid-turn with it. For long
   or multi-line text, pass `-` and pipe the text on stdin. Use `--` before
-  literal prompt text that starts with `-`; `-h` and `--help` before `--` show
-  command help and are never typed. `muxel ctl help COMMAND` also shows it.
+  literal prompt text that starts with `-`; `-h` and `--help` before `--` refuse
+  with exit 2 and are never typed. Use `muxel ctl help COMMAND` for help.
   The reply waits for Enter. If keys, pastes, mouse or wheel reports reach the
   pane after the paste, Enter is withheld and `send` fails with the prompt left
   in its input. A closed or restarted terminal also withholds Enter. Check
@@ -1675,7 +1677,8 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   retry safe; inspect the agent before typing again. A failure with `pasted: true`
   means a paste was attempted and the input may be partial. Check `screen` before
   retrying. A `working` error with `reason: just_submitted` means the prior
-  control turn is still in its grace; `wait` for its reply.
+  control turn is still in its grace on a pane with provider status or configured
+  screen markers; `wait` for its reply. Activity-only panes allow a later send.
   Codex, Claude and Grok sends also observe provider acceptance for about ten
   seconds (three more after a retry). `submission_confirmed` is true only for a fresh provider receipt and
   false when acceptance remains unknown, with `unconfirmed_reason` `timed_out`,
@@ -2525,18 +2528,17 @@ Steps:
     }
 
     #[test]
-    fn dash_h_after_command_shows_help_and_types_nothing() {
+    fn dash_h_after_command_refuses_without_typing() {
         for args in [
             words(&["send", "agent", "-h"]),
             words(&["send", "--help"]),
             words(&["keys", "agent", "enter", "--help"]),
             words(&["new", "project", "-h"]),
         ] {
-            assert_eq!(
-                parse_cli(&args),
-                Ok(CliCommand::Help(Some(args[0].clone()))),
-                "{args:?}"
-            );
+            let error = parse_cli(&args).unwrap_err();
+            assert!(error.contains("was not run"), "{args:?}: {error}");
+            assert!(error.contains("muxel ctl help"), "{args:?}: {error}");
+            assert!(error.contains("`--`"), "{args:?}: {error}");
         }
         assert_eq!(
             parse_cli(&words(&["help", "send"])),
