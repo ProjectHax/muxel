@@ -6,6 +6,13 @@ enum InjectionMode: Equatable, Hashable {
     case none
     case cliFlag(flag: String)
     case typeIn
+    /// Context added by Muse's SessionStart hook. Only desktop muxel's local
+    /// launches install the hook, so the phone delivers nothing.
+    case sessionHook
+    /// A mode from a newer desktop muxel. One pane no longer fails the shared
+    /// layout, and its name is written back, though not any fields a newer
+    /// mode adds. The phone delivers nothing for it.
+    case unknown(mode: String)
 }
 
 extension InjectionMode: Codable {
@@ -19,9 +26,8 @@ extension InjectionMode: Codable {
         case "none": self = .none
         case "cli_flag": self = .cliFlag(flag: try c.decode(String.self, forKey: .flag))
         case "type_in": self = .typeIn
-        case let other:
-            throw DecodingError.dataCorruptedError(
-                forKey: .mode, in: c, debugDescription: "unknown injection mode \(other)")
+        case "session_hook": self = .sessionHook
+        case let other: self = .unknown(mode: other)
         }
     }
 
@@ -35,6 +41,10 @@ extension InjectionMode: Codable {
             try c.encode(flag, forKey: .flag)
         case .typeIn:
             try c.encode("type_in", forKey: .mode)
+        case .sessionHook:
+            try c.encode("session_hook", forKey: .mode)
+        case let .unknown(mode):
+            try c.encode(mode, forKey: .mode)
         }
     }
 }
