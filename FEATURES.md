@@ -1300,7 +1300,10 @@ feature is added or changed, update the matching entry here in the same change**
   and muxel keeps retrying on its own — backing off to one attempt every 30s, for as
   long as the outage lasts — until the host is reachable and reattaches the agent
   right where it left off. Resuming a laptop whose Wi-Fi isn't up yet just costs a
-  retry or two. The notification feed reports an outage once per host, not per pane:
+  retry or two. An owner lookup or terminal launch already recovering a pane keeps
+  its place across retry ticks; an attempt still pending after 60 seconds yields
+  to a new attempt so a hung worker cannot stall recovery forever.
+  The notification feed reports an outage once per host, not per pane:
   one entry counts the panes still reconnecting and turns into "reconnected" when
   they're all back, so waking with a dozen agents running is one line, not two dozen
   (dismiss it and it stays dismissed until the next outage). On a laptop, a drop

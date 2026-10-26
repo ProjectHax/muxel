@@ -68,6 +68,8 @@ mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
 #[cfg(all(test, windows))]
+mod remote_reconnect_tests;
+#[cfg(all(test, windows))]
 mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
@@ -623,9 +625,15 @@ fn restore_startup_holds_admission(
 /// How long a running launch holds restore admission for the other panes. The
 /// deadline only stops one slow launch from holding back the others: past it
 /// the launch keeps running, its pane keeps showing that it is starting, and
-/// its result is installed when it lands. Only Restart, closing the pane or
-/// leaving the project supersedes it.
+/// its result is installed when it lands. Restart, closing the pane or leaving
+/// the project supersedes it immediately; recovery of a dead view has its own
+/// longer timeout for an unresponsive launch.
 const TERMINAL_LAUNCH_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Ticks must let an in-flight owner probe or PTY launch land before retrying
+/// the exited view it will replace. A hung worker eventually yields ownership
+/// so recovery cannot stall forever. This is separate from restore admission.
+const REATTACH_PENDING_LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A pane's launch in flight: the token that owns it, and when its worker was
 /// dispatched (when it was reserved, until then).
@@ -8704,20 +8712,31 @@ impl MuxelApp {
                 token
             }
         };
+        #[cfg(all(test, windows))]
+        let probe = remote_reconnect_tests::next_owner_probe();
         cx.spawn_in(window, async move |this, cx| {
-            let pending = expected.clone();
-            let prepared = cx
-                .background_executor()
-                .spawn(async move {
-                    integrations::remote_tmux_launch_target(
-                        &loc,
-                        &pending,
-                        iid,
-                        false,
-                        Instant::now() + Duration::from_secs(10),
-                    )
-                })
-                .await;
+            let prepared = async {
+                #[cfg(all(test, windows))]
+                if let Some(probe) = probe {
+                    return probe
+                        .recv()
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("test owner probe cancelled")));
+                }
+                let pending = expected.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        integrations::remote_tmux_launch_target(
+                            &loc,
+                            &pending,
+                            iid,
+                            false,
+                            Instant::now() + Duration::from_secs(10),
+                        )
+                    })
+                    .await
+            }
+            .await;
             // `Some(false)`: the binding changed meanwhile (a peer layout rebound
             // the pane), so this answer is about the wrong owner.
             let landed = Self::in_project_or_main(&this, Some(pid), cx, |this, window, cx| {
@@ -12916,6 +12935,10 @@ impl MuxelApp {
             let tmux_lost = exited
                 && tmux_session.is_some()
                 && (exit_signal.is_some() || exit_code != Some(0))
+                && self
+                    .terminal_launching
+                    .get(&iid)
+                    .is_none_or(|launch| launch.since.elapsed() >= REATTACH_PENDING_LAUNCH_TIMEOUT)
                 && self.terminal_launches.get(&iid).is_none_or(|&(at, _)| {
                     at.elapsed() >= reattach_backoff(self.reconnecting.get(&iid).copied())
                 });
