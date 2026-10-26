@@ -776,6 +776,367 @@ fn write_rollout_at(path: &Path, payload: serde_json::Value, age_secs: u64) {
 }
 
 #[test]
+fn latest_sessions_unreadable_rollout_does_not_select_an_older_conversation() {
+    use super::codex_latest_sessions;
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+    let root = std::env::temp_dir().join(format!("muxel-codex-unreadable-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let older = "01a1543c-9700-7000-8000-000000000001";
+    let newer = "01a1543c-9700-7000-8000-000000000002";
+    let day = super::codex_sessions::directories(&root, older)[0].clone();
+    write_rollout_at(
+        &day.join(format!("rollout-{older}.jsonl")),
+        serde_json::json!({"id":older,"cwd":root}),
+        60,
+    );
+    let unresolved = day.join(format!("rollout-{newer}.jsonl"));
+    for bytes in [
+        b"{incomplete".as_slice(),
+        b"",
+        b"\xff\n",
+        b"{\"type\":\"session_meta\",\"payload\":{}}",
+        b"{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+    ] {
+        std::fs::write(&unresolved, bytes).unwrap();
+        assert_eq!(
+            codex_latest_sessions(
+                &root,
+                &root,
+                &HashSet::new(),
+                1,
+                Instant::now() + Duration::from_secs(60)
+            ),
+            None,
+            "an unresolved newer rollout could be this directory's latest conversation"
+        );
+    }
+    let owned = [newer.to_string()].into_iter().collect();
+    let found = codex_latest_sessions(
+        &root,
+        &root,
+        &owned,
+        1,
+        Instant::now() + Duration::from_secs(60),
+    )
+    .unwrap();
+    assert_eq!(
+        found[0].id, older,
+        "an owned unresolved thread cannot change the match"
+    );
+}
+
+#[test]
+fn hint_unreadable_rollout_keeps_a_truncated_hint_ambiguous() {
+    let root = std::env::temp_dir().join(format!("muxel-codex-unreadable-hint-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let first = "01a1543c-9700-7000-8000-000000000001";
+    let second = "01a1543c-9700-7000-8000-000000000002";
+    let day = super::codex_sessions::directories(&root, first)[0].clone();
+    write_rollout_at(
+        &day.join(format!("rollout-{first}.jsonl")),
+        serde_json::json!({"id":first,"cwd":root}),
+        60,
+    );
+    std::fs::write(day.join(format!("rollout-{second}.jsonl")), b"{incomplete").unwrap();
+    assert_eq!(
+        codex_session_id_from_hint(&root, &format!("{}...", &first[..29]), &root),
+        None,
+        "a matching filename with unreadable metadata may be a second matching thread"
+    );
+    assert_eq!(
+        codex_session_id_from_hint(&root, first, &root).as_deref(),
+        Some(first)
+    );
+    write_rollout_at(
+        &day.join(format!("rollout-{second}.jsonl")),
+        serde_json::json!({"id":second,"source":"subagent"}),
+        0,
+    );
+    // A confirmed subagent is excluded even without a cwd; an unreadable
+    // compression sibling cannot introduce a different thread identity.
+    std::fs::write(
+        day.join(format!("rollout-{first}.jsonl.zst")),
+        b"compressed",
+    )
+    .unwrap();
+    assert_eq!(
+        codex_session_id_from_hint(&root, &format!("{}...", &first[..29]), &root).as_deref(),
+        Some(first)
+    );
+}
+
+#[test]
+fn import_unreadable_rollout_does_not_select_an_older_conversation() {
+    let root =
+        std::env::temp_dir().join(format!("muxel-codex-unreadable-import-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let day = root.join(".codex/sessions/2026/10/19");
+    write_rollout_at(
+        &day.join("rollout-older.jsonl"),
+        serde_json::json!({"id":"older","cwd":root}),
+        60,
+    );
+    std::fs::write(day.join("rollout-newer.jsonl"), b"{incomplete").unwrap();
+    assert_eq!(
+        super::codex_latest_session_id(&root, &root),
+        None,
+        "Import must not mistake an unreadable newer rollout for another directory"
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(day.join("rollout-newer.jsonl"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+        .unwrap();
+    assert_eq!(
+        super::codex_latest_session_id(&root, &root).as_deref(),
+        Some("older"),
+        "an unresolved older rollout cannot replace the known newer conversation"
+    );
+}
+
+#[test]
+fn unreadable_rollout_removed_after_enumeration_keeps_latest_match_unresolved() {
+    let root = std::env::temp_dir().join(format!("muxel-codex-removed-{}", Uuid::new_v4()));
+    let _home = TempHome(root.clone());
+    let id = Uuid::new_v4();
+    assert_eq!(
+        super::codex_sessions::newest_matches(
+            std::iter::once((
+                std::time::SystemTime::now(),
+                Some(id),
+                root.join(format!("rollout-{id}.jsonl"))
+            )),
+            &root,
+            1,
+            &mut || false,
+        ),
+        None
+    );
+}
+
+fn review_rollout_candidates(tied: bool) -> (TempHome, Vec<(Uuid, PathBuf)>) {
+    use std::time::{Duration, SystemTime};
+    let root = std::env::temp_dir().join(format!("muxel-codex-review-{}", Uuid::new_v4()));
+    let valid = Uuid::parse_str("01a1543c-9700-7000-8000-000000000001").unwrap();
+    let unknown = Uuid::parse_str("01a1543c-9700-7000-8000-000000000002").unwrap();
+    let day = root.join(".codex/sessions/2026/10/19");
+    let valid_path = day.join(format!("rollout-{valid}.jsonl"));
+    let unknown_path = day.join(format!("rollout-{unknown}.jsonl"));
+    write_rollout_at(&valid_path, serde_json::json!({"id":valid,"cwd":root}), 0);
+    std::fs::write(&unknown_path, b"{incomplete").unwrap();
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for (path, stamp) in [
+        (&valid_path, modified),
+        (
+            &unknown_path,
+            if tied {
+                modified
+            } else {
+                modified - Duration::from_secs(10)
+            },
+        ),
+    ] {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+    }
+    (
+        TempHome(root),
+        vec![(valid, valid_path), (unknown, unknown_path)],
+    )
+}
+
+// The reader now retains the enumeration stamps. Adapt the same on-disk red
+// fixtures without changing their timestamps, contents, ordering or assertions.
+fn review_stamped(
+    candidates: Vec<(Uuid, PathBuf)>,
+) -> impl Iterator<Item = (std::time::SystemTime, Option<Uuid>, PathBuf)> {
+    candidates.into_iter().map(|(id, path)| {
+        (
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            Some(id),
+            path,
+        )
+    })
+}
+
+#[test]
+fn review_rollout_equal_timestamp_unreadable_candidate_blocks_the_limit() {
+    let (home, candidates) = review_rollout_candidates(true);
+    assert_eq!(
+        super::codex_sessions::newest_matches(review_stamped(candidates), &home.0, 1, &mut || {
+            false
+        }),
+        None,
+        "a full limit does not rule out an unreadable candidate at the same timestamp"
+    );
+}
+
+#[test]
+fn review_rollout_deadline_inside_a_timestamp_group_withholds_tied_matches() {
+    let (home, candidates) = review_rollout_candidates(true);
+    let mut opened = 0;
+    assert_eq!(
+        super::codex_sessions::newest_matches(review_stamped(candidates), &home.0, 1, &mut || {
+            opened += 1;
+            opened > 1
+        }),
+        None,
+        "expiry before an equally new candidate is checked must withhold the tied match"
+    );
+}
+
+#[test]
+fn review_rollout_older_unreadable_candidate_keeps_the_verified_newer_prefix() {
+    let (home, candidates) = review_rollout_candidates(false);
+    let expected = super::CodexSession {
+        id: candidates[0].0.to_string(),
+        path: candidates[0].1.clone(),
+    };
+    assert_eq!(
+        super::codex_sessions::newest_matches(review_stamped(candidates), &home.0, 2, &mut || {
+            false
+        }),
+        Some(vec![expected]),
+        "an older unresolved candidate cannot invalidate a strictly newer verified match"
+    );
+}
+
+fn review_rollout_compression_siblings() -> (TempHome, String) {
+    use std::time::Duration;
+    let root = std::env::temp_dir().join(format!("muxel-codex-siblings-{}", Uuid::new_v4()));
+    let id = "01a1543c-9700-7000-8000-000000000001";
+    let jsonl = root
+        .join(".codex/sessions/2026/10/19")
+        .join(format!("rollout-{id}.jsonl"));
+    write_rollout_at(&jsonl, serde_json::json!({"id":id,"cwd":root}), 60);
+    std::fs::write(jsonl.with_extension("jsonl.zst"), [0x28, 0xb5, 0x2f, 0xfd]).unwrap();
+    // Explicit timestamps make the compressed sibling strictly newer.
+    let earlier = std::time::SystemTime::now() - Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(jsonl)
+        .unwrap()
+        .set_modified(earlier)
+        .unwrap();
+    (TempHome(root), id.to_string())
+}
+
+#[test]
+fn review_rollout_restore_uses_the_readable_compression_sibling() {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+    let (home, id) = review_rollout_compression_siblings();
+    let found = super::codex_latest_sessions(
+        &home.0,
+        &home.0,
+        &HashSet::new(),
+        1,
+        Instant::now() + Duration::from_secs(60),
+    );
+    assert_eq!(
+        found.map(|sessions| sessions
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>()),
+        Some(vec![id])
+    );
+}
+
+#[test]
+fn review_rollout_import_uses_the_readable_compression_sibling() {
+    let (home, id) = review_rollout_compression_siblings();
+    assert_eq!(super::codex_latest_session_id(&home.0, &home.0), Some(id));
+}
+
+fn excluded_subagent_siblings(unreadable_newer: bool) -> (TempHome, String) {
+    let root = std::env::temp_dir().join(format!("muxel-codex-subagent-{}", Uuid::new_v4()));
+    let conversation = "01a1543c-9700-7000-8000-000000000001";
+    let subagent = "01a1543c-9700-7000-8000-000000000002";
+    let day = root.join(".codex/sessions/2026/10/19");
+    write_rollout_at(
+        &day.join(format!("rollout-{conversation}.jsonl")),
+        serde_json::json!({"id":conversation,"cwd":root}),
+        60,
+    );
+    let jsonl = day.join(format!("rollout-{subagent}.jsonl"));
+    write_rollout_at(
+        &jsonl,
+        serde_json::json!({"id":subagent,"cwd":root,"source":"subagent"}),
+        0,
+    );
+    let compressed = jsonl.with_extension("jsonl.zst");
+    std::fs::write(&compressed, [0x28, 0xb5, 0x2f, 0xfd]).unwrap();
+    let newest = std::time::SystemTime::now();
+    for (path, age) in [
+        (&jsonl, if unreadable_newer { 10 } else { 0 }),
+        (&compressed, if unreadable_newer { 0 } else { 10 }),
+    ] {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(newest - std::time::Duration::from_secs(age))
+            .unwrap();
+    }
+    (TempHome(root), conversation.to_string())
+}
+
+fn assert_subagent_siblings_allow_restore(unreadable_newer: bool) {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+    let (home, conversation) = excluded_subagent_siblings(unreadable_newer);
+    let found = super::codex_latest_sessions(
+        &home.0,
+        &home.0,
+        &HashSet::new(),
+        1,
+        Instant::now() + Duration::from_secs(60),
+    );
+    assert_eq!(
+        found.map(|sessions| sessions
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>()),
+        Some(vec![conversation]),
+        "a confirmed subagent excludes its unreadable same-UUID sibling"
+    );
+}
+
+#[test]
+fn subagent_siblings_restore_with_unreadable_copy_newer() {
+    assert_subagent_siblings_allow_restore(true);
+}
+
+#[test]
+fn subagent_siblings_restore_with_readable_copy_newer() {
+    assert_subagent_siblings_allow_restore(false);
+}
+
+#[test]
+fn subagent_siblings_import_with_unreadable_copy_newer() {
+    let (home, conversation) = excluded_subagent_siblings(true);
+    assert_eq!(
+        super::codex_latest_session_id(&home.0, &home.0),
+        Some(conversation)
+    );
+}
+
+#[test]
+fn subagent_siblings_import_with_readable_copy_newer() {
+    let (home, conversation) = excluded_subagent_siblings(false);
+    assert_eq!(
+        super::codex_latest_session_id(&home.0, &home.0),
+        Some(conversation)
+    );
+}
+
+#[test]
 fn walked_codex_id_is_found_outside_its_day_and_a_complete_miss_is_missing() {
     use super::codex_rollout_by_walk;
     use std::time::{Duration, Instant};
@@ -970,9 +1331,13 @@ fn latest_lookup_out_of_time_while_opening_keeps_the_newest_matches_found() {
             write_rollout_at(
                 &path,
                 serde_json::json!({"id": id(n).to_string(), "cwd": recorded}),
-                0,
+                n as u64,
             );
-            (id(n), path)
+            (
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                Some(id(n)),
+                path,
+            )
         })
         .collect();
     // Two panes want two matches, but only the newest rollout is this
