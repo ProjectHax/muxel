@@ -1050,6 +1050,25 @@ impl Claim {
         format!("v1|{}|*|*|*|{nonce}", claim_field(owner))
     }
 
+    /// A safe tmux format pattern for comparing the claim before replacing it.
+    /// A nonce identifies modern sends even when a hostname needs quoting;
+    /// legacy claims need every encoded byte to be literal and format-safe.
+    pub fn compare_pattern(&self) -> Option<String> {
+        if let Some(nonce) = self.nonce {
+            let owner = claim_field(&self.owner);
+            owner
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                .then(|| Self::pattern(&self.owner, nonce))
+        } else {
+            let value = self.encode();
+            value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "|-_.".contains(c))
+                .then_some(value)
+        }
+    }
+
     /// `None` for an unset option, or a value this version doesn't understand.
     pub fn decode(value: &str) -> Option<Self> {
         let mut parts = value.trim().split('|');
@@ -2673,5 +2692,34 @@ Steps:
             &before,
             at + super::REPLY_GRACE_MS
         ));
+    }
+
+    #[test]
+    fn claim_compare_patterns_keep_modern_nonce_and_refuse_unsafe_legacy_values() {
+        let claim = super::Claim {
+            owner: "owner".into(),
+            host: "desk'name".into(),
+            at: 42,
+            grace_ms: super::REPLY_GRACE_MS,
+            nonce: Some(uuid::Uuid::from_u128(7)),
+        };
+        assert_eq!(
+            claim.compare_pattern(),
+            Some(super::Claim::pattern("owner", uuid::Uuid::from_u128(7)))
+        );
+        let legacy = super::Claim {
+            nonce: None,
+            host: "desk".into(),
+            ..claim
+        };
+        assert_eq!(legacy.compare_pattern(), Some(legacy.encode()));
+        assert!(
+            super::Claim {
+                host: "desk'name".into(),
+                ..legacy
+            }
+            .compare_pattern()
+            .is_none()
+        );
     }
 }

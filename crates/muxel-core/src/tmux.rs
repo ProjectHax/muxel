@@ -1081,6 +1081,48 @@ pub fn unset_option_if_args(session: &str, option: &str, pattern: &str) -> Optio
     ])
 }
 
+/// Atomically publish a claim only if the option is still absent or still
+/// matches the value observed before the paste. The caller reads it back to
+/// distinguish a successful set from the false branch of `if-shell`.
+pub fn set_option_if_args(
+    session: &str,
+    option: &str,
+    expected_pattern: Option<&str>,
+    value: &str,
+) -> Option<Vec<String>> {
+    let option_ok = option.strip_prefix('@').is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    });
+    if !option_ok
+        || session.contains('\'')
+        || expected_pattern.is_some_and(|pattern| {
+            !pattern
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "|*-_.".contains(c))
+        })
+    {
+        return None;
+    }
+    let condition = expected_pattern.map_or_else(
+        || format!("#{{==:#{{{option}}},}}"),
+        |pattern| format!("#{{m:{pattern},#{{{option}}}}}"),
+    );
+    Some(vec![
+        "if-shell".into(),
+        "-F".into(),
+        "-t".into(),
+        format!("={session}:"),
+        condition,
+        format!(
+            "set-option -q -t '={session}:' {option} {}",
+            tmux_string(value.as_bytes())
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,6 +1144,27 @@ mod tests {
         assert!(unset_option_if_args("it's", "@muxel-ctl", "v1|*").is_none());
         assert!(unset_option_if_args("pane", "@muxel-ctl", "v1|a,b|*").is_none());
         assert!(unset_option_if_args("pane", "@bad option", "v1|*").is_none());
+    }
+
+    #[test]
+    fn claim_publish_is_conditional_and_quotes_the_new_value() {
+        assert_eq!(
+            set_option_if_args("pane", "@muxel-ctl", None, "v1|me|desk|10|30000").unwrap(),
+            [
+                "if-shell",
+                "-F",
+                "-t",
+                "=pane:",
+                "#{==:#{@muxel-ctl},}",
+                "set-option -q -t '=pane:' @muxel-ctl \"v1\\174me\\174desk\\17410\\17430000\""
+            ]
+        );
+        let expected = "v1|me|*|*|*|nonce";
+        let args = set_option_if_args("pane", "@muxel-ctl", Some(expected), "new").unwrap();
+        assert_eq!(args[4], "#{m:v1|me|*|*|*|nonce,#{@muxel-ctl}}");
+        assert!(set_option_if_args("it's", "@muxel-ctl", None, "new").is_none());
+        assert!(set_option_if_args("pane", "@bad option", None, "new").is_none());
+        assert!(set_option_if_args("pane", "@muxel-ctl", Some("bad,pattern"), "new").is_none());
     }
 
     #[test]
