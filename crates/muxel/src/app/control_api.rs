@@ -27,8 +27,17 @@ mod new_tests;
 
 /// Shared command permission for typing into an existing terminal. This is
 /// rechecked on every write, including panes created before the opt-in was revoked.
-fn control_program_writable(inst: &Instance, allow_shells: bool) -> Result<(), String> {
-    if !allow_shells && (inst.literal_argv || !readaloud::is_agent_program(inst.program.as_deref()))
+fn control_program_writable(
+    inst: &Instance,
+    allow_shells: bool,
+    fallback_shell: bool,
+) -> Result<(), String> {
+    // Existing panes may run remotely. Match the provider name without
+    // resolving local executables on the UI thread.
+    if !allow_shells
+        && (fallback_shell
+            || inst.literal_argv
+            || !muxel_core::is_known_agent_program(inst.program.as_deref()))
     {
         let name = inst.display_name();
         return Err(format!(
@@ -1162,7 +1171,13 @@ impl MuxelApp {
             )
             .into());
         }
-        control_program_writable(inst, self.settings.control_allow_shells)?;
+        // A failed agent launch leaves its saved program intact while a shell
+        // runs instead. Check the current launch at every write, including the
+        // delayed Enter/key callbacks, so a relaunch cannot retain an old grant.
+        let fallback_shell = self
+            .terminal_view(iid)
+            .is_some_and(|view| view.read(cx).launch_error().is_some());
+        control_program_writable(inst, self.settings.control_allow_shells, fallback_shell)?;
         let refuse = |code, message: String| Err(ctl::Error::new(code, message));
         match self.control_state(inst, cx) {
             Some(AgentState::Exited) => {

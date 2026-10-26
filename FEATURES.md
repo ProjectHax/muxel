@@ -810,8 +810,13 @@ feature is added or changed, update the matching entry here in the same change**
   writes require global control and this command grant even when creation is off.
   Turning "Also allow typing into shell panes" off refuses subsequent control
   writes to every literal argv pane, even agent-looking or interpreter programs,
-  and panes classified as shells.
-  Configured non-literal agents remain controllable while outside control is on;
+  and every program outside the known built-in agent providers, including SSH
+  and WSL shell presets. Existing-pane writes recognize known agents by executable
+  name, including custom paths and agents in remote projects.
+  An agent that falls back to a shell after a failed launch requires the same
+  shell-input grant, including restored panes. A successful agent relaunch uses
+  the agent policy again.
+  Configured non-literal known agents remain controllable while outside control is on;
   disabling all outside control is a separate setting. Delayed Enter and keys
   recheck the shell-input grant and terminal/session availability before writing.
   Revocation does not stop processes
