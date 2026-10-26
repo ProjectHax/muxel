@@ -57,6 +57,13 @@ reports cannot control the pane. The PTY reader answers capability queries
 through the existing ordered reply queue, preserving earlier grid-dependent
 replies and following DA replies. Only the UI drain publishes status reports.
 
+Claude suppresses its OSC title glyph after a successful capability probe.
+While its root is current, the terminal accepts this glyph-less text for naming
+only; the root's decoded nonempty `title` takes precedence. Without a current
+root, glyph-less Claude titles remain unrecognized. Title-derived lifecycle
+parsing does not change. Root title storage is shared across snapshot reads;
+clear, binding changes and process exit remove its naming authority.
+
 The drain's passive observer processes each timed segment after synchronized
 capacity replay selects its read time and before VTE can defer title callbacks.
 Old partial reports retain their opening freshness and binding generation; a

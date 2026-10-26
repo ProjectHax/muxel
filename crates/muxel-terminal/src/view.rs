@@ -351,7 +351,7 @@ impl RuntimeStatusState {
         // its deferred UUID title through the #91 listener.
         let binding_rev = session.binding_revision();
         let binding_changed = binding_rev != self.binding_rev;
-        let program_root = (!exited).then_some(program_status.root).flatten();
+        let program_root = (!exited).then_some(program_status.root.as_ref()).flatten();
         let program_status_cleared = program_status.clear_revision > self.program_status_revision;
         let program_status_changed_source =
             program_root.is_some() != self.program_status_active || program_status_cleared;
@@ -765,7 +765,7 @@ impl RuntimeStatusState {
     }
 }
 
-fn program_status_state(root: RootStatus) -> AgentStatus {
+fn program_status_state(root: &RootStatus) -> AgentStatus {
     match root.state {
         ProgramState::Idle => AgentStatus::Idle,
         ProgramState::Working => AgentStatus::Working,
@@ -777,7 +777,7 @@ fn program_status_state(root: RootStatus) -> AgentStatus {
     }
 }
 
-fn program_status_reason(root: RootStatus) -> TerminalStatusReason {
+fn program_status_reason(root: &RootStatus) -> TerminalStatusReason {
     if root.state == ProgramState::Error {
         TerminalStatusReason::ProgramStatusError
     } else {
@@ -1470,6 +1470,33 @@ pub fn clean_agent_title(program: &str, title: &str) -> Option<String> {
         TitleProvider::Other => Some(title.to_string()),
         provider => parse_agent_title(provider, Some(title))?.name,
     }
+}
+
+fn program_auto_title(
+    session: &TerminalSession,
+    provider: TitleProvider,
+    exited: bool,
+) -> Option<String> {
+    if exited || provider != TitleProvider::Claude {
+        return None;
+    }
+    let root = session.program_status_snapshot().root?;
+    if let Some(name) = root
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return Some(name.to_string());
+    }
+    let title = session.title()?;
+    if let Some(frame) = parse_agent_title(provider, Some(&title)) {
+        return frame.name;
+    }
+    // Claude suppresses its lifecycle glyph once its capability probe succeeds.
+    // This name-only exception requires a current root; title_status stays strict.
+    let name = title.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Decide an agent's lifecycle state from its signals. Pure (unit-testable):
@@ -3515,6 +3542,11 @@ impl TerminalView {
 
     pub fn title(&self) -> Option<String> {
         self.session.title()
+    }
+
+    /// A name authorized by the current program-status root, independent of status.
+    pub fn program_auto_title(&self) -> Option<String> {
+        program_auto_title(&self.session, self.title_provider, self.exited)
     }
 
     /// See [`TerminalSession::provider_switched`].
@@ -6426,6 +6458,144 @@ mod provider_switch_tests {
         TerminalSession::spawn(spec, 80, 24).expect("spawn fixture")
     }
 
+    mod program_name_tests {
+        use super::{
+            AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TitleProvider, fixture,
+        };
+        use crate::view::{clean_agent_title, program_auto_title, title_status};
+        use std::time::Instant;
+
+        #[test]
+        fn claude_glyphless_title_names_pane_while_program_status_is_current() {
+            let (session, _receiver) = fixture();
+            session.test_program_status(b"\x1b]7501;state=working\x07\x1b]0;Review changes\x07");
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Claude, false).as_deref(),
+                Some("Review changes")
+            );
+            assert_eq!(
+                title_status(TitleProvider::Claude, Some("Review changes"), None),
+                None
+            );
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
+            session.kill();
+        }
+
+        #[test]
+        fn claude_glyphless_title_without_program_status_is_ignored() {
+            let (session, _receiver) = fixture();
+            session.test_program_status(b"\x1b]0;Review changes\x07");
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Claude, false),
+                None
+            );
+            assert_eq!(clean_agent_title("claude", "Review changes"), None);
+            session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=clear\x07");
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Claude, false),
+                None
+            );
+            session.test_program_status(b"\x1b]7501;state=working\x07");
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Claude, true),
+                None
+            );
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Codex, false),
+                None
+            );
+            session.provider_switched(std::time::SystemTime::now(), std::time::SystemTime::now());
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Claude, false),
+                None
+            );
+            session.kill();
+        }
+
+        #[test]
+        fn program_status_title_field_names_pane() {
+            let (session, _receiver) = fixture();
+            session.test_program_status(b"\x1b]0;Other topic\x07\x1b]7501;state=blocked:kind=permission:title=UFNQIHBhbmU=\x07");
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Claude, false).as_deref(),
+                Some("PSP pane")
+            );
+            session.test_program_status(b"\x1b]7501;state=working:id=child:title=Q2hpbGQ=\x07");
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Claude, false).as_deref(),
+                Some("PSP pane")
+            );
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            assert_eq!(runtime.snapshot(&session).status, AgentStatus::Blocked);
+            session.test_program_status(b"\x1b]7501;state=working\x07");
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Claude, false).as_deref(),
+                Some("Other topic")
+            );
+            session.test_program_status(b"\x1b]7501;state=clear\x07");
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Claude, false),
+                None
+            );
+            session.kill();
+        }
+
+        #[test]
+        fn claude_2_1_310_control_stream_names_pane_with_and_without_program_status() {
+            for (wire, supported) in [
+                (
+                    include_bytes!("fixtures/claude-2.1.310-7501.osc").as_slice(),
+                    true,
+                ),
+                (
+                    include_bytes!("fixtures/claude-2.1.310-no-7501.osc").as_slice(),
+                    false,
+                ),
+            ] {
+                let (session, _receiver) = fixture();
+                // The real stream contains both BEL and ST; split every control frame.
+                for byte in wire {
+                    session.test_program_status(std::slice::from_ref(byte));
+                }
+                assert_eq!(session.program_status_snapshot().root.is_some(), supported);
+                let name = program_auto_title(&session, TitleProvider::Claude, false)
+                    .or_else(|| clean_agent_title("claude", &session.title().unwrap()));
+                assert_eq!(name.as_deref(), Some("Exact OK reply"));
+                if supported {
+                    let mut runtime =
+                        RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+                    runtime.reconcile(
+                        &session,
+                        TitleProvider::Claude,
+                        &[],
+                        &[],
+                        false,
+                        Instant::now(),
+                    );
+                    assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
+                }
+                session.kill();
+            }
+        }
+    }
+
     #[test]
     fn known_launch_keeps_program_report_through_its_first_confirming_title() {
         let id = "019f95d7-db31-7db0-904d-9e08330e0001";
@@ -6504,6 +6674,7 @@ mod provider_switch_tests {
             Some(crate::program_status::RootStatus {
                 state: crate::program_status::ProgramState::Blocked,
                 kind: Some(crate::program_status::ProgramStatusKind::Permission),
+                title: None,
             })
         );
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);

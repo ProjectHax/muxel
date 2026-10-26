@@ -7,6 +7,7 @@
 use alacritty_terminal::vte::{Parser, Perform};
 use base64::Engine as _;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use std::sync::Arc;
 
 pub(crate) const CAPABILITY_REPLY: &str =
     "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
@@ -464,15 +465,16 @@ impl Observer {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RootStatus {
     pub state: ProgramState,
     pub kind: Option<ProgramStatusKind>,
+    pub title: Option<Arc<str>>,
 }
 
 /// The exact UUID-shaped title field accepted by #91. Codex also publishes
 /// abbreviated fields ending in `...`; a full UUID parser would miss those
-/// boundaries. Fixed storage keeps the snapshot Copy without hashing titles.
+/// boundaries. Fixed storage bounds UUID comparison without hashing titles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ThreadKey {
     bytes: [u8; 36],
@@ -497,7 +499,7 @@ impl ThreadKey {
 /// One pane's root record and ordered transition facts. `revision` also lets a
 /// lagging UI notice a clear that was followed by another report in one read.
 /// A Working turn stays active through Blocked until it becomes Idle.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProgramStatusSnapshot {
     pub root: Option<RootStatus>,
     pub binding_revision: u64,
@@ -560,6 +562,7 @@ impl ProgramStatusSnapshot {
         if (self.working_active
             || self
                 .root
+                .as_ref()
                 .is_some_and(|root| root.state == ProgramState::Blocked))
             && matches!(report.state, ProgramState::Done | ProgramState::Error)
         {
@@ -575,6 +578,7 @@ impl ProgramStatusSnapshot {
         self.root = Some(RootStatus {
             state: report.state,
             kind: report.kind,
+            title: report.title.map(Arc::from),
         });
     }
 
@@ -599,11 +603,13 @@ impl ProgramStatusSnapshot {
     pub fn shell_prompt(&mut self) {
         if self
             .root
+            .as_ref()
             .is_some_and(|root| matches!(root.state, ProgramState::Working | ProgramState::Blocked))
         {
             self.clear();
         } else if self
             .root
+            .as_ref()
             .is_some_and(|root| root.state == ProgramState::Idle)
         {
             self.revision = self.revision.wrapping_add(1);
@@ -836,7 +842,7 @@ mod tests {
                 status.apply(report);
             }
         }
-        assert_eq!(status.root.unwrap().state, ProgramState::Idle);
+        assert_eq!(status.root.as_ref().unwrap().state, ProgramState::Idle);
         assert_eq!(status.working_to_idle_revision, status.revision);
         let clear = events(b"\x1b]7501;state=clear\x07").pop().unwrap();
         if let Event::Report(report) = clear {
@@ -871,7 +877,7 @@ mod tests {
                 }
             }
             assert!(matches!(
-                status.root.unwrap().state,
+                status.root.as_ref().unwrap().state,
                 ProgramState::Done | ProgramState::Error
             ));
         }

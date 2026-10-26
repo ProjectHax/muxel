@@ -410,6 +410,8 @@ feature is added or changed, update the matching entry here in the same change**
   provider switch, shell prompt, process exit, or relaunch returns an unfinished
   pane to its existing fallback detection. Both local and remote tmux panes
   continue using that fallback because tmux does not forward OSC 7501 reports.
+  While a Claude root is current, its glyph-less title can name the pane without
+  supplying lifecycle status; a title in the root report takes precedence.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A marker-based agent whose turn finishes

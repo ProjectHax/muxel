@@ -2796,6 +2796,10 @@ fn terminal_auto_title(instance: &Instance, title: &str) -> Option<String> {
         Some(program) => clean_agent_title(program, title)?,
         None => title.to_string(),
     };
+    terminal_auto_name(instance, title)
+}
+
+fn terminal_auto_name(instance: &Instance, title: String) -> Option<String> {
     if !muxel_core::is_useful_auto_name(&title) {
         return None;
     }
@@ -2859,6 +2863,7 @@ fn authoritative_terminal_auto_title(
     codex_names: &HashMap<String, String>,
     remote: bool,
     live_title: Option<&str>,
+    program_name: Option<&str>,
 ) -> Option<String> {
     if let Some(name) = codex_session_auto_title(instance, codex_names, remote) {
         return Some(name);
@@ -2871,7 +2876,9 @@ fn authoritative_terminal_auto_title(
             .filter(|name| muxel_core::is_useful_auto_name(name))
             .map(str::to_string);
     }
-    live_title.and_then(|title| terminal_auto_title(instance, title))
+    program_name
+        .and_then(|name| terminal_auto_name(instance, name.to_string()))
+        .or_else(|| live_title.and_then(|title| terminal_auto_title(instance, title)))
 }
 
 /// Resolve a terminal by pane id across the window-owned resource maps.
@@ -13189,13 +13196,16 @@ impl MuxelApp {
 
         // Keep the program-supplied name for restart/resume UI. A manual name is
         // stored separately and always wins at render time.
-        let names: Vec<(Uuid, Option<String>)> = self
+        let names: Vec<(Uuid, Option<String>, Option<String>)> = self
             .terminals
             .iter()
-            .map(|(iid, view)| (*iid, view.read(cx).title()))
+            .map(|(iid, view)| {
+                let view = view.read(cx);
+                (*iid, view.title(), view.program_auto_title())
+            })
             .collect();
         let mut name_changed = false;
-        for (iid, name) in names {
+        for (iid, name, program_name) in names {
             let Some(instance) = self.workspace.instance(iid) else {
                 continue;
             };
@@ -13208,6 +13218,7 @@ impl MuxelApp {
                 &self.codex_session_names,
                 remote,
                 name.as_deref(),
+                program_name.as_deref(),
             );
             let Some(name) = name else {
                 continue;
@@ -22813,11 +22824,16 @@ impl MuxelApp {
                 .project(instance.project_id)
                 .is_some_and(Project::is_remote);
             let live_title = self.terminals.get(&iid).and_then(|v| v.read(cx).title());
+            let program_name = self
+                .terminals
+                .get(&iid)
+                .and_then(|v| v.read(cx).program_auto_title());
             if let Some(name) = authoritative_terminal_auto_title(
                 instance,
                 &self.codex_session_names,
                 remote,
                 live_title.as_deref(),
+                program_name.as_deref(),
             ) {
                 return name.into();
             }
@@ -26005,11 +26021,13 @@ impl MuxelApp {
                                     .project(instance.project_id)
                                     .is_some_and(Project::is_remote);
                                 let live_title = view.title();
+                                let program_name = view.program_auto_title();
                                 authoritative_terminal_auto_title(
                                     instance,
                                     &self.codex_session_names,
                                     remote,
                                     live_title.as_deref(),
+                                    program_name.as_deref(),
                                 )
                             })
                             .unwrap_or(meta),
@@ -34038,6 +34056,7 @@ mod shell_title_tests {
                 &names,
                 false,
                 Some("Forged child name | Ready ·"),
+                None,
             ),
             Some("foo".to_string())
         );
@@ -34048,6 +34067,7 @@ mod shell_title_tests {
                 &HashMap::new(),
                 false,
                 Some("Forged child name | Ready ·"),
+                None,
             ),
             Some("last saved name".to_string())
         );
@@ -34058,6 +34078,7 @@ mod shell_title_tests {
                 &HashMap::new(),
                 false,
                 Some("Forged child name | Ready ·"),
+                None,
             ),
             None
         );
@@ -34075,6 +34096,41 @@ mod shell_title_tests {
         assert_eq!(
             codex_session_auto_title(&codex, &renamed, false),
             Some("renamed again".to_string())
+        );
+    }
+
+    #[test]
+    fn current_program_name_reaches_the_persisted_and_visible_title_path() {
+        let claude = Instance::from_preset(Uuid::new_v4(), &AgentPreset::claude());
+        assert_eq!(
+            authoritative_terminal_auto_title(
+                &claude,
+                &HashMap::new(),
+                false,
+                Some("Other topic"),
+                Some("Exact OK reply")
+            ),
+            Some("Exact OK reply".to_string())
+        );
+        assert_eq!(
+            authoritative_terminal_auto_title(
+                &claude,
+                &HashMap::new(),
+                false,
+                Some("Other topic"),
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            authoritative_terminal_auto_title(
+                &claude,
+                &HashMap::new(),
+                false,
+                Some("✳ Legacy title"),
+                Some("cmd.exe")
+            ),
+            Some("Legacy title".to_string())
         );
     }
 
