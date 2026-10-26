@@ -170,6 +170,13 @@ feature is added or changed, update the matching entry here in the same change**
     the lookup at most two seconds; an unbound pane whose lookup finds nothing,
     is skipped, or runs out of time starts fresh, and Import can still find an
     older conversation.
+    An unreadable rollout that could change the chosen conversation leaves
+    discovery unresolved, including shortened title hints and Import; confirmed
+    subagent rollouts remain excluded. In restore and Import, a confirmed
+    subagent also excludes its unreadable compression siblings.
+    Discovery checks equally recent candidates before binding a pane, keeps
+    verified newer conversations when an older candidate is unresolved, and can
+    use a readable copy when a compression sibling cannot be read.
     The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
     UUIDs resolve in their timestamp's local day directory, with one neighboring day
@@ -806,8 +813,13 @@ feature is added or changed, update the matching entry here in the same change**
   writes require global control and this command grant even when creation is off.
   Turning "Also allow typing into shell panes" off refuses subsequent control
   writes to every literal argv pane, even agent-looking or interpreter programs,
-  and panes classified as shells.
-  Configured non-literal agents remain controllable while outside control is on;
+  and every program outside the known built-in agent providers, including SSH
+  and WSL shell presets. Existing-pane writes recognize known agents by executable
+  name, including custom paths and agents in remote projects.
+  An agent that falls back to a shell after a failed launch requires the same
+  shell-input grant, including restored panes. A successful agent relaunch uses
+  the agent policy again.
+  Configured non-literal known agents remain controllable while outside control is on;
   disabling all outside control is a separate setting. Delayed Enter and keys
   recheck the shell-input grant and terminal/session availability before writing.
   Revocation does not stop processes
@@ -834,17 +846,23 @@ feature is added or changed, update the matching entry here in the same change**
   the prior turn's grace. `ctl help COMMAND` and `COMMAND -h` show command help;
   `--` before literal text keeps `-h` and `--help` as prompt text. Unknown verbs
   suggest a nearby command.
-  Codex, Claude and Grok sends then observe fresh provider acceptance for up to
-  ten seconds and report `submission_confirmed` and `enter_retries`. Unknown
-  acceptance is reported as false; unsupported providers report null. Only
-  Windows Codex may receive one extra Enter after five seconds, with the same
-  launch, permission and input guards and an exact fully visible ASCII prose
-  draft in its idle composer. A compact composer frame captured before paste
-  and an added blank cursor line must prove that its first Enter was consumed,
-  with no resize or title change. Wrapped prose is
-  supported; clipped, multiline, Unicode, completion or ambiguous drafts are
-  left for inspection. Claude and Grok get no automatic retry. Text is never
-  pasted again, and an unconfirmed receipt does not authorize resending it.
+  Codex, Claude and Grok sends then observe fresh provider acceptance for about
+  ten seconds (three more after a retry) and report `submission_confirmed` and
+  `enter_retries`. Unknown acceptance is reported as false with an
+  `unconfirmed_reason` (`timed_out`, `input_changed` or `interrupted`); once
+  Enter is in, the reply is always this receipt, never an error. muxel doesn't
+  wait when the pane can't show a receipt — an unsupported provider, or no
+  readable idle status title (tmux hides titles) with a Grok, multi-paragraph or
+  repeated prompt — and reports null. Turning outside control off stops the
+  later Enters and keys of `send`, `answer` and `keys`. Only Windows Codex may
+  receive one extra Enter after five seconds, with the same launch, permission
+  and input guards and an exact fully visible ASCII prose draft in its idle
+  composer. A compact composer frame captured before paste and an added blank
+  cursor line must prove that its first Enter was consumed, with no resize or
+  title change. Wrapped prose is supported; clipped, multiline, Unicode,
+  completion or ambiguous drafts are left for inspection. Claude and Grok get no
+  automatic retry. Text is never pasted again, and an unconfirmed receipt does
+  not authorize resending it.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It
@@ -1313,7 +1331,10 @@ feature is added or changed, update the matching entry here in the same change**
   and muxel keeps retrying on its own — backing off to one attempt every 30s, for as
   long as the outage lasts — until the host is reachable and reattaches the agent
   right where it left off. Resuming a laptop whose Wi-Fi isn't up yet just costs a
-  retry or two. The notification feed reports an outage once per host, not per pane:
+  retry or two. An owner lookup or terminal launch already recovering a pane keeps
+  its place across retry ticks; an attempt still pending after 60 seconds yields
+  to a new attempt so a hung worker cannot stall recovery forever.
+  The notification feed reports an outage once per host, not per pane:
   one entry counts the panes still reconnecting and turns into "reconnected" when
   they're all back, so waking with a dozen agents running is one line, not two dozen
   (dismiss it and it stays dismissed until the next outage). On a laptop, a drop

@@ -597,9 +597,11 @@ fn control_new_policy_raw_write_revocation() {
         let instance = argv(program).instance(project, &[], 0).unwrap();
         let before = serde_json::to_value(&instance).unwrap();
         app.settings.control_allow_shells = true;
-        assert!(control_program_writable(&instance, app.settings.control_allow_shells).is_ok());
+        assert!(
+            control_program_writable(&instance, app.settings.control_allow_shells, false).is_ok()
+        );
         app.settings.control_allow_shells = false;
-        let error = control_program_writable(&instance, app.settings.control_allow_shells)
+        let error = control_program_writable(&instance, app.settings.control_allow_shells, false)
             .expect_err("raw-command write permission revoked");
         assert!(
             error.contains(COMMAND_SETTING),
@@ -621,7 +623,7 @@ fn control_new_policy_configured_agent_writes_survive_shell_opt_out() {
     assert!(!app.settings.control_allow_shells);
     let instance = Instance::from_preset(app.workspace.projects[0].id, &AgentPreset::codex());
     assert!(!instance.literal_argv);
-    assert!(control_program_writable(&instance, app.settings.control_allow_shells).is_ok());
+    assert!(control_program_writable(&instance, app.settings.control_allow_shells, false).is_ok());
     app.settings.control_allow_shells = true;
     for instance in [
         Instance::shell(app.workspace.projects[0].id),
@@ -629,7 +631,131 @@ fn control_new_policy_configured_agent_writes_survive_shell_opt_out() {
             .instance(&app.workspace.projects[0], &[], 0)
             .unwrap(),
     ] {
-        assert!(control_program_writable(&instance, app.settings.control_allow_shells).is_ok());
+        assert!(
+            control_program_writable(&instance, app.settings.control_allow_shells, false).is_ok()
+        );
+    }
+}
+
+#[test]
+fn control_fallback_shell_permission_tracks_restored_and_relaunched_agent() {
+    let app = MuxelApp::fixture();
+    let original = Instance::from_preset(app.workspace.projects[0].id, &AgentPreset::codex());
+    let saved = serde_json::to_value(&original).unwrap();
+    for restored in [false, true] {
+        let instance = if restored {
+            serde_json::from_value::<Instance>(saved.clone()).unwrap()
+        } else {
+            original.clone()
+        };
+        assert!(!instance.control_created);
+        assert!(control_program_writable(&instance, false, false).is_ok());
+        let missing = std::env::temp_dir()
+            .join(format!("muxel-missing-agent-{}", Uuid::new_v4()))
+            .join("codex.exe");
+        assert!(!missing.exists());
+        let spec = control_launch_spec(
+            Some(&instance),
+            None,
+            None,
+            CommandSpec::program(missing.to_string_lossy().into_owned(), vec![]),
+        );
+        assert!(spec.allow_shell_fallback);
+        let fallback =
+            muxel_terminal::TerminalLaunch::spawn_for_instance(spec, (80, 24), instance.id)
+                .expect("ordinary agent failure must install the real fallback shell");
+        assert!(fallback.launch_error().is_some());
+        for grant in [false, true, false] {
+            let result =
+                control_program_writable(&instance, grant, fallback.launch_error().is_some());
+            if grant {
+                assert!(result.is_ok());
+            } else {
+                let error = result.expect_err("saved agent metadata must not authorize its shell");
+                assert!(error.contains(COMMAND_SETTING));
+            }
+        }
+        drop(fallback);
+
+        // The test executable stands in for an installed agent: --help exits
+        // without starting another test or contacting a provider. A fresh
+        // successful launch must clear the old fallback's permission requirement.
+        let spec = control_launch_spec(
+            Some(&instance),
+            None,
+            None,
+            CommandSpec::program(
+                std::env::current_exe().unwrap().display().to_string(),
+                vec!["--help".into()],
+            ),
+        );
+        let relaunched =
+            muxel_terminal::TerminalLaunch::spawn_for_instance(spec, (80, 24), instance.id)
+                .expect("successful requested process must launch without a fallback");
+        assert!(relaunched.launch_error().is_none());
+        assert!(
+            control_program_writable(&instance, false, relaunched.launch_error().is_some()).is_ok()
+        );
+        assert_eq!(serde_json::to_value(&instance).unwrap(), saved);
+    }
+}
+
+#[test]
+fn control_write_policy_recognizes_known_agent_names_without_local_resolution() {
+    let app = MuxelApp::fixture();
+    let custom = std::env::temp_dir().join("custom-agent").join("CoDeX.EXE");
+    for (program, known) in [
+        ("codex", true),
+        ("claude", true),
+        (custom.to_str().unwrap(), true),
+        ("ssh", false),
+        ("wsl.exe", false),
+        ("python", false),
+        ("python3", false),
+        ("node", false),
+        ("claude-wrapper.sh", false),
+        ("./codex", true),
+    ] {
+        let mut instance =
+            Instance::from_preset(app.workspace.projects[0].id, &AgentPreset::codex());
+        instance.program = Some(program.into());
+        instance.args = vec!["host".into()];
+        assert!(!instance.literal_argv);
+        let before = serde_json::to_value(&instance).unwrap();
+        let result = control_program_writable(&instance, false, false);
+        assert_eq!(result.is_ok(), known, "{program}: {result:?}");
+        if let Err(error) = result {
+            assert!(error.contains(COMMAND_SETTING), "{program}: {error}");
+        }
+        assert!(
+            control_program_writable(&instance, true, false).is_ok(),
+            "{program}"
+        );
+        assert_eq!(serde_json::to_value(&instance).unwrap(), before);
+    }
+}
+
+#[test]
+fn control_write_policy_remote_agents_need_no_local_installation() {
+    let mut app = MuxelApp::fixture();
+    app.workspace.projects[0].remote = Some(muxel_core::RemoteRef {
+        host_id: Uuid::new_v4(),
+        remote_root: "/remote/repo".into(),
+    });
+    for program in ["codex", "claude"] {
+        let mut instance =
+            Instance::from_preset(app.workspace.projects[0].id, &AgentPreset::codex());
+        instance.program = Some(program.into());
+        assert!(
+            app.workspace
+                .project(instance.project_id)
+                .unwrap()
+                .is_remote()
+        );
+        assert!(
+            control_program_writable(&instance, false, false).is_ok(),
+            "{program}"
+        );
     }
 }
 
@@ -643,9 +769,12 @@ fn control_new_policy_write_entry_points_recheck_permission() {
         .split("    fn control_claim_site(")
         .next()
         .unwrap();
+    let write_boundary = write_boundary.split_whitespace().collect::<String>();
     assert!(
         write_boundary
-            .find("control_program_writable(inst, self.settings.control_allow_shells)?")
+            .find(
+                "control_program_writable(inst,self.settings.control_allow_shells,fallback_shell)?"
+            )
             .unwrap()
             < write_boundary.find("self.control_state(").unwrap()
     );
@@ -735,9 +864,9 @@ fn control_new_policy_shell_classification_refuses_writes_after_opt_out() {
                 .unwrap();
             // This is the program metadata a preset/literal shell retains after
             // creation. control_writable invokes this same policy on every write.
-            assert!(control_program_writable(&instance, true).is_ok());
-            let error =
-                control_program_writable(&instance, false).expect_err("shell permission revoked");
+            assert!(control_program_writable(&instance, true, false).is_ok());
+            let error = control_program_writable(&instance, false, false)
+                .expect_err("shell permission revoked");
             assert!(
                 error.contains(COMMAND_SETTING),
                 "unexpected refusal: {error}"
@@ -922,7 +1051,11 @@ fn control_new_policy_production_queue_enters_the_tested_mutation_boundary() {
         .unwrap();
     assert!(
         write_boundary
-            .contains("control_program_writable(inst, self.settings.control_allow_shells)?")
+            .split_whitespace()
+            .collect::<String>()
+            .contains(
+                "control_program_writable(inst,self.settings.control_allow_shells,fallback_shell)?"
+            )
     );
 }
 

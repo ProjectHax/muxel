@@ -1611,6 +1611,15 @@ pub struct PromptSubmission {
     allow_working_title: bool,
     before_prompt: Option<String>,
     origin: Option<PromptOriginProof>,
+    observable: bool,
+}
+
+impl PromptSubmission {
+    /// Whether this pane can show a receipt for this prompt at all. Without
+    /// one, waiting for confirmation only delays the caller.
+    pub fn observable(&self) -> bool {
+        self.observable
+    }
 }
 
 struct PromptOriginProof {
@@ -1815,6 +1824,28 @@ fn ctl_title_can_confirm(
             provider_screen_status(provider, &screen.text),
             Some(AgentStatus::Working | AgentStatus::Blocked)
         )
+}
+
+/// A ctl receipt is either a working title after an idle one, which needs a
+/// provider status title muxel can read (tmux hides OSC titles), or a fresh
+/// transcript row beside an empty composer. Those readers stop at the first
+/// blank line, so only a prompt without one can match; a row repeating the
+/// previous prompt is never fresh; and Grok's composer is never known empty.
+fn ctl_acceptance_observable(
+    provider: TitleProvider,
+    title: Option<&str>,
+    allow_working_title: bool,
+    input: &str,
+    before_prompt: Option<&str>,
+) -> bool {
+    let title_receipt = allow_working_title
+        && parse_agent_title(provider, title)
+            .and_then(|frame| frame.status)
+            .is_some();
+    let transcript_receipt = matches!(provider, TitleProvider::Claude | TitleProvider::Codex)
+        && !input.trim().lines().any(|line| line.trim().is_empty())
+        && before_prompt != Some(crate::startup::normalized(input).as_str());
+    title_receipt || transcript_receipt
 }
 
 fn prompt_submission_state(
@@ -2951,6 +2982,14 @@ impl TerminalView {
         } else {
             None
         };
+        let observable = origin.is_some()
+            || ctl_acceptance_observable(
+                self.title_provider,
+                title.as_deref(),
+                allow_working_title,
+                text,
+                before_prompt.as_deref(),
+            );
         // Preserve this generation even if it changes while reading history.
         // Returning None would incorrectly downgrade a switch to an unsupported
         // provider and skip the caller's pre-Enter interruption check.
@@ -2965,6 +3004,7 @@ impl TerminalView {
             allow_working_title,
             before_prompt,
             origin,
+            observable,
         })
     }
 
@@ -3514,12 +3554,46 @@ mod launch_identity_tests {
             if allow_fallback {
                 let launch = result.expect("ordinary UI preset retains its fallback");
                 let deadline = Instant::now() + Duration::from_secs(15);
-                while !marker.is_file() && Instant::now() < deadline {
+                let marker_complete = loop {
+                    if std::fs::read_to_string(&marker).ok().as_deref() == Some("fallback") {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
                     std::thread::sleep(Duration::from_millis(10));
-                }
+                };
+                // File creation precedes the completed write, and kill does not
+                // wait for the writer to release its Windows file handle.
                 launch.session.kill();
-                assert!(marker.is_file(), "the injected fallback must really run");
-                std::fs::remove_file(&marker).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    match launch.rx.try_recv() {
+                        Ok(ProfiledPtyChunk::Exit { .. }) => break,
+                        Err(async_channel::TryRecvError::Closed) => break,
+                        Ok(ProfiledPtyChunk::Output { .. }) => {}
+                        Err(async_channel::TryRecvError::Empty) => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let cleanup = loop {
+                    match std::fs::remove_file(&marker) {
+                        Ok(()) => break Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => break Ok(()),
+                        Err(error) if Instant::now() >= deadline => break Err(error),
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                };
+                assert!(
+                    marker_complete,
+                    "the injected fallback must finish its write"
+                );
+                cleanup.expect("remove fallback marker after bounded retries");
             } else {
                 assert!(
                     result.is_err(),
@@ -3843,8 +3917,8 @@ mod startup_readiness_tests {
         PromptOriginProof, PromptSubmissionState, QuietStartup, QuietStartupTarget, SHIFT_TAB,
         STARTUP_KEY_GAP_MS, STARTUP_MAX_WAIT_MS, STARTUP_PRE_TYPE_MS, STARTUP_SUBMIT_DELAY_MS,
         StartupAttempt, TitleProvider, claude_startup_ready, codex_ctl_ready,
-        controlled_startup_deadline, ctl_title_can_confirm, ctl_transcript_prompt,
-        prompt_submission_state, quiet_startup, startup_has_fresh_user_row,
+        controlled_startup_deadline, ctl_acceptance_observable, ctl_title_can_confirm,
+        ctl_transcript_prompt, prompt_submission_state, quiet_startup, startup_has_fresh_user_row,
         startup_provider_accepted, startup_ready, startup_retry_allowed,
     };
     use crate::startup::Screen;
@@ -4113,6 +4187,52 @@ mod startup_readiness_tests {
                 status
             ));
         }
+    }
+
+    #[test]
+    fn ctl_send_waits_only_where_a_receipt_can_be_seen() {
+        let multi = "first paragraph\n\nsecond paragraph";
+        for (provider, idle) in [
+            (TitleProvider::Codex, "scratch | Ready"),
+            (TitleProvider::Claude, "✳ scratch"),
+            (TitleProvider::Grok, "scratch - grok"),
+        ] {
+            // A readable status title confirms any prompt sent while idle.
+            assert!(ctl_acceptance_observable(
+                provider,
+                Some(idle),
+                true,
+                multi,
+                Some("first paragraph")
+            ));
+            // tmux hides the title and a busy pane can't use it either; then
+            // only a fresh transcript row the readers return whole can confirm.
+            for (title, allow) in [(None, true), (Some(idle), false)] {
+                assert!(!ctl_acceptance_observable(
+                    provider, title, allow, multi, None
+                ));
+                assert_eq!(
+                    ctl_acceptance_observable(provider, title, allow, "one\nparagraph\n", None),
+                    provider != TitleProvider::Grok
+                );
+                // The same prompt again leaves the newest row unchanged.
+                assert!(!ctl_acceptance_observable(
+                    provider,
+                    title,
+                    allow,
+                    "continue ",
+                    Some("continue")
+                ));
+            }
+        }
+        // A Codex thread-only title carries no run state to watch.
+        assert!(!ctl_acceptance_observable(
+            TitleProvider::Codex,
+            Some("scratch"),
+            true,
+            multi,
+            None
+        ));
     }
 
     #[test]
@@ -6031,6 +6151,102 @@ mod provider_switch_tests {
     }
 
     #[test]
+    fn split_old_osc_title_cannot_rebind_on_a_fresh_terminator() {
+        let (session, _receiver) = fixture();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let c = uuid::Uuid::new_v4();
+        let old = SystemTime::now() - Duration::from_secs(3);
+        let hook = old + Duration::from_secs(1);
+        let fresh = hook + Duration::from_secs(4);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{a} | Ready\x07"),
+            old - Duration::from_secs(1),
+        )]));
+        session.process_drained(&drained(&[(&format!("\x1b]0;{b} | Ready"), old)]));
+        session.provider_switched_at(hook, hook, SystemTime::now());
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[("\x07", fresh)]));
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&a.to_string())
+        );
+
+        // A title whose opening bytes were read after the hook still binds.
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{c} | Ready\x07"),
+            fresh + Duration::from_millis(1),
+        )]));
+        assert!(session.binding_revision() > switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&c.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn synchronized_old_title_keeps_its_opening_read_time() {
+        let (session, _receiver) = fixture();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let old = SystemTime::now() - Duration::from_secs(3);
+        let hook = old + Duration::from_secs(1);
+        let fresh = hook + Duration::from_secs(4);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{a} | Working\x07"),
+            old - Duration::from_secs(1),
+        )]));
+        session.process_drained(&drained(&[(
+            &format!("\x1b[?2026h\x1b]0;{b} | Ready\x07"),
+            old,
+        )]));
+        session.provider_switched_at(hook, hook, SystemTime::now());
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[("\x1b[?2026l", fresh)]));
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&a.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn escape_controls_keep_an_old_title_old_but_a_fresh_bell_fresh() {
+        let (session, _receiver) = fixture();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let old = SystemTime::now() - Duration::from_secs(3);
+        let hook = old + Duration::from_secs(1);
+        let fresh = hook + Duration::from_secs(4);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{a} | Working\x07"),
+            old - Duration::from_secs(1),
+        )]));
+        session.process_drained(&drained(&[("\x1b", old)]));
+        session.provider_switched_at(hook, hook, SystemTime::now());
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[(&format!("\x00\x07]0;{b} | Ready\x07"), fresh)]));
+        assert!(session.has_bell());
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&a.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
     fn a_switch_with_no_fresh_evidence_settles_at_its_deadline_without_completing() {
         let (session, _receiver) = fixture();
         let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
@@ -6720,6 +6936,52 @@ mod provider_switch_tests {
         let fresh = hook + SWITCH_SLACK + SWITCH_SETTLE + Duration::from_secs(1);
         session.process_drained(&drained(&[(working, fresh)]));
         let (snapshot, _) = viewer.sample_at(&session, late + Duration::from_millis(60));
+        assert!(!viewer.runtime.screen_held);
+        assert!(snapshot.attributable);
+        session.kill();
+    }
+
+    #[test]
+    fn a_split_title_opened_inside_the_window_cannot_release_a_screen_hold() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Grok);
+        let clock = viewer.clock;
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let row = "◎ 1 command still running · send a message to interrupt";
+        let working_prefix = "\x1b]0;\u{2839} - Responding - Topic - grok";
+        let working = "\x1b]0;\u{2839} - Responding - Topic - grok\x07";
+        session.process_drained(&drained(&[
+            (row, hook + Duration::from_millis(90)),
+            (working_prefix, hook + Duration::from_millis(100)),
+        ]));
+        session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+        let (_, deadline) = viewer.sample_at(&session, clock);
+        assert!(viewer.runtime.screen_held);
+
+        // VTE dispatches the title on this later BEL, but its read time is
+        // still the prefix's time inside the switch window.
+        let after_window = hook + SWITCH_SLACK + Duration::from_millis(100);
+        session.process_drained(&drained(&[("\x07", after_window)]));
+        let late = deadline.expect("a settle deadline") + Duration::from_secs(5);
+        let (snapshot, _) = viewer.sample_at(&session, late);
+        assert!(
+            !session
+                .runtime_evidence_at(None, wall_time_at(late))
+                .title_fresh
+        );
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(!snapshot.attributable);
+        assert!(viewer.runtime.screen_held);
+
+        // A newly opened title read after the window confirms the marker.
+        let fresh = after_window + Duration::from_secs(1);
+        session.process_drained(&drained(&[(working, fresh)]));
+        let (snapshot, _) = viewer.sample_at(&session, late + Duration::from_millis(60));
+        assert!(
+            session
+                .runtime_evidence_at(None, wall_time_at(late))
+                .title_fresh
+        );
         assert!(!viewer.runtime.screen_held);
         assert!(snapshot.attributable);
         session.kill();
