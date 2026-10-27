@@ -7898,6 +7898,28 @@ impl MuxelApp {
             .map(|h| h.effective(&self.identities))
     }
 
+    /// The tmux session of every pane that runs on remote host `host_id`, or on
+    /// this machine for `None`, under the name each pane launches with. A literal
+    /// pane runs no session, whatever stale tmux fields a peer left on it.
+    fn pane_sessions_on(&self, host_id: Option<Uuid>) -> Vec<SessionTarget> {
+        self.workspace
+            .instances
+            .iter()
+            .filter(|i| !i.literal_argv)
+            .filter_map(|i| {
+                let project = self.workspace.project(i.project_id)?;
+                match (project.remote.as_ref(), host_id) {
+                    (Some(r), Some(host_id)) if r.host_id == host_id => {
+                        let host = self.remotes.iter().find(|h| h.id == host_id)?;
+                        Some(i.tmux_target(&host.name))
+                    }
+                    (None, None) => Some(i.tmux_target(&project.name)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Program/args (+ extra env) to run an instance's command on a remote host
     /// over SSH: `ssh [opts] host -- '…'`, or `sshpass -e ssh …` for password
     /// auth (the password — keychain or this session — is passed via `$SSHPASS`).
@@ -9707,22 +9729,17 @@ impl MuxelApp {
         let Some(project) = self.workspace.project(pid) else {
             return;
         };
-        let Some(root) = project.remote.as_ref().map(|r| r.remote_root.clone()) else {
-            return;
-        };
-        let host_name = project
+        let Some((root, host_id)) = project
             .remote
             .as_ref()
-            .and_then(|r| self.remotes.iter().find(|h| h.id == r.host_id))
-            .map(|h| h.name.clone())
-            .unwrap_or_default();
-        let owned: Vec<SessionTarget> = self
-            .workspace
-            .instances
-            .iter()
-            .filter(|i| i.project_id == pid)
-            .map(|i| i.tmux_target(&host_name))
-            .collect();
+            .map(|r| (r.remote_root.clone(), r.host_id))
+        else {
+            return;
+        };
+        // Every pane on this host owns its session, not just this project's: a
+        // project nested in this one's tree, or a second entry for the same root,
+        // already shows its own panes' sessions.
+        let owned = self.pane_sessions_on(Some(host_id));
         // A pane the user closed must not come back as a pane: neither one whose kill
         // is still unconfirmed (`reap_closed_sessions` is working on it) nor one whose
         // kill was confirmed after `sessions` was listed.
@@ -15977,10 +15994,10 @@ impl MuxelApp {
             .workspace
             .project(project_id)
             .is_some_and(|p| p.is_remote());
-        // Remote tmux session: closing a pane always tears its session down —
-        // a *dropped* SSH connection never reaches here (an abnormal exit leaves
-        // a tombstone pane instead of auto-closing), so reconnectability is
-        // preserved where it matters. Killed over ssh in the background, over the
+        // Remote tmux session: closing a pane tears its session down unless another
+        // pane still shows it — a *dropped* SSH connection never reaches here (an
+        // abnormal exit leaves a tombstone pane instead of auto-closing), so
+        // reconnectability is preserved where it matters. Killed over ssh in the background, over the
         // host's commands master — never the pane's own, which is going away.
         //
         // Gated on the host having tmux *at all*, not on tmux being its current
@@ -16005,13 +16022,18 @@ impl MuxelApp {
             // at one costs a single round trip and nothing else.
             (Some(tmux), Some(host)) => {
                 let session = tmux.on_host(&host.name);
-                self.reap_remote_session(project_id, iid, host, session, cx);
+                if !self.session_kept_for_another_pane(Some(host.id), &session) {
+                    self.reap_remote_session(project_id, iid, host, session, cx);
+                }
             }
             // A remote instance's session lives on the host, not here; killing the
             // recorded name locally would be a no-op at best.
             (Some(tmux), None) if !is_remote => {
                 if let Some(session) = tmux.recorded_session {
-                    integrations::kill_tmux_session(&SessionTarget::new(session, tmux.socket));
+                    let session = SessionTarget::new(session, tmux.socket);
+                    if !self.session_kept_for_another_pane(None, &session) {
+                        integrations::kill_tmux_session(&session);
+                    }
                 }
             }
             _ => {}
@@ -16032,6 +16054,25 @@ impl MuxelApp {
             }
             muxel_core::WorktreeCleanup::None => {}
         }
+    }
+
+    /// Whether a closed pane's `session` stays running because another pane on the
+    /// same host (`None`: this machine) still shows it — see
+    /// `tmux::session_still_shown`. The closed pane must already be gone from the
+    /// workspace. A kept session is noted in the event log, so a close that left an
+    /// agent running can be told apart from a kill that failed.
+    fn session_kept_for_another_pane(
+        &self,
+        host_id: Option<Uuid>,
+        session: &SessionTarget,
+    ) -> bool {
+        let kept = muxel_core::tmux::session_still_shown(session, &self.pane_sessions_on(host_id));
+        if kept {
+            muxel_store::append_event_log(&format!(
+                "close: kept “{session}” running — another pane still shows it"
+            ));
+        }
+        kept
     }
 
     /// Kill the tmux session a closed pane left on a remote host, and keep at it

@@ -1233,7 +1233,11 @@ feature is added or changed, update the matching entry here in the same change**
   back mid-conversation, exactly where it was, rather than starting a second one
   beside it. It adopts only muxel's own sessions, only within the project, and never
   one a pane already owns or one you deliberately closed — your own tmux is left
-  alone.
+  alone. A pane already owns its session even when its saved record names the
+  wrong tmux server, as a copy of the layout from before a restart moved the
+  session does, and a pane in another project on the same host (one nested in
+  this project's folder, say) owns its own, so neither comes back as a second
+  pane on the same agent.
 - **Closing a remote agent really stops it** — closing a remote pane kills its tmux
   session on the host, and muxel *confirms* the session is gone rather than assuming
   the kill landed. A kill that fails (a blip, a host that is busy or briefly
@@ -1528,9 +1532,11 @@ feature is added or changed, update the matching entry here in the same change**
   it left off (tmux scrollback is the only casualty). A deliberate `tmux kill-session`,
   and an agent simply quitting, still close the pane normally. The feed says which
   happened — *reattached* (session survived) or *session restored* (agent resumed).
-- **tmux lifecycle** — closing a **pane** always kills its tmux session (local or
-  remote); a *dropped* SSH connection never auto-closes — it leaves a tombstone
-  pane, keeping the remote session reconnectable. Quitting the **app** leaves
+- **tmux lifecycle** — closing a **pane** kills its tmux session (local or
+  remote), unless another pane still shows that session: then it keeps running
+  for that pane, and closing the last pane on it stops it. A *dropped* SSH
+  connection never auto-closes — it leaves a tombstone pane, keeping the remote
+  session reconnectable. Quitting the **app** leaves
   sessions alive by design (they reattach next launch): when any exist, the quit
   dialog offers two checkboxes — **Also kill local tmux sessions** and **Also
   kill remote tmux sessions** — both off by default; the kills are
