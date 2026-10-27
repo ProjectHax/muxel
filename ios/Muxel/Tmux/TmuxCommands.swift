@@ -277,6 +277,19 @@ enum TmuxCommands {
             ?? eligible.first { TmuxSession.session(name($0), matchesInstanceId: instance.id) }
     }
 
+    /// Port of `session_still_shown` in `crates/muxel-core/src/tmux.rs`: whether a
+    /// close must leave session `name` running because a pane it doesn't remove
+    /// (`closing`) still shows it. One session can be in two panes — a desktop
+    /// adopted it beside a pane whose record had gone stale — and killing it for
+    /// either took the other pane's agent too. The last pane to close stops it.
+    /// Matched by name alone: a recorded socket can be stale, and session names
+    /// carry the pane's own id. A literal pane runs no session.
+    static func sessionStillShown(_ name: String, closing: Set<String>, in instances: [Instance]) -> Bool {
+        instances.contains { other in
+            !closing.contains(other.id) && !other.literalArgv && other.tmuxSession == name
+        }
+    }
+
     // MARK: Lifecycle
 
     /// Start the remote tmux server *before* any session exists, from a command line

@@ -117,6 +117,29 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertFalse(cmd.contains("-L"))
     }
 
+    // Port of `a_session_another_pane_still_shows_outlives_the_close`: two panes on
+    // one session, their records disagreeing about the server. Closing either leaves
+    // it to the other; only the last pane to close stops it.
+    func testASessionAnotherPaneStillShowsOutlivesTheClose() {
+        let name = "muxel_p_12345678"
+        var original = Instance(id: "12345678-0000-4000-8000-000000000000", projectId: "p",
+                                title: "Claude", program: "claude", args: [])
+        original.tmuxSession = name
+        original.tmuxSocket = "default"
+        var adopted = Instance(id: "abcdef12-0000-4000-8000-000000000000", projectId: "p",
+                               title: "Claude", program: "claude", args: [])
+        adopted.tmuxSession = name
+        adopted.tmuxSocket = TmuxCommands.socketName
+        let both = [original, adopted]
+        XCTAssertTrue(TmuxCommands.sessionStillShown(name, closing: [adopted.id], in: both))
+        XCTAssertTrue(TmuxCommands.sessionStillShown(name, closing: [original.id], in: both))
+        XCTAssertFalse(TmuxCommands.sessionStillShown(name, closing: [original.id, adopted.id], in: both))
+        XCTAssertFalse(TmuxCommands.sessionStillShown("muxel_p_87654321", closing: [original.id], in: both))
+        var literal = adopted
+        literal.literalArgv = true
+        XCTAssertFalse(TmuxCommands.sessionStillShown(name, closing: [original.id], in: [original, literal]))
+    }
+
     // sshd runs an exec channel's command with its bare default PATH and no profile, so a
     // Mac's Homebrew tmux (`/opt/homebrew/bin/tmux` on Apple silicon) is not on it and every
     // tmux command fails with `command not found: tmux`. Port of `ssh::tmux_path_prelude`.
