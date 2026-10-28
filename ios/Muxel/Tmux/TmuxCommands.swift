@@ -381,16 +381,23 @@ enum TmuxCommands {
     /// with it. With no `program`, tmux starts its own default login shell, so no
     /// wrapping is needed. Returned as a shell string (not a quoted arg array) because
     /// it relies on the remote shell expanding `$SHELL`. Clears a stale pane id from the
-    /// server first (`clearInstanceId`).
+    /// server first (`clearInstanceId`). Creates a missing `cwd` first (`createDir`).
     static func launchAgent(session: String, cwd: String, program: String?, args: [String]) -> String {
         var cmd =
-            "\(pathPrelude); \(selectSocket(session)); tmux \"$@\" \(clearInstanceId) "
+            "\(pathPrelude); \(selectSocket(session)); \(createDir(cwd)); tmux \"$@\" \(clearInstanceId) "
             + "new-session -d -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
             cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"
         }
         return cmd
+    }
+
+    /// Creates a session's missing folder, which tmux would otherwise replace with the
+    /// home folder. Best effort, so a failure never keeps a running session from being
+    /// reattached. Port of the `mkdir -p` in `ssh::remote_command` (ssh.rs).
+    static func createDir(_ cwd: String) -> String {
+        "mkdir -p -- \(Shell.quote(cwd))"
     }
 
     /// Attach to a session interactively (used on a PTY channel for live view).
@@ -416,10 +423,12 @@ enum TmuxCommands {
     /// they get one, exactly like desktop's `ssh -t`. `program == nil` → default shell.
     /// Clears a stale pane id from the server first (`clearInstanceId`). A new session
     /// goes on muxel's own server; `-A` reattaches one wherever it runs (`selectSocket`).
+    /// Creates a missing `cwd` first (`createDir`).
     static func newAttachedPTYCommand(session: String, cwd: String, program: String?, args: [String], socket: String? = nil) -> String {
         // `clear;` wipes the login banner + echoed command before tmux takes over.
         var cmd =
-            "\(pathPrelude); \(selectSocket(session, socket: socket)); clear; exec tmux \"$@\" \(clearInstanceId) "
+            "\(pathPrelude); \(selectSocket(session, socket: socket)); \(createDir(cwd)); clear; "
+            + "exec tmux \"$@\" \(clearInstanceId) "
             + "new-session -A -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)

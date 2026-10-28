@@ -3424,6 +3424,27 @@ fn effective_local_cwd(
         .map(|path| path.display().to_string())
 }
 
+/// Create a local pane's working folder when it is missing, so its program
+/// starts there. Otherwise the PTY starts it in the home folder on Unix and
+/// fails the launch on Windows. A folder that can't be created refuses the
+/// launch rather than starting the program somewhere else.
+fn create_missing_cwd(spec: &CommandSpec) -> anyhow::Result<()> {
+    let Some(cwd) = spec.cwd.as_deref().filter(|cwd| !cwd.is_empty()) else {
+        return Ok(());
+    };
+    if Path::new(cwd).is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(cwd).map_err(|error| {
+        anyhow::Error::msg(tf(
+            "Could not create the folder {folder}: {error}",
+            &[("folder", cwd), ("error", &error.to_string())],
+        ))
+    })?;
+    muxel_store::append_event_log(&format!("launch: created missing folder {cwd}"));
+    Ok(())
+}
+
 /// A generic early exit does not prove a saved Codex, Claude or Muse
 /// conversation is gone. Only a provider-specific missing-session message can
 /// recover Codex. Claude's transcript probe decides before launch because a
@@ -3497,9 +3518,10 @@ fn tmux_codex_resume_ended(armed: bool, exit_code: Option<i32>, recent_resume: b
 #[cfg(test)]
 mod claude_resume_tests {
     use super::{
-        AgentPreset, Instance, SessionTarget, arms_tmux_resume_recovery,
-        claude_hook_writer_survives, effective_local_cwd, generated_resume_receipt,
-        resume_missing_message, should_recover_expired_session, tmux_codex_resume_ended,
+        AgentPreset, CommandSpec, Instance, SessionTarget, arms_tmux_resume_recovery,
+        claude_hook_writer_survives, create_missing_cwd, effective_local_cwd,
+        generated_resume_receipt, resume_missing_message, should_recover_expired_session,
+        tmux_codex_resume_ended,
     };
     use std::path::Path;
     use std::time::SystemTime;
@@ -3585,6 +3607,29 @@ mod claude_resume_tests {
             .as_deref(),
             Some("D:/dev/orez-wt-19497-flow")
         );
+    }
+
+    #[test]
+    fn a_missing_launch_folder_is_created_and_an_impossible_one_refused() {
+        let root = std::env::temp_dir().join(format!("muxel-cwd-{}", Uuid::new_v4()));
+        // The creation is logged; keep that out of the real event log.
+        let _storage = muxel_store::test_support::set_root(root.clone());
+        let folder = root.join("deleted").join("project");
+        let spec = CommandSpec::shell().with_cwd(folder.display().to_string());
+        create_missing_cwd(&spec).expect("creates the folder and its parents");
+        assert!(folder.is_dir());
+        create_missing_cwd(&spec).expect("an existing folder is left alone");
+
+        // A file where the folder should be can't become one.
+        let file = root.join("file");
+        std::fs::write(&file, "").unwrap();
+        let spec = CommandSpec::shell().with_cwd(file.display().to_string());
+        assert!(create_missing_cwd(&spec).is_err());
+        assert!(file.is_file());
+
+        // No folder to make.
+        create_missing_cwd(&CommandSpec::shell()).expect("no cwd");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -8265,6 +8310,7 @@ impl MuxelApp {
                 crate::user_data_dir::is_isolated(),
             )
         }) {
+            create_missing_cwd(&spec)?;
             return Ok(spec);
         }
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
@@ -8482,6 +8528,7 @@ impl MuxelApp {
         if let Some(cwd) = local_cwd {
             spec = spec.with_cwd(cwd);
         }
+        create_missing_cwd(&spec)?;
         if let Some(input) = resolved.startup_input.clone() {
             spec = spec.with_startup_input(input);
         }

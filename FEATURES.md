@@ -41,6 +41,13 @@ feature is added or changed, update the matching entry here in the same change**
   positions.
 - **Per-project focus** — switching away from a project and back restores the
   pane that was last focused there, falling back safely if that pane was removed.
+- **Missing folders are created** — a pane whose folder doesn't exist on its host
+  (the project's, a worktree's or its own launch folder: deleted, or never made on
+  the machine a synced layout was opened on) creates it, parents included, before
+  starting its program — locally and on a remote host. Before, the program started
+  in the home folder instead. A local folder that can't be created stops the
+  launch with the reason. A remote Windows pane using cmd still needs its folder
+  to exist.
 - **Responsive cold project restore** — opening a project whose agents have not
   started yet paints the selected pane first and admits the remaining terminal
   processes in bounded waves. On Windows the next pair starts only after every

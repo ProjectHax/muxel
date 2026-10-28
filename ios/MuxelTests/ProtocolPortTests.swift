@@ -171,6 +171,7 @@ final class ProtocolPortTests: XCTestCase {
             session: "muxel_h_abcdef12", cwd: "/work", program: "claude", args: ["--model", "opus"])
         XCTAssertTrue(cmd.hasPrefix(
             "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("muxel_h_abcdef12")); "
+            + "mkdir -p -- '/work'; "
             + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
             + "new-session -d -s 'muxel_h_abcdef12' -c '/work' "
             + "-- \"${SHELL:-/bin/sh}\" -ilc "))
@@ -180,7 +181,7 @@ final class ProtocolPortTests: XCTestCase {
         // No program → tmux's own default login shell, no wrapping.
         XCTAssertEqual(
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; "
                 + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -d -s 's' -c '/w'")
     }
@@ -193,7 +194,7 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(TmuxCommands.instanceIdEnv, "MUXEL_INSTANCE_ID")
         XCTAssertEqual(
             TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); clear; "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; clear; "
                 + "exec tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -A -s 's' -c '/w'")
         // Cleared in the same tmux command list, ahead of the session it would leak into.
