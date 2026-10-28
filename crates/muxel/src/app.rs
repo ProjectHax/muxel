@@ -8857,6 +8857,7 @@ impl MuxelApp {
     }
 
     fn fail_tmux_launch(&mut self, iid: Uuid, message: String) {
+        self.cancel_control_startup(iid);
         self.terminal_launching.remove(&iid);
         self.failed_launches.insert(iid, message.clone());
         self.add_event(NotifKind::Error, t("Launch failed"), message);
@@ -8923,7 +8924,7 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(instance) = self.workspace.instance(iid) else {
+        let Some(instance) = self.workspace.instance(iid).filter(|i| !i.literal_argv) else {
             return false;
         };
         let pid = instance.project_id;
@@ -8992,6 +8993,11 @@ impl MuxelApp {
                 {
                     return true;
                 }
+                if !this.launch_permitted(iid, reason) {
+                    this.cancel_control_startup(iid);
+                    this.terminal_launching.remove(&iid);
+                    return true;
+                }
                 let Some(instance) = this.workspace.instance_mut(iid) else {
                     return true;
                 };
@@ -9053,12 +9059,16 @@ impl MuxelApp {
         // A peer/workspace update can change metadata while the task yields.
         // Recheck before discovery so a restore reservation cannot replay argv.
         if !self.launch_permitted(instance_id, reason) {
+            self.cancel_control_startup(instance_id);
             self.terminal_launching.remove(&instance_id);
             return None;
         }
         if !self.prepare_local_tmux_owner(instance_id) {
             return None;
         }
+        // Owner discovery retains a ticket without owning the first task. Claim
+        // it only after preparation succeeds, without re-reserving the launch.
+        self.claim_reserved_control_startup(instance_id, token);
         let spec = match self.command_for(instance_id) {
             Ok(spec) => spec,
             Err(error) => {

@@ -1263,7 +1263,7 @@ impl MuxelApp {
         instance.session_id = Some(candidate.id);
         instance.session_path = path;
         instance.session_started = true;
-        if !same_id {
+        if !same_id || force_boundary {
             instance.auto_name = None;
         }
         self.bump_session_binding_generation(iid);
@@ -1480,6 +1480,113 @@ fn claim_validated_claude_record(
         return None;
     }
     Some(record)
+}
+
+#[cfg(all(test, windows))]
+mod binding_regressions {
+    use super::SessionCandidate;
+    use crate::app::restart_completion_tests::with_app;
+    use muxel_core::{Instance, Project};
+    use uuid::Uuid;
+
+    #[test]
+    fn same_id_provider_boundary_clears_name_but_path_upgrade_preserves_it() {
+        with_app(|cx, window| {
+            window
+                .update(cx, |app, _, cx| {
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let root = muxel_store::data_dir().unwrap();
+                    let project = app
+                        .workspace
+                        .add_project(Project::new("Claude binding", root.clone()));
+                    let mut instance = Instance::shell(project);
+                    let identity = Uuid::new_v4().to_string();
+                    instance.session_id = Some(identity.clone());
+                    instance.auto_name = Some("Previous conversation".into());
+                    let id = instance.id;
+                    app.workspace.add_instance(instance);
+                    let path = root.join("exact-transcript.jsonl");
+                    let candidate = || SessionCandidate {
+                        id: identity.clone(),
+                        path: Some(path.clone()),
+                    };
+
+                    let update = app
+                        .stage_discovered_session(id, candidate(), false)
+                        .unwrap();
+                    assert!(app.finish_discovered_sessions(vec![update], cx));
+                    let instance = app.workspace.instance(id).unwrap();
+                    assert_eq!(instance.auto_name.as_deref(), Some("Previous conversation"));
+                    assert_eq!(instance.session_path.as_deref(), Some(path.as_path()));
+
+                    // A new Claude nonce can report A -> B -> A between reads.
+                    // Its unchanged final UUID still creates a provider boundary.
+                    let update = app.stage_discovered_session(id, candidate(), true).unwrap();
+                    assert_eq!(app.workspace.instance(id).unwrap().auto_name, None);
+                    assert!(app.finish_discovered_sessions(vec![update], cx));
+                    let doc =
+                        muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                    let saved = muxel_store::load_workspace_from(&doc).unwrap();
+                    assert_eq!(saved.instance(id).unwrap().auto_name, None);
+                    assert_eq!(
+                        saved.instance(id).unwrap().session_id.as_deref(),
+                        Some(identity.as_str())
+                    );
+                    assert_eq!(
+                        saved.instance(id).unwrap().session_path.as_deref(),
+                        Some(path.as_path())
+                    );
+                    assert!(
+                        app.stage_discovered_session(id, candidate(), false)
+                            .is_none()
+                    );
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn discovered_boundary_save_failure_restores_the_previous_name() {
+        with_app(|cx, window| {
+            window
+                .update(cx, |app, _, cx| {
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let project = app.workspace.add_project(Project::new(
+                        "Claude binding",
+                        muxel_store::data_dir().unwrap(),
+                    ));
+                    let mut instance = Instance::shell(project);
+                    let identity = Uuid::new_v4().to_string();
+                    instance.session_id = Some(identity.clone());
+                    instance.auto_name = Some("Previous conversation".into());
+                    let id = instance.id;
+                    let before = serde_json::to_value(&instance).unwrap();
+                    app.workspace.add_instance(instance);
+                    assert!(app.try_persist());
+                    let doc =
+                        muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                    std::fs::remove_file(&doc).unwrap();
+                    std::fs::create_dir(&doc).unwrap();
+
+                    let candidate = || SessionCandidate {
+                        id: identity.clone(),
+                        path: None,
+                    };
+                    let update = app.stage_discovered_session(id, candidate(), true).unwrap();
+                    assert_eq!(app.workspace.instance(id).unwrap().auto_name, None);
+                    assert!(!app.finish_discovered_sessions(vec![update], cx));
+                    assert_eq!(
+                        serde_json::to_value(app.workspace.instance(id).unwrap()).unwrap(),
+                        before
+                    );
+                    std::fs::remove_dir(&doc).unwrap();
+                    let update = app.stage_discovered_session(id, candidate(), true).unwrap();
+                    assert!(app.finish_discovered_sessions(vec![update], cx));
+                    assert_eq!(app.workspace.instance(id).unwrap().auto_name, None);
+                })
+                .unwrap();
+        });
+    }
 }
 
 #[cfg(all(test, windows))]

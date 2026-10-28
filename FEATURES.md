@@ -445,6 +445,9 @@ feature is added or changed, update the matching entry here in the same change**
   activity row still on screen stays uncertain until it goes or a new title
   confirms it.
   A Grok conversation switch releases old loop ownership even if saving fails.
+  A confirmed provider switch clears the previous conversation's automatic name,
+  including a switch back to the same UUID between reads; a transcript path
+  upgrade alone keeps the name.
   Each pane uses its own discovery history, so another pane's refresh cannot
   discard its valid current title.
   The snapshot carries a launch id and
@@ -726,6 +729,8 @@ feature is added or changed, update the matching entry here in the same change**
   file-link and memory instructions use the preset's separate flag/config
   transport when available, and are omitted for TypeIn-only presets.
   The task text is discarded after first launch.
+  Remote tmux owner discovery keeps the task pending until that same launch
+  can prepare its terminal; refused ownership or launch permission cancels it.
   Restart, restore and resume neither re-type nor resubmit it, including launches without a resumable
   conversation. A duplicate of the pane starts without it, and the phone never
   types or submits it. Literal, shell and browser launches refuse prompts with
