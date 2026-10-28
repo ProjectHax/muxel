@@ -11034,13 +11034,41 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Uuid {
-        let project = self.settings.new_project(name, root);
+        // A folder already worked in from elsewhere — a remote project another
+        // machine keeps on this one, or the iOS app — has its panes saved in
+        // `.muxel/workspace.json`, their agents still running in tmux here. It isn't
+        // new: it opens with those panes, and with the shared memory and
+        // accomplishment log its doc records rather than this machine's defaults.
+        let saved = self.use_tmux && Self::folder_has_saved_panes(&root);
+        let project = if saved {
+            Project::new(name, root)
+        } else {
+            self.settings.new_project(name, root)
+        };
         let pid = project.id;
-        let preset = self.current_agent_preset();
-        let instance = Instance::from_preset(pid, &preset);
-
         self.workspace.add_project(project);
         self.workspace.active_project = Some(pid);
+        if saved {
+            // Its first sync, against an empty layout, takes the saved one and
+            // launches its panes, which attach to the sessions still running.
+            self.ensure_project_terminals(pid, window, cx);
+            self.start_new_project_logs(pid, cx);
+            if self.show_file_browser {
+                self.load_file_browser(pid, cx);
+            }
+            if let Some(iid) = self
+                .workspace
+                .project(pid)
+                .and_then(|p| p.preferred_instance())
+            {
+                self.focus_instance(iid, window, cx);
+            }
+            self.persist();
+            cx.notify();
+            return pid;
+        }
+        let preset = self.current_agent_preset();
+        let instance = Instance::from_preset(pid, &preset);
         self.start_new_project_logs(pid, cx);
         // Point the open file browser at the new project right away.
         if self.show_file_browser {
@@ -11061,6 +11089,14 @@ impl MuxelApp {
             cx,
         );
         pid
+    }
+
+    /// Whether `root` has panes saved in its `.muxel/workspace.json` for a project
+    /// at that same root.
+    fn folder_has_saved_panes(root: &std::path::Path) -> bool {
+        integrations::fetch_remote_layout(&integrations::RepoLoc::Local(root.to_path_buf()))
+            .and_then(|json| RemoteLayout::parse(&json, &root.display().to_string()))
+            .is_some_and(|doc| doc.has_panes())
     }
 
     /// Create a project that lives on a remote host (over SSH). `root_path` is set

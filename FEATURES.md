@@ -1404,7 +1404,9 @@ feature is added or changed, update the matching entry here in the same change**
   Panes a peer creates over SSH — the iOS app, or muxel on another machine that
   opened this one as a remote project — show up in the local window within a few
   seconds, attached to the peer's tmux session (found by the pane id at the end of
-  the session name when the peer didn't record one).
+  the session name when the peer didn't record one). Opening a folder that another
+  machine already has as a remote project (or the iOS app works in) brings up its
+  saved panes, attached to their running agents, instead of a fresh pane.
 - **Reconnect on failure** — when a remote project's SSH connection fails (or
   drops), the pane area shows the error with **Reconnect** (re-runs the connect
   pre-flight, re-syncs the layout, respawns panes) and **Scan for projects**

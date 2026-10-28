@@ -1495,6 +1495,15 @@ impl RemoteLayout {
         (doc.version == REMOTE_LAYOUT_VERSION && doc.remote_root == expect_root).then_some(doc)
     }
 
+    /// Whether the doc has any panes. A folder opened as a new project may already
+    /// be worked in from elsewhere — a remote project another machine keeps on this
+    /// one, or the iOS app — and then these are the panes opening it should show.
+    pub fn has_panes(&self) -> bool {
+        self.layout
+            .as_ref()
+            .is_some_and(|layout| layout.first_instance().is_some())
+    }
+
     /// Pretty JSON for storage on the remote.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
@@ -3835,6 +3844,37 @@ mod remote_layout_tests {
         // And a doc captured for it parses back only against that same root.
         assert!(RemoteLayout::parse(&doc.to_json(), "/local/proj").is_some());
         assert!(RemoteLayout::parse(&doc.to_json(), "/other").is_none());
+    }
+
+    #[test]
+    fn a_folder_worked_in_remotely_opens_locally_with_its_panes() {
+        // Another machine's remote project wrote the host's doc for this folder.
+        let mut ws = Workspace::default();
+        let mut remote = remote_project("/srv/app");
+        let pane = Instance::shell(remote.id);
+        remote.layout = Some(PaneNode::leaf(pane.id));
+        remote.layout_updated_at = Some(50);
+        ws.add_instance(pane);
+        ws.projects = vec![remote.clone()];
+        let json = RemoteLayout::capture(&remote, &ws, 60).to_json();
+
+        // Opened locally on the host, the folder's doc is this project's own.
+        let doc = RemoteLayout::parse(&json, "/srv/app").expect("doc for this root");
+        assert!(doc.has_panes());
+        // A project just opened there has no panes and has never synced, so its
+        // first sync takes the doc rather than pushing its empty layout over it.
+        let fresh = Project::new("app", "/srv/app");
+        let local = RemoteLayout::capture(&fresh, &Workspace::default(), 70);
+        assert_eq!(
+            connect_layout_action(&doc, None, &local.content_key(), 0),
+            PeerLayoutAction::Adopt
+        );
+
+        // A doc with no panes left leaves the folder to open with a fresh one.
+        let mut emptied = remote;
+        emptied.layout = None;
+        let json = RemoteLayout::capture(&emptied, &ws, 60).to_json();
+        assert!(!RemoteLayout::parse(&json, "/srv/app").unwrap().has_panes());
     }
 
     #[test]
