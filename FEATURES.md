@@ -351,6 +351,7 @@ feature is added or changed, update the matching entry here in the same change**
   `MUXEL_MEMORY_FILE` env var. Enable it on a project (sidebar right-click or
   Settings → Projects); a memory button on the project row opens the manager. Plain
   shells are skipped.
+  Settings → Projects → **New projects** can turn it on for every project added later.
 - **Self-maintaining memory** — each fact is one `##` section carrying a machine
   meta line (id, dates, tags). muxel maintains the file **on its own**, with or
   without the memory panel open: a section an agent adds is stamped within about a
@@ -387,6 +388,7 @@ feature is added or changed, update the matching entry here in the same change**
   opens a connection by itself). muxel rewrites the file only when something
   actually changes. Works for local and remote SSH projects; local agents also get
   the path in `MUXEL_ACCOMPLISHMENTS_FILE`.
+  Settings → Projects → **New projects** can turn it on for every project added later.
 - **Accomplishments panel** — a check button on the project row opens a docked,
   resizable panel (sharing the file-browser/memory slot) listing the log by day,
   newest first, with colored type tags, per-type totals, search, delete, and a

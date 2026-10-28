@@ -2699,6 +2699,12 @@ pub struct Settings {
     /// older entries are pruned from `.muxel/ACCOMPLISHMENTS.md`.
     #[serde(default = "default_accomplishment_retention_days")]
     pub accomplishment_retention_days: u32,
+    /// Turn shared memory on for every project created from now on.
+    #[serde(default)]
+    pub new_project_memory: bool,
+    /// Turn the accomplishment log on for every project created from now on.
+    #[serde(default)]
+    pub new_project_accomplishments: bool,
 }
 
 fn default_stt_model() -> String {
@@ -3016,7 +3022,20 @@ impl Default for Settings {
             shared_loops: Vec::new(),
             shared_runner_confirmations: Vec::new(),
             accomplishment_retention_days: default_accomplishment_retention_days(),
+            new_project_memory: false,
+            new_project_accomplishments: false,
         }
+    }
+}
+
+impl Settings {
+    /// A project created from now on, with the features these settings turn on
+    /// for new projects.
+    pub fn new_project(&self, name: impl Into<String>, root_path: impl Into<PathBuf>) -> Project {
+        let mut project = Project::new(name, root_path);
+        project.memory_enabled = self.new_project_memory;
+        project.accomplishments_enabled = self.new_project_accomplishments;
+        project
     }
 }
 
@@ -3377,6 +3396,24 @@ mod settings_tests {
         // fills an *absent* field, not an explicitly empty one).
         let s2: Settings = serde_json::from_str(r#"{"snippets": []}"#).expect("parse");
         assert!(s2.snippets.is_empty());
+    }
+
+    #[test]
+    fn new_projects_get_the_features_settings_turn_on_for_them() {
+        // Off for a config from before these settings, so nothing changes on upgrade.
+        let mut s: Settings = serde_json::from_str("{}").expect("parse");
+        let p = s.new_project("app", "/srv/app");
+        assert!(!p.memory_enabled && !p.accomplishments_enabled);
+        assert_eq!(
+            (p.name.as_str(), p.root_path.as_path()),
+            ("app", Path::new("/srv/app"))
+        );
+
+        s.new_project_memory = true;
+        let p = s.new_project("app", "/srv/app");
+        assert!(p.memory_enabled && !p.accomplishments_enabled);
+        s.new_project_accomplishments = true;
+        assert!(s.new_project("app", "/srv/app").accomplishments_enabled);
     }
 
     #[test]

@@ -11034,13 +11034,14 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Uuid {
-        let project = Project::new(name, root);
+        let project = self.settings.new_project(name, root);
         let pid = project.id;
         let preset = self.current_agent_preset();
         let instance = Instance::from_preset(pid, &preset);
 
         self.workspace.add_project(project);
         self.workspace.active_project = Some(pid);
+        self.start_new_project_logs(pid, cx);
         // Point the open file browser at the new project right away.
         if self.show_file_browser {
             self.load_file_browser(pid, cx);
@@ -11073,7 +11074,7 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Uuid {
-        let mut project = Project::new(name, PathBuf::from(&remote_dir));
+        let mut project = self.settings.new_project(name, PathBuf::from(&remote_dir));
         project.remote = Some(RemoteRef {
             host_id,
             remote_root: remote_dir,
@@ -11087,6 +11088,7 @@ impl MuxelApp {
         self.workspace.add_instance(instance);
         self.workspace.add_project(project);
         self.workspace.active_project = Some(pid);
+        self.start_new_project_logs(pid, cx);
         // Point the open file browser at the new project right away.
         if self.show_file_browser {
             self.load_file_browser(pid, cx);
@@ -11098,6 +11100,26 @@ impl MuxelApp {
         self.persist();
         cx.notify();
         pid
+    }
+
+    /// Set up the shared memory and accomplishment log a new project starts with
+    /// (Settings → Projects), the way turning each one on does.
+    fn start_new_project_logs(&mut self, pid: Uuid, cx: &mut Context<Self>) {
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
+        let (memory, accomplishments) = (project.memory_enabled, project.accomplishments_enabled);
+        if memory && self.memory_ensured.insert(pid) {
+            self.ensure_project_memory(pid, cx);
+            self.memory_upkeep.check_soon();
+        }
+        if accomplishments {
+            if self.accomplishments_ensured.insert(pid) {
+                self.ensure_project_accomplishments(pid, cx);
+            }
+            self.accomplishments_checked_at = None;
+            self.accomplishments_generation += 1;
+        }
     }
 
     /// Open the new-remote-project wizard (defaults the host to the first saved).
@@ -32711,8 +32733,36 @@ impl MuxelApp {
                     )),
             );
 
+        // Global: what a project starts with. Existing projects keep their own.
+        let new_projects = v_flex()
+            .gap_1()
+            .child(self.settings_label(&t("New projects"), cx))
+            .child(self.setting_check(
+                "new-project-memory",
+                self.settings.new_project_memory,
+                &t("Turn on shared memory"),
+                cx,
+                |s, on| s.new_project_memory = on,
+            ))
+            .child(self.setting_check(
+                "new-project-accomplishments",
+                self.settings.new_project_accomplishments,
+                &t("Turn on the accomplishment log"),
+                cx,
+                |s, on| s.new_project_accomplishments = on,
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t(
+                        "Applies to projects added from now on. Change an existing project from its menu in the sidebar.",
+                    )),
+            );
+
         v_flex()
             .gap_4()
+            .child(new_projects)
             .child(retention)
             .child(
                 div()
