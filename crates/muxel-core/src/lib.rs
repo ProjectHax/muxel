@@ -1111,6 +1111,13 @@ pub struct Project {
     /// the synced layout doc.
     #[serde(default)]
     pub closed_sessions: Vec<tmux::ClosedSession>,
+    /// [`RemoteLayout::fingerprint`] of the shared layout doc as this machine last
+    /// wrote or adopted it. Remembered across restarts so a connect can tell a doc
+    /// a peer rewrote while this machine was away (adopt it) from one this machine
+    /// has changes on top of (push them) — see [`connect_layout_action`]. Local
+    /// bookkeeping, never part of the synced layout doc.
+    #[serde(default)]
+    pub layout_synced: Option<String>,
 }
 
 /// One agent in a project's saved startup set.
@@ -1139,6 +1146,7 @@ impl Project {
             accomplishments_enabled: false,
             layout_updated_at: None,
             closed_sessions: Vec::new(),
+            layout_synced: None,
         }
     }
 
@@ -1519,6 +1527,18 @@ impl RemoteLayout {
         self.key(true)
     }
 
+    /// A short fingerprint of a [`content_key`](Self::content_key), so a project can
+    /// remember which doc it last synced ([`Project::layout_synced`]) without
+    /// storing the whole layout a second time. FNV-1a rather than DefaultHasher,
+    /// whose output may change with Rust releases and would forget every project's
+    /// sync across an upgrade.
+    pub fn fingerprint(key: &str) -> String {
+        let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        format!("{hash:016x}")
+    }
+
     fn key(&self, edits_only: bool) -> String {
         let instances: Vec<Instance> = self
             .instances
@@ -1594,6 +1614,44 @@ pub fn peer_layout_action(
     } else {
         PeerLayoutAction::Adopt
     }
+}
+
+/// Decide a connect's first sync with the shared file (`remote`) by the live-poll
+/// rule ([`peer_layout_action`]), with the doc this machine last wrote or adopted
+/// known only by its persisted fingerprint, `synced` ([`Project::layout_synced`]).
+///
+/// Without it, a connect could only compare revisions, and a tie went to this
+/// machine. But a peer catching up on session bookkeeping — rebinding a pane's
+/// tmux session, picking up the conversation a pane moved to — pushes without a
+/// new revision (see [`RemoteLayout::edit_key`]). A machine coming back with its
+/// old copy then pushed that copy's stale bookkeeping over the peer's: panes
+/// pointed back at a server their session had left, and at conversations they
+/// had moved on from, which the next restart would resume. Knowing it has changed
+/// nothing since its last sync, this machine adopts the file instead. When the
+/// fingerprint matches neither side (both changed, or a doc from before this was
+/// remembered) the revisions decide, as before.
+pub fn connect_layout_action(
+    remote: &RemoteLayout,
+    synced: Option<&str>,
+    local_key: &str,
+    local_rev: u64,
+) -> PeerLayoutAction {
+    let remote_key = remote.content_key();
+    let known = |key: &str| synced == Some(RemoteLayout::fingerprint(key).as_str());
+    let synced_key = if known(&remote_key) {
+        Some(remote_key.as_str())
+    } else if known(local_key) {
+        Some(local_key)
+    } else {
+        None
+    };
+    peer_layout_action(
+        &remote_key,
+        remote.updated_at,
+        synced_key,
+        local_key,
+        local_rev,
+    )
 }
 
 /// Whether writing this machine's layout over the shared file as it stands now
@@ -3842,6 +3900,57 @@ mod remote_layout_tests {
         // Nothing recorded yet: only a strictly newer peer layout is taken.
         assert_eq!(peer_layout_action("p", 10, None, "b", 9), Adopt);
         assert_eq!(peer_layout_action("p", 8, None, "b", 9), Ignore);
+    }
+
+    /// The bug: a machine back from being away tied with the host file on revision
+    /// (a peer's session bookkeeping never bumps it) and pushed its own stale copy
+    /// over the peer's — panes pointing back at conversations they had left.
+    #[test]
+    fn a_connect_adopts_a_peers_bookkeeping_when_nothing_changed_here() {
+        use PeerLayoutAction::{Adopt, Ignore, InSync};
+        let mut ws = Workspace::default();
+        let mut proj = remote_project("/srv/app");
+        let mut pane = Instance::shell(proj.id);
+        pane.session_id = Some("old-conversation".into());
+        proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: vec![pane.id],
+            active: 0,
+        }));
+        proj.layout_updated_at = Some(100);
+        ws.instances = vec![pane];
+        ws.projects = vec![proj.clone()];
+        let ours = RemoteLayout::capture(&proj, &ws, 100);
+        let ours_key = ours.content_key();
+        let synced = RemoteLayout::fingerprint(&ours_key);
+
+        // A peer moved the pane on to another conversation, same revision.
+        let mut theirs = ours.clone();
+        theirs.instances[0].session_id = Some("new-conversation".into());
+        assert_eq!(theirs.updated_at, 100);
+        let action = |synced: Option<&str>, local: &str, rev| {
+            connect_layout_action(&theirs, synced, local, rev)
+        };
+        assert_eq!(action(Some(&synced), &ours_key, 100), Adopt);
+        // Even when this machine's clock stamped it later: it changed nothing since.
+        assert_eq!(action(Some(&synced), &ours_key, 500), Adopt);
+        // Nothing remembered (a doc from before this existed): revisions decide.
+        assert_eq!(action(None, &ours_key, 100), Ignore);
+
+        // This machine has changes the file was synced before: they are pushed.
+        let theirs_synced = RemoteLayout::fingerprint(&theirs.content_key());
+        assert_eq!(action(Some(&theirs_synced), "edited here", 100), Ignore);
+        // Both sides changed since: the newer revision wins.
+        assert_eq!(action(Some("0000000000000000"), "edited here", 100), Ignore);
+        assert_eq!(action(Some("0000000000000000"), "edited here", 99), Adopt);
+        // Already the same.
+        assert_eq!(action(None, &theirs.content_key(), 1), InSync);
+    }
+
+    #[test]
+    fn a_layout_fingerprint_is_stable_across_builds() {
+        assert_eq!(RemoteLayout::fingerprint(""), "cbf29ce484222325");
+        assert_eq!(RemoteLayout::fingerprint("foobar"), "85944171f73967e8");
     }
 
     #[test]

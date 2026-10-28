@@ -1372,8 +1372,11 @@ feature is added or changed, update the matching entry here in the same change**
   machine restores the whole session (the tmux-backed panes re-attach to their
   still-running agents). muxel pushes the layout as you rearrange panes and, on
   connect, loads whichever copy — local or remote — is newer; the replaced copy is
-  kept as a one-level backup on each side. Automatic for every remote project; no
-  setup required. **Changes sync live**: while connected, each side re-reads the
+  kept as a one-level backup on each side. A machine coming back after changing
+  nothing takes the host's copy whenever it differs from the one it last saw, so
+  its old copy never overwrites what other machines recorded meanwhile — which
+  conversation each pane is in, which tmux server its session runs on. Automatic
+  for every remote project; no setup required. **Changes sync live**: while connected, each side re-reads the
   shared file every few seconds and applies a peer's changes in place — panes a peer
   adds appear, attached to their running tmux sessions; panes it closes go away;
   renames carry over — without restarting any pane both sides share. Only real

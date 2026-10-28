@@ -12432,7 +12432,7 @@ impl MuxelApp {
         ) {
             muxel_core::PeerLayoutAction::Ignore => {}
             muxel_core::PeerLayoutAction::InSync => {
-                self.layout_synced_keys.insert(pid, remote_key);
+                self.remember_layout_synced(pid, remote_key);
             }
             muxel_core::PeerLayoutAction::Adopt => self.adopt_peer_layout(pid, remote, window, cx),
         }
@@ -12570,7 +12570,22 @@ impl MuxelApp {
         }
         self.layout_keys.insert(pid, key);
         self.layout_edit_keys.insert(pid, doc.edit_key());
-        self.layout_synced_keys.insert(pid, remote_key);
+        self.remember_layout_synced(pid, remote_key);
+    }
+
+    /// Record `key` as the shared doc this machine last wrote or adopted for `pid`:
+    /// in memory for the live poll, and by fingerprint in the workspace so the next
+    /// connect can tell a peer's write from this machine's own
+    /// (`muxel_core::connect_layout_action`).
+    fn remember_layout_synced(&mut self, pid: Uuid, key: String) {
+        let fingerprint = RemoteLayout::fingerprint(&key);
+        self.layout_synced_keys.insert(pid, key);
+        if let Some(project) = self.workspace.project_mut(pid)
+            && project.layout_synced.as_deref() != Some(fingerprint.as_str())
+        {
+            project.layout_synced = Some(fingerprint);
+            self.persist();
+        }
     }
 
     /// Bind a local project's terminal panes that a peer created without recording
@@ -17007,7 +17022,7 @@ impl MuxelApp {
                 this.remote_push_inflight.remove(&pid);
                 match res {
                     Ok(Pushed::Written(key, moved)) => {
-                        this.layout_synced_keys.insert(pid, key);
+                        this.remember_layout_synced(pid, key);
                         this.layout_push_failing.remove(&pid);
                         this.take_moves_off_default(pid, &moved, window, cx);
                     }
@@ -17115,6 +17130,8 @@ impl MuxelApp {
         let local_key = local.content_key();
         let local_edit = local.edit_key();
         let local_rev = proj.layout_updated_at.unwrap_or(0);
+        // The doc as this machine last wrote or adopted it, by fingerprint.
+        let synced = proj.layout_synced.clone();
         let remote = fetched
             .as_deref()
             .and_then(|j| RemoteLayout::parse(j, &layout_root));
@@ -17123,19 +17140,32 @@ impl MuxelApp {
         // the field existed says nothing — see below.
         let recorded_memory = remote.as_ref().and_then(|r| r.memory_enabled);
 
-        match remote {
-            // Remote is strictly newer and actually different → adopt it.
-            Some(r) if r.updated_at > local_rev && r.content_key() != local_key => {
+        let action = remote.as_ref().map(|r| {
+            muxel_core::connect_layout_action(r, synced.as_deref(), &local_key, local_rev)
+        });
+        match (remote, action) {
+            // A peer wrote it since this machine last synced, and either nothing
+            // changed here or the peer's change is newer → adopt it.
+            (Some(r), Some(muxel_core::PeerLayoutAction::Adopt)) => {
                 self.pull_remote_layout(pid, local, r, window, cx);
             }
             // Already in sync → just arm change detection.
-            Some(r) if r.content_key() == local_key => {
+            (Some(_), Some(muxel_core::PeerLayoutAction::InSync)) => {
                 self.layout_keys.insert(pid, local_key.clone());
                 self.layout_edit_keys.insert(pid, local_edit);
-                self.layout_synced_keys.insert(pid, local_key);
+                self.remember_layout_synced(pid, local_key);
             }
-            // Local is newer, or there's no usable remote doc → push local up.
-            _ => {
+            // This machine has changes on top of the file (or the newer ones), or
+            // there's no usable remote doc → push local up.
+            (remote, _) => {
+                // A file still as this machine left it is its own last write: the
+                // push must not mistake it for a peer's (`push_overwrites_peer`).
+                if let Some(r) = remote {
+                    let key = r.content_key();
+                    if synced.as_deref() == Some(RemoteLayout::fingerprint(&key).as_str()) {
+                        self.layout_synced_keys.insert(pid, key);
+                    }
+                }
                 self.layout_keys.insert(pid, local_key);
                 self.layout_edit_keys.insert(pid, local_edit);
                 self.remote_push_due.insert(pid, Instant::now());
