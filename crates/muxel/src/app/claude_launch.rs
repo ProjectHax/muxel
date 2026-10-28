@@ -291,8 +291,8 @@ impl MuxelApp {
             // reservation itself performs no hook or transcript filesystem I/O.
             record: Ok(None),
             cwd: instance
-                .worktree_path
-                .clone()
+                .working_directory()
+                .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(|| project.root_path.clone()),
             preset: preset.clone(),
             program: instance.program.clone(),
@@ -589,6 +589,28 @@ mod tests {
         app.presets.push(preset);
         app.current_workspace = Some(Uuid::new_v4());
         id
+    }
+
+    #[test]
+    fn claude_preflight_uses_the_panes_explicit_launch_directory() {
+        with_app(|cx, window| {
+            window
+                .update(cx, |app, window, cx| {
+                    let id = pane(app);
+                    let cwd = muxel_store::data_dir().unwrap().join("claude-ctl-cwd");
+                    std::fs::create_dir_all(&cwd).unwrap();
+                    let instance = app.workspace.instance_mut(id).unwrap();
+                    instance.launch_dir = Some(cwd.clone());
+                    instance.session_started = false;
+                    instance.session_path = None;
+
+                    let prepared = app.prepare_terminal_spawn(id, window, cx).unwrap();
+                    let request = prepared.pending.unwrap().request;
+                    assert_eq!(request.key.cwd, cwd);
+                    assert_eq!(prepared.meta.cwd, cwd.display().to_string());
+                })
+                .unwrap();
+        });
     }
 
     fn run_preparation(
