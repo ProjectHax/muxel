@@ -695,8 +695,8 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Outside control (`muxel ctl`)
 
-- **Let another agent drive muxel** — Settings → Grok Bot → "Allow outside tools
-  to control muxel" (off by default) lets a program on the same computer — an
+- **Let another agent drive muxel** — Settings → Outside control → "Allow outside
+  tools to control muxel" (off by default) lets a program on the same computer — an
   orchestrating agent such as xAI's Grok Bot, a script, another coding agent — work
   the agents running in muxel through the `muxel ctl` command: list projects, the
   pane layout and every agent (program, model, worktree, focus), see each one's
@@ -745,7 +745,7 @@ feature is added or changed, update the matching entry here in the same change**
   compatibility no-op. JSON uses `focus` (default false); the legacy `background`
   field is accepted and ignored. The JSON reply identifies the pane and launch.
   ALL outside creation requires both "Allow outside tools to control muxel" and
-  the separate **Outside terminal creation** policy in Settings → Grok Bot.
+  the separate **Outside terminal creation** policy in Settings → Outside control.
   It defaults to **Off**. **Ask** requires a click for each request; **Allow**
   opens only presets whose program is a known agent provider (the built-in agent
   presets' programs — Claude, Codex, Grok, opencode, Amp, Muse, Hermes, Ollama,
@@ -910,15 +910,16 @@ feature is added or changed, update the matching entry here in the same change**
   trusted. The check goes by process id alone, so if that id has since gone to
   another process, the file still passes. On Linux and macOS that is any process;
   on Windows it is one the user may open, such as one of their own.
-- **Settings → Grok Bot** — a setup page that walks through connecting Grok Bot
-  in four steps: turn on outside control (with a live status: on and listening,
-  starting, or off), allow command execution on this computer in Grok Bot's own
-  settings (where to find it), copy the skill (with a preview of exactly what gets
-  pasted), and **Test**, which runs the same `muxel ctl` command Grok Bot will and
-  shows what muxel answered — or why it couldn't. It also shows this computer's
-  muxel command, with a copy button, and links to Grok Bot's documentation.
-- **Instructions for the other agent** — `muxel ctl skill` (or Settings → Grok Bot
-  → "Copy skill") produces a ready-made skill: the commands, what each status
+- **Settings → Outside control** — a setup page that walks through connecting
+  another agent in four steps: turn on outside control (with a live status: on and
+  listening, starting, or off), let the agent run commands on this computer (with
+  where to allow it in Grok Bot's own settings), copy the skill (with a preview of
+  exactly what gets pasted), and **Test**, which runs the same `muxel ctl` command
+  the agent will and shows what muxel answered — or why it couldn't. It also shows
+  this computer's muxel command, with a copy button, and links to Grok Bot's
+  documentation.
+- **Instructions for the other agent** — `muxel ctl skill` (or Settings → Outside
+  control → "Copy skill") produces a ready-made skill: the commands, what each status
   means, and the rules — one prompt at a time, `wait` after `send`, and permission
   prompts left to the user unless they've said otherwise. Paste it into Grok Bot
   (whose "Execution on Local Computer" setting must allow it to run commands here)

@@ -42,7 +42,7 @@ fn control_program_writable(
         let name = inst.display_name();
         return Err(format!(
             "typing into '{name}' requires command execution permission in Settings > \
-             Grok Bot > \"Also allow typing into shell panes\""
+             Outside control > \"Also allow typing into shell panes\""
         ));
     }
     Ok(())
@@ -334,12 +334,12 @@ impl MuxelApp {
         }
     }
 
-    // --- Settings → Grok Bot --------------------------------------------------------
+    // --- Settings → Outside control ------------------------------------------------
 
-    /// Settings → Grok Bot: setting Grok Bot (or any agent that can run commands
-    /// on this computer) up to drive muxel, step by step — turn outside control on,
-    /// let Grok Bot run commands here, give it the skill, check it works.
-    pub(super) fn render_settings_grok_bot(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Settings → Outside control: setting an agent that can run commands on this
+    /// computer (Grok Bot, …) up to drive muxel, step by step — turn outside control
+    /// on, let the agent run commands here, give it the skill, check it works.
+    pub(super) fn render_settings_outside_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (muted, border, radius) = (theme.muted_foreground, theme.border, theme.radius);
         let (accent, accent_fg) = (theme.primary, theme.primary_foreground);
@@ -421,11 +421,11 @@ impl MuxelApp {
         } else {
             (
                 muted,
-                t("Off. Grok Bot can't reach muxel until this is on."),
+                t("Off. Other agents can't reach muxel until this is on."),
             )
         };
 
-        let test_result = match &self.settings_ui.grok_test {
+        let test_result = match &self.settings_ui.control_test {
             RemoteTestState::Idle => None,
             RemoteTestState::Testing => Some(hint(t("Testing…"))),
             RemoteTestState::Ok(msg) => Some(
@@ -444,9 +444,9 @@ impl MuxelApp {
             ),
         };
 
-        let preview = self.settings_ui.grok_skill_preview.then(|| {
+        let preview = self.settings_ui.control_skill_preview.then(|| {
             div()
-                .id("grok-skill-preview")
+                .id("control-skill-preview")
                 .max_h(px(300.0))
                 .overflow_y_scroll()
                 .p_2()
@@ -463,12 +463,12 @@ impl MuxelApp {
             .gap_3()
             .max_w(px(560.0))
             .child(text(t(
-                "Grok Bot, xAI's agent app, can work with the agents you run in muxel: list your projects and agents, see which are working or waiting on you, read their replies, send them prompts and answer their questions. It does this by running the muxel ctl command on this computer. Set it up in four steps.",
+                "Another agent, such as xAI's Grok Bot, a coding agent or a script, can work with the agents you run in muxel: list your projects and agents, see which are working or waiting on you, read their replies, send them prompts and answer their questions. It does this by running the muxel ctl command on this computer. Set it up in four steps.",
             )))
             .child(
                 step(1, t("Turn on outside control"))
                     .child(check(
-                        Checkbox::new("grok-control")
+                        Checkbox::new("control-enabled")
                             .checked(enabled)
                             .on_click(cx.listener(|this, c: &bool, _w, cx| {
                                 this.set_control_enabled(*c, cx)
@@ -481,7 +481,7 @@ impl MuxelApp {
                         (ctl::CreationPolicy::Ask, t("Ask")),
                         (ctl::CreationPolicy::Allow, t("Allow")),
                     ].into_iter().map(|(policy, label)| {
-                        Button::new(SharedString::from(format!("grok-control-new-{policy:?}")))
+                        Button::new(SharedString::from(format!("control-new-{policy:?}")))
                             .ghost().label(label).selected(self.settings.control_allow_new == policy)
                             .disabled(!enabled)
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -495,7 +495,7 @@ impl MuxelApp {
                         "Off by default, including upgrades. Ask requires a click for each request. Allow opens presets that run a known agent (Claude, Codex, Grok, opencode, Amp, …) from an absolute path or PATH entry without a click; any other program, such as ssh, wsl or python, and any relative path still Asks. Literal commands and shell presets always Ask and also require the shell/command permission below. Approvals expire after 120 seconds. Turning creation or outside control off refuses all pending requests. Outside control off also stops the control server. Existing panes, admitted launches and typing permissions are unchanged. Toolbar creation is unaffected.",
                     )))
                     .child(check(
-                        Checkbox::new("grok-control-shells")
+                        Checkbox::new("control-shells")
                             .checked(self.settings.control_allow_shells)
                             .disabled(!enabled)
                             .on_click(cx.listener(|this, c: &bool, _w, cx| {
@@ -523,15 +523,15 @@ impl MuxelApp {
                     ),
             )
             .child(
-                step(2, t("Let Grok Bot run commands on this computer"))
+                step(2, t("Let the agent run commands on this computer"))
                     .child(text(t(
-                        "Grok Bot works on a cloud computer unless you allow it to run commands on yours. In Grok Bot, open Settings → General → Bot → Execution on Local Computer and choose \"Ask every time\" (you approve each command, which shows exactly what it will run) or \"Always allow\".",
+                        "The agent has to run muxel ctl on this computer, not in a cloud sandbox. Grok Bot, for one, works on a cloud computer unless you allow it to run commands on yours: in Grok Bot, open Settings → General → Bot → Execution on Local Computer and choose \"Ask every time\" (you approve each command, which shows exactly what it will run) or \"Always allow\".",
                     ))),
             )
             .child(
-                step(3, t("Give Grok Bot the muxel skill"))
+                step(3, t("Give the agent the muxel skill"))
                     .child(text(t(
-                        "The skill teaches Grok Bot the muxel commands and the rules for using them: one prompt at a time, wait for the reply, and leave your agents' permission prompts to you unless you've told it otherwise.",
+                        "The skill teaches the agent the muxel commands and the rules for using them: one prompt at a time, wait for the reply, and leave your agents' permission prompts to you unless you've told it otherwise.",
                     )))
                     .child(
                         div()
@@ -540,56 +540,56 @@ impl MuxelApp {
                             .items_center()
                             .gap_2()
                             .child(
-                                Button::new("grok-copy-skill")
+                                Button::new("control-copy-skill")
                                     .primary()
                                     .icon(IconName::Copy)
                                     .label(t("Copy skill"))
-                                    .on_click(cx.listener(|this, _e, _w, cx| this.copy_grok_skill(cx))),
+                                    .on_click(cx.listener(|this, _e, _w, cx| this.copy_control_skill(cx))),
                             )
                             .child(
-                                Button::new("grok-preview-skill")
+                                Button::new("control-preview-skill")
                                     .ghost()
-                                    .label(if self.settings_ui.grok_skill_preview {
+                                    .label(if self.settings_ui.control_skill_preview {
                                         t("Hide skill")
                                     } else {
                                         t("Show skill")
                                     })
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.settings_ui.grok_skill_preview =
-                                            !this.settings_ui.grok_skill_preview;
+                                        this.settings_ui.control_skill_preview =
+                                            !this.settings_ui.control_skill_preview;
                                         cx.notify();
                                     })),
                             )
-                            .children(self.settings_ui.grok_skill_copied.then(|| {
+                            .children(self.settings_ui.control_skill_copied.then(|| {
                                 div()
                                     .text_xs()
                                     .text_color(success)
-                                    .child(t("✓ Copied. Paste it into Grok Bot."))
+                                    .child(t("✓ Copied. Paste it into the agent."))
                             })),
                     )
                     .child(hint(t(
-                        "In Grok Bot, add a new skill and paste this in. Grok Bot's skills are shared by all your Bots, and one copy works on every computer you run muxel on: it tells Grok Bot how to find muxel on each one.",
+                        "Add it to the agent as a skill, or to its instructions. One copy works on every computer you run muxel on: it tells the agent how to find muxel on each one. In Grok Bot, add a new skill; its skills are shared by all your Bots.",
                     )))
                     .children(preview),
             )
             .child(
                 step(4, t("Check it works"))
                     .child(text(t(
-                        "Test runs the same command Grok Bot will, and reports what muxel answered.",
+                        "Test runs the same command the agent will, and reports what muxel answered.",
                     )))
                     .child(
                         div().flex().items_center().gap_2().child(
-                            Button::new("grok-test")
+                            Button::new("control-test")
                                 .ghost()
                                 .icon(IconName::Play)
                                 .label(t("Test"))
                                 .disabled(!listening)
-                                .on_click(cx.listener(|this, _e, _w, cx| this.run_grok_test(cx))),
+                                .on_click(cx.listener(|this, _e, _w, cx| this.run_control_test(cx))),
                         ),
                     )
                     .children(test_result)
                     .child(hint(t(
-                        "Then ask Grok Bot something like \"Which of my muxel agents are waiting on me?\"",
+                        "Then ask the agent something like \"Which of my muxel agents are waiting on me?\"",
                     ))),
             )
             .child(self.settings_label(&t("The muxel command on this computer"), cx))
@@ -610,7 +610,7 @@ impl MuxelApp {
                             .child(format!("{} ctl", muxel_core::ssh::sh_quote(&exe))),
                     )
                     .child(
-                        Button::new("grok-copy-exe")
+                        Button::new("control-copy-exe")
                             .ghost()
                             .small()
                             .icon(IconName::Copy)
@@ -623,7 +623,7 @@ impl MuxelApp {
             )
             .child(
                 div().flex().child(
-                    Button::new("grok-docs")
+                    Button::new("control-grok-docs")
                         .ghost()
                         .small()
                         .icon(IconName::ExternalLink)
@@ -636,17 +636,17 @@ impl MuxelApp {
             .into_any_element()
     }
 
-    fn copy_grok_skill(&mut self, cx: &mut Context<Self>) {
+    fn copy_control_skill(&mut self, cx: &mut Context<Self>) {
         let skill = ctl::skill(&crate::control::exe_path());
         cx.write_to_clipboard(ClipboardItem::new_string(skill));
-        self.settings_ui.grok_skill_copied = true;
+        self.settings_ui.control_skill_copied = true;
         cx.notify();
     }
 
-    /// Settings → Grok Bot → Test: run this muxel's own `muxel ctl projects`, as
-    /// Grok Bot will, and show what came back.
-    fn run_grok_test(&mut self, cx: &mut Context<Self>) {
-        self.settings_ui.grok_test = RemoteTestState::Testing;
+    /// Settings → Outside control → Test: run this muxel's own `muxel ctl projects`,
+    /// as the agent will, and show what came back.
+    fn run_control_test(&mut self, cx: &mut Context<Self>) {
+        self.settings_ui.control_test = RemoteTestState::Testing;
         cx.notify();
         let exe = crate::control::exe_path();
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
@@ -661,8 +661,8 @@ impl MuxelApp {
                     let reply: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
                     match reply["projects"].as_array() {
                         Some(projects) => RemoteTestState::Ok(tn(
-                            "Grok Bot can reach muxel on {host}: it sees {count} project.",
-                            "Grok Bot can reach muxel on {host}: it sees {count} projects.",
+                            "Agents can reach muxel on {host}: it sees {count} project.",
+                            "Agents can reach muxel on {host}: it sees {count} projects.",
                             projects.len(),
                             &[
                                 ("host", reply["host"].as_str().unwrap_or("this computer")),
@@ -681,7 +681,7 @@ impl MuxelApp {
                 }
             };
             let _ = this.update(cx, |app, cx| {
-                app.settings_ui.grok_test = state;
+                app.settings_ui.control_test = state;
                 cx.notify();
             });
         })

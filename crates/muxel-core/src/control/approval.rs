@@ -89,12 +89,14 @@ pub fn creation_refusal(code: ErrorCode) -> Error {
     Error::new(
         code,
         match code {
-            ErrorCode::ControlDisabled => "outside control is disabled in Settings > Grok Bot",
+            ErrorCode::ControlDisabled => {
+                "outside control is disabled in Settings > Outside control"
+            }
             ErrorCode::CreationDisabled => {
-                "outside terminal creation is Off; choose Ask or Allow in Settings > Grok Bot > Outside terminal creation"
+                "outside terminal creation is Off; choose Ask or Allow in Settings > Outside control > Outside terminal creation"
             }
             ErrorCode::CommandPermissionRequired => {
-                "opening shell panes or running literal commands requires Settings > Grok Bot > \"Also allow typing into shell panes\"; commands run as the host muxel process, outside the caller's sandbox"
+                "opening shell panes or running literal commands requires Settings > Outside control > \"Also allow typing into shell panes\"; commands run as the host muxel process, outside the caller's sandbox"
             }
             ErrorCode::ApprovalDenied => "terminal creation was denied in muxel",
             ErrorCode::ApprovalTimeout => "terminal creation approval expired after 120 seconds",
