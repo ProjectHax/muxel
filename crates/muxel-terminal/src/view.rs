@@ -699,9 +699,9 @@ impl RuntimeStatusState {
 
         if program_root.is_none()
             && let Some(deadline) = fallback_status_deadline(now, idle, status, activity_fallback)
-            .into_iter()
-            .chain(settle_deadline)
-            .min()
+                .into_iter()
+                .chain(settle_deadline)
+                .min()
         {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
@@ -7460,6 +7460,58 @@ mod provider_switch_tests {
             Instant::now(),
         );
         assert_eq!(runtime.reason, TerminalStatusReason::ProcessExit);
+        session.kill();
+    }
+
+    #[test]
+    fn program_status_overrides_muse_hooks_until_clear() {
+        use muxel_core::muse::MuseState;
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        runtime.muse_hook_state = Some(MuseState::Blocked);
+        session.test_program_status(b"\x1b]7501;state=working\x07");
+        runtime.reconcile(
+            &session,
+            TitleProvider::Muse,
+            &[],
+            &[],
+            false,
+            Instant::now(),
+        );
+        assert_eq!(runtime.status, AgentStatus::Working);
+        assert_eq!(runtime.reason, TerminalStatusReason::ProgramStatus(None));
+        session.test_program_status(b"\x1b]7501;state=clear\x07");
+        runtime.reconcile(
+            &session,
+            TitleProvider::Muse,
+            &[],
+            &[],
+            false,
+            Instant::now(),
+        );
+        assert_eq!(runtime.status, AgentStatus::Blocked);
+        assert_eq!(runtime.reason, TerminalStatusReason::ProviderHook);
+        session.kill();
+    }
+
+    #[test]
+    fn a_current_muse_hook_survives_silent_title_retirement() {
+        use muxel_core::muse::MuseState;
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Muse);
+        viewer.runtime.muse_cwd_label = Some("repo".into());
+        session.process_output("\x1b]0;\u{280b} repo\x07".as_bytes());
+        assert_eq!(viewer.sample(&session).0, AgentStatus::Working);
+        let hook = SystemTime::now();
+        session.provider_switched_at(hook, hook, hook);
+        let switched_at = viewer.clock;
+        viewer.sample_at(&session, switched_at);
+        viewer.runtime.muse_hook_state = Some(MuseState::Blocked);
+        session.set_idle_for_test(Duration::from_secs(6));
+        let (snapshot, _) = viewer.sample_at(&session, switched_at + Duration::from_secs(6));
+        assert_eq!(snapshot.status, AgentStatus::Blocked);
+        assert_eq!(snapshot.reason, TerminalStatusReason::ProviderHook);
+        assert!(snapshot.attributable);
         session.kill();
     }
 
