@@ -54,6 +54,27 @@ impl CloseGroup {
     }
 }
 
+/// The close evidence behind an agent's status badge. A program's own report
+/// is provider-owned, like a hook; `decide` still treats only an Idle or Done
+/// report as quiet. An error report ends the turn without saying the program
+/// is idle, so it asks.
+fn reason_close_evidence(reason: TerminalStatusReason) -> CloseEvidence {
+    match reason {
+        TerminalStatusReason::ProcessExit => CloseEvidence::Process,
+        TerminalStatusReason::ProgramStatus(_) => CloseEvidence::Program,
+        TerminalStatusReason::ProgramStatusError => CloseEvidence::Quiet,
+        TerminalStatusReason::ProviderHook => CloseEvidence::Hook,
+        TerminalStatusReason::ProviderTitle => CloseEvidence::Title,
+        TerminalStatusReason::ProviderScreen => CloseEvidence::Screen,
+        TerminalStatusReason::BlockedMarker | TerminalStatusReason::WorkingMarker => {
+            CloseEvidence::Output
+        }
+        TerminalStatusReason::Bell => CloseEvidence::Bell,
+        TerminalStatusReason::RecentOutput => CloseEvidence::Output,
+        TerminalStatusReason::Quiet => CloseEvidence::Quiet,
+    }
+}
+
 pub(super) struct ClientCount {
     target: SessionTarget,
     count: Option<usize>,
@@ -133,18 +154,7 @@ impl MuxelApp {
             } else if !attributable {
                 CloseEvidence::Settling
             } else {
-                match view.runtime_snapshot().reason {
-                    TerminalStatusReason::ProcessExit => CloseEvidence::Process,
-                    TerminalStatusReason::ProviderHook => CloseEvidence::Hook,
-                    TerminalStatusReason::ProviderTitle => CloseEvidence::Title,
-                    TerminalStatusReason::ProviderScreen => CloseEvidence::Screen,
-                    TerminalStatusReason::BlockedMarker | TerminalStatusReason::WorkingMarker => {
-                        CloseEvidence::Output
-                    }
-                    TerminalStatusReason::Bell => CloseEvidence::Bell,
-                    TerminalStatusReason::RecentOutput => CloseEvidence::Output,
-                    TerminalStatusReason::Quiet => CloseEvidence::Quiet,
-                }
+                reason_close_evidence(view.runtime_snapshot().reason)
             }
         } else {
             CloseEvidence::Settling
@@ -178,7 +188,7 @@ impl MuxelApp {
             launch_id: view.map(|view| view.session().id),
             binding_rev: view.map_or(0, |view| view.session().binding_revision()),
             input_rev: view.map_or(0, |view| view.session().input_rev()),
-            completion_rev: view.map_or(0, TerminalView::completion_revision),
+            completion_rev: view.map_or(0, TerminalView::launch_completion_revision),
         }
     }
 
@@ -1240,5 +1250,55 @@ impl MuxelApp {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reason_close_evidence;
+    use muxel_core::control::AgentState;
+    use muxel_core::recoverable_close::{CloseDecision, CloseFacts, decide};
+    use muxel_terminal::{ProgramStatusKind, TerminalStatusReason};
+
+    fn facts(status: AgentState, reason: TerminalStatusReason) -> CloseFacts {
+        CloseFacts {
+            status,
+            evidence: reason_close_evidence(reason),
+            attributable: true,
+            awaiting_reply: false,
+            another_tmux_client: false,
+            session_may_outlive: true,
+            launch_id: None,
+            binding_rev: 0,
+            input_rev: 0,
+            completion_rev: 0,
+        }
+    }
+
+    #[test]
+    fn program_reports_are_quiet_only_when_idle_or_done() {
+        let report = TerminalStatusReason::ProgramStatus(None);
+        for status in [AgentState::Idle, AgentState::Done] {
+            assert_eq!(
+                decide(facts(status, report), true),
+                CloseDecision::Hold { forced: false },
+                "{status:?}"
+            );
+        }
+        let blocked = TerminalStatusReason::ProgramStatus(Some(ProgramStatusKind::Question));
+        for (status, reason) in [
+            (AgentState::Working, report),
+            (AgentState::Blocked, blocked),
+        ] {
+            assert_eq!(decide(facts(status, reason), true), CloseDecision::Ask);
+        }
+        // An error report shows Done, but it is no proof the program is idle.
+        assert_eq!(
+            decide(
+                facts(AgentState::Done, TerminalStatusReason::ProgramStatusError),
+                true
+            ),
+            CloseDecision::Ask
+        );
     }
 }
