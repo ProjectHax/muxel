@@ -430,10 +430,13 @@ feature is added or changed, update the matching entry here in the same change**
   supplying lifecycle status; a title in the current root report takes precedence.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
-  icon, dashboard, and notification dots. Screen checks skip Claude's input box,
-  so a typed or pasted draft can't set a Claude pane's status. Grok's unanswered
-  question card reports **blocked** in a pane without a tmux status bar. A
-  marker-based agent whose turn finishes
+  icon, dashboard, and notification dots. Screen checks, markers included, skip
+  Claude's input box, so a typed or pasted draft doesn't set a Claude pane's
+  status, while permission forms and hints outside the box still do. A draft can
+  still count, as before, where muxel can't pick out the box whole: a rule drawn
+  below it, a draft line that lands on the box's edge, or bash mode's `!` prompt.
+  Grok's unanswered question card reports **blocked** in a pane without a tmux
+  status bar. A marker-based agent whose turn finishes
   is held at **done** until the agent works again — even if it never rang the bell —
   and that completion survives a muxel restart. Focusing the pane marks its
   notification read without rewriting lifecycle state or age. Sidebar badges include
@@ -456,9 +459,9 @@ feature is added or changed, update the matching entry here in the same change**
   transition. Remote Codex panes retain the provider's structural title fallback.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
-  defaults per agent and **editable working/blocked markers per preset**. Claude's
-  built-in lists give way to its own status-row and permission-form parsers; an
-  edited list matches as written.
+  defaults per agent and **editable working/blocked markers per preset**. On a
+  Claude pane, built-in and edited lists alike match outside its input box,
+  alongside Claude's own status-row and permission-form parsers.
 - **Heuristic fallback** — agents without markers fall back to bell + output
   activity. They reach **done** only from the bell or process exit, never from a
   quiet spell — so an incidental redraw (e.g. a focus repaint when you click the

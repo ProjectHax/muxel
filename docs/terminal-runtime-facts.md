@@ -30,15 +30,20 @@ pass for an edge. Status recognition may locate the box while a repaint hides or
 moves the cursor; this does not authorize startup input, whose stricter cursor
 guards are unchanged. A real dialog without a box keeps the full screen.
 
-When a Claude pane's marker list is exactly the built-in one (`esc to interrupt`
-for working; `❯ 1.` and `Do you want to proceed` for blocked), Claude's strict
-permission and live-work parsers replace it. A stored preset can't tell the
-seeded list from the same list typed in, so that list counts as the built-in.
-Any other list is the user's own and matches as written outside the input box,
-including strings the built-in list also has. Grok's unanswered question card
-reports Blocked while its title still says Working, when the card's footer is
-the screen's last row. Under a tmux status bar the card isn't read and the
-title's Working stands.
+Claude's marker lists, built-in (`esc to interrupt` for working; `❯ 1.` and
+`Do you want to proceed` for blocked) or edited, match against that same
+context, beside its strict permission and live-work parsers. A draft can't
+supply a marker, while chrome outside the box still does: a permission form's
+`❯ 1.` choice row, or the `esc to interrupt` footer below the box in a tmux
+pane, which never sees Claude's title. A form replaces the box below a rule
+and opens with its title or question, so it doesn't pass for the box. Text
+outside the box matches as written, a reply quoting a marker included. A draft
+still counts, as it did before, where the box isn't found whole: when a rule
+row sits below the box (a statusLine separator), when a draft row at column 0
+reproduces the box's edge, or in bash mode, whose prompt is `!` rather than
+`❯`. Grok's unanswered question card reports Blocked while its title still says
+Working, when the card's footer is the screen's last row. Under a tmux status
+bar the card isn't read and the title's Working stands.
 
 ## Snapshot fields
 

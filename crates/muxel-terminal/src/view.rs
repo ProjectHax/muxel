@@ -492,18 +492,8 @@ impl RuntimeStatusState {
                 self.last_screen_capture = Some(now);
                 let captured = session.startup_screen();
                 let screen = status_screen_context(title_provider, &captured);
-                self.working_marker = status_marker_matches(
-                    title_provider,
-                    working_markers,
-                    CLAUDE_WORKING_MARKERS,
-                    &screen,
-                );
-                self.blocked_marker = status_marker_matches(
-                    title_provider,
-                    blocked_markers,
-                    CLAUDE_BLOCKED_MARKERS,
-                    &screen,
-                );
+                self.working_marker = working_markers.iter().any(|marker| screen.contains(marker));
+                self.blocked_marker = blocked_markers.iter().any(|marker| screen.contains(marker));
                 self.provider_screen = provider_screen_status(title_provider, &screen);
             }
             StatusScreenCapture::At(deadline) => next_deadline = Some(deadline),
@@ -1109,12 +1099,10 @@ fn sticky_title_status(
     observed.or(previous)
 }
 
-/// Claude's built-in marker lists, as the app's `default_markers` supplies them
-/// and the seeded Claude preset stores its working list.
-const CLAUDE_WORKING_MARKERS: &[&str] = &["esc to interrupt"];
-const CLAUDE_BLOCKED_MARKERS: &[&str] = &["❯ 1.", "Do you want to proceed"];
-
-/// Leave Claude's input box out of every screen-based status source.
+/// Leave Claude's input box out of every screen-based status source, markers
+/// included, so a draft can't set status. Chrome outside the box still counts:
+/// a permission form's `❯ 1.` row, or the `esc to interrupt` footer below the
+/// box in a tmux pane, which never sees Claude's title.
 fn status_screen_context(provider: TitleProvider, screen: &crate::startup::Screen) -> Cow<'_, str> {
     if provider == TitleProvider::Claude
         && let Some(context) = screen.claude_status_context()
@@ -1122,27 +1110,6 @@ fn status_screen_context(provider: TitleProvider, screen: &crate::startup::Scree
         return Cow::Owned(context);
     }
     Cow::Borrowed(&screen.text)
-}
-
-/// Claude's strict UI parsers replace its built-in marker list: quoted prose is
-/// not chrome. Any other list is the user's own and matches as written, even
-/// where it repeats a built-in string. A stored preset can't tell the seeded
-/// list from the same list typed in, so an exact copy counts as the built-in.
-fn status_marker_matches(
-    provider: TitleProvider,
-    markers: &[String],
-    builtin: &[&str],
-    screen: &str,
-) -> bool {
-    let is_builtin = provider == TitleProvider::Claude
-        && markers
-            .iter()
-            .map(String::as_str)
-            .eq(builtin.iter().copied());
-    !is_builtin
-        && markers
-            .iter()
-            .any(|marker| screen.contains(marker.as_str()))
 }
 
 /// Provider-owned visible UI that adds state not carried by the terminal title.
@@ -7794,7 +7761,7 @@ mod provider_switch_tests {
 
         #[test]
         fn quoted_permission_question_in_prompt_is_not_blocked() {
-            let text = "Reply quoted: Do you want to proceed?\n────────────\n❯ Explain the phrase Do you want to proceed\n────────────\n? for shortcuts";
+            let text = "Earlier output\n────────────\n❯ Explain the phrase Do you want to proceed\n────────────\n? for shortcuts";
             assert_eq!(claude_sample(text, 2, 43), AgentStatus::Idle);
         }
 
@@ -7816,10 +7783,7 @@ mod provider_switch_tests {
         #[test]
         fn hidden_composer_cannot_supply_status_or_authorize_input() {
             use crate::startup::Screen;
-            use crate::view::{
-                CLAUDE_BLOCKED_MARKERS, provider_screen_status, status_marker_matches,
-                status_screen_context,
-            };
+            use crate::view::{provider_screen_status, status_screen_context};
             let screen = Screen {
                 text: "Previous output\n────────────\n❯ Do you want to proceed?\n  1. Yes\n  3. No\n  Esc to cancel\n────────────\n? for shortcuts".to_string(),
                 cursor_row: 5,
@@ -7833,38 +7797,29 @@ mod provider_switch_tests {
                 provider_screen_status(TitleProvider::Claude, &context),
                 None
             );
-            assert!(!status_marker_matches(
-                TitleProvider::Claude,
-                &markers(&["Esc to cancel"]),
-                CLAUDE_BLOCKED_MARKERS,
-                &context
-            ));
+            assert!(!context.contains("Esc to cancel"));
             assert!(screen.claude_composer_context(false).is_none());
         }
 
         #[test]
-        fn claude_builtin_marker_in_a_reply_is_not_activity() {
-            let text = "The quoted phrase is esc to interrupt\n────────────\n❯ Explain that phrase\n────────────\n? for shortcuts";
-            assert_eq!(claude_sample(text, 2, 20), AgentStatus::Idle);
-        }
-
-        #[test]
-        fn custom_markers_match_as_written_outside_the_input_box() {
-            // Any list but the built-in one is the user's own, even where it
-            // repeats a built-in string.
+        fn markers_match_as_written_outside_the_input_box() {
+            // Built-in and edited lists alike match anywhere but the input
+            // box, so a reply quoting one counts, as on master.
             let reply = "The quoted phrase is esc to interrupt\n────────────\n❯ Explain that phrase\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(reply, 2, 20), AgentStatus::Working);
             let busy = markers(&["esc to interrupt", "custom busy"]);
             assert_eq!(
                 claude_sample_with(reply, (2, 20), &busy, &[]),
                 AgentStatus::Working
             );
             let quoted = "Reply quoted: Do you want to proceed?\n────────────\n❯ Explain the phrase\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(quoted, 2, 20), AgentStatus::Blocked);
             let asking = markers(&["Do you want to proceed"]);
             assert_eq!(
                 claude_sample_with(quoted, (2, 20), &[], &asking),
                 AgentStatus::Blocked
             );
-            // Inside the input box the user's own marker still doesn't match.
+            // Inside the input box the user's own marker doesn't match either.
             let draft =
                 "Earlier output\n────────────\n❯ custom busy\n────────────\n? for shortcuts";
             assert_eq!(
@@ -7999,12 +7954,271 @@ mod provider_switch_tests {
         fixture_test!(grok_working_fixture, "grok", "working", Working);
         fixture_test!(grok_blocked_fixture, "grok", "blocked", Blocked);
         fixture_test!(grok_done_fixture, "grok", "done", Done);
+
+        /// Probe screens for Claude 2.1.312 in the 80×24 `fixture` pane, laid
+        /// out like the AskUserQuestion capture: a dialog replaces the input
+        /// box under a full-width rule. Dialog strings are as the CLI composes
+        /// them; the file name, command and host are placeholders.
+        const HEADER: &str = "\n ▐▛███▛█   Claude Code v2.1.312\n▝▜██████▀  Sonnet 5.5 · Claude Team\n ▝▝   ▝▝   [project]\n\n❯ Update the parser, then check its docs.\n";
+        const TMUX_BAR: &str =
+            "[0] 0:claude*                                        \"host\" 14:32 29-Oct-26";
+        const IDLE_FOOTER: &str = "  ? for shortcuts";
+        const BUSY_FOOTER: &str = "  ⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt";
+
+        fn rule() -> String {
+            "─".repeat(80)
+        }
+
+        fn input_box(draft: &str, footer: &str) -> String {
+            let rule = rule();
+            format!("{rule}\n❯ {draft}\n{rule}\n{footer}")
+        }
+
+        fn idle_screen(draft: &str) -> String {
+            format!("{HEADER}\n{}", input_box(draft, IDLE_FOOTER))
+        }
+
+        fn working_screen(spinner: &str, draft: &str) -> String {
+            format!(
+                "{HEADER}\n{spinner} Scheming… (3s · ↑ 1.2k tokens)\n\n{}",
+                input_box(draft, BUSY_FOOTER)
+            )
+        }
+
+        fn finished_screen(draft: &str) -> String {
+            format!(
+                "{HEADER}\n● Done.\n\n✻ Baked for 4s · done 6:51 AM\n\n{}",
+                input_box(draft, IDLE_FOOTER)
+            )
+        }
+
+        fn dialog_screen(dialog: &str) -> String {
+            format!("{HEADER}\n● Update(src/parser.rs)\n\n{}\n{dialog}", rule())
+        }
+
+        /// Each Claude 2.1.312 dialog that shows numbered choices, by name.
+        fn dialogs() -> Vec<(&'static str, String)> {
+            let dashed = "╌".repeat(80);
+            let edit = |question: &str| {
+                format!(
+                    " Edit file\n src/parser.rs\n{dashed}\n 12 -    let value = parse(input);\n 12 +    let value = parse(input)?;\n{dashed}\n {question}\n ❯ 1. Yes\n   2. Yes, allow all edits during this session (shift+tab)\n   3. No\n\n Esc to cancel · Tab to amend"
+                )
+            };
+            vec![
+                ("edit", edit("Do you want to make this edit to parser.rs?")),
+                ("create", edit("Do you want to create parser.rs?")),
+                ("overwrite", edit("Do you want to overwrite parser.rs?")),
+                ("write", edit("Do you want to write to parser.rs?")),
+                (
+                    "fetch",
+                    " Fetch\n\n   https://example.com/docs\n   Claude wants to fetch content from example.com\n\n Do you want to allow Claude to fetch this content?\n ❯ 1. Yes\n   2. Yes, and don't ask again for example.com\n   3. No, and tell Claude what to do differently (esc)\n\n Esc to cancel".to_string(),
+                ),
+                (
+                    "plan",
+                    " Ready to code?\n\n Here is Claude's plan:\n ╭────────────────────────────────╮\n │ 1. Fix the parser's error path │\n ╰────────────────────────────────╯\n\n Claude has written up a plan and is ready to execute. Would you like to\n proceed?\n\n ❯ 1. Yes, and auto-accept edits\n   2. Yes, and manually approve edits\n   3. No, keep planning".to_string(),
+                ),
+                (
+                    "network",
+                    " Network request\n\n   Host: registry.example.com\n\n Do you want to allow this connection?\n ❯ 1. Yes\n   2. Yes, and don't ask again for registry.example.com\n   3. No\n\n Esc to cancel".to_string(),
+                ),
+                (
+                    "bash",
+                    " Bash command\n\n   cargo test --workspace\n   Run the test suite\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again for cargo test commands in [project]\n   3. No, and tell Claude what to do differently (esc)\n\n Esc to cancel · Tab to amend · ctrl+e to explain".to_string(),
+                ),
+                // A narrow pane wraps the question card's hint, which then
+                // misses the strict parser; its choice row still counts.
+                (
+                    "narrow question",
+                    format!(
+                        " ☐ Parser\n\n Which fix do you want?\n\n ❯ 1. Return an error\n   2. Fall back to the default\n   3. Type something.\n{}\n   4. Chat about this\n\n Enter to select · ↑/↓ to\n navigate · Esc to cancel",
+                        rule()
+                    ),
+                ),
+            ]
+        }
+
+        /// Draw one screen with Claude's paste mode on: the cursor sits in the
+        /// input box when there is one and is hidden otherwise. `None` sends no
+        /// title, as in a tmux pane.
+        fn draw(session: &crate::session::TerminalSession, title: Option<&str>, screen: &str) {
+            let mut wire = "\x1b[2J\x1b[H".to_string();
+            if let Some(title) = title {
+                wire.push_str(&format!("\x1b]0;{title}\x07"));
+            }
+            wire.push_str("\x1b[?2004h");
+            let rows: Vec<_> = screen.lines().collect();
+            for (row, line) in rows.iter().enumerate() {
+                wire.push_str(&format!("\x1b[{};1H{line}", row + 1));
+            }
+            let composer = (1..rows.len())
+                .rev()
+                .find(|&row| rows[row].starts_with("❯ ") && rows[row - 1] == rule());
+            wire.push_str(&match composer {
+                Some(row) => format!("\x1b[{};3H\x1b[?25h", row + 1),
+                None => "\x1b[H\x1b[?25l".to_string(),
+            });
+            session.process_output(wire.as_bytes());
+        }
+
+        /// Reconcile each `(title, screen)` step 100 ms apart with Claude's
+        /// built-in markers, submitting the turn after the first step as its
+        /// Enter would. Returns each step's status.
+        fn probe(steps: &[(Option<&str>, String)]) -> Vec<AgentStatus> {
+            use std::time::Duration;
+            let (working, blocked) = builtin();
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let mut seen = Vec::new();
+            for (index, (title, screen)) in steps.iter().enumerate() {
+                if index == 1 {
+                    session.mark_turn_submitted();
+                }
+                draw(&session, *title, screen);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    start + Duration::from_millis(100 * index as u64),
+                );
+                seen.push(runtime.snapshot(&session).status);
+            }
+            session.kill();
+            seen
+        }
+
+        #[test]
+        fn every_numbered_permission_dialog_reads_blocked() {
+            use crate::view::status_screen_context;
+            for (name, dialog) in dialogs() {
+                let screen = dialog_screen(&dialog);
+                // No dialog passes for the input box: its choice row is kept.
+                let (session, _receiver) = fixture();
+                draw(&session, None, &screen);
+                let captured = session.startup_screen();
+                assert!(
+                    status_screen_context(TitleProvider::Claude, &captured).contains("❯ 1. "),
+                    "{name}"
+                );
+                session.kill();
+                // Claude can leave an idle-shaped title up behind the form,
+                // where missing its `❯ 1.` row would latch a false Done.
+                for title in ["✳ Update parser", "◑ Update parser"] {
+                    assert_eq!(
+                        probe(&[
+                            (Some("✳ Claude Code"), idle_screen("")),
+                            (Some("◑ Update parser"), working_screen("✶", "")),
+                            (Some(title), screen.clone()),
+                        ]),
+                        [
+                            AgentStatus::Idle,
+                            AgentStatus::Working,
+                            AgentStatus::Blocked
+                        ],
+                        "{name} under {title}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn visible_dialog_beats_a_working_program_report() {
+            // A Working report can miss the form Claude waits on, as #110
+            // allows; the form on screen still beats it.
+            use super::TerminalStatusReason;
+            let (working, blocked) = builtin();
+            for (name, dialog) in dialogs() {
+                let (session, _receiver) = fixture();
+                let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+                draw(&session, Some("◑ Update parser"), &dialog_screen(&dialog));
+                session.test_program_status(b"\x1b]7501;state=working\x07");
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    Instant::now(),
+                );
+                let snapshot = runtime.snapshot(&session);
+                assert_eq!(
+                    snapshot.coverage,
+                    TerminalStatusCoverage::ProgramStatus,
+                    "{name}"
+                );
+                assert_eq!(snapshot.status, AgentStatus::Blocked, "{name}");
+                // Only the Bash form also passes the strict parser.
+                let reason = if name == "bash" {
+                    TerminalStatusReason::ProviderScreen
+                } else {
+                    TerminalStatusReason::BlockedMarker
+                };
+                assert_eq!(snapshot.reason, reason, "{name}");
+                assert!(snapshot.attributable, "{name}");
+                session.kill();
+            }
+        }
+
+        #[test]
+        fn interrupt_footer_keeps_every_spinner_frame_working_without_a_title() {
+            // A tmux client forwards no title, so the footer below the input
+            // box is the Working evidence for frames the strict row parser
+            // doesn't know.
+            let tmux = |screen: String| (None, format!("{screen}\n{TMUX_BAR}"));
+            let mut steps = vec![tmux(idle_screen(""))];
+            for spinner in ["✶", "✻", "✽", "·"] {
+                steps.push(tmux(working_screen(spinner, "")));
+            }
+            steps.push(tmux(finished_screen("")));
+            assert_eq!(
+                probe(&steps),
+                [
+                    AgentStatus::Idle,
+                    AgentStatus::Working,
+                    AgentStatus::Working,
+                    AgentStatus::Working,
+                    AgentStatus::Working,
+                    AgentStatus::Done,
+                ]
+            );
+        }
+
+        #[test]
+        fn draft_quoting_a_dialog_cannot_set_blocked() {
+            // The draft stays in the box through a whole turn. With no title,
+            // as in a tmux pane, the footer still carries Working.
+            for draft in [
+                "Do you want to proceed?",
+                "❯ 1. Yes",
+                "Why did it ask Do you want to proceed? ❯ 1. Yes",
+            ] {
+                for title in [Some("✳ Claude Code"), None] {
+                    let bar = if title.is_none() { TMUX_BAR } else { "" };
+                    let working_title = title.map(|_| "◑ Update parser");
+                    assert_eq!(
+                        probe(&[
+                            (title, format!("{}\n{bar}", idle_screen(draft))),
+                            (
+                                working_title,
+                                format!("{}\n{bar}", working_screen("✶", draft))
+                            ),
+                            (title, format!("{}\n{bar}", finished_screen(draft))),
+                        ]),
+                        [AgentStatus::Idle, AgentStatus::Working, AgentStatus::Done],
+                        "{draft:?} under {title:?}"
+                    );
+                }
+            }
+        }
     }
 
-    /// Ryan's #111 review scenarios on Codex 0.164, whose title is a bare
-    /// thread UUID and which has no markers. Its screen is not a status
-    /// source, so each sequence reduces exactly as on master: Idle until the
-    /// bell rings, then Done.
+    /// Codex 0.164 turns, whose title is a bare thread UUID and which has no
+    /// markers: a reasoning header, a queued follow-up, a model footer the
+    /// parser doesn't know, and popups after the turn. Its screen is not a
+    /// status source, so each sequence reduces exactly as on master: Idle
+    /// until the bell rings, then Done.
     mod codex_master_parity_tests {
         use super::{AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TitleProvider};
         use crate::session::{CommandSpec, LaunchBinding, TerminalSession};
