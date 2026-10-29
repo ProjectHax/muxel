@@ -1,5 +1,6 @@
 //! Pure close admission and expiry checks. The app supplies current launch facts.
 
+use crate::TerminalLaunchReason;
 use crate::control::AgentState;
 use uuid::Uuid;
 
@@ -86,11 +87,66 @@ pub fn may_finalize(before: CloseFacts, now: CloseFacts, forced: bool) -> bool {
     forced || before == now && decide(now, true) == CloseDecision::Hold { forced: false }
 }
 
+/// What a held pane's launch was doing when its close began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldLaunch {
+    /// Nothing in flight: the pane kept the process it had.
+    Settled,
+    /// A launch or reattach was starting. The hold dropped its result.
+    Starting(TerminalLaunchReason),
+    /// A restart was queued. Its kill may not have run yet.
+    Restart,
+}
+
+pub fn held_launch(restart_pending: bool, launching: Option<TerminalLaunchReason>) -> HeldLaunch {
+    match (restart_pending, launching) {
+        (true, _) => HeldLaunch::Restart,
+        (false, Some(reason)) => HeldLaunch::Starting(reason),
+        (false, None) => HeldLaunch::Settled,
+    }
+}
+
+/// The held pane's terminal when Undo runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldView {
+    Running,
+    /// Exited, or a launch that failed: the pane shows that as before.
+    Ended,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UndoLaunch {
+    /// Bring the pane back as it is.
+    Resume,
+    /// Run the pane's ordinary launch again. A tmux pane reattaches to its
+    /// session; nothing is killed first.
+    Launch(TerminalLaunchReason),
+    /// Run the restart the hold interrupted, which replaces the session.
+    Restart,
+}
+
+/// Only a restart the user asked for may replace a session on Undo. A launch
+/// or reattach the hold cut short runs again, and never over a live terminal.
+pub fn undo_launch(held: HeldLaunch, view: HeldView) -> UndoLaunch {
+    match (held, view) {
+        (HeldLaunch::Restart, _) => UndoLaunch::Restart,
+        (_, HeldView::Running) => UndoLaunch::Resume,
+        (HeldLaunch::Starting(reason), _) => UndoLaunch::Launch(reason),
+        (HeldLaunch::Settled, HeldView::Missing) => {
+            UndoLaunch::Launch(TerminalLaunchReason::Recovery)
+        }
+        (HeldLaunch::Settled, HeldView::Ended) => UndoLaunch::Resume,
+    }
+}
+
 #[cfg(test)]
 mod recoverable_close_policy_tests {
     use super::{
-        CloseDecision, CloseEvidence, CloseFacts, decide, may_finalize, shell_close_evidence,
+        CloseDecision, CloseEvidence, CloseFacts, HeldLaunch, HeldView, UndoLaunch, decide,
+        held_launch, may_finalize, shell_close_evidence, undo_launch,
     };
+    use crate::TerminalLaunchReason;
     use crate::control::AgentState;
     use uuid::Uuid;
 
@@ -362,6 +418,51 @@ mod recoverable_close_policy_tests {
                 true
             ),
             CloseDecision::Immediate
+        );
+    }
+
+    #[test]
+    fn undo_restarts_only_a_queued_restart() {
+        let reason = TerminalLaunchReason::Recovery;
+        assert_eq!(held_launch(true, Some(reason)), HeldLaunch::Restart);
+        assert_eq!(
+            held_launch(false, Some(reason)),
+            HeldLaunch::Starting(reason)
+        );
+        assert_eq!(held_launch(false, None), HeldLaunch::Settled);
+        for view in [HeldView::Running, HeldView::Ended, HeldView::Missing] {
+            assert_eq!(undo_launch(HeldLaunch::Restart, view), UndoLaunch::Restart);
+        }
+        // A reconnect in flight over the old, exited client, and a restore that
+        // had no terminal yet: both attach again, never restart.
+        for reason in [
+            TerminalLaunchReason::Recovery,
+            TerminalLaunchReason::Restore,
+            TerminalLaunchReason::NewPane,
+        ] {
+            for view in [HeldView::Ended, HeldView::Missing] {
+                assert_eq!(
+                    undo_launch(HeldLaunch::Starting(reason), view),
+                    UndoLaunch::Launch(reason)
+                );
+            }
+            assert_eq!(
+                undo_launch(HeldLaunch::Starting(reason), HeldView::Running),
+                UndoLaunch::Resume,
+                "a live terminal is never replaced"
+            );
+        }
+        assert_eq!(
+            undo_launch(HeldLaunch::Settled, HeldView::Running),
+            UndoLaunch::Resume
+        );
+        assert_eq!(
+            undo_launch(HeldLaunch::Settled, HeldView::Ended),
+            UndoLaunch::Resume
+        );
+        assert_eq!(
+            undo_launch(HeldLaunch::Settled, HeldView::Missing),
+            UndoLaunch::Launch(TerminalLaunchReason::Recovery)
         );
     }
 }

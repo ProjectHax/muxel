@@ -114,7 +114,8 @@ feature is added or changed, update the matching entry here in the same change**
   is cancelled across close and Undo, and hidden panes leave ctl listings;
   writes refuse with `closing` and `undo_until`. A shell counts down only with
   prompt evidence, so local tmux shells on Unix, which can't pass OSC 133
-  through, always ask.
+  through, always ask. Undo reattaches a pane whose launch or reconnect was
+  in flight, and restarts only a pane whose restart was queued.
 - **Resource and worktree close** — dirty editors offer Save / Don't Save /
   Cancel; clean editors, diffs and browsers close immediately. The last pane of
   a muxel worktree with changes or unmerged commits uses its disposal choice

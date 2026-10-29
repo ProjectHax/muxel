@@ -3,7 +3,8 @@
 use super::*;
 use muxel_core::control::AgentState;
 use muxel_core::recoverable_close::{
-    CloseDecision, CloseEvidence, CloseFacts, decide, may_finalize, shell_close_evidence,
+    CloseDecision, CloseEvidence, CloseFacts, HeldLaunch, HeldView, UndoLaunch, decide,
+    held_launch, may_finalize, shell_close_evidence, undo_launch,
 };
 use muxel_terminal::TerminalStatusReason;
 
@@ -20,7 +21,7 @@ pub(super) struct HeldClose {
     pub project: Uuid,
     pub facts: CloseFacts,
     pub forced: bool,
-    pub restart: bool,
+    pub launch: HeldLaunch,
     pub restart_lease: Option<RestartLease>,
 }
 
@@ -341,8 +342,13 @@ impl MuxelApp {
             };
             let pid = inst.project_id;
             let facts = self.close_facts(iid, cx);
-            let restart =
-                self.terminal_restarts.contains(iid) || self.terminal_launching.contains_key(&iid);
+            // An attach in flight is not a restart: Undo attaches again.
+            let launch = held_launch(
+                self.terminal_restarts.contains(iid),
+                self.terminal_launching
+                    .get(&iid)
+                    .map(|ticket| ticket.reason),
+            );
             let restart_lease = self.terminal_restarts.lease(iid);
             group.layouts.entry(pid).or_insert_with(|| {
                 durable
@@ -364,7 +370,7 @@ impl MuxelApp {
                     project: pid,
                     facts,
                     forced,
-                    restart,
+                    launch,
                     restart_lease,
                 },
             );
@@ -515,6 +521,43 @@ impl MuxelApp {
             cx.notify();
             return;
         }
+        let (focus, restored) = self.release_close_group(index, cx);
+        self.show_close_list = false;
+        if let Some(iid) = focus {
+            if let Some(inst) = self.workspace.instance(iid) {
+                self.workspace.active_project = Some(inst.project_id);
+            }
+            self.focus_instance(iid, window, cx);
+        }
+        for (iid, held) in restored {
+            let view = match self.terminal_view(iid) {
+                Some(view) if !view.read(cx).exited() => HeldView::Running,
+                Some(_) => HeldView::Ended,
+                None if self.failed_launches.contains_key(&iid) => HeldView::Ended,
+                None => HeldView::Missing,
+            };
+            match undo_launch(held.launch, view) {
+                UndoLaunch::Resume => {}
+                UndoLaunch::Launch(reason) => {
+                    self.spawn_terminal_for(iid, reason, window, cx);
+                    if focus == Some(iid) {
+                        self.focus_instance(iid, window, cx);
+                    }
+                }
+                UndoLaunch::Restart => self.restart_agent(iid, window, cx),
+            }
+        }
+        self.persist();
+        cx.notify();
+    }
+
+    /// End a group's hold: its panes go back where they were, take input again,
+    /// and are no longer closing. Returns the pane to focus and what each held.
+    fn release_close_group(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> (Option<Uuid>, Vec<(Uuid, HeldClose)>) {
         let group = self.close_groups.remove(index);
         let ids: HashSet<_> = group
             .members
@@ -531,7 +574,7 @@ impl MuxelApp {
                 recoverable_layout::restore_layout(&mut project.layout, original, &ids);
             }
         }
-        let mut restart = Vec::new();
+        let mut restored = Vec::new();
         for iid in group.members {
             if let Some(held) = self.closing.remove(&iid) {
                 // A pane brought back is no longer going away. A disposal
@@ -545,23 +588,13 @@ impl MuxelApp {
                 if let Some(auto) = self.auto.get_mut(&iid) {
                     auto.rebaseline();
                 }
-                if held.restart {
-                    restart.push(iid);
-                }
+                restored.push((iid, held));
             }
         }
-        self.show_close_list = false;
-        if let Some(iid) = focus {
-            if let Some(inst) = self.workspace.instance(iid) {
-                self.workspace.active_project = Some(inst.project_id);
-            }
-            self.focus_instance(iid, window, cx);
+        if self.close_groups.is_empty() {
+            self.show_close_list = false;
         }
-        for iid in restart {
-            self.restart_agent(iid, window, cx);
-        }
-        self.persist();
-        cx.notify();
+        (focus, restored)
     }
 
     pub(super) fn undo_latest_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
