@@ -214,8 +214,9 @@ fn known_code<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<ErrorCod
 /// script can act on; `error` says the same for people and may be reworded. Other
 /// failures (a bad command line, no agent by that name) carry only `error`.
 ///
-/// These refusals type nothing, except `input_changed`: its prompt was pasted,
-/// but Enter was withheld. A lost reply after sending has an uncertain outcome;
+/// These refusals type nothing, except `input_changed` (its prompt was pasted,
+/// but Enter was withheld) and `keys_partly_pressed` (some keys went in). A lost
+/// reply after sending has an uncertain outcome;
 /// inspect the agent before retrying.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -250,9 +251,11 @@ pub enum ErrorCode {
     LaunchMismatch,
     /// The prompt was pasted but its delayed Enter was withheld.
     InputChanged,
-    /// A pane behind tmux takes ctl input only through tmux, at the tmux pane
-    /// its terminal showed when it attached, and that pane couldn't be found.
+    /// A pane behind tmux takes ctl input only through tmux, at the agent's own
+    /// tmux pane, and that pane couldn't be found or has gone. Nothing was typed.
     TmuxPaneUnresolved,
+    /// Some of a `keys` request's keys were pressed, then the rest failed.
+    KeysPartlyPressed,
     /// `muxel ctl` found no muxel to ask: it isn't running, outside control is
     /// off, its `control.json` can't be read or reached, or a read-only creation
     /// status cannot be answered.
@@ -1561,9 +1564,11 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   Codex, Claude and Grok sends also observe provider acceptance for about ten
   seconds (three more after a retry). `submission_confirmed` is true only for a fresh provider receipt and
   false when acceptance remains unknown, with `unconfirmed_reason` `timed_out`,
-  `input_changed` (other input arrived; no further Enter is sent) or
+  `input_changed` (other input arrived; no further Enter is sent),
   `interrupted` (the pane closed, restarted, switched conversation or lost
-  permission). Once Enter is in, the reply is this receipt, never an error.
+  permission) or `retry_unanswered` (tmux didn't answer whether it pressed the
+  retry Enter, so it may have arrived). Once Enter is in, the reply is this
+  receipt, never an error.
   It is null, without waiting, when the pane can't show a receipt: an
   unsupported provider, or no readable idle status title (tmux hides titles)
   with a Grok, multi-paragraph or repeated prompt.
@@ -1596,11 +1601,16 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
 For an agent kept in tmux, `send`, `answer`, `keys` and a `new --prompt` task
 go to the agent's own tmux pane through tmux (`paste-buffer`, `send-keys`),
 never through the tmux client muxel shows, so tmux's prefix and key bindings
-never act on them, and agent panes need no shell grant. The pane is the one
-its terminal showed when the client attached (or when outside control was
-turned on), by tmux pane id, even after the user opens other windows or
-splits. The reply to `keys` comes once tmux has taken every key. If that pane
-is gone, input is refused with `tmux_pane_unresolved` and nothing is typed.
+never act on them, and agent panes need no shell grant. The pane is the agent's
+own, the one its tmux session was created with, whichever pane or window the
+user has opened or made active. A prompt arrives as tmux's own `paste-buffer -p`
+pastes: line breaks as CR, without ESC. The reply to `keys` comes once tmux
+has taken every key, one tmux command per key; over SSH without a shared
+connection each is a new login. If the agent's pane is gone or can't be
+reached, input is refused with `tmux_pane_unresolved` and nothing is typed;
+after a failed lookup the next waits a little longer each time, up to two
+minutes. A remote agent's input needs muxel's background SSH commands to that
+host to work.
 
 AGENT is an agent's `id` from `panes` (like `1a2b3c4d`), its name (`Claude`),
 `project/name` when names repeat, or `focused` for the pane the user is looking
@@ -1645,6 +1655,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `tmux_pane_unresolved` - the agent's tmux pane, which takes its input, is
   gone or couldn't be found; nothing was typed. Check `screen`; the user may
   need to restart the agent.
+- `keys_partly_pressed` - some keys were pressed, then the rest failed. Inspect
+  `screen` before pressing any again.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
 - `control_disabled` - outside control was turned off before the mutation.
 - `creation_disabled` - Outside terminal creation is Off; the user must choose Ask or Allow.
@@ -1830,6 +1842,7 @@ mod tests {
             (ErrorCode::LaunchMismatch, "launch_mismatch"),
             (ErrorCode::InputChanged, "input_changed"),
             (ErrorCode::TmuxPaneUnresolved, "tmux_pane_unresolved"),
+            (ErrorCode::KeysPartlyPressed, "keys_partly_pressed"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
             (ErrorCode::StaleEndpoint, "stale_endpoint"),
         ] {
@@ -1993,6 +2006,7 @@ mod tests {
             ErrorCode::LaunchMismatch,
             ErrorCode::InputChanged,
             ErrorCode::TmuxPaneUnresolved,
+            ErrorCode::KeysPartlyPressed,
             ErrorCode::HostUnavailable,
             ErrorCode::StaleEndpoint,
         ] {

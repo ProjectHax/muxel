@@ -859,20 +859,30 @@ feature is added or changed, update the matching entry here in the same change**
   `answer`, `keys`, and a `new --prompt` task) goes to the pane's own tmux pane
   through tmux itself: the prompt as one paste from a muxel-named buffer
   (`paste-buffer -p`, bracketed when the agent asked for it, text read from
-  standard input and never parsed as a tmux command) with the same bytes a
-  direct paste sends, keys with `send-keys` (a character outside ASCII as a
-  raw paste of that character).
+  standard input and never parsed as a tmux command), keys with `send-keys` (a
+  character outside ASCII as a raw paste of that character). muxel can't see
+  whether the agent's pane asked for bracketed paste, so the paste is the same
+  bytes either way, the ones tmux's own paste sends: each line break a CR, and
+  no ESC, so a prompt can never end the bracket early or start a sequence.
   Nothing goes through the attached tmux client, so tmux's prefix, `prefix2`,
   the user's `bind -n` keys and extended-key encodings in ctl input reach the
   agent as text and never open a window or run a tmux command, and agent panes
-  need no shell grant. Each terminal fixes its tmux pane, by pane id, when its
-  client attaches (or when outside control is turned on), so input stays with
-  the agent after the user opens other windows or splits; if that pane is gone,
-  input is refused with `tmux_pane_unresolved` and nothing is typed, never
-  redirected. Writes to one pane stay in order; `keys` replies once tmux has
-  taken every key. Panes not kept in tmux take the same input as PTY bytes, as
-  before. This needs tmux 2.1 or later on a remote host; local tmux panes
-  already need 3.2.
+  need no shell grant. The first ctl write to a terminal finds the agent's own
+  tmux pane, the one its session was created with (the session's lowest pane
+  id, still running the program muxel launched), whichever pane the user left
+  active, and keeps it by pane id, so input stays with the agent after the
+  user opens other windows or splits. If it can't be found or has gone, input
+  is refused with `tmux_pane_unresolved` and nothing is typed, never
+  redirected; after a failed lookup the next waits 2 seconds, doubling to at
+  most 2 minutes, so a host that can't be reached isn't asked again on every
+  write. Writes to one pane stay in order; `keys` replies once tmux has taken
+  every key, and a press that fails after earlier ones went in is
+  `keys_partly_pressed`. A remote pane takes ctl input only over SSH commands
+  run beside its terminal: where the host refuses them, input is refused rather
+  than typed through the client, and without a shared SSH connection each
+  command, and so each key press, makes its own login. Panes not kept in tmux
+  take the same input as PTY bytes, as before. This needs tmux 2.1 or later on
+  a remote host; local tmux panes already need 3.2.
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
@@ -889,7 +899,8 @@ feature is added or changed, update the matching entry here in the same change**
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
   ten seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an
-  `unconfirmed_reason` (`timed_out`, `input_changed` or `interrupted`); once
+  `unconfirmed_reason` (`timed_out`, `input_changed`, `interrupted`, or
+  `retry_unanswered` when tmux didn't answer for the retry Enter); once
   Enter is in, the reply is always this receipt, never an error. muxel doesn't
   wait when the pane can't show a receipt — an unsupported provider, or no
   readable idle status title (tmux hides titles) with a Grok, multi-paragraph or

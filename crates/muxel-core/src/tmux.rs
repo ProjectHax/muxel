@@ -1122,32 +1122,54 @@ pub fn unset_option_if_args(session: &str, option: &str, pattern: &str) -> Optio
 // Prompt text goes on standard input to `load-buffer -`, and a typed character
 // goes as its code point (`0x3b`), or, outside ASCII, on standard input to a raw
 // paste. Every other argument is a fixed word, a pane id (`%12`) or a buffer name
-// muxel made. Version floors, from tmux's CHANGES: `display-message -p` 1.2,
-// `load-buffer -` 1.3, `paste-buffer -p` and hex keys 1.7, named buffers 2.0, the
-// `=` exact-session target 2.1. A hex key above 0x7f is a plain character only
-// from 2.4, which is why those characters are pasted.
+// muxel made. Version floors, from tmux's CHANGES and its 2.0 source:
+// `display-message -p` 1.2, `load-buffer -` 1.3, `paste-buffer -p` and hex keys
+// 1.7, `#{?…}` conditionals 1.8, named buffers and `#{pane_start_command}` 2.0,
+// the `=` exact-session target 2.1. A hex key above 0x7f is a plain character
+// only from 2.4, which is why those characters are pasted.
 
-/// Arguments for `tmux …` printing `session`'s active pane id, the pane its
-/// client shows. Read it with [`parse_control_pane`]. Like
-/// [`pane_title_args`], the output names its session, because `display-message`
-/// formats without a target (and succeeds) when it can't find one.
+/// Arguments for `tmux …` listing every pane of `session` (all its windows) as
+/// `session:%id:F`, where `F` is 1 when the pane was started with a command of
+/// its own and 0 when it runs the default shell. Read it with
+/// [`parse_control_pane`].
 pub fn control_pane_args(session: &str) -> Vec<String> {
     vec![
-        "display-message".to_string(),
-        "-p".to_string(),
+        "list-panes".to_string(),
+        "-s".to_string(),
         "-t".to_string(),
         format!("={session}:"),
-        "#{session_name}:#{pane_id}".to_string(),
+        "-F".to_string(),
+        "#{session_name}:#{pane_id}:#{?pane_start_command,1,0}".to_string(),
     ]
 }
 
-/// The pane id (`%12`) in [`control_pane_args`]' output, only when it is
-/// `session`'s own.
-pub fn parse_control_pane(session: &str, out: &str) -> Option<String> {
-    let line = out.trim_end_matches(['\n', '\r']);
-    let pane = line.strip_prefix(session)?.strip_prefix(':')?;
-    let digits = pane.strip_prefix('%')?;
-    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| pane.to_string())
+/// The pane ctl input for `session` goes to: the agent's own pane, which is the
+/// pane the session was created with. tmux numbers panes in creation order and
+/// never reuses an id on a live server, so that is the session's lowest pane id
+/// for as long as it lives, whichever pane or window the user has made active.
+///
+/// A session muxel created with a program (`with_command`) started that pane
+/// with a command. If its lowest pane has none, the agent's pane has gone and a
+/// pane the user opened is left, so there is no pane to type into. Lines naming
+/// another session, and anything that isn't a pane id, are ignored.
+pub fn parse_control_pane(session: &str, out: &str, with_command: bool) -> Option<String> {
+    let (id, started) = out
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix(session)?.strip_prefix(":%")?;
+            let (digits, started) = rest.split_once(':')?;
+            let started = match started.trim_end_matches('\r') {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            if !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((digits.parse::<u64>().ok()?, started))
+        })
+        .min_by_key(|(id, _)| *id)?;
+    (started || !with_command).then(|| format!("%{id}"))
 }
 
 /// The paste buffer one ctl paste uses: its own, so two pastes never mix and
@@ -1158,11 +1180,11 @@ pub fn control_buffer_name(nonce: Uuid) -> String {
 
 /// Arguments for `tmux …` that read text from standard input into `buffer` and
 /// paste it into `pane` as one paste, byte for byte: `-r` stops `paste-buffer`
-/// turning each LF into CR, so the caller decides line endings (a prompt gets
-/// what a direct paste would send). With `bracket`, `-p` brackets the paste
-/// when the pane's program asked for bracketed paste; without it, the bytes
-/// arrive as plain input. `-d` deletes the buffer once it is pasted. A failed
-/// paste leaves the buffer: delete it with [`delete_buffer_args`].
+/// rewriting line breaks, so the caller decides them ([`control_paste_input`]).
+/// With `bracket`, `-p` brackets the paste when the pane's program asked for
+/// bracketed paste; without it, the bytes arrive as plain input. `-d` deletes
+/// the buffer once it is pasted. A failed paste leaves the buffer: delete it
+/// with [`delete_buffer_args`].
 pub fn control_paste_args(buffer: &str, pane: &str, bracket: bool) -> Vec<String> {
     let mut args = vec![
         "load-buffer".to_string(),
@@ -1182,6 +1204,20 @@ pub fn control_paste_args(buffer: &str, pane: &str, bracket: bool) -> Vec<String
             .map(|arg| (*arg).to_string()),
     );
     args
+}
+
+/// The bytes a ctl prompt is pasted as, the same whether or not the pane asked
+/// for bracketed paste, since muxel can't see that pane's mode (it sees only the
+/// mode of the pane the client shows). They are what tmux's own `paste-buffer
+/// -p` sends: each line break as CR, which a program outside bracketed paste
+/// reads as Enter, as typed, and one inside reads as a line break. ESC is
+/// removed, so the text can't end a bracketed paste early (`\e[201~`) and have
+/// the rest read as keys, and can't press keys in a pane outside one.
+pub fn control_paste_input(text: &str) -> Vec<u8> {
+    text.replace('\x1b', "")
+        .replace("\r\n", "\r")
+        .replace('\n', "\r")
+        .into_bytes()
 }
 
 /// Arguments for `tmux …` deleting one of muxel's paste buffers.
@@ -1274,32 +1310,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_input_uses_the_pinned_pane_and_keeps_text_out_of_arguments() {
+    fn the_agent_pane_is_the_sessions_first_whichever_pane_is_active() {
         assert_eq!(
             control_pane_args("muxel_p_1a2b3c4d"),
             [
-                "display-message",
-                "-p",
+                "list-panes",
+                "-s",
                 "-t",
                 "=muxel_p_1a2b3c4d:",
-                "#{session_name}:#{pane_id}"
+                "-F",
+                "#{session_name}:#{pane_id}:#{?pane_start_command,1,0}"
             ]
         );
-        assert_eq!(
-            parse_control_pane("muxel_p_1", "muxel_p_1:%12\n").as_deref(),
-            Some("%12")
-        );
-        // No target: tmux formats without one. A namesake prefix, a window id
-        // or anything but a pane id is not this session's pane.
-        for out in [
-            ":\n",
-            "muxel_p_12:%3\n",
-            "muxel_p_1:@3\n",
-            "muxel_p_1:%\n",
-            "muxel_p_1:%1;x\n",
-        ] {
-            assert_eq!(parse_control_pane("muxel_p_1", out), None, "{out:?}");
+        // The user split the agent's window (%14) and opened another window
+        // (%20); list order follows windows, not age.
+        let panes = "muxel_p_1:%20:0\nmuxel_p_1:%12:1\nmuxel_p_1:%14:0\n";
+        for with_command in [true, false] {
+            assert_eq!(
+                parse_control_pane("muxel_p_1", panes, with_command).as_deref(),
+                Some("%12")
+            );
         }
+        // Numeric order, not text order.
+        assert_eq!(
+            parse_control_pane("muxel_p_1", "muxel_p_1:%9:1\nmuxel_p_1:%10:0\n", true).as_deref(),
+            Some("%9")
+        );
+        // The agent's pane has gone and the user's shell is left: nothing to
+        // type into. A shell session (no command of its own) keeps its first pane.
+        let left = "muxel_p_1:%14:0\nmuxel_p_1:%20:0\n";
+        assert_eq!(parse_control_pane("muxel_p_1", left, true), None);
+        assert_eq!(
+            parse_control_pane("muxel_p_1", left, false).as_deref(),
+            Some("%14")
+        );
+        // A namesake session, a window id, a missing flag or anything but a pane
+        // id is not this session's pane.
+        for out in [
+            "",
+            ":%3:1\n",
+            "muxel_p_12:%3:1\n",
+            "muxel_p_1:@3:1\n",
+            "muxel_p_1:%:1\n",
+            "muxel_p_1:%1;x:1\n",
+            "muxel_p_1:%3\n",
+            "muxel_p_1:%3:yes\n",
+        ] {
+            assert_eq!(parse_control_pane("muxel_p_1", out, false), None, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_is_pasted_as_tmux_pastes_with_no_escape_left() {
+        assert_eq!(
+            control_paste_input("one\x1b[201~two\r\nthree\nfour ✓\x1b"),
+            "one[201~two\rthree\rfour ✓".as_bytes()
+        );
+        assert_eq!(control_paste_input("plain"), b"plain");
+    }
+
+    #[test]
+    fn control_input_keeps_text_out_of_arguments() {
         let buffer = control_buffer_name(Uuid::nil());
         assert_eq!(buffer, "muxel-ctl-00000000000000000000000000000000");
         assert_eq!(

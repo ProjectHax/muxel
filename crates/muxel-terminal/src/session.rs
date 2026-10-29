@@ -1911,9 +1911,6 @@ impl TerminalSession {
         }
         *self.last_output.lock() = Instant::now();
         self.output_seen.store(true, Ordering::Relaxed);
-        if let Some(tmux) = &self.tmux_input {
-            tmux.note_output();
-        }
     }
 
     /// Take accumulated damage for the next paint.
@@ -2065,7 +2062,7 @@ impl TerminalSession {
     }
 
     /// Write outside-control (`muxel ctl`) input. A terminal whose program is a
-    /// tmux client gets it at its pinned tmux pane through tmux, queued in order
+    /// tmux client gets it at its agent's tmux pane through tmux, queued in order
     /// behind this terminal's earlier ctl writes; any other terminal gets the
     /// same PTY bytes as [`Self::try_paste`], [`Self::try_write_input`] and
     /// [`Self::try_submit_input`]. Either way the input revision and draft bit
@@ -2088,23 +2085,19 @@ impl TerminalSession {
                 written.map_err(|error| ControlWriteError::Closed(error.to_string())),
             );
         };
-        let (input, submit) = match input {
+        let submit = match &input {
             ControlInput::Submit => {
                 self.scroll_input_to_bottom();
                 self.submission_pending.store(false, Ordering::Release);
-                (input, Some((self.clone(), SystemTime::now())))
+                Some((self.clone(), SystemTime::now()))
             }
             ControlInput::Paste(text) => {
                 self.admit_input(!text.is_empty());
-                // The bytes a direct paste would send, decided by this
-                // terminal's mode as tmux set it for the pane it shows; tmux
-                // adds the brackets itself, only if the pane asked for them.
-                let text = paste_text(&text, self.is_bracketed_paste());
-                (ControlInput::Paste(text), None)
+                None
             }
-            ControlInput::Keys { ref keys, .. } => {
+            ControlInput::Keys { keys, .. } => {
                 self.admit_input(!keys.is_empty());
-                (input, None)
+                None
             }
         };
         ControlWrite::queued(tmux.deliver(input), submit)
@@ -2115,16 +2108,7 @@ impl TerminalSession {
         self.tmux_input.is_some()
     }
 
-    /// Fix the tmux pane outside-control input goes to, if this terminal is a
-    /// tmux client whose pane isn't fixed yet. Asynchronous: it runs on the
-    /// terminal's input worker, ahead of any later ctl write.
-    pub fn pin_tmux_pane(&self) {
-        if let Some(tmux) = &self.tmux_input {
-            tmux.pin();
-        }
-    }
-
-    /// The tmux pane id outside-control input goes to, once fixed.
+    /// The tmux pane id outside-control input goes to, once found.
     pub fn tmux_input_pane(&self) -> Option<String> {
         self.tmux_input.as_ref()?.pinned_pane()
     }
@@ -2259,12 +2243,10 @@ impl TerminalSession {
     /// Paste text and report admission to the PTY writer. Success does not
     /// confirm that the child consumed the text.
     pub fn try_paste(&self, text: &str) -> std::io::Result<()> {
-        let bracketed = self.is_bracketed_paste();
-        let text = paste_text(text, bracketed);
-        let payload = if bracketed {
-            format!("\x1b[200~{text}\x1b[201~")
+        let payload = if self.is_bracketed_paste() {
+            format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {
-            text
+            text.replace("\r\n", "\r").replace('\n', "\r")
         };
         self.try_write_input(payload.as_bytes())
     }
@@ -3000,17 +2982,6 @@ impl TerminalSession {
         push_mouse_report(&mut buf, base + mods, col, row, true, sgr);
         self.mark_user_input();
         self.write_pointer(&buf);
-    }
-}
-
-/// The text of a paste, without its brackets: inside a bracketed paste ESC is
-/// removed, so the text can't end the paste early and have the rest read as
-/// keys; outside one each line break goes as CR, the Enter a terminal sends.
-fn paste_text(text: &str, bracketed: bool) -> String {
-    if bracketed {
-        text.replace('\x1b', "")
-    } else {
-        text.replace("\r\n", "\r").replace('\n', "\r")
     }
 }
 

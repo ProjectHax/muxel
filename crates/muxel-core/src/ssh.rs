@@ -2081,8 +2081,8 @@ mod tests {
         assert_eq!(
             session_tmux_command(&target, &tmux::control_pane_args(&target.name)),
             format!(
-                "{lead} display-message -p -t '=muxel_app_1a2b3c4d:' \
-                 '#{{session_name}}:#{{pane_id}}'"
+                "{lead} list-panes -s -t '=muxel_app_1a2b3c4d:' -F \
+                 '#{{session_name}}:#{{pane_id}}:#{{?pane_start_command,1,0}}'"
             )
         );
         let buffer = tmux::control_buffer_name(uuid::Uuid::nil());

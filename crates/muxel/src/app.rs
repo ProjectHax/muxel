@@ -5026,10 +5026,6 @@ pub struct MuxelApp {
     /// Panes whose latest launch is armed by `arms_tmux_resume_recovery`
     /// (runtime only): only they may read a clean early exit as a failed resume.
     codex_unconfirmed_resumes: HashSet<Uuid>,
-    /// Whether outside control is on, shared with every tmux client's ctl
-    /// input route: while it is, each one fixes its tmux pane as soon as it
-    /// attaches (see `muxel_terminal::TmuxInputRoute`).
-    control_pin_on_attach: Arc<std::sync::atomic::AtomicBool>,
     /// Full persisted settings (source of truth for config not mirrored above).
     settings: muxel_core::Settings,
     /// Active theme name + mode override (persisted).
@@ -7416,9 +7412,6 @@ impl MuxelApp {
             claude_hook_seen: HashMap::new(),
             codex_restore_lookups: Default::default(),
             codex_unconfirmed_resumes: HashSet::new(),
-            control_pin_on_attach: Arc::new(std::sync::atomic::AtomicBool::new(
-                settings.control_enabled,
-            )),
             theme: settings.theme.clone(),
             theme_mode: settings.theme_mode.clone(),
             use_tmux: settings.default_use_tmux,
@@ -8456,7 +8449,7 @@ impl MuxelApp {
                 let session = integrations::profile_tmux_target(&i.tmux_target(&host.name));
                 spec = spec.with_tmux_input(muxel_terminal::TmuxInputRoute::new(
                     session.name.clone(),
-                    self.control_pin_on_attach.clone(),
+                    resolved.program.is_some(),
                     move |args: &[String], stdin: Option<&[u8]>| {
                         integrations::run_remote_tmux_input(&conn, &session, args, stdin)
                     },
@@ -8527,7 +8520,7 @@ impl MuxelApp {
                     let input_socket = socket.clone();
                     let input = muxel_terminal::TmuxInputRoute::new(
                         session.name.clone(),
-                        self.control_pin_on_attach.clone(),
+                        resolved.program.is_some(),
                         move |args: &[String], stdin: Option<&[u8]>| {
                             integrations::run_local_tmux_input(&input_socket, args, stdin)
                         },

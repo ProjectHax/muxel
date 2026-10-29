@@ -306,21 +306,6 @@ impl MuxelApp {
     pub(super) fn sync_control(&mut self, cx: &mut Context<Self>) {
         self.sync_control_approvals(cx);
         let want = self.settings.control_enabled;
-        if want
-            && !self
-                .control_pin_on_attach
-                .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            // Outside control just came on. Fix each tmux client's pane now,
-            // before anyone opens another window in it; later clients fix theirs
-            // when they attach.
-            for view in self.terminals.values() {
-                view.read(cx).session().pin_tmux_pane();
-            }
-        } else if !want {
-            self.control_pin_on_attach
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
         if want && self.control.is_none() && !self.control_failed {
             let (tx, rx) = async_channel::unbounded();
             match crate::control::Server::start(tx) {
@@ -1528,6 +1513,11 @@ impl MuxelApp {
                                     retries += 1;
                                     Ok(action)
                                 }
+                                // The retry may have been pressed.
+                                Err(ControlWriteError::Unknown(_)) => {
+                                    retries += 1;
+                                    Err(Unconfirmed::RetryUnanswered)
+                                }
                                 Err(_) => Err(Unconfirmed::Interrupted),
                             },
                             Ok((action, None)) => Ok(action),
@@ -1584,7 +1574,9 @@ impl MuxelApp {
                             })
                             .unwrap_or_else(|_| Err("muxel is shutting down".into()));
                         let written = match write {
-                            Ok(write) => write.finish().await.map_err(keys_failed),
+                            Ok(write) => {
+                                write.finish().await.map_err(|error| keys_failed(error, i))
+                            }
                             Err(error) => Err(error),
                         };
                         if let Err(error) = written {
@@ -1716,6 +1708,9 @@ enum Unconfirmed {
     InputChanged,
     /// The pane closed, restarted, switched conversation or lost permission.
     Interrupted,
+    /// tmux didn't answer whether it pressed the retry Enter, so it may have
+    /// arrived; no further Enter is sent.
+    RetryUnanswered,
 }
 
 impl Unconfirmed {
@@ -1724,6 +1719,7 @@ impl Unconfirmed {
             Self::TimedOut => "timed_out",
             Self::InputChanged => "input_changed",
             Self::Interrupted => "interrupted",
+            Self::RetryUnanswered => "retry_unanswered",
         }
     }
 }
@@ -1826,7 +1822,7 @@ fn paste_failed(error: ControlWriteError) -> ctl::Error {
         ControlWriteError::Refused(_) => {
             format!("couldn't paste the prompt through tmux: {error}").into()
         }
-        ControlWriteError::Unknown(_) => format!(
+        ControlWriteError::Unknown(_) | ControlWriteError::Partial(_) => format!(
             "couldn't confirm the paste through tmux: {error}. Check its `screen` before sending again"
         )
         .into(),
@@ -1841,14 +1837,35 @@ fn enter_failed(error: ControlWriteError) -> ctl::Error {
         ControlWriteError::Unresolved(why) | ControlWriteError::Refused(why) => {
             format!("the prompt was pasted but tmux didn't press Enter ({why}): check its `screen`")
         }
-        ControlWriteError::Unknown(why) => format!(
+        ControlWriteError::Unknown(why) | ControlWriteError::Partial(why) => format!(
             "the prompt was pasted but tmux didn't answer whether it pressed Enter ({why}): check its `screen` before sending again"
         ),
     }
     .into()
 }
 
-fn keys_failed(error: ControlWriteError) -> ctl::Error {
+/// A failed key press, after `pressed_before` earlier presses went in. Once
+/// any key of the request went in, the reply never says nothing was typed:
+/// it is `keys_partly_pressed`, whatever stopped the rest.
+fn keys_failed(error: ControlWriteError, pressed_before: usize) -> ctl::Error {
+    if pressed_before > 0 || matches!(error, ControlWriteError::Partial(_)) {
+        let then = match error {
+            ControlWriteError::Refused(why) | ControlWriteError::Unresolved(why) => {
+                format!("tmux refused the next ({why})")
+            }
+            ControlWriteError::Unknown(why) => format!(
+                "tmux didn't answer for the next ({why}), so it may or may not have been pressed"
+            ),
+            ControlWriteError::Closed(why) => format!("the terminal's input closed ({why})"),
+            ControlWriteError::Partial(why) => why,
+        };
+        return ctl::Error::new(
+            ErrorCode::KeysPartlyPressed,
+            format!(
+                "some keys were pressed, then {then}. Check its `screen` before pressing them again"
+            ),
+        );
+    }
     match error {
         ControlWriteError::Unresolved(why) => ctl::Error::new(ErrorCode::TmuxPaneUnresolved, why),
         ControlWriteError::Closed(why) => {
@@ -2057,9 +2074,28 @@ mod prompt_submission_tests {
             unresolved.message
         );
         assert_eq!(
-            keys_failed(gone()).code,
+            keys_failed(gone(), 0).code,
             Some(ErrorCode::TmuxPaneUnresolved)
         );
+        // Once a key went in, a later refusal never reads as "nothing typed",
+        // whether earlier presses went in or part of this one did.
+        for (error, before) in [
+            (gone(), 2),
+            (ControlWriteError::Refused("lost server".into()), 1),
+            (
+                ControlWriteError::Partial("tmux refused the rest (x)".into()),
+                0,
+            ),
+        ] {
+            let partly = keys_failed(error, before);
+            assert_eq!(partly.code, Some(ErrorCode::KeysPartlyPressed));
+            assert!(
+                !partly.message.contains("nothing was typed")
+                    && partly.message.contains("`screen`"),
+                "{}",
+                partly.message
+            );
+        }
 
         let refused = paste_failed(ControlWriteError::Refused("target pane has exited".into()));
         assert_eq!(refused.code, None);
@@ -2251,6 +2287,7 @@ mod prompt_submission_tests {
             (Unconfirmed::TimedOut, "timed_out"),
             (Unconfirmed::InputChanged, "input_changed"),
             (Unconfirmed::Interrupted, "interrupted"),
+            (Unconfirmed::RetryUnanswered, "retry_unanswered"),
         ] {
             let mut stopped = pasted.clone();
             submission_receipt(&mut stopped, Some(Err(reason)), 0);

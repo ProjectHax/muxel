@@ -6,9 +6,10 @@
 //! the extended-key decoder can turn them into tmux commands, such as opening a
 //! shell window inside an agent's pane. So ctl input to such a terminal goes to
 //! its tmux pane through tmux itself (`paste-buffer`, `send-keys`), on the
-//! server the client attached to, and never through the client. Which pane is
-//! fixed once per terminal, when its client attaches: the pane it showed then,
-//! by tmux pane id. If that can't be found, the write is refused; it never falls
+//! server the client attached to, and never through the client. The pane is the
+//! agent's own, the one its session was created with, found by tmux pane id at
+//! the first ctl write and kept for the terminal's life, whichever pane the user
+//! has made active. If it can't be found, the write is refused; it never falls
 //! back to the client.
 //!
 //! Every other terminal takes the same input as PTY bytes, as it always has.
@@ -27,16 +28,48 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-/// How long output waits before it tries to fix the pane again after a try
-/// failed, so a client streaming output doesn't run tmux for every chunk.
-const PIN_RETRY: Duration = Duration::from_secs(1);
+/// After a failed lookup of the pane, how long until the next may run. Each
+/// lookup is a tmux command, over SSH for a remote pane (a full login when the
+/// host's connection can't be shared), so a caller retrying a pane that can't
+/// be reached never runs one more often than this allows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PinBackoff {
+    failures: u32,
+    next: Option<Instant>,
+}
+
+impl PinBackoff {
+    /// The first wait, doubled after each further failure up to [`Self::MAX`].
+    const FIRST: Duration = Duration::from_secs(2);
+    const MAX: Duration = Duration::from_secs(120);
+
+    /// The wait after `failures` failed lookups in a row.
+    pub(crate) fn delay(failures: u32) -> Duration {
+        if failures == 0 {
+            return Duration::ZERO;
+        }
+        Self::FIRST
+            .saturating_mul(1 << (failures - 1).min(16))
+            .min(Self::MAX)
+    }
+
+    /// How long until a lookup may run, or `None` when one may run at `now`.
+    pub(crate) fn wait(&self, now: Instant) -> Option<Duration> {
+        self.next.filter(|&next| next > now).map(|next| next - now)
+    }
+
+    pub(crate) fn failed(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        self.next = Some(now + Self::delay(self.failures));
+    }
+}
 
 /// One write `muxel ctl` makes to a terminal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlInput {
-    /// Text pasted as one paste, as [`crate::TerminalSession::try_paste`]
-    /// pastes it: while the terminal is in bracketed-paste mode, bracketed and
-    /// without ESC; otherwise with each line break sent as CR.
+    /// Text pasted as one paste. A terminal muxel writes to gets what
+    /// [`crate::TerminalSession::try_paste`] sends; a tmux pane gets
+    /// [`tmux::control_paste_input`]'s bytes, bracketed when it asked.
     Paste(String),
     /// Keys pressed together. `app_cursor` is the cursor-key mode a directly
     /// written terminal's arrow bytes are encoded for; tmux encodes keys for its
@@ -61,21 +94,21 @@ pub type TmuxRunner = Arc<dyn Fn(&[String], Option<&[u8]>) -> io::Result<Output>
 pub struct TmuxInputRoute {
     session: String,
     run: TmuxRunner,
-    /// While outside control is on, the pane is fixed as soon as the client
-    /// draws, rather than at the first ctl write.
-    pin_on_attach: Arc<AtomicBool>,
+    /// Whether muxel created the session with a program of its own (an agent),
+    /// rather than the user's default shell. See [`tmux::parse_control_pane`].
+    with_command: bool,
 }
 
 impl TmuxInputRoute {
     pub fn new(
         session: impl Into<String>,
-        pin_on_attach: Arc<AtomicBool>,
+        with_command: bool,
         run: impl Fn(&[String], Option<&[u8]>) -> io::Result<Output> + Send + Sync + 'static,
     ) -> Self {
         Self {
             session: session.into(),
             run: Arc::new(run),
-            pin_on_attach,
+            with_command,
         }
     }
 }
@@ -93,14 +126,23 @@ impl std::fmt::Debug for TmuxInputRoute {
 pub enum ControlWriteError {
     /// The terminal's PTY writer is gone.
     Closed(String),
-    /// The tmux pane this terminal showed when it attached couldn't be found.
-    /// Nothing was typed.
+    /// The agent's tmux pane couldn't be found, or has gone. Nothing was typed.
     Unresolved(String),
     /// tmux refused the command, or it couldn't be started. Nothing was typed.
     Refused(String),
     /// The command started, but no answer came back in time or its connection
     /// dropped: it may or may not have been delivered.
     Unknown(String),
+    /// Part of the write was delivered (some of its keys), then the rest failed.
+    Partial(String),
+}
+
+impl ControlWriteError {
+    /// Whether some of the write may have reached the pane: a write that may
+    /// have typed counts as typed.
+    pub fn may_have_typed(&self) -> bool {
+        matches!(self, Self::Closed(_) | Self::Unknown(_) | Self::Partial(_))
+    }
 }
 
 impl std::fmt::Display for ControlWriteError {
@@ -113,6 +155,7 @@ impl std::fmt::Display for ControlWriteError {
                 f,
                 "tmux didn't answer ({why}), so it may or may not have been typed"
             ),
+            Self::Partial(why) => write!(f, "part of it was typed, then {why}"),
         }
     }
 }
@@ -192,23 +235,16 @@ impl ControlWrite {
     }
 }
 
-enum Pin {
-    Unresolved,
-    Pinned(String),
-}
-
 struct Shared {
-    pin: Mutex<Pin>,
-    pin_queued: AtomicBool,
-    /// When output may next try to fix the pane, after a failed try.
-    retry_at: Mutex<Option<Instant>>,
+    /// The agent's pane, once found. It never changes after that.
+    pin: Mutex<Option<String>>,
+    /// Failed lookups of the pane, so one that can't be found isn't looked up
+    /// again too soon.
+    backoff: Mutex<PinBackoff>,
     closed: AtomicBool,
 }
 
-enum Job {
-    Pin,
-    Deliver(ControlInput, async_channel::Sender<Delivered>),
-}
+struct Job(ControlInput, async_channel::Sender<Delivered>);
 
 /// A terminal's tmux route and its ordered input worker. ctl writes to one
 /// terminal run one at a time, in the order they were made.
@@ -223,54 +259,23 @@ impl TmuxInput {
         Self {
             route,
             shared: Arc::new(Shared {
-                pin: Mutex::new(Pin::Unresolved),
-                pin_queued: AtomicBool::new(false),
-                retry_at: Mutex::new(None),
+                pin: Mutex::new(None),
+                backoff: Mutex::new(PinBackoff::default()),
                 closed: AtomicBool::new(false),
             }),
             worker: Mutex::new(None),
         }
     }
 
-    /// The tmux pane id ctl input goes to, once fixed.
+    /// The tmux pane id ctl input goes to, once found.
     pub(crate) fn pinned_pane(&self) -> Option<String> {
-        match &*self.shared.pin.lock() {
-            Pin::Pinned(pane) => Some(pane.clone()),
-            Pin::Unresolved => None,
-        }
+        self.shared.pin.lock().clone()
     }
 
-    /// Output arrived: while outside control is on and the pane isn't fixed
-    /// yet, try now. Before the client has attached the session may not exist,
-    /// so a failed try is repeated by later output, at most once a second.
-    pub(crate) fn note_output(&self) {
-        if self.route.pin_on_attach.load(Ordering::Acquire)
-            && self
-                .shared
-                .retry_at
-                .lock()
-                .is_none_or(|at| Instant::now() >= at)
-        {
-            self.pin();
-        }
-    }
-
-    /// Fix the pane now, unless it is fixed or a try is already queued.
-    pub(crate) fn pin(&self) {
-        if self.pinned_pane().is_some() || self.shared.pin_queued.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if self.send(Job::Pin).is_err() {
-            self.shared.pin_queued.store(false, Ordering::Release);
-        }
-    }
-
-    /// Queue `input` for the pinned pane. A paste's text is already what the
-    /// pane should get: [`crate::TerminalSession::control_write`] prepares it
-    /// as a direct paste would.
+    /// Queue `input` for the agent's pane, which the first write looks up.
     pub(crate) fn deliver(&self, input: ControlInput) -> async_channel::Receiver<Delivered> {
         let (tx, rx) = async_channel::bounded(1);
-        if let Err(Job::Deliver(_, tx)) = self.send(Job::Deliver(input, tx)) {
+        if let Err(Job(_, tx)) = self.send(Job(input, tx)) {
             let _ = tx.try_send(Err(ControlWriteError::Refused(
                 "muxel couldn't start its tmux input worker".into(),
             )));
@@ -309,61 +314,69 @@ impl Drop for TmuxInput {
 }
 
 fn work(route: &TmuxInputRoute, shared: &Shared, jobs: mpsc::Receiver<Job>) {
-    while let Ok(job) = jobs.recv() {
-        match job {
-            Job::Pin => {
-                shared.pin_queued.store(false, Ordering::Release);
-                if !shared.closed.load(Ordering::Acquire) && pinned_pane(route, shared).is_err() {
-                    *shared.retry_at.lock() = Some(Instant::now() + PIN_RETRY);
-                }
-            }
-            Job::Deliver(input, done) => {
-                let result = if shared.closed.load(Ordering::Acquire) {
-                    Err(ControlWriteError::Refused("the terminal closed".into()))
-                } else {
-                    pinned_pane(route, shared).and_then(|pane| deliver(&route.run, &pane, &input))
-                };
-                let _ = done.try_send(result);
-            }
-        }
+    while let Ok(Job(input, done)) = jobs.recv() {
+        let result = if shared.closed.load(Ordering::Acquire) {
+            Err(ControlWriteError::Refused("the terminal closed".into()))
+        } else {
+            pinned_pane(route, shared, Instant::now())
+                .and_then(|pane| deliver(&route.run, &pane, &input))
+        };
+        let _ = done.try_send(result);
     }
 }
 
-/// The pinned pane, fixing it from the session's active pane if this terminal
-/// has none yet. Once fixed it never changes: a pane that later vanishes fails
-/// delivery rather than redirecting it to whatever is active now.
-fn pinned_pane(route: &TmuxInputRoute, shared: &Shared) -> Result<String, ControlWriteError> {
-    if let Pin::Pinned(pane) = &*shared.pin.lock() {
-        return Ok(pane.clone());
+/// The agent's pane, looking it up if this terminal has none yet. Once found
+/// it never changes: a pane that later vanishes fails delivery rather than
+/// redirecting it. After a failed lookup, writes fail without running tmux
+/// until [`PinBackoff`] allows the next one.
+fn pinned_pane(
+    route: &TmuxInputRoute,
+    shared: &Shared,
+    now: Instant,
+) -> Result<String, ControlWriteError> {
+    if let Some(pane) = shared.pin.lock().clone() {
+        return Ok(pane);
+    }
+    let unresolved = |why: &str| {
+        ControlWriteError::Unresolved(format!(
+            "couldn't find the agent's tmux pane in session {} ({why}); ctl input to a tmux pane never goes through its client",
+            route.session
+        ))
+    };
+    if let Some(wait) = shared.backoff.lock().wait(now) {
+        return Err(unresolved(&format!(
+            "the last lookup failed; the next can run in {} s",
+            wait.as_secs_f64().ceil()
+        )));
     }
     let args = tmux::control_pane_args(&route.session);
     let why = match (route.run)(&args, None) {
         Ok(out) if out.status.success() => {
-            match tmux::parse_control_pane(&route.session, &String::from_utf8_lossy(&out.stdout)) {
+            let panes = String::from_utf8_lossy(&out.stdout);
+            match tmux::parse_control_pane(&route.session, &panes, route.with_command) {
                 Some(pane) => {
-                    *shared.pin.lock() = Pin::Pinned(pane.clone());
+                    *shared.pin.lock() = Some(pane.clone());
                     return Ok(pane);
                 }
-                None => "tmux has no such session".to_string(),
+                None if panes.trim().is_empty() => "tmux listed no panes".to_string(),
+                None => "the pane the session was created with has gone".to_string(),
             }
         }
         Ok(out) => stderr_line(&out),
         Err(error) => error.to_string(),
     };
-    Err(ControlWriteError::Unresolved(format!(
-        "couldn't find the tmux pane of session {} ({why}); ctl input to a tmux pane never goes through its client",
-        route.session
-    )))
+    shared.backoff.lock().failed(now);
+    Err(unresolved(&why))
 }
 
 /// Deliver `input` to `pane`. A refusal from a pane that has since gone is
-/// reported as unresolved: the pane this terminal attached to is no more, and
-/// no other takes its place.
+/// reported as unresolved: the agent's pane is no more, and no other takes its
+/// place.
 fn deliver(run: &TmuxRunner, pane: &str, input: &ControlInput) -> Delivered {
     match deliver_once(run, pane, input) {
         Err(ControlWriteError::Refused(why)) if pane_gone(run, pane) => {
             Err(ControlWriteError::Unresolved(format!(
-                "the tmux pane {pane} this terminal showed when it attached is gone ({why}); ctl input to a tmux pane never goes through its client"
+                "the agent's tmux pane {pane} is gone ({why}); ctl input to a tmux pane never goes through its client"
             )))
         }
         delivered => delivered,
@@ -380,14 +393,20 @@ fn pane_gone(run: &TmuxRunner, pane: &str) -> bool {
 
 fn deliver_once(run: &TmuxRunner, pane: &str, input: &ControlInput) -> Delivered {
     match input {
-        ControlInput::Paste(text) => paste(run, pane, text, true),
+        ControlInput::Paste(text) => paste(run, pane, &tmux::control_paste_input(text), true),
         ControlInput::Keys { keys, .. } => {
-            for key_step in tmux::control_key_steps(keys) {
-                match key_step {
+            for (i, key_step) in tmux::control_key_steps(keys).into_iter().enumerate() {
+                let pressed = match key_step {
                     tmux::KeyStep::Send(keys) => {
-                        step(run, &tmux::control_keys_args(pane, &keys), None)?
+                        step(run, &tmux::control_keys_args(pane, &keys), None)
                     }
-                    tmux::KeyStep::Paste(text) => paste(run, pane, &text, false)?,
+                    tmux::KeyStep::Paste(text) => paste(run, pane, text.as_bytes(), false),
+                };
+                match pressed {
+                    Ok(()) => {}
+                    // Earlier keys of this write went in.
+                    Err(error) if i > 0 => return Err(partial(error)),
+                    Err(error) => return Err(error),
                 }
             }
             Ok(())
@@ -396,14 +415,25 @@ fn deliver_once(run: &TmuxRunner, pane: &str, input: &ControlInput) -> Delivered
     }
 }
 
-/// Paste `text` byte for byte from a buffer of its own, bracketed (`-p`) only
+/// `error` for the rest of a write whose first part was delivered.
+fn partial(error: ControlWriteError) -> ControlWriteError {
+    ControlWriteError::Partial(match error {
+        ControlWriteError::Refused(why) | ControlWriteError::Unresolved(why) => {
+            format!("tmux refused the rest ({why})")
+        }
+        ControlWriteError::Unknown(why) => format!("tmux didn't answer for the rest ({why})"),
+        ControlWriteError::Closed(why) | ControlWriteError::Partial(why) => why,
+    })
+}
+
+/// Paste `bytes` as they are from a buffer of its own, bracketed (`-p`) only
 /// when `bracket` and the pane asked for it.
-fn paste(run: &TmuxRunner, pane: &str, text: &str, bracket: bool) -> Delivered {
+fn paste(run: &TmuxRunner, pane: &str, bytes: &[u8], bracket: bool) -> Delivered {
     let buffer = tmux::control_buffer_name(uuid::Uuid::new_v4());
     let pasted = step(
         run,
         &tmux::control_paste_args(&buffer, pane, bracket),
-        Some(text.as_bytes()),
+        Some(bytes),
     );
     if pasted.is_err() {
         // A failed paste leaves its buffer behind.
@@ -440,7 +470,10 @@ fn stderr_line(out: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlInput, ControlWrite, ControlWriteError, TmuxInput, TmuxInputRoute};
+    use super::{
+        ControlInput, ControlWrite, ControlWriteError, PinBackoff, Shared, TmuxInput,
+        TmuxInputRoute, pinned_pane,
+    };
     use crate::session::{CommandSpec, TerminalSession};
     use muxel_core::control::Key;
     use parking_lot::Mutex;
@@ -449,7 +482,7 @@ mod tests {
         process::Output,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -476,21 +509,22 @@ mod tests {
 
     type Calls = Arc<Mutex<Vec<(Vec<String>, Option<Vec<u8>>)>>>;
 
-    /// A fake tmux: records every command, answers the pin query with `%7`
-    /// and every other command with `answer`.
+    /// What a fake tmux lists for an agent session: the agent's pane `%7`,
+    /// started with its program, and a user's split `%9` with none.
+    const AGENT_PANES: &str = "muxel_p_1:%9:0\nmuxel_p_1:%7:1\n";
+
+    /// A fake tmux for an agent session: records every command, lists
+    /// [`AGENT_PANES`] and answers every other command with `answer`.
     fn route(answer: fn(&[String]) -> io::Result<Output>) -> (TmuxInputRoute, Calls) {
         let calls: Calls = Arc::default();
         let seen = calls.clone();
         let route = TmuxInputRoute::new(
             "muxel_p_1",
-            Arc::new(AtomicBool::new(false)),
+            true,
             move |args: &[String], stdin: Option<&[u8]>| {
                 seen.lock().push((args.to_vec(), stdin.map(<[u8]>::to_vec)));
-                if args
-                    .last()
-                    .is_some_and(|format| format == "#{session_name}:#{pane_id}")
-                {
-                    return Ok(output(0, "muxel_p_1:%7\n", ""));
+                if args[0] == "list-panes" {
+                    return Ok(output(0, AGENT_PANES, ""));
                 }
                 answer(args)
             },
@@ -525,9 +559,14 @@ mod tests {
     }
 
     #[test]
-    fn writes_go_in_order_to_the_pane_pinned_once() {
+    fn writes_go_in_order_to_the_agents_pane_found_once() {
         let (route, calls) = route(|_| Ok(output(0, "", "")));
         let input = TmuxInput::new(route);
+        assert_eq!(
+            input.pinned_pane(),
+            None,
+            "nothing is looked up before a write"
+        );
         deliver(&input, ControlInput::Paste("two\nlines".into())).unwrap();
         deliver(
             &input,
@@ -538,17 +577,22 @@ mod tests {
         )
         .unwrap();
         deliver(&input, ControlInput::Submit).unwrap();
-        assert_eq!(input.pinned_pane().as_deref(), Some("%7"));
+        assert_eq!(
+            input.pinned_pane().as_deref(),
+            Some("%7"),
+            "the agent's pane, not the user's split"
+        );
         let calls = calls.lock();
         let commands: Vec<&str> = calls.iter().map(|(args, _)| args[0].as_str()).collect();
         assert_eq!(
             commands,
-            ["display-message", "load-buffer", "send-keys", "send-keys"],
-            "the pane is resolved once, then every write targets it"
+            ["list-panes", "load-buffer", "send-keys", "send-keys"],
+            "the pane is looked up once, then every write targets it"
         );
         assert!(calls[1].0.ends_with(&["-t".to_string(), "%7".to_string()]));
         assert!(calls[1].0.contains(&"-p".to_string()), "{:?}", calls[1].0);
-        assert_eq!(calls[1].1.as_deref(), Some(&b"two\nlines"[..]));
+        assert!(calls[1].0.contains(&"-r".to_string()), "{:?}", calls[1].0);
+        assert_eq!(calls[1].1.as_deref(), Some(&b"two\rlines"[..]));
         assert_eq!(calls[2].0, ["send-keys", "-t", "%7", "C-b", "0x63"]);
         assert_eq!(calls[3].0, ["send-keys", "-t", "%7", "Enter"]);
         assert!(calls[2].1.is_none() && calls[3].1.is_none());
@@ -579,6 +623,43 @@ mod tests {
         assert_eq!(calls.len(), 4);
     }
 
+    /// Keys refused after earlier keys of the same press went in are a partial
+    /// write, which counts as typed; a refusal of the first is not.
+    #[test]
+    fn keys_refused_after_earlier_ones_went_in_are_partly_typed() {
+        let (route, calls) = route(|args| {
+            Ok(match args[0].as_str() {
+                "send-keys" if args.contains(&"Enter".to_string()) => output(1, "", "not now\n"),
+                "display-message" => output(0, "%7\n", ""),
+                _ => output(0, "", ""),
+            })
+        });
+        let input = TmuxInput::new(route);
+        let press = |keys: Vec<Key>| ControlInput::Keys {
+            keys,
+            app_cursor: false,
+        };
+        let error = deliver(
+            &input,
+            press(vec![Key::Char('a'), Key::Char('é'), Key::Enter]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ControlWriteError::Partial("tmux refused the rest (not now)".into())
+        );
+        assert!(error.may_have_typed());
+        assert_eq!(
+            commands(&calls),
+            ["list-panes", "send-keys", "load-buffer", "send-keys"],
+            "a partial write isn't taken for a pane that has gone"
+        );
+
+        let error = deliver(&input, press(vec![Key::Enter])).unwrap_err();
+        assert_eq!(error, ControlWriteError::Refused("not now".into()));
+        assert!(!error.may_have_typed());
+    }
+
     /// A terminal whose program would be a tmux client, behind a fake tmux
     /// that records every command and refuses `send-keys` while `refuse` is set.
     fn tmux_terminal(
@@ -588,13 +669,11 @@ mod tests {
         let seen = calls.clone();
         let route = TmuxInputRoute::new(
             "muxel_p_1",
-            Arc::new(AtomicBool::new(false)),
+            true,
             move |args: &[String], stdin: Option<&[u8]>| {
                 seen.lock().push((args.to_vec(), stdin.map(<[u8]>::to_vec)));
                 Ok(match args[0].as_str() {
-                    "display-message" if args[4] == "#{session_name}:#{pane_id}" => {
-                        output(0, "muxel_p_1:%7\n", "")
-                    }
+                    "list-panes" => output(0, AGENT_PANES, ""),
                     "display-message" => output(0, "%7\n", ""),
                     "send-keys" if refuse.load(Ordering::Acquire) => output(1, "", "not now\n"),
                     _ => output(0, "", ""),
@@ -611,15 +690,15 @@ mod tests {
         (session, rx, calls)
     }
 
-    /// Master pasted into the tmux client what a direct paste sends, by the
-    /// client terminal's own bracketed-paste mode; tmux carried that to the
-    /// pane. Through tmux the pane gets the same bytes.
+    /// muxel sees only the client terminal's bracketed-paste mode, which can
+    /// differ from the agent pane's, so a paste through tmux is the same bytes
+    /// either way: line breaks as CR and no ESC, bracketed by tmux only if the
+    /// pane asked.
     #[test]
-    fn a_paste_through_tmux_sends_what_a_direct_paste_would() {
+    fn a_paste_through_tmux_is_the_same_whatever_the_clients_mode() {
         let (session, _rx, calls) = tmux_terminal(Arc::default());
-        let text = "one\r\ntwo\nthree\x1b[1m";
+        let text = "one\r\ntwo\nthree\x1b[201~four\r";
         finish(session.control_write(ControlInput::Paste(text.into()))).unwrap();
-        // tmux turns on its client's bracketed-paste mode for a pane that asks.
         session.process_output(b"\x1b[?2004h");
         assert!(session.is_bracketed_paste());
         finish(session.control_write(ControlInput::Paste(text.into()))).unwrap();
@@ -629,22 +708,10 @@ mod tests {
             .filter(|(args, _)| args[0] == "load-buffer")
             .collect();
         assert_eq!(pastes.len(), 2);
-        assert_eq!(
-            pastes[0].1.as_deref(),
-            Some(&b"one\rtwo\rthree\x1b[1m"[..]),
-            "outside bracketed paste: line breaks as CR, ESC kept"
-        );
-        assert_eq!(
-            pastes[1].1.as_deref(),
-            Some(&b"one\r\ntwo\nthree[1m"[..]),
-            "inside bracketed paste: line breaks kept, ESC removed"
-        );
-        assert!(
-            pastes
-                .iter()
-                .all(|(args, _)| args.contains(&"-p".to_string())),
-            "tmux brackets either only if the pane asked"
-        );
+        for (args, bytes) in pastes {
+            assert_eq!(bytes.as_deref(), Some(&b"one\rtwo\rthree[201~four\r"[..]));
+            assert!(args.contains(&"-p".to_string()) && args.contains(&"-r".to_string()));
+        }
         drop(calls);
         session.kill();
     }
@@ -687,7 +754,7 @@ mod tests {
         assert_eq!(
             commands(&calls),
             [
-                "display-message",
+                "list-panes",
                 "load-buffer",
                 "delete-buffer",
                 "display-message"
@@ -717,33 +784,26 @@ mod tests {
         ] {
             let error = deliver(&input, write).unwrap_err();
             assert!(
-                matches!(&error, ControlWriteError::Unresolved(why) if why.contains("%7 this terminal showed")),
+                matches!(&error, ControlWriteError::Unresolved(why) if why.contains("tmux pane %7 is gone")),
                 "{error:?}"
             );
+            assert!(!error.may_have_typed());
         }
         assert_eq!(input.pinned_pane().as_deref(), Some("%7"));
-        let pin_queries = calls
-            .lock()
+        let lookups = commands(&calls)
             .iter()
-            .filter(|(args, _)| {
-                args.last()
-                    .is_some_and(|f| f == "#{session_name}:#{pane_id}")
-            })
+            .filter(|command| *command == "list-panes")
             .count();
-        assert_eq!(
-            pin_queries, 1,
-            "a pane that has gone is never looked up again"
-        );
+        assert_eq!(lookups, 1, "a pane that has gone is never looked up again");
     }
 
     #[test]
     fn an_unanswered_command_is_reported_as_unknown_not_refused() {
         let (route, _) = route(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")));
         let input = TmuxInput::new(route);
-        assert!(matches!(
-            deliver(&input, ControlInput::Submit),
-            Err(ControlWriteError::Unknown(_))
-        ));
+        let error = deliver(&input, ControlInput::Submit).unwrap_err();
+        assert!(matches!(error, ControlWriteError::Unknown(_)), "{error:?}");
+        assert!(error.may_have_typed());
     }
 
     #[test]
@@ -752,34 +812,119 @@ mod tests {
         let seen = calls.clone();
         let route = TmuxInputRoute::new(
             "muxel_p_1",
-            Arc::new(AtomicBool::new(false)),
+            true,
             move |args: &[String], stdin: Option<&[u8]>| {
                 seen.lock().push((args.to_vec(), stdin.map(<[u8]>::to_vec)));
-                // No such session: display-message formats without a target.
-                Ok(output(0, ":\n", ""))
+                // The agent's pane has gone; the user's split is left.
+                Ok(output(0, "muxel_p_1:%9:0\n", ""))
             },
         );
         let input = TmuxInput::new(route);
         let error = deliver(&input, ControlInput::Paste("x".into())).unwrap_err();
         assert!(
-            matches!(error, ControlWriteError::Unresolved(_)),
+            matches!(&error, ControlWriteError::Unresolved(why) if why.contains("created with has gone")),
             "{error:?}"
         );
+        // Inside the backoff window: refused without running tmux.
+        let error = deliver(&input, ControlInput::Submit).unwrap_err();
         assert!(
-            calls
-                .lock()
-                .iter()
-                .all(|(args, _)| args[0] == "display-message"),
-            "nothing is typed anywhere without a pinned pane"
+            matches!(&error, ControlWriteError::Unresolved(why) if why.contains("the next can run in 2 s")),
+            "{error:?}"
+        );
+        assert_eq!(
+            commands(&calls),
+            ["list-panes"],
+            "nothing is typed anywhere without the agent's pane"
         );
         assert_eq!(input.pinned_pane(), None);
+    }
+
+    /// The wait after each failed lookup in a row: two seconds, doubling, at
+    /// most two minutes.
+    #[test]
+    fn pane_lookups_back_off_from_two_seconds_to_two_minutes() {
+        let secs = |failures| PinBackoff::delay(failures).as_secs();
+        let schedule: Vec<u64> = (0..=9).map(secs).collect();
+        assert_eq!(schedule, [0, 2, 4, 8, 16, 32, 64, 120, 120, 120]);
+        assert_eq!(secs(u32::MAX), 120);
+
+        let t0 = Instant::now();
+        let mut backoff = PinBackoff::default();
+        assert_eq!(backoff.wait(t0), None, "the first lookup runs at once");
+        backoff.failed(t0);
+        assert_eq!(backoff.wait(t0), Some(Duration::from_secs(2)));
+        assert_eq!(
+            backoff.wait(t0 + Duration::from_millis(500)),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(backoff.wait(t0 + Duration::from_secs(2)), None);
+        backoff.failed(t0 + Duration::from_secs(2));
+        assert_eq!(
+            backoff.wait(t0 + Duration::from_secs(2)),
+            Some(Duration::from_secs(4))
+        );
+    }
+
+    /// A pane that can't be found runs one lookup per backoff window however
+    /// often writes come, and once found is never looked up again.
+    #[test]
+    fn writes_inside_the_backoff_window_run_no_tmux() {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let found = Arc::new(AtomicBool::new(false));
+        let route = {
+            let (lookups, found) = (lookups.clone(), found.clone());
+            TmuxInputRoute::new("muxel_p_1", true, move |args: &[String], _| {
+                assert_eq!(args[0], "list-panes");
+                lookups.fetch_add(1, Ordering::SeqCst);
+                Ok(if found.load(Ordering::SeqCst) {
+                    output(0, AGENT_PANES, "")
+                } else {
+                    output(
+                        1,
+                        "",
+                        "ssh: connect to host h port 22: Connection refused\n",
+                    )
+                })
+            })
+        };
+        let shared = Shared {
+            pin: Mutex::new(None),
+            backoff: Mutex::new(PinBackoff::default()),
+            closed: AtomicBool::new(false),
+        };
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        // A write every second; lookups run only at 0, 2, 6, 14 and 30 s.
+        let mut ran_at = Vec::new();
+        for second in 0..=30 {
+            let before = lookups.load(Ordering::SeqCst);
+            let error = pinned_pane(&route, &shared, at(second)).unwrap_err();
+            assert!(
+                matches!(error, ControlWriteError::Unresolved(_)),
+                "{error:?}"
+            );
+            if lookups.load(Ordering::SeqCst) > before {
+                ran_at.push(second);
+            }
+        }
+        assert_eq!(ran_at, [0, 2, 6, 14, 30]);
+
+        found.store(true, Ordering::SeqCst);
+        assert!(
+            pinned_pane(&route, &shared, at(31)).is_err(),
+            "still waiting"
+        );
+        assert_eq!(pinned_pane(&route, &shared, at(62)).unwrap(), "%7");
+        assert_eq!(pinned_pane(&route, &shared, at(63)).unwrap(), "%7");
+        assert_eq!(lookups.load(Ordering::SeqCst), 6);
     }
 }
 
 /// ctl input through a real tmux, to an agent pane behind an attached client,
 /// on a throwaway socket no muxel profile uses. No shell grant exists at this
 /// level: these writes are what an agent pane gets with the grant off. Skipped
-/// where tmux isn't installed; CI installs it.
+/// where tmux isn't installed; CI installs it. Nothing here runs
+/// `capture-pane`: what the client shows is read from its own terminal.
 #[cfg(all(test, unix))]
 mod real_tmux_tests {
     use super::tests::finish;
@@ -790,16 +935,31 @@ mod real_tmux_tests {
         io::{self, Write as _},
         path::{Path, PathBuf},
         process::{Command, Output, Stdio},
-        sync::{Arc, atomic::AtomicBool},
+        sync::Arc,
         time::{Duration, Instant},
     };
 
-    /// The agent: it asks for bracketed paste, as agents' editors do, takes its
-    /// terminal raw so every byte arrives as sent, says it is ready (tmux reads
-    /// a pane's output in order, so its mode is set once that shows) and
-    /// records every byte in `$1`.
-    const AGENT: &str =
-        "printf '\\033[?2004h'\nstty raw -echo\nprintf 'agent ready\\r\\n'\nexec cat > \"$1\"\n";
+    /// A recorder pane: `sh RECORDER <file> <label> <mode>`. With mode
+    /// `bracketed` it asks for bracketed paste, as agents' editors do. It takes
+    /// its terminal raw so every byte arrives as sent, says `<label> ready`
+    /// (tmux reads a pane's output in order, so its paste mode is set once that
+    /// shows in the client) and records every byte in `<file>`.
+    const RECORDER: &str = "[ \"$3\" = bracketed ] && printf '\\033[?2004h'\nstty raw -echo\nprintf '%s ready\\r\\n' \"$2\"\nexec cat > \"$1\"\n";
+
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Bracketed,
+        Plain,
+    }
+
+    impl Mode {
+        fn arg(self) -> &'static str {
+            match self {
+                Self::Bracketed => "bracketed",
+                Self::Plain => "plain",
+            }
+        }
+    }
 
     fn tmux_command(socket: &str) -> Command {
         let mut tmux = Command::new("tmux");
@@ -826,71 +986,103 @@ mod real_tmux_tests {
         child.wait_with_output()
     }
 
+    /// A terminal running `tmux new-session -A` for `name`: it creates the
+    /// session with the agent recorder as its program, or attaches to it.
+    fn client(socket: &str, name: &str, launch: &[String]) -> (Arc<TerminalSession>, PtyReceiver) {
+        let mut args: Vec<String> = ["-L", socket, "-f", "/dev/null"].map(String::from).into();
+        args.extend(["new-session", "-A", "-s", name, "--"].map(String::from));
+        args.extend(launch.iter().cloned());
+        let route_socket = socket.to_string();
+        let route =
+            TmuxInputRoute::new(name, true, move |args: &[String], stdin: Option<&[u8]>| {
+                run(&route_socket, args, stdin)
+            });
+        let mut spec = CommandSpec::program("tmux", args).with_tmux_input(route);
+        spec.env_remove.push("TMUX".into());
+        TerminalSession::spawn(spec, 80, 24).expect("spawn tmux client")
+    }
+
     struct Agent {
         socket: String,
         name: String,
         dir: PathBuf,
         script: PathBuf,
         recv: PathBuf,
+        launch: Vec<String>,
         session: Arc<TerminalSession>,
         rx: PtyReceiver,
     }
 
+    /// Another client terminal on the agent's session, as after muxel
+    /// restarts or reconnects.
+    struct Client {
+        session: Arc<TerminalSession>,
+        _rx: PtyReceiver,
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            self.session.kill();
+        }
+    }
+
     impl Agent {
         /// A tmux client in a terminal, attached to a session whose one pane
-        /// runs the agent, with the client's tmux pane already fixed for ctl
-        /// input (as it is at attach while outside control is on).
+        /// runs an agent that asks for bracketed paste. No ctl write has looked
+        /// up its pane yet.
         fn start() -> Option<Self> {
-            if Command::new("tmux").arg("-V").output().is_err() {
+            Self::start_as(Mode::Bracketed)
+        }
+
+        fn start_as(mode: Mode) -> Option<Self> {
+            let Ok(version) = Command::new("tmux").arg("-V").output() else {
                 eprintln!("tmux is not installed; skipping");
                 return None;
-            }
+            };
             let id = uuid::Uuid::new_v4().simple().to_string();
             let socket = format!("mxltest-{id}");
             let dir = std::env::temp_dir().join(format!("muxel-ctl-tmux-{id}"));
             std::fs::create_dir_all(&dir).unwrap();
-            let script = dir.join("agent.sh");
-            std::fs::write(&script, AGENT).unwrap();
+            let script = dir.join("recorder.sh");
+            std::fs::write(&script, RECORDER).unwrap();
             let recv = dir.join("agent.bin");
             let name = format!("muxel_ctl_{}", &id[..8]);
-            let mut args: Vec<String> = ["-L", &socket, "-f", "/dev/null"].map(String::from).into();
-            args.extend(["new-session", "-A", "-s", &name, "--", "sh"].map(String::from));
-            args.push(script.display().to_string());
-            args.push(recv.display().to_string());
-            let route_socket = socket.clone();
-            let route = TmuxInputRoute::new(
-                name.clone(),
-                Arc::new(AtomicBool::new(true)),
-                move |args: &[String], stdin: Option<&[u8]>| run(&route_socket, args, stdin),
-            );
-            let mut spec = CommandSpec::program("tmux", args).with_tmux_input(route);
-            spec.env_remove.push("TMUX".into());
-            let (session, rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn tmux client");
+            let launch: Vec<String> = vec![
+                "sh".into(),
+                script.display().to_string(),
+                recv.display().to_string(),
+                "agent".into(),
+                mode.arg().into(),
+            ];
+            let (session, rx) = client(&socket, &name, &launch);
             let agent = Self {
                 socket,
                 name,
                 dir,
                 script,
                 recv,
+                launch,
                 session,
                 rx,
             };
-            // A ctl paste is prepared by the client terminal's paste mode, as
-            // a direct paste is, so wait until tmux has set it for the agent.
-            agent.until("the client attached and its pane was fixed", |agent| {
+            agent.until("the client attached to the agent", |agent| {
                 agent.recv.exists()
-                    && agent.screen().contains("agent ready")
+                    && agent.shows("agent ready")
                     && agent.format("#{session_attached}") == "1"
-                    && agent.session.tmux_input_pane().is_some()
-                    && agent.session.is_bracketed_paste()
             });
             assert!(agent.session.delivers_through_tmux());
+            assert_eq!(agent.session.tmux_input_pane(), None);
             eprintln!(
-                "real tmux: {} attached, ctl input pinned to {}",
-                agent.name,
-                agent.session.tmux_input_pane().unwrap()
+                "real {}: {} attached",
+                String::from_utf8_lossy(&version.stdout).trim(),
+                agent.name
             );
             Some(agent)
+        }
+
+        /// Whether the client's terminal shows `text`: what tmux drew there.
+        fn shows(&self, text: &str) -> bool {
+            self.session.recent_text(50).contains(text)
         }
 
         fn tmux(&self, args: &[&str]) -> Output {
@@ -911,6 +1103,7 @@ mod real_tmux_tests {
             format!("={}:", self.name)
         }
 
+        /// `format` for the session's active pane.
         fn format(&self, format: &str) -> String {
             let out = tmux_command(&self.socket)
                 .args(["display-message", "-p", "-t", &self.target(), format])
@@ -918,15 +1111,6 @@ mod real_tmux_tests {
                 .output()
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim_end().to_string()
-        }
-
-        fn screen(&self) -> String {
-            let out = tmux_command(&self.socket)
-                .args(["capture-pane", "-p", "-t", &self.target()])
-                .stdin(Stdio::null())
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).into_owned()
         }
 
         fn windows(&self) -> usize {
@@ -944,17 +1128,73 @@ mod real_tmux_tests {
         }
 
         /// Run another recorder in a new pane made by `command` (such as
-        /// `new-window`), as a user would; returns the file it records into.
-        fn open(&self, command: &str, label: &str) -> PathBuf {
+        /// `new-window`) with it as the pane's program, as a user would, and
+        /// wait until it is ready; returns the file it records into.
+        fn open(&self, command: &str, label: &str, mode: Mode) -> PathBuf {
             let recv = self.dir.join(format!("{label}.bin"));
             let (target, script, file) = (
                 self.target(),
                 self.script.display().to_string(),
                 recv.display().to_string(),
             );
-            self.tmux(&[command, "-t", &target, "sh", &script, &file]);
-            self.until(&format!("the {label} started"), |_| recv.exists());
+            self.tmux(&[
+                command,
+                "-t",
+                &target,
+                "sh",
+                &script,
+                &file,
+                label,
+                mode.arg(),
+            ]);
+            self.until(&format!("the {label} was ready"), |agent| {
+                recv.exists() && agent.shows(&format!("{label} ready"))
+            });
             recv
+        }
+
+        /// Split the window with no command, as a user's split runs their
+        /// shell (here a recorder set as the default shell): the new pane has
+        /// no start command, and is active.
+        fn split_shell(&self, label: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt as _;
+            let recv = self.dir.join(format!("{label}.bin"));
+            let shell = self.dir.join(format!("{label}.sh"));
+            std::fs::write(
+                &shell,
+                format!(
+                    "#!/bin/sh\nexec sh '{}' '{}' '{label}' plain\n",
+                    self.script.display(),
+                    recv.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            self.tmux(&[
+                "set-option",
+                "-g",
+                "default-shell",
+                &shell.display().to_string(),
+            ]);
+            self.tmux(&["split-window", "-t", &self.target()]);
+            self.until(&format!("the {label} was ready"), |agent| {
+                recv.exists() && agent.shows(&format!("{label} ready"))
+            });
+            assert_eq!(
+                self.format("#{pane_start_command}"),
+                "",
+                "a split without a command has no start command"
+            );
+            recv
+        }
+
+        /// A second client terminal attached to the same session.
+        fn attach_again(&self) -> Client {
+            let (session, rx) = client(&self.socket, &self.name, &self.launch);
+            self.until("the second client attached", |agent| {
+                agent.format("#{session_attached}") == "2"
+            });
+            Client { session, _rx: rx }
         }
 
         fn write(&self, input: ControlInput) -> Result<(), ControlWriteError> {
@@ -972,8 +1212,8 @@ mod real_tmux_tests {
             read(&self.recv)
         }
 
-        /// Pump the client's output (which fixes the pane, as muxel's terminal
-        /// does) until `ready`, or fail the test.
+        /// Pump the client's output into its terminal, as muxel's does, until
+        /// `ready`, or fail the test.
         fn until(&self, what: &str, ready: impl Fn(&Self) -> bool) {
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
@@ -997,6 +1237,19 @@ mod real_tmux_tests {
         fn until_received(&self, expected: &[u8]) {
             let what = format!("the agent got {:?}", String::from_utf8_lossy(expected));
             self.until(&what, |agent| agent.received() == expected);
+        }
+
+        /// What the client terminal's own paste mode is now, for the log: muxel
+        /// sees only this, never the agent pane's.
+        fn log_client_mode(&self, when: &str) {
+            eprintln!(
+                "{when}: the client terminal's bracketed paste is {}",
+                if self.session.is_bracketed_paste() {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
         }
     }
 
@@ -1070,11 +1323,17 @@ mod real_tmux_tests {
     #[test]
     fn a_multi_line_unicode_prompt_arrives_as_one_paste_and_enter_submits_once() {
         let Some(agent) = Agent::start() else { return };
-        let prompt = "first line \u{2713} \u{e9}\nsecond \u{2014} \u{65e5}\u{672c}; $HOME `id` 'q' \"d\" \\\n\tthird\x1b[31m end";
+        let prompt = "first line \u{2713} \u{e9}\nsecond \u{2014} \u{65e5}\u{672c}; $HOME `id` 'q' \"d\" \\\r\n\tthird\x1b[31m end";
         agent.write(ControlInput::Paste(prompt.into())).unwrap();
         agent.write(ControlInput::Submit).unwrap();
         let mut expected = b"\x1b[200~".to_vec();
-        expected.extend(prompt.replace('\x1b', "").as_bytes());
+        expected.extend(
+            prompt
+                .replace('\x1b', "")
+                .replace("\r\n", "\r")
+                .replace('\n', "\r")
+                .as_bytes(),
+        );
         expected.extend(b"\x1b[201~\r");
         agent.until_received(&expected);
         let buffers = agent.buffers();
@@ -1087,12 +1346,89 @@ mod real_tmux_tests {
         assert_eq!(agent.received(), expected);
     }
 
+    /// The agent's pane asked for bracketed paste and the user's active pane
+    /// didn't. tmux brackets a `-p` paste only for a pane that asked, and muxel
+    /// can't see which did, so a prompt holding the bracket's own end sequence
+    /// must still arrive as one paste.
     #[test]
-    fn ctl_input_stays_on_the_pinned_pane_after_the_user_opens_a_window_and_a_split() {
+    fn a_bracketed_agent_gets_one_whole_paste_while_an_unbracketed_pane_is_active() {
+        let Some(agent) = Agent::start_as(Mode::Bracketed) else {
+            return;
+        };
+        let split = agent.open("split-window", "split", Mode::Plain);
+        agent.log_client_mode("an unbracketed split active");
+        agent
+            .write(ControlInput::Paste("one\x1b[201~two\r\nthree\nfour".into()))
+            .unwrap();
+        agent.write(ControlInput::Submit).unwrap();
+        let expected = b"\x1b[200~one[201~two\rthree\rfour\x1b[201~\r";
+        agent.until_received(expected);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(agent.received(), expected);
+        assert!(read(&split).is_empty(), "{:?}", read(&split));
+    }
+
+    /// The reverse: the agent's pane didn't ask for bracketed paste and the
+    /// user's active pane did. The agent gets the prompt as typed lines, each
+    /// break a CR, the key Enter sends, and no ESC to start a sequence.
+    #[test]
+    fn an_unbracketed_agent_gets_typed_lines_while_a_bracketed_pane_is_active() {
+        let Some(agent) = Agent::start_as(Mode::Plain) else {
+            return;
+        };
+        let split = agent.open("split-window", "split", Mode::Bracketed);
+        agent.log_client_mode("a bracketed split active");
+        agent
+            .write(ControlInput::Paste("one\r\ntwo\nthree\x1b[1m end".into()))
+            .unwrap();
+        agent.write(ControlInput::Submit).unwrap();
+        let expected = b"one\rtwo\rthree[1m end\r";
+        agent.until_received(expected);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(agent.received(), expected);
+        assert!(read(&split).is_empty(), "{:?}", read(&split));
+    }
+
+    /// The user splits the agent's window and leaves their shell active; then
+    /// the first ctl write, and the first from a client attached later (muxel
+    /// restarted or reconnected), both find the agent's pane.
+    #[test]
+    fn the_agents_pane_is_found_whichever_pane_the_user_left_active() {
         let Some(agent) = Agent::start() else { return };
+        let agent_pane = agent.format("#{pane_id}");
+        let shell = agent.split_shell("shell");
+        assert_ne!(
+            agent.format("#{pane_id}"),
+            agent_pane,
+            "the shell is active"
+        );
+
+        agent.write(ControlInput::Paste("first".into())).unwrap();
+        agent.until_received(b"\x1b[200~first\x1b[201~");
+        assert_eq!(agent.session.tmux_input_pane(), Some(agent_pane.clone()));
+
+        let again = agent.attach_again();
+        assert_eq!(again.session.tmux_input_pane(), None);
+        finish(
+            again
+                .session
+                .control_write(ControlInput::Paste("again".into())),
+        )
+        .unwrap();
+        finish(again.session.control_write(ControlInput::Submit)).unwrap();
+        agent.until_received(b"\x1b[200~first\x1b[201~\x1b[200~again\x1b[201~\r");
+        assert_eq!(again.session.tmux_input_pane(), Some(agent_pane));
+        assert!(read(&shell).is_empty(), "{:?}", read(&shell));
+    }
+
+    #[test]
+    fn ctl_input_stays_on_the_agents_pane_after_the_user_opens_a_window_and_a_split() {
+        let Some(agent) = Agent::start() else { return };
+        agent.write(ControlInput::Paste("first".into())).unwrap();
+        agent.until_received(b"\x1b[200~first\x1b[201~");
         let pinned = agent.session.tmux_input_pane().unwrap();
-        let window = agent.open("new-window", "window");
-        let split = agent.open("split-window", "split");
+        let window = agent.open("new-window", "window", Mode::Bracketed);
+        let split = agent.open("split-window", "split", Mode::Bracketed);
         assert_ne!(
             agent.format("#{pane_id}"),
             pinned,
@@ -1102,7 +1438,7 @@ mod real_tmux_tests {
             .write(ControlInput::Paste("to the agent".into()))
             .unwrap();
         agent.write(ControlInput::Submit).unwrap();
-        agent.until_received(b"\x1b[200~to the agent\x1b[201~\r");
+        agent.until_received(b"\x1b[200~first\x1b[201~\x1b[200~to the agent\x1b[201~\r");
         assert_eq!(agent.session.tmux_input_pane(), Some(pinned));
         assert!(read(&window).is_empty() && read(&split).is_empty());
     }
@@ -1110,9 +1446,11 @@ mod real_tmux_tests {
     #[test]
     fn a_vanished_pane_fails_delivery_and_nothing_is_typed_anywhere() {
         let Some(agent) = Agent::start() else { return };
+        agent.write(ControlInput::Paste("first".into())).unwrap();
+        agent.until_received(b"\x1b[200~first\x1b[201~");
         let pinned = agent.session.tmux_input_pane().unwrap();
         // The session, and its client, live on in another window.
-        let window = agent.open("new-window", "window");
+        let window = agent.open("new-window", "window", Mode::Bracketed);
         agent.tmux(&["kill-pane", "-t", &pinned]);
 
         for write in [
@@ -1134,9 +1472,34 @@ mod real_tmux_tests {
             !buffers.contains("muxel-ctl-"),
             "the failed paste left its buffer: {buffers}"
         );
-        // The pane is never re-resolved to whatever is active now.
+        // The pane is never looked up again for whatever is active now.
         assert_eq!(agent.session.tmux_input_pane(), Some(pinned));
         std::thread::sleep(Duration::from_millis(300));
         assert!(read(&window).is_empty(), "{:?}", read(&window));
+    }
+
+    /// The agent's pane has gone before any ctl write and only the user's
+    /// shell is left: no pane is found, nothing is typed, and the next lookup
+    /// waits out its backoff.
+    #[test]
+    fn with_the_agents_pane_gone_the_users_shell_is_never_found() {
+        let Some(agent) = Agent::start() else { return };
+        let agent_pane = agent.format("#{pane_id}");
+        let shell = agent.split_shell("shell");
+        agent.tmux(&["kill-pane", "-t", &agent_pane]);
+
+        let failed = agent.write(ControlInput::Paste("lost".into()));
+        assert!(
+            matches!(&failed, Err(ControlWriteError::Unresolved(why)) if why.contains("created with has gone")),
+            "{failed:?}"
+        );
+        let failed = agent.write(ControlInput::Submit);
+        assert!(
+            matches!(&failed, Err(ControlWriteError::Unresolved(why)) if why.contains("the next can run in")),
+            "{failed:?}"
+        );
+        assert_eq!(agent.session.tmux_input_pane(), None);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(read(&shell).is_empty(), "{:?}", read(&shell));
     }
 }
