@@ -3772,6 +3772,31 @@ mod settings_tests {
     }
 
     #[test]
+    fn retired_close_confirmations_still_load_and_keep_their_values() {
+        // Settings from before the close rule replaced per-kind confirmation.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        let fields = v.as_object_mut().unwrap();
+        fields.insert("confirm_close_editor".into(), true.into());
+        fields.insert("confirm_close_diff".into(), true.into());
+        fields.insert("confirm_close_terminal".into(), false.into());
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert!(s.confirm_close_editor && s.confirm_close_diff);
+        assert!(!s.confirm_close_terminal);
+        // Missing, the busy-terminal question stays on.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        for key in [
+            "confirm_close_terminal",
+            "confirm_close_editor",
+            "confirm_close_diff",
+        ] {
+            v.as_object_mut().unwrap().remove(key);
+        }
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert!(s.confirm_close_terminal);
+        assert!(!s.confirm_close_editor && !s.confirm_close_diff);
+    }
+
+    #[test]
     fn settings_terminal_mouse_default_and_round_trip() {
         assert_eq!(Settings::default().terminal_mouse, "copy_paste");
         // An old config missing the key still loads, defaulting to copy_paste.

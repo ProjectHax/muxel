@@ -5,7 +5,7 @@ use muxel_core::control::AgentState;
 use muxel_core::recoverable_close::{
     CloseDecision, CloseEvidence, CloseFacts, CloseStage, HeldLaunch, HeldView, UndoLaunch, decide,
     departure_finalizes, exit_proves_closed, expired_close_may_finish, held_launch, may_finalize,
-    rehide_held, shell_close_evidence, undo_launch,
+    rehide_held, session_may_outlive, shell_close_evidence, undo_launch,
 };
 use muxel_terminal::TerminalStatusReason;
 use std::borrow::Cow;
@@ -124,16 +124,15 @@ impl MuxelApp {
     /// which may still be running the agent whatever the local client shows.
     /// The same panes `teardown_closed_instance` kills or ledgers a session for.
     fn close_session_may_outlive(&self, inst: &Instance) -> bool {
-        if inst.literal_argv {
-            return false;
-        }
-        match self.workspace.project(inst.project_id) {
-            Some(project) if project.is_remote() => self
-                .remote_host_for_instance(inst.id)
-                .is_some_and(|host| !host.os.is_windows()),
-            Some(_) => inst.tmux_session.is_some(),
-            None => false,
-        }
+        let remote_unix = match self.workspace.project(inst.project_id) {
+            Some(project) if project.is_remote() => Some(
+                self.remote_host_for_instance(inst.id)
+                    .is_some_and(|host| !host.os.is_windows()),
+            ),
+            Some(_) => None,
+            None => return false,
+        };
+        session_may_outlive(inst.literal_argv, remote_unix, inst.tmux_session.is_some())
     }
 
     pub(super) fn close_facts(&self, iid: Uuid, cx: &App) -> CloseFacts {
@@ -1318,10 +1317,15 @@ impl MuxelApp {
 
 #[cfg(test)]
 mod tests {
-    use super::reason_close_evidence;
+    use super::{CloseGroup, reason_close_evidence};
     use muxel_core::control::AgentState;
-    use muxel_core::recoverable_close::{CloseDecision, CloseFacts, decide};
+    use muxel_core::recoverable_close::{
+        CloseDecision, CloseFacts, CloseStage, decide, departure_finalizes,
+    };
     use muxel_terminal::{ProgramStatusKind, TerminalStatusReason};
+    use std::collections::HashMap;
+    use std::time::Instant;
+    use uuid::Uuid;
 
     fn facts(status: AgentState, reason: TerminalStatusReason) -> CloseFacts {
         CloseFacts {
@@ -1363,5 +1367,41 @@ mod tests {
             ),
             CloseDecision::Ask
         );
+    }
+
+    #[test]
+    fn a_close_waiting_on_the_shared_layout_is_still_a_running_countdown() {
+        let mut group = CloseGroup {
+            id: Uuid::new_v4(),
+            members: Vec::new(),
+            deadline: Instant::now(),
+            undo_until: 0,
+            needs_decision: false,
+            checking: false,
+            undoing: false,
+            sync_marks: None,
+            layouts: HashMap::new(),
+            focus: None,
+            caller: None,
+        };
+        assert_eq!(group.stage(), CloseStage::CountingDown);
+        assert!(!group.syncing());
+        // Past its deadline, waiting for a read: leaving still finishes it.
+        group.sync_marks = Some(vec![(Uuid::new_v4(), 3)]);
+        assert!(group.syncing());
+        assert!(departure_finalizes(group.stage()));
+        // Once read, the check, decision and Undo keep their own stages.
+        for (checking, needs_decision, undoing, stage) in [
+            (true, false, false, CloseStage::Checking),
+            (false, true, false, CloseStage::AwaitingDecision),
+            (false, true, true, CloseStage::Undoing),
+        ] {
+            group.checking = checking;
+            group.needs_decision = needs_decision;
+            group.undoing = undoing;
+            assert_eq!(group.stage(), stage);
+            assert!(!group.syncing(), "{stage:?}");
+            assert!(!departure_finalizes(stage), "{stage:?}");
+        }
     }
 }

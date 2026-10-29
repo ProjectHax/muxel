@@ -58,6 +58,18 @@ pub enum CloseDecision {
     Hold { forced: bool },
 }
 
+/// [`CloseFacts::session_may_outlive`] for a pane: a local one with a recorded
+/// tmux session, or one of a project on a host (`remote_unix`: Some, and
+/// whether that host runs tmux). A literal command runs no tmux. These are the
+/// panes whose close kills a session, or ledgers one to kill.
+pub fn session_may_outlive(
+    literal_argv: bool,
+    remote_unix: Option<bool>,
+    local_tmux: bool,
+) -> bool {
+    !literal_argv && remote_unix.unwrap_or(local_tmux)
+}
+
 fn looks_dead(facts: CloseFacts) -> bool {
     matches!(
         facts.status,
@@ -246,7 +258,8 @@ mod recoverable_close_policy_tests {
     use super::{
         CloseDecision, CloseEvidence, CloseFacts, CloseStage, HeldLaunch, HeldView, LayoutReads,
         UndoLaunch, decide, departure_finalizes, exit_proves_closed, expired_close_may_finish,
-        held_launch, may_finalize, rehide_held, shell_close_evidence, undo_launch,
+        held_launch, may_finalize, rehide_held, session_may_outlive, shell_close_evidence,
+        undo_launch,
     };
     use crate::control::AgentState;
     use crate::{PaneNode, SplitDirection, TerminalLaunchReason, split};
@@ -567,6 +580,20 @@ mod recoverable_close_policy_tests {
             undo_launch(HeldLaunch::Settled, HeldView::Missing),
             UndoLaunch::Launch(TerminalLaunchReason::Recovery)
         );
+    }
+
+    #[test]
+    fn only_panes_whose_close_kills_a_tmux_session_may_outlive_it() {
+        // Local: only with a recorded session.
+        assert!(session_may_outlive(false, None, true));
+        assert!(!session_may_outlive(false, None, false));
+        // Remote: a Unix host always runs the pane in tmux; Windows never.
+        assert!(session_may_outlive(false, Some(true), false));
+        assert!(!session_may_outlive(false, Some(false), true));
+        // A literal command runs no tmux, wherever it is.
+        for remote_unix in [None, Some(true), Some(false)] {
+            assert!(!session_may_outlive(true, remote_unix, true));
+        }
     }
 
     #[test]
