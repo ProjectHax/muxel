@@ -37,7 +37,8 @@ use uuid::Uuid;
 
 #[path = "input_hold.rs"]
 mod input_hold;
-use input_hold::{InputGate, ShellMarks, ShellPrompt};
+pub(crate) use input_hold::InputGate;
+use input_hold::{ShellMarks, ShellPrompt};
 
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
 
@@ -704,6 +705,10 @@ pub struct CommandSpec {
     /// Where that task's startup reads the provider's title when the PTY can't
     /// see it (a tmux-wrapped pane). Unused by any other automation.
     pub title_source: Option<TitleSource>,
+    /// Set when this command is a tmux client: outside-control input then goes
+    /// to its tmux pane through tmux, never through the client. See
+    /// [`crate::control_input`].
+    pub tmux_input: Option<crate::TmuxInputRoute>,
     /// Shift+Tab presses to send at startup before typing (runner auto mode).
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input` (false = leave it in
@@ -746,6 +751,7 @@ impl CommandSpec {
             auto_mode_presses: 0,
             startup_turn: None,
             title_source: None,
+            tmux_input: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -772,6 +778,7 @@ impl CommandSpec {
             auto_mode_presses: 0,
             startup_turn: None,
             title_source: None,
+            tmux_input: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -853,6 +860,11 @@ impl CommandSpec {
 
     pub fn with_title_source(mut self, source: TitleSource) -> Self {
         self.title_source = Some(source);
+        self
+    }
+
+    pub fn with_tmux_input(mut self, route: crate::TmuxInputRoute) -> Self {
+        self.tmux_input = Some(route);
         self
     }
 }
@@ -1323,6 +1335,9 @@ pub struct TerminalSession {
     /// typed byte, so correlating one input with the next output batch is wrong
     /// when agent output is already queued.
     interactive_until: Mutex<Option<Instant>>,
+    /// The tmux route for outside-control input, when this terminal's program
+    /// is a tmux client (see [`crate::control_input`]).
+    tmux_input: Option<crate::control_input::TmuxInput>,
     _reader: JoinHandle<()>,
     #[cfg(all(test, windows))]
     _monitor: JoinHandle<()>,
@@ -1780,7 +1795,7 @@ impl TerminalSession {
             output_queue,
             killer,
             input_closed,
-            input_gate,
+            input_gate: input_gate.clone(),
             shell_prompt,
             input_stop: write_tx,
             child_pid,
@@ -1823,6 +1838,11 @@ impl TerminalSession {
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
             interactive_until: Mutex::new(None),
+            // ctl input through tmux honours the same close hold.
+            tmux_input: spec
+                .tmux_input
+                .clone()
+                .map(|route| crate::control_input::TmuxInput::new(route, input_gate.clone())),
             _reader: reader_handle,
             #[cfg(all(test, windows))]
             _monitor: monitor_handle,
@@ -2169,14 +2189,29 @@ impl TerminalSession {
     /// PTY. An error means the terminal's writer is gone (its program exited and
     /// a write has already failed); `Ok` only means the bytes were queued.
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return Err(std::io::Error::new(
+        self.check_input_gate()?;
+        self.admit_input(!data.is_empty());
+        self.try_write_raw(data)?;
+        self.shell_prompt.submitted(data);
+        Ok(())
+    }
+
+    /// Refuse input while the terminal is held for closing.
+    fn check_input_gate(&self) -> std::io::Result<()> {
+        if self.accepts_input_epoch(self.input_epoch()) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "terminal is closing",
-            ));
+            ))
         }
+    }
+
+    /// The bookkeeping every input write does before its bytes go anywhere.
+    fn admit_input(&self, nonempty: bool) {
         self.scroll_input_to_bottom();
-        if !data.is_empty() {
+        if nonempty {
             let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
             self.advance_input(Some(submitted_enter));
             if submitted_enter {
@@ -2186,9 +2221,6 @@ impl TerminalSession {
             // interaction window even if stream output is already queued.
             self.mark_interactive();
         }
-        self.try_write_raw(data)?;
-        self.shell_prompt.submitted(data);
-        Ok(())
     }
 
     /// Admit a complete submission (Enter, or text ending in Enter) and commit
@@ -2196,12 +2228,16 @@ impl TerminalSession {
     /// submission evidence unchanged, with no marker for a later key to consume.
     /// Success means queued bytes, not confirmation that the child consumed them.
     pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
-        if !self.accepts_input_epoch(self.input_epoch()) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "terminal is closing",
-            ));
-        }
+        // This API admits a known prompt after `paste_prompt` has checked
+        // the pane and input revision. Generic keyboard Enter uses
+        // `mark_turn_submitted` and cannot prove prompt intent.
+        self.try_submit(data, true)
+    }
+
+    /// [`Self::try_submit_input`], committing a prompt submission when `prompt`
+    /// and a plain one otherwise.
+    fn try_submit(&self, data: &[u8], prompt: bool) -> std::io::Result<()> {
+        self.check_input_gate()?;
         self.scroll_input_to_bottom();
         let mut writer = self.writer.lock();
         // The child can react as soon as write_all publishes bytes. Keep the
@@ -2213,16 +2249,89 @@ impl TerminalSession {
         writer.flush()?;
         self.shell_prompt.submitted(data);
         if !data.is_empty() {
-            // This API admits a known prompt after `paste_prompt` has checked
-            // the pane and input revision. Generic keyboard Enter uses
-            // `mark_turn_submitted` and cannot prove prompt intent.
-            self.evidence.lock().record_prompt_submission(submitted_at);
-            self.turn_submitted.store(true, Ordering::Relaxed);
-            self.advance_input(Some(true));
-            self.mark_interactive();
-            self.trigger_runtime();
+            self.commit_submission(submitted_at, prompt);
         }
         Ok(())
+    }
+
+    /// The facts an admitted submission commits together. A `prompt` one
+    /// follows a known prompt, as [`Self::mark_prompt_submitted`] records; any
+    /// other is a bare Enter, as [`Self::mark_turn_submitted`] records.
+    pub(crate) fn commit_submission(&self, submitted_at: SystemTime, prompt: bool) {
+        {
+            let mut evidence = self.evidence.lock();
+            if prompt {
+                evidence.record_prompt_submission(submitted_at);
+            } else {
+                evidence.record_submission(submitted_at);
+            }
+        }
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        self.advance_input(Some(true));
+        self.mark_interactive();
+        self.trigger_runtime();
+    }
+
+    /// Write outside-control (`muxel ctl`) input. A terminal whose program is a
+    /// tmux client gets it at its agent's tmux pane through tmux, queued in order
+    /// behind this terminal's earlier ctl writes; any other terminal gets the
+    /// same PTY bytes as [`Self::try_paste`], [`Self::try_write_input`] and
+    /// [`Self::try_submit_input`]. Either way the input revision and draft bit
+    /// move as for a PTY write, and a submit's facts are committed only once it
+    /// is admitted (for tmux, in [`crate::ControlWrite::finish`]).
+    pub fn control_write(self: &Arc<Self>, input: crate::ControlInput) -> crate::ControlWrite {
+        use crate::{ControlInput, ControlWrite, ControlWriteError};
+        let Some(tmux) = &self.tmux_input else {
+            let written = match &input {
+                ControlInput::Paste(text) => self.try_paste(text),
+                ControlInput::Keys { keys, app_cursor } => self.try_write_input(
+                    &keys
+                        .iter()
+                        .flat_map(|key| key.bytes(*app_cursor))
+                        .collect::<Vec<u8>>(),
+                ),
+                ControlInput::Submit => self.try_submit_input(b"\r"),
+                ControlInput::SubmitKey => self.try_submit(b"\r", false),
+            };
+            return ControlWrite::done(
+                written.map_err(|error| ControlWriteError::Closed(error.to_string())),
+            );
+        };
+        // Held for closing, the pane takes no ctl input by this route either.
+        // A write queued before the hold dies on the worker, even after Undo.
+        let epoch = self.input_epoch();
+        if !self.accepts_input_epoch(epoch) {
+            return ControlWrite::done(Err(ControlWriteError::Closed(
+                "terminal is closing".into(),
+            )));
+        }
+        let submit = match &input {
+            ControlInput::Submit | ControlInput::SubmitKey => {
+                self.scroll_input_to_bottom();
+                self.submission_pending.store(false, Ordering::Release);
+                let prompt = input == ControlInput::Submit;
+                Some((self.clone(), SystemTime::now(), prompt))
+            }
+            ControlInput::Paste(text) => {
+                self.admit_input(!text.is_empty());
+                None
+            }
+            ControlInput::Keys { keys, .. } => {
+                self.admit_input(!keys.is_empty());
+                None
+            }
+        };
+        ControlWrite::queued(tmux.deliver(input, epoch), submit)
+    }
+
+    /// Whether outside-control input reaches this terminal through tmux.
+    pub fn delivers_through_tmux(&self) -> bool {
+        self.tmux_input.is_some()
+    }
+
+    /// The tmux pane id outside-control input goes to, once found.
+    pub fn tmux_input_pane(&self) -> Option<String> {
+        self.tmux_input.as_ref()?.pinned_pane()
     }
 
     fn scroll_input_to_bottom(&self) {

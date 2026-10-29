@@ -8926,7 +8926,23 @@ impl MuxelApp {
             });
             let (program, args, env) =
                 self.remote_program_args(inst, &host, &control_path, &remote_cwd, &resolved);
-            (CommandSpec::program(program, args), None, env)
+            let mut spec = CommandSpec::program(program, args);
+            // The same gate and session `remote_program_args` launched the
+            // client with. Its ctl input runs tmux on that host over the host's
+            // commands master, as the shared claim does.
+            if let Some(i) = inst.filter(|i| host.use_tmux(i.use_tmux))
+                && let Some(integrations::RepoLoc::Remote(conn)) = self.repo_loc(i.project_id)
+            {
+                let session = integrations::profile_tmux_target(&i.tmux_target(&host.name));
+                spec = spec.with_tmux_input(muxel_terminal::TmuxInputRoute::new(
+                    session.name.clone(),
+                    resolved.program.is_some(),
+                    move |args: &[String], stdin: Option<&[u8]>| {
+                        integrations::run_remote_tmux_input(&conn, &session, args, stdin)
+                    },
+                ));
+            }
+            (spec, None, env)
         } else {
             // A resumed Claude conversation must launch from the cwd recorded in
             // its transcript. Claude rejects the UUID when invoked from another
@@ -8986,8 +9002,20 @@ impl MuxelApp {
                     let title = muxel_terminal::TitleSource::new(move || {
                         integrations::tmux_pane_title(&title_socket, &name)
                     });
+                    // Outside-control input goes to this client's pane through
+                    // the same server, never through the client.
+                    let input_socket = socket.clone();
+                    let input = muxel_terminal::TmuxInputRoute::new(
+                        session.name.clone(),
+                        resolved.program.is_some(),
+                        move |args: &[String], stdin: Option<&[u8]>| {
+                            integrations::run_local_tmux_input(&input_socket, args, stdin)
+                        },
+                    );
                     (
-                        CommandSpec::program("tmux", launch.args).with_title_source(title),
+                        CommandSpec::program("tmux", launch.args)
+                            .with_title_source(title)
+                            .with_tmux_input(input),
                         launch.env,
                     )
                 }

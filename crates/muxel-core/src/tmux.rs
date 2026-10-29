@@ -1230,9 +1230,401 @@ pub fn claim_write_args(
     }
 }
 
+// --- Outside-control input through tmux ---------------------------------------------
+//
+// `muxel ctl` input for a pane behind tmux goes to its tmux pane through tmux
+// commands, never through the attached client's input. The client decodes what it
+// reads with its key tables (the prefix, `prefix2`, `bind -n`, extended keys), so
+// bytes written there can run tmux commands; `paste-buffer` and `send-keys`
+// without `-K` reach the pane directly.
+//
+// Caller text never appears in a tmux argument: an argument ending in `;` splits
+// the command list (tmux 2.x `cmd_list_parse`, 3.x `cmd_parse_from_arguments`).
+// Prompt text goes on standard input to `load-buffer -`, and a typed character
+// goes as its code point (`0x3b`), or, outside ASCII, on standard input to a raw
+// paste. Every other argument is a fixed word, a pane id (`%12`) or a buffer name
+// muxel made. Version floors, from tmux's CHANGES and its 2.0 source:
+// `display-message -p` 1.2, `load-buffer -` 1.3, `paste-buffer -p` and hex keys
+// 1.7, `#{?…}` conditionals 1.8, named buffers and `#{pane_start_command}` 2.0,
+// the `=` exact-session target 2.1. A hex key above 0x7f is a plain character
+// only from 2.4, which is why those characters are pasted.
+
+/// Arguments for `tmux …` listing every pane of `session` (all its windows) as
+/// `session:%id:F`, where `F` is 1 when the pane was started with a command of
+/// its own and 0 when it runs the default shell. Read it with
+/// [`parse_control_pane`].
+pub fn control_pane_args(session: &str) -> Vec<String> {
+    vec![
+        "list-panes".to_string(),
+        "-s".to_string(),
+        "-t".to_string(),
+        format!("={session}:"),
+        "-F".to_string(),
+        "#{session_name}:#{pane_id}:#{?pane_start_command,1,0}".to_string(),
+    ]
+}
+
+/// The pane ctl input for `session` goes to: the agent's own pane, which is the
+/// pane the session was created with. tmux numbers panes in creation order and
+/// never reuses an id on a live server, so that is the session's lowest pane id
+/// for as long as it lives, whichever pane or window the user has made active.
+///
+/// A session muxel created with a program (`with_command`) started that pane
+/// with a command. If its lowest pane has none, the agent's pane has gone and a
+/// pane the user opened is left, so there is no pane to type into. Lines naming
+/// another session, and anything that isn't a pane id, are ignored.
+pub fn parse_control_pane(session: &str, out: &str, with_command: bool) -> Option<String> {
+    let (id, started) = out
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix(session)?.strip_prefix(":%")?;
+            let (digits, started) = rest.split_once(':')?;
+            let started = match started.trim_end_matches('\r') {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            if !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((digits.parse::<u64>().ok()?, started))
+        })
+        .min_by_key(|(id, _)| *id)?;
+    (started || !with_command).then(|| format!("%{id}"))
+}
+
+/// The paste buffer one ctl paste uses: its own, so two pastes never mix and
+/// none touches the user's buffers.
+pub fn control_buffer_name(nonce: Uuid) -> String {
+    format!("muxel-ctl-{}", nonce.simple())
+}
+
+/// Arguments for `tmux …` that read text from standard input into `buffer` and
+/// paste it into `pane` as one paste, byte for byte: `-r` stops `paste-buffer`
+/// rewriting line breaks, so the caller decides them ([`control_paste_input`]).
+/// With `bracket`, `-p` brackets the paste when the pane's program asked for
+/// bracketed paste; without it, the bytes arrive as plain input. `-d` deletes
+/// the buffer once it is pasted. A failed paste leaves the buffer: delete it
+/// with [`delete_buffer_args`].
+pub fn control_paste_args(buffer: &str, pane: &str, bracket: bool) -> Vec<String> {
+    let mut args = vec![
+        "load-buffer".to_string(),
+        "-b".to_string(),
+        buffer.to_string(),
+        "-".to_string(),
+        ";".to_string(),
+        "paste-buffer".to_string(),
+        "-d".to_string(),
+    ];
+    if bracket {
+        args.push("-p".to_string());
+    }
+    args.extend(
+        ["-r", "-b", buffer, "-t", pane]
+            .iter()
+            .map(|arg| (*arg).to_string()),
+    );
+    args
+}
+
+/// The bytes a ctl prompt is pasted as, the same whether or not the pane asked
+/// for bracketed paste, since muxel can't see that pane's mode (it sees only the
+/// mode of the pane the client shows). They are what tmux's own `paste-buffer
+/// -p` sends: each line break as CR, which a program outside bracketed paste
+/// reads as Enter, as typed, and one inside reads as a line break. ESC is
+/// removed, so the text can't end a bracketed paste early (`\e[201~`) and have
+/// the rest read as keys, and can't press keys in a pane outside one.
+pub fn control_paste_input(text: &str) -> Vec<u8> {
+    text.replace('\x1b', "")
+        .replace("\r\n", "\r")
+        .replace('\n', "\r")
+        .into_bytes()
+}
+
+/// Arguments for `tmux …` deleting one of muxel's paste buffers.
+pub fn delete_buffer_args(buffer: &str) -> Vec<String> {
+    vec![
+        "delete-buffer".to_string(),
+        "-b".to_string(),
+        buffer.to_string(),
+    ]
+}
+
+/// Arguments for `tmux …` printing `pane`'s own id while it exists. Asked after
+/// input to it was refused, to tell a pane that has gone from one that refused;
+/// a pane that's gone gets an error, or an empty line.
+pub fn control_pane_exists_args(pane: &str) -> Vec<String> {
+    vec![
+        "display-message".to_string(),
+        "-p".to_string(),
+        "-t".to_string(),
+        pane.to_string(),
+        "#{pane_id}".to_string(),
+    ]
+}
+
+/// The tmux key a ctl key presses. A character goes as its code point, which
+/// tmux sends as that character (hex keys since tmux 1.7). Only an ASCII
+/// character is that portable: tmux 2.1 to 2.3 read a code point above 0x7f as
+/// a key with modifier bits, so [`control_key_steps`] pastes those instead.
+pub fn key_name(key: crate::control::Key) -> String {
+    use crate::control::Key;
+    match key {
+        Key::Enter => "Enter".into(),
+        Key::Escape => "Escape".into(),
+        Key::Tab => "Tab".into(),
+        Key::BackTab => "BTab".into(),
+        Key::Up => "Up".into(),
+        Key::Down => "Down".into(),
+        Key::Right => "Right".into(),
+        Key::Left => "Left".into(),
+        Key::Home => "Home".into(),
+        Key::End => "End".into(),
+        Key::Backspace => "BSpace".into(),
+        Key::Delete => "DC".into(),
+        Key::PageUp => "PPage".into(),
+        Key::PageDown => "NPage".into(),
+        Key::Space => "Space".into(),
+        Key::Ctrl(c) => format!("C-{c}"),
+        Key::Char(c) => format!("0x{:x}", u32::from(c)),
+    }
+}
+
+/// Arguments for `tmux …` pressing `keys` in `pane`. Without `-K`, tmux gives
+/// the keys to the pane (or to the mode the user left it in, such as copy mode)
+/// and never to a client's key table.
+pub fn control_keys_args(pane: &str, keys: &[crate::control::Key]) -> Vec<String> {
+    let mut args = vec!["send-keys".to_string(), "-t".to_string(), pane.to_string()];
+    args.extend(keys.iter().map(|&key| key_name(key)));
+    args
+}
+
+/// One tmux command of a ctl key press.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyStep {
+    /// Keys for [`control_keys_args`]: named keys and ASCII characters.
+    Send(Vec<crate::control::Key>),
+    /// Characters outside ASCII, pasted as their UTF-8 bytes without `-p`
+    /// ([`control_paste_args`]), as typing them sends those bytes. `send-keys`
+    /// takes their code points correctly only from tmux 2.4.
+    Paste(String),
+}
+
+/// The tmux commands that press `keys` in order: runs of keys `send-keys` can
+/// name on any supported tmux, and runs of other characters pasted raw.
+pub fn control_key_steps(keys: &[crate::control::Key]) -> Vec<KeyStep> {
+    use crate::control::Key;
+    let mut steps: Vec<KeyStep> = Vec::new();
+    for &key in keys {
+        match (key, steps.last_mut()) {
+            (Key::Char(c), Some(KeyStep::Paste(text))) if !c.is_ascii() => text.push(c),
+            (Key::Char(c), _) if !c.is_ascii() => steps.push(KeyStep::Paste(c.to_string())),
+            (key, Some(KeyStep::Send(run))) => run.push(key),
+            (key, _) => steps.push(KeyStep::Send(vec![key])),
+        }
+    }
+    steps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_pane_is_the_sessions_first_whichever_pane_is_active() {
+        assert_eq!(
+            control_pane_args("muxel_p_1a2b3c4d"),
+            [
+                "list-panes",
+                "-s",
+                "-t",
+                "=muxel_p_1a2b3c4d:",
+                "-F",
+                "#{session_name}:#{pane_id}:#{?pane_start_command,1,0}"
+            ]
+        );
+        // The user split the agent's window (%14) and opened another window
+        // (%20); list order follows windows, not age.
+        let panes = "muxel_p_1:%20:0\nmuxel_p_1:%12:1\nmuxel_p_1:%14:0\n";
+        for with_command in [true, false] {
+            assert_eq!(
+                parse_control_pane("muxel_p_1", panes, with_command).as_deref(),
+                Some("%12")
+            );
+        }
+        // Numeric order, not text order.
+        assert_eq!(
+            parse_control_pane("muxel_p_1", "muxel_p_1:%9:1\nmuxel_p_1:%10:0\n", true).as_deref(),
+            Some("%9")
+        );
+        // The agent's pane has gone and the user's shell is left: nothing to
+        // type into. A shell session (no command of its own) keeps its first pane.
+        let left = "muxel_p_1:%14:0\nmuxel_p_1:%20:0\n";
+        assert_eq!(parse_control_pane("muxel_p_1", left, true), None);
+        assert_eq!(
+            parse_control_pane("muxel_p_1", left, false).as_deref(),
+            Some("%14")
+        );
+        // A namesake session, a window id, a missing flag or anything but a pane
+        // id is not this session's pane.
+        for out in [
+            "",
+            ":%3:1\n",
+            "muxel_p_12:%3:1\n",
+            "muxel_p_1:@3:1\n",
+            "muxel_p_1:%:1\n",
+            "muxel_p_1:%1;x:1\n",
+            "muxel_p_1:%3\n",
+            "muxel_p_1:%3:yes\n",
+        ] {
+            assert_eq!(parse_control_pane("muxel_p_1", out, false), None, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_is_pasted_as_tmux_pastes_with_no_escape_left() {
+        assert_eq!(
+            control_paste_input("one\x1b[201~two\r\nthree\nfour ✓\x1b"),
+            "one[201~two\rthree\rfour ✓".as_bytes()
+        );
+        assert_eq!(control_paste_input("plain"), b"plain");
+    }
+
+    #[test]
+    fn control_input_keeps_text_out_of_arguments() {
+        let buffer = control_buffer_name(Uuid::nil());
+        assert_eq!(buffer, "muxel-ctl-00000000000000000000000000000000");
+        assert_eq!(
+            control_paste_args(&buffer, "%12", true),
+            [
+                "load-buffer",
+                "-b",
+                buffer.as_str(),
+                "-",
+                ";",
+                "paste-buffer",
+                "-d",
+                "-p",
+                "-r",
+                "-b",
+                buffer.as_str(),
+                "-t",
+                "%12"
+            ]
+        );
+        assert_eq!(
+            control_paste_args(&buffer, "%12", false),
+            [
+                "load-buffer",
+                "-b",
+                buffer.as_str(),
+                "-",
+                ";",
+                "paste-buffer",
+                "-d",
+                "-r",
+                "-b",
+                buffer.as_str(),
+                "-t",
+                "%12"
+            ]
+        );
+        assert_eq!(
+            delete_buffer_args(&buffer),
+            ["delete-buffer", "-b", buffer.as_str()]
+        );
+        assert_eq!(
+            control_pane_exists_args("%12"),
+            ["display-message", "-p", "-t", "%12", "#{pane_id}"]
+        );
+    }
+
+    #[test]
+    fn keys_outside_ascii_are_pasted_raw_and_the_rest_keep_their_order() {
+        use crate::control::Key;
+        let keys = [
+            Key::Ctrl('b'),
+            Key::Char('c'),
+            Key::Char('é'),
+            Key::Char('✓'),
+            Key::Enter,
+            Key::Char('𝄞'),
+        ];
+        assert_eq!(
+            control_key_steps(&keys),
+            [
+                KeyStep::Send(vec![Key::Ctrl('b'), Key::Char('c')]),
+                KeyStep::Paste("é✓".into()),
+                KeyStep::Send(vec![Key::Enter]),
+                KeyStep::Paste("𝄞".into()),
+            ]
+        );
+        assert_eq!(
+            control_key_steps(&[Key::Enter]),
+            [KeyStep::Send(vec![Key::Enter])]
+        );
+        assert!(control_key_steps(&[]).is_empty());
+    }
+
+    #[test]
+    fn every_ctl_key_presses_a_named_tmux_key_or_its_code_point() {
+        use crate::control::Key;
+        let keys: Vec<Key> = [
+            "enter",
+            "esc",
+            "tab",
+            "shift-tab",
+            "up",
+            "down",
+            "right",
+            "left",
+            "home",
+            "end",
+            "backspace",
+            "delete",
+            "pageup",
+            "pagedown",
+            "space",
+            "ctrl-b",
+            ";",
+            "~",
+            "1",
+        ]
+        .iter()
+        .map(|name| Key::parse(name).unwrap())
+        .collect();
+        assert_eq!(
+            control_keys_args("%3", &keys),
+            [
+                "send-keys",
+                "-t",
+                "%3",
+                "Enter",
+                "Escape",
+                "Tab",
+                "BTab",
+                "Up",
+                "Down",
+                "Right",
+                "Left",
+                "Home",
+                "End",
+                "BSpace",
+                "DC",
+                "PPage",
+                "NPage",
+                "Space",
+                "C-b",
+                "0x3b",
+                "0x7e",
+                "0x31"
+            ]
+        );
+        // No argument a caller chose can end in `;` or hold a tmux format.
+        for arg in control_keys_args("%3", &keys) {
+            assert!(!arg.ends_with(';') && !arg.contains('#'), "{arg}");
+        }
+    }
 
     #[test]
     fn claim_cleanup_is_conditional_and_refuses_unsafe_patterns() {

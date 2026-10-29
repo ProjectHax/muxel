@@ -189,7 +189,9 @@ pub struct Response {
     /// A stable detail of a refusal, when its code alone is too broad.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Present and true after a paste attempt. A writer error may leave partial input.
+    /// Present and true once input may have reached the pane: after a paste that
+    /// may have gone in, or a key of `keys` or `answer`. A writer error may leave
+    /// partial input; a paste tmux refused typed nothing and leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pasted: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,8 +254,9 @@ fn known_code<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<ErrorCod
 /// script can act on; `error` says the same for people and may be reworded. Other
 /// failures (a bad command line, no agent by that name) carry only `error`.
 ///
-/// These refusals type nothing, except `input_changed`: its prompt was pasted,
-/// but Enter was withheld. A lost reply after sending has an uncertain outcome;
+/// These refusals type nothing, except `input_changed` (its prompt was pasted,
+/// but Enter was withheld) and `keys_partly_pressed` (some keys went in). A lost
+/// reply after sending has an uncertain outcome;
 /// inspect the agent before retrying.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -291,6 +294,11 @@ pub enum ErrorCode {
     LaunchMismatch,
     /// The prompt was pasted but its delayed Enter was withheld.
     InputChanged,
+    /// A pane behind tmux takes ctl input only through tmux, at the agent's own
+    /// tmux pane, and that pane couldn't be found or has gone. Nothing was typed.
+    TmuxPaneUnresolved,
+    /// Some of a `keys` request's keys were pressed, then the rest failed.
+    KeysPartlyPressed,
     /// The caller selected its own pane without explicitly forcing the action.
     SelfTarget,
     /// `muxel ctl` found no muxel to ask: it isn't running, outside control is
@@ -692,46 +700,102 @@ pub fn describe_layout(node: &PaneNode) -> (Value, HashMap<Uuid, usize>) {
 
 // --- Keys --------------------------------------------------------------------------
 
-/// The bytes a key name sends: `enter`, `esc`, `tab`, `shift-tab`, the arrows,
-/// `backspace`, `delete`, `space`, `home`, `end`, `pageup`, `pagedown`,
-/// `ctrl-<letter>`, or any single character. Arrows (and home/end) follow the
-/// terminal's cursor-key mode, as a real keypress would.
-pub fn key_bytes(key: &str, app_cursor: bool) -> Option<Vec<u8>> {
-    let mut chars = key.chars();
-    if let (Some(c), None) = (chars.next(), chars.next()) {
-        return Some(c.to_string().into_bytes());
-    }
-    let arrow = |c: char| {
-        let lead = if app_cursor { "\x1bO" } else { "\x1b[" };
-        format!("{lead}{c}").into_bytes()
-    };
-    let name = key.trim().to_ascii_lowercase().replace('_', "-");
-    let bytes = match name.as_str() {
-        "enter" | "return" => b"\r".to_vec(),
-        "esc" | "escape" => b"\x1b".to_vec(),
-        "tab" => b"\t".to_vec(),
-        "shift-tab" | "backtab" => b"\x1b[Z".to_vec(),
-        "up" => arrow('A'),
-        "down" => arrow('B'),
-        "right" => arrow('C'),
-        "left" => arrow('D'),
-        "home" => arrow('H'),
-        "end" => arrow('F'),
-        "backspace" => b"\x7f".to_vec(),
-        "delete" | "del" => b"\x1b[3~".to_vec(),
-        "pageup" | "page-up" => b"\x1b[5~".to_vec(),
-        "pagedown" | "page-down" => b"\x1b[6~".to_vec(),
-        "space" => b" ".to_vec(),
-        _ => {
-            let letter = name.strip_prefix("ctrl-")?;
-            let mut it = letter.chars();
-            match (it.next(), it.next()) {
-                (Some(c), None) if c.is_ascii_lowercase() => vec![c as u8 - b'a' + 1],
-                _ => return None,
-            }
+/// One key `ctl keys` can press. A terminal muxel writes to directly gets its
+/// [`Key::bytes`]; a pane behind tmux gets the tmux key it names (see
+/// `tmux::key_name`), which tmux encodes for that pane's own modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    Enter,
+    Escape,
+    Tab,
+    BackTab,
+    Up,
+    Down,
+    Right,
+    Left,
+    Home,
+    End,
+    Backspace,
+    Delete,
+    PageUp,
+    PageDown,
+    Space,
+    /// `ctrl-<letter>`, lowercase ASCII.
+    Ctrl(char),
+    /// Any single character, typed as itself.
+    Char(char),
+}
+
+impl Key {
+    /// `enter`, `esc`, `tab`, `shift-tab`, the arrows, `backspace`, `delete`,
+    /// `space`, `home`, `end`, `pageup`, `pagedown`, `ctrl-<letter>`, or any
+    /// single character.
+    pub fn parse(key: &str) -> Option<Self> {
+        let mut chars = key.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            return Some(Self::Char(c));
         }
-    };
-    Some(bytes)
+        let name = key.trim().to_ascii_lowercase().replace('_', "-");
+        Some(match name.as_str() {
+            "enter" | "return" => Self::Enter,
+            "esc" | "escape" => Self::Escape,
+            "tab" => Self::Tab,
+            "shift-tab" | "backtab" => Self::BackTab,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "right" => Self::Right,
+            "left" => Self::Left,
+            "home" => Self::Home,
+            "end" => Self::End,
+            "backspace" => Self::Backspace,
+            "delete" | "del" => Self::Delete,
+            "pageup" | "page-up" => Self::PageUp,
+            "pagedown" | "page-down" => Self::PageDown,
+            "space" => Self::Space,
+            _ => {
+                let letter = name.strip_prefix("ctrl-")?;
+                let mut it = letter.chars();
+                match (it.next(), it.next()) {
+                    (Some(c), None) if c.is_ascii_lowercase() => Self::Ctrl(c),
+                    _ => return None,
+                }
+            }
+        })
+    }
+
+    /// The bytes this key sends to a terminal muxel writes to itself. Arrows
+    /// (and home/end) follow the terminal's cursor-key mode, as a real keypress
+    /// would.
+    pub fn bytes(self, app_cursor: bool) -> Vec<u8> {
+        let arrow = |c: char| {
+            let lead = if app_cursor { "\x1bO" } else { "\x1b[" };
+            format!("{lead}{c}").into_bytes()
+        };
+        match self {
+            Self::Enter => b"\r".to_vec(),
+            Self::Escape => b"\x1b".to_vec(),
+            Self::Tab => b"\t".to_vec(),
+            Self::BackTab => b"\x1b[Z".to_vec(),
+            Self::Up => arrow('A'),
+            Self::Down => arrow('B'),
+            Self::Right => arrow('C'),
+            Self::Left => arrow('D'),
+            Self::Home => arrow('H'),
+            Self::End => arrow('F'),
+            Self::Backspace => b"\x7f".to_vec(),
+            Self::Delete => b"\x1b[3~".to_vec(),
+            Self::PageUp => b"\x1b[5~".to_vec(),
+            Self::PageDown => b"\x1b[6~".to_vec(),
+            Self::Space => b" ".to_vec(),
+            Self::Ctrl(c) => vec![c as u8 - b'a' + 1],
+            Self::Char(c) => c.to_string().into_bytes(),
+        }
+    }
+}
+
+/// The bytes a key name sends (see [`Key::parse`] and [`Key::bytes`]).
+pub fn key_bytes(key: &str, app_cursor: bool) -> Option<Vec<u8>> {
+    Key::parse(key).map(|key| key.bytes(app_cursor))
 }
 
 /// Whether pressing `key` submits what's typed.
@@ -1217,6 +1281,7 @@ usage: muxel ctl <command> [args]
 AGENT is an id from `panes`, a name, project/name, or `focused`.
 send, answer and keys refuse the caller's own pane unless --force is explicit.
 Everything after `--` is taken literally (for text that starts with -).
+Input to a pane kept in tmux goes to its tmux pane through tmux, never through the tmux client; agent panes need no shell grant.
 For `new` without --prompt, presets/defaults keep toolbar injection, resume and hooks; raw argv bypasses them.
 ALL `new` requests require outside control AND Settings > Outside control > Outside terminal creation set to Ask or Allow.
 Ask requires a click for every request. Allow covers configured non-shell terminal presets.
@@ -1750,18 +1815,22 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   terminal. This guard is checked again immediately before pasting after any
   asynchronous claim work, and `--force` never bypasses it. A successful reply
   includes the actual `launch_id` and `"pasted": true` for admission to the PTY
-  writer, not confirmation of agent delivery. A lost reply does not make a
+  writer (for an agent kept in tmux: tmux pasted it into the agent's tmux pane),
+  not confirmation of agent delivery. A lost reply does not make a
   retry safe; inspect the agent before typing again. A failure with `pasted: true`
-  means a paste was attempted and the input may be partial. Check `screen` before
+  means the prompt may have reached the agent, in whole or in part; a paste tmux
+  refused typed nothing and has no `pasted`. Check `screen` before
   retrying. A `working` error with `reason: just_submitted` means the prior
   control turn is still in its grace on a pane with provider status or configured
   screen markers; `wait` for its reply. Activity-only panes allow a later send.
   Codex, Claude and Grok sends also observe provider acceptance for about ten
   seconds (three more after a retry). `submission_confirmed` is true only for a fresh provider receipt and
   false when acceptance remains unknown, with `unconfirmed_reason` `timed_out`,
-  `input_changed` (other input arrived; no further Enter is sent) or
+  `input_changed` (other input arrived; no further Enter is sent),
   `interrupted` (the pane closed, restarted, switched conversation or lost
-  permission). Once Enter is in, the reply is this receipt, never an error.
+  permission) or `retry_unanswered` (tmux didn't answer whether it pressed the
+  retry Enter, so it may have arrived). Once Enter is in, the reply is this
+  receipt, never an error.
   It is null, without waiting, when the pane can't show a receipt: an
   unsupported provider, or no readable idle status title (tmux hides titles)
   with a Grok, multi-paragraph or repeated prompt.
@@ -1790,6 +1859,21 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   the agent is blocked on.
 - `muxel ctl keys AGENT KEY...` - press keys: enter, esc, tab, shift-tab, up, down,
   left, right, backspace, space, ctrl-c, or any single character.
+
+For an agent kept in tmux, `send`, `answer`, `keys` and a `new --prompt` task
+go to the agent's own tmux pane through tmux (`paste-buffer`, `send-keys`),
+never through the tmux client muxel shows, so tmux's prefix and key bindings
+never act on them, and agent panes need no shell grant. The pane is the agent's
+own, the one its tmux session was created with, whichever pane or window the
+user has opened or made active. A prompt arrives as tmux's own `paste-buffer -p`
+pastes: line breaks as CR, without ESC. The reply to `keys` comes once tmux
+has taken every key, one tmux command per key; over SSH without a shared
+connection each is a new login. A `keys` or `answer` failure once a key may
+have gone in has `pasted: true`. If the agent's pane is gone or can't be
+reached, input is refused with `tmux_pane_unresolved` and nothing is typed;
+after a failed lookup the next waits a little longer each time, up to two
+minutes. A remote agent's input needs muxel's background SSH commands to that
+host to work.
 
 AGENT is an agent's `id` from `panes` (like `1a2b3c4d`), its name (`Claude`),
 `project/name` when names repeat, or `focused` for the pane the user is looking
@@ -1834,6 +1918,11 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.
+- `tmux_pane_unresolved` - the agent's tmux pane, which takes its input, is
+  gone or couldn't be found; nothing was typed. Check `screen`; the user may
+  need to restart the agent.
+- `keys_partly_pressed` - some keys were pressed, then the rest failed. Inspect
+  `screen` before pressing any again.
 - `self_target` - this command would type into its caller's own pane; select a
   different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
@@ -2118,6 +2207,8 @@ mod tests {
             (ErrorCode::ClaimedElsewhere, "claimed_elsewhere"),
             (ErrorCode::LaunchMismatch, "launch_mismatch"),
             (ErrorCode::InputChanged, "input_changed"),
+            (ErrorCode::TmuxPaneUnresolved, "tmux_pane_unresolved"),
+            (ErrorCode::KeysPartlyPressed, "keys_partly_pressed"),
             (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),
             (ErrorCode::StaleEndpoint, "stale_endpoint"),
@@ -2282,6 +2373,8 @@ mod tests {
             ErrorCode::ClaimedElsewhere,
             ErrorCode::LaunchMismatch,
             ErrorCode::InputChanged,
+            ErrorCode::TmuxPaneUnresolved,
+            ErrorCode::KeysPartlyPressed,
             ErrorCode::HostUnavailable,
             ErrorCode::StaleEndpoint,
         ] {

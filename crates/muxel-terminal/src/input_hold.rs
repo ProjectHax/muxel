@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Default)]
-pub(super) struct InputGate(AtomicU64);
+pub(crate) struct InputGate(AtomicU64);
 
 impl InputGate {
     pub fn epoch(&self) -> u64 {
