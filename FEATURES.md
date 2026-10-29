@@ -219,13 +219,24 @@ feature is added or changed, update the matching entry here in the same change**
   directly inside that store, which is what stops a stray path from rebinding a pane,
   and `/clear` or a fork may announce its new UUID before Claude has written the first
   record. A Codex pane stays tied to its own directory. Remote Claude panes keep their
-  starter binding. Recurring Codex rollout discovery and Claude hook validation run
-  in the background, alongside Grok's process lookup. Each pane keeps one pending
-  lookup across pop-out and docking. Failed Codex hints retry with a delay that
-  grows from one to thirty seconds, even while the day directory changes.
-  A sibling-owned tmux title is reread under backoff so a later unowned title
-  can bind; its rollout validation is cached only while the same sibling owns
-  it. Other sibling-owned hints wait until ownership or binding changes. Launch,
+  starter binding. Claude bindings save the exact transcript path. Launch checks that
+  path once and reads its current working directory on a worker; a pending hook's
+  validated cwd still takes precedence for that launch. Legacy or moved
+  transcripts share one fallback search per launch batch, with the found path saved
+  for later launches. Launch preflight lists the hook directory once per batch and
+  reads only panes with a pending record. Read-aloud and control reads use the saved
+  transcript path. Recurring Codex rollout discovery, Claude hook validation and
+  Grok's process lookup run in the background. A newer Claude hook supersedes an
+  older pending launch, and consumed hook records cannot revive a discarded or
+  expired conversation. A missing Claude store permits fresh launches; a hook
+  record read error affects only that pane; an error listing the hook directory
+  refuses the batch. Preset edits during restore continue the
+  launch automatically. Each pane keeps one pending lookup across pop-out and
+  docking. Failed Codex hints retry with a delay that grows from
+  one to thirty seconds, even while the day directory changes. A sibling-owned
+  tmux title is reread under backoff so a later unowned title can bind; its
+  rollout validation is cached only while the same sibling owns it. Other
+  sibling-owned hints wait until ownership or binding changes. Launch,
   directory, hint or binding changes reset the delay. The name index is reread
   in full on a worker when its size or modification time changes; unchanged
   indexes take one stat. Claude and Grok retry unresolved results with backoff.
@@ -447,6 +458,9 @@ feature is added or changed, update the matching entry here in the same change**
   activity row still on screen stays uncertain until it goes or a new title
   confirms it.
   A Grok conversation switch releases old loop ownership even if saving fails.
+  A confirmed provider switch clears the previous conversation's automatic name,
+  including a switch back to the same UUID between reads; a transcript path
+  upgrade alone keeps the name.
   Each pane uses its own discovery history, so another pane's refresh cannot
   discard its valid current title.
   The snapshot carries a launch id and
@@ -728,6 +742,8 @@ feature is added or changed, update the matching entry here in the same change**
   file-link and memory instructions use the preset's separate flag/config
   transport when available, and are omitted for TypeIn-only presets.
   The task text is discarded after first launch.
+  Remote tmux owner discovery keeps the task pending until that same launch
+  can prepare its terminal; refused ownership or launch permission cancels it.
   Restart, restore and resume neither re-type nor resubmit it, including launches without a resumable
   conversation. A duplicate of the pane starts without it, and the phone never
   types or submits it. Literal, shell and browser launches refuse prompts with
@@ -1387,7 +1403,13 @@ feature is added or changed, update the matching entry here in the same change**
   kept as a one-level backup on each side. A machine coming back after changing
   nothing takes the host's copy whenever it differs from the one it last saw, so
   its old copy never overwrites what other machines recorded meanwhile — which
-  conversation each pane is in, which tmux server its session runs on. Automatic
+  conversation each pane is in, which tmux server its session runs on. A machine
+  waking from sleep that finds a pane's session ended (another machine closed it)
+  closes the pane without counting that as a newer change, so it takes the host's
+  layout instead of pushing its old one over panes opened meanwhile. When both
+  machines changed the layout while apart, the newer change wins, but panes the
+  other machine opened in the meantime are kept, attached to their running agents,
+  rather than dropped. Automatic
   for every remote project; no setup required. **Changes sync live**: while connected, each side re-reads the
   shared file every few seconds and applies a peer's changes in place — panes a peer
   adds appear, attached to their running tmux sessions; panes it closes go away;
@@ -1406,7 +1428,9 @@ feature is added or changed, update the matching entry here in the same change**
   Panes a peer creates over SSH — the iOS app, or muxel on another machine that
   opened this one as a remote project — show up in the local window within a few
   seconds, attached to the peer's tmux session (found by the pane id at the end of
-  the session name when the peer didn't record one).
+  the session name when the peer didn't record one). Opening a folder that another
+  machine already has as a remote project (or the iOS app works in) brings up its
+  saved panes, attached to their running agents, instead of a fresh pane.
 - **Reconnect on failure** — when a remote project's SSH connection fails (or
   drops), the pane area shows the error with **Reconnect** (re-runs the connect
   pre-flight, re-syncs the layout, respawns panes) and **Scan for projects**
