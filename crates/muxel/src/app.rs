@@ -5505,6 +5505,11 @@ pub struct MuxelApp {
     /// round trips every few seconds.
     remote_branch_poll_inflight: bool,
     remote_layout_poll_inflight: bool,
+    /// Per project, the layout polls begun and applied: a close whose
+    /// countdown ran out waits for one begun after it did.
+    layout_reads: HashMap<Uuid, muxel_core::recoverable_close::LayoutReads>,
+    /// Such a close is waiting: poll on the next tick, not the 5-tick cadence.
+    close_layout_poll: bool,
     /// Coalescing/backoff and stale-result guards for background provider scans.
     session_discoveries: muxel_core::session_discovery::SessionDiscoveries,
     /// Accepted Grok identity and observation time belong to one pane launch.
@@ -7872,6 +7877,8 @@ impl MuxelApp {
             remote_poll_count: 0,
             remote_branch_poll_inflight: false,
             remote_layout_poll_inflight: false,
+            layout_reads: HashMap::new(),
+            close_layout_poll: false,
             session_discoveries: Default::default(),
             #[cfg(windows)]
             grok_observations: HashMap::new(),
@@ -13074,16 +13081,19 @@ impl MuxelApp {
             return;
         }
         let synced: Vec<Uuid> = self.remote_synced.iter().copied().collect();
-        let jobs: Vec<(Uuid, u64, integrations::RepoLoc)> = synced
+        let mut jobs: Vec<(Uuid, u64, u64, integrations::RepoLoc)> = synced
             .into_iter()
             .filter(|pid| self.project_syncs_layout(*pid))
             // Mid-push, the file may be half written; the next poll reads it whole.
             .filter(|pid| !self.remote_push_inflight.contains(pid))
             .filter_map(|pid| {
                 let epoch = self.layout_push_epoch.get(&pid).copied().unwrap_or(0);
-                self.repo_loc(pid).map(|loc| (pid, epoch, loc))
+                self.repo_loc(pid).map(|loc| (pid, epoch, 0, loc))
             })
             .collect();
+        for (pid, _, read, _) in &mut jobs {
+            *read = self.layout_reads.entry(*pid).or_default().begin();
+        }
         if jobs.is_empty() {
             return;
         }
@@ -13093,8 +13103,12 @@ impl MuxelApp {
                 .background_executor()
                 .spawn(async move {
                     jobs.into_iter()
-                        .map(|(pid, epoch, loc)| {
-                            (pid, epoch, integrations::fetch_remote_layout(&loc))
+                        .map(|(pid, epoch, read, loc)| {
+                            // A local file is never out of reach: none there
+                            // means no peer has written one.
+                            let reached = matches!(loc, integrations::RepoLoc::Local(_));
+                            let json = integrations::fetch_remote_layout(&loc);
+                            (pid, epoch, read, reached || json.is_some(), json)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -13102,7 +13116,7 @@ impl MuxelApp {
             // Even with the window gone, or polling would stop for good.
             let _ = this.update(cx, |this, _| this.remote_layout_poll_inflight = false);
             let _ = this.update_in(cx, |this, window, cx| {
-                for (pid, epoch, json) in results {
+                for (pid, epoch, read, reached, json) in results {
                     // A push began after this read did, so the read may be this
                     // machine's own previous write. Taken for a peer's, it would be
                     // adopted over the push — a pane just closed here coming straight
@@ -13114,6 +13128,9 @@ impl MuxelApp {
                     }
                     if let Some(json) = json {
                         this.poll_peer_layout(pid, &json, window, cx);
+                    }
+                    if reached {
+                        this.layout_reads.entry(pid).or_default().applied(read);
                     }
                 }
             });
@@ -13645,8 +13662,11 @@ impl MuxelApp {
         // refreshed off the UI thread so they don't stutter the render loop.
         self.refresh_status(cx);
         // Throttle remote (ssh) branch polling + layout re-fetch to every ~5s.
+        let close_poll = std::mem::take(&mut self.close_layout_poll);
         if self.remote_poll_count == 0 {
             self.poll_remote_branches(cx);
+            self.fetch_remote_layouts(window, cx);
+        } else if close_poll {
             self.fetch_remote_layouts(window, cx);
         }
         self.remote_poll_count = (self.remote_poll_count + 1) % 5;

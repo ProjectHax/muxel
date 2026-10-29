@@ -201,12 +201,52 @@ pub fn rehide_held(layout: &mut Option<PaneNode>, held: &[Uuid]) -> Vec<Uuid> {
     gone
 }
 
+/// Reads of one project's shared layout file, numbered as they begin. A read
+/// is applied once this machine has compared it with its own layout, adopting
+/// a peer's newer edit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayoutReads {
+    started: u64,
+    applied: u64,
+}
+
+impl LayoutReads {
+    /// Number a read as it begins.
+    pub fn begin(&mut self) -> u64 {
+        self.started += 1;
+        self.started
+    }
+
+    /// Read `ticket`'s result has been applied.
+    pub fn applied(&mut self, ticket: u64) {
+        self.applied = self.applied.max(ticket);
+    }
+
+    /// The reads begun so far. Only a later one can show what peers wrote
+    /// after this moment.
+    pub fn mark(&self) -> u64 {
+        self.started
+    }
+}
+
+/// Whether a close whose countdown ran out may finish, given each project it
+/// touches that shares its layout as (its [`LayoutReads::mark`] when the
+/// deadline was first seen passed, its reads now). A machine that slept
+/// through the countdown wakes with peers' edits unread, and the final close
+/// is stamped with the wall clock: finished first, it would outrank and
+/// overwrite them. So it waits for a read begun after the deadline.
+pub fn expired_close_may_finish(projects: impl IntoIterator<Item = (u64, LayoutReads)>) -> bool {
+    projects
+        .into_iter()
+        .all(|(mark, reads)| reads.applied > mark)
+}
+
 #[cfg(test)]
 mod recoverable_close_policy_tests {
     use super::{
-        CloseDecision, CloseEvidence, CloseFacts, CloseStage, HeldLaunch, HeldView, UndoLaunch,
-        decide, departure_finalizes, exit_proves_closed, held_launch, may_finalize, rehide_held,
-        shell_close_evidence, undo_launch,
+        CloseDecision, CloseEvidence, CloseFacts, CloseStage, HeldLaunch, HeldView, LayoutReads,
+        UndoLaunch, decide, departure_finalizes, exit_proves_closed, expired_close_may_finish,
+        held_launch, may_finalize, rehide_held, shell_close_evidence, undo_launch,
     };
     use crate::control::AgentState;
     use crate::{PaneNode, SplitDirection, TerminalLaunchReason, split};
@@ -608,5 +648,32 @@ mod recoverable_close_policy_tests {
         ] {
             assert!(!departure_finalizes(stage), "{stage:?}");
         }
+    }
+
+    #[test]
+    fn an_expired_close_waits_for_a_layout_read_begun_after_its_deadline() {
+        let mut reads = LayoutReads::default();
+        // A read in flight across the sleep began before the deadline.
+        let before = reads.begin();
+        let mark = reads.mark();
+        reads.applied(before);
+        assert!(!expired_close_may_finish([(mark, reads)]));
+        // A read the push dropped, or that failed, was never applied.
+        let dropped = reads.begin();
+        assert!(!expired_close_may_finish([(mark, reads)]));
+        let fresh = reads.begin();
+        reads.applied(fresh);
+        assert!(expired_close_may_finish([(mark, reads)]));
+        // An older read landing late doesn't undo it.
+        reads.applied(dropped);
+        assert!(expired_close_may_finish([(mark, reads)]));
+        // Every shared project the close touches must have been read.
+        let other = LayoutReads::default();
+        assert!(!expired_close_may_finish([
+            (mark, reads),
+            (other.mark(), other)
+        ]));
+        // A close touching no shared layout finishes at its deadline.
+        assert!(expired_close_may_finish([]));
     }
 }

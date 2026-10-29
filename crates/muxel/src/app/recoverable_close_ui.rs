@@ -66,7 +66,7 @@ impl MuxelApp {
             .sum();
         let multiple = panes > 1;
         let decision = !several && latest.needs_decision && !latest.undoing;
-        let label: SharedString = if latest.checking && !latest.undoing {
+        let label: SharedString = if (latest.checking || latest.syncing()) && !latest.undoing {
             t("Checking before close…")
         } else if decision {
             self.close_decision_label(latest)
@@ -92,7 +92,7 @@ impl MuxelApp {
             t("Keep")
         } else if latest.undoing {
             t("Restoring…")
-        } else if latest.checking || multiple {
+        } else if latest.checking || latest.syncing() || multiple {
             t("Undo")
         } else {
             countdown_label(latest.deadline)
@@ -252,7 +252,7 @@ impl MuxelApp {
                     t("Restoring…")
                 } else if group.needs_decision {
                     self.close_decision_label(group)
-                } else if group.checking {
+                } else if group.checking || group.syncing() {
                     t("Checking before close…")
                 } else {
                     countdown_label(group.deadline)

@@ -4,8 +4,8 @@ use super::*;
 use muxel_core::control::AgentState;
 use muxel_core::recoverable_close::{
     CloseDecision, CloseEvidence, CloseFacts, CloseStage, HeldLaunch, HeldView, UndoLaunch, decide,
-    departure_finalizes, exit_proves_closed, held_launch, may_finalize, rehide_held,
-    shell_close_evidence, undo_launch,
+    departure_finalizes, exit_proves_closed, expired_close_may_finish, held_launch, may_finalize,
+    rehide_held, shell_close_evidence, undo_launch,
 };
 use muxel_terminal::TerminalStatusReason;
 use std::borrow::Cow;
@@ -35,12 +35,21 @@ pub(super) struct CloseGroup {
     pub needs_decision: bool,
     pub checking: bool,
     pub undoing: bool,
+    /// Past the deadline: each layout-shared project's read mark then. The
+    /// close waits for a later read of each (`expired_close_may_finish`).
+    pub sync_marks: Option<Vec<(Uuid, u64)>>,
     pub layouts: HashMap<Uuid, Option<PaneNode>>,
     pub focus: Option<Uuid>,
     pub caller: Option<String>,
 }
 
 impl CloseGroup {
+    /// Past its deadline, waiting to read what peers did to the shared
+    /// layout. Leaving the workspace still finishes it as a running countdown.
+    pub fn syncing(&self) -> bool {
+        self.sync_marks.is_some() && !self.checking && !self.needs_decision && !self.undoing
+    }
+
     pub fn stage(&self) -> CloseStage {
         if self.undoing {
             CloseStage::Undoing
@@ -384,6 +393,7 @@ impl MuxelApp {
             needs_decision: false,
             checking: false,
             undoing: false,
+            sync_marks: None,
             layouts: HashMap::new(),
             focus: self.active_instance,
             caller,
@@ -746,6 +756,9 @@ impl MuxelApp {
             .map(|g| g.id)
             .collect();
         for gid in due {
+            if !self.close_layout_synced(gid) {
+                continue;
+            }
             // A confirmed close is final at its deadline. It must not wait for
             // unrelated quiet members' remote client-count probes.
             let forced: Vec<_> = self
@@ -805,6 +818,56 @@ impl MuxelApp {
         if !self.close_groups.is_empty() {
             cx.notify();
         }
+    }
+
+    /// Whether an expired group has read every layout-shared project it
+    /// touches since its deadline. The first call marks where that read must
+    /// begin and asks for a poll now.
+    fn close_layout_synced(&mut self, gid: Uuid) -> bool {
+        let Some(group) = self.close_groups.iter().find(|g| g.id == gid) else {
+            return false;
+        };
+        let Some(marks) = &group.sync_marks else {
+            let mut projects: Vec<Uuid> = group
+                .members
+                .iter()
+                .filter_map(|iid| self.closing.get(iid).map(|held| held.project))
+                .filter(|&pid| self.project_syncs_layout(pid))
+                .collect();
+            projects.sort_unstable();
+            projects.dedup();
+            let marks: Vec<_> = projects
+                .into_iter()
+                .map(|pid| {
+                    (
+                        pid,
+                        self.layout_reads
+                            .get(&pid)
+                            .copied()
+                            .unwrap_or_default()
+                            .mark(),
+                    )
+                })
+                .collect();
+            let unshared = marks.is_empty();
+            self.close_layout_poll |= !unshared;
+            if let Some(group) = self.close_groups.iter_mut().find(|g| g.id == gid) {
+                group.sync_marks = Some(marks);
+            }
+            return unshared;
+        };
+        // A project gone or no longer shared has nothing to overwrite.
+        expired_close_may_finish(
+            marks
+                .iter()
+                .filter(|(pid, _)| self.project_syncs_layout(*pid))
+                .map(|&(pid, mark)| {
+                    (
+                        mark,
+                        self.layout_reads.get(&pid).copied().unwrap_or_default(),
+                    )
+                }),
+        )
     }
 
     fn finish_close_expiry(&mut self, gid: Uuid, cx: &mut Context<Self>) {

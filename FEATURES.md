@@ -123,6 +123,9 @@ feature is added or changed, update the matching entry here in the same change**
   in flight, and restarts only a pane whose restart was queued. A held pane
   stays in the shared layout until its close is final, so other machines and
   the iOS app keep syncing, and their edits are adopted, while it counts down.
+  A countdown that runs out finishes only after the next read of the shared
+  layout, showing "Checking before close…" until then, so edits a peer made
+  while this machine slept are adopted, not overwritten.
 - **Resource and worktree close** — dirty editors offer Save / Don't Save /
   Cancel; clean editors, diffs and browsers close immediately. The last pane of
   a muxel worktree with changes or unmerged commits uses its disposal choice
