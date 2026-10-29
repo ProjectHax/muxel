@@ -2072,9 +2072,15 @@ async fn confirm_startup_submission(
             AcceptanceAction::RetryEnter => {
                 // Recheck session, ownership and input revision on admission;
                 // never re-paste the task or retry an ambiguous provider.
-                write_startup_input(view, session, cx, guard, armed_at, true, |session| {
-                    session.try_submit_input(b"\r")
-                })?;
+                write_startup_input(
+                    view,
+                    session,
+                    cx,
+                    guard,
+                    armed_at,
+                    crate::ControlInput::Submit,
+                )
+                .await?;
                 profile::startup_event(
                     attempt.instance_id,
                     "codex",
@@ -2265,23 +2271,47 @@ async fn wait_startup_composer(
     }
 }
 
-fn write_startup_input(
+/// One write of a controller task, through the terminal's outside-control
+/// input: PTY bytes, or tmux commands for a tmux client (see
+/// [`TerminalSession::control_write`]). The guard admits it on the UI thread; a
+/// tmux write then counts only once tmux answers, before anything else checks.
+async fn write_startup_input(
     view: &WeakEntity<TerminalView>,
     session: &Arc<TerminalSession>,
     cx: &mut AsyncApp,
     guard: &mut crate::startup::Guard,
     armed_at: Instant,
-    submit: bool,
-    write: impl FnOnce(&TerminalSession) -> std::io::Result<()>,
+    input: crate::ControlInput,
 ) -> Result<(), crate::startup::Stop> {
-    with_startup_view(view, session, cx, |_| {
+    let submit = input == crate::ControlInput::Submit;
+    let (write, admitted_at) = with_startup_view(view, session, cx, |_| {
         let admitted_at = startup_now_ms();
-        guard.write(armed_at.elapsed(), session.input_rev(), || write(session))?;
-        if submit {
-            guard.enter_admitted(admitted_at);
+        let mut write = None;
+        guard.write(armed_at.elapsed(), session.input_rev(), || {
+            let pending = session.control_write(input);
+            let written = match pending.ready() {
+                Some(Err(error)) => Err(std::io::Error::other(error.to_string())),
+                _ => Ok(()),
+            };
+            write = Some(pending);
+            written
+        })?;
+        Ok::<_, crate::startup::Stop>((write, admitted_at))
+    })??;
+    let mut admitted_at = admitted_at;
+    if let Some(write) = write.filter(crate::ControlWrite::is_queued) {
+        if let Err(error) = write.finish().await {
+            log::warn!("terminal startup automation: tmux input failed: {error}");
+            guard.fail(crate::startup::Stop::WriteFailed);
+            return Err(crate::startup::Stop::WriteFailed);
         }
-        Ok(())
-    })?
+        // A tmux Enter lands when tmux runs it, not when it was queued.
+        admitted_at = startup_now_ms();
+    }
+    if submit {
+        guard.enter_admitted(admitted_at);
+    }
+    Ok(())
 }
 
 /// Why the drain loop most recently notified GPUI to request a redraw.
@@ -2668,9 +2698,12 @@ impl TerminalView {
                             cx,
                             &mut guard,
                             armed_at,
-                            false,
-                            |session| session.try_write_input(SHIFT_TAB),
-                        )?;
+                            crate::ControlInput::Keys {
+                                keys: vec![muxel_core::control::Key::BackTab],
+                                app_cursor: false,
+                            },
+                        )
+                        .await?;
                         cx.background_executor()
                             .timer(Duration::from_millis(STARTUP_KEY_GAP_MS))
                             .await;
@@ -2683,9 +2716,12 @@ impl TerminalView {
                             cx,
                             &mut guard,
                             armed_at,
-                            false,
-                            |session| session.try_write_input(b"\r"),
-                        )?;
+                            crate::ControlInput::Keys {
+                                keys: vec![muxel_core::control::Key::Enter],
+                                app_cursor: false,
+                            },
+                        )
+                        .await?;
                         cx.background_executor()
                             .timer(Duration::from_millis(STARTUP_KEY_GAP_MS))
                             .await;
@@ -2705,9 +2741,9 @@ impl TerminalView {
                             cx,
                             &mut guard,
                             armed_at,
-                            false,
-                            |session| session.try_paste(&input),
-                        )?;
+                            crate::ControlInput::Paste(input.clone()),
+                        )
+                        .await?;
                         profile::startup_event(
                             instance_id,
                             &automation_program,
@@ -2743,9 +2779,9 @@ impl TerminalView {
                                 cx,
                                 &mut guard,
                                 armed_at,
-                                true,
-                                |session| session.try_submit_input(b"\r"),
-                            )?;
+                                crate::ControlInput::Submit,
+                            )
+                            .await?;
                             profile::startup_event(
                                 instance_id,
                                 &automation_program,

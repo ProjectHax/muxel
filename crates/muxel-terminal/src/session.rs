@@ -695,6 +695,10 @@ pub struct CommandSpec {
     /// Where that task's startup reads the provider's title when the PTY can't
     /// see it (a tmux-wrapped pane). Unused by any other automation.
     pub title_source: Option<TitleSource>,
+    /// Set when this command is a tmux client: outside-control input then goes
+    /// to its tmux pane through tmux, never through the client. See
+    /// [`crate::control_input`].
+    pub tmux_input: Option<crate::TmuxInputRoute>,
     /// Shift+Tab presses to send at startup before typing (runner auto mode).
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input` (false = leave it in
@@ -737,6 +741,7 @@ impl CommandSpec {
             auto_mode_presses: 0,
             startup_turn: None,
             title_source: None,
+            tmux_input: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -763,6 +768,7 @@ impl CommandSpec {
             auto_mode_presses: 0,
             startup_turn: None,
             title_source: None,
+            tmux_input: None,
             submit: true,
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
@@ -844,6 +850,11 @@ impl CommandSpec {
 
     pub fn with_title_source(mut self, source: TitleSource) -> Self {
         self.title_source = Some(source);
+        self
+    }
+
+    pub fn with_tmux_input(mut self, route: crate::TmuxInputRoute) -> Self {
+        self.tmux_input = Some(route);
         self
     }
 }
@@ -1240,6 +1251,9 @@ pub struct TerminalSession {
     /// typed byte, so correlating one input with the next output batch is wrong
     /// when agent output is already queued.
     interactive_until: Mutex<Option<Instant>>,
+    /// The tmux route for outside-control input, when this terminal's program
+    /// is a tmux client (see [`crate::control_input`]).
+    tmux_input: Option<crate::control_input::TmuxInput>,
     _reader: JoinHandle<()>,
     #[cfg(all(test, windows))]
     _monitor: JoinHandle<()>,
@@ -1704,6 +1718,10 @@ impl TerminalSession {
             paint_list: Mutex::new(None),
             pending_damage: Mutex::new(ContentDamage::Full),
             interactive_until: Mutex::new(None),
+            tmux_input: spec
+                .tmux_input
+                .clone()
+                .map(crate::control_input::TmuxInput::new),
             _reader: reader_handle,
             #[cfg(all(test, windows))]
             _monitor: monitor_handle,
@@ -1893,6 +1911,9 @@ impl TerminalSession {
         }
         *self.last_output.lock() = Instant::now();
         self.output_seen.store(true, Ordering::Relaxed);
+        if let Some(tmux) = &self.tmux_input {
+            tmux.note_output();
+        }
     }
 
     /// Take accumulated damage for the next paint.
@@ -1995,8 +2016,14 @@ impl TerminalSession {
     /// PTY. An error means the terminal's writer is gone (its program exited and
     /// a write has already failed); `Ok` only means the bytes were queued.
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
+        self.admit_input(!data.is_empty());
+        self.try_write_raw(data)
+    }
+
+    /// The bookkeeping every input write does before its bytes go anywhere.
+    fn admit_input(&self, nonempty: bool) {
         self.scroll_input_to_bottom();
-        if !data.is_empty() {
+        if nonempty {
             let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
             self.advance_input(Some(submitted_enter));
             if submitted_enter {
@@ -2006,7 +2033,6 @@ impl TerminalSession {
             // interaction window even if stream output is already queued.
             self.mark_interactive();
         }
-        self.try_write_raw(data)
     }
 
     /// Admit a complete submission (Enter, or text ending in Enter) and commit
@@ -2024,13 +2050,83 @@ impl TerminalSession {
         writer.write_all(data)?;
         writer.flush()?;
         if !data.is_empty() {
-            self.evidence.lock().record_submission(submitted_at);
-            self.turn_submitted.store(true, Ordering::Relaxed);
-            self.advance_input(Some(true));
-            self.mark_interactive();
-            self.trigger_runtime();
+            self.commit_submission(submitted_at);
         }
         Ok(())
+    }
+
+    /// The facts an admitted submission commits together.
+    pub(crate) fn commit_submission(&self, submitted_at: SystemTime) {
+        self.evidence.lock().record_submission(submitted_at);
+        self.turn_submitted.store(true, Ordering::Relaxed);
+        self.advance_input(Some(true));
+        self.mark_interactive();
+        self.trigger_runtime();
+    }
+
+    /// Write outside-control (`muxel ctl`) input. A terminal whose program is a
+    /// tmux client gets it at its pinned tmux pane through tmux, queued in order
+    /// behind this terminal's earlier ctl writes; any other terminal gets the
+    /// same PTY bytes as [`Self::try_paste`], [`Self::try_write_input`] and
+    /// [`Self::try_submit_input`]. Either way the input revision and draft bit
+    /// move as for a PTY write, and a submit's facts are committed only once it
+    /// is admitted (for tmux, in [`crate::ControlWrite::finish`]).
+    pub fn control_write(self: &Arc<Self>, input: crate::ControlInput) -> crate::ControlWrite {
+        use crate::{ControlInput, ControlWrite, ControlWriteError};
+        let Some(tmux) = &self.tmux_input else {
+            let written = match &input {
+                ControlInput::Paste(text) => self.try_paste(text),
+                ControlInput::Keys { keys, app_cursor } => self.try_write_input(
+                    &keys
+                        .iter()
+                        .flat_map(|key| key.bytes(*app_cursor))
+                        .collect::<Vec<u8>>(),
+                ),
+                ControlInput::Submit => self.try_submit_input(b"\r"),
+            };
+            return ControlWrite::done(
+                written.map_err(|error| ControlWriteError::Closed(error.to_string())),
+            );
+        };
+        let (input, submit) = match input {
+            ControlInput::Submit => {
+                self.scroll_input_to_bottom();
+                self.submission_pending.store(false, Ordering::Release);
+                (input, Some((self.clone(), SystemTime::now())))
+            }
+            ControlInput::Paste(text) => {
+                self.admit_input(!text.is_empty());
+                // The bytes a direct paste would send, decided by this
+                // terminal's mode as tmux set it for the pane it shows; tmux
+                // adds the brackets itself, only if the pane asked for them.
+                let text = paste_text(&text, self.is_bracketed_paste());
+                (ControlInput::Paste(text), None)
+            }
+            ControlInput::Keys { ref keys, .. } => {
+                self.admit_input(!keys.is_empty());
+                (input, None)
+            }
+        };
+        ControlWrite::queued(tmux.deliver(input), submit)
+    }
+
+    /// Whether outside-control input reaches this terminal through tmux.
+    pub fn delivers_through_tmux(&self) -> bool {
+        self.tmux_input.is_some()
+    }
+
+    /// Fix the tmux pane outside-control input goes to, if this terminal is a
+    /// tmux client whose pane isn't fixed yet. Asynchronous: it runs on the
+    /// terminal's input worker, ahead of any later ctl write.
+    pub fn pin_tmux_pane(&self) {
+        if let Some(tmux) = &self.tmux_input {
+            tmux.pin();
+        }
+    }
+
+    /// The tmux pane id outside-control input goes to, once fixed.
+    pub fn tmux_input_pane(&self) -> Option<String> {
+        self.tmux_input.as_ref()?.pinned_pane()
     }
 
     fn scroll_input_to_bottom(&self) {
@@ -2163,10 +2259,12 @@ impl TerminalSession {
     /// Paste text and report admission to the PTY writer. Success does not
     /// confirm that the child consumed the text.
     pub fn try_paste(&self, text: &str) -> std::io::Result<()> {
-        let payload = if self.is_bracketed_paste() {
-            format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
+        let bracketed = self.is_bracketed_paste();
+        let text = paste_text(text, bracketed);
+        let payload = if bracketed {
+            format!("\x1b[200~{text}\x1b[201~")
         } else {
-            text.replace("\r\n", "\r").replace('\n', "\r")
+            text
         };
         self.try_write_input(payload.as_bytes())
     }
@@ -2902,6 +3000,17 @@ impl TerminalSession {
         push_mouse_report(&mut buf, base + mods, col, row, true, sgr);
         self.mark_user_input();
         self.write_pointer(&buf);
+    }
+}
+
+/// The text of a paste, without its brackets: inside a bracketed paste ESC is
+/// removed, so the text can't end the paste early and have the rest read as
+/// keys; outside one each line break goes as CR, the Enter a terminal sends.
+fn paste_text(text: &str, bracketed: bool) -> String {
+    if bracketed {
+        text.replace('\x1b', "")
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r")
     }
 }
 

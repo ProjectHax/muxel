@@ -13,6 +13,7 @@ use super::*;
 use muxel_core::ReadAloudScope;
 use muxel_core::control::{self as ctl, AgentEntry, AgentInfo, AgentState, Command, ErrorCode};
 use muxel_core::readaloud;
+use muxel_terminal::{ControlInput, ControlWrite, ControlWriteError};
 use serde_json::{Value, json};
 
 /// What a request comes to: its reply, or why there is none.
@@ -177,8 +178,13 @@ enum Answer {
 enum Input {
     /// Pasted, then submitted with Enter `SUBMIT_DELAY_MS` later.
     Prompt(String),
-    /// Raw keys, `KEY_GAP_MS` apart; `true` marks one that submits.
-    Keys(Vec<(Vec<u8>, bool)>),
+    /// Key presses, `KEY_GAP_MS` apart; `true` marks one that submits. The keys
+    /// of one press are written together. `app_cursor` is the cursor-key mode
+    /// when the request came in, which a directly written terminal's arrows use.
+    Keys {
+        presses: Vec<(Vec<ctl::Key>, bool)>,
+        app_cursor: bool,
+    },
 }
 
 /// The turn a piece of typing starts, for `wait` here and for other muxels.
@@ -300,6 +306,21 @@ impl MuxelApp {
     pub(super) fn sync_control(&mut self, cx: &mut Context<Self>) {
         self.sync_control_approvals(cx);
         let want = self.settings.control_enabled;
+        if want
+            && !self
+                .control_pin_on_attach
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            // Outside control just came on. Fix each tmux client's pane now,
+            // before anyone opens another window in it; later clients fix theirs
+            // when they attach.
+            for view in self.terminals.values() {
+                view.read(cx).session().pin_tmux_pane();
+            }
+        } else if !want {
+            self.control_pin_on_attach
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         if want && self.control.is_none() && !self.control_failed {
             let (tx, rx) = async_channel::unbounded();
             match crate::control::Server::start(tx) {
@@ -1349,7 +1370,10 @@ impl MuxelApp {
             grace_ms: ctl::ANSWER_GRACE_MS,
             lead_ms: 0,
         };
-        let input = Input::Keys(vec![(key.as_bytes().to_vec(), false)]);
+        let input = Input::Keys {
+            presses: vec![(key.chars().map(ctl::Key::Char).collect(), false)],
+            app_cursor: false,
+        };
         self.control_typing(iid, input, Some(turn), false, reply, cx)
     }
 
@@ -1361,11 +1385,11 @@ impl MuxelApp {
     ) -> CtlResult<Typing> {
         let session = self.control_writable(iid, cx)?;
         let app_cursor = session.is_app_cursor_mode();
-        let presses: Vec<(Vec<u8>, bool)> = keys
+        let presses: Vec<(Vec<ctl::Key>, bool)> = keys
             .iter()
             .map(|key| {
-                ctl::key_bytes(key, app_cursor)
-                    .map(|bytes| (bytes, ctl::key_submits(key)))
+                ctl::Key::parse(key)
+                    .map(|parsed| (vec![parsed], ctl::key_submits(key)))
                     .ok_or_else(|| format!("unknown key '{key}'"))
             })
             .collect::<Result<_, _>>()?;
@@ -1391,7 +1415,11 @@ impl MuxelApp {
             lead_ms,
         });
         let reply = json!({ "pressed": keys, "agent": ctl::short_id(iid) });
-        self.control_typing(iid, Input::Keys(presses), turn, false, reply, cx)
+        let input = Input::Keys {
+            presses,
+            app_cursor,
+        };
+        self.control_typing(iid, input, turn, false, reply, cx)
     }
 
     /// Type `typing` into its agent, and note the turn it starts at `at` (when a
@@ -1420,16 +1448,20 @@ impl MuxelApp {
                 let attempt = self
                     .terminal_view(iid)
                     .and_then(|view| view.read(cx).begin_prompt_submission(&text));
-                let mut reply = match paste_prompt(&session, iid, &text, launch_id) {
-                    Ok(reply) => reply,
+                let (mut reply, paste) = match paste_prompt(&session, iid, &text, launch_id) {
+                    Ok(pasted) => pasted,
                     Err(error) => return Task::ready(Err(error)),
                 };
                 let pasted = session.input_rev();
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    // A paste through tmux is in only once tmux has run it.
+                    // Until then there is no receipt and nothing to press
+                    // Enter on. A direct paste is already in.
+                    paste.finish().await.map_err(paste_failed)?;
                     cx.background_executor()
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                         .await;
-                    let mut revision = this.update(cx, |app, cx| -> CtlResult<u64> {
+                    let enter = this.update(cx, |app, cx| -> CtlResult<ControlWrite> {
                         let live = app.control_writable(iid, cx);
                         enter_verdict(live, &session, pasted, session.input_rev())?;
                         if attempt.as_ref().is_some_and(|attempt| {
@@ -1440,16 +1472,21 @@ impl MuxelApp {
                         }) {
                             return Err("the provider conversation changed after the paste, so Enter was withheld: check its `screen`".into());
                         }
-                        press_prompt_enter(&session, pasted)?;
-                        // Claim timestamps predict settlement. Local wait starts
-                        // at the actual Enter admission, never at the prediction.
-                        app.note_control_turn(iid, turn, now_ms());
-                        Ok(session.input_rev())
+                        press_prompt_enter(&session, pasted)
                     })
                     .unwrap_or_else(|_| Err("muxel is shutting down".into()))?;
+                    enter.finish().await.map_err(enter_failed)?;
+                    // Claim timestamps predict settlement. Local wait starts
+                    // at the actual Enter admission, never at the prediction.
+                    let revision = this.update(cx, |app, _| {
+                        app.note_control_turn(iid, turn, now_ms());
+                        session.input_rev()
+                    });
                     // Enter is in. Whatever happens next, the reply is this
                     // receipt: an error would read as "Enter withheld".
-                    let Some(attempt) = attempt.filter(|attempt| attempt.observable()) else {
+                    let (Ok(mut revision), Some(attempt)) =
+                        (revision, attempt.filter(|attempt| attempt.observable()))
+                    else {
                         submission_receipt(&mut reply, None, 0);
                         return Ok(reply);
                     };
@@ -1471,17 +1508,31 @@ impl MuxelApp {
                                     return Err(Unconfirmed::Interrupted);
                                 }
                                 let action = confirmation.observe(started.elapsed(), observation);
-                                if action == PromptConfirmationAction::RetryEnter {
+                                let retry = if action == PromptConfirmationAction::RetryEnter {
                                     // Observation and admission share this UI turn. The
                                     // same permission, launch and input guards still apply.
-                                    press_prompt_enter(&session, revision)
-                                        .map_err(|_| Unconfirmed::Interrupted)?;
-                                    revision = session.input_rev();
-                                    retries += 1;
-                                }
-                                Ok(action)
+                                    Some(
+                                        press_prompt_enter(&session, revision)
+                                            .map_err(|_| Unconfirmed::Interrupted)?,
+                                    )
+                                } else {
+                                    None
+                                };
+                                Ok((action, retry))
                             })
                             .unwrap_or(Err(Unconfirmed::Interrupted));
+                        let action = match action {
+                            Ok((action, Some(retry))) => match retry.finish().await {
+                                Ok(()) => {
+                                    revision = session.input_rev();
+                                    retries += 1;
+                                    Ok(action)
+                                }
+                                Err(_) => Err(Unconfirmed::Interrupted),
+                            },
+                            Ok((action, None)) => Ok(action),
+                            Err(stop) => Err(stop),
+                        };
                         let outcome = match action {
                             Ok(PromptConfirmationAction::Confirmed) => Ok(()),
                             Ok(PromptConfirmationAction::Unconfirmed) => Err(Unconfirmed::TimedOut),
@@ -1498,9 +1549,15 @@ impl MuxelApp {
                     }
                 })
             }
-            Input::Keys(presses) => {
-                cx.spawn(async move |this: WeakEntity<Self>, cx| {
-                    for (i, (bytes, submit)) in presses.into_iter().enumerate() {
+            Input::Keys {
+                presses,
+                app_cursor,
+            } => {
+                let through_tmux = session.delivers_through_tmux();
+                let total = presses.len();
+                let receipt = reply.clone();
+                let pressed = cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    for (i, (keys, submit)) in presses.into_iter().enumerate() {
                         if i > 0 {
                             cx.background_executor()
                                 .timer(Duration::from_millis(KEY_GAP_MS))
@@ -1508,29 +1565,49 @@ impl MuxelApp {
                         }
                         // Recheck each key after its delay. A restarted pane
                         // must not receive input meant for its previous session.
-                        let wrote = this
-                            .update(cx, |app, cx| {
-                                let Ok(current_session) = app.control_writable(iid, cx) else {
-                                    return false;
-                                };
+                        let write = this
+                            .update(cx, |app, cx| -> CtlResult<ControlWrite> {
+                                let current_session = app.control_writable(iid, cx)?;
                                 if !Arc::ptr_eq(&session, &current_session) {
-                                    return false;
+                                    return Err("the pane restarted".into());
                                 }
-                                if submit {
-                                    session.mark_turn_submitted();
-                                }
-                                session.write_input(&bytes);
-                                true
+                                // A press that submits is an Enter (`key_submits`).
+                                // It goes as the submit, so the turn counts as
+                                // submitted only once the Enter is taken.
+                                let input = if submit {
+                                    debug_assert!(keys == [ctl::Key::Enter]);
+                                    ControlInput::Submit
+                                } else {
+                                    ControlInput::Keys { keys, app_cursor }
+                                };
+                                Ok(session.control_write(input))
                             })
-                            .unwrap_or(false);
-                        if !wrote {
-                            break;
+                            .unwrap_or_else(|_| Err("muxel is shutting down".into()));
+                        let written = match write {
+                            Ok(write) => write.finish().await.map_err(keys_failed),
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = written {
+                            return Err(ctl::Error {
+                                message: format!(
+                                    "{}; {i} of {total} keys were pressed before it",
+                                    error.message
+                                ),
+                                ..error
+                            });
                         }
                     }
-                })
-                .detach();
+                    Ok(receipt)
+                });
                 let lead_ms = turn.as_ref().map_or(0, |turn| turn.lead_ms);
                 self.note_control_turn(iid, turn, at.unwrap_or_else(|| now_ms() + lead_ms));
+                if through_tmux {
+                    // The reply says whether tmux took every key.
+                    return pressed;
+                }
+                // A PTY write is in once queued, so the reply never waited for
+                // the keys' gaps.
+                pressed.detach();
                 Task::ready(Ok(reply))
             }
         }
@@ -1706,27 +1783,79 @@ fn enter_verdict<T>(
     Ok(())
 }
 
+/// Paste `text` through the terminal's outside-control input. The receipt
+/// belongs to the returned write: a direct paste is already admitted, while a
+/// paste through tmux has run only once [`ControlWrite::finish`] succeeds, and
+/// the receipt must not be sent before then.
 fn paste_prompt(
-    session: &TerminalSession,
+    session: &Arc<TerminalSession>,
     pane: Uuid,
     text: &str,
     expected_launch: Option<Uuid>,
-) -> CtlResult<Value> {
+) -> CtlResult<(Value, ControlWrite)> {
     ctl::check_launch_id(expected_launch, Some(session.id))?;
-    session
-        .try_paste(text)
-        .map_err(|error| format!("couldn't admit the prompt to the PTY writer: {error}"))?;
-    Ok(ctl::pasted_prompt_receipt(pane, session.id))
+    let paste = session.control_write(ControlInput::Paste(text.to_string()));
+    if let Some(Err(error)) = paste.ready() {
+        return Err(paste_failed(error));
+    }
+    Ok((ctl::pasted_prompt_receipt(pane, session.id), paste))
 }
 
-fn press_prompt_enter(session: &Arc<TerminalSession>, pasted: u64) -> CtlResult<()> {
+/// The Enter after a paste, or its one retry. Through tmux it is admitted once
+/// [`ControlWrite::finish`] succeeds.
+fn press_prompt_enter(session: &Arc<TerminalSession>, pasted: u64) -> CtlResult<ControlWrite> {
     enter_verdict(Ok(session.clone()), session, pasted, session.input_rev())?;
-    session.try_submit_input(b"\r").map_err(|error| {
-        format!(
-            "the prompt was pasted but Enter couldn't be admitted ({error}): check its `screen`"
+    let enter = session.control_write(ControlInput::Submit);
+    if let Some(Err(error)) = enter.ready() {
+        return Err(enter_failed(error));
+    }
+    Ok(enter)
+}
+
+/// Why a prompt wasn't pasted. Only an unanswered tmux command leaves it
+/// unknown; every other failure typed nothing.
+fn paste_failed(error: ControlWriteError) -> ctl::Error {
+    match error {
+        ControlWriteError::Closed(why) => {
+            format!("couldn't admit the prompt to the PTY writer: {why}").into()
+        }
+        ControlWriteError::Unresolved(why) => ctl::Error::new(
+            ErrorCode::TmuxPaneUnresolved,
+            format!("{why}. Nothing was typed"),
+        ),
+        ControlWriteError::Refused(_) => {
+            format!("couldn't paste the prompt through tmux: {error}").into()
+        }
+        ControlWriteError::Unknown(_) => format!(
+            "couldn't confirm the paste through tmux: {error}. Check its `screen` before sending again"
         )
-    })?;
-    Ok(())
+        .into(),
+    }
+}
+
+fn enter_failed(error: ControlWriteError) -> ctl::Error {
+    match error {
+        ControlWriteError::Closed(why) => {
+            format!("the prompt was pasted but Enter couldn't be admitted ({why}): check its `screen`")
+        }
+        ControlWriteError::Unresolved(why) | ControlWriteError::Refused(why) => {
+            format!("the prompt was pasted but tmux didn't press Enter ({why}): check its `screen`")
+        }
+        ControlWriteError::Unknown(why) => format!(
+            "the prompt was pasted but tmux didn't answer whether it pressed Enter ({why}): check its `screen` before sending again"
+        ),
+    }
+    .into()
+}
+
+fn keys_failed(error: ControlWriteError) -> ctl::Error {
+    match error {
+        ControlWriteError::Unresolved(why) => ctl::Error::new(ErrorCode::TmuxPaneUnresolved, why),
+        ControlWriteError::Closed(why) => {
+            format!("couldn't admit a key to the PTY writer: {why}").into()
+        }
+        error => format!("couldn't press a key through tmux: {error}").into(),
+    }
 }
 
 fn release_claim(site: &ClaimSite, claim: &ctl::Claim) {
@@ -1900,12 +2029,62 @@ mod prompt_submission_tests {
             before,
             "a refused launch must type nothing"
         );
-        let receipt = paste_prompt(&session, pane, "prompt", Some(session.id)).unwrap();
+        let (receipt, paste) = paste_prompt(&session, pane, "prompt", Some(session.id)).unwrap();
         let revision = session.input_rev();
         session.kill();
+        assert_eq!(
+            paste.ready(),
+            Some(Ok(())),
+            "a direct paste is admitted at once"
+        );
         assert_ne!(revision, before);
         assert_eq!(receipt["pasted"], true);
         assert_eq!(receipt["launch_id"], session.id.to_string());
+    }
+
+    /// A failed tmux step is an error, never a `"pasted": true` receipt, and
+    /// says whether anything was typed.
+    #[test]
+    fn tmux_delivery_failures_say_whether_anything_was_typed() {
+        use super::{enter_failed, keys_failed, paste_failed};
+        use muxel_terminal::ControlWriteError;
+        let gone = || ControlWriteError::Unresolved("the tmux pane %3 … is gone".into());
+        let unresolved = paste_failed(gone());
+        assert_eq!(unresolved.code, Some(ErrorCode::TmuxPaneUnresolved));
+        assert!(
+            unresolved.message.ends_with("Nothing was typed"),
+            "{}",
+            unresolved.message
+        );
+        assert_eq!(
+            keys_failed(gone()).code,
+            Some(ErrorCode::TmuxPaneUnresolved)
+        );
+
+        let refused = paste_failed(ControlWriteError::Refused("target pane has exited".into()));
+        assert_eq!(refused.code, None);
+        assert!(
+            refused.message.contains("nothing was typed"),
+            "{}",
+            refused.message
+        );
+        let unknown = paste_failed(ControlWriteError::Unknown(
+            "no answer within 10 seconds".into(),
+        ));
+        assert!(
+            unknown.message.contains("may or may not have been typed")
+                && unknown.message.contains("`screen`"),
+            "{}",
+            unknown.message
+        );
+        let enter = enter_failed(ControlWriteError::Refused("lost server".into()));
+        assert!(
+            enter
+                .message
+                .starts_with("the prompt was pasted but tmux didn't press Enter"),
+            "{}",
+            enter.message
+        );
     }
 
     #[test]
@@ -1945,7 +2124,7 @@ mod prompt_submission_tests {
         assert_eq!(session.input_snapshot(), (pasted, true));
         assert!(events.is_empty());
 
-        let entered = press_prompt_enter(&session, pasted);
+        let entered = press_prompt_enter(&session, pasted).map(|enter| enter.ready());
         let submitted = session.input_snapshot();
         let notified = events.try_recv();
         let has_submitted = session.has_submitted_turn();
@@ -1953,7 +2132,7 @@ mod prompt_submission_tests {
         let next_draft = session.input_snapshot();
         session.kill();
 
-        assert_eq!(entered, Ok(()));
+        assert_eq!(entered, Ok(Some(Ok(()))));
         assert_eq!(submitted, (pasted + 1, false));
         assert_eq!(notified, Ok(()));
         assert!(has_submitted);

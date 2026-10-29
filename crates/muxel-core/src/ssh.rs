@@ -2069,6 +2069,53 @@ mod tests {
         }
     }
 
+    /// ctl input to a remote tmux pane is one ssh command on the host's commands
+    /// master: the pinned pane id and muxel's own buffer name are its only
+    /// variable words, and the prompt itself travels on ssh's standard input.
+    #[test]
+    fn ctl_input_over_ssh_targets_the_pinned_pane_with_text_on_stdin() {
+        use crate::control::Key;
+        use crate::tmux::{self, SessionTarget};
+        let target = SessionTarget::new("muxel_app_1a2b3c4d", Some(Socket::Private));
+        let lead = format!("{}; set -- -L mxl; tmux \"$@\"", tmux_path_prelude());
+        assert_eq!(
+            session_tmux_command(&target, &tmux::control_pane_args(&target.name)),
+            format!(
+                "{lead} display-message -p -t '=muxel_app_1a2b3c4d:' \
+                 '#{{session_name}}:#{{pane_id}}'"
+            )
+        );
+        let buffer = tmux::control_buffer_name(uuid::Uuid::nil());
+        assert_eq!(
+            session_tmux_command(&target, &tmux::control_paste_args(&buffer, "%12", true)),
+            format!(
+                "{lead} load-buffer -b {buffer} - ';' paste-buffer -d -p -r -b {buffer} -t %12"
+            )
+        );
+        assert_eq!(
+            session_tmux_command(&target, &tmux::delete_buffer_args(&buffer)),
+            format!("{lead} delete-buffer -b {buffer}")
+        );
+        assert_eq!(
+            session_tmux_command(&target, &tmux::control_pane_exists_args("%12")),
+            format!("{lead} display-message -p -t %12 '#{{pane_id}}'")
+        );
+        let keys = [Key::Ctrl('b'), Key::Char('c'), Key::Char('\''), Key::Enter];
+        assert_eq!(
+            session_tmux_command(&target, &tmux::control_keys_args("%12", &keys)),
+            format!("{lead} send-keys -t %12 C-b 0x63 0x27 Enter")
+        );
+        // A recorded Default owner selects the default server the same way.
+        let default = SessionTarget::new("muxel_app_1a2b3c4d", Some(Socket::Default));
+        assert_eq!(
+            session_tmux_command(&default, &tmux::control_keys_args("%3", &[Key::Enter])),
+            format!(
+                "{}; set --; tmux \"$@\" send-keys -t %3 Enter",
+                tmux_path_prelude()
+            )
+        );
+    }
+
     /// The bug this guards: sshd runs the remote command with its bare default PATH
     /// (`/usr/bin:/bin:/usr/sbin:/sbin`) and no profile, so a Mac's Homebrew tmux —
     /// `/opt/homebrew/bin/tmux` on Apple silicon — is not on it. Every `tmux` word in

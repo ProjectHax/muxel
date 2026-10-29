@@ -822,11 +822,16 @@ fn control_new_policy_write_entry_points_recheck_permission() {
                 callback.find("press_prompt_enter(&session,").unwrap(),
             )
         } else {
+            // A submitting key is written as the submit, whose facts are
+            // recorded only once the Enter is taken, never marked ahead of a
+            // write that tmux may refuse.
+            assert!(!callback.contains("mark_turn_submitted"));
+            assert!(callback.contains("ControlInput::Submit"));
             (
                 callback
                     .find("Arc::ptr_eq(&session,&current_session)")
                     .unwrap(),
-                callback.find("session.write_input(").unwrap(),
+                callback.find("session.control_write(input)").unwrap(),
             )
         };
         assert!(timer < update && update < gate && gate < same_session && same_session < write);

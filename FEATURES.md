@@ -854,6 +854,25 @@ feature is added or changed, update the matching entry here in the same change**
   the pane closes or restarts. A withheld send fails and attempts to release only
   its own tmux claim; timeout, command failure or older tmux can leave the claim
   in place under its existing aging rules.
+- **Typed through tmux, not its client** — for a pane kept in tmux, local or
+  over SSH, every `ctl` write (`send`'s paste and Enter and its one Codex retry,
+  `answer`, `keys`, and a `new --prompt` task) goes to the pane's own tmux pane
+  through tmux itself: the prompt as one paste from a muxel-named buffer
+  (`paste-buffer -p`, bracketed when the agent asked for it, text read from
+  standard input and never parsed as a tmux command) with the same bytes a
+  direct paste sends, keys with `send-keys` (a character outside ASCII as a
+  raw paste of that character).
+  Nothing goes through the attached tmux client, so tmux's prefix, `prefix2`,
+  the user's `bind -n` keys and extended-key encodings in ctl input reach the
+  agent as text and never open a window or run a tmux command, and agent panes
+  need no shell grant. Each terminal fixes its tmux pane, by pane id, when its
+  client attaches (or when outside control is turned on), so input stays with
+  the agent after the user opens other windows or splits; if that pane is gone,
+  input is refused with `tmux_pane_unresolved` and nothing is typed, never
+  redirected. Writes to one pane stay in order; `keys` replies once tmux has
+  taken every key. Panes not kept in tmux take the same input as PTY bytes, as
+  before. This needs tmux 2.1 or later on a remote host; local tmux panes
+  already need 3.2.
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
@@ -865,7 +884,8 @@ feature is added or changed, update the matching entry here in the same change**
   Restart docks a popped-out terminal before replacing its process.
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
-  receipt confirms writer admission with `pasted: true`.
+  receipt confirms writer admission with `pasted: true` (for a pane kept in
+  tmux, that tmux pasted it into the agent's tmux pane).
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
   ten seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an

@@ -1726,7 +1726,7 @@ mod tmux_server_origin_tests {
 mod tmux_probe_tests {
     use super::{
         ensure_tmux_server, kill_tmux_session_confirmed, local_tmux_has_session_confirmed,
-        local_tmux_root, restart_local_tmux, tmux_on,
+        local_tmux_root, restart_local_tmux, run_local_tmux_input, tmux_on,
     };
     use muxel_core::tmux::{SERVER_MARK_ENV, SessionTarget, Socket};
     use std::time::{Duration, Instant};
@@ -1929,6 +1929,82 @@ mod tmux_probe_tests {
             None,
             "not marked as muxel's"
         );
+    }
+
+    /// A local pane's ctl input runner, on a real server: it finds the pane,
+    /// pastes text it is given on standard input (never in an argument, where
+    /// tmux would split `;` into another command), and reports tmux's refusal
+    /// as a failed command rather than as an error starting it.
+    #[test]
+    fn ctl_input_runs_on_the_panes_server_with_its_text_on_stdin() {
+        use muxel_core::control::Key;
+        use muxel_core::tmux;
+        let Some(server) = Server::new() else {
+            return;
+        };
+        server.start_with(&[]);
+        let dir = std::env::temp_dir().join(format!("muxel-ctl-input-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recv = dir.join("agent.bin");
+        let agent = format!("stty raw -echo; exec cat > '{}'", recv.display());
+        let status = tmux_on(&server.0)
+            .args(["new-session", "-d", "-s", "agent", "sh", "-c", &agent])
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let until = Instant::now() + Duration::from_secs(10);
+        while !recv.exists() {
+            assert!(Instant::now() < until, "the agent never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let out = run_local_tmux_input(&server.0, &tmux::control_pane_args("agent"), None).unwrap();
+        let pane = tmux::parse_control_pane("agent", &String::from_utf8_lossy(&out.stdout))
+            .expect("the agent's pane");
+        let buffer = tmux::control_buffer_name(uuid::Uuid::new_v4());
+        let text = "it's; $HOME `id` \"x\" ; display-message boom";
+        let out = run_local_tmux_input(
+            &server.0,
+            &tmux::control_paste_args(&buffer, &pane, true),
+            Some(text.as_bytes()),
+        )
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = run_local_tmux_input(
+            &server.0,
+            &tmux::control_keys_args(&pane, &[Key::Char(';'), Key::Enter]),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let expected = format!("{text};\r");
+        let until = Instant::now() + Duration::from_secs(10);
+        while std::fs::read(&recv).unwrap_or_default() != expected.as_bytes() {
+            assert!(
+                Instant::now() < until,
+                "the agent got {:?}",
+                String::from_utf8_lossy(&std::fs::read(&recv).unwrap_or_default())
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let out = run_local_tmux_input(
+            &server.0,
+            &tmux::control_keys_args("%999", &[Key::Enter]),
+            None,
+        )
+        .unwrap();
+        assert!(!out.status.success(), "a missing pane is refused");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -2398,6 +2474,110 @@ fn tmux_command_at(loc: &RepoLoc, session: &SessionTarget, args: &[String]) -> O
     };
     cmd.stdin(Stdio::null());
     Some(cmd)
+}
+
+/// How long one outside-control tmux command may take before it counts as
+/// unanswered.
+const TMUX_INPUT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// One outside-control input command (`muxel_terminal::TmuxInputRoute`) on the
+/// local tmux server `socket` a pane's client attached to, with `stdin` as its
+/// standard input. Blocking and bounded.
+pub fn run_local_tmux_input(
+    socket: &Socket,
+    args: &[String],
+    stdin: Option<&[u8]>,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = tmux_on(socket.clone());
+    cmd.args(args);
+    run_tmux_input(cmd, stdin, false)
+}
+
+/// The same on a remote pane's host, over the host's commands master, on the
+/// server holding `session` (as the shared claim is read and written). The
+/// input text travels on ssh's standard input, never in the command line.
+pub fn run_remote_tmux_input(
+    conn: &RemoteConn,
+    session: &SessionTarget,
+    args: &[String],
+    stdin: Option<&[u8]>,
+) -> std::io::Result<std::process::Output> {
+    if conn.host.os.is_windows() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a Windows host has no tmux",
+        ));
+    }
+    let cmd = remote_ssh_command(conn, ssh::session_tmux_command(session, args));
+    run_tmux_input(cmd, stdin, true)
+}
+
+fn run_tmux_input(
+    mut cmd: Command,
+    stdin: Option<&[u8]>,
+    over_ssh: bool,
+) -> std::io::Result<std::process::Output> {
+    use std::io::{Read as _, Write as _};
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    // Written from its own thread, so a child that never reads can't hold this
+    // one past the deadline. It ends when the child's end of the pipe closes.
+    let feeder = stdin.zip(child.stdin.take()).map(|(data, mut pipe)| {
+        let data = data.to_vec();
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&data);
+        })
+    });
+    let deadline = Instant::now() + TMUX_INPUT_DEADLINE;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("no answer within {} seconds", TMUX_INPUT_DEADLINE.as_secs()),
+                ));
+            }
+        }
+    };
+    if let Some(feeder) = feeder {
+        let _ = feeder.join();
+    }
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_end(&mut stderr);
+    }
+    // ssh exits 255 for its own failures, which can come after the remote
+    // command ran.
+    if over_ssh && status.code() == Some(255) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!("ssh failed: {}", String::from_utf8_lossy(&stderr).trim()),
+        ));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Run this muxel's own `ctl` command (`exe ctl <args>`), the way an outside
