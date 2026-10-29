@@ -15,6 +15,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod worker_tests;
+
 type Ready = (TerminalSpawnMeta, CommandSpec, (u16, u16));
 
 #[derive(Clone, PartialEq, Eq)]
@@ -262,7 +265,10 @@ impl MuxelApp {
     ) -> Option<LaunchKey> {
         let instance = self.workspace.instance(pane)?;
         let project = self.workspace.project(instance.project_id)?;
-        if project.remote.is_some() || instance.kind != InstanceKind::Terminal {
+        if instance.literal_argv
+            || project.remote.is_some()
+            || instance.kind != InstanceKind::Terminal
+        {
             return None;
         }
         let preset = instance
@@ -370,6 +376,8 @@ impl MuxelApp {
         resolution: Resolution,
         cx: &mut Context<Self>,
     ) -> Option<TerminalPreparation> {
+        #[cfg(test)]
+        let _home = super::claude_test_home(request.home.clone());
         let mut key = request.key.clone();
         if !launch_token_current(&self.terminal_launching, key.pane, key.token)
             || self.current_workspace != key.workspace
@@ -608,6 +616,34 @@ mod tests {
                     let request = prepared.pending.unwrap().request;
                     assert_eq!(request.key.cwd, cwd);
                     assert_eq!(prepared.meta.cwd, cwd.display().to_string());
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn pr108_literal_argv_skips_claude_lookup_and_keeps_its_binding() {
+        with_app(|cx, window| {
+            window
+                .update(cx, |app, window, cx| {
+                    let id = pane(app);
+                    let row = app.workspace.instance_mut(id).unwrap();
+                    row.literal_argv = true;
+                    let saved_id = row.session_id.clone();
+                    let saved_path = Some(std::path::PathBuf::from("literal-owned.jsonl"));
+                    row.session_path = saved_path.clone();
+                    assert!(!app.needs_claude_preflight(id));
+                    let reason = muxel_core::TerminalLaunchReason::NewPane;
+                    let token = app.reserve_terminal_spawn(id, reason, window, cx).unwrap();
+                    assert!(
+                        app.prepare_reserved_terminal_spawn(id, token, reason, cx)
+                            .unwrap()
+                            .ready_parts()
+                            .is_some()
+                    );
+                    let row = app.workspace.instance(id).unwrap();
+                    assert_eq!(row.session_id, saved_id);
+                    assert_eq!(row.session_path, saved_path);
                 })
                 .unwrap();
         });
@@ -1474,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn w8lm_consumed_hook_does_not_undo_fresh_start_but_a_new_resume_to_same_id_works() {
+    fn pr108_consumed_hook_does_not_undo_fresh_start_but_a_new_resume_to_same_id_works() {
         with_app(|cx, window| {
             let home = muxel_store::data_dir().unwrap().join("w8lm-home");
             let announced = Uuid::new_v4().to_string();
@@ -1494,6 +1530,7 @@ mod tests {
             let record =
                 crate::session_binding::claude_binding_path(&muxel_store::data_dir().unwrap(), id);
             let first_modified = std::fs::metadata(&record).unwrap().modified().unwrap();
+            let first_bytes = std::fs::read(&record).unwrap();
             let first_receipt =
                 crate::session_binding::claude_hook_identity(&muxel_store::data_dir().unwrap(), id)
                     .unwrap();
@@ -1511,6 +1548,21 @@ mod tests {
                     app.bump_session_binding_generation(id);
                 })
                 .unwrap();
+            // Model a consumed receipt retained after failed acknowledgement
+            // or a surviving writer. Preserve bytes AND mtime, so it remains
+            // exactly the worker's consumed publication rather than a new hook.
+            std::fs::write(&record, first_bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&record)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(first_modified))
+                .unwrap();
+            assert_eq!(
+                crate::session_binding::claude_hook_identity(&muxel_store::data_dir().unwrap(), id)
+                    .unwrap(),
+                first_receipt
+            );
             let mut fresh = window
                 .update(cx, |app, _, _| {
                     app.prepare_claude_launch(id, token)
@@ -1627,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn w8lm_h2_legacy_moved_transcript_receipt_cannot_undo_a_later_fresh_start() {
+    fn pr108_legacy_moved_transcript_receipt_cannot_undo_a_later_fresh_start() {
         with_app(|cx, window| {
             let home = muxel_store::data_dir().unwrap().join("h2-legacy-home");
             let (id, announced, mut pending) = window

@@ -40,8 +40,27 @@ fn normalized(path: &Path) -> String {
     }
 }
 
-fn stored_path(home: &Path, path: &Path, id: Uuid) -> bool {
-    path.is_absolute()
+fn local_absolute(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        path.is_absolute()
+            && matches!(path.components().next(), Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+    }
+    #[cfg(not(windows))]
+    {
+        path.is_absolute()
+    }
+}
+
+/// Validate peer-supplied transcript paths without touching the filesystem.
+/// Only the expected UUID file in one local Claude project directory is allowed.
+/// A trusted local verbatim drive path is equivalent to its ordinary form;
+/// network and device namespaces are never admitted.
+pub fn stored_claude_session_path(home: &Path, path: &Path, id: Uuid) -> bool {
+    local_absolute(home)
+        && local_absolute(path)
         && !path.components().any(|part| part == Component::ParentDir)
         && path
             .file_stem()
@@ -82,7 +101,7 @@ pub fn discover_claude_sessions(
         let preferred = request
             .path
             .as_ref()
-            .filter(|path| stored_path(home, path, id))
+            .filter(|path| stored_claude_session_path(home, path, id))
             .cloned()
             .or_else(|| {
                 request

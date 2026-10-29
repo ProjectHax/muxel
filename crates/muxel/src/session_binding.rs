@@ -1279,6 +1279,10 @@ pub(crate) struct ClaimedClaudeRecord {
 }
 
 impl ClaimedClaudeRecord {
+    pub(crate) fn identity(&self) -> String {
+        claude_record_identity(&self.bytes, self.modified)
+    }
+
     /// Whether the hook has written a newer record since this one was claimed.
     fn superseded(&self) -> Result<bool> {
         self.shared
@@ -1451,6 +1455,13 @@ fn read_claude_record(path: &Path) -> std::result::Result<Option<ClaudeRecord>, 
             "Claude hook record exceeds {MAX_HOOK_INPUT_BYTES} bytes"
         ));
     }
+    Ok(Some(ClaudeRecord {
+        identity: claude_record_identity(&bytes, modified),
+        bytes,
+    }))
+}
+
+fn claude_record_identity(bytes: &[u8], modified: Option<SystemTime>) -> String {
     let (sign, time) = match modified.map(|time| time.duration_since(std::time::UNIX_EPOCH)) {
         None => (0_u8, std::time::Duration::ZERO),
         Some(Ok(time)) => (1, time),
@@ -1461,11 +1472,8 @@ fn read_claude_record(path: &Path) -> std::result::Result<Option<ClaudeRecord>, 
     hash.update([sign]);
     hash.update(time.as_secs().to_le_bytes());
     hash.update(time.subsec_nanos().to_le_bytes());
-    hash.update(&bytes);
-    Ok(Some(ClaudeRecord {
-        identity: format!("v1:{:x}", hash.finalize()),
-        bytes,
-    }))
+    hash.update(bytes);
+    format!("v1:{:x}", hash.finalize())
 }
 
 /// A bounded own-data receipt check. Transcript validation stays on the worker.

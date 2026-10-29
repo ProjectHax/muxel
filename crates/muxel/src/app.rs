@@ -76,6 +76,8 @@ mod remote_reconnect_tests;
 mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
+#[cfg(test)]
+mod transcript_read_tests;
 use claude_launch::TerminalPreparation;
 mod tmux_install_modal;
 mod upkeep;
@@ -3136,9 +3138,29 @@ fn resolve_binding_context<'a>(
 
 /// The user's home directory (`HOME` on Unix, `USERPROFILE` on Windows).
 fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = CLAUDE_TEST_HOME.with_borrow(Clone::clone) {
+        return Some(home);
+    }
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CLAUDE_TEST_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn claude_test_home(home: Option<PathBuf>) -> impl Drop {
+    struct Restore(Option<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLAUDE_TEST_HOME.with_borrow_mut(|current| *current = self.0.take());
+        }
+    }
+    Restore(CLAUDE_TEST_HOME.with_borrow_mut(|current| std::mem::replace(current, home)))
 }
 
 #[cfg(any(windows, test))]
@@ -4862,12 +4884,86 @@ impl ReplySource {
 /// caller's to skip).
 fn read_file_tail(path: &std::path::Path, max: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+    // Validate directories from the trusted-store side toward the file. Never
+    // follow a project symlink/junction into a device or a network share.
+    let project = path.parent()?;
+    let projects = project.parent()?;
+    let claude = projects.parent()?;
+    for directory in [claude, projects, project] {
+        if !transcript_metadata(directory)?.is_dir() {
+            return None;
+        }
+    }
+    if !transcript_metadata(path)?.is_file() {
+        return None;
+    }
+    #[cfg(test)]
+    if !transcript_read_tests::observe("open", path) {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A file swapped for a FIFO or symlink after the check must not block
+        // this worker or redirect the open.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || transcript_is_link(&metadata) {
+        return None;
+    }
+    let len = metadata.len();
     file.seek(SeekFrom::Start(len.saturating_sub(max))).ok()?;
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
+    #[cfg(test)]
+    if !transcript_read_tests::observe("read", path) {
+        return None;
+    }
+    file.take(max).read_to_end(&mut buf).ok()?;
     Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn transcript_is_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn transcript_metadata(path: &Path) -> Option<std::fs::Metadata> {
+    #[cfg(test)]
+    if !transcript_read_tests::observe("metadata", path) {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    (!transcript_is_link(&metadata)).then_some(metadata)
+}
+
+/// Select the local transcript before its off-thread reader runs. Kept as a
+/// separate seam so untrusted peer paths can be tested without a GUI or I/O.
+fn claude_reply_transcript(
+    home: &Path,
+    session_id: Option<&str>,
+    stored_path: Option<&Path>,
+) -> Option<PathBuf> {
+    let id = Uuid::parse_str(session_id?).ok()?;
+    let path = stored_path?;
+    muxel_core::stored_claude_session_path(home, path, id).then(|| path.to_path_buf())
 }
 
 /// The small label shown under the cursor while dragging a project row.
@@ -12779,6 +12875,15 @@ impl MuxelApp {
         Option<PathBuf>,
     )> {
         use crate::session_binding::RecoveredClaudeRecord::{Handled, NotYet};
+        let receipt = record.identity();
+        if self
+            .workspace
+            .instance(iid)
+            .and_then(|instance| instance.claude_hook_record.as_deref())
+            == Some(receipt.as_str())
+        {
+            return Ok((Handled, None));
+        }
         let Some(binding) = crate::session_binding::claude_binding_from_record(&record.bytes, home)
         else {
             return Ok((NotYet, None));
@@ -12796,22 +12901,25 @@ impl MuxelApp {
             .workspace
             .instance(iid)
             .and_then(|instance| instance.session_id.as_deref());
-        if !crate::session_binding::claude_record_switches(&binding, seen, bound, true) {
-            self.remember_claude_hook(iid, launch, binding.stamp);
-            return Ok((Handled, cwd));
-        }
+        let switches = crate::session_binding::claude_record_switches(&binding, seen, bound, true);
         let Some(instance) = self.workspace.instance_mut(iid) else {
             return Ok((Handled, cwd));
         };
         let previous_session_id = instance.session_id.clone();
         let previous_session_path = instance.session_path.clone();
+        let previous_hook_record = instance.claude_hook_record.clone();
         let previous_session_started = instance.session_started;
         let previous_auto_name = instance.auto_name.clone();
-        instance.session_id = Some(binding.session_id);
-        instance.session_path = Some(binding.path);
-        instance.session_started = true;
-        instance.auto_name = None;
-        self.bump_session_binding_generation(iid);
+        if switches {
+            instance.session_id = Some(binding.session_id);
+            instance.session_path = Some(binding.path);
+            instance.session_started = true;
+            instance.auto_name = None;
+        }
+        instance.claude_hook_record = Some(receipt);
+        if switches {
+            self.bump_session_binding_generation(iid);
+        }
         if self.try_persist() {
             self.remember_claude_hook(iid, launch, binding.stamp);
             Ok((Handled, cwd))
@@ -12824,9 +12932,12 @@ impl MuxelApp {
                 .expect("Claude binding owner disappeared during persistence");
             instance.session_id = previous_session_id;
             instance.session_path = previous_session_path;
+            instance.claude_hook_record = previous_hook_record;
             instance.session_started = previous_session_started;
             instance.auto_name = previous_auto_name;
-            self.bump_session_binding_generation(iid);
+            if switches {
+                self.bump_session_binding_generation(iid);
+            }
             anyhow::bail!(
                 "{}",
                 t(
@@ -20939,7 +21050,13 @@ impl MuxelApp {
         let project = self.workspace.project(inst.project_id)?;
         let local = project.remote.is_none();
         let transcript = if local && is_claude_program(inst.program.as_deref()) {
-            inst.session_path.clone()
+            home_dir().and_then(|home| {
+                claude_reply_transcript(
+                    &home,
+                    inst.session_id.as_deref(),
+                    inst.session_path.as_deref(),
+                )
+            })
         } else {
             None
         };

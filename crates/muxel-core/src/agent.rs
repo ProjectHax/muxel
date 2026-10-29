@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 mod claude_sessions;
 mod codex_sessions;
-pub use claude_sessions::{ClaudeSession, ClaudeSessionRequest, discover_claude_sessions};
+pub use claude_sessions::{
+    ClaudeSession, ClaudeSessionRequest, discover_claude_sessions, stored_claude_session_path,
+};
 pub use codex_sessions::{
     CodexHintMiss, CodexResumePath, CodexSession, CodexSessionNames, codex_latest_sessions,
     codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
