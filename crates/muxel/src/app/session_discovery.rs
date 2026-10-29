@@ -1195,7 +1195,7 @@ impl MuxelApp {
         // UUID equals the saved one. It still needs a runtime boundary.
         let candidate = SessionCandidate {
             id: binding.session_id,
-            path: None,
+            path: Some(binding.path),
         };
         let mut update = self.stage_discovered_session(iid, candidate, true)?;
         update.switched = Some((switched_at, switched_at));
