@@ -892,10 +892,41 @@ feature is added or changed, update the matching entry here in the same change**
   Revocation does not stop processes
   or undo input already delivered.
   `send` waits for its delayed Enter and withholds it if local input changes or
-  the pane closes or restarts. A failure before a paste attempt releases only its
-  own tmux claim; after a paste attempt it keeps the claim under the normal aging
-  rules, since the prompt may have reached the agent. Timeout, command failure or
-  older tmux can also leave the claim in place.
+  the pane closes or restarts. A failure that typed nothing (before a paste, or
+  a paste tmux refused) releases only its own tmux claim; once a prompt or key
+  may have reached the agent it keeps the claim under the normal aging rules.
+  Timeout, command failure or older tmux can also leave the claim in place.
+- **Typed through tmux, not its client** — for a pane kept in tmux, local or
+  over SSH, every `ctl` write (`send`'s paste and Enter and its one Codex retry,
+  `answer`, `keys`, and a `new --prompt` task) goes to the pane's own tmux pane
+  through tmux itself: the prompt as one paste from a muxel-named buffer
+  (`paste-buffer -p`, bracketed when the agent asked for it, text read from
+  standard input and never parsed as a tmux command), keys with `send-keys` (a
+  character outside ASCII as a raw paste of that character). muxel can't see
+  whether the agent's pane asked for bracketed paste, so the paste is the same
+  bytes either way, the ones tmux's own paste sends: each line break a CR, and
+  no ESC, so a prompt can never end the bracket early or start a sequence.
+  Nothing goes through the attached tmux client, so tmux's prefix, `prefix2`,
+  the user's `bind -n` keys and extended-key encodings in ctl input reach the
+  agent as text and never open a window or run a tmux command, and agent panes
+  need no shell grant. The first ctl write to a terminal finds the agent's own
+  tmux pane, the one its session was created with (the session's lowest pane
+  id; in a session muxel created with a program, that pane must also have been
+  started with a command, which a plain shell split never is, though muxel
+  doesn't check which command), whichever pane the user left active, and keeps
+  it by pane id, so input stays with the agent after the user opens other
+  windows or splits. If it can't be found or has gone, input
+  is refused with `tmux_pane_unresolved` and nothing is typed, never
+  redirected; after a failed lookup the next waits 2 seconds, doubling to at
+  most 2 minutes, so a host that can't be reached isn't asked again on every
+  write. Writes to one pane stay in order; `keys` replies once tmux has taken
+  every key, and a press that fails after earlier ones went in is
+  `keys_partly_pressed`. A remote pane takes ctl input only over SSH commands
+  run beside its terminal: where the host refuses them, input is refused rather
+  than typed through the client, and without a shared SSH connection each
+  command, and so each key press, makes its own login. Panes not kept in tmux
+  take the same input as PTY bytes, as before. This needs tmux 2.1 or later on
+  a remote host; local tmux panes already need 3.2.
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
@@ -907,18 +938,24 @@ feature is added or changed, update the matching entry here in the same change**
   Restart docks a popped-out terminal before replacing its process.
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
-  receipt confirms writer admission with `pasted: true`.
-  A send failure after a paste attempt reports `pasted: true`; a writer failure
-  may have left partial input. `working` with `reason: just_submitted` identifies
-  the prior turn's grace when the pane has a provider status or configured screen
-  marker. Activity-only panes can accept consecutive sends. `ctl help COMMAND`
-  shows command help; `-h` and `--help` after a command refuse with exit 2 so a
-  script cannot mistake help for a sent prompt. `--` before literal text keeps
-  those words as prompt text. Unknown verbs suggest a nearby command.
+  receipt confirms writer admission with `pasted: true` (for a pane kept in
+  tmux, that tmux pasted it into the agent's tmux pane).
+  A send failure once its paste may have gone in reports `pasted: true`: a writer
+  failure, or a paste tmux didn't answer, may have left partial input. A paste
+  tmux refused, or one refused as `tmux_pane_unresolved`, typed nothing and has
+  no `pasted`. Through tmux, a `keys` or `answer` failure once a key may have
+  gone in reports `pasted: true` too. `working` with `reason: just_submitted`
+  identifies the prior turn's grace when the pane has a provider status or
+  configured screen marker. Activity-only panes can accept consecutive sends.
+  `ctl help COMMAND` shows command help; `-h` and `--help` after a command refuse
+  with exit 2 so a script cannot mistake help for a sent prompt. `--` before
+  literal text keeps those words as prompt text. Unknown verbs suggest a nearby
+  command.
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
   ten seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an
-  `unconfirmed_reason` (`timed_out`, `input_changed` or `interrupted`); once
+  `unconfirmed_reason` (`timed_out`, `input_changed`, `interrupted`, or
+  `retry_unanswered` when tmux didn't answer for the retry Enter); once
   Enter is in, the reply is always this receipt, never an error. muxel doesn't
   wait when the pane can't show a receipt — an unsupported provider, or no
   readable idle status title (tmux hides titles) with a Grok, multi-paragraph or
@@ -1010,9 +1047,11 @@ feature is added or changed, update the matching entry here in the same change**
   this way, whether that was this muxel, and whether its turn is still open.
   `send --force` overrides it, publishing its marker after the paste within two
   seconds or withholding Enter. Within one muxel, a second `send` to an agent is
-  refused until the first one's Enter is in. muxel checks once per host whether
-  its tmux can compare markers (2.6 or later); older tmux overwrites the marker
-  and reads it back instead, and leaves it to lapse rather than clearing it.
+  refused until the first one's Enter is in (for a pane kept in tmux, until tmux
+  has taken it, since the paste and Enter are tmux commands too). muxel checks
+  once per host whether its tmux can compare markers (2.6 or later); older tmux
+  overwrites the marker and reads it back instead, and leaves it to lapse rather
+  than clearing it.
 
 ## Terminal
 
