@@ -1,0 +1,135 @@
+{
+  "captured": "2026-10-26",
+  "columns": 120,
+  "rows": 40,
+  "versions": {
+    "claude": "2.1.310",
+    "grok": "1.0.70"
+  },
+  "providers": {
+    "claude": {
+      "idle": {
+        "text": "\n ▐▛███▛█   Claude Code v2.1.310\n▝▜██████▀  Sonnet 5.5 with low effort · Claude Team\n ▝▝   ▝▝   [project]\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                                                                       ○ low · /effort\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯ Try \"how does <filepath> work?\"\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents",
+        "cursor_row": 36,
+        "cursor_column": 2,
+        "cursor_visible": true,
+        "bracketed_paste": true,
+        "title": "✳ Claude Code",
+        "source": {
+          "raw": "claude-turn.raw",
+          "cut": 1671,
+          "elapsed_ms": 2945,
+          "prefixSha256": "8c65573d05be781aa56eebc2c7d0f482c7850f614c67755b97a0ffa120d5e2a1",
+          "meaning": "Startup before model turn; inspect replayed grid to confirm settled composer."
+        }
+      },
+      "working": {
+        "text": "\n ▐▛███▛█   Claude Code v2.1.310\n▝▜██████▀  Sonnet 5.5 with low effort · Claude Team\n ▝▝   ▝▝   [project]\n\n\n❯ Reply with exactly B1_OK. Do not use tools.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n· Scheming…\n                                                                                                       ○ low · /effort\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents",
+        "cursor_row": 36,
+        "cursor_column": 2,
+        "cursor_visible": true,
+        "bracketed_paste": true,
+        "title": "◑ Claude Code",
+        "source": {
+          "raw": "claude-turn.raw",
+          "cut": 2375,
+          "elapsed_ms": 9541,
+          "prefixSha256": "a94921040cd5dab635208ffbb87ec9434558f05b238fa83c1046d953ee4a35ef",
+          "meaning": "During model request before completed reply; native activity/control evidence in timeline."
+        }
+      },
+      "done": {
+        "text": "\n ▐▛███▛█   Claude Code v2.1.310\n▝▜██████▀  Sonnet 5.5 with low effort · Claude Team\n ▝▝   ▝▝   [project]\n\n\n❯ Reply with exactly B1_OK. Do not use tools.\n\n● B1_OK\n\n✻ Baked for 2s · done 6:51 AM\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n                                                                                                       ○ low · /effort\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n❯\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 4 agents",
+        "cursor_row": 36,
+        "cursor_column": 2,
+        "cursor_visible": true,
+        "bracketed_paste": true,
+        "title": "✳ B1_OK",
+        "source": {
+          "raw": "claude-turn.raw",
+          "cut": 2917,
+          "elapsed_ms": 10571,
+          "prefixSha256": "4ba8e346e999c9ca9c7f447415ba3e55f97a22f9397ab7151845f70ede8d4312",
+          "meaning": "Completed assistant B1_OK plus provider completion row; carries lifecycle history, unlike standalone visible idle."
+        }
+      },
+      "blocked": {
+        "text": "\n ▐▛███▛█   Claude Code v2.1.310\n▝▜██████▀  Sonnet 5.5 with low effort · Claude Team\n ▝▝   ▝▝   [project]\n\n\n❯ Use AskUserQuestion now to ask me to choose Alpha or Beta. Do not answer the question yourself. Do not use any other\n  tool.\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n ☐ Choice\n\nWhich do you choose: Alpha or Beta?\n\n❯ 1. Alpha\n     Choose Alpha.\n  2. Beta\n     Choose Beta.\n  3. Type something.\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  4. Chat about this\n\nEnter to select · ↑/↓ to navigate · Esc to cancel\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+        "cursor_row": 13,
+        "cursor_column": 0,
+        "cursor_visible": false,
+        "bracketed_paste": true,
+        "title": "✳ Alpha or Beta choice",
+        "source": {
+          "raw": "claude-blocked.raw",
+          "cut": 4770,
+          "elapsed_ms": 10258,
+          "prefixSha256": "8686145663b5adc9f73ec887a395b28d676e64788db7da97e962f716858ab5cc",
+          "meaning": "Native unanswered Alpha/Beta question card; no answer/approval/cancel input sent."
+        }
+      }
+    },
+    "grok": {
+      "idle": {
+        "text": "\n  ≡ master [project]\n\n\n\n\n\n   ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n   │                                                                                                                │\n   │  Grok Build  1.0.70                                                                                            │\n   │                                                                                                                │\n   │  Tool Call Density (v1.0.52)                                                                                   │\n   │  Choose how much of each tool call you see with /density. Don't see it? Run grok update!                       │\n   │                                                                                                                │\n   │  Resume session                                                                                        ctrl+r  │\n   │  New worktree                                                                                          ctrl+w  │\n   │  Changelog                                                                                                     │\n   │  Quit                                                                                                  ctrl+q  │\n   │                                                                                                                │\n   ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯\n\n\n\n\n\n\n\n\n\n\n\n\n   Tip: Run /dashboard (or Ctrl+\\) to see and manage all your agents in one place.\n\n  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n  │ >                                                                                                                │\n  ╰────────────────────────────────────────────────────────────────────────────── Grok 4.7 (xhigh) · always-approve ─╯\n\n                                                                                                              [stable]\n",
+        "cursor_row": 35,
+        "cursor_column": 6,
+        "cursor_visible": true,
+        "bracketed_paste": true,
+        "title": "grok",
+        "source": {
+          "raw": "grok-turn-composer.raw",
+          "cut": 2868,
+          "elapsed_ms": 826,
+          "prefixSha256": "fa41a7c6def1c692b24b20117f7e151f9c7331b51ac71f233fb2ab21d5029791",
+          "meaning": "Startup before model turn; inspect replayed grid to confirm settled composer."
+        }
+      },
+      "working": {
+        "text": "\n  master [project]                                                                           1.8K / 256K │ [Dashboard]\n\n\n     > Reply with exactly B1_OK. Do not use tools.                                                           6:54 AM\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n   - Waiting for response… 1.4s                                                                     1.9s ↓1.77k [stop]\n\n  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n  │ >                                                                                                                │\n  ╰────────────────────────────────────────────────────────────────────────────── Grok 4.7 (xhigh) · always-approve ─╯\n\n  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+x:shortcuts\n",
+        "cursor_row": 35,
+        "cursor_column": 6,
+        "cursor_visible": true,
+        "bracketed_paste": true,
+        "title": "⠦ - Waiting for response… - grok",
+        "source": {
+          "raw": "grok-turn-composer.raw",
+          "cut": 6461,
+          "elapsed_ms": 10299,
+          "prefixSha256": "346f8638b731d177127476c5cfe4927ba235721403018f48ed541a254881b04e",
+          "meaning": "During model request before completed reply; native activity/control evidence in timeline."
+        }
+      },
+      "done": {
+        "text": "\n  master [project]                                                                            21K / 256K │ [Dashboard]\n\n\n     > Reply with exactly B1_OK. Do not use tools.                                                           6:54 AM\n\n\n     B1_OK                                                                                                   6:54 AM\n\n     Worked for 2.7s\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n  │ >                                                                                                                │\n  ╰────────────────────────────────────────────────────────────────────────────── Grok 4.7 (xhigh) · always-approve ─╯\n\n  Shift+Tab:mode  │  Ctrl+x:shortcuts\n",
+        "cursor_row": 35,
+        "cursor_column": 6,
+        "cursor_visible": true,
+        "bracketed_paste": true,
+        "title": "grok",
+        "source": {
+          "raw": "grok-turn-composer.raw",
+          "cut": 7698,
+          "elapsed_ms": 11082,
+          "prefixSha256": "6fc53616fcf2fdd23fd221be1d8827f3eb367e4ce15e005ebcb6d3c5112ec94c",
+          "meaning": "Completed assistant B1_OK plus provider completion row; carries lifecycle history, unlike standalone visible idle."
+        }
+      },
+      "blocked": {
+        "text": "\n  master [project]                                                                            13K / 256K │ [Dashboard]\n\n\n     > [?6cUse ask_user_question now to ask me to choose Alpha or Beta. Do not answer the question           6:54 AM\n       yourself. Do not run commands or change any files.\n\n\n     ♦ Thought for 6.6s\n     ♦ Ask Which option do you want?\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n   ♦ Waiting on answers for Which option do you want?                                               9.2s ↓13.7k [stop]\n\n  │\n  │  Which option do you want?\n  │\n  │\n  │  1 (○) Alpha (Recommended)  Choose Alpha.                                                                        █\n  │  2 (○) Beta                 Choose Beta.                                                                         █\n  │  z (○) Type your answer here\n  │\n  │  ↑/↓ navigate · y copy                                                                            Enter:submit\n  │\n\n  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss\n",
+        "cursor_row": 38,
+        "cursor_column": 56,
+        "cursor_visible": false,
+        "bracketed_paste": true,
+        "title": "⠴ - Running: Ask: Which option do you want? - Ask User to Choose Alpha or Beta - grok",
+        "source": {
+          "raw": "grok-blocked.raw",
+          "cut": 25317,
+          "elapsed_ms": 44823,
+          "prefixSha256": "3108867647e39d89d555b1810b04a9791678bdb96eb3e38d10902ab819c817ae",
+          "meaning": "Native unanswered Alpha/Beta question card; no answer/approval/cancel input sent."
+        }
+      }
+    }
+  }
+}

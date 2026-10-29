@@ -13,6 +13,7 @@ use crate::session::{
 use alacritty_terminal::term::ClipboardType;
 use anyhow::Context as _;
 use gpui::*;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
@@ -489,7 +490,8 @@ impl RuntimeStatusState {
             StatusScreenCapture::Now => {
                 self.content_generation = content_generation;
                 self.last_screen_capture = Some(now);
-                let screen = session.visible_text();
+                let captured = session.startup_screen();
+                let screen = status_screen_context(title_provider, &captured);
                 self.working_marker = working_markers.iter().any(|marker| screen.contains(marker));
                 self.blocked_marker = blocked_markers.iter().any(|marker| screen.contains(marker));
                 self.provider_screen = provider_screen_status(title_provider, &screen);
@@ -1097,6 +1099,19 @@ fn sticky_title_status(
     observed.or(previous)
 }
 
+/// Leave Claude's input box out of every screen-based status source, markers
+/// included, so a draft can't set status. Chrome outside the box still counts:
+/// a permission form's `❯ 1.` row, or the `esc to interrupt` footer below the
+/// box in a tmux pane, which never sees Claude's title.
+fn status_screen_context(provider: TitleProvider, screen: &crate::startup::Screen) -> Cow<'_, str> {
+    if provider == TitleProvider::Claude
+        && let Some(context) = screen.claude_status_context()
+    {
+        return Cow::Owned(context);
+    }
+    Cow::Borrowed(&screen.text)
+}
+
 /// Provider-owned visible UI that adds state not carried by the terminal title.
 fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<AgentStatus> {
     match provider {
@@ -1104,6 +1119,7 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
         TitleProvider::Claude if claude_screen_has_current_work(screen) => {
             Some(AgentStatus::Working)
         }
+        TitleProvider::Grok if is_grok_question(screen) => Some(AgentStatus::Blocked),
         TitleProvider::Grok
             if screen.lines().any(|line| {
                 is_live_background_row(
@@ -1118,6 +1134,44 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
         }
         _ => None,
     }
+}
+
+/// Grok's unanswered question card, read only while the card's own footer is
+/// the screen's last row: a card quoted above the composer is not one. Under a
+/// tmux status bar the card isn't read, and the title's Working stands.
+fn is_grok_question(screen: &str) -> bool {
+    let rows: Vec<_> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let Some(footer) = rows.last() else {
+        return false;
+    };
+    if !footer.starts_with("Tab:next answer")
+        || !footer.contains("Esc:scrollback")
+        || !footer.ends_with("Shift+x:dismiss")
+    {
+        return false;
+    }
+    rows.iter()
+        .any(|row| row.starts_with("♦ Waiting on answers for "))
+        && rows
+            .iter()
+            .any(|row| row.contains("↑/↓ navigate · y copy") && row.contains("Enter:submit"))
+        && rows
+            .iter()
+            .filter(|row| {
+                let row = row.trim_start_matches('│').trim();
+                row.split_once(" (○) ")
+                    .or_else(|| row.split_once(" (●) "))
+                    .is_some_and(|(number, label)| {
+                        number.parse::<usize>().is_ok_and(|number| number > 0)
+                            && !label.trim().is_empty()
+                    })
+            })
+            .count()
+            >= 2
 }
 
 fn claude_screen_has_current_work(screen: &str) -> bool {
@@ -7680,6 +7734,710 @@ mod provider_switch_tests {
             assert_eq!(snapshot.completion_revision, completion_revision);
         }
         session.kill();
+    }
+
+    mod status_user_text_tests {
+        use super::{
+            AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TitleProvider, fixture,
+        };
+        use std::time::Instant;
+
+        fn markers(values: &[&str]) -> Vec<String> {
+            values.iter().map(|value| value.to_string()).collect()
+        }
+
+        /// The marker lists the app supplies for Claude when none are edited.
+        fn builtin() -> (Vec<String>, Vec<String>) {
+            (
+                markers(&["esc to interrupt"]),
+                markers(&["❯ 1.", "Do you want to proceed"]),
+            )
+        }
+
+        fn claude_sample_with(
+            text: &str,
+            (cursor_row, cursor_column): (usize, usize),
+            working: &[String],
+            blocked: &[String],
+        ) -> AgentStatus {
+            let (session, _receiver) = fixture();
+            session.process_output(
+                format!(
+                    "\x1b[2J\x1b[H\x1b]0;✳ Test pane\x07\x1b[?2004h{}\x1b[{};{}H\x1b[?25h",
+                    text.replace('\n', "\r\n"),
+                    cursor_row + 1,
+                    cursor_column + 1,
+                )
+                .as_bytes(),
+            );
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                working,
+                blocked,
+                false,
+                Instant::now(),
+            );
+            let status = runtime.snapshot(&session).status;
+            session.kill();
+            status
+        }
+
+        fn claude_sample(text: &str, cursor_row: usize, cursor_column: usize) -> AgentStatus {
+            let (working, blocked) = builtin();
+            claude_sample_with(text, (cursor_row, cursor_column), &working, &blocked)
+        }
+
+        #[test]
+        fn pasted_permission_transcript_in_composer_is_not_blocked() {
+            let text = "Claude Code\n────────────\n❯ Do you want to proceed?\n  1. Yes\n  3. No\n  Esc to cancel\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(text, 5, 15), AgentStatus::Idle);
+        }
+
+        #[test]
+        fn quoted_permission_question_in_prompt_is_not_blocked() {
+            let text = "Earlier output\n────────────\n❯ Explain the phrase Do you want to proceed\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(text, 2, 43), AgentStatus::Idle);
+        }
+
+        #[test]
+        fn real_permission_dialog_still_blocks() {
+            let text = "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\nEsc to cancel";
+            assert_eq!(claude_sample(text, 1, 2), AgentStatus::Blocked);
+        }
+
+        #[test]
+        fn draft_with_its_own_rule_line_is_still_removed() {
+            // Draft rows sit under the prompt, two columns in. A rule typed
+            // there, even one as long as the box's edges, is not an edge, so
+            // the whole box is still found and left out.
+            let text = "Claude Code\n────────────\n❯ Check this:\n  ────────────\n  Do you want to proceed?\n  1. Yes\n  3. No\n  Esc to cancel\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(text, 7, 15), AgentStatus::Idle);
+        }
+
+        #[test]
+        fn hidden_composer_cannot_supply_status_or_authorize_input() {
+            use crate::startup::Screen;
+            use crate::view::{provider_screen_status, status_screen_context};
+            let screen = Screen {
+                text: "Previous output\n────────────\n❯ Do you want to proceed?\n  1. Yes\n  3. No\n  Esc to cancel\n────────────\n? for shortcuts".to_string(),
+                cursor_row: 5,
+                cursor_column: 15,
+                cursor_visible: false,
+                bracketed_paste: true,
+            };
+            let context = status_screen_context(TitleProvider::Claude, &screen);
+            assert!(!context.contains("Do you want to proceed"));
+            assert_eq!(
+                provider_screen_status(TitleProvider::Claude, &context),
+                None
+            );
+            assert!(!context.contains("Esc to cancel"));
+            assert!(screen.claude_composer_context(false).is_none());
+        }
+
+        #[test]
+        fn markers_match_as_written_outside_the_input_box() {
+            // Built-in and edited lists alike match anywhere but the input
+            // box, so a reply quoting one counts, as on master.
+            let reply = "The quoted phrase is esc to interrupt\n────────────\n❯ Explain that phrase\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(reply, 2, 20), AgentStatus::Working);
+            let busy = markers(&["esc to interrupt", "custom busy"]);
+            assert_eq!(
+                claude_sample_with(reply, (2, 20), &busy, &[]),
+                AgentStatus::Working
+            );
+            let quoted = "Reply quoted: Do you want to proceed?\n────────────\n❯ Explain the phrase\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(quoted, 2, 20), AgentStatus::Blocked);
+            let asking = markers(&["Do you want to proceed"]);
+            assert_eq!(
+                claude_sample_with(quoted, (2, 20), &[], &asking),
+                AgentStatus::Blocked
+            );
+            // Inside the input box the user's own marker doesn't match either.
+            let draft =
+                "Earlier output\n────────────\n❯ custom busy\n────────────\n? for shortcuts";
+            assert_eq!(
+                claude_sample_with(draft, (2, 13), &markers(&["custom busy"]), &[]),
+                AgentStatus::Idle
+            );
+        }
+
+        #[test]
+        fn grok_question_card_counts_only_while_its_footer_ends_the_screen() {
+            // Grok's input box is not removed. A quoted card above the idle
+            // composer is rejected because the card's footer must be the last row.
+            use crate::view::provider_screen_status;
+            let data: serde_json::Value =
+                serde_json::from_str(include_str!("fixtures/provider-state-screens.json")).unwrap();
+            let samples = &data["providers"]["grok"];
+            let card = samples["blocked"]["text"].as_str().unwrap().trim_end();
+            let idle = samples["idle"]["text"].as_str().unwrap();
+            assert_eq!(
+                provider_screen_status(TitleProvider::Grok, card),
+                Some(AgentStatus::Blocked)
+            );
+            let quoted = format!("{card}\n\n{idle}");
+            assert_eq!(provider_screen_status(TitleProvider::Grok, &quoted), None);
+            // Under a tmux status bar the card isn't read, and the Working
+            // that Grok's title reports stands, as on master.
+            let tmux = format!(
+                "{card}\n[0] 0:grok*                              \"host\" 14:32 29-Oct-26"
+            );
+            assert_eq!(provider_screen_status(TitleProvider::Grok, &tmux), None);
+        }
+
+        fn provider_fixture(provider: &str, state: &str, expected: AgentStatus) {
+            use crate::session::{CommandSpec, LaunchBinding, TerminalSession};
+            use std::time::Duration;
+            let data: serde_json::Value =
+                serde_json::from_str(include_str!("fixtures/provider-state-screens.json")).unwrap();
+            let provider_kind = match provider {
+                "claude" => TitleProvider::Claude,
+                "grok" => TitleProvider::Grok,
+                _ => unreachable!(),
+            };
+            let samples = &data["providers"][provider];
+            #[cfg(windows)]
+            let command = CommandSpec::program(
+                "cmd.exe",
+                vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+            );
+            #[cfg(unix)]
+            let command = CommandSpec::program("/bin/cat", vec![]);
+            let (session, _receiver) =
+                TerminalSession::spawn(command.with_binding(LaunchBinding::Known(None)), 120, 40)
+                    .unwrap();
+            let draw = |sample: &serde_json::Value| {
+                let mut wire = format!(
+                    "\x1b[2J\x1b[H\x1b]0;{}\x07",
+                    sample["title"].as_str().unwrap()
+                );
+                for (row, line) in sample["text"].as_str().unwrap().lines().enumerate() {
+                    wire.push_str(&format!("\x1b[{};1H{line}", row + 1));
+                }
+                wire.push_str(if sample["bracketed_paste"].as_bool().unwrap() {
+                    "\x1b[?2004h"
+                } else {
+                    "\x1b[?2004l"
+                });
+                wire.push_str(&format!(
+                    "\x1b[{};{}H",
+                    sample["cursor_row"].as_i64().unwrap() + 1,
+                    sample["cursor_column"].as_u64().unwrap() + 1
+                ));
+                wire.push_str(if sample["cursor_visible"].as_bool().unwrap() {
+                    "\x1b[?25h"
+                } else {
+                    "\x1b[?25l"
+                });
+                session.process_output(wire.as_bytes());
+            };
+            let (working, blocked) = if provider == "claude" {
+                builtin()
+            } else {
+                (vec![], vec![])
+            };
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let now = Instant::now();
+            draw(&samples["idle"]);
+            runtime.reconcile(&session, provider_kind, &working, &blocked, false, now);
+            if state != "idle" {
+                session.mark_turn_submitted();
+                draw(&samples[if state == "done" { "working" } else { state }]);
+                runtime.reconcile(
+                    &session,
+                    provider_kind,
+                    &working,
+                    &blocked,
+                    false,
+                    now + Duration::from_millis(100),
+                );
+            }
+            if state == "done" {
+                draw(&samples["done"]);
+                runtime.reconcile(
+                    &session,
+                    provider_kind,
+                    &working,
+                    &blocked,
+                    false,
+                    now + Duration::from_millis(200),
+                );
+            }
+            let snapshot = runtime.snapshot(&session);
+            assert_eq!(snapshot.status, expected, "{provider} {state}");
+            if state == "done" {
+                assert!(snapshot.completion_ready);
+            }
+            session.kill();
+        }
+
+        macro_rules! fixture_test {
+            ($name:ident, $provider:literal, $state:literal, $expected:ident) => {
+                #[test]
+                fn $name() {
+                    provider_fixture($provider, $state, AgentStatus::$expected);
+                }
+            };
+        }
+        fixture_test!(claude_idle_fixture, "claude", "idle", Idle);
+        fixture_test!(claude_working_fixture, "claude", "working", Working);
+        fixture_test!(claude_blocked_fixture, "claude", "blocked", Blocked);
+        fixture_test!(claude_done_fixture, "claude", "done", Done);
+        fixture_test!(grok_idle_fixture, "grok", "idle", Idle);
+        fixture_test!(grok_working_fixture, "grok", "working", Working);
+        fixture_test!(grok_blocked_fixture, "grok", "blocked", Blocked);
+        fixture_test!(grok_done_fixture, "grok", "done", Done);
+
+        /// Probe screens for Claude 2.1.312 in the 80×24 `fixture` pane, laid
+        /// out like the AskUserQuestion capture: a dialog replaces the input
+        /// box under a full-width rule. Dialog strings are as the CLI composes
+        /// them; the file name, command and host are placeholders.
+        const HEADER: &str = "\n ▐▛███▛█   Claude Code v2.1.312\n▝▜██████▀  Sonnet 5.5 · Claude Team\n ▝▝   ▝▝   [project]\n\n❯ Update the parser, then check its docs.\n";
+        const TMUX_BAR: &str =
+            "[0] 0:claude*                                        \"host\" 14:32 29-Oct-26";
+        const IDLE_FOOTER: &str = "  ? for shortcuts";
+        const BUSY_FOOTER: &str = "  ⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt";
+
+        fn rule() -> String {
+            "─".repeat(80)
+        }
+
+        fn input_box(draft: &str, footer: &str) -> String {
+            let rule = rule();
+            format!("{rule}\n❯ {draft}\n{rule}\n{footer}")
+        }
+
+        fn idle_screen(draft: &str) -> String {
+            format!("{HEADER}\n{}", input_box(draft, IDLE_FOOTER))
+        }
+
+        fn working_screen(spinner: &str, draft: &str) -> String {
+            format!(
+                "{HEADER}\n{spinner} Scheming… (3s · ↑ 1.2k tokens)\n\n{}",
+                input_box(draft, BUSY_FOOTER)
+            )
+        }
+
+        fn finished_screen(draft: &str) -> String {
+            format!(
+                "{HEADER}\n● Done.\n\n✻ Baked for 4s · done 6:51 AM\n\n{}",
+                input_box(draft, IDLE_FOOTER)
+            )
+        }
+
+        fn dialog_screen(dialog: &str) -> String {
+            format!("{HEADER}\n● Update(src/parser.rs)\n\n{}\n{dialog}", rule())
+        }
+
+        /// Each Claude 2.1.312 dialog that shows numbered choices, by name.
+        fn dialogs() -> Vec<(&'static str, String)> {
+            let dashed = "╌".repeat(80);
+            let edit = |question: &str| {
+                format!(
+                    " Edit file\n src/parser.rs\n{dashed}\n 12 -    let value = parse(input);\n 12 +    let value = parse(input)?;\n{dashed}\n {question}\n ❯ 1. Yes\n   2. Yes, allow all edits during this session (shift+tab)\n   3. No\n\n Esc to cancel · Tab to amend"
+                )
+            };
+            vec![
+                ("edit", edit("Do you want to make this edit to parser.rs?")),
+                ("create", edit("Do you want to create parser.rs?")),
+                ("overwrite", edit("Do you want to overwrite parser.rs?")),
+                ("write", edit("Do you want to write to parser.rs?")),
+                (
+                    "fetch",
+                    " Fetch\n\n   https://example.com/docs\n   Claude wants to fetch content from example.com\n\n Do you want to allow Claude to fetch this content?\n ❯ 1. Yes\n   2. Yes, and don't ask again for example.com\n   3. No, and tell Claude what to do differently (esc)\n\n Esc to cancel".to_string(),
+                ),
+                (
+                    "plan",
+                    " Ready to code?\n\n Here is Claude's plan:\n ╭────────────────────────────────╮\n │ 1. Fix the parser's error path │\n ╰────────────────────────────────╯\n\n Claude has written up a plan and is ready to execute. Would you like to\n proceed?\n\n ❯ 1. Yes, and auto-accept edits\n   2. Yes, and manually approve edits\n   3. No, keep planning".to_string(),
+                ),
+                (
+                    "network",
+                    " Network request\n\n   Host: registry.example.com\n\n Do you want to allow this connection?\n ❯ 1. Yes\n   2. Yes, and don't ask again for registry.example.com\n   3. No\n\n Esc to cancel".to_string(),
+                ),
+                (
+                    "bash",
+                    " Bash command\n\n   cargo test --workspace\n   Run the test suite\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again for cargo test commands in [project]\n   3. No, and tell Claude what to do differently (esc)\n\n Esc to cancel · Tab to amend · ctrl+e to explain".to_string(),
+                ),
+                // A narrow pane wraps the question card's hint, which then
+                // misses the strict parser; its choice row still counts.
+                (
+                    "narrow question",
+                    format!(
+                        " ☐ Parser\n\n Which fix do you want?\n\n ❯ 1. Return an error\n   2. Fall back to the default\n   3. Type something.\n{}\n   4. Chat about this\n\n Enter to select · ↑/↓ to\n navigate · Esc to cancel",
+                        rule()
+                    ),
+                ),
+            ]
+        }
+
+        /// Draw one screen with Claude's paste mode on: the cursor sits in the
+        /// input box when there is one and is hidden otherwise. `None` sends no
+        /// title, as in a tmux pane.
+        fn draw(session: &crate::session::TerminalSession, title: Option<&str>, screen: &str) {
+            let mut wire = "\x1b[2J\x1b[H".to_string();
+            if let Some(title) = title {
+                wire.push_str(&format!("\x1b]0;{title}\x07"));
+            }
+            wire.push_str("\x1b[?2004h");
+            let rows: Vec<_> = screen.lines().collect();
+            for (row, line) in rows.iter().enumerate() {
+                wire.push_str(&format!("\x1b[{};1H{line}", row + 1));
+            }
+            let composer = (1..rows.len())
+                .rev()
+                .find(|&row| rows[row].starts_with("❯ ") && rows[row - 1] == rule());
+            wire.push_str(&match composer {
+                Some(row) => format!("\x1b[{};3H\x1b[?25h", row + 1),
+                None => "\x1b[H\x1b[?25l".to_string(),
+            });
+            session.process_output(wire.as_bytes());
+        }
+
+        /// Reconcile each `(title, screen)` step 100 ms apart with Claude's
+        /// built-in markers, submitting the turn after the first step as its
+        /// Enter would. Returns each step's status.
+        fn probe(steps: &[(Option<&str>, String)]) -> Vec<AgentStatus> {
+            use std::time::Duration;
+            let (working, blocked) = builtin();
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let mut seen = Vec::new();
+            for (index, (title, screen)) in steps.iter().enumerate() {
+                if index == 1 {
+                    session.mark_turn_submitted();
+                }
+                draw(&session, *title, screen);
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    start + Duration::from_millis(100 * index as u64),
+                );
+                seen.push(runtime.snapshot(&session).status);
+            }
+            session.kill();
+            seen
+        }
+
+        #[test]
+        fn every_numbered_permission_dialog_reads_blocked() {
+            use crate::view::status_screen_context;
+            for (name, dialog) in dialogs() {
+                let screen = dialog_screen(&dialog);
+                // No dialog passes for the input box: its choice row is kept.
+                let (session, _receiver) = fixture();
+                draw(&session, None, &screen);
+                let captured = session.startup_screen();
+                assert!(
+                    status_screen_context(TitleProvider::Claude, &captured).contains("❯ 1. "),
+                    "{name}"
+                );
+                session.kill();
+                // Claude can leave an idle-shaped title up behind the form,
+                // where missing its `❯ 1.` row would latch a false Done.
+                for title in ["✳ Update parser", "◑ Update parser"] {
+                    assert_eq!(
+                        probe(&[
+                            (Some("✳ Claude Code"), idle_screen("")),
+                            (Some("◑ Update parser"), working_screen("✶", "")),
+                            (Some(title), screen.clone()),
+                        ]),
+                        [
+                            AgentStatus::Idle,
+                            AgentStatus::Working,
+                            AgentStatus::Blocked
+                        ],
+                        "{name} under {title}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn visible_dialog_beats_a_working_program_report() {
+            // A Working report can miss the form Claude waits on, as #110
+            // allows; the form on screen still beats it.
+            use super::TerminalStatusReason;
+            let (working, blocked) = builtin();
+            for (name, dialog) in dialogs() {
+                let (session, _receiver) = fixture();
+                let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+                draw(&session, Some("◑ Update parser"), &dialog_screen(&dialog));
+                session.test_program_status(b"\x1b]7501;state=working\x07");
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Claude,
+                    &working,
+                    &blocked,
+                    false,
+                    Instant::now(),
+                );
+                let snapshot = runtime.snapshot(&session);
+                assert_eq!(
+                    snapshot.coverage,
+                    TerminalStatusCoverage::ProgramStatus,
+                    "{name}"
+                );
+                assert_eq!(snapshot.status, AgentStatus::Blocked, "{name}");
+                // Only the Bash form also passes the strict parser.
+                let reason = if name == "bash" {
+                    TerminalStatusReason::ProviderScreen
+                } else {
+                    TerminalStatusReason::BlockedMarker
+                };
+                assert_eq!(snapshot.reason, reason, "{name}");
+                assert!(snapshot.attributable, "{name}");
+                session.kill();
+            }
+        }
+
+        #[test]
+        fn interrupt_footer_keeps_every_spinner_frame_working_without_a_title() {
+            // A tmux client forwards no title, so the footer below the input
+            // box is the Working evidence for frames the strict row parser
+            // doesn't know.
+            let tmux = |screen: String| (None, format!("{screen}\n{TMUX_BAR}"));
+            let mut steps = vec![tmux(idle_screen(""))];
+            for spinner in ["✶", "✻", "✽", "·"] {
+                steps.push(tmux(working_screen(spinner, "")));
+            }
+            steps.push(tmux(finished_screen("")));
+            assert_eq!(
+                probe(&steps),
+                [
+                    AgentStatus::Idle,
+                    AgentStatus::Working,
+                    AgentStatus::Working,
+                    AgentStatus::Working,
+                    AgentStatus::Working,
+                    AgentStatus::Done,
+                ]
+            );
+        }
+
+        #[test]
+        fn draft_quoting_a_dialog_cannot_set_blocked() {
+            // The draft stays in the box through a whole turn. With no title,
+            // as in a tmux pane, the footer still carries Working.
+            for draft in [
+                "Do you want to proceed?",
+                "❯ 1. Yes",
+                "Why did it ask Do you want to proceed? ❯ 1. Yes",
+            ] {
+                for title in [Some("✳ Claude Code"), None] {
+                    let bar = if title.is_none() { TMUX_BAR } else { "" };
+                    let working_title = title.map(|_| "◑ Update parser");
+                    assert_eq!(
+                        probe(&[
+                            (title, format!("{}\n{bar}", idle_screen(draft))),
+                            (
+                                working_title,
+                                format!("{}\n{bar}", working_screen("✶", draft))
+                            ),
+                            (title, format!("{}\n{bar}", finished_screen(draft))),
+                        ]),
+                        [AgentStatus::Idle, AgentStatus::Working, AgentStatus::Done],
+                        "{draft:?} under {title:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Codex 0.164 turns, whose title is a bare thread UUID and which has no
+    /// markers: a reasoning header, a queued follow-up, a model footer the
+    /// parser doesn't know, and popups after the turn. Its screen is not a
+    /// status source, so each sequence reduces exactly as on master: Idle
+    /// until the bell rings, then Done.
+    mod codex_master_parity_tests {
+        use super::{AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TitleProvider};
+        use crate::session::{CommandSpec, LaunchBinding, TerminalSession};
+        use std::time::{Duration, Instant};
+
+        const THREAD: &str = "00000000-0000-4000-8000-000000000001";
+        const DAYBREAK: &str = "Daybreak Blue low · [project]";
+        const SUNSET: &str = "Sunset Gold low · [project]";
+        const BANNER: &str = "\n  >_ OpenAI Codex (v0.164.0)\n     [project]\n";
+        const WORKING: &str = "• Working (0s • esc to interrupt)";
+        const FINISHED: &str = "• B1_OK\n\n  Worked for 3s • 06:53";
+
+        fn editor(footer: &str) -> String {
+            format!("› Ask Codex to do anything\n\n  {footer}")
+        }
+
+        fn idle(footer: &str) -> String {
+            format!("{BANNER}\n{}", editor(footer))
+        }
+
+        /// A turn's screen: the submitted prompt, its activity, then whatever
+        /// Codex draws below that (its editor and footer, or a popup).
+        fn turn(activity: &str, bottom: &str) -> String {
+            format!(
+                "{BANNER}\n› Reply with exactly B1_OK. Do not use tools.\n\n{activity}\n\n{bottom}"
+            )
+        }
+
+        /// Reconcile each `(ms, screen, bell)` step `ms` after the start,
+        /// drawing a non-empty screen and then ringing the bell where marked.
+        /// The turn is submitted after the first step, as its Enter would be.
+        /// Returns each step's status and snapshot sequence.
+        fn reduce(steps: &[(u64, &str, bool)]) -> Vec<(AgentStatus, u64)> {
+            #[cfg(windows)]
+            let command = CommandSpec::program(
+                "cmd.exe",
+                vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+            );
+            #[cfg(unix)]
+            let command = CommandSpec::program("/bin/cat", vec![]);
+            let binding = LaunchBinding::Known(Some(THREAD.to_string()));
+            let (session, _receiver) =
+                TerminalSession::spawn(command.with_binding(binding), 120, 40).unwrap();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let mut seen = Vec::new();
+            for (index, (ms, screen, bell)) in steps.iter().enumerate() {
+                if index == 1 {
+                    session.mark_turn_submitted();
+                }
+                let mut wire = String::new();
+                if !screen.is_empty() {
+                    wire.push_str(&format!("\x1b[2J\x1b[H\x1b]0;{THREAD}\x07\x1b[?2004h"));
+                    let rows: Vec<_> = screen.lines().collect();
+                    for (row, line) in rows.iter().enumerate() {
+                        wire.push_str(&format!("\x1b[{};1H{line}", row + 1));
+                    }
+                    let editor = rows
+                        .iter()
+                        .rposition(|line| line.starts_with('›'))
+                        .unwrap_or_default();
+                    wire.push_str(&format!("\x1b[{};3H\x1b[?25h", editor + 1));
+                }
+                if *bell {
+                    wire.push('\x07');
+                }
+                session.process_output(wire.as_bytes());
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Codex,
+                    &[],
+                    &[],
+                    false,
+                    start + Duration::from_millis(*ms),
+                );
+                let snapshot = runtime.snapshot(&session);
+                seen.push((snapshot.status, snapshot.snapshot_seq));
+            }
+            session.kill();
+            seen
+        }
+
+        fn statuses(steps: &[(u64, &str, bool)]) -> Vec<AgentStatus> {
+            reduce(steps)
+                .into_iter()
+                .map(|(status, _)| status)
+                .collect()
+        }
+
+        #[test]
+        fn codex_reasoning_header_stays_idle_as_on_master() {
+            let working = turn(WORKING, &editor(DAYBREAK));
+            let reasoning = turn(
+                "• Exploring the repository (4s • esc to interrupt)",
+                &editor(DAYBREAK),
+            );
+            assert_eq!(
+                statuses(&[
+                    (100, &idle(DAYBREAK), false),
+                    (200, &working, false),
+                    (300, &reasoning, false),
+                    (400, &reasoning, false),
+                ]),
+                [AgentStatus::Idle; 4]
+            );
+        }
+
+        #[test]
+        fn codex_queued_follow_up_row_stays_idle_as_on_master() {
+            let working = turn(WORKING, &editor(DAYBREAK));
+            let queued = turn(
+                "• Working (4s • esc to interrupt)\n\n  ↳ Also update the changelog.",
+                &editor(DAYBREAK),
+            );
+            assert_eq!(
+                statuses(&[
+                    (100, &idle(DAYBREAK), false),
+                    (200, &working, false),
+                    (300, &queued, false),
+                    (400, &queued, false),
+                ]),
+                [AgentStatus::Idle; 4]
+            );
+        }
+
+        #[test]
+        fn codex_unrecognised_model_footer_is_done_on_the_bell_as_on_master() {
+            let working = turn(WORKING, &editor(SUNSET));
+            let finished = turn(FINISHED, &editor(SUNSET));
+            assert_eq!(
+                statuses(&[
+                    (100, &idle(SUNSET), false),
+                    (200, &working, false),
+                    (300, &finished, false),
+                    (400, "", true),
+                    // Ten minutes later, nothing has changed it.
+                    (600_400, "", false),
+                ]),
+                [
+                    AgentStatus::Idle,
+                    AgentStatus::Idle,
+                    AgentStatus::Idle,
+                    AgentStatus::Done,
+                    AgentStatus::Done,
+                ]
+            );
+        }
+
+        #[test]
+        fn codex_popups_after_a_turn_publish_nothing_as_on_master() {
+            let working = turn(WORKING, &editor(DAYBREAK));
+            let finished = turn(FINISHED, &editor(DAYBREAK));
+            let slash = turn(
+                FINISHED,
+                "› /\n\n  /model     choose what model and reasoning effort to use\n  /review    review my current changes and find issues\n  /new       start a new chat during a conversation",
+            );
+            let esc_again = turn(
+                FINISHED,
+                "› Ask Codex to do anything\n\n  esc again to edit previous message",
+            );
+            let ctrl_c = turn(
+                FINISHED,
+                "› Ask Codex to do anything\n\n  ctrl + c again to quit",
+            );
+            let seen = reduce(&[
+                (100, &idle(DAYBREAK), false),
+                (200, &working, false),
+                (300, &finished, false),
+                (400, &slash, false),
+                (500, &esc_again, false),
+                (600, &ctrl_c, false),
+                (700, &finished, false),
+            ]);
+            assert!(
+                seen.iter().all(|(status, _)| *status == AgentStatus::Idle),
+                "{seen:?}"
+            );
+            // Once the turn has finished, no popup publishes a change.
+            assert!(
+                seen[2..].iter().all(|(_, seq)| *seq == seen[2].1),
+                "{seen:?}"
+            );
+        }
     }
 
     fn drained(reads: &[(&str, SystemTime)]) -> PtyOutput {

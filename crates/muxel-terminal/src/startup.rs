@@ -639,19 +639,34 @@ impl Screen {
     /// permission question must not be mistaken for that question after paste.
     pub(crate) fn claude_composer_context(&self, empty: bool) -> Option<String> {
         let composer = self.composer_rows(empty)?;
-        Some(
-            self.text
-                .lines()
-                .enumerate()
-                .filter(|(index, _)| !composer.contains(index))
-                .map(|(_, row)| row)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        Some(self.context_without_rows(composer))
+    }
+
+    /// Status leaves out Claude's input box whether it holds a draft or the
+    /// placeholder, and wherever a repaint left the cursor.
+    pub(crate) fn claude_status_context(&self) -> Option<String> {
+        let composer = self.composer_rows_inner(None)?;
+        Some(self.context_without_rows(composer))
+    }
+
+    fn context_without_rows(&self, composer: std::ops::Range<usize>) -> String {
+        self.text
+            .lines()
+            .enumerate()
+            .filter(|(index, _)| !composer.contains(index))
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn composer_rows(&self, empty: bool) -> Option<std::ops::Range<usize>> {
-        if !self.bracketed_paste || !self.cursor_visible {
+        self.composer_rows_inner(Some(empty))
+    }
+
+    /// `empty` is the startup-input test, which needs the visible cursor inside
+    /// the box. `None` finds the box for status alone and never grants input.
+    fn composer_rows_inner(&self, empty: Option<bool>) -> Option<std::ops::Range<usize>> {
+        if !self.bracketed_paste || (empty.is_some() && !self.cursor_visible) {
             return None;
         }
         let Ok(cursor) = usize::try_from(self.cursor_row) else {
@@ -665,11 +680,25 @@ impl Screen {
             let row = row.trim();
             row.chars().count() >= 8 && row.chars().all(|ch| ch == '─' || ch == '━')
         };
-        let top = rows[..cursor].iter().rposition(|row| rule(row))?;
-        let bottom = rows[cursor + 1..]
-            .iter()
-            .position(|row| rule(row))
-            .map(|offset| cursor + 1 + offset)?;
+        let (top, bottom) = if empty.is_some() {
+            let top = rows[..cursor].iter().rposition(|row| rule(row))?;
+            let bottom = rows[cursor + 1..]
+                .iter()
+                .position(|row| rule(row))
+                .map(|offset| cursor + 1 + offset)?;
+            (top, bottom)
+        } else {
+            // A repaint can leave the cursor anywhere, so take the final box.
+            // Its edges are the same full-width rule. Draft rows are drawn
+            // under the prompt, two columns in, so a rule typed into a draft
+            // never matches an edge and can't cut the box short.
+            let bottom = rows.iter().rposition(|row| rule(row))?;
+            let edge = rows[bottom].trim_end();
+            let top = rows[..bottom]
+                .iter()
+                .rposition(|row| row.trim_end() == edge)?;
+            (top, bottom)
+        };
         // The final framed region belongs to the composer, not an earlier turn.
         if rows[bottom + 1..].iter().any(|row| rule(row)) {
             return None;
@@ -681,7 +710,9 @@ impl Screen {
             return None;
         }
         let cursor_at_start = cursor == top + 1 && self.cursor_column == prefix + 2;
-        (cursor_at_start == empty).then_some(top + 1..bottom)
+        empty
+            .is_none_or(|empty| cursor_at_start == empty)
+            .then_some(top + 1..bottom)
     }
 }
 
@@ -1342,6 +1373,21 @@ mod tests {
         );
         assert!(!draft.claude_composer(true));
         assert!(draft.claude_composer(false));
+    }
+    #[test]
+    fn status_box_edges_ignore_a_rule_typed_into_the_draft() {
+        let mut draft = screen(
+            "Claude Code\n────────────\n❯ Check this:\n  ────────────\n  Esc to cancel\n────────────\nmode",
+            4,
+            15,
+        );
+        draft.cursor_visible = false;
+        assert_eq!(
+            draft.claude_status_context().as_deref(),
+            Some("Claude Code\n────────────\n────────────\nmode")
+        );
+        // Neither status nor a hidden cursor grants startup input.
+        assert!(!draft.claude_composer(false));
     }
     #[test]
     fn trust_choice_quoted_transcript_and_wrong_terminal_modes_are_not_ready() {
