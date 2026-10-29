@@ -13,6 +13,7 @@ use super::*;
 use muxel_core::ReadAloudScope;
 use muxel_core::control::{self as ctl, AgentEntry, AgentInfo, AgentState, Command, ErrorCode};
 use muxel_core::readaloud;
+use muxel_core::tmux::ClaimWrite;
 use muxel_terminal::TerminalStatusCoverage;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -228,6 +229,7 @@ struct ClaimSite {
 /// claim exactly as found.
 #[derive(Debug)]
 struct DeferredClaim {
+    writes: ClaimWrite,
     expected_pattern: Option<String>,
     claim: ctl::Claim,
     published: Arc<AtomicBool>,
@@ -252,7 +254,51 @@ struct Typing {
     force: bool,
     /// `send --launch-id`: checked again immediately before the paste.
     launch_id: Option<Uuid>,
+    /// A prompt holds its pane from admission until its Enter is admitted.
+    in_flight: Option<SendInFlight>,
     reply: Value,
+}
+
+/// A `send` from this process between its admission and its Enter. While one
+/// is held, an ordinary send to the same pane is refused: its paste could land
+/// between the first send's paste and Enter, and that Enter would submit both
+/// texts. The tmux claim can't see this when the first send's SSH write or
+/// readback outlasts [`LOCAL_CLAIM_PENDING_MS`]; this marker never ages.
+/// `--force` passes it, as it passes the other busy refusals.
+#[derive(Debug)]
+struct SendInFlight(Uuid);
+
+impl SendInFlight {
+    fn panes() -> &'static std::sync::Mutex<HashMap<Uuid, usize>> {
+        static PANES: std::sync::OnceLock<std::sync::Mutex<HashMap<Uuid, usize>>> =
+            std::sync::OnceLock::new();
+        PANES.get_or_init(Default::default)
+    }
+
+    fn begin(pane: Uuid, force: bool) -> CtlResult<Self> {
+        let mut panes = Self::panes().lock().unwrap_or_else(|e| e.into_inner());
+        let sends = panes.entry(pane).or_default();
+        if *sends > 0 && !force {
+            return Err(ctl::Error::new(
+                ErrorCode::ClaimedElsewhere,
+                "another `send` to this agent hasn't pressed Enter yet: `wait` on the agent and try again (or pass --force to send anyway)",
+            ));
+        }
+        *sends += 1;
+        Ok(Self(pane))
+    }
+}
+
+impl Drop for SendInFlight {
+    fn drop(&mut self) {
+        let mut panes = Self::panes().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sends) = panes.get_mut(&self.0) {
+            *sends -= 1;
+            if *sends == 0 {
+                panes.remove(&self.0);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -802,13 +848,7 @@ impl MuxelApp {
                         .background_executor()
                         .spawn(async move {
                             if force {
-                                read_claim_for_admission(&claim_site)?;
-                                let observed = integrations::tmux_option(
-                                    &claim_site.loc,
-                                    &claim_site.session,
-                                    ctl::CLAIM_OPTION,
-                                );
-                                deferred_claim(observed.as_deref(), grace_ms, lead_ms)
+                                defer_forced_claim(&claim_site, grace_ms, lead_ms)
                                     .map(|deferred| (deferred.claim.clone(), Some(deferred), None))
                             } else {
                                 claim_agent(
@@ -1366,6 +1406,7 @@ impl MuxelApp {
             activity: inst.activity.clone(),
             force,
             launch_id: None,
+            in_flight: None,
             reply,
         })
     }
@@ -1402,6 +1443,7 @@ impl MuxelApp {
             return Err("nothing to send".into());
         }
         check_send_state(self.control_send_admission(iid, force, cx))?;
+        let in_flight = SendInFlight::begin(iid, force)?;
         let turn = Turn {
             prompt: Some(text.clone()),
             grace_ms: ctl::REPLY_GRACE_MS,
@@ -1414,6 +1456,7 @@ impl MuxelApp {
             self.control_typing(iid, Input::Prompt(text), Some(turn), force, Value::Null, cx)?;
         Ok(Typing {
             launch_id,
+            in_flight: Some(in_flight),
             ..typing
         })
     }
@@ -1532,6 +1575,7 @@ impl MuxelApp {
             reply,
             launch_id,
             force,
+            in_flight,
             ..
         } = typing;
         match typing.input {
@@ -1574,6 +1618,8 @@ impl MuxelApp {
                         Ok(session.input_rev())
                     })
                     .unwrap_or_else(|_| Err(ctl::Error::from("muxel is shutting down").after_paste()))?;
+                    // A later send's paste can no longer join this prompt.
+                    drop(in_flight);
                     // Enter is in. Whatever happens next, the reply is this
                     // receipt: an error would read as "Enter withheld".
                     let Some(attempt) = attempt.filter(|attempt| attempt.observable()) else {
@@ -1918,6 +1964,17 @@ fn read_claim(site: &ClaimSite) -> Option<ctl::Claim> {
         .and_then(|value| ctl::Claim::decode(&value))
 }
 
+/// The claim tmux holds before typing. Where the write is conditional, an
+/// unreadable value is first repaired so that it can be compared. A server
+/// before tmux 2.6 can't compare, so its next write replaces whatever is
+/// there, as earlier muxels did, and the readback decides.
+fn read_claim_before_typing(site: &ClaimSite, writes: ClaimWrite) -> CtlResult<Option<ctl::Claim>> {
+    match writes {
+        ClaimWrite::Conditional => read_claim_for_admission(site),
+        ClaimWrite::Unconditional => Ok(read_claim(site)),
+    }
+}
+
 fn read_claim_for_admission(site: &ClaimSite) -> CtlResult<Option<ctl::Claim>> {
     read_claim_for_admission_with(
         || integrations::tmux_option(&site.loc, &site.session, ctl::CLAIM_OPTION),
@@ -1991,8 +2048,28 @@ fn read_claim_for_admission_with(
     Ok(Some(claim))
 }
 
-fn deferred_claim(observed: Option<&str>, grace_ms: i64, lead_ms: i64) -> CtlResult<DeferredClaim> {
+/// A forced send's claim, to publish after its paste: over the value it read
+/// now, where tmux can compare, or over whatever is there on older tmux.
+fn defer_forced_claim(site: &ClaimSite, grace_ms: i64, lead_ms: i64) -> CtlResult<DeferredClaim> {
+    let writes = integrations::tmux_claim_write(&site.loc, &site.session);
+    let observed = match writes {
+        ClaimWrite::Conditional => {
+            read_claim_for_admission(site)?;
+            integrations::tmux_option(&site.loc, &site.session, ctl::CLAIM_OPTION)
+        }
+        ClaimWrite::Unconditional => None,
+    };
+    deferred_claim(observed.as_deref(), grace_ms, lead_ms, writes)
+}
+
+fn deferred_claim(
+    observed: Option<&str>,
+    grace_ms: i64,
+    lead_ms: i64,
+    writes: ClaimWrite,
+) -> CtlResult<DeferredClaim> {
     let expected_pattern = observed
+        .filter(|_| writes == ClaimWrite::Conditional)
         .map(|value| {
             ctl::Claim::decode(value)
                 .and_then(|claim| claim.compare_pattern())
@@ -2005,6 +2082,7 @@ fn deferred_claim(observed: Option<&str>, grace_ms: i64, lead_ms: i64) -> CtlRes
         })
         .transpose()?;
     Ok(DeferredClaim {
+        writes,
         expected_pattern,
         claim: ctl::Claim {
             owner: owner_id().to_string(),
@@ -2017,37 +2095,39 @@ fn deferred_claim(observed: Option<&str>, grace_ms: i64, lead_ms: i64) -> CtlRes
     })
 }
 
+/// Between a forced paste and its Enter: publish the claim and read it back
+/// within one bounded deadline (see [`integrations::publish_tmux_claim_bounded`]).
 fn publish_deferred_claim(site: &ClaimSite, deferred: DeferredClaim) -> CtlResult<()> {
-    publish_deferred_claim_with(
-        deferred,
-        |expected, claim| {
-            integrations::set_tmux_option_if(
-                &site.loc,
-                &site.session,
-                ctl::CLAIM_OPTION,
-                expected,
-                &claim.encode_tmux_command(),
-            )
-            .map_err(|error| {
-                ctl::Error::from(format!(
-                    "the prompt was pasted but its tmux claim could not be published ({error:#}); Enter was withheld: check `screen`"
-                ))
-                .after_paste()
-            })
-        },
-        || read_claim(site),
-    )
+    let writes = deferred.writes;
+    publish_deferred_claim_with(deferred, |expected, claim| {
+        integrations::publish_tmux_claim_bounded(
+            &site.loc,
+            &site.session,
+            ctl::CLAIM_OPTION,
+            writes,
+            expected,
+            &claim.encode_tmux_command(),
+        )
+        .map(|current| current.as_deref().and_then(ctl::Claim::decode))
+        .map_err(|error| {
+            ctl::Error::from(format!(
+                "the prompt was pasted but its tmux claim could not be published ({error:#}); Enter was withheld: check `screen`"
+            ))
+            .after_paste()
+        })
+    })
 }
 
+/// `publish` writes the claim over the expected pattern and returns the claim
+/// it reads back.
 fn publish_deferred_claim_with(
     deferred: DeferredClaim,
-    write_if: impl FnOnce(Option<&str>, &ctl::Claim) -> CtlResult<()>,
-    read: impl FnOnce() -> Option<ctl::Claim>,
+    publish: impl FnOnce(Option<&str>, &ctl::Claim) -> CtlResult<Option<ctl::Claim>>,
 ) -> CtlResult<()> {
     let mut claim = deferred.claim;
     claim.at = now_ms() + SUBMIT_DELAY_MS as i64;
-    write_if(deferred.expected_pattern.as_deref(), &claim)?;
-    if !read().is_some_and(|current| current.same_turn(&claim)) {
+    let current = publish(deferred.expected_pattern.as_deref(), &claim)?;
+    if !current.is_some_and(|current| current.same_turn(&claim)) {
         return Err(ctl::Error::new(
             ErrorCode::ClaimedElsewhere,
             "another muxel changed the tmux claim after the paste; Enter was withheld: check `screen`",
@@ -2068,6 +2148,8 @@ fn publish_deferred_claim_with(
 /// If tmux cannot accept the write, typing proceeds without a shared claim.
 /// If the write succeeds but readback cannot confirm it, typing is refused
 /// before paste. A forced prompt publishes its claim after paste instead.
+/// tmux before 2.6 can't write conditionally ([`ClaimWrite::Unconditional`]);
+/// there the write replaces the claim and only the readback picks one winner.
 fn claim_agent(
     site: &ClaimSite,
     grace_ms: i64,
@@ -2076,6 +2158,7 @@ fn claim_agent(
     state: Option<AgentState>,
     activity: &AgentActivity,
 ) -> CtlResult<ClaimStart> {
+    let writes = integrations::tmux_claim_write(&site.loc, &site.session);
     claim_agent_with(
         ClaimAttempt {
             grace_ms,
@@ -2083,13 +2166,15 @@ fn claim_agent(
             can_force,
             state,
             activity,
+            writes,
         },
-        || read_claim_for_admission(site),
+        || read_claim_before_typing(site, writes),
         |expected, claim| {
-            integrations::set_tmux_option_if(
+            integrations::set_tmux_claim(
                 &site.loc,
                 &site.session,
                 ctl::CLAIM_OPTION,
+                writes,
                 expected,
                 &claim.encode_tmux_command(),
             )
@@ -2110,6 +2195,7 @@ struct ClaimAttempt<'a> {
     can_force: bool,
     state: Option<AgentState>,
     activity: &'a AgentActivity,
+    writes: ClaimWrite,
 }
 
 fn claim_agent_with(
@@ -2124,6 +2210,7 @@ fn claim_agent_with(
         can_force,
         state,
         activity,
+        writes,
     } = attempt;
     let busy = |claim: &ctl::Claim, how: &str| {
         let hint = if can_force {
@@ -2162,6 +2249,7 @@ fn claim_agent_with(
     };
     let expected_pattern = theirs
         .as_ref()
+        .filter(|_| writes == ClaimWrite::Conditional)
         .map(|claim| {
             claim.compare_pattern().ok_or_else(|| {
                 ctl::Error::new(
@@ -2256,12 +2344,17 @@ fn show_value(
 #[cfg(test)]
 mod prompt_submission_tests {
     use super::{
-        ClaimAttempt, PromptConfirmation, PromptConfirmationAction, SendAdmission, Unconfirmed,
-        claim_agent_with, confirmation_verdict, deferred_claim, enter_verdict, just_submitted_turn,
-        now_ms, owner_id, paste_prompt, press_prompt_enter, publish_deferred_claim_with,
-        read_claim_for_admission_with, restore_claim_with, submission_receipt,
+        ClaimAttempt, PromptConfirmation, PromptConfirmationAction, SendAdmission, SendInFlight,
+        Unconfirmed, claim_agent_with, confirmation_verdict, deferred_claim, enter_verdict,
+        just_submitted_turn, now_ms, owner_id, paste_prompt, press_prompt_enter,
+        publish_deferred_claim_with, read_claim_for_admission_with, restore_claim_with,
+        submission_receipt,
     };
-    use muxel_core::{AgentActivity, control::ErrorCode};
+    use muxel_core::{
+        AgentActivity,
+        control::{Claim, ErrorCode},
+        tmux::ClaimWrite,
+    };
     use muxel_terminal::{CommandSpec, PromptSubmissionState, TerminalSession};
     use serde_json::json;
     use std::{
@@ -2270,6 +2363,78 @@ mod prompt_submission_tests {
         time::Duration,
     };
     use uuid::Uuid;
+
+    /// tmux's `#{m:pattern,value}`: fnmatch(3) without flags, where `*` also
+    /// matches `|`. Claim patterns hold only `*` and literal characters.
+    fn tmux_matches(pattern: &str, value: &str) -> bool {
+        match pattern.split_once('*') {
+            None => pattern == value,
+            Some((head, tail)) => value.strip_prefix(head).is_some_and(|rest| {
+                (0..=rest.len())
+                    .filter(|at| rest.is_char_boundary(*at))
+                    .any(|at| tmux_matches(tail, &rest[at..]))
+            }),
+        }
+    }
+
+    #[test]
+    fn the_tmux_match_model_is_fnmatch_not_equality() {
+        assert!(tmux_matches("v1|me|*|*|*|n*", "v1|me|h|1|2|n"));
+        assert!(tmux_matches("v1|me|*|*|*|n*", "v1|me|h|1|2|n|later|fields"));
+        assert!(tmux_matches("v1|me|*|*|*|n*", "v1|me|h|a|b|c|1|2|n"));
+        assert!(!tmux_matches("v1|me|*|*|*|n", "v1|me|h|1|2|n|later"));
+        assert!(!tmux_matches("v1|me|*|*|*|n*", "v1|you|h|1|2|n"));
+        assert!(!tmux_matches("v1|me|*|*|*|n*", "v1|me|h|1|2|m"));
+        assert!(tmux_matches("exact", "exact") && !tmux_matches("exact", "exact2"));
+    }
+
+    /// One tmux session option as the server holds it: raw text, which the
+    /// conditional commands compare the way tmux 2.6+ does.
+    #[derive(Default)]
+    struct TmuxOption(RefCell<Option<String>>);
+
+    impl TmuxOption {
+        fn holding(claim: &Claim) -> Self {
+            Self::raw(claim.encode_tmux_command())
+        }
+
+        fn raw(value: impl Into<String>) -> Self {
+            Self(RefCell::new(Some(value.into())))
+        }
+
+        fn claim(&self) -> Option<Claim> {
+            self.0.borrow().as_deref().and_then(Claim::decode)
+        }
+
+        fn put(&self, claim: &Claim) {
+            *self.0.borrow_mut() = Some(claim.encode_tmux_command());
+        }
+
+        /// `set_option_if_args`: `#{==:#{@muxel-ctl},}` with no pattern,
+        /// `#{m:pattern,#{@muxel-ctl}}` with one. True when the set ran.
+        fn set_if(&self, expected: Option<&str>, value: &str) -> bool {
+            let current = self.0.borrow().clone().unwrap_or_default();
+            let holds = match expected {
+                None => current.is_empty(),
+                Some(pattern) => tmux_matches(pattern, &current),
+            };
+            if holds {
+                *self.0.borrow_mut() = Some(value.to_string());
+            }
+            holds
+        }
+    }
+
+    fn attempt(activity: &AgentActivity, writes: ClaimWrite) -> ClaimAttempt<'_> {
+        ClaimAttempt {
+            grace_ms: muxel_core::control::REPLY_GRACE_MS,
+            lead_ms: 400,
+            can_force: true,
+            state: Some(super::AgentState::Idle),
+            activity,
+            writes,
+        }
+    }
 
     #[test]
     fn a_launch_guard_refuses_before_pasting_and_receipts_use_the_admitted_launch() {
@@ -2407,6 +2572,7 @@ mod prompt_submission_tests {
                         Some(&old.encode()),
                         muxel_core::control::REPLY_GRACE_MS,
                         super::SUBMIT_DELAY_MS as i64,
+                        ClaimWrite::Conditional,
                     )
                     .unwrap();
                     let published = deferred.published.clone();
@@ -2445,6 +2611,63 @@ mod prompt_submission_tests {
             );
             assert!(!published.load(std::sync::atomic::Ordering::Acquire));
             assert_eq!(session.input_rev(), before, "late state wrote input");
+        });
+    }
+
+    /// The marker is taken when `send` is admitted and given back at its Enter.
+    #[cfg(windows)]
+    #[test]
+    fn control_send_holds_its_pane_from_admission_until_enter() {
+        use gpui::AppContext as _;
+        use muxel_core::{Instance, Project};
+        use muxel_terminal::{TerminalLaunch, TerminalView};
+        use std::time::Instant;
+
+        super::super::popout_lifecycle_tests::with_app(|cx, window| {
+            let (pane, sent) = window
+                .update(cx, |app, window, cx| {
+                    let root = muxel_store::data_dir().unwrap().join("control-in-flight");
+                    std::fs::create_dir_all(&root).unwrap();
+                    let project = app.workspace.add_project(Project::new("control", root));
+                    let mut instance = Instance::shell(project);
+                    instance.program = Some("cmd.exe".into());
+                    instance.args = vec!["/D".into(), "/Q".into(), "/K".into()];
+                    let pane = instance.id;
+                    let spec = CommandSpec::program("cmd.exe", instance.args.clone());
+                    app.workspace.add_instance(instance);
+                    app.settings.control_enabled = true;
+                    app.settings.control_allow_shells = true;
+                    let launch = TerminalLaunch::spawn(spec, (80, 24)).unwrap();
+                    let view =
+                        cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+                    app.terminals.insert(pane, view);
+                    // A fresh shell pane can report Working, which only
+                    // `--force` passes. A forced send still takes the marker.
+                    let first = app
+                        .control_send(pane, "first".into(), true, None, cx)
+                        .unwrap();
+                    let second = SendInFlight::begin(pane, false).unwrap_err();
+                    assert_eq!(second.code, Some(ErrorCode::ClaimedElsewhere));
+                    let pressed = app.control_press(first, None, None, cx);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    cx.spawn(async move |_, _| {
+                        tx.send(pressed.await).unwrap();
+                    })
+                    .detach();
+                    (pane, rx)
+                })
+                .unwrap();
+            cx.run_until_parked();
+            assert!(
+                SendInFlight::begin(pane, false).is_err(),
+                "the pasted prompt released its pane before Enter"
+            );
+            cx.executor()
+                .advance_clock(Duration::from_millis(super::SUBMIT_DELAY_MS));
+            cx.run_until_parked();
+            let sent = sent.try_recv().expect("the send finished");
+            assert!(sent.is_ok(), "{sent:?}");
+            assert!(SendInFlight::begin(pane, false).is_ok());
         });
     }
 
@@ -2553,28 +2776,23 @@ mod prompt_submission_tests {
             grace_ms: muxel_core::control::REPLY_GRACE_MS,
             nonce: Some(Uuid::new_v4()),
         };
-        let stored = RefCell::new(Some(old.clone()));
+        let stored = TmuxOption::holding(&old);
         let writes = Cell::new(0);
+        let activity = AgentActivity::default();
         let started = claim_agent_with(
-            ClaimAttempt {
-                grace_ms: muxel_core::control::REPLY_GRACE_MS,
-                lead_ms: 400,
-                can_force: true,
-                state: Some(super::AgentState::Idle),
-                activity: &AgentActivity::default(),
-            },
-            || Ok(stored.borrow().clone()),
+            attempt(&activity, ClaimWrite::Conditional),
+            || Ok(stored.claim()),
             |expected, claim| {
                 assert_eq!(expected, old.compare_pattern().as_deref());
                 writes.set(writes.get() + 1);
-                *stored.borrow_mut() = Some(claim.clone());
+                assert!(stored.set_if(expected, &claim.encode_tmux_command()));
                 true
             },
             |_| {},
         )
         .unwrap();
         assert_eq!(writes.get(), 1, "ordinary send must claim before paste");
-        assert!(stored.borrow().as_ref().unwrap().same_turn(&started.claim));
+        assert!(stored.claim().unwrap().same_turn(&started.claim));
     }
 
     #[test]
@@ -2598,6 +2816,7 @@ mod prompt_submission_tests {
                     can_force: false,
                     state: Some(super::AgentState::Blocked),
                     activity: &AgentActivity::default(),
+                    writes: ClaimWrite::Conditional,
                 },
                 || Ok(stored.borrow().clone()),
                 |_, claim| {
@@ -2644,7 +2863,13 @@ mod prompt_submission_tests {
             assert_eq!(repairs.get(), 1, "raw claim was not repaired: {raw}");
             assert!(result.is_some_and(|claim| claim.compare_pattern().is_some()));
             assert!(
-                deferred_claim(stored.borrow().as_deref(), 30_000, 400).is_ok(),
+                deferred_claim(
+                    stored.borrow().as_deref(),
+                    30_000,
+                    400,
+                    ClaimWrite::Conditional
+                )
+                .is_ok(),
                 "--force could not publish after repair: {raw}"
             );
         }
@@ -2708,22 +2933,18 @@ mod prompt_submission_tests {
             grace_ms: muxel_core::control::REPLY_GRACE_MS,
             nonce: Some(Uuid::new_v4()),
         };
-        let stored = RefCell::new(Some(live.clone()));
+        let stored = TmuxOption::holding(&live);
         let writes = Cell::new(0);
+        let activity = AgentActivity::default();
+        let write = |expected: Option<&str>, claim: &Claim| {
+            writes.set(writes.get() + 1);
+            stored.set_if(expected, &claim.encode_tmux_command());
+            true
+        };
         let error = claim_agent_with(
-            ClaimAttempt {
-                grace_ms: muxel_core::control::REPLY_GRACE_MS,
-                lead_ms: 400,
-                can_force: true,
-                state: Some(super::AgentState::Idle),
-                activity: &AgentActivity::default(),
-            },
-            || Ok(stored.borrow().clone()),
-            |_, claim| {
-                writes.set(writes.get() + 1);
-                *stored.borrow_mut() = Some(claim.clone());
-                true
-            },
+            attempt(&activity, ClaimWrite::Conditional),
+            || Ok(stored.claim()),
+            write,
             |_| {},
         )
         .unwrap_err();
@@ -2733,7 +2954,7 @@ mod prompt_submission_tests {
             0,
             "the second send wrote over the first claim"
         );
-        assert!(stored.borrow().as_ref().unwrap().same_turn(&live));
+        assert!(stored.claim().unwrap().same_turn(&live));
 
         // A later local send can follow the predicted Enter after its margin,
         // while a peer still sees the full shared reply grace.
@@ -2745,44 +2966,24 @@ mod prompt_submission_tests {
             owner: "peer".into(),
             ..expired.clone()
         };
-        *stored.borrow_mut() = Some(peer.clone());
+        stored.put(&peer);
         assert!(
             claim_agent_with(
-                ClaimAttempt {
-                    grace_ms: muxel_core::control::REPLY_GRACE_MS,
-                    lead_ms: 400,
-                    can_force: true,
-                    state: Some(super::AgentState::Idle),
-                    activity: &AgentActivity::default(),
-                },
-                || Ok(stored.borrow().clone()),
-                |_, claim| {
-                    writes.set(writes.get() + 1);
-                    *stored.borrow_mut() = Some(claim.clone());
-                    true
-                },
+                attempt(&activity, ClaimWrite::Conditional),
+                || Ok(stored.claim()),
+                write,
                 |_| {},
             )
             .is_err()
         );
         assert_eq!(writes.get(), 0);
-        assert_eq!(stored.borrow().as_ref().unwrap().owner, "peer");
+        assert_eq!(stored.claim().unwrap().owner, "peer");
 
-        *stored.borrow_mut() = Some(expired.clone());
+        stored.put(&expired);
         let next = claim_agent_with(
-            ClaimAttempt {
-                grace_ms: muxel_core::control::REPLY_GRACE_MS,
-                lead_ms: 400,
-                can_force: true,
-                state: Some(super::AgentState::Idle),
-                activity: &AgentActivity::default(),
-            },
-            || Ok(stored.borrow().clone()),
-            |_, claim| {
-                writes.set(writes.get() + 1);
-                *stored.borrow_mut() = Some(claim.clone());
-                true
-            },
+            attempt(&activity, ClaimWrite::Conditional),
+            || Ok(stored.claim()),
+            write,
             |_| {},
         )
         .unwrap();
@@ -2791,7 +2992,7 @@ mod prompt_submission_tests {
             1,
             "the replacement must be claimed before paste"
         );
-        assert!(stored.borrow().as_ref().unwrap().same_turn(&next.claim));
+        assert!(stored.claim().unwrap().same_turn(&next.claim));
         assert!(!next.claim.same_turn(&expired));
         assert_eq!(next.previous, Some(expired.clone()));
         // A delayed pre-paste refusal restores the prior nonce, but only if
@@ -2806,37 +3007,28 @@ mod prompt_submission_tests {
                 &next.claim,
                 next.previous.as_ref(),
                 |pattern, value| {
-                    let matches = stored
-                        .borrow()
-                        .as_ref()
-                        .and_then(|claim| claim.compare_pattern())
-                        .as_deref()
-                        == Some(pattern);
-                    if matches {
-                        *stored.borrow_mut() = muxel_core::control::Claim::decode(value);
-                    }
+                    stored.set_if(Some(pattern), value);
                 },
                 |_| panic!("a prior claim should be restored, not unset"),
             );
         };
-        *stored.borrow_mut() = Some(peer.clone());
+        stored.put(&peer);
         restore();
-        assert!(stored.borrow().as_ref().unwrap().same_turn(&peer));
-        *stored.borrow_mut() = Some(next.claim.clone());
+        assert!(stored.claim().unwrap().same_turn(&peer));
+        stored.put(&next.claim);
         restore();
-        assert!(stored.borrow().as_ref().unwrap().same_turn(&expired));
+        assert!(stored.claim().unwrap().same_turn(&expired));
 
         let answer = claim_agent_with(
             ClaimAttempt {
                 grace_ms: muxel_core::control::ANSWER_GRACE_MS,
                 lead_ms: 0,
                 can_force: false,
-                state: Some(super::AgentState::Idle),
-                activity: &AgentActivity::default(),
+                ..attempt(&activity, ClaimWrite::Conditional)
             },
-            || Ok(stored.borrow().clone()),
-            |_, claim| {
-                *stored.borrow_mut() = Some(claim.clone());
+            || Ok(stored.claim()),
+            |expected, claim| {
+                stored.set_if(expected, &claim.encode_tmux_command());
                 true
             },
             |_| {},
@@ -2853,30 +3045,23 @@ mod prompt_submission_tests {
             grace_ms: muxel_core::control::REPLY_GRACE_MS,
             nonce: Some(Uuid::new_v4()),
         };
-        let stored = RefCell::new(None);
+        let stored = TmuxOption::default();
+        let activity = AgentActivity::default();
         let result = claim_agent_with(
-            ClaimAttempt {
-                grace_ms: muxel_core::control::REPLY_GRACE_MS,
-                lead_ms: 400,
-                can_force: true,
-                state: Some(super::AgentState::Idle),
-                activity: &AgentActivity::default(),
-            },
-            || Ok(stored.borrow().clone()),
+            attempt(&activity, ClaimWrite::Conditional),
+            || Ok(stored.claim()),
             |expected, claim| {
                 assert!(expected.is_none());
-                *stored.borrow_mut() = Some(peer.clone());
+                stored.put(&peer);
                 // The conditional tmux set sees the peer's intervening claim
                 // and takes its false branch.
-                if stored.borrow().is_none() {
-                    *stored.borrow_mut() = Some(claim.clone());
-                }
+                assert!(!stored.set_if(expected, &claim.encode_tmux_command()));
                 true
             },
             |_| {},
         );
         assert_eq!(result.unwrap_err().code, Some(ErrorCode::ClaimedElsewhere));
-        assert!(stored.borrow().as_ref().unwrap().same_turn(&peer));
+        assert!(stored.claim().unwrap().same_turn(&peer));
     }
 
     #[test]
@@ -2895,29 +3080,17 @@ mod prompt_submission_tests {
             grace_ms: muxel_core::control::REPLY_GRACE_MS,
             nonce: Some(Uuid::new_v4()),
         };
-        let stored = RefCell::new(Some(stale.clone()));
+        let stored = TmuxOption::holding(&stale);
+        let activity = AgentActivity::default();
         let loser = claim_agent_with(
-            ClaimAttempt {
-                grace_ms: muxel_core::control::REPLY_GRACE_MS,
-                lead_ms: 400,
-                can_force: true,
-                state: Some(super::AgentState::Idle),
-                activity: &AgentActivity::default(),
-            },
-            || Ok(stored.borrow().clone()),
+            attempt(&activity, ClaimWrite::Conditional),
+            || Ok(stored.claim()),
             |expected, claim| {
                 assert_eq!(expected, stale.compare_pattern().as_deref());
-                *stored.borrow_mut() = Some(winner.clone());
-                if stored
-                    .borrow()
-                    .as_ref()
-                    .unwrap()
-                    .compare_pattern()
-                    .as_deref()
-                    == expected
-                {
-                    *stored.borrow_mut() = Some(claim.clone());
-                }
+                // The winner's conditional set lands first; ours no longer
+                // matches the stale claim.
+                assert!(stored.set_if(expected, &winner.encode_tmux_command()));
+                assert!(!stored.set_if(expected, &claim.encode_tmux_command()));
                 true
             },
             |_| {},
@@ -2928,7 +3101,7 @@ mod prompt_submission_tests {
             loser.pasted, None,
             "the losing sender must refuse before paste"
         );
-        assert!(stored.borrow().as_ref().unwrap().same_turn(&winner));
+        assert!(stored.claim().unwrap().same_turn(&winner));
     }
 
     #[test]
@@ -2940,44 +3113,244 @@ mod prompt_submission_tests {
             grace_ms: muxel_core::control::REPLY_GRACE_MS,
             nonce: Some(Uuid::new_v4()),
         };
-        let stored = RefCell::new(Some(old.clone()));
-        let deferred = deferred_claim(Some(&old.encode()), old.grace_ms, 400).unwrap();
+        let stored = TmuxOption::holding(&old);
+        let deferred = deferred_claim(
+            Some(&old.encode()),
+            old.grace_ms,
+            400,
+            ClaimWrite::Conditional,
+        )
+        .unwrap();
         let published = deferred.published.clone();
-        assert!(stored.borrow().as_ref().unwrap().same_turn(&old));
+        assert!(stored.claim().unwrap().same_turn(&old));
         assert!(!published.load(std::sync::atomic::Ordering::Acquire));
         let peer = muxel_core::control::Claim {
             owner: "new-peer".into(),
             nonce: Some(Uuid::new_v4()),
             ..old.clone()
         };
-        *stored.borrow_mut() = Some(peer.clone());
-        let write_if = |expected: Option<&str>, claim: &muxel_core::control::Claim| {
-            let current = stored.borrow();
-            let matches = current
-                .as_ref()
-                .and_then(muxel_core::control::Claim::compare_pattern)
-                .as_deref()
-                == expected;
-            drop(current);
-            if matches {
-                *stored.borrow_mut() = Some(claim.clone());
-            }
-            Ok(())
+        stored.put(&peer);
+        let publish = |expected: Option<&str>, claim: &Claim| {
+            stored.set_if(expected, &claim.encode_tmux_command());
+            Ok(stored.claim())
         };
-        let error = publish_deferred_claim_with(deferred, write_if, || stored.borrow().clone())
-            .unwrap_err();
+        let error = publish_deferred_claim_with(deferred, publish).unwrap_err();
         assert_eq!(error.code, Some(ErrorCode::ClaimedElsewhere));
         assert_eq!(error.pasted, Some(true));
-        assert!(stored.borrow().as_ref().unwrap().same_turn(&peer));
+        assert!(stored.claim().unwrap().same_turn(&peer));
         assert!(!published.load(std::sync::atomic::Ordering::Acquire));
 
-        *stored.borrow_mut() = Some(old.clone());
-        let deferred = deferred_claim(Some(&old.encode()), old.grace_ms, 400).unwrap();
+        stored.put(&old);
+        let deferred = deferred_claim(
+            Some(&old.encode()),
+            old.grace_ms,
+            400,
+            ClaimWrite::Conditional,
+        )
+        .unwrap();
         let published = deferred.published.clone();
-        publish_deferred_claim_with(deferred, write_if, || stored.borrow().clone()).unwrap();
+        publish_deferred_claim_with(deferred, publish).unwrap();
         assert!(published.load(std::sync::atomic::Ordering::Acquire));
-        assert!(!stored.borrow().as_ref().unwrap().same_turn(&old));
-        assert!(deferred_claim(Some("unreadable"), old.grace_ms, 400).is_err());
+        assert!(!stored.claim().unwrap().same_turn(&old));
+        assert!(
+            deferred_claim(
+                Some("unreadable"),
+                old.grace_ms,
+                400,
+                ClaimWrite::Conditional
+            )
+            .is_err()
+        );
+    }
+
+    /// A muxel released after this one may append fields to its claim. Every
+    /// conditional command still has to recognize it, or this version would
+    /// refuse that pane forever.
+    #[test]
+    fn a_later_muxels_claim_with_extra_fields_is_matched_and_honored() {
+        let later = |at: i64| {
+            let claim = muxel_core::control::Claim {
+                owner: "later-peer".into(),
+                host: "other".into(),
+                at,
+                grace_ms: muxel_core::control::REPLY_GRACE_MS,
+                nonce: Some(Uuid::new_v4()),
+            };
+            let raw = format!("{}|field-from-a-later-muxel", claim.encode_tmux_command());
+            (claim, raw)
+        };
+        let activity = AgentActivity::default();
+
+        // Its turn still open: it holds the pane, as any peer claim does.
+        let (live, raw) = later(now_ms());
+        let stored = TmuxOption::raw(raw);
+        assert!(stored.claim().unwrap().same_turn(&live));
+        let refused = claim_agent_with(
+            attempt(&activity, ClaimWrite::Conditional),
+            || Ok(stored.claim()),
+            |_, _| panic!("a live claim must not be replaced"),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, Some(ErrorCode::ClaimedElsewhere));
+
+        // Its turn over: the conditional write takes the true branch.
+        let (_, raw) = later(now_ms() - muxel_core::control::REPLY_GRACE_MS - 1_000);
+        let stored = TmuxOption::raw(raw.clone());
+        let took = Cell::new(false);
+        let started = claim_agent_with(
+            attempt(&activity, ClaimWrite::Conditional),
+            || Ok(stored.claim()),
+            |expected, claim| {
+                assert!(tmux_matches(expected.unwrap(), &raw), "{expected:?}");
+                took.set(stored.set_if(expected, &claim.encode_tmux_command()));
+                true
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(took.get(), "the conditional write took the false branch");
+        assert!(stored.claim().unwrap().same_turn(&started.claim));
+        // A pre-paste refusal can still give the later claim back.
+        restore_claim_with(
+            &started.claim,
+            started.previous.as_ref(),
+            |pattern, value| assert!(stored.set_if(Some(pattern), value)),
+            |_| panic!("the later claim should be restored"),
+        );
+        assert_eq!(stored.claim(), started.previous);
+
+        // `--force` publishes over it after the paste.
+        let (_, raw) = later(now_ms());
+        let stored = TmuxOption::raw(raw.clone());
+        let deferred = deferred_claim(Some(&raw), 30_000, 400, ClaimWrite::Conditional).unwrap();
+        let published = deferred.published.clone();
+        publish_deferred_claim_with(deferred, |expected, claim| {
+            assert!(stored.set_if(expected, &claim.encode_tmux_command()));
+            Ok(stored.claim())
+        })
+        .unwrap();
+        assert!(published.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// tmux 2.0-2.5 expand `#{m:}` (and before 2.4 `#{==:}`) to nothing, so
+    /// every conditional set takes the false branch there.
+    struct OldTmux(TmuxOption);
+
+    impl OldTmux {
+        fn set_if(&self, _expected: Option<&str>, _value: &str) -> bool {
+            false
+        }
+
+        fn set(&self, value: &str) {
+            *self.0.0.borrow_mut() = Some(value.to_string());
+        }
+    }
+
+    #[test]
+    fn tmux_before_2_6_claims_with_a_plain_write_and_readback() {
+        let activity = AgentActivity::default();
+        // A claim whose turn is over, as an earlier send left it.
+        let earlier = muxel_core::control::Claim {
+            owner: "earlier".into(),
+            host: "Sams-Mac".into(),
+            at: now_ms() - muxel_core::control::REPLY_GRACE_MS - 1_000,
+            grace_ms: muxel_core::control::REPLY_GRACE_MS,
+            nonce: Some(Uuid::new_v4()),
+        };
+        let old = OldTmux(TmuxOption::holding(&earlier));
+
+        // The conditional write can never land, so the send is refused before
+        // paste: the regression this fallback exists for.
+        let refused = claim_agent_with(
+            attempt(&activity, ClaimWrite::Conditional),
+            || Ok(old.0.claim()),
+            |expected, claim| {
+                assert!(!old.set_if(expected, &claim.encode_tmux_command()));
+                true
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, Some(ErrorCode::ClaimedElsewhere));
+        assert_eq!(refused.pasted, None);
+
+        // The fallback writes over whatever is there and reads it back, even
+        // a legacy value that could never be compared safely.
+        let legacy = muxel_core::control::Claim {
+            host: "Sam's-Mac".into(),
+            nonce: None,
+            ..earlier.clone()
+        };
+        assert!(legacy.compare_pattern().is_none());
+        old.set(&legacy.encode());
+        let started = claim_agent_with(
+            attempt(&activity, ClaimWrite::Unconditional),
+            || Ok(old.0.claim()),
+            |expected, claim| {
+                assert_eq!(expected, None, "old tmux has nothing to compare with");
+                old.set(&claim.encode_tmux_command());
+                true
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(old.0.claim().unwrap().same_turn(&started.claim));
+
+        // Two senders: the readback still leaves one winner before paste.
+        let winner = muxel_core::control::Claim {
+            owner: "winner".into(),
+            nonce: Some(Uuid::new_v4()),
+            at: now_ms(),
+            ..earlier.clone()
+        };
+        old.set(&earlier.encode());
+        let loser = claim_agent_with(
+            attempt(&activity, ClaimWrite::Unconditional),
+            || Ok(old.0.claim()),
+            |_, claim| {
+                old.set(&claim.encode_tmux_command());
+                old.set(&winner.encode_tmux_command());
+                true
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(loser.code, Some(ErrorCode::ClaimedElsewhere));
+        assert_eq!(loser.pasted, None);
+        assert!(old.0.claim().unwrap().same_turn(&winner));
+
+        // `--force` needs no comparable observation and publishes plainly.
+        assert!(deferred_claim(Some("unreadable"), 30_000, 400, ClaimWrite::Conditional).is_err());
+        let deferred =
+            deferred_claim(Some("unreadable"), 30_000, 400, ClaimWrite::Unconditional).unwrap();
+        assert_eq!(deferred.writes, ClaimWrite::Unconditional);
+        assert_eq!(deferred.expected_pattern, None);
+        publish_deferred_claim_with(deferred, |expected, claim| {
+            assert_eq!(expected, None);
+            old.set(&claim.encode_tmux_command());
+            Ok(old.0.claim())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_second_local_send_waits_for_the_first_ones_enter() {
+        let pane = Uuid::new_v4();
+        let first = SendInFlight::begin(pane, false).unwrap();
+        let second = SendInFlight::begin(pane, false).unwrap_err();
+        assert_eq!(second.code, Some(ErrorCode::ClaimedElsewhere));
+        assert_eq!(second.pasted, None);
+        // Other panes are independent.
+        let other = SendInFlight::begin(Uuid::new_v4(), false).unwrap();
+        // `--force` passes it, and counts while it is in flight itself.
+        let forced = SendInFlight::begin(pane, true).unwrap();
+        drop(first);
+        assert!(SendInFlight::begin(pane, false).is_err());
+        drop(forced);
+        let third = SendInFlight::begin(pane, false).unwrap();
+        drop((third, other));
+        assert!(!SendInFlight::panes().lock().unwrap().contains_key(&pane));
     }
 
     #[test]

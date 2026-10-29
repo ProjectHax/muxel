@@ -970,7 +970,11 @@ feature is added or changed, update the matching entry here in the same change**
   crashed lapses once the agent is seen to finish, or when its grace period runs
   out. `show` reports it as `controller`: which computer last typed into the agent
   this way, whether that was this muxel, and whether its turn is still open.
-  `send --force` overrides it.
+  `send --force` overrides it, publishing its marker after the paste within two
+  seconds or withholding Enter. Within one muxel, a second `send` to an agent is
+  refused until the first one's Enter is in. muxel checks once per host whether
+  its tmux can compare markers (2.6 or later); older tmux overwrites the marker
+  and reads it back instead, and leaves it to lapse rather than clearing it.
 
 ## Terminal
 

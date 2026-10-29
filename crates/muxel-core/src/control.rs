@@ -276,7 +276,8 @@ pub enum ErrorCode {
     NotRunning,
     /// The agent's program has exited.
     Exited,
-    /// Another request holds the shared tmux claim.
+    /// Another request holds the shared tmux claim, or another `send` from this
+    /// muxel hasn't pressed its Enter yet.
     ClaimedElsewhere,
     /// The pane's terminal was replaced since the caller inspected it.
     LaunchMismatch,
@@ -1077,8 +1078,11 @@ impl Claim {
         self.owner == other.owner && self.nonce.is_some() && self.nonce == other.nonce
     }
 
+    /// A tmux `#{m:}` (fnmatch) pattern for one send's claim. The trailing `*`
+    /// keeps matching a claim a later muxel writes with extra fields after the
+    /// nonce, which [`Claim::decode`] already accepts.
     pub fn pattern(owner: &str, nonce: Uuid) -> String {
-        format!("v1|{}|*|*|*|{nonce}", claim_field(owner))
+        format!("v1|{}|*|*|*|{nonce}*", claim_field(owner))
     }
 
     /// A safe tmux format pattern for comparing the claim before replacing it.
@@ -1710,7 +1714,8 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   Use it when `show` doesn't explain what's on screen.
 - `muxel ctl send AGENT TEXT` - type TEXT into the agent and press Enter. Refused
   while the agent is working, blocked, or still in the grace after a submitted
-  control turn, or while muxel on another computer is mid-turn with it. For long
+  control turn, while muxel on another computer is mid-turn with it, or while
+  another `send` to it from this muxel hasn't pressed Enter yet. For long
   or multi-line text, pass `-` and pipe the text on stdin. Use `--` before
   literal prompt text that starts with `-`; `-h` and `--help` before `--` refuse
   with exit 2 and are never typed. Use `muxel ctl help COMMAND` for help.
@@ -1801,7 +1806,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `working`, `blocked`, `starting` - not now: `wait`, answer its question, or try
   again in a moment.
 - `not_running`, `exited` - the agent isn't running; the user has to open it.
-- `claimed_elsewhere` - another request holds the shared tmux claim.
+- `claimed_elsewhere` - another request holds the shared tmux claim, or another
+  `send` to the agent hasn't pressed Enter yet.
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.
@@ -1909,6 +1915,30 @@ mod tests {
         };
         assert!(!claim_matches(&pattern, &legacy.encode()));
         assert_eq!(super::Claim::decode(&legacy.encode()), Some(legacy));
+    }
+
+    #[test]
+    fn claim_pattern_matches_a_later_version_claim_with_extra_fields() {
+        let claim = super::Claim {
+            owner: "later".into(),
+            host: "desk".into(),
+            at: 1234,
+            grace_ms: 30_000,
+            nonce: Some(id(3)),
+        };
+        let later = format!("{}|field-from-a-later-muxel", claim.encode_tmux_command());
+        let decoded = super::Claim::decode(&later).unwrap();
+        assert!(decoded.same_turn(&claim));
+        let pattern = decoded.compare_pattern().unwrap();
+        assert_eq!(pattern, super::Claim::pattern("later", id(3)));
+        assert!(pattern.ends_with(&format!("{}*", id(3))), "{pattern}");
+        assert!(claim_matches(&pattern, &later));
+        assert!(claim_matches(&pattern, &claim.encode_tmux_command()));
+        let other = super::Claim {
+            nonce: Some(id(4)),
+            ..claim
+        };
+        assert!(!claim_matches(&pattern, &other.encode_tmux_command()));
     }
 
     #[test]
