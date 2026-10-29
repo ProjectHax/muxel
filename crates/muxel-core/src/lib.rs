@@ -35,16 +35,17 @@ pub mod winshell;
 pub mod worktree;
 
 pub use agent::{
-    ACCOMPLISHMENTS_FILE, AgentPreset, CodexHintMiss, CodexResumePath, CodexSession,
-    CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
-    accomplishments_header, accomplishments_instruction, append_agent_instruction,
-    claude_session_cwd, claude_session_path, codex_developer_instructions_override,
-    codex_latest_session_id, codex_latest_sessions, codex_resume_path, codex_rollout_by_walk,
-    codex_session_from_hint, codex_session_hint_from_title, codex_session_id_from_hint,
-    codex_session_names, codex_terminal_title_override, file_link_instruction,
+    ACCOMPLISHMENTS_FILE, AgentPreset, ClaudeSession, ClaudeSessionRequest, CodexHintMiss,
+    CodexResumePath, CodexSession, CodexSessionNames, EnvVar, InjectionMode, MEMORY_DIR,
+    MEMORY_FILE, PresetKind, ResolvedLaunch, accomplishments_header, accomplishments_instruction,
+    append_agent_instruction, claude_session_cwd, claude_session_cwd_with_len, claude_session_path,
+    codex_developer_instructions_override, codex_latest_session_id, codex_latest_sessions,
+    codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
+    codex_session_hint_from_title, codex_session_id_from_hint, codex_session_names,
+    codex_terminal_title_override, discover_claude_sessions, file_link_instruction,
     find_claude_session_path, is_known_agent_program, launches_known_agent, memory_header,
     memory_instruction, memory_reference, muxel_file_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args,
+    resolve_launch_for_session, session_resume_args, stored_claude_session_path,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
@@ -607,6 +608,10 @@ pub struct Instance {
     /// Validated provider transcript/rollout path for the saved session id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_path: Option<PathBuf>,
+    /// Last consumed Claude hook receipt. Retain it across same-pane fresh
+    /// starts so a retained hook cannot restore a discarded conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_hook_record: Option<String>,
     /// Whether this instance's session has been launched at least once, so a
     /// respawn resumes it instead of starting a new conversation.
     #[serde(default)]
@@ -719,6 +724,7 @@ impl Instance {
     pub fn reset_conversation_for_duplicate(&mut self) {
         self.session_id = None;
         self.session_path = None;
+        self.claude_hook_record = None;
         self.session_started = false;
         self.auto_name = None;
         // Duplication is a new local UI action, not the outside launch approval.
@@ -783,6 +789,7 @@ impl Instance {
             worktree_id: None,
             session_id: None,
             session_path: None,
+            claude_hook_record: None,
             session_started: false,
         }
     }
@@ -851,6 +858,7 @@ impl Instance {
             worktree_id: None,
             session_id: None,
             session_path: None,
+            claude_hook_record: None,
             session_started: false,
         }
     }
@@ -1422,7 +1430,7 @@ pub struct RemoteLayout {
     /// project and is ignored.
     pub remote_root: String,
     pub layout: Option<PaneNode>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_shared_instances")]
     pub instances: Vec<Instance>,
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
@@ -1445,6 +1453,26 @@ pub struct RemoteLayout {
     /// the host appends to the one file. `None` = a doc from before the field.
     #[serde(default)]
     pub accomplishments_enabled: Option<bool>,
+}
+
+// Local Workspace persistence keeps receipts; only the shared document omits them.
+fn serialize_shared_instances<S: serde::Serializer>(
+    instances: &[Instance],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+
+    let mut sequence = serializer.serialize_seq(Some(instances.len()))?;
+    for instance in instances {
+        if instance.claude_hook_record.is_some() {
+            let mut shared = instance.clone();
+            shared.claude_hook_record = None;
+            sequence.serialize_element(&shared)?;
+        } else {
+            sequence.serialize_element(instance)?;
+        }
+    }
+    sequence.end()
 }
 
 impl RemoteLayout {
@@ -1518,8 +1546,9 @@ impl RemoteLayout {
     /// Per-machine state is left out, so it never reads as a layout change: the
     /// owning project's id (every machine has its own id for the same project) and
     /// what this machine observes of a pane — its program-supplied title, terminal
-    /// grid and agent activity. Counting those pushed the layout on every resize
-    /// and agent turn, and made two peers look out of sync when nothing differed.
+    /// grid, agent activity and consumed hook receipts. Counting those pushed the
+    /// layout on every resize and agent turn, and made two peers look out of sync
+    /// when nothing differed.
     pub fn content_key(&self) -> String {
         self.key(false)
     }
@@ -1557,6 +1586,7 @@ impl RemoteLayout {
             .map(|mut instance| {
                 instance.project_id = Uuid::nil();
                 instance.auto_name = None;
+                instance.claude_hook_record = None;
                 instance.grid = None;
                 instance.activity = AgentActivity::default();
                 if edits_only {
@@ -1761,8 +1791,12 @@ pub fn merge_peer_instances(
     peer.into_iter()
         .map(|mut instance| {
             instance.project_id = project_id;
+            // A peer's consumed receipt says nothing about this machine, even
+            // when this is the first time it has seen the pane.
+            instance.claude_hook_record = None;
             if let Some(mine) = local.iter().find(|l| l.id == instance.id) {
                 instance.auto_name = mine.auto_name.clone();
+                instance.claude_hook_record = mine.claude_hook_record.clone();
                 instance.grid = mine.grid;
                 instance.activity = mine.activity.clone();
                 // Older peers cannot write socket ownership. Preserve an already
@@ -2973,6 +3007,7 @@ mod instance_tests {
         instance.custom_name = Some("Manual name".into());
         instance.auto_name = Some("Generated title".into());
         instance.session_id = Some(Uuid::new_v4().to_string());
+        instance.claude_hook_record = Some("consumed receipt".into());
         instance.session_started = true;
 
         instance.reset_conversation_for_duplicate();
@@ -2980,6 +3015,7 @@ mod instance_tests {
         assert_eq!(instance.custom_name.as_deref(), Some("Manual name"));
         assert_eq!(instance.auto_name, None);
         assert_eq!(instance.session_id, None);
+        assert_eq!(instance.claude_hook_record, None);
         assert!(!instance.session_started);
     }
 
@@ -3995,6 +4031,134 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn pr108_claude_hook_record_does_not_change_shared_content_keys() {
+        let mut ws = Workspace::default();
+        let mut project = remote_project("/srv/app");
+        let mut instance = Instance::shell(project.id);
+        instance.program = Some("claude".into());
+        project.layout = Some(PaneNode::leaf(instance.id));
+        ws.instances.push(instance);
+        ws.projects.push(project.clone());
+        let original = RemoteLayout::capture(&project, &ws, 1);
+        for receipt in [
+            Some("first-local-receipt"),
+            Some("second-local-receipt"),
+            None,
+        ] {
+            ws.instances[0].claude_hook_record = receipt.map(str::to_string);
+            let consumed = RemoteLayout::capture(&project, &ws, 1);
+            assert_eq!(
+                consumed.content_key(),
+                original.content_key(),
+                "receipt consumption must not push shared layout content"
+            );
+            assert_eq!(consumed.edit_key(), original.edit_key());
+        }
+        ws.instances[0].custom_name = Some("Shared rename".into());
+        let renamed = RemoteLayout::capture(&project, &ws, 1);
+        assert_ne!(renamed.content_key(), original.content_key());
+    }
+
+    #[test]
+    fn pr108_claude_hook_record_is_local_persistence_not_shared_serialization() {
+        let mut ws = Workspace::default();
+        let mut project = remote_project("/srv/app");
+        let mut instance = Instance::shell(project.id);
+        instance.program = Some("claude".into());
+        instance.claude_hook_record = Some("consumed-local-receipt".into());
+        project.layout = Some(PaneNode::leaf(instance.id));
+        ws.instances.push(instance);
+        ws.projects.push(project.clone());
+        let local_json = serde_json::to_value(&ws).unwrap();
+        assert_eq!(
+            local_json["instances"][0]["claude_hook_record"],
+            "consumed-local-receipt"
+        );
+        let local_back: Workspace = serde_json::from_value(local_json).unwrap();
+        assert_eq!(
+            local_back.instances[0].claude_hook_record,
+            ws.instances[0].claude_hook_record
+        );
+        let mut shared = RemoteLayout::capture(&project, &ws, 1);
+        // Cover reserializing a document read from an older desktop too, not
+        // just a capture that could clear the field in its temporary clone.
+        shared.instances[0].claude_hook_record = Some("receipt-from-older-desktop".into());
+        let wire = serde_json::to_value(&shared).unwrap();
+        assert!(
+            wire["instances"][0].get("claude_hook_record").is_none(),
+            "RemoteLayout must not publish a machine's consumed receipt"
+        );
+        let stored: serde_json::Value = serde_json::from_str(&shared.to_json()).unwrap();
+        assert!(stored["instances"][0].get("claude_hook_record").is_none());
+        assert_eq!(
+            ws.instances[0].claude_hook_record.as_deref(),
+            Some("consumed-local-receipt")
+        );
+    }
+
+    #[test]
+    fn pr108_peer_merge_keeps_this_machines_claude_hook_record() {
+        let local_pid = Uuid::new_v4();
+        let peer_pid = Uuid::new_v4();
+        for consumed in [None, Some("consumed-local-receipt")] {
+            let mut mine = Instance::shell(local_pid);
+            mine.program = Some("claude".into());
+            mine.session_id = Some("local-conversation".into());
+            mine.claude_hook_record = consumed.map(str::to_string);
+            for session in ["local-conversation", "peer-changed-conversation"] {
+                for receipt_field in ["missing", "null", "foreign"] {
+                    let mut incoming = serde_json::to_value(&mine).unwrap();
+                    incoming["project_id"] = serde_json::json!(peer_pid);
+                    incoming["session_id"] = serde_json::json!(session);
+                    incoming["custom_name"] = serde_json::json!("Peer rename");
+                    match receipt_field {
+                        "missing" => {
+                            incoming
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("claude_hook_record");
+                        }
+                        "null" => incoming["claude_hook_record"] = serde_json::Value::Null,
+                        _ => {
+                            incoming["claude_hook_record"] =
+                                serde_json::json!("consumed-peer-receipt")
+                        }
+                    }
+                    let peer: Instance = serde_json::from_value(incoming).unwrap();
+                    let merged =
+                        merge_peer_instances(std::slice::from_ref(&mine), vec![peer], local_pid);
+                    assert_eq!(
+                        merged[0].claude_hook_record, mine.claude_hook_record,
+                        "peer receipt field {receipt_field} / session {session} must not change local consumption"
+                    );
+                    assert_eq!(merged[0].project_id, local_pid);
+                    assert_eq!(merged[0].session_id.as_deref(), Some(session));
+                    assert_eq!(merged[0].custom_name.as_deref(), Some("Peer rename"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pr108_new_peer_pane_does_not_adopt_another_machines_claude_hook_record() {
+        let local_pid = Uuid::new_v4();
+        let mut peer = Instance::shell(Uuid::new_v4());
+        peer.program = Some("claude".into());
+        peer.session_id = Some("peer-conversation".into());
+        peer.claude_hook_record = Some("consumed-peer-receipt".into());
+        let merged = merge_peer_instances(&[], vec![peer.clone()], local_pid);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, peer.id);
+        assert_eq!(merged[0].project_id, local_pid);
+        assert_eq!(merged[0].session_id, peer.session_id);
+        assert_eq!(merged[0].program, peer.program);
+        assert!(
+            merged[0].claude_hook_record.is_none(),
+            "a peer's consumed receipt does not prove this machine consumed it"
+        );
+    }
+
+    #[test]
     fn content_key_ignores_per_machine_state() {
         let mut ws = Workspace::default();
         let mut proj = remote_project("/srv/app");
@@ -4113,6 +4277,7 @@ mod remote_layout_tests {
         ws.instances[1].tmux_session = Some("muxel_proj_1a2b3c4d".into());
         ws.instances[1].tmux_socket = Some(tmux::Socket::Default);
         ws.instances[1].session_id = Some(Uuid::new_v4().to_string());
+        ws.instances[1].claude_hook_record = Some("consumed receipt".into());
         ws.instances[1].session_started = true;
         let bound = RemoteLayout::capture(&proj, &ws, 1);
         assert_ne!(bound.content_key(), before.content_key());
