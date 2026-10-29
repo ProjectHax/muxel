@@ -3,9 +3,9 @@
 use super::*;
 use muxel_core::control::AgentState;
 use muxel_core::recoverable_close::{
-    CloseDecision, CloseEvidence, CloseFacts, CloseStage, HeldLaunch, HeldView, UndoLaunch, decide,
-    departure_finalizes, exit_proves_closed, expired_close_may_finish, held_launch, may_finalize,
-    rehide_held, session_may_outlive, shell_close_evidence, undo_launch,
+    CloseDecision, CloseEvidence, CloseFacts, CloseStage, ExpiredCloseSync, HeldLaunch, HeldView,
+    LayoutWait, UndoLaunch, decide, departure_finalizes, exit_proves_closed, expired_close_sync,
+    held_launch, may_finalize, rehide_held, session_may_outlive, shell_close_evidence, undo_launch,
 };
 use muxel_terminal::TerminalStatusReason;
 use std::borrow::Cow;
@@ -35,9 +35,12 @@ pub(super) struct CloseGroup {
     pub needs_decision: bool,
     pub checking: bool,
     pub undoing: bool,
-    /// Past the deadline: each layout-shared project's read mark then. The
-    /// close waits for a later read of each (`expired_close_may_finish`).
-    pub sync_marks: Option<Vec<(Uuid, u64)>>,
+    /// Past the deadline: when it was first seen passed, and each
+    /// layout-shared project's read mark then. The close waits for a later
+    /// read of each (`expired_close_sync`).
+    pub sync_marks: Option<(Instant, Vec<(Uuid, u64)>)>,
+    /// The decision is whether to close without reading the shared layout.
+    pub layout_unread: bool,
     pub layouts: HashMap<Uuid, Option<PaneNode>>,
     pub focus: Option<Uuid>,
     pub caller: Option<String>,
@@ -393,6 +396,7 @@ impl MuxelApp {
             checking: false,
             undoing: false,
             sync_marks: None,
+            layout_unread: false,
             layouts: HashMap::new(),
             focus: self.active_instance,
             caller,
@@ -755,8 +759,13 @@ impl MuxelApp {
             .map(|g| g.id)
             .collect();
         for gid in due {
-            if !self.close_layout_synced(gid) {
-                continue;
+            match self.close_layout_sync(gid, now) {
+                ExpiredCloseSync::Finish => {}
+                ExpiredCloseSync::Wait => continue,
+                ExpiredCloseSync::Ask => {
+                    self.ask_close_without_layout(gid);
+                    continue;
+                }
             }
             // A confirmed close is final at its deadline. It must not wait for
             // unrelated quiet members' remote client-count probes.
@@ -819,14 +828,14 @@ impl MuxelApp {
         }
     }
 
-    /// Whether an expired group has read every layout-shared project it
-    /// touches since its deadline. The first call marks where that read must
-    /// begin and asks for a poll now.
-    fn close_layout_synced(&mut self, gid: Uuid) -> bool {
+    /// Where an expired group stands on the layout-shared projects it
+    /// touches. The first call marks where their reads must begin and asks for
+    /// a poll now.
+    fn close_layout_sync(&mut self, gid: Uuid, now: Instant) -> ExpiredCloseSync {
         let Some(group) = self.close_groups.iter().find(|g| g.id == gid) else {
-            return false;
+            return ExpiredCloseSync::Wait;
         };
-        let Some(marks) = &group.sync_marks else {
+        if group.sync_marks.is_none() {
             let mut projects: Vec<Uuid> = group
                 .members
                 .iter()
@@ -838,35 +847,52 @@ impl MuxelApp {
             let marks: Vec<_> = projects
                 .into_iter()
                 .map(|pid| {
-                    (
-                        pid,
-                        self.layout_reads
-                            .get(&pid)
-                            .copied()
-                            .unwrap_or_default()
-                            .mark(),
-                    )
+                    let reads = self.layout_reads.get(&pid).copied().unwrap_or_default();
+                    (pid, reads.mark())
                 })
                 .collect();
-            let unshared = marks.is_empty();
-            self.close_layout_poll |= !unshared;
+            self.close_layout_poll |= !marks.is_empty();
             if let Some(group) = self.close_groups.iter_mut().find(|g| g.id == gid) {
-                group.sync_marks = Some(marks);
+                group.sync_marks = Some((now, marks));
             }
-            return unshared;
+        }
+        let Some((since, marks)) = self
+            .close_groups
+            .iter()
+            .find(|g| g.id == gid)
+            .and_then(|g| g.sync_marks.as_ref())
+        else {
+            return ExpiredCloseSync::Wait;
         };
-        // A project gone or no longer shared has nothing to overwrite.
-        expired_close_may_finish(
+        // A project gone or no longer shared has nothing to overwrite. Reads
+        // begin only for a connected project with a place to read.
+        expired_close_sync(
             marks
                 .iter()
                 .filter(|(pid, _)| self.project_syncs_layout(*pid))
-                .map(|&(pid, mark)| {
-                    (
-                        mark,
-                        self.layout_reads.get(&pid).copied().unwrap_or_default(),
-                    )
+                .map(|&(pid, mark)| LayoutWait {
+                    mark,
+                    reads: self.layout_reads.get(&pid).copied().unwrap_or_default(),
+                    readable: self.remote_synced.contains(&pid) && self.repo_loc(pid).is_some(),
                 }),
+            now.saturating_duration_since(*since),
         )
+    }
+
+    /// The shared layout can't be read to finish this close on top of it, so
+    /// Close (which pushes regardless) or Keep is the user's call.
+    fn ask_close_without_layout(&mut self, gid: Uuid) {
+        let Some(group) = self.close_groups.iter_mut().find(|g| g.id == gid) else {
+            return;
+        };
+        group.needs_decision = true;
+        group.layout_unread = true;
+        let members = group.members.clone();
+        for iid in members {
+            muxel_store::append_event_log(&format!(
+                "close: couldn't read the shared layout to finish closing [{iid}]"
+            ));
+        }
     }
 
     fn finish_close_expiry(&mut self, gid: Uuid, cx: &mut Context<Self>) {
@@ -1380,6 +1406,7 @@ mod tests {
             checking: false,
             undoing: false,
             sync_marks: None,
+            layout_unread: false,
             layouts: HashMap::new(),
             focus: None,
             caller: None,
@@ -1387,7 +1414,7 @@ mod tests {
         assert_eq!(group.stage(), CloseStage::CountingDown);
         assert!(!group.syncing());
         // Past its deadline, waiting for a read: leaving still finishes it.
-        group.sync_marks = Some(vec![(Uuid::new_v4(), 3)]);
+        group.sync_marks = Some((Instant::now(), vec![(Uuid::new_v4(), 3)]));
         assert!(group.syncing());
         assert!(departure_finalizes(group.stage()));
         // Once read, the check, decision and Undo keep their own stages.

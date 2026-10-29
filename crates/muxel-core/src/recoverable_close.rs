@@ -2,6 +2,7 @@
 
 use crate::control::AgentState;
 use crate::{PaneNode, TerminalLaunchReason, remove};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,28 +242,71 @@ impl LayoutReads {
     }
 }
 
-/// Whether a close whose countdown ran out may finish, given each project it
-/// touches that shares its layout as (its [`LayoutReads::mark`] when the
-/// deadline was first seen passed, its reads now). A machine that slept
-/// through the countdown wakes with peers' edits unread, and the final close
-/// is stamped with the wall clock: finished first, it would outrank and
-/// overwrite them. So it waits for a read begun after the deadline.
-pub fn expired_close_may_finish(projects: impl IntoIterator<Item = (u64, LayoutReads)>) -> bool {
-    projects
-        .into_iter()
-        .all(|(mark, reads)| reads.applied > mark)
+/// How long a close past its deadline waits for reads of the shared layout
+/// before the user decides: several polls, each of which may be slow over SSH.
+pub const LAYOUT_READ_WAIT: Duration = Duration::from_secs(30);
+
+/// A layout-shared project that a close past its deadline touches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutWait {
+    /// Its [`LayoutReads::mark`] when the deadline was first seen passed.
+    pub mark: u64,
+    pub reads: LayoutReads,
+    /// A read of it can begin: it is connected and its layout has a place.
+    pub readable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpiredCloseSync {
+    /// Every shared layout has been read since the deadline.
+    Finish,
+    /// A read is still to come.
+    Wait,
+    /// One can't be read, or its reads didn't land in time: Close or Keep is
+    /// the user's call.
+    Ask,
+}
+
+/// What a close whose countdown ran out does about the shared layouts it
+/// touches, `waited` after the deadline was first seen passed. A machine that
+/// slept through the countdown wakes with peers' edits unread, and the final
+/// close is stamped with the wall clock: finished first, it would outrank and
+/// overwrite them. So it waits for a read begun after the deadline, but not
+/// for one that can't begin or never lands.
+pub fn expired_close_sync(
+    projects: impl IntoIterator<Item = LayoutWait>,
+    waited: Duration,
+) -> ExpiredCloseSync {
+    let mut unread = false;
+    for project in projects {
+        if project.reads.applied > project.mark {
+            continue;
+        }
+        if !project.readable {
+            return ExpiredCloseSync::Ask;
+        }
+        unread = true;
+    }
+    if !unread {
+        ExpiredCloseSync::Finish
+    } else if waited >= LAYOUT_READ_WAIT {
+        ExpiredCloseSync::Ask
+    } else {
+        ExpiredCloseSync::Wait
+    }
 }
 
 #[cfg(test)]
 mod recoverable_close_policy_tests {
     use super::{
-        CloseDecision, CloseEvidence, CloseFacts, CloseStage, HeldLaunch, HeldView, LayoutReads,
-        UndoLaunch, decide, departure_finalizes, exit_proves_closed, expired_close_may_finish,
-        held_launch, may_finalize, rehide_held, session_may_outlive, shell_close_evidence,
-        undo_launch,
+        CloseDecision, CloseEvidence, CloseFacts, CloseStage, ExpiredCloseSync, HeldLaunch,
+        HeldView, LAYOUT_READ_WAIT, LayoutReads, LayoutWait, UndoLaunch, decide,
+        departure_finalizes, exit_proves_closed, expired_close_sync, held_launch, may_finalize,
+        rehide_held, session_may_outlive, shell_close_evidence, undo_launch,
     };
     use crate::control::AgentState;
     use crate::{PaneNode, SplitDirection, TerminalLaunchReason, split};
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn quiet() -> CloseFacts {
@@ -679,28 +723,93 @@ mod recoverable_close_policy_tests {
 
     #[test]
     fn an_expired_close_waits_for_a_layout_read_begun_after_its_deadline() {
+        let soon = Duration::from_secs(1);
+        let shared = |mark, reads| LayoutWait {
+            mark,
+            reads,
+            readable: true,
+        };
         let mut reads = LayoutReads::default();
         // A read in flight across the sleep began before the deadline.
         let before = reads.begin();
         let mark = reads.mark();
         reads.applied(before);
-        assert!(!expired_close_may_finish([(mark, reads)]));
+        assert_eq!(
+            expired_close_sync([shared(mark, reads)], soon),
+            ExpiredCloseSync::Wait
+        );
         // A read the push dropped, or that failed, was never applied.
         let dropped = reads.begin();
-        assert!(!expired_close_may_finish([(mark, reads)]));
+        assert_eq!(
+            expired_close_sync([shared(mark, reads)], soon),
+            ExpiredCloseSync::Wait
+        );
         let fresh = reads.begin();
         reads.applied(fresh);
-        assert!(expired_close_may_finish([(mark, reads)]));
+        assert_eq!(
+            expired_close_sync([shared(mark, reads)], soon),
+            ExpiredCloseSync::Finish
+        );
         // An older read landing late doesn't undo it.
         reads.applied(dropped);
-        assert!(expired_close_may_finish([(mark, reads)]));
+        assert_eq!(
+            expired_close_sync([shared(mark, reads)], soon),
+            ExpiredCloseSync::Finish
+        );
         // Every shared project the close touches must have been read.
         let other = LayoutReads::default();
-        assert!(!expired_close_may_finish([
-            (mark, reads),
-            (other.mark(), other)
-        ]));
+        assert_eq!(
+            expired_close_sync([shared(mark, reads), shared(other.mark(), other)], soon),
+            ExpiredCloseSync::Wait
+        );
         // A close touching no shared layout finishes at its deadline.
-        assert!(expired_close_may_finish([]));
+        assert_eq!(expired_close_sync([], soon), ExpiredCloseSync::Finish);
+    }
+
+    #[test]
+    fn an_expired_close_asks_when_its_shared_layout_cant_be_read() {
+        let unread = LayoutReads::default();
+        let waiting = LayoutWait {
+            mark: unread.mark(),
+            reads: unread,
+            readable: true,
+        };
+        // Offline, reconnecting, or with nowhere to read: ask at once.
+        let offline = LayoutWait {
+            readable: false,
+            ..waiting
+        };
+        assert_eq!(
+            expired_close_sync([offline], Duration::ZERO),
+            ExpiredCloseSync::Ask
+        );
+        assert_eq!(
+            expired_close_sync([waiting, offline], Duration::ZERO),
+            ExpiredCloseSync::Ask
+        );
+        // Reads that don't land (no file, failing SSH) get a bounded wait.
+        assert_eq!(
+            expired_close_sync([waiting], LAYOUT_READ_WAIT - Duration::from_secs(1)),
+            ExpiredCloseSync::Wait
+        );
+        assert_eq!(
+            expired_close_sync([waiting], LAYOUT_READ_WAIT),
+            ExpiredCloseSync::Ask
+        );
+        // A project read since the deadline needs nothing more, even if it
+        // has since gone offline.
+        let mut reads = LayoutReads::default();
+        let mark = reads.mark();
+        let read = reads.begin();
+        reads.applied(read);
+        let read_then_offline = LayoutWait {
+            mark,
+            reads,
+            readable: false,
+        };
+        assert_eq!(
+            expired_close_sync([read_then_offline], LAYOUT_READ_WAIT),
+            ExpiredCloseSync::Finish
+        );
     }
 }

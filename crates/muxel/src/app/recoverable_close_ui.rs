@@ -37,7 +37,9 @@ impl MuxelApp {
     }
 
     fn close_decision_label(&self, group: &CloseGroup) -> SharedString {
-        if group.members.len() == 1 {
+        if group.layout_unread {
+            t("Couldn't read the shared layout")
+        } else if group.members.len() == 1 {
             tf(
                 "Review before closing {name}",
                 &[("name", self.close_group_name(group).as_ref())],

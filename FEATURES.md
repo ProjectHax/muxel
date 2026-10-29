@@ -126,7 +126,9 @@ feature is added or changed, update the matching entry here in the same change**
   the iOS app keep syncing, and their edits are adopted, while it counts down.
   A countdown that runs out finishes only after the next read of the shared
   layout, showing "Checking before close…" until then, so edits a peer made
-  while this machine slept are adopted, not overwritten.
+  while this machine slept are adopted, not overwritten. When that layout
+  can't be read (its host is offline or reconnecting, or no read lands within
+  30 seconds), the close asks Close or Keep instead.
 - **Resource and worktree close** — dirty editors offer Save / Don't Save /
   Cancel; clean editors, diffs and browsers close immediately. The last pane of
   a muxel worktree with changes or unmerged commits uses its disposal choice
