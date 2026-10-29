@@ -51,25 +51,39 @@ transition by polling more often.
 
 ## Program status reports
 
-Direct PTY panes accept validated OSC 7501 root reports. A current root supplies
-`ProgramStatus` coverage and overrides visible fallback detection. Child-id
-reports cannot control the pane. The PTY reader answers capability queries
-through the existing ordered reply queue, preserving earlier grid-dependent
-replies and following DA replies. Only the UI drain publishes status reports.
+Direct PTY panes accept validated OSC 7501 root reports, and the reducer uses
+them only on panes whose program is a known reporter (Claude, Codex, Grok,
+Muse). Elsewhere any printed bytes can carry a report, so those panes keep
+fallback detection. A current root supplies `ProgramStatus` coverage and
+overrides visible fallback detection, except that Blocked read now from the
+provider's screen or title, or a blocked marker, replaces a Working root. It
+applies only while that evidence is attributable (no held screen, no settling
+or unsettled silent-switch title) and keeps its visible reason. Child-id reports cannot control the pane. The PTY reader answers
+capability queries through the existing ordered reply queue, preserving earlier
+grid-dependent replies and following DA replies. Only the UI drain publishes
+status reports.
+
+A root that isn't Working settles the provider for completion readiness, like
+an Idle title; a Working root alone does not, since Codex reports Working while
+it boots a resumed session. The app keeps a durable Done through a report's
+Working until a turn is submitted in the launch.
 
 Claude suppresses its OSC title glyph after a successful capability probe.
-While its root is current, the terminal accepts this glyph-less text for naming
-only; the root's decoded nonempty `title` takes precedence. Without a current
-root, glyph-less Claude titles remain unrecognized. Title-derived lifecycle
-parsing does not change. Root title storage is shared across snapshot reads;
-clear, binding changes and process exit remove its naming authority.
+Once any root report has arrived in a launch, the terminal accepts this
+glyph-less text for naming only, through later clears, RIS and binding
+switches; the current root's decoded nonempty `title` takes precedence. Before
+a report, glyph-less Claude titles remain unrecognized. Title-derived lifecycle
+parsing does not change. Process exit removes the naming authority.
 
 The drain's passive observer processes each timed segment after synchronized
 capacity replay selects its read time and before VTE can defer title callbacks.
-Old partial reports retain their opening freshness and binding generation; a
-fresh terminator cannot revive them. Replayed bytes are not observed twice.
-The synchronized-output deadline flushes a stuck frame without another read,
-retaining its original time.
+While no escape, OSC or pending terminator is open, it skips plain output and
+any ESC pair that can't start an OSC or a reset (CSI's `ESC [`, charset and
+string introducers) without feeding VTE: no skipped byte can raise an event it
+reports, and VTE enters Escape at the next fed ESC from any state. Old partial reports retain their
+opening freshness and binding generation; a fresh terminator cannot revive
+them. Replayed bytes are not observed twice. The synchronized-output deadline
+flushes a stuck frame without another read, retaining its original time.
 
 Working/Blocked-to-Done/Error transitions advance the completion counter. Codex
 also completes a submitted Working-to-Idle turn in its current binding. Explicit

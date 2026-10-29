@@ -6,7 +6,7 @@ use crate::colors::TerminalPalette;
 use crate::element::TerminalElement;
 use crate::keymap::{KeyModifiers, key_to_bytes};
 use crate::profile;
-use crate::program_status::{ProgramState, ProgramStatusKind, RootStatus};
+use crate::program_status::{ProgramState, ProgramStatusKind, ProgramStatusSnapshot, RootStatus};
 use crate::session::{
     CommandSpec, ProfiledPtyChunk, ProfiledPtyReceiver, PtyOutput, TerminalSession,
 };
@@ -346,9 +346,15 @@ impl RuntimeStatusState {
         exited: bool,
         now: Instant,
     ) -> (bool, Option<Instant>) {
-        let program_status = session.program_status_snapshot();
+        let snapshot = session.program_status_snapshot();
         // Reading PSP may flush an expired synchronized update and deliver
-        // its deferred UUID title through the #91 listener.
+        // its deferred UUID title through the #91 listener, so it is read on
+        // every pane.
+        let program_status = if title_provider.reports_program_status() {
+            snapshot
+        } else {
+            ProgramStatusSnapshot::default()
+        };
         let binding_rev = session.binding_revision();
         let binding_changed = binding_rev != self.binding_rev;
         let program_root = (!exited).then_some(program_status.root.as_ref()).flatten();
@@ -599,6 +605,20 @@ impl RuntimeStatusState {
         if title != Some(AgentStatus::Blocked) && provider_screen == Some(AgentStatus::Blocked) {
             title = provider_screen;
         }
+        // A reporter can miss a prompt it is waiting on. Blocked read now from
+        // the provider's screen or title, or a configured marker, beats a
+        // Working root so the Blocked notification still fires. A title from
+        // before an unsettled silent switch, or a held screen, is not read now.
+        let visible_blocked = [
+            (provider_screen == Some(AgentStatus::Blocked))
+                .then_some(TerminalStatusReason::ProviderScreen),
+            (fresh_title == Some(AgentStatus::Blocked) && self.silent_switch_until.is_none())
+                .then_some(TerminalStatusReason::ProviderTitle),
+            blocked_marker.then_some(TerminalStatusReason::BlockedMarker),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|reason| status_is_attributable(settling, self.screen_held, *reason));
 
         let fallback_raw = hook.unwrap_or_else(|| {
             if silent_switch_settled {
@@ -638,33 +658,40 @@ impl RuntimeStatusState {
         let new_completions = new_explicit + codex_idle_completions;
         let previous_completion_revision = self.completion_revision;
         self.completion_revision = self.completion_revision.wrapping_add(new_completions);
+        let masked_blocked = program_root
+            .filter(|root| root.state == ProgramState::Working)
+            .and(visible_blocked);
         let raw = program_root.map_or(fallback_raw, |root| {
-            if root.state == ProgramState::Idle && self.codex_idle_done {
+            if masked_blocked.is_some() {
+                AgentStatus::Blocked
+            } else if root.state == ProgramState::Idle && self.codex_idle_done {
                 AgentStatus::Done
             } else {
                 program_status_state(root)
             }
         });
-        let raw_reason = program_root.map_or_else(
-            || {
-                if silent_switch_settled && !exited && !bell {
-                    TerminalStatusReason::Quiet
-                } else if hook == Some(raw) {
-                    TerminalStatusReason::ProviderHook
-                } else {
-                    status_reason(
-                        raw,
-                        exited,
-                        bell,
-                        title,
-                        provider_screen,
-                        working_marker,
-                        blocked_marker,
-                    )
-                }
-            },
-            program_status_reason,
-        );
+        let raw_reason = masked_blocked.unwrap_or_else(|| {
+            program_root.map_or_else(
+                || {
+                    if silent_switch_settled && !exited && !bell {
+                        TerminalStatusReason::Quiet
+                    } else if hook == Some(raw) {
+                        TerminalStatusReason::ProviderHook
+                    } else {
+                        status_reason(
+                            raw,
+                            exited,
+                            bell,
+                            title,
+                            provider_screen,
+                            working_marker,
+                            blocked_marker,
+                        )
+                    }
+                },
+                program_status_reason,
+            )
+        });
         let raw_attributable = status_is_attributable(settling, self.screen_held, raw_reason);
         let (status, latch, armed) = if program_root.is_some() {
             // Authoritative protocol states bypass the visible-source latch.
@@ -706,31 +733,39 @@ impl RuntimeStatusState {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
 
-        let reason = program_root.map_or_else(
-            || {
-                if silent_switch_settled {
-                    TerminalStatusReason::Quiet
-                } else if hook == Some(status) {
-                    TerminalStatusReason::ProviderHook
-                } else {
-                    status_reason(
-                        status,
-                        exited,
-                        bell,
-                        title,
-                        provider_screen,
-                        working_marker,
-                        blocked_marker,
-                    )
-                }
-            },
-            program_status_reason,
-        );
+        let reason = masked_blocked.unwrap_or_else(|| {
+            program_root.map_or_else(
+                || {
+                    if silent_switch_settled {
+                        TerminalStatusReason::Quiet
+                    } else if hook == Some(status) {
+                        TerminalStatusReason::ProviderHook
+                    } else {
+                        status_reason(
+                            status,
+                            exited,
+                            bell,
+                            title,
+                            provider_screen,
+                            working_marker,
+                            blocked_marker,
+                        )
+                    }
+                },
+                program_status_reason,
+            )
+        });
         let attributable = status_is_attributable(settling, self.screen_held, reason);
         if exited {
             next_deadline = None;
         }
-        let completion_ready = self.provider_settled || submitted_turn || program_root.is_some();
+        // A report that the provider isn't working settles it, as an Idle
+        // title does. A Working report alone is not readiness: Codex reports
+        // Working while it boots a resumed session, with no prompt.
+        if program_root.is_some_and(|root| root.state != ProgramState::Working) {
+            self.provider_settled = true;
+        }
+        let completion_ready = self.provider_settled || submitted_turn;
         let coverage = if program_root.is_some() {
             TerminalStatusCoverage::ProgramStatus
         } else {
@@ -805,6 +840,14 @@ impl TitleProvider {
     /// have a verified readiness and acceptance protocol.
     fn has_startup_protocol(self) -> bool {
         matches!(self, Self::Claude | Self::Codex | Self::Grok)
+    }
+
+    /// Whether the pane's program is a known OSC 7501 reporter. Only these
+    /// panes accept a report as status. Anything a shell, opencode or Amp
+    /// pane prints can carry one, `cat` of a file included, and a report's
+    /// origin can't be checked.
+    fn reports_program_status(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Grok | Self::Muse)
     }
 
     fn from_program(program: &str) -> Self {
@@ -1480,21 +1523,27 @@ fn program_auto_title(
     if exited || provider != TitleProvider::Claude {
         return None;
     }
-    let root = session.program_status_snapshot().root?;
-    if let Some(name) = root
-        .title
-        .as_deref()
+    let program_status = session.program_status_snapshot();
+    if let Some(name) = program_status
+        .root
+        .as_ref()
+        .and_then(|root| root.title.as_deref())
         .map(str::trim)
         .filter(|name| !name.is_empty())
     {
         return Some(name.to_string());
     }
+    if !program_status.reported {
+        return None;
+    }
     let title = session.title()?;
     if let Some(frame) = parse_agent_title(provider, Some(&title)) {
         return frame.name;
     }
-    // Claude suppresses its lifecycle glyph once its capability probe succeeds.
-    // This name-only exception requires a current root; title_status stays strict.
+    // Claude drops its lifecycle glyph for the rest of the launch once its
+    // capability probe succeeds, which any root report shows. So a glyph-less
+    // title still names the pane after `/clear`, `/resume`, RIS or a switch
+    // retires the root. This exception is for naming; title_status stays strict.
     let name = title.trim();
     (!name.is_empty()).then(|| name.to_string())
 }
@@ -6491,7 +6540,7 @@ mod provider_switch_tests {
         }
 
         #[test]
-        fn claude_glyphless_title_without_program_status_is_ignored() {
+        fn claude_glyphless_title_is_ignored_until_claude_reports() {
             let (session, _receiver) = fixture();
             session.test_program_status(b"\x1b]0;Review changes\x07");
             assert_eq!(
@@ -6499,10 +6548,11 @@ mod provider_switch_tests {
                 None
             );
             assert_eq!(clean_agent_title("claude", "Review changes"), None);
-            session.test_program_status(b"\x1b]7501;state=working\x07\x1b]7501;state=clear\x07");
+            session.test_program_status(b"\x1b]7501;state=working:id=worker\x07");
             assert_eq!(
                 program_auto_title(&session, TitleProvider::Claude, false),
-                None
+                None,
+                "a child report does not show the program dropped its glyphs"
             );
             session.test_program_status(b"\x1b]7501;state=working\x07");
             assert_eq!(
@@ -6513,9 +6563,39 @@ mod provider_switch_tests {
                 program_auto_title(&session, TitleProvider::Codex, false),
                 None
             );
-            session.provider_switched(std::time::SystemTime::now(), std::time::SystemTime::now());
+            session.kill();
+        }
+
+        /// Once Claude has reported, it sends glyph-less titles for the rest
+        /// of the launch, including while no root is current.
+        #[test]
+        fn claude_names_the_pane_after_clear_ris_and_a_switch_retire_its_root() {
+            let (session, _receiver) = fixture();
+            session.test_program_status(b"\x1b]7501;state=idle\x07\x1b]0;Review changes\x07");
+            let name = || program_auto_title(&session, TitleProvider::Claude, false);
+            assert_eq!(name().as_deref(), Some("Review changes"));
+            // `/clear` and `/resume`.
+            session.test_program_status(b"\x1b]7501;state=clear\x07\x1b]0;Fix the parser\x07");
+            assert_eq!(session.program_status_snapshot().root, None);
+            assert_eq!(name().as_deref(), Some("Fix the parser"));
+            // RIS.
+            session.test_program_status(b"\x1bc\x1b]0;After reset\x07");
+            assert_eq!(session.program_status_snapshot().root, None);
+            assert_eq!(name().as_deref(), Some("After reset"));
+            // A report inside an out-of-band switch window, wiped by the
+            // switch, and the conversation's next title.
+            session.test_program_status(b"\x1b]7501;state=working\x07");
+            let now = std::time::SystemTime::now();
+            session.provider_switched(now, now);
+            assert_eq!(session.program_status_snapshot().root, None);
+            session.test_program_status(b"\x1b]0;Resumed topic\x07");
+            assert_eq!(name().as_deref(), Some("Resumed topic"));
             assert_eq!(
-                program_auto_title(&session, TitleProvider::Claude, false),
+                title_status(TitleProvider::Claude, Some("Resumed topic"), None),
+                None
+            );
+            assert_eq!(
+                program_auto_title(&session, TitleProvider::Claude, true),
                 None
             );
             session.kill();
@@ -6551,8 +6631,9 @@ mod provider_switch_tests {
             );
             session.test_program_status(b"\x1b]7501;state=clear\x07");
             assert_eq!(
-                program_auto_title(&session, TitleProvider::Claude, false),
-                None
+                program_auto_title(&session, TitleProvider::Claude, false).as_deref(),
+                Some("Other topic"),
+                "the reported title goes with its root; the pane title remains"
             );
             session.kill();
         }
@@ -6925,14 +7006,19 @@ mod provider_switch_tests {
         };
         let working = sample(b"\x1b]7501;state=working\x07", 0);
         assert_eq!(working.status, AgentStatus::Working);
-        assert!(working.completion_ready);
+        assert!(
+            !working.completion_ready,
+            "a Working report alone is not readiness"
+        );
         assert_eq!(working.coverage, TerminalStatusCoverage::ProgramStatus);
         assert_eq!(working.reason, TerminalStatusReason::ProgramStatus(None));
 
         let child = sample(b"\x1b]7501;state=blocked:kind=question:id=worker\x07", 1);
         assert_eq!(child.status, AgentStatus::Working);
+        assert!(!child.completion_ready);
         let blocked = sample(b"\x1b]7501;state=blocked:kind=permission\x07", 2);
         assert_eq!(blocked.status, AgentStatus::Blocked);
+        assert!(blocked.completion_ready);
         assert_eq!(
             blocked.reason,
             TerminalStatusReason::ProgramStatus(Some(ProgramStatusKind::Permission))
@@ -6974,6 +7060,210 @@ mod provider_switch_tests {
         assert_eq!(fresh.snapshot(&restarted).status, AgentStatus::Idle);
         assert_eq!(fresh.coverage, TerminalStatusCoverage::ProviderVisible);
         restarted.kill();
+    }
+
+    /// `cat` of a file holding reports, or a reporter run inside the pane and
+    /// then lost (crash, SIGKILL, ssh drop), says nothing about these panes.
+    #[test]
+    fn reports_in_a_shell_opencode_or_amp_pane_cannot_set_status() {
+        for program in ["claude", "codex.exe", "grok", "muse.cmd"] {
+            assert!(
+                TitleProvider::from_program(program).reports_program_status(),
+                "{program}"
+            );
+        }
+        for program in ["bash", "pwsh.exe", "opencode", "amp"] {
+            let provider = TitleProvider::from_program(program);
+            assert!(!provider.reports_program_status(), "{program}");
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(super::status_coverage(provider, &[], &[]));
+            let now = Instant::now();
+            session.test_program_status(
+                b"\x1b]7501;state=blocked:kind=permission\x07\x1b]7501;state=working\x07",
+            );
+            let (_, deadline) = runtime.reconcile(&session, provider, &[], &[], false, now);
+            let snapshot = runtime.snapshot(&session);
+            assert_ne!(snapshot.status, AgentStatus::Blocked, "{program}");
+            assert_ne!(
+                snapshot.coverage,
+                TerminalStatusCoverage::ProgramStatus,
+                "{program}"
+            );
+            assert!(
+                !matches!(
+                    snapshot.reason,
+                    TerminalStatusReason::ProgramStatus(_)
+                        | TerminalStatusReason::ProgramStatusError
+                ),
+                "{program}"
+            );
+            // The activity fallback owns the pane: recent output reads as
+            // Working with a deadline to go quiet, never Working indefinitely.
+            assert_eq!(
+                deadline.is_some(),
+                snapshot.status == AgentStatus::Working,
+                "{program}"
+            );
+            assert!(
+                matches!(
+                    snapshot.reason,
+                    TerminalStatusReason::RecentOutput | TerminalStatusReason::Quiet
+                ),
+                "{program}: {:?}",
+                snapshot.reason
+            );
+            session.test_program_status(b"\x1b]7501;state=done\x07");
+            runtime.reconcile(
+                &session,
+                provider,
+                &[],
+                &[],
+                false,
+                now + Duration::from_millis(1),
+            );
+            assert_eq!(runtime.snapshot(&session).completion_revision, 0);
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn visible_blocked_beats_a_working_report_that_missed_it() {
+        // Codex: the action-required title.
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = Instant::now();
+        session.test_program_status(b"\x1b]7501;state=working\x07\x1b]0;[ ! ] Action Required\x07");
+        runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, now);
+        let blocked = runtime.snapshot(&session);
+        assert_eq!(blocked.status, AgentStatus::Blocked);
+        assert_eq!(blocked.reason, TerminalStatusReason::ProviderTitle);
+        assert_eq!(blocked.coverage, TerminalStatusCoverage::ProgramStatus);
+        assert!(blocked.attributable);
+        session.test_program_status(b"\x1b]0;Fix the parser | Working\x07");
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(100),
+        );
+        let working = runtime.snapshot(&session);
+        assert_eq!(working.status, AgentStatus::Working);
+        assert_eq!(working.reason, TerminalStatusReason::ProgramStatus(None));
+        session.kill();
+
+        // Claude: its permission prompt on screen.
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        session.test_program_status(
+            "\x1b]7501;state=working\x07Do you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. No\r\n\r\nEsc to cancel\r\n"
+                .as_bytes(),
+        );
+        runtime.reconcile(&session, TitleProvider::Claude, &[], &[], false, now);
+        let blocked = runtime.snapshot(&session);
+        assert_eq!(blocked.status, AgentStatus::Blocked);
+        assert_eq!(blocked.reason, TerminalStatusReason::ProviderScreen);
+        assert!(blocked.attributable);
+        // Its own report of the prompt keeps the report's kind.
+        session.test_program_status(b"\x1b]7501;state=blocked:kind=permission\x07");
+        runtime.reconcile(
+            &session,
+            TitleProvider::Claude,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(100),
+        );
+        assert_eq!(
+            runtime.snapshot(&session).reason,
+            TerminalStatusReason::ProgramStatus(Some(ProgramStatusKind::Permission))
+        );
+        session.kill();
+
+        // A configured blocked marker beats Working only; other reports stand.
+        let markers = vec!["Approve this?".to_string()];
+        for (report, status) in [
+            ("working", AgentStatus::Blocked),
+            ("idle", AgentStatus::Idle),
+            ("done", AgentStatus::Done),
+        ] {
+            let (session, _receiver) = fixture();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            session.test_program_status(
+                format!("\x1b]7501;state={report}\x07Approve this?\r\n").as_bytes(),
+            );
+            runtime.reconcile(&session, TitleProvider::Grok, &[], &markers, false, now);
+            let snapshot = runtime.snapshot(&session);
+            assert_eq!(snapshot.status, status, "{report}");
+            if status == AgentStatus::Blocked {
+                assert_eq!(snapshot.reason, TerminalStatusReason::BlockedMarker);
+            }
+            session.kill();
+        }
+    }
+
+    /// Codex 0.165.0 `codex resume <id>` with no prompt, captured from the
+    /// system ConPTY (thread id replaced): it reports Working while it boots,
+    /// after the Ready title that already settled the provider.
+    #[test]
+    fn codex_resume_reports_working_at_boot_without_a_turn() {
+        let thread = "019f95d7-db31-7db0-904d-9e08330e0021";
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        let now = Instant::now();
+        let mut sample = |wire: String, offset_ms| {
+            session.test_program_status(wire.as_bytes());
+            runtime.reconcile(
+                &session,
+                TitleProvider::Codex,
+                &[],
+                &[],
+                false,
+                now + Duration::from_millis(offset_ms),
+            );
+            runtime.snapshot(&session)
+        };
+        // 2.25 s and 2.26 s.
+        let ready = sample(format!("\x1b]0;Ready\x07\x1b]0;{thread} | Ready\x07"), 0);
+        assert_eq!(ready.status, AgentStatus::Idle);
+        assert!(ready.completion_ready, "the Ready title settles Codex");
+        // 2.68 s.
+        let booting = sample(
+            format!(
+                "\x1b]0;{thread} | Starting \u{283c}\x07\x1b]7501;state=working:app=codex\x1b\\"
+            ),
+            420,
+        );
+        assert_eq!(booting.status, AgentStatus::Working);
+        assert_eq!(booting.reason, TerminalStatusReason::ProgramStatus(None));
+        assert!(!session.has_submitted_turn());
+        // 2.70 s.
+        let idle = sample(
+            format!("\x1b]0;{thread} | Ready\x07\x1b]7501;state=idle:app=codex\x1b\\"),
+            440,
+        );
+        assert_eq!(idle.status, AgentStatus::Idle);
+        assert_eq!(idle.completion_revision, 0, "no turn ran");
+        session.kill();
+
+        // A Working report with no title before it is not readiness.
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+        session.test_program_status(b"\x1b]7501;state=working:app=codex\x1b\\");
+        runtime.reconcile(&session, TitleProvider::Codex, &[], &[], false, now);
+        assert!(!runtime.snapshot(&session).completion_ready);
+        session.test_program_status(b"\x1b]7501;state=idle:app=codex\x1b\\");
+        runtime.reconcile(
+            &session,
+            TitleProvider::Codex,
+            &[],
+            &[],
+            false,
+            now + Duration::from_millis(20),
+        );
+        assert!(runtime.snapshot(&session).completion_ready);
+        session.kill();
     }
 
     #[test]

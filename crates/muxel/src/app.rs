@@ -885,7 +885,7 @@ mod restored_activity_tests {
     use super::{
         AgentActivityState, AgentPreset, AgentStatus, Instance, activity_needs_observation,
         attend_agent_activity, attention_rank, is_restored_transition, persisted_status,
-        restore_activity_guard_active, restored_activity_sample,
+        restore_activity_guard_active, restored_activity_sample, unprompted_report_working,
     };
     use std::time::Duration;
     use uuid::Uuid;
@@ -1004,6 +1004,48 @@ mod restored_activity_tests {
             persisted_status(AgentStatus::Idle, Some(&done), ready_guarded),
             AgentStatus::Done
         );
+    }
+
+    #[test]
+    fn a_report_working_before_any_turn_keeps_restored_done() {
+        use muxel_terminal::{
+            TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason,
+        };
+        let done = attended_completion();
+        let mut runtime = TerminalRuntimeSnapshot {
+            status: AgentStatus::Working,
+            attributable: true,
+            reason: TerminalStatusReason::ProgramStatus(None),
+            coverage: TerminalStatusCoverage::ProgramStatus,
+            launch_id: Uuid::new_v4(),
+            binding_rev: 0,
+            snapshot_seq: 1,
+            input_rev: 0,
+            draft_latched: false,
+            completion_ready: false,
+            completion_revision: 0,
+        };
+        // Codex reports Working while it boots a resumed session, after the
+        // Ready title that ends the restore guard.
+        let guarded = restore_activity_guard_active(true, false, true, Some(Duration::ZERO), 0);
+        assert!(!guarded);
+        let held = guarded || unprompted_report_working(&runtime, false);
+        assert_eq!(
+            persisted_status(AgentStatus::Working, Some(&done), held),
+            AgentStatus::Done
+        );
+        // A submitted turn makes the report real work.
+        let held = unprompted_report_working(&runtime, true);
+        assert_eq!(
+            persisted_status(AgentStatus::Working, Some(&done), held),
+            AgentStatus::Working
+        );
+        // Visible evidence and other reported states keep their own rules.
+        runtime.reason = TerminalStatusReason::ProviderTitle;
+        assert!(!unprompted_report_working(&runtime, false));
+        runtime.reason = TerminalStatusReason::ProgramStatus(None);
+        runtime.status = AgentStatus::Blocked;
+        assert!(!unprompted_report_working(&runtime, false));
     }
 
     #[test]
@@ -1216,6 +1258,34 @@ fn persisted_status(
     } else {
         status
     }
+}
+
+/// Whether the provider's own report is all that says Working: no turn has
+/// been submitted in this launch. Codex reports Working while it boots a
+/// resumed session, before any prompt and after its first Ready title. Like
+/// startup noise during restore, that cannot replace a durable Done.
+fn unprompted_report_working(
+    runtime: &muxel_terminal::TerminalRuntimeSnapshot,
+    submitted_turn: bool,
+) -> bool {
+    runtime.status == AgentStatus::Working
+        && matches!(
+            runtime.reason,
+            muxel_terminal::TerminalStatusReason::ProgramStatus(_)
+        )
+        && !submitted_turn
+}
+
+/// What a terminal pane shows: its live status, with durable Done kept while
+/// it restores (`restoring`) and through a report's Working before any turn.
+fn shown_terminal_status(
+    view: &TerminalView,
+    instance: Option<&Instance>,
+    restoring: bool,
+) -> AgentStatus {
+    let runtime = view.runtime_snapshot();
+    let unprompted = unprompted_report_working(&runtime, view.session().has_submitted_turn());
+    persisted_status(runtime.status, instance, restoring || unprompted)
 }
 
 fn attention_rank(runtime: Option<AgentStatus>, activity: Option<&AgentActivity>) -> Option<u8> {
@@ -21446,8 +21516,9 @@ impl MuxelApp {
                 .map(|&(at, _)| at.elapsed()),
             startup_delay_ms,
         );
+        let unprompted = unprompted_report_working(&runtime, submitted_turn);
         TerminalActivitySample {
-            status: persisted_status(raw_status, instance, restoring),
+            status: persisted_status(raw_status, instance, restoring || unprompted),
             raw_status,
             submitted_turn,
             restoring,
@@ -24797,11 +24868,7 @@ impl MuxelApp {
                     .unwrap_or_default();
                 let program = inst.and_then(|i| i.program.clone());
                 let status = self.terminals.get(&iid).map(|v| {
-                    persisted_status(
-                        v.read(cx).status(),
-                        inst,
-                        self.restoring_activity.contains(&iid),
-                    )
+                    shown_terminal_status(v.read(cx), inst, self.restoring_activity.contains(&iid))
                 });
                 let color = status
                     .map(|s| status_hsla(s, cx))
@@ -26345,7 +26412,11 @@ impl MuxelApp {
                                 )
                             })
                             .unwrap_or(meta),
-                            view.status(),
+                            shown_terminal_status(
+                                view,
+                                inst,
+                                self.restoring_activity.contains(&iid),
+                            ),
                         )
                     } else if let Some(ed) = self.editors.get(&iid) {
                         (ed.read(cx).title(), AgentStatus::Idle)

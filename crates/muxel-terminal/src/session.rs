@@ -1149,6 +1149,10 @@ pub struct TerminalSession {
     processor: Mutex<Processor>,
     program_status_observer: Mutex<Observer>,
     program_status_generation: AtomicU64,
+    /// Lets the throughput benchmark compare the drain with and without the
+    /// OSC 7501 observer on one session.
+    #[cfg(test)]
+    observe_program_status_for_bench: AtomicBool,
     read_clock: Mutex<OutputReadClock>,
     writer: SharedWriter,
     output_queue: Arc<OutputQueueState>,
@@ -1685,6 +1689,8 @@ impl TerminalSession {
             processor: Mutex::new(Processor::new()),
             program_status_observer: Mutex::new(Observer::default()),
             program_status_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            observe_program_status_for_bench: AtomicBool::new(true),
             read_clock: Mutex::new(OutputReadClock::default()),
             writer,
             master,
@@ -1799,8 +1805,23 @@ impl TerminalSession {
     /// Capacity replay has already separated the old frame from these bytes,
     /// so the observer and the listener receive the same attribution time.
     fn observe_program_status(&self, bytes: &[u8], fresh: bool) {
+        #[cfg(test)]
+        if !self
+            .observe_program_status_for_bench
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
         let mut observer = self.program_status_observer.lock();
-        for &byte in bytes {
+        let mut rest = bytes;
+        loop {
+            // Plain output, and escapes that can't start an OSC or a reset,
+            // raise no event; skip them instead of feeding VTE byte by byte.
+            rest = &rest[observer.inert_prefix(rest)..];
+            let Some((&byte, tail)) = rest.split_first() else {
+                break;
+            };
+            rest = tail;
             let generation = self.program_status_generation.load(Ordering::Acquire);
             let Some(event) = observer.advance_at(byte, fresh, generation) else {
                 continue;
@@ -2874,7 +2895,7 @@ impl TerminalSession {
         let binding_rev = self.evidence.lock().binding_rev();
         let mut status = self.program_status.lock();
         if status.binding_revision > binding_rev {
-            return ProgramStatusSnapshot::default();
+            return status.launch_facts();
         }
         if status.binding_revision < binding_rev {
             // An overlong title can be rejected by the observer's OSC budget
@@ -7380,5 +7401,213 @@ mod input_rev_tests {
         session.scroll_wheel(-40.0, 20.0, 0, 0);
         assert_ne!(session.input_rev(), wheeled);
         session.kill();
+    }
+}
+
+/// Drain throughput with and without the OSC 7501 observer. Benchmarks, so
+/// ignored; run with `cargo test -p muxel-terminal --lib throughput_bench --
+/// --ignored --nocapture --test-threads=1` (add `--release` for an optimized build).
+#[cfg(test)]
+mod throughput_bench {
+    use super::{CommandSpec, PtyChunk, TerminalSession};
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// One PTY read (`PTY_READ_BUFFER_BYTES`).
+    const CHUNK: usize = 64 << 10;
+    const DRAIN_TOTAL: usize = 64 << 20;
+    const DRAIN_RUNS: usize = 5;
+    const PTY_TOTAL: usize = 4 << 20;
+    const PTY_RUNS: usize = 3;
+    const SENTINEL: &[u8] = b"MUXEL_BENCH_END";
+
+    fn repeat_to(unit: &[u8], len: usize) -> Vec<u8> {
+        unit.iter().copied().cycle().take(len).collect()
+    }
+
+    fn workloads(len: usize) -> Vec<(&'static str, Vec<u8>)> {
+        let mut text = Vec::new();
+        let mut colored = Vec::new();
+        let mut tui = Vec::new();
+        for n in 0..4096 {
+            text.extend_from_slice(
+                format!(
+                    "{n:06} warning: unused variable `report` in crates/muxel-terminal/src/view.rs:{n}\r\n"
+                )
+                .as_bytes(),
+            );
+            colored.extend_from_slice(
+                format!(
+                    "\x1b[1m\x1b[32m   Compiling\x1b[0m muxel-terminal v0.3.3 (\x1b[4mD:/dev/muxel/crates/muxel-terminal\x1b[24m) \x1b[38;5;244m[{n}/4096]\x1b[39m\r\n"
+                )
+                .as_bytes(),
+            );
+            // A full-screen agent repaint: cursor moves and SGR every few words.
+            let row = n % 40 + 1;
+            tui.extend_from_slice(
+                format!(
+                    "\x1b[{row};1H\x1b[2K\x1b[38;2;110;110;110m│\x1b[0m \x1b[1m{n:05}\x1b[22m \x1b[38;2;200;160;80mReading\x1b[39m src/view.rs \x1b[2m(esc to interrupt)\x1b[22m"
+                )
+                .as_bytes(),
+            );
+        }
+        vec![
+            ("yes", repeat_to(b"y\r\n", len)),
+            ("plain text", repeat_to(&text, len)),
+            ("colored build log", repeat_to(&colored, len)),
+            ("TUI repaint", repeat_to(&tui, len)),
+        ]
+    }
+
+    fn mb_per_s(bytes: usize, elapsed: Duration) -> f64 {
+        bytes as f64 / elapsed.as_secs_f64() / 1e6
+    }
+
+    fn summary(rates: &mut [f64]) -> (f64, f64, f64) {
+        rates.sort_by(f64::total_cmp);
+        (rates[0], rates[rates.len() / 2], rates[rates.len() - 1])
+    }
+
+    fn report(name: &str, off: &mut [f64], on: &mut [f64]) {
+        let (off_min, off_median, off_max) = summary(off);
+        let (on_min, on_median, on_max) = summary(on);
+        println!(
+            "{name:>18}: off {off_median:7.1} MB/s ({off_min:.1}-{off_max:.1}), on {on_median:7.1} MB/s ({on_min:.1}-{on_max:.1}), observer cost {:+.1}%",
+            (off_median / on_median - 1.0) * 100.0
+        );
+    }
+
+    fn quiet() -> CommandSpec {
+        if cfg!(windows) {
+            CommandSpec::program(
+                "cmd.exe",
+                vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+            )
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        }
+    }
+
+    fn drain(session: &TerminalSession, chunk: &[u8], observe: bool) -> f64 {
+        session
+            .observe_program_status_for_bench
+            .store(observe, Ordering::Relaxed);
+        let started = Instant::now();
+        for _ in 0..DRAIN_TOTAL / chunk.len() {
+            session.process_output(chunk);
+        }
+        mb_per_s(DRAIN_TOTAL, started.elapsed())
+    }
+
+    /// The UI drain alone: PTY-sized reads parsed into one session's grid.
+    #[test]
+    #[ignore = "benchmark"]
+    fn observer_cost_in_the_drain() {
+        let (session, _rx) = TerminalSession::spawn(quiet(), 120, 40).expect("spawn");
+        println!(
+            "drain: {} MiB per run in {} KiB reads, {DRAIN_RUNS} runs each, median (min-max)",
+            DRAIN_TOTAL >> 20,
+            CHUNK >> 10
+        );
+        for (name, chunk) in workloads(CHUNK) {
+            drain(&session, &chunk, true); // fill the grid and scrollback first
+            let (mut off, mut on) = (Vec::new(), Vec::new());
+            for _ in 0..DRAIN_RUNS {
+                off.push(drain(&session, &chunk, false));
+                on.push(drain(&session, &chunk, true));
+            }
+            report(name, &mut off, &mut on);
+        }
+        session.kill();
+    }
+
+    fn cat(path: &Path) -> CommandSpec {
+        if cfg!(windows) {
+            let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32")
+                .join("cmd.exe");
+            CommandSpec::program(
+                cmd.to_string_lossy(),
+                ["/d", "/q", "/c", "type"]
+                    .into_iter()
+                    .map(String::from)
+                    .chain([path.to_string_lossy().into_owned()])
+                    .chain(["&", "echo", "MUXEL_BENCH_END"].map(String::from))
+                    .collect(),
+            )
+        } else {
+            CommandSpec::program(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    format!("cat '{}'; echo MUXEL_BENCH_END", path.display()),
+                ],
+            )
+        }
+    }
+
+    /// Spawn to sentinel: the child writes the file through the platform PTY
+    /// while this thread drains it like the view does.
+    fn through_pty(path: &Path, observe: bool) -> (f64, usize) {
+        let started = Instant::now();
+        let (session, rx) = TerminalSession::spawn(cat(path), 120, 40).expect("spawn");
+        session
+            .observe_program_status_for_bench
+            .store(observe, Ordering::Relaxed);
+        let deadline = started + Duration::from_secs(300);
+        let mut received = 0;
+        let mut carry: Vec<u8> = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(PtyChunk::Output(bytes)) => {
+                    session.process_output(&bytes);
+                    received += bytes.len();
+                    carry.extend_from_slice(&bytes[..bytes.len().min(SENTINEL.len())]);
+                    let seen = carry.windows(SENTINEL.len()).any(|w| w == SENTINEL)
+                        || bytes.windows(SENTINEL.len()).any(|w| w == SENTINEL);
+                    if seen {
+                        break;
+                    }
+                    carry.clear();
+                    carry.extend_from_slice(&bytes[bytes.len().saturating_sub(SENTINEL.len())..]);
+                }
+                Ok(PtyChunk::Exit { .. }) | Err(async_channel::TryRecvError::Closed) => break,
+                Err(async_channel::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "no sentinel after 300 s");
+                    std::thread::yield_now();
+                }
+            }
+        }
+        let rate = mb_per_s(PTY_TOTAL, started.elapsed());
+        session.kill();
+        (rate, received)
+    }
+
+    /// `cat`/`type` of a large file in a pane, end to end.
+    #[test]
+    #[ignore = "benchmark"]
+    fn observer_cost_through_a_real_pty() {
+        let dir = std::env::temp_dir().join(format!("muxel-bench-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        println!(
+            "pty: {} MiB file per run, {PTY_RUNS} runs each, rate = file bytes / spawn-to-sentinel",
+            PTY_TOTAL >> 20
+        );
+        for (name, content) in workloads(PTY_TOTAL).into_iter().take(3) {
+            let path = dir.join(format!("{}.txt", name.replace(' ', "-")));
+            std::fs::write(&path, &content).unwrap();
+            let (mut off, mut on) = (Vec::new(), Vec::new());
+            let mut received = 0;
+            for _ in 0..PTY_RUNS {
+                off.push(through_pty(&path, false).0);
+                let (rate, bytes) = through_pty(&path, true);
+                on.push(rate);
+                received = bytes;
+            }
+            println!("{name:>18}: {received} bytes reached the drain");
+            report(name, &mut off, &mut on);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

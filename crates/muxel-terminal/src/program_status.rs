@@ -380,6 +380,38 @@ impl Observer {
         self.advance_at(byte, true, 0)
     }
 
+    /// How many leading `bytes` the observer can skip without feeding them.
+    /// With no escape, OSC, discard or pending ST open, a byte other than ESC
+    /// raises no event and leaves that state as it is. So does an ESC whose
+    /// next byte leaves Escape without starting an OSC or a reset, such as
+    /// CSI's `[`. VTE reaches Escape at the next fed ESC from any state, with
+    /// its parameters reset, and the only callbacks the skipped bytes could
+    /// raise (print, execute, CSI, DCS and other escapes) are ignored here. A
+    /// partial UTF-8 prefix VTE holds never absorbs ESC.
+    pub(crate) fn inert_prefix(&self, bytes: &[u8]) -> usize {
+        if self.escape || self.osc_len > 0 || self.discard_osc || self.pending_st.is_some() {
+            return 0;
+        }
+        let mut skip = 0;
+        loop {
+            let Some(at) = bytes[skip..].iter().position(|&byte| byte == 0x1b) else {
+                return bytes.len();
+            };
+            let escape = skip + at;
+            match bytes.get(escape + 1) {
+                Some(next)
+                    if !matches!(
+                        next,
+                        b']' | b'c' | 0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff
+                    ) =>
+                {
+                    skip = escape + 2;
+                }
+                _ => return escape,
+            }
+        }
+    }
+
     pub(crate) fn advance_at(&mut self, byte: u8, fresh: bool, generation: u64) -> Option<Event> {
         let confirmed_st = self.pending_st.take().and_then(|pending| {
             (byte == b'\\' && fresh && pending.generation == generation).then_some(pending.event)
@@ -508,11 +540,24 @@ pub(crate) struct ProgramStatusSnapshot {
     pub working_to_idle_revision: u64,
     pub idle_completions: u64,
     pub explicit_completions: u64,
+    /// Whether this launch's program has sent any root report, `clear`
+    /// included. Nothing retires it before the launch ends: a reporter stays
+    /// one through `/clear`, RIS and binding switches.
+    pub reported: bool,
     working_active: bool,
     thread: Option<ThreadKey>,
 }
 
 impl ProgramStatusSnapshot {
+    /// The launch facts alone, for a read that can't use this binding's
+    /// reports yet.
+    pub fn launch_facts(&self) -> Self {
+        Self {
+            reported: self.reported,
+            ..Self::default()
+        }
+    }
+
     pub fn observe_title(
         &mut self,
         thread: ThreadKey,
@@ -550,6 +595,7 @@ impl ProgramStatusSnapshot {
         if report.id.is_some() {
             return;
         }
+        self.reported = true;
         if report.state == ProgramState::Clear {
             self.clear();
             return;
@@ -621,7 +667,10 @@ impl ProgramStatusSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, Observer, ProgramState, ProgramStatusKind, ProgramStatusSnapshot, Scanner};
+    use super::{
+        Event, MAX_SEQUENCE, Observer, ProgramState, ProgramStatusKind, ProgramStatusSnapshot,
+        Scanner,
+    };
 
     fn observed(bytes: &[u8]) -> Vec<Event> {
         let mut observer = Observer::default();
@@ -657,6 +706,107 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(events, vec![Event::Title("Topic".to_string())]);
         assert_eq!(observer.advance(b'\\'), None);
+    }
+
+    /// Feed reads the way the session drain does: skip each inert prefix,
+    /// then advance one byte.
+    fn observed_skipping(reads: &[&[u8]]) -> Vec<Event> {
+        let mut observer = Observer::default();
+        let mut events = Vec::new();
+        for read in reads {
+            let mut rest = *read;
+            loop {
+                rest = &rest[observer.inert_prefix(rest)..];
+                let Some((&byte, tail)) = rest.split_first() else {
+                    break;
+                };
+                rest = tail;
+                events.extend(observer.advance(byte));
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn skipping_inert_bytes_observes_the_same_events() {
+        let oversized = format!(
+            "\x1b]0;{}\x07after\x1b]7501;state=done\x07",
+            "x".repeat(MAX_SEQUENCE + 10)
+        );
+        let wires: [&[u8]; 4] = [
+            include_bytes!("fixtures/claude-2.1.310-7501.osc"),
+            include_bytes!("fixtures/claude-2.1.310-no-7501.osc"),
+            b"\xe2\x9c\x1b]7501;state=working\x07plain \x1b[1;32mcolor\x1b[0m\x1bP]0;c\x1b\\\x1b(c\x1bc\x1b]0;Title\x1b\\\xf0\x9f\x1b]133;A\x07\x1b[?2026h\x1b]7501;state=idle\x1b\\",
+            oversized.as_bytes(),
+        ];
+        for wire in wires {
+            let expected = observed(wire);
+            assert!(!expected.is_empty());
+            for split in (0..=wire.len()).step_by(wire.len() / 512 + 1) {
+                assert_eq!(
+                    observed_skipping(&[&wire[..split], &wire[split..]]),
+                    expected,
+                    "split at {split}"
+                );
+            }
+        }
+        // Differential check: random streams of whole and cut-short frames,
+        // so sequences, strings and partial UTF-8 interleave.
+        let frames: &[&[u8]] = &[
+            b"\x1b]7501;state=working\x07",
+            b"\x1b]7501;state=blocked:kind=permission\x1b\\",
+            b"\x1b]7501;?\x07",
+            b"\x1b]0;Topic\x07",
+            b"\x1b]2;a;b\x1b\\",
+            b"\x1b]133;A\x07",
+            b"\x1bc",
+            b"\x1b(c",
+            b"\x1b\x00]0;NUL\x07",
+            b"\x1b\x1b]0;Twice\x07",
+            b"\x1b\x18",
+            b"\x1b#8",
+            b"\x1b[1;32m",
+            b"\x1b[38;2;1;2;3m",
+            b"\x1b[?2026h",
+            b"\x1bP]0;c\x1b\\",
+            b"\x1b^c\x07",
+            b"plain text ",
+            b"\r\n",
+            b"\xe2\x9d\xaf",
+            b"\x18",
+            b"\x1a",
+            b"\x7f",
+            b"\x9c",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut events = 0;
+        for _ in 0..20_000 {
+            let mut wire = Vec::new();
+            for _ in 0..next() % 12 {
+                let frame = frames[(next() % frames.len() as u64) as usize];
+                let end = if next() % 4 == 0 {
+                    (next() % (frame.len() as u64 + 1)) as usize
+                } else {
+                    frame.len()
+                };
+                wire.extend_from_slice(&frame[..end]);
+            }
+            let split = (next() % (wire.len() as u64 + 1)) as usize;
+            let expected = observed(&wire);
+            events += expected.len();
+            assert_eq!(
+                observed_skipping(&[&wire[..split], &wire[split..]]),
+                expected,
+                "{wire:?} split at {split}"
+            );
+        }
+        assert!(events > 10_000, "the streams raise events: {events}");
     }
 
     #[test]
@@ -850,6 +1000,36 @@ mod tests {
         }
         assert_eq!(status.root, None);
         assert_eq!(status.clear_revision, status.revision);
+    }
+
+    #[test]
+    fn any_root_report_marks_the_launch_as_a_reporter_until_it_ends() {
+        let mut status = ProgramStatusSnapshot::default();
+        let apply = |status: &mut ProgramStatusSnapshot, wire: &[u8]| {
+            for event in events(wire) {
+                if let Event::Report(report) = event {
+                    status.apply(report);
+                }
+            }
+        };
+        apply(&mut status, b"\x1b]7501;state=working:id=worker\x07");
+        assert!(
+            !status.reported,
+            "a child report says nothing about the program"
+        );
+        apply(&mut status, b"\x1b]7501;state=clear\x07");
+        assert!(status.reported);
+        apply(&mut status, b"\x1b]7501;state=working\x07");
+        status.clear();
+        status.shell_prompt();
+        status.clear_binding();
+        status.adopt_binding(3);
+        status.recover_binding(4, None);
+        assert!(status.reported);
+        let early = status.launch_facts();
+        assert!(early.reported);
+        assert_eq!(early.root, None);
+        assert_eq!(early.binding_revision, 0);
     }
 
     #[test]
