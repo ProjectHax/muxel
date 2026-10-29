@@ -134,7 +134,8 @@ feature is added or changed, update the matching entry here in the same change**
   still being checked or waiting for Close / Keep, which reopens next time.
   Removing a project waits for that decision. If that save fails, the first
   switch stops with a notice and the next one leaves anyway; the pane reopens
-  next time.
+  next time. Saving an untitled editor on close writes the path picked in the
+  save dialog on this machine, as Save As does.
 - **Workspace changes** — switching workspaces closes the previous workspace's
   pop-out and per-monitor project windows without interrupting the switch.
 
@@ -1530,12 +1531,9 @@ feature is added or changed, update the matching entry here in the same change**
   to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
   (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
-  confirmation, per-kind close confirmation (terminal on, editor/diff off by
-  default), and auto-close a pane when its process exits **cleanly** (an
-  abnormal exit always leaves a tombstone pane instead). The terminal
-  confirmation is skipped for an untouched **shell** pane — one sitting idle at
-  its prompt with no foreground command and no other tabs — since closing it
-  loses nothing.
+  confirmation, "Ask before closing a busy terminal" (on by default; see
+  Recoverable terminal close), and auto-close a pane when its process exits
+  **cleanly** (an abnormal exit always leaves a tombstone pane instead).
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't

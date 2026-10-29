@@ -2582,11 +2582,12 @@ pub struct Settings {
     /// Close a pane automatically when its process exits.
     #[serde(default = "default_true")]
     pub close_on_exit: bool,
-    /// Ask for confirmation before closing a pane, per kind. Terminals default
-    /// on (they hold a running process); editors/diffs default off (cheap to
-    /// reopen, nothing is lost).
+    /// Ask before closing a busy or uncertain terminal (default on). A quiet
+    /// one counts down with Undo either way.
     #[serde(default = "default_true")]
     pub confirm_close_terminal: bool,
+    /// No longer used: a dirty editor always offers Save, and a clean editor
+    /// or diff pane closes at once. Kept so older settings still load.
     #[serde(default)]
     pub confirm_close_editor: bool,
     #[serde(default)]

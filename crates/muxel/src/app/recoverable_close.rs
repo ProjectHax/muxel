@@ -1153,21 +1153,26 @@ impl MuxelApp {
                         .close_editor(iid)
                         .is_some_and(|current| current == &editor)
                     {
-                        this.save_close_editor_path(iid, rest, path, cx);
+                        // The dialog picked a path on this machine. Write it
+                        // here, as Save As does, even in a remote project.
+                        this.save_close_editor_path(iid, rest, path, false, cx);
                     }
                 });
             })
             .detach();
             return;
         };
-        self.save_close_editor_path(iid, rest, path, cx);
+        self.save_close_editor_path(iid, rest, path, true, cx);
     }
 
+    /// `in_project`: `path` is the editor's own, in the project (over SSH for
+    /// a remote one). Otherwise it is a local path picked in a save dialog.
     fn save_close_editor_path(
         &mut self,
         iid: Uuid,
         rest: Vec<Uuid>,
         path: PathBuf,
+        in_project: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(editor) = self.close_editor(iid).cloned() else {
@@ -1180,6 +1185,7 @@ impl MuxelApp {
         let loc = self
             .workspace
             .instance(iid)
+            .filter(|_| in_project)
             .and_then(|inst| self.repo_loc(inst.project_id));
         cx.spawn(async move |this, cx| {
             let result = cx

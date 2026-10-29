@@ -31629,30 +31629,6 @@ impl MuxelApp {
             )
             .child(
                 self.check_row(
-                    Checkbox::new("b-confirm-close-editor")
-                        .checked(self.settings.confirm_close_editor)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings.confirm_close_editor = *c;
-                            this.persist_settings();
-                            cx.notify();
-                        })),
-                    &t("Confirm before closing an editor"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("b-confirm-close-diff")
-                        .checked(self.settings.confirm_close_diff)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings.confirm_close_diff = *c;
-                            this.persist_settings();
-                            cx.notify();
-                        })),
-                    &t("Confirm before closing a git-diff pane"),
-                ),
-            )
-            .child(
-                self.check_row(
                     Checkbox::new("b-dev-console")
                         .checked(self.settings.dev_console_enabled)
                         .on_click(cx.listener(|this, c: &bool, _w, cx| {
