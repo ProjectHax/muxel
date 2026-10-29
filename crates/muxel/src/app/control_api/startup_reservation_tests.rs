@@ -18,6 +18,7 @@ fn retained_tmux_reservation_claims_the_first_task_once_for_its_generation() {
                 iid,
                 LaunchTicket {
                     token: 17,
+                    reason: TerminalLaunchReason::NewPane,
                     since: Instant::now(),
                     startup: None,
                 },
@@ -68,6 +69,7 @@ fn retained_reservation_refusal_cancels_its_unclaimed_task_before_preparation() 
                 iid,
                 LaunchTicket {
                     token: 17,
+                    reason: TerminalLaunchReason::Restore,
                     since: Instant::now(),
                     startup: None,
                 },
@@ -99,6 +101,7 @@ fn tmux_preparation_failure_cancels_a_task_before_or_after_claiming_it() {
                     iid,
                     LaunchTicket {
                         token: 17,
+                        reason: TerminalLaunchReason::NewPane,
                         since: Instant::now(),
                         startup,
                     },

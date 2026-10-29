@@ -5044,6 +5044,7 @@ dependencies = [
  "self-replace",
  "serde",
  "serde_json",
+ "sha2",
  "sys-locale",
  "tokio",
  "ureq 2.12.1",

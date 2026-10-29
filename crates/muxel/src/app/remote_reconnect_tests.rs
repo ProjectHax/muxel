@@ -109,7 +109,11 @@ fn exited_remote_pane(cx: &mut TestAppContext, window: WindowHandle<MuxelApp>) -
             app.main_window = Some(window.window_handle());
             app.use_tmux = false;
             app.use_worktree = false;
-            let (meta, _, size) = app.prepare_terminal_spawn(iid, window, cx).unwrap();
+            let (meta, _, size) = app
+                .prepare_terminal_spawn(iid, window, cx)
+                .unwrap()
+                .ready_parts()
+                .expect("non-Claude fixture must prepare synchronously");
             let command =
                 CommandSpec::program("cmd.exe", vec!["/d".into(), "/c".into(), "exit 37".into()]);
             let launch = TerminalLaunch::spawn_for_instance(command, size, iid).unwrap();

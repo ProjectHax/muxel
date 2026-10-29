@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+mod claude_sessions;
 mod codex_sessions;
+pub use claude_sessions::{
+    ClaudeSession, ClaudeSessionRequest, discover_claude_sessions, stored_claude_session_path,
+};
 pub use codex_sessions::{
     CodexHintMiss, CodexResumePath, CodexSession, CodexSessionNames, codex_latest_sessions,
     codex_resume_path, codex_rollout_by_walk, codex_session_from_hint,
@@ -840,12 +844,28 @@ pub fn find_claude_session_path(
 /// very large, so only inspect a bounded tail; current entries carry `cwd`, and
 /// relocation entries carry the more specific `relocatedCwd`.
 pub fn claude_session_cwd(transcript: &Path) -> std::io::Result<Option<PathBuf>> {
+    let file = std::fs::File::open(transcript)?;
+    let len = file.metadata()?.len();
+    read_claude_session_cwd(transcript, file, len)
+}
+
+/// Read the bounded cwd tail after a caller has already checked the transcript.
+pub fn claude_session_cwd_with_len(
+    transcript: &Path,
+    len: u64,
+) -> std::io::Result<Option<PathBuf>> {
+    read_claude_session_cwd(transcript, std::fs::File::open(transcript)?, len)
+}
+
+fn read_claude_session_cwd(
+    transcript: &Path,
+    mut file: std::fs::File,
+    len: u64,
+) -> std::io::Result<Option<PathBuf>> {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
     const TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
-    let mut file = std::fs::File::open(transcript)?;
-    let len = file.metadata()?.len();
     let start = len.saturating_sub(TAIL_BYTES);
     file.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::new(file);
