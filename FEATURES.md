@@ -412,6 +412,22 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Agent status
 
+- **Program Status Protocol** — direct PTY panes answer an OSC 7501 capability
+  query before a following DA query, and Claude, Codex, Grok and Muse panes take
+  their reports as status. Working, blocked (including permission, question, or
+  auth kind), and finished states come from the agent while its root report is
+  current; a shell, opencode or Amp pane ignores reports, since anything printed
+  there can carry one. A blocked prompt on screen or in the agent's title still
+  shows **blocked** while the report says Working. A finished Codex turn also
+  reaches **done** when its submitted Working turn reports Idle; protocol `error`
+  uses the existing **done** badge with its error source retained. A Working
+  report before any prompt in the launch, such as Codex's while it resumes a
+  session, keeps a restored **done**. Clear, provider switch, shell prompt,
+  process exit, or relaunch returns an unfinished pane to its existing fallback
+  detection. Both local and remote tmux panes continue using that fallback
+  because tmux does not forward OSC 7501 reports. Once Claude has reported in a
+  launch, its glyph-less title names the pane for the rest of that launch without
+  supplying lifecycle status; a title in the current root report takes precedence.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. A marker-based agent whose turn finishes
@@ -451,10 +467,13 @@ feature is added or changed, update the matching entry here in the same change**
   evidence arrives, and the Enter that picked the conversation doesn't count as
   a turn in it. During uncertainty, `ctl` treats the pane as Working: ordinary
   sends are refused and `wait` keeps waiting; `send --force` retains its override.
-  An agent that prints nothing more after the switch settles a couple of seconds
-  later, on a timer, so an idle pane accepts sends again; an old prompt or
+  If no fresh evidence arrives after the switch, a timer settles an idle pane
+  so it accepts sends again; an old prompt or
   activity row still on screen stays uncertain until it goes or a new title
   confirms it.
+  An old busy title retires after five seconds of silence when no new submission,
+  fresh title, screen marker or bell sustains it. This returns to Idle without
+  reporting a completed turn.
   A Grok conversation switch releases old loop ownership even if saving fails.
   A confirmed provider switch clears the previous conversation's automatic name,
   including a switch back to the same UUID between reads; a transcript path

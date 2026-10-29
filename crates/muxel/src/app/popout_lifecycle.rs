@@ -59,6 +59,7 @@ mod tests {
             input_rev: 0,
             draft_latched: false,
             completion_ready: false,
+            completion_revision: 0,
         };
         let terminal = Rc::new(Cell::new(runtime));
         let mut docked = HashMap::from([(pane, terminal.clone())]);
