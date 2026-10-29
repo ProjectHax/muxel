@@ -5,6 +5,129 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-10-29
+
+### Added
+- **Closing a terminal can be undone** — closing a live terminal no longer kills
+  it straight away. The tab goes, the program keeps running out of sight for 15
+  seconds, and a chip in the title bar offers **Undo** (also Ctrl+Alt+Z), which
+  brings back the same process in its old tab position with its draft, scrollback,
+  and focus. An idle agent, or a shell at its prompt, just counts down; an agent
+  that is working, waiting on you, or still starting asks first and says what it's
+  doing, and a confirmed close still gets the Undo. Closing several tabs at once
+  gives one countdown and one Undo, and if some are busy, one prompt lists them
+  with **Close all** or **Close only the idle ones**. If an agent you closed
+  without being asked starts working before the countdown ends, it isn't closed:
+  the chip turns into **Close / Keep**. In a project whose layout is shared with
+  another machine or the iOS app, a countdown that runs out finishes only once
+  muxel has read the shared layout again, so a close that finishes after the
+  laptop wakes doesn't overwrite changes made elsewhere while it slept; when that
+  layout can't be read, it asks Close or Keep instead. Quitting or switching
+  workspaces keeps a pane that is waiting on your decision, and it reopens next
+  time. "Ask before closing terminals" is now **Ask before closing a busy
+  terminal**, and the separate editor and git-diff confirmations are gone: an
+  editor with unsaved changes always offers Save / Don't Save, and a clean
+  editor or diff closes at once. Thanks to
+  [@railapex](https://github.com/railapex) ([#114](https://github.com/ProjectHax/muxel/pull/114)).
+- **Agents tell muxel their own status** — Claude Code and Codex, and Grok when
+  set up for it, now report directly whether they're working, waiting on you, or
+  finished, instead of muxel guessing from their titles and screen text, where a
+  quoted prompt or an old spinner row could read as status. A prompt you can see
+  on screen still shows the pane as waiting on you even if the agent says it's
+  working, so a missed permission prompt still notifies. Shells, opencode, Amp,
+  and panes kept in tmux keep the detection they had. Once Claude reports, its
+  pane keeps its conversation name even though Claude drops the status mark from
+  its title. On Windows, Claude reports only through a recent OpenConsole; under
+  the built-in console it keeps the old detection, while Codex reports everywhere.
+  Thanks to
+  [@railapex](https://github.com/railapex) ([#110](https://github.com/ProjectHax/muxel/pull/110)).
+- **New projects can start with shared memory and the accomplishment log** — both
+  could only be turned on one project at a time from its sidebar menu.
+  Settings → Projects now has a **New projects** group that turns either one on
+  for every project you add from then on, local or remote. Existing projects keep
+  their own choice, and both are off by default.
+- **Opening a folder another machine works in brings back its panes** — opening a
+  folder locally always started a fresh agent pane, even when another machine or
+  the iOS app already had panes saved there with their agents still running in
+  tmux on this computer; they only came back through Import. With tmux mode on,
+  the new project now takes that saved layout and attaches to the running agents.
+
+### Changed
+- **The Grok Bot settings page is now Outside control** — the page sets up any
+  agent or script that drives muxel through `muxel ctl`, but its name and text
+  spoke only to Grok Bot. Its steps now speak of "the agent", with Grok Bot kept
+  as the worked example, and errors that send you there name Settings → Outside
+  control.
+
+### Fixed
+- **Outside tools can't type tmux commands into an agent pane** — for a pane kept
+  in tmux, locally or on a remote host, `muxel ctl` typed into the tmux window
+  rather than the agent, so keys like Ctrl+B C reached tmux itself: they opened a
+  shell inside an agent pane, and later input landed in that shell without the
+  shell permission ever being checked. Prompts and keys now go straight to the
+  agent's own tmux pane, and stay with it after you split or open windows. If
+  muxel can't find the agent's pane it refuses and types nothing. On a remote host
+  this goes over muxel's background SSH connection; a host that only takes
+  interactive logins refuses `ctl` input instead of having it typed through the
+  window. A pane that is closing refuses it too. Thanks to
+  [@railapex](https://github.com/railapex) ([#113](https://github.com/ProjectHax/muxel/pull/113)).
+- **`muxel ctl send` doesn't paste into an agent that just got busy** — `send`
+  checked the pane when the request arrived, then waited before pasting, and an
+  agent that started working in between got the prompt anyway; a second sender
+  could also mistake a turn still awaiting its reply for idle. The pane is now
+  checked again right before the paste, and a turn awaiting its reply counts as
+  busy. Every failure after the paste says the text was pasted, so a script knows
+  not to send it twice. `send`, `answer`, and `keys` refuse the calling agent's
+  own pane unless `--force`, `muxel ctl help COMMAND` explains a command, and a
+  `-h` after a command is refused rather than typed into the agent. Thanks to
+  [@railapex](https://github.com/railapex) ([#107](https://github.com/ProjectHax/muxel/pull/107)).
+- **A pane another machine just opened no longer vanishes when this one wakes** —
+  while a laptop slept, another machine closed a pane and opened a new agent. On
+  waking, the laptop saw its own copy of the ended session exit, closed that pane
+  too, and stamped the close as the newest change, so its stale layout was pushed
+  over the shared one and the new pane disappeared everywhere while its agent
+  kept running. That close now counts as older than anything another machine did
+  meanwhile, and a push no longer drops panes another machine opened: it takes
+  them in first, attached to their running agents.
+- **Reconnecting no longer opens a second pane on a running agent** — after a
+  restart moved a pane's tmux session, another machine reconnecting could adopt
+  the same running agent into a second pane, and closing either pane killed the
+  agent. Every pane on a host now counts as owning its session, and closing a pane
+  leaves the agent running while another pane still shows it; the iOS app does
+  the same.
+- **A machine coming back takes the newer shared layout** — a machine that had
+  changed nothing could reconnect with its old copy, keep it, and push it over
+  the host's, pointing panes back at tmux servers and conversations they had
+  moved on from, which the next restart then resumed. A machine with no changes
+  of its own since it last synced now takes the host's layout.
+- **A pane whose folder is missing creates it** — a pane whose folder didn't exist
+  on its host, because it was deleted or the layout came from another machine,
+  started its program somewhere else, usually your home folder. muxel now creates
+  the folder first, and a local one that can't be created stops the launch with
+  the reason instead.
+- **Text typed into Claude's prompt no longer sets the pane's status** — a draft
+  or paste containing "Do you want to proceed?" read as a live permission prompt
+  and turned the pane blocked. Claude's input box is now left out of status
+  reading, while real permission prompts and Claude's working indicator still
+  count. Grok's question card now shows the pane as waiting on you. Thanks to
+  [@railapex](https://github.com/railapex) ([#111](https://github.com/ProjectHax/muxel/pull/111)).
+- **Restoring Claude panes no longer stalls the window** — when a Claude pane's
+  conversation wasn't under its folder, after `/cd`, a worktree move, or a
+  `/resume` into another project, muxel searched every Claude project on the
+  thread that draws the window, once per pane. Each pane now remembers where its
+  conversation is, and any search runs in the background. Thanks to
+  [@railapex](https://github.com/railapex) ([#108](https://github.com/ProjectHax/muxel/pull/108)).
+- **`muxel ctl new --prompt` gives tmux panes their first task** — a pane opened
+  this way under tmux started without its task, and a refused or failed launch
+  left the caller waiting; the task now arrives, and a launch that can't happen
+  answers the caller. Thanks to
+  [@railapex](https://github.com/railapex) ([#109](https://github.com/ProjectHax/muxel/pull/109)).
+- **`muxel ctl send` submits long Codex prompts that wrap at a hyphen** — on
+  Windows, when Codex wrapped a prompt right after a hyphen, `send` couldn't
+  recognise it and never pressed Enter again, so the whole prompt sat in Codex's
+  composer. That retry now fires. Thanks to
+  [@railapex](https://github.com/railapex) ([#112](https://github.com/ProjectHax/muxel/pull/112)).
+
 ## [0.3.3] — 2026-10-26
 
 ### Added
