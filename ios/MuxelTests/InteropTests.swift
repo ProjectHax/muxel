@@ -321,10 +321,38 @@ final class InteropTests: XCTestCase {
     }
 
     func testInjectionModeRoundTrips() throws {
-        for mode in [InjectionMode.none, .typeIn, .cliFlag(flag: "--append-system-prompt")] {
+        for mode in [InjectionMode.none, .typeIn, .cliFlag(flag: "--append-system-prompt"),
+                     .sessionHook, .unknown(mode: "future_mode")] {
             let data = try MuxelJSON.encoder.encode(mode)
             XCTAssertEqual(try MuxelJSON.decoder.decode(InjectionMode.self, from: data), mode)
         }
+        let hook = try MuxelJSON.decoder.decode(InjectionMode.self,
+                                                from: Data(#"{"mode":"session_hook"}"#.utf8))
+        XCTAssertEqual(hook, .sessionHook)
+    }
+
+    func testUnknownInjectionModeKeepsTheLayoutReadableAndUnchanged() throws {
+        let json = """
+        {
+          "version": 1, "updated_at": 1719500000, "remote_root": "/srv/app",
+          "layout": { "kind": "leaf", "tabs": ["aaaaaaaa-0000-0000-0000-000000000000"], "active": 0 },
+          "instances": [
+            { "id": "aaaaaaaa-0000-0000-0000-000000000000", "project_id": "11110000-0000-0000-0000-000000000000",
+              "title": "Agent", "program": "agent", "system_prompt": "context",
+              "injection": { "mode": "future_mode" } }
+          ],
+          "worktrees": []
+        }
+        """
+        let layout = try MuxelJSON.decoder.decode(RemoteLayout.self, from: Data(json.utf8))
+        let instance = try XCTUnwrap(layout.instances.first)
+        XCTAssertEqual(instance.injection, .unknown(mode: "future_mode"))
+        let launch = AgentLaunch.resolveLaunch(instance)
+        XCTAssertNil(launch.startupInput)
+        XCTAssertEqual(launch.args, [])
+        let written = try MuxelJSON.encoder.encode(layout)
+        let back = try MuxelJSON.decoder.decode(RemoteLayout.self, from: written)
+        XCTAssertEqual(back.instances.first?.injection, .unknown(mode: "future_mode"))
     }
 
     func testPaneIdsRemovedReportsOnlyPeerClosedPanes() {

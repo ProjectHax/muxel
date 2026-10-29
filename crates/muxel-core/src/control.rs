@@ -1161,7 +1161,7 @@ AGENT is an id from `panes`, a name, project/name, or `focused`.
 send, answer and keys refuse the caller's own pane unless --force is explicit.
 Everything after `--` is taken literally (for text that starts with -).
 For `new` without --prompt, presets/defaults keep toolbar injection, resume and hooks; raw argv bypasses them.
-ALL `new` requests require outside control AND Settings > Grok Bot > Outside terminal creation set to Ask or Allow.
+ALL `new` requests require outside control AND Settings > Outside control > Outside terminal creation set to Ask or Allow.
 Ask requires a click for every request. Allow covers configured non-shell terminal presets.
 Literal argv and shell presets always Ask; the click card never takes keyboard focus.
 Each card disables Allow and Deny for 750 ms after appearing and ignores double-clicks.
@@ -1187,7 +1187,7 @@ Raw argv panes restore stopped; only Run again replays their saved command.
 `new` launch directories are never owned, registered or deleted by muxel.
 On Windows, raw argv requires a native executable; use --preset for batch wrappers.
 `new` opens terminal panes; browser presets (including a browser default) are not supported yet.
-muxel must be running with Settings > Grok Bot > \"Allow outside tools to control muxel\" on.
+muxel must be running with Settings > Outside control > \"Allow outside tools to control muxel\" on.
 To reach a muxel started with --user-data-dir DIR, run `muxel --user-data-dir DIR ctl ...`;
 its own panes reach it without the flag.
 
@@ -1569,7 +1569,7 @@ Every command prints JSON. A failure exits non-zero and prints
 `{"ok": false, "error": "..."}` - the error says what went wrong and what to do,
 and a `code` is added when there is something to act on (see Errors below). If
 it says muxel isn't running or outside control is off, ask the user to open
-muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
+muxel and turn on Settings > Outside control > "Allow outside tools to control muxel".
 
 ## Commands
 
@@ -1609,7 +1609,7 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   and activates its window. `--background` is accepted as a compatibility no-op,
   including alongside `--focus`. JSON callers use `focus` (default false);
   the legacy `background` field remains accepted and does not control focus.
-  Every `new` request requires outside control plus Settings > Grok Bot >
+  Every `new` request requires outside control plus Settings > Outside control >
   Outside terminal creation set to Ask or Allow. Ask requires a click for every
   request; Allow permits configured non-shell terminal presets. All literal argv,
   even an agent

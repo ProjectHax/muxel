@@ -116,8 +116,9 @@ pub enum SettingsSection {
     Speech,
     ReadAloud,
     Agents,
-    /// Setting up Grok Bot (or another agent) to drive muxel through `muxel ctl`.
-    GrokBot,
+    /// Outside control: letting another agent (Grok Bot, a script, …) drive muxel
+    /// through `muxel ctl`.
+    OutsideControl,
     Runners,
     Snippets,
     Loops,
@@ -193,13 +194,13 @@ pub struct SettingsUi {
     /// Inline message of the last refused or rolled-back add.
     pub lib_add_error: Option<String>,
 
-    // Grok Bot tab.
-    /// Inline result of the last "Test" (running `muxel ctl` as Grok Bot would).
-    pub grok_test: RemoteTestState,
+    // Outside control tab.
+    /// Inline result of the last "Test" (running `muxel ctl` as the agent would).
+    pub control_test: RemoteTestState,
     /// Whether the skill's full text is shown below its Copy button.
-    pub grok_skill_preview: bool,
+    pub control_skill_preview: bool,
     /// The skill has been copied to the clipboard (shown beside the button).
-    pub grok_skill_copied: bool,
+    pub control_skill_copied: bool,
 
     // SSH remote-host editor.
     pub selected_remote: Option<usize>,
@@ -364,9 +365,9 @@ impl SettingsUi {
                 InputState::new(window, cx).placeholder(t("Display name (blank = from the URL)"))
             }),
             lib_add_error: None,
-            grok_test: RemoteTestState::Idle,
-            grok_skill_preview: false,
-            grok_skill_copied: false,
+            control_test: RemoteTestState::Idle,
+            control_skill_preview: false,
+            control_skill_copied: false,
             selected_remote: None,
             s_auth: SshAuth::Agent,
             s_test: RemoteTestState::Idle,

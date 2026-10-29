@@ -5012,7 +5012,7 @@ dependencies = [
 
 [[package]]
 name = "muxel"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5042,6 +5042,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "rust-embed",
  "self-replace",
+ "serde",
  "serde_json",
  "sys-locale",
  "tokio",
@@ -5058,7 +5059,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64",
  "chrono",
@@ -5071,7 +5072,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-store"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5084,7 +5085,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-terminal"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -5104,7 +5105,7 @@ dependencies = [
 
 [[package]]
 name = "muxel-tray"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ksni",
  "log",

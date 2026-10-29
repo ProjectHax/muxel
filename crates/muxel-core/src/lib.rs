@@ -16,6 +16,7 @@ pub mod isolated_root;
 pub mod library;
 pub mod locale;
 pub mod memory;
+pub mod muse;
 pub mod outage;
 mod pane;
 pub mod path_paste;
@@ -1110,6 +1111,13 @@ pub struct Project {
     /// the synced layout doc.
     #[serde(default)]
     pub closed_sessions: Vec<tmux::ClosedSession>,
+    /// [`RemoteLayout::fingerprint`] of the shared layout doc as this machine last
+    /// wrote or adopted it. Remembered across restarts so a connect can tell a doc
+    /// a peer rewrote while this machine was away (adopt it) from one this machine
+    /// has changes on top of (push them) — see [`connect_layout_action`]. Local
+    /// bookkeeping, never part of the synced layout doc.
+    #[serde(default)]
+    pub layout_synced: Option<String>,
 }
 
 /// One agent in a project's saved startup set.
@@ -1138,6 +1146,7 @@ impl Project {
             accomplishments_enabled: false,
             layout_updated_at: None,
             closed_sessions: Vec::new(),
+            layout_synced: None,
         }
     }
 
@@ -1486,6 +1495,15 @@ impl RemoteLayout {
         (doc.version == REMOTE_LAYOUT_VERSION && doc.remote_root == expect_root).then_some(doc)
     }
 
+    /// Whether the doc has any panes. A folder opened as a new project may already
+    /// be worked in from elsewhere — a remote project another machine keeps on this
+    /// one, or the iOS app — and then these are the panes opening it should show.
+    pub fn has_panes(&self) -> bool {
+        self.layout
+            .as_ref()
+            .is_some_and(|layout| layout.first_instance().is_some())
+    }
+
     /// Pretty JSON for storage on the remote.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
@@ -1516,6 +1534,18 @@ impl RemoteLayout {
     /// peer made meanwhile, such as moving the pane that was just bound.
     pub fn edit_key(&self) -> String {
         self.key(true)
+    }
+
+    /// A short fingerprint of a [`content_key`](Self::content_key), so a project can
+    /// remember which doc it last synced ([`Project::layout_synced`]) without
+    /// storing the whole layout a second time. FNV-1a rather than DefaultHasher,
+    /// whose output may change with Rust releases and would forget every project's
+    /// sync across an upgrade.
+    pub fn fingerprint(key: &str) -> String {
+        let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        format!("{hash:016x}")
     }
 
     fn key(&self, edits_only: bool) -> String {
@@ -1593,6 +1623,44 @@ pub fn peer_layout_action(
     } else {
         PeerLayoutAction::Adopt
     }
+}
+
+/// Decide a connect's first sync with the shared file (`remote`) by the live-poll
+/// rule ([`peer_layout_action`]), with the doc this machine last wrote or adopted
+/// known only by its persisted fingerprint, `synced` ([`Project::layout_synced`]).
+///
+/// Without it, a connect could only compare revisions, and a tie went to this
+/// machine. But a peer catching up on session bookkeeping — rebinding a pane's
+/// tmux session, picking up the conversation a pane moved to — pushes without a
+/// new revision (see [`RemoteLayout::edit_key`]). A machine coming back with its
+/// old copy then pushed that copy's stale bookkeeping over the peer's: panes
+/// pointed back at a server their session had left, and at conversations they
+/// had moved on from, which the next restart would resume. Knowing it has changed
+/// nothing since its last sync, this machine adopts the file instead. When the
+/// fingerprint matches neither side (both changed, or a doc from before this was
+/// remembered) the revisions decide, as before.
+pub fn connect_layout_action(
+    remote: &RemoteLayout,
+    synced: Option<&str>,
+    local_key: &str,
+    local_rev: u64,
+) -> PeerLayoutAction {
+    let remote_key = remote.content_key();
+    let known = |key: &str| synced == Some(RemoteLayout::fingerprint(key).as_str());
+    let synced_key = if known(&remote_key) {
+        Some(remote_key.as_str())
+    } else if known(local_key) {
+        Some(local_key)
+    } else {
+        None
+    };
+    peer_layout_action(
+        &remote_key,
+        remote.updated_at,
+        synced_key,
+        local_key,
+        local_rev,
+    )
 }
 
 /// Whether writing this machine's layout over the shared file as it stands now
@@ -2640,6 +2708,12 @@ pub struct Settings {
     /// older entries are pruned from `.muxel/ACCOMPLISHMENTS.md`.
     #[serde(default = "default_accomplishment_retention_days")]
     pub accomplishment_retention_days: u32,
+    /// Turn shared memory on for every project created from now on.
+    #[serde(default)]
+    pub new_project_memory: bool,
+    /// Turn the accomplishment log on for every project created from now on.
+    #[serde(default)]
+    pub new_project_accomplishments: bool,
 }
 
 fn default_stt_model() -> String {
@@ -2957,7 +3031,20 @@ impl Default for Settings {
             shared_loops: Vec::new(),
             shared_runner_confirmations: Vec::new(),
             accomplishment_retention_days: default_accomplishment_retention_days(),
+            new_project_memory: false,
+            new_project_accomplishments: false,
         }
+    }
+}
+
+impl Settings {
+    /// A project created from now on, with the features these settings turn on
+    /// for new projects.
+    pub fn new_project(&self, name: impl Into<String>, root_path: impl Into<PathBuf>) -> Project {
+        let mut project = Project::new(name, root_path);
+        project.memory_enabled = self.new_project_memory;
+        project.accomplishments_enabled = self.new_project_accomplishments;
+        project
     }
 }
 
@@ -3214,7 +3301,7 @@ mod settings_tests {
             if !existing_muse {
                 let added = settings.presets.pop().unwrap();
                 assert_eq!(added.name, "Muse Code");
-                assert_eq!(added.injection, InjectionMode::None);
+                assert_eq!(added.injection, InjectionMode::SessionHook);
             }
             settings.preset_seed_version = 17;
             assert_eq!(
@@ -3318,6 +3405,24 @@ mod settings_tests {
         // fills an *absent* field, not an explicitly empty one).
         let s2: Settings = serde_json::from_str(r#"{"snippets": []}"#).expect("parse");
         assert!(s2.snippets.is_empty());
+    }
+
+    #[test]
+    fn new_projects_get_the_features_settings_turn_on_for_them() {
+        // Off for a config from before these settings, so nothing changes on upgrade.
+        let mut s: Settings = serde_json::from_str("{}").expect("parse");
+        let p = s.new_project("app", "/srv/app");
+        assert!(!p.memory_enabled && !p.accomplishments_enabled);
+        assert_eq!(
+            (p.name.as_str(), p.root_path.as_path()),
+            ("app", Path::new("/srv/app"))
+        );
+
+        s.new_project_memory = true;
+        let p = s.new_project("app", "/srv/app");
+        assert!(p.memory_enabled && !p.accomplishments_enabled);
+        s.new_project_accomplishments = true;
+        assert!(s.new_project("app", "/srv/app").accomplishments_enabled);
     }
 
     #[test]
@@ -3742,6 +3847,37 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn a_folder_worked_in_remotely_opens_locally_with_its_panes() {
+        // Another machine's remote project wrote the host's doc for this folder.
+        let mut ws = Workspace::default();
+        let mut remote = remote_project("/srv/app");
+        let pane = Instance::shell(remote.id);
+        remote.layout = Some(PaneNode::leaf(pane.id));
+        remote.layout_updated_at = Some(50);
+        ws.add_instance(pane);
+        ws.projects = vec![remote.clone()];
+        let json = RemoteLayout::capture(&remote, &ws, 60).to_json();
+
+        // Opened locally on the host, the folder's doc is this project's own.
+        let doc = RemoteLayout::parse(&json, "/srv/app").expect("doc for this root");
+        assert!(doc.has_panes());
+        // A project just opened there has no panes and has never synced, so its
+        // first sync takes the doc rather than pushing its empty layout over it.
+        let fresh = Project::new("app", "/srv/app");
+        let local = RemoteLayout::capture(&fresh, &Workspace::default(), 70);
+        assert_eq!(
+            connect_layout_action(&doc, None, &local.content_key(), 0),
+            PeerLayoutAction::Adopt
+        );
+
+        // A doc with no panes left leaves the folder to open with a fresh one.
+        let mut emptied = remote;
+        emptied.layout = None;
+        let json = RemoteLayout::capture(&emptied, &ws, 60).to_json();
+        assert!(!RemoteLayout::parse(&json, "/srv/app").unwrap().has_panes());
+    }
+
+    #[test]
     fn content_key_ignores_updated_at_but_tracks_layout() {
         let mut ws = Workspace::default();
         let mut proj = remote_project("/srv/app");
@@ -3841,6 +3977,57 @@ mod remote_layout_tests {
         // Nothing recorded yet: only a strictly newer peer layout is taken.
         assert_eq!(peer_layout_action("p", 10, None, "b", 9), Adopt);
         assert_eq!(peer_layout_action("p", 8, None, "b", 9), Ignore);
+    }
+
+    /// The bug: a machine back from being away tied with the host file on revision
+    /// (a peer's session bookkeeping never bumps it) and pushed its own stale copy
+    /// over the peer's — panes pointing back at conversations they had left.
+    #[test]
+    fn a_connect_adopts_a_peers_bookkeeping_when_nothing_changed_here() {
+        use PeerLayoutAction::{Adopt, Ignore, InSync};
+        let mut ws = Workspace::default();
+        let mut proj = remote_project("/srv/app");
+        let mut pane = Instance::shell(proj.id);
+        pane.session_id = Some("old-conversation".into());
+        proj.layout = Some(PaneNode::Leaf(LeafData {
+            pane_id: Uuid::new_v4(),
+            tabs: vec![pane.id],
+            active: 0,
+        }));
+        proj.layout_updated_at = Some(100);
+        ws.instances = vec![pane];
+        ws.projects = vec![proj.clone()];
+        let ours = RemoteLayout::capture(&proj, &ws, 100);
+        let ours_key = ours.content_key();
+        let synced = RemoteLayout::fingerprint(&ours_key);
+
+        // A peer moved the pane on to another conversation, same revision.
+        let mut theirs = ours.clone();
+        theirs.instances[0].session_id = Some("new-conversation".into());
+        assert_eq!(theirs.updated_at, 100);
+        let action = |synced: Option<&str>, local: &str, rev| {
+            connect_layout_action(&theirs, synced, local, rev)
+        };
+        assert_eq!(action(Some(&synced), &ours_key, 100), Adopt);
+        // Even when this machine's clock stamped it later: it changed nothing since.
+        assert_eq!(action(Some(&synced), &ours_key, 500), Adopt);
+        // Nothing remembered (a doc from before this existed): revisions decide.
+        assert_eq!(action(None, &ours_key, 100), Ignore);
+
+        // This machine has changes the file was synced before: they are pushed.
+        let theirs_synced = RemoteLayout::fingerprint(&theirs.content_key());
+        assert_eq!(action(Some(&theirs_synced), "edited here", 100), Ignore);
+        // Both sides changed since: the newer revision wins.
+        assert_eq!(action(Some("0000000000000000"), "edited here", 100), Ignore);
+        assert_eq!(action(Some("0000000000000000"), "edited here", 99), Adopt);
+        // Already the same.
+        assert_eq!(action(None, &theirs.content_key(), 1), InSync);
+    }
+
+    #[test]
+    fn a_layout_fingerprint_is_stable_across_builds() {
+        assert_eq!(RemoteLayout::fingerprint(""), "cbf29ce484222325");
+        assert_eq!(RemoteLayout::fingerprint("foobar"), "85944171f73967e8");
     }
 
     #[test]

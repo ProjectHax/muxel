@@ -830,8 +830,11 @@ final class AppState: ObservableObject {
                 }
                 // Resolve the *live* session by uuid8 suffix so we kill the real one (which
                 // may carry desktop's host slug), not a phone-slug name that doesn't exist.
+                // Another pane still showing it keeps it running.
                 if current.kind == .terminal, !current.literalArgv,
-                   let target = await liveSessionTarget(current, on: host) {
+                   let target = await liveSessionTarget(current, on: host),
+                   !TmuxCommands.sessionStillShown(target.name, closing: [current.id],
+                                                   in: fresh?.instances ?? []) {
                     _ = try? await conn.tmux(TmuxCommands.killSession(target.name),
                                             session: target.name, socket: target.socket)
                 }
@@ -860,7 +863,10 @@ final class AppState: ObservableObject {
                 // target's current owner from the document inside this queue slot.
                 let current = fresh?.instances.filter { ids.contains($0.id) } ?? []
                 for inst in current where inst.kind == .terminal && !inst.literalArgv {
-                    if let target = await liveSessionTarget(inst, on: host) {
+                    // A session a kept pane still shows keeps running for it.
+                    if let target = await liveSessionTarget(inst, on: host),
+                       !TmuxCommands.sessionStillShown(target.name, closing: ids,
+                                                       in: fresh?.instances ?? []) {
                         _ = try? await conn.tmux(TmuxCommands.killSession(target.name),
                                                 session: target.name, socket: target.socket)
                     }

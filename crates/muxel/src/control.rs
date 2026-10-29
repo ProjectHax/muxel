@@ -1,6 +1,6 @@
 //! `muxel ctl`: outside control of the running app over a loopback port.
 //!
-//! While Settings → Grok Bot → "Allow outside tools to control muxel" is on, the
+//! While Settings → Outside control → "Allow outside tools to control muxel" is on, the
 //! app listens on `127.0.0.1:<random port>` and writes the port and a fresh random
 //! token to `<data dir>/control.json`. Unix creates the file with mode 0600;
 //! Windows inherits the parent directory's ACL, so the user data directory must
@@ -39,7 +39,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_POLL: Duration = Duration::from_secs(1);
 
 const NOT_RUNNING: &str = "muxel isn't running, or outside control is off: open muxel and \
-     turn on Settings > Grok Bot > \"Allow outside tools to control muxel\". (If it is \
+     turn on Settings > Outside control > \"Allow outside tools to control muxel\". (If it is \
      running, this command may see a different home directory than muxel does: set \
      MUXEL_CONTROL to the path of muxel's control.json.)";
 

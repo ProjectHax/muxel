@@ -475,6 +475,12 @@ pub fn parse_sessions_on(out: &str, socket: Socket) -> Vec<RemoteSession> {
 
 /// Resolve old name-only owners against discovery's preference order, while
 /// keeping explicitly owned sessions on the exact server that was attached.
+///
+/// An owner whose recorded server isn't running its session resolves by name too.
+/// That record is stale, not a claim on nothing: a restart moved the session off
+/// Default after this copy of the pane was saved (a peer's layout, or this
+/// machine's from before it was away). Read literally, it left the pane's own
+/// running session looking unowned, and a connect adopted it into a second pane.
 pub fn owned_session_keys<'a>(
     sessions: &'a [RemoteSession],
     owned: &'a [SessionTarget],
@@ -485,12 +491,18 @@ pub fn owned_session_keys<'a>(
             .entry(session.name.as_str())
             .or_insert(&session.socket);
     }
+    let listed = |name: &str, socket: &Socket| {
+        sessions
+            .iter()
+            .any(|s| s.name == name && s.socket == *socket)
+    };
     owned
         .iter()
         .filter_map(|target| {
             target
                 .socket
                 .as_ref()
+                .filter(|socket| listed(&target.name, socket))
                 .or_else(|| preferred.get(target.name.as_str()).copied())
                 .map(|socket| (target.name.as_str(), socket))
         })
@@ -533,6 +545,22 @@ pub fn orphan_sessions(
         .filter(|s| !closed.contains(&(s.name.as_str(), &s.socket)))
         .cloned()
         .collect()
+}
+
+/// Whether closing a pane must leave its session `closed` running, because another
+/// pane on the same host still shows it. `others` is the session of every other
+/// pane there.
+///
+/// One session can be in two panes: one adopted beside a pane whose record had
+/// gone stale, or an import. Closing either used to kill the session, and the
+/// agent the other pane was still showing went with it. The last pane to close
+/// is the one that stops it.
+///
+/// Matched by name alone, since a record of the server can be stale (see
+/// [`owned_session_keys`]). Session names carry the pane's own id, so panes with
+/// the same name are showing the same session.
+pub fn session_still_shown(closed: &SessionTarget, others: &[SessionTarget]) -> bool {
+    others.iter().any(|other| other.name == closed.name)
 }
 
 /// Whether `path` is `root` or sits beneath it (a worktree, say).
@@ -1879,6 +1907,34 @@ mod tests {
             ..closed
         };
         assert_eq!(orphan_sessions(&found, "/p", &[], &[legacy]), found[1..]);
+    }
+
+    /// The pane's record still names Default, but a restart has since moved its
+    /// session onto muxel's own server. The running session is the pane's, not an
+    /// orphan to adopt into a second pane beside it.
+    #[test]
+    fn an_owner_whose_recorded_server_lacks_the_session_owns_its_namesake() {
+        let name = "muxel_p_12345678";
+        let found = parse_sessions_on(&format!("{name}|/p|claude|\n"), Socket::Private);
+        let stale = [SessionTarget::new(name, Some(Socket::Default))];
+        assert!(orphan_sessions(&found, "/p", &stale, &[]).is_empty());
+        assert!(owned_session_keys(&found, &stale).contains(&(name, &Socket::Private)));
+    }
+
+    /// Two panes on one session: closing either leaves it to the other, even when
+    /// their records disagree about the server. Only the last pane stops it.
+    #[test]
+    fn a_session_another_pane_still_shows_outlives_the_close() {
+        let adopted = SessionTarget::new("muxel_p_12345678", Some(Socket::Private));
+        let stale = SessionTarget::new("muxel_p_12345678", Some(Socket::Default));
+        let unrelated = SessionTarget::new("muxel_p_87654321", Some(Socket::Private));
+        assert!(session_still_shown(
+            &adopted,
+            &[unrelated.clone(), stale.clone()]
+        ));
+        assert!(session_still_shown(&stale, std::slice::from_ref(&adopted)));
+        assert!(!session_still_shown(&adopted, &[unrelated]));
+        assert!(!session_still_shown(&adopted, &[]));
     }
 
     #[test]

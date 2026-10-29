@@ -40,6 +40,8 @@ pub enum InjectionMode {
     CliFlag { flag: String },
     /// Type it into the terminal and press Enter shortly after the agent starts.
     TypeIn,
+    /// Add context through Muse's SessionStart hook, without a user turn.
+    SessionHook,
 }
 
 /// An environment variable applied to an agent's process.
@@ -465,15 +467,13 @@ impl AgentPreset {
             effort_flag: Some("--reasoning-effort".to_string()),
             args: Vec::new(),
             system_prompt: None,
-            // No verified hidden instruction transport; never type into a live prompt.
-            injection: InjectionMode::None,
+            injection: InjectionMode::SessionHook,
             env: Vec::new(),
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
-            // Muse can resume by id, but muxel does not capture its session id.
             session_id_flag: None,
-            resume_flag: None,
+            resume_flag: Some("resume".to_string()),
         }
     }
 
@@ -556,6 +556,14 @@ impl AgentPreset {
         out.extend(self.args.iter().cloned());
         out
     }
+
+    /// Muse presets saved by v18 predate capture support. Detect the capability
+    /// without replaying settings migrations or rewriting users' presets.
+    pub fn effective_resume_flag(&self) -> Option<&str> {
+        self.resume_flag
+            .as_deref()
+            .or_else(|| crate::muse::is_program(self.program.as_deref()).then_some("resume"))
+    }
 }
 
 /// Whether `program` runs one of muxel's built-in agent providers — the program
@@ -626,6 +634,8 @@ pub struct ResolvedLaunch {
     pub args: Vec<String>,
     /// Text to type into the terminal once the agent is ready (TypeIn injection).
     pub startup_input: Option<String>,
+    /// Invocation-only context supplied by a provider SessionStart hook.
+    pub session_context: Option<String>,
     /// Number of Shift+Tab presses to send before typing (runner "auto mode").
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input`.
@@ -651,6 +661,7 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
             program: instance.program.clone(),
             args: instance.args.clone(),
             startup_input: None,
+            session_context: None,
             auto_mode_presses: 0,
             submit: false,
             env: instance
@@ -662,6 +673,7 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
     }
     let mut args = instance.args.clone();
     let mut startup_input = None;
+    let mut session_context = None;
 
     if let Some(prompt) = instance.system_prompt.as_ref().filter(|p| !p.is_empty()) {
         if instance.control_prompt {
@@ -683,6 +695,12 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
                 }
                 InjectionMode::TypeIn => {}
                 InjectionMode::None => {}
+                InjectionMode::SessionHook
+                    if crate::muse::is_program(instance.program.as_deref()) =>
+                {
+                    session_context = Some(prompt.clone());
+                }
+                InjectionMode::SessionHook => {}
             }
         }
     }
@@ -697,6 +715,7 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
         program: instance.program.clone(),
         args,
         startup_input,
+        session_context,
         auto_mode_presses: instance.auto_mode_presses,
         submit,
         env: instance
@@ -724,7 +743,12 @@ pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<
     if instance.literal_argv {
         return None;
     }
-    let resume_flag = preset.resume_flag.as_deref()?;
+    if crate::muse::is_program(instance.program.as_deref())
+        && instance.args.iter().any(|arg| arg == "--no-session-log")
+    {
+        return None;
+    }
+    let resume_flag = preset.effective_resume_flag()?;
     if instance.session_started {
         let id = instance.session_id.as_deref()?;
         return Some(vec![resume_flag.to_string(), id.to_string()]);
@@ -1553,8 +1577,106 @@ mod tests {
             ["--model", "configured-model", "--reasoning-effort", "high"]
         );
         assert_eq!(launch.startup_input, None);
-        assert_eq!(preset.injection, InjectionMode::None);
+        assert_eq!(preset.injection, InjectionMode::SessionHook);
+        assert_eq!(
+            launch.session_context.as_deref(),
+            Some("Project instructions\nwith details")
+        );
         assert_eq!(session_resume_args(&preset, &inst), None);
+    }
+
+    #[test]
+    fn muse_resume_uses_bound_id_and_preserves_overrides() {
+        let mut preset = AgentPreset::muse();
+        preset.model = Some("configured-model".into());
+        preset.effort = Some("medium".into());
+        preset.args = vec!["--worktree".into(), "off".into()];
+        let mut pane = instance(&preset, Some("launch context"));
+        assert_eq!(session_resume_args(&preset, &pane), None);
+        pane.session_id = Some("01a14039-60e8-7532-9187-0cd6f75f15a0".into());
+        pane.session_started = true;
+        let mut args = session_resume_args(&preset, &pane).unwrap();
+        let launch = resolve_launch_for_session(&pane, true);
+        args.extend(launch.args);
+        assert_eq!(
+            args,
+            [
+                "resume",
+                "01a14039-60e8-7532-9187-0cd6f75f15a0",
+                "--model",
+                "configured-model",
+                "--reasoning-effort",
+                "medium",
+                "--worktree",
+                "off"
+            ]
+        );
+        assert!(launch.startup_input.is_none());
+        preset.resume_flag = None;
+        assert!(session_resume_args(&preset, &pane).is_some());
+        pane.args.push("--no-session-log".into());
+        assert!(session_resume_args(&preset, &pane).is_none());
+    }
+
+    #[test]
+    fn muse_full_launch_places_hook_config_before_a_preserved_positional_tail() {
+        let sid = "01a14039-60e8-7532-9187-0cd6f75f15a0";
+        let config = "managed_hooks_path=\"C:/Muxel data/hooks.json\"";
+        for resuming in [false, true] {
+            for positional in [false, true] {
+                let mut preset = AgentPreset::muse();
+                preset.model = Some("configured-model".into());
+                preset.effort = Some("medium".into());
+                preset.args = if positional {
+                    ["--", "preserved prompt", "--literal-tail", "-chooks={}"]
+                        .map(str::to_string)
+                        .to_vec()
+                } else {
+                    ["--worktree", "off"].map(str::to_string).to_vec()
+                };
+                let mut pane = instance(&preset, None);
+                pane.session_id = Some(sid.into());
+                pane.session_started = resuming;
+                let launch = resolve_launch_for_session(&pane, resuming);
+                let mut args = session_resume_args(&preset, &pane).unwrap_or_default();
+                args.extend(launch.args);
+                crate::muse::insert_hook_config(&mut args, config.into());
+                let mut expected = if resuming {
+                    vec!["resume".to_string(), sid.into()]
+                } else {
+                    Vec::new()
+                };
+                expected.extend(
+                    [
+                        "--model",
+                        "configured-model",
+                        "--reasoning-effort",
+                        "medium",
+                    ]
+                    .map(str::to_string),
+                );
+                if positional {
+                    expected.extend(
+                        [
+                            "--config",
+                            config,
+                            "--",
+                            "preserved prompt",
+                            "--literal-tail",
+                            "-chooks={}",
+                        ]
+                        .map(str::to_string),
+                    );
+                } else {
+                    expected.extend(["--worktree", "off", "--config", config].map(str::to_string));
+                }
+                assert_eq!(
+                    args, expected,
+                    "resuming={resuming}, positional={positional}"
+                );
+                assert!(launch.startup_input.is_none());
+            }
+        }
     }
 
     #[test]

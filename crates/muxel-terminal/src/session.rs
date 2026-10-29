@@ -2999,6 +2999,19 @@ fn resolve_program_for_spawn(program: &str) -> String {
     }
 }
 
+/// Hook configuration contains JSON and must never cross cmd.exe reparsing.
+pub fn muse_config_supported(program: &str) -> bool {
+    #[cfg(windows)]
+    {
+        !is_windows_batch_program(&resolve_program_for_spawn(program))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = program;
+        true
+    }
+}
+
 fn command_builder_for_spawn(program: &str, args: &[String]) -> CommandBuilder {
     #[cfg(not(windows))]
     {
@@ -3085,6 +3098,20 @@ fn resolve_program_for_spawn_windows(program: &str) -> String {
     use std::path::{Path, PathBuf};
 
     fn prefer_packaged_codex(path: PathBuf) -> PathBuf {
+        if path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("muse"))
+            && is_windows_batch_program(&path.to_string_lossy())
+            && let Some(parent) = path.parent()
+            && let Ok(version) = std::fs::read_to_string(parent.join(".muse-version"))
+            && let Some(name) = muxel_core::muse::native_binary_name(version.trim())
+        {
+            let native = parent.join(name);
+            if native.is_file() {
+                return native;
+            }
+        }
         let is_codex_batch = path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -5602,6 +5629,27 @@ mod windows_spawn_resolve {
             "batch runner changed argument boundaries: {output:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn muse_windows_shim_resolves_only_its_selected_native_binary() {
+        let dir = std::env::temp_dir().join(format!("muxel-muse-resolve-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("muse.cmd");
+        let native = dir.join("muse-bin-1.4.8-R6256.1.exe");
+        std::fs::write(&shim, "@exit /b 0").unwrap();
+        std::fs::write(dir.join(".muse-version"), "1.4.8-R6256.1\n").unwrap();
+        std::fs::write(&native, []).unwrap();
+        assert_eq!(
+            resolve_program_for_spawn_windows(shim.to_str().unwrap()),
+            native.to_string_lossy()
+        );
+        std::fs::write(dir.join(".muse-version"), "../other").unwrap();
+        assert_eq!(
+            resolve_program_for_spawn_windows(shim.to_str().unwrap()),
+            shim.to_string_lossy()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Manual installed-tool smoke test for the full PTY launch path. Ignored in

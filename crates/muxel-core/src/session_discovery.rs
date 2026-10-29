@@ -12,6 +12,7 @@ pub enum SessionProvider {
     Codex,
     Claude,
     Grok,
+    Muse,
 }
 
 /// Captured without I/O on the UI thread. Binding generations distinguish an
@@ -316,7 +317,7 @@ impl SessionDiscovery {
 
     /// Returns whether this result may be applied. `found` controls the next
     /// poll: Codex misses back off from one to thirty seconds, independently of
-    /// directory stamp changes. Claude and Grok
+    /// directory stamp changes. Claude, Grok and Muse
     /// cap misses at two seconds so new in-process switches stay timely.
     /// A hit polls in one second; a bound Codex hint stops polling altogether.
     pub fn finish(
@@ -342,7 +343,7 @@ impl SessionDiscovery {
             self.misses = self.misses.saturating_add(1);
             let cap = match request.key.provider {
                 SessionProvider::Codex => 30,
-                SessionProvider::Claude | SessionProvider::Grok => 2,
+                SessionProvider::Claude | SessionProvider::Grok | SessionProvider::Muse => 2,
             };
             Duration::from_secs((1_u64 << (self.misses - 1).min(5)).min(cap))
         };
@@ -678,7 +679,11 @@ mod tests {
 
     #[test]
     fn hook_and_process_polls_cap_missing_backoff_to_keep_switches_timely() {
-        for provider in [SessionProvider::Claude, SessionProvider::Grok] {
+        for provider in [
+            SessionProvider::Claude,
+            SessionProvider::Grok,
+            SessionProvider::Muse,
+        ] {
             let mut key = key();
             key.provider = provider;
             let mut discovery = SessionDiscovery::default();
