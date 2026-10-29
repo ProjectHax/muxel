@@ -42,6 +42,9 @@ pub struct CloseFacts {
     pub attributable: bool,
     pub awaiting_reply: bool,
     pub another_tmux_client: bool,
+    /// The pane runs in a tmux session that closing it would kill, here or on
+    /// its host. A dead client or failed launch says nothing about the agent.
+    pub session_may_outlive: bool,
     pub launch_id: Option<Uuid>,
     pub binding_rev: u64,
     pub input_rev: u64,
@@ -55,12 +58,30 @@ pub enum CloseDecision {
     Hold { forced: bool },
 }
 
-pub fn decide(facts: CloseFacts, ask_busy: bool) -> CloseDecision {
-    if matches!(
+fn looks_dead(facts: CloseFacts) -> bool {
+    matches!(
         facts.status,
         AgentState::Exited | AgentState::NotRunning | AgentState::Failed
-    ) {
-        return CloseDecision::Immediate;
+    )
+}
+
+/// Whether the pane's process is known to be gone, so its close loses nothing.
+/// A tmux pane's exited client may have detached from an agent still running.
+pub fn exit_proves_closed(facts: CloseFacts) -> bool {
+    facts.status == AgentState::Exited && !facts.session_may_outlive
+}
+
+pub fn decide(facts: CloseFacts, ask_busy: bool) -> CloseDecision {
+    if looks_dead(facts) {
+        if !facts.session_may_outlive {
+            return CloseDecision::Immediate;
+        }
+        // The session may still hold the agent; closing would kill it.
+        return if ask_busy {
+            CloseDecision::Ask
+        } else {
+            CloseDecision::Hold { forced: true }
+        };
     }
     let quiet = matches!(facts.status, AgentState::Idle | AgentState::Done)
         && facts.attributable
@@ -144,7 +165,7 @@ pub fn undo_launch(held: HeldLaunch, view: HeldView) -> UndoLaunch {
 mod recoverable_close_policy_tests {
     use super::{
         CloseDecision, CloseEvidence, CloseFacts, HeldLaunch, HeldView, UndoLaunch, decide,
-        held_launch, may_finalize, shell_close_evidence, undo_launch,
+        exit_proves_closed, held_launch, may_finalize, shell_close_evidence, undo_launch,
     };
     use crate::TerminalLaunchReason;
     use crate::control::AgentState;
@@ -157,6 +178,7 @@ mod recoverable_close_policy_tests {
             attributable: true,
             awaiting_reply: false,
             another_tmux_client: false,
+            session_may_outlive: false,
             launch_id: Some(Uuid::new_v4()),
             binding_rev: 3,
             input_rev: 7,
@@ -464,5 +486,58 @@ mod recoverable_close_policy_tests {
             undo_launch(HeldLaunch::Settled, HeldView::Missing),
             UndoLaunch::Launch(TerminalLaunchReason::Recovery)
         );
+    }
+
+    #[test]
+    fn tmux_pane_that_only_looks_dead_asks_and_keeps_its_undo() {
+        // A pane that never connected, a restart whose kill failed, and a
+        // detached client all leave the session, and maybe the agent, running.
+        for status in [
+            AgentState::NotRunning,
+            AgentState::Failed,
+            AgentState::Exited,
+        ] {
+            let tmux = CloseFacts {
+                status,
+                evidence: CloseEvidence::Process,
+                session_may_outlive: true,
+                ..quiet()
+            };
+            assert_eq!(decide(tmux, true), CloseDecision::Ask, "{status:?}");
+            assert_eq!(
+                decide(tmux, false),
+                CloseDecision::Hold { forced: true },
+                "{status:?}"
+            );
+            assert!(!exit_proves_closed(tmux), "{status:?}");
+            let direct = CloseFacts {
+                session_may_outlive: false,
+                ..tmux
+            };
+            assert_eq!(decide(direct, true), CloseDecision::Immediate, "{status:?}");
+            assert_eq!(exit_proves_closed(direct), status == AgentState::Exited);
+        }
+    }
+
+    #[test]
+    fn tmux_client_exiting_during_a_quiet_countdown_needs_a_decision() {
+        let before = CloseFacts {
+            session_may_outlive: true,
+            ..quiet()
+        };
+        assert_eq!(decide(before, true), CloseDecision::Hold { forced: false });
+        let now = CloseFacts {
+            status: AgentState::Exited,
+            evidence: CloseEvidence::Process,
+            ..before
+        };
+        assert!(!exit_proves_closed(now));
+        assert!(!may_finalize(before, now, false));
+        // Without a session behind it, the exit itself finishes the close.
+        let direct = CloseFacts {
+            session_may_outlive: false,
+            ..now
+        };
+        assert!(exit_proves_closed(direct));
     }
 }

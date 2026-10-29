@@ -4,7 +4,7 @@ use super::*;
 use muxel_core::control::AgentState;
 use muxel_core::recoverable_close::{
     CloseDecision, CloseEvidence, CloseFacts, HeldLaunch, HeldView, UndoLaunch, decide,
-    held_launch, may_finalize, shell_close_evidence, undo_launch,
+    exit_proves_closed, held_launch, may_finalize, shell_close_evidence, undo_launch,
 };
 use muxel_terminal::TerminalStatusReason;
 
@@ -72,6 +72,22 @@ impl MuxelApp {
             loc,
             SessionTarget::new(name.clone(), inst.tmux_socket.clone()),
         ))
+    }
+
+    /// Whether closing this pane kills a tmux session, here or on its host,
+    /// which may still be running the agent whatever the local client shows.
+    /// The same panes `teardown_closed_instance` kills or ledgers a session for.
+    fn close_session_may_outlive(&self, inst: &Instance) -> bool {
+        if inst.literal_argv {
+            return false;
+        }
+        match self.workspace.project(inst.project_id) {
+            Some(project) if project.is_remote() => self
+                .remote_host_for_instance(inst.id)
+                .is_some_and(|host| !host.os.is_windows()),
+            Some(_) => inst.tmux_session.is_some(),
+            None => false,
+        }
     }
 
     pub(super) fn close_facts(&self, iid: Uuid, cx: &App) -> CloseFacts {
@@ -142,6 +158,7 @@ impl MuxelApp {
             attributable: attributable || evidence == CloseEvidence::ShellPrompt,
             awaiting_reply,
             another_tmux_client,
+            session_may_outlive: inst.is_some_and(|inst| self.close_session_may_outlive(inst)),
             launch_id: view.map(|view| view.session().id),
             binding_rev: view.map_or(0, |view| view.session().binding_revision()),
             input_rev: view.map_or(0, |view| view.session().input_rev()),
@@ -242,7 +259,19 @@ impl MuxelApp {
                 .iter()
                 .map(|&iid| {
                     let inst = self.workspace.instance(iid).unwrap();
-                    let state = match self.close_facts(iid, cx).status {
+                    let facts = self.close_facts(iid, cx);
+                    if facts.session_may_outlive
+                        && matches!(
+                            facts.status,
+                            AgentState::Exited | AgentState::NotRunning | AgentState::Failed
+                        )
+                    {
+                        return tf(
+                            "{name}'s tmux session may still be running.",
+                            &[("name", inst.display_name())],
+                        );
+                    }
+                    let state = match facts.status {
                         AgentState::Working => t("working"),
                         AgentState::Idle | AgentState::Done => {
                             return tf(
@@ -633,7 +662,7 @@ impl MuxelApp {
                 .flat_map(|g| g.members.iter())
                 .filter_map(|&iid| {
                     self.closing.get(&iid).filter(|held| !held.forced)?;
-                    if self.close_facts(iid, cx).status == AgentState::Exited {
+                    if exit_proves_closed(self.close_facts(iid, cx)) {
                         return None;
                     }
                     self.close_tmux_site(iid)
@@ -687,8 +716,7 @@ impl MuxelApp {
                 self.workspace.instance(iid).is_none()
                     || self.closing.get(&iid).is_none_or(|held| {
                         let now = self.close_facts(iid, cx);
-                        now.status == AgentState::Exited
-                            || may_finalize(held.facts, now, held.forced)
+                        exit_proves_closed(now) || may_finalize(held.facts, now, held.forced)
                     })
             })
             .collect();
