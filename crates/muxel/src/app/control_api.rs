@@ -2110,17 +2110,23 @@ fn enter_failed(error: ControlWriteError) -> ctl::Error {
 }
 
 /// A `keys` request that stopped at press `i` of `total`. Once earlier presses
-/// went in it fails with `pasted: true`, whatever stopped this one, so its
-/// claim stays (see [`release_claim_after_result`]).
+/// went in it fails as `keys_partly_pressed` with `pasted: true`, whatever
+/// stopped this one, so its claim stays (see [`release_claim_after_result`]):
+/// a refusal's own code would say nothing was typed. A closing pane's undo
+/// deadline still applies.
 fn keys_stopped(error: ctl::Error, i: usize, total: usize) -> ctl::Error {
-    let error = ctl::Error {
-        message: format!(
-            "{}; {i} of {total} keys were pressed before it",
-            error.message
-        ),
-        ..error
-    };
-    if i > 0 { error.after_paste() } else { error }
+    let message = format!(
+        "{}; {i} of {total} keys were pressed before it",
+        error.message
+    );
+    if i == 0 {
+        return ctl::Error { message, ..error };
+    }
+    ctl::Error {
+        undo_until: error.undo_until,
+        ..ctl::Error::new(ErrorCode::KeysPartlyPressed, message)
+    }
+    .after_paste()
 }
 
 /// A failed key press, after `pressed_before` earlier presses went in. Once
@@ -2829,6 +2835,46 @@ mod prompt_submission_tests {
             later.message
         );
         assert!(!releases(later));
+    }
+
+    /// A refusal that stops keys after some went in must not keep its own
+    /// code, which promises nothing was typed. One before the first keeps it.
+    #[test]
+    fn keys_refused_after_some_went_in_are_partly_pressed() {
+        use super::keys_stopped;
+        use muxel_core::control::{Error, ErrorCode};
+        let deadline = 1_800_000_000_015;
+        let first = keys_stopped(Error::closing(deadline), 0, 3);
+        assert_eq!(first.code, Some(ErrorCode::Closing));
+        assert_eq!(first.pasted, None);
+        assert_eq!(first.undo_until, Some(deadline));
+        let later = keys_stopped(Error::closing(deadline), 2, 3);
+        assert_eq!(later.code, Some(ErrorCode::KeysPartlyPressed));
+        assert_eq!(later.pasted, Some(true));
+        assert_eq!(later.undo_until, Some(deadline));
+        assert!(
+            later
+                .message
+                .ends_with("2 of 3 keys were pressed before it")
+        );
+        for refusal in [
+            ErrorCode::Starting,
+            ErrorCode::Exited,
+            ErrorCode::InputChanged,
+        ] {
+            let later = keys_stopped(Error::new(refusal, "no").with_reason("why"), 1, 2);
+            assert_eq!(
+                later.code,
+                Some(ErrorCode::KeysPartlyPressed),
+                "{refusal:?}"
+            );
+            assert_eq!(
+                (later.reason, later.pasted),
+                (None, Some(true)),
+                "{refusal:?}"
+            );
+            assert_eq!(later.undo_until, None, "{refusal:?}");
+        }
     }
 
     /// A terminal whose ctl input goes through a fake tmux. Its agent pane is
