@@ -412,6 +412,22 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Agent status
 
+- **Program Status Protocol** — direct PTY panes answer an OSC 7501 capability
+  query before a following DA query, and Claude, Codex, Grok and Muse panes take
+  their reports as status. Working, blocked (including permission, question, or
+  auth kind), and finished states come from the agent while its root report is
+  current; a shell, opencode or Amp pane ignores reports, since anything printed
+  there can carry one. A blocked prompt on screen or in the agent's title still
+  shows **blocked** while the report says Working. A finished Codex turn also
+  reaches **done** when its submitted Working turn reports Idle; protocol `error`
+  uses the existing **done** badge with its error source retained. A Working
+  report before any prompt in the launch, such as Codex's while it resumes a
+  session, keeps a restored **done**. Clear, provider switch, shell prompt,
+  process exit, or relaunch returns an unfinished pane to its existing fallback
+  detection. Both local and remote tmux panes continue using that fallback
+  because tmux does not forward OSC 7501 reports. Once Claude has reported in a
+  launch, its glyph-less title names the pane for the rest of that launch without
+  supplying lifecycle status; a title in the current root report takes precedence.
 - **Real lifecycle badges** — each pane shows **working**, **idle**, **blocked**,
   or **done**, color-coded (blue / gray / amber / green) on the tab pill, sidebar
   icon, dashboard, and notification dots. Screen checks skip Claude's input box,
@@ -456,10 +472,13 @@ feature is added or changed, update the matching entry here in the same change**
   evidence arrives, and the Enter that picked the conversation doesn't count as
   a turn in it. During uncertainty, `ctl` treats the pane as Working: ordinary
   sends are refused and `wait` keeps waiting; `send --force` retains its override.
-  An agent that prints nothing more after the switch settles a couple of seconds
-  later, on a timer, so an idle pane accepts sends again; an old prompt or
+  If no fresh evidence arrives after the switch, a timer settles an idle pane
+  so it accepts sends again; an old prompt or
   activity row still on screen stays uncertain until it goes or a new title
   confirms it.
+  An old busy title retires after five seconds of silence when no new submission,
+  fresh title, screen marker or bell sustains it. This returns to Idle without
+  reporting a completed turn.
   A Grok conversation switch releases old loop ownership even if saving fails.
   A confirmed provider switch clears the previous conversation's automatic name,
   including a switch back to the same UUID between reads; a transcript path
@@ -846,7 +865,10 @@ feature is added or changed, update the matching entry here in the same change**
   returns the same, so a caller can `send` then `wait` without polling. An answer
   to a question counts as a turn too, so `answer` then `wait` works the same way.
 - **Refuses what would go wrong** — `send` won't type into an agent that is
-  working or waiting on a question (unless forced), `answer` only picks an option
+  working, waiting on a question, or still in the grace after a submitted control
+  turn (unless forced). It checks again at paste after the shared tmux claim settles.
+  `send`, `answer`, and `keys` also refuse a call from the target pane itself unless
+  forced. An older host ignores the caller ID. `answer` only picks an option
   the prompt actually offers, and a pane that isn't running says so rather than
   swallowing the input. Shell panes are off limits unless "Also allow typing into
   shell panes" is on too, since typing into a shell is running commands. That
@@ -867,9 +889,10 @@ feature is added or changed, update the matching entry here in the same change**
   Revocation does not stop processes
   or undo input already delivered.
   `send` waits for its delayed Enter and withholds it if local input changes or
-  the pane closes or restarts. A withheld send fails and attempts to release only
-  its own tmux claim; timeout, command failure or older tmux can leave the claim
-  in place under its existing aging rules.
+  the pane closes or restarts. A failure before a paste attempt releases only its
+  own tmux claim; after a paste attempt it keeps the claim under the normal aging
+  rules, since the prompt may have reached the agent. Timeout, command failure or
+  older tmux can also leave the claim in place.
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.
@@ -882,6 +905,13 @@ feature is added or changed, update the matching entry here in the same change**
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
   receipt confirms writer admission with `pasted: true`.
+  A send failure after a paste attempt reports `pasted: true`; a writer failure
+  may have left partial input. `working` with `reason: just_submitted` identifies
+  the prior turn's grace when the pane has a provider status or configured screen
+  marker. Activity-only panes can accept consecutive sends. `ctl help COMMAND`
+  shows command help; `-h` and `--help` after a command refuse with exit 2 so a
+  script cannot mistake help for a sent prompt. `--` before literal text keeps
+  those words as prompt text. Unknown verbs suggest a nearby command.
   Codex, Claude and Grok sends then observe fresh provider acceptance for about
   ten seconds (three more after a retry) and report `submission_confirmed` and
   `enter_retries`. Unknown acceptance is reported as false with an
@@ -975,7 +1005,11 @@ feature is added or changed, update the matching entry here in the same change**
   crashed lapses once the agent is seen to finish, or when its grace period runs
   out. `show` reports it as `controller`: which computer last typed into the agent
   this way, whether that was this muxel, and whether its turn is still open.
-  `send --force` overrides it.
+  `send --force` overrides it, publishing its marker after the paste within two
+  seconds or withholding Enter. Within one muxel, a second `send` to an agent is
+  refused until the first one's Enter is in. muxel checks once per host whether
+  its tmux can compare markers (2.6 or later); older tmux overwrites the marker
+  and reads it back instead, and leaves it to lapse rather than clearing it.
 
 ## Terminal
 

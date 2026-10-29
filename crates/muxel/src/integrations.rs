@@ -9,11 +9,12 @@ use muxel_core::accomplishments::{self, Accomplishment};
 use muxel_core::library::GitFailure;
 use muxel_core::library::resync::LocalChanges;
 use muxel_core::memory::{self, MemoryEntry};
-use muxel_core::tmux::{ServerOrigin, SessionTarget, Socket};
+use muxel_core::tmux::{ClaimWrite, ServerOrigin, SessionTarget, Socket};
 use muxel_core::{
     ACCOMPLISHMENTS_FILE, MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth,
     accomplishments_header, memory_header, remote_ops, ssh,
 };
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -2544,28 +2545,199 @@ pub fn tmux_option(loc: &RepoLoc, session: &SessionTarget, option: &str) -> Opti
         session,
         &muxel_core::tmux::show_option_args(&session.name, option),
     )?;
+    option_value(&out)
+}
+
+/// A `show-options -qv` reply's value: `None` when the option is unset or the
+/// command failed.
+fn option_value(out: &std::process::Output) -> Option<String> {
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !value.is_empty()).then_some(value)
 }
 
-/// Set a tmux session's user option (`@name`), wherever the session lives.
-pub fn set_tmux_option(
+/// How `session`'s tmux server can publish a claim. Probed once per host and
+/// remembered for this process; a probe that can't run is not remembered, and
+/// the conditional write it falls back to fails the same way an unreachable
+/// tmux always has, leaving the send unclaimed.
+pub fn tmux_claim_write(loc: &RepoLoc, session: &SessionTarget) -> ClaimWrite {
+    static HOSTS: std::sync::OnceLock<Mutex<HashMap<String, ClaimWrite>>> =
+        std::sync::OnceLock::new();
+    claim_write_cached(HOSTS.get_or_init(Default::default), tmux_host(loc), || {
+        let probe = muxel_core::tmux::match_format_probe_args(&session.name);
+        let out = tmux_at(loc, session, &probe)?;
+        out.status.success().then(|| {
+            muxel_core::tmux::claim_write_from_probe(&String::from_utf8_lossy(&out.stdout))
+        })
+    })
+}
+
+/// The machine whose tmux runs `loc`'s sessions. Local panes all use this
+/// machine's tmux; a remote one is the SSH login's.
+fn tmux_host(loc: &RepoLoc) -> String {
+    match loc {
+        RepoLoc::Local(_) => "local".into(),
+        RepoLoc::Remote(c) => format!(
+            "ssh:{}@{}:{}",
+            c.host.user,
+            c.host.hostname,
+            c.host.port.unwrap_or(22)
+        ),
+    }
+}
+
+fn claim_write_cached(
+    hosts: &Mutex<HashMap<String, ClaimWrite>>,
+    host: String,
+    probe: impl FnOnce() -> Option<ClaimWrite>,
+) -> ClaimWrite {
+    if let Some(known) = hosts.lock().unwrap_or_else(|e| e.into_inner()).get(&host) {
+        return *known;
+    }
+    // No lock across the probe: it may wait on SSH. Racing first probes of
+    // one host learn the same answer.
+    let Some(found) = probe() else {
+        return ClaimWrite::Conditional;
+    };
+    hosts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(host, found);
+    found
+}
+
+/// Publish a claim through one tmux server command, conditionally where the
+/// server can compare it with the pre-paste observation. A false `if-shell`
+/// branch exits cleanly; the caller reads the option back to learn whether its
+/// nonce won.
+pub fn set_tmux_claim(
     loc: &RepoLoc,
     session: &SessionTarget,
     option: &str,
+    write: ClaimWrite,
+    expected_pattern: Option<&str>,
     value: &str,
 ) -> Result<()> {
-    let args = muxel_core::tmux::set_option_args(&session.name, option, value);
+    let args = claim_write_args(session, option, write, expected_pattern, value)?;
     let Some(out) = tmux_at(loc, session, &args) else {
         bail!("tmux isn't reachable for session “{session}”");
     };
     if !out.status.success() {
         bail!(
-            "tmux set-option failed: {}",
+            "tmux claim set-option failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(())
+}
+
+fn claim_write_args(
+    session: &SessionTarget,
+    option: &str,
+    write: ClaimWrite,
+    expected_pattern: Option<&str>,
+    value: &str,
+) -> Result<Vec<String>> {
+    muxel_core::tmux::claim_write_args(&session.name, option, write, expected_pattern, value)
+        .ok_or_else(|| anyhow::anyhow!("can't quote the tmux claim safely"))
+}
+
+/// Publish a forced send's claim between its paste and Enter, then read it
+/// back. Both commands share one two-second deadline, as claim cleanup does,
+/// so an SSH stall withholds Enter within that bound rather than holding the
+/// pasted prompt for the connect timeout. Returns the value read back.
+pub fn publish_tmux_claim_bounded(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    write: ClaimWrite,
+    expected_pattern: Option<&str>,
+    value: &str,
+) -> Result<Option<String>> {
+    let deadline = Instant::now() + CLAIM_COMMAND_BOUND;
+    let lifecycle = GitEnv::production();
+    let args = claim_write_args(session, option, write, expected_pattern, value)?;
+    let target = BoundedTmux::find(loc, session, deadline, &lifecycle)?;
+    let show = muxel_core::tmux::show_option_args(&target.session.name, option);
+    publish_claim_until(
+        target.command(&args)?,
+        || target.command(&show),
+        deadline,
+        &lifecycle,
+    )
+}
+
+/// [`publish_tmux_claim_bounded`] for prepared commands: `read` runs only after
+/// `write` succeeds, and both stop at `deadline`.
+fn publish_claim_until(
+    write: Command,
+    read: impl FnOnce() -> Result<Command>,
+    deadline: Instant,
+    lifecycle: &GitEnv,
+) -> Result<Option<String>> {
+    run_claim_command(write, deadline, lifecycle)?;
+    let out = run_tmux_output_with(read()?, deadline, lifecycle)?;
+    Ok(option_value(&out))
+}
+
+/// Replace an unreadable or uncomparable claim only if its raw bytes have not
+/// changed. A unique temporary option holds the expected value outside the
+/// command string, where arbitrary option bytes cannot become tmux syntax.
+pub fn normalize_tmux_option_if_raw(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    raw: &str,
+    normalized: &str,
+) -> Result<()> {
+    let temp = format!("@muxel-ctl-expected-{}", uuid::Uuid::new_v4().simple());
+    let set = muxel_core::tmux::set_option_args(&session.name, &temp, raw);
+    let Some(set_out) = tmux_at(loc, session, &set) else {
+        bail!("tmux isn't reachable for session “{session}”");
+    };
+    if !set_out.status.success() {
+        bail!(
+            "tmux could not prepare claim repair: {}",
+            String::from_utf8_lossy(&set_out.stderr).trim()
+        );
+    }
+    let update =
+        muxel_core::tmux::set_option_if_option_args(&session.name, option, &temp, normalized)
+            .ok_or_else(|| anyhow::anyhow!("can't prepare conditional tmux claim repair safely"))?;
+    let updated = tmux_at(loc, session, &update);
+    let cleanup = vec![
+        "set-option".to_string(),
+        "-qu".to_string(),
+        "-t".to_string(),
+        format!("={}:", session.name),
+        temp,
+    ];
+    if tmux_at(loc, session, &cleanup).is_none_or(|out| !out.status.success()) {
+        log::warn!("muxel ctl: couldn't clean temporary claim comparison option for {session}");
+    }
+    let Some(out) = updated else {
+        bail!("tmux isn't reachable for session “{session}” during claim repair");
+    };
+    if !out.status.success() {
+        bail!(
+            "tmux conditional claim repair failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Restore the displaced claim after a pre-paste refusal with the same bounded
+/// conditional command used by claim cleanup.
+pub fn restore_tmux_option_if(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    pattern: &str,
+    value: &str,
+) -> Result<()> {
+    let args = muxel_core::tmux::set_option_if_args(&session.name, option, Some(pattern), value)
+        .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim restoration safely"))?;
+    run_bounded_tmux_claim_command(loc, session, args)
 }
 
 /// Give claim cleanup two seconds before terminating its command.
@@ -2575,26 +2747,73 @@ pub fn unset_tmux_option_if(
     option: &str,
     pattern: &str,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let lifecycle = GitEnv::production();
-    let session = profile_tmux_target(session);
     let args = muxel_core::tmux::unset_option_if_args(&session.name, option, pattern)
         .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim cleanup safely"))?;
-    let cmd = match loc {
-        RepoLoc::Local(_) => {
-            let socket = bounded_tmux_socket(&session, deadline, &lifecycle, |socket| {
+    run_bounded_tmux_claim_command(loc, session, args)
+}
+
+/// How long a claim command may run where it can hold up typing: cleanup and
+/// restore after a send, and a forced send's publish between paste and Enter.
+const CLAIM_COMMAND_BOUND: Duration = Duration::from_secs(2);
+
+fn run_bounded_tmux_claim_command(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    args: Vec<String>,
+) -> Result<()> {
+    let deadline = Instant::now() + CLAIM_COMMAND_BOUND;
+    let lifecycle = GitEnv::production();
+    let cmd = BoundedTmux::find(loc, session, deadline, &lifecycle)?.command(&args)?;
+    run_claim_command(cmd, deadline, &lifecycle)
+}
+
+/// Where bounded claim commands run: a local socket found within the
+/// deadline, or the session's SSH host.
+struct BoundedTmux<'a> {
+    loc: &'a RepoLoc,
+    session: SessionTarget,
+    socket: Option<Socket>,
+}
+
+impl<'a> BoundedTmux<'a> {
+    fn find(
+        loc: &'a RepoLoc,
+        session: &SessionTarget,
+        deadline: Instant,
+        lifecycle: &GitEnv,
+    ) -> Result<Self> {
+        let session = profile_tmux_target(session);
+        let socket = match loc {
+            RepoLoc::Local(_) => Some(bounded_tmux_socket(
+                &session,
+                deadline,
+                lifecycle,
+                |socket| {
+                    let mut cmd = tmux_on(socket);
+                    cmd.args(muxel_core::tmux::has_session_args(&session.name));
+                    cmd
+                },
+            )?),
+            RepoLoc::Remote(_) => None,
+        };
+        Ok(Self {
+            loc,
+            session,
+            socket,
+        })
+    }
+
+    fn command(&self, args: &[String]) -> Result<Command> {
+        match &self.socket {
+            Some(socket) => {
                 let mut cmd = tmux_on(socket);
-                cmd.args(muxel_core::tmux::has_session_args(&session.name));
-                cmd
-            })?;
-            let mut cmd = tmux_on(socket);
-            cmd.args(args);
-            cmd
+                cmd.args(args);
+                Ok(cmd)
+            }
+            None => tmux_command_at(self.loc, &self.session, args)
+                .ok_or_else(|| anyhow::anyhow!("tmux is unavailable")),
         }
-        RepoLoc::Remote(_) => tmux_command_at(loc, &session, &args)
-            .ok_or_else(|| anyhow::anyhow!("tmux is unavailable"))?,
-    };
-    run_claim_cleanup(cmd, deadline, &lifecycle)
+    }
 }
 
 fn bounded_tmux_socket(
@@ -2613,11 +2832,11 @@ fn bounded_tmux_socket(
     })
 }
 
-fn run_claim_cleanup(cmd: Command, deadline: Instant, lifecycle: &GitEnv) -> Result<()> {
+fn run_claim_command(cmd: Command, deadline: Instant, lifecycle: &GitEnv) -> Result<()> {
     match run_tmux_until(cmd, deadline, lifecycle)? {
         Some(status) if status.success() => Ok(()),
-        Some(status) => bail!("tmux claim cleanup failed: {status}"),
-        None => bail!("tmux claim cleanup timed out"),
+        Some(status) => bail!("tmux claim command failed: {status}"),
+        None => bail!("tmux claim command timed out"),
     }
 }
 
@@ -3945,7 +4164,7 @@ mod tests {
     fn claim_cleanup_stops_a_command_that_does_not_finish() {
         let lifecycle = GitEnv::for_tests();
         let started = Instant::now();
-        let err = run_claim_cleanup(
+        let err = run_claim_command(
             hanging_tmux_command(),
             started + Duration::from_millis(50),
             &lifecycle,
@@ -3954,6 +4173,120 @@ mod tests {
         assert!(err.to_string().contains("timed out"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_one_tmux_child_reaped(&lifecycle);
+    }
+
+    fn shell_command(script: &str) -> Command {
+        if cfg!(windows) {
+            let mut cmd = command("cmd.exe");
+            cmd.args(["/D", "/C", script]);
+            cmd
+        } else {
+            let mut cmd = command("/bin/sh");
+            cmd.args(["-c", script]);
+            cmd
+        }
+    }
+
+    #[test]
+    fn forced_claim_publish_and_readback_share_one_deadline() {
+        // A stalled write stops at the deadline and the readback never runs.
+        let lifecycle = GitEnv::for_tests();
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        let err = publish_claim_until(
+            hanging_tmux_command(),
+            || Ok(shell_command("echo never")),
+            deadline,
+            &lifecycle,
+        )
+        .expect_err("a stalled publish must not hold the prompt");
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_one_tmux_child_reaped(&lifecycle);
+
+        // The readback gets only what is left of the same deadline.
+        let lifecycle = GitEnv::for_tests();
+        let started = Instant::now();
+        let err = publish_claim_until(
+            shell_command("exit 0"),
+            || Ok(hanging_tmux_command()),
+            started + Duration::from_secs(1),
+            &lifecycle,
+        )
+        .expect_err("a stalled readback must not hold the prompt");
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(lifecycle.spawned.load(Ordering::SeqCst), 2);
+
+        let lifecycle = GitEnv::for_tests();
+        let read = publish_claim_until(
+            shell_command("exit 0"),
+            || Ok(shell_command("echo v1-claim")),
+            Instant::now() + Duration::from_secs(10),
+            &lifecycle,
+        )
+        .unwrap();
+        assert_eq!(read.as_deref(), Some("v1-claim"));
+    }
+
+    #[test]
+    fn claim_write_is_probed_once_per_host_and_an_unanswered_probe_is_retried() {
+        let hosts = Mutex::new(HashMap::new());
+        let probes = std::cell::Cell::new(0);
+        let probe = |answer: Option<ClaimWrite>| {
+            probes.set(probes.get() + 1);
+            answer
+        };
+        // Unreachable tmux: try conditionally now, and probe again next time.
+        assert_eq!(
+            claim_write_cached(&hosts, "ssh:old".into(), || probe(None)),
+            ClaimWrite::Conditional
+        );
+        assert_eq!(
+            claim_write_cached(&hosts, "ssh:old".into(), || probe(Some(
+                ClaimWrite::Unconditional
+            ))),
+            ClaimWrite::Unconditional
+        );
+        assert_eq!(
+            claim_write_cached(&hosts, "ssh:old".into(), || probe(Some(
+                ClaimWrite::Conditional
+            ))),
+            ClaimWrite::Unconditional,
+            "a host's answer is remembered"
+        );
+        assert_eq!(probes.get(), 2);
+        assert_eq!(
+            claim_write_cached(&hosts, "local".into(), || probe(Some(
+                ClaimWrite::Conditional
+            ))),
+            ClaimWrite::Conditional
+        );
+        assert_eq!(probes.get(), 3);
+    }
+
+    #[test]
+    fn claim_probes_are_keyed_by_the_tmux_host() {
+        let remote = |user: &str, hostname: &str, port| {
+            let mut host = RemoteHost::new("label", hostname);
+            host.user = user.into();
+            host.port = port;
+            RepoLoc::remote(host, "/srv".into(), "/tmp/cm".into(), None)
+        };
+        assert_eq!(tmux_host(&RepoLoc::Local("/a".into())), "local");
+        assert_eq!(tmux_host(&RepoLoc::Local("/b".into())), "local");
+        assert_eq!(
+            tmux_host(&remote("me", "box", None)),
+            tmux_host(&remote("me", "box", Some(22)))
+        );
+        assert_ne!(
+            tmux_host(&remote("me", "box", None)),
+            tmux_host(&remote("you", "box", None))
+        );
+        assert_ne!(
+            tmux_host(&remote("me", "box", None)),
+            tmux_host(&remote("me", "box", Some(2222)))
+        );
     }
 
     #[test]

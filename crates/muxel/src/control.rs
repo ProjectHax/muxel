@@ -46,6 +46,7 @@ const NOT_RUNNING: &str = "muxel isn't running, or outside control is off: open 
 /// A request on its way to the app, with where its reply goes.
 pub struct Incoming {
     pub command: Command,
+    pub caller_instance_id: Option<Uuid>,
     pub reply: std::sync::mpsc::Sender<Response>,
 }
 
@@ -184,6 +185,7 @@ fn dispatch(request: Request, token: &str, tx: &async_channel::Sender<Incoming>)
     let (reply, answer) = std::sync::mpsc::channel();
     let incoming = Incoming {
         command: request.command,
+        caller_instance_id: request.caller_instance_id,
         reply,
     };
     if tx.send_blocking(incoming).is_err() {
@@ -235,8 +237,13 @@ pub fn run_cli(args: &[String]) -> i32 {
         Err(error) => return fail(error.into(), 2),
     };
     let result = match command {
-        CliCommand::Help => {
-            emit(control::USAGE);
+        CliCommand::Help(command) => {
+            emit(
+                command
+                    .as_deref()
+                    .and_then(control::command_help)
+                    .unwrap_or(control::USAGE),
+            );
             return 0;
         }
         CliCommand::Skill => {
@@ -339,12 +346,14 @@ pub fn attach_parent_console() {
 }
 
 fn fail(error: control::Error, status: i32) -> i32 {
-    let reply = match error.code {
-        Some(code) => json!({ "ok": false, "code": code, "error": error.message }),
-        None => json!({ "ok": false, "error": error.message }),
-    };
-    emit(&with_host(reply).to_string());
+    emit(&failure_body(error).to_string());
     status
+}
+
+fn failure_body(error: control::Error) -> Value {
+    let reply = serde_json::to_value(control::Response::err(error))
+        .expect("control errors have a JSON representation");
+    with_host(reply)
 }
 
 /// Print one reply. A reader that stops early (`muxel ctl panes | head`, `grep
@@ -559,6 +568,9 @@ fn request_at(path: &Path, command: Command) -> Result<Value, control::Error> {
     let mut line = serde_json::to_string(&Request {
         version: control::request_version(&command),
         token: endpoint.token,
+        caller_instance_id: std::env::var(control::INSTANCE_ID_ENV)
+            .ok()
+            .and_then(|id| id.parse().ok()),
         command,
     })
     .map_err(|e| e.to_string())?;
@@ -621,7 +633,7 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
 #[cfg(test)]
 mod tests {
     use super::{
-        Server, dispatch, process_alive, read_endpoint, request_at, same_secret,
+        Server, dispatch, failure_body, process_alive, read_endpoint, request_at, same_secret,
         wait_creation_with, write_endpoint,
     };
     use muxel_core::control::{self, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response};
@@ -633,6 +645,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("muxel-ctl-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn cli_failure_body_keeps_reason_and_pasted() {
+        let busy = failure_body(
+            control::Error::new(ErrorCode::Working, "prior turn is open")
+                .with_reason("just_submitted"),
+        );
+        assert_eq!(busy["ok"], false);
+        assert_eq!(busy["code"], "working");
+        assert_eq!(busy["reason"], "just_submitted");
+        assert!(busy.get("pasted").is_none());
+        assert!(busy["host"].is_string());
+
+        let pasted = failure_body(
+            control::Error::new(ErrorCode::InputChanged, "Enter withheld").after_paste(),
+        );
+        assert_eq!(pasted["pasted"], true);
+        assert_eq!(pasted["error"], "Enter withheld");
+    }
+
+    #[test]
+    fn trailing_help_flag_is_a_cli_refusal() {
+        let args = ["send", "agent", "prompt", "-h"].map(str::to_string);
+        assert_eq!(super::run_cli(&args), 2);
     }
 
     #[test]
@@ -812,6 +849,7 @@ mod tests {
             let request = control::Request {
                 version: control::request_version(&command),
                 token: "test".into(),
+                caller_instance_id: None,
                 command,
             };
             assert_eq!(
