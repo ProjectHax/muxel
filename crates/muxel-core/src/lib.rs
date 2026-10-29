@@ -4391,6 +4391,68 @@ mod remote_layout_tests {
     }
 
     #[test]
+    fn a_held_close_lands_on_top_of_peer_edits_adopted_while_it_was_held() {
+        // Both machines show shells A and H (rev 100). This one closes H, which
+        // counts down with H still in the shared document.
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let a = Instance::shell(proj.id);
+        let held = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::leaf(a.id));
+        assert!(pane::add_tab(&mut proj.layout, a.id, held.id));
+        proj.layout_updated_at = Some(100);
+        ws.instances = vec![a.clone(), held.clone()];
+        ws.projects = vec![proj.clone()];
+        let base = RemoteLayout::capture(&proj, &ws, 100);
+        let base_key = base.content_key();
+
+        // Meanwhile the peer renames A (rev 200). The live poll still runs, and
+        // this machine's document is unchanged by the hold: it adopts the rename.
+        let mut peer = base.clone();
+        peer.instances
+            .iter_mut()
+            .find(|i| i.id == a.id)
+            .unwrap()
+            .custom_name = Some("Reviewer".into());
+        peer.updated_at = 200;
+        let peer_key = peer.content_key();
+        assert_eq!(
+            peer_layout_action(&peer_key, 200, Some(&base_key), &base_key, 100),
+            PeerLayoutAction::Adopt
+        );
+
+        // The close becomes final at 300, an edit on top of the adopted layout.
+        let mut adopted = peer.clone();
+        assert!(pane::remove(&mut adopted.layout, held.id));
+        adopted.instances.retain(|i| i.id != held.id);
+        adopted.updated_at = 300;
+        assert!(!push_overwrites_peer(
+            &peer,
+            Some(&peer_key),
+            &adopted.content_key(),
+            300
+        ));
+        assert_eq!(
+            adopted.instances[0].custom_name.as_deref(),
+            Some("Reviewer"),
+            "the pushed close keeps the peer's rename"
+        );
+
+        // Frozen for the hold, this machine never saw the rename. Its close, newer
+        // than the peer's write, went out over it and undid the rename everywhere.
+        let mut frozen = base.clone();
+        assert!(pane::remove(&mut frozen.layout, held.id));
+        frozen.instances.retain(|i| i.id != held.id);
+        assert!(!push_overwrites_peer(
+            &peer,
+            Some(&base_key),
+            &frozen.content_key(),
+            300
+        ));
+        assert_eq!(frozen.instances[0].custom_name, None);
+    }
+
+    #[test]
     fn unseen_peer_panes_are_the_peers_new_ones_not_this_machines_closes() {
         // Both machines show shells A and B (rev 100).
         let mut ws = Workspace::default();

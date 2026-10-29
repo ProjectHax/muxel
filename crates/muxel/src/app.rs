@@ -9729,7 +9729,6 @@ impl MuxelApp {
             // callback can resolve newer-wins before spawning panes.
             let loc = if first_sync { self.repo_loc(pid) } else { None };
             let host_for_err = host.clone();
-            let layout_epoch = self.layout_push_epoch.get(&pid).copied().unwrap_or(0);
             cx.spawn(async move |this, cx| {
                 let (res, fetched, sessions, has_memory) = cx
                     .background_executor()
@@ -9782,11 +9781,7 @@ impl MuxelApp {
                                 String::new(),
                             );
                         }
-                        if first_sync
-                            && !this.project_has_closes(pid)
-                            && this.layout_push_epoch.get(&pid).copied().unwrap_or(0)
-                                == layout_epoch
-                        {
+                        if first_sync {
                             this.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
                             // After the sync, so a session the layout accounts for is
                             // not adopted a second time.
@@ -12715,8 +12710,7 @@ impl MuxelApp {
                     // machine's own previous write. Taken for a peer's, it would be
                     // adopted over the push — a pane just closed here coming straight
                     // back. The next poll reads the file as it is now.
-                    if this.project_has_closes(pid)
-                        || this.remote_push_inflight.contains(&pid)
+                    if this.remote_push_inflight.contains(&pid)
                         || this.layout_push_epoch.get(&pid).copied().unwrap_or(0) != epoch
                     {
                         continue;
@@ -12739,9 +12733,6 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.project_has_closes(pid) {
-            return;
-        }
         let Some(proj) = self.workspace.project(pid) else {
             return;
         };
@@ -12753,8 +12744,11 @@ impl MuxelApp {
             return;
         };
         let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        let local_key = RemoteLayout::capture(proj, &self.workspace, now_epoch).content_key();
         let local_rev = proj.layout_updated_at.unwrap_or(0);
+        let Some(local) = self.sync_capture(pid, now_epoch) else {
+            return;
+        };
+        let local_key = local.content_key();
         let remote_key = remote.content_key();
         match muxel_core::peer_layout_action(
             &remote_key,
@@ -12783,9 +12777,9 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.project_has_closes(pid) {
-            return;
-        }
+        // A held pane is still in the shared document: the peer's layout
+        // places it, or drops it if the peer closed it.
+        self.show_held_panes(pid);
         let Some(project) = self.workspace.project(pid) else {
             return;
         };
@@ -12857,6 +12851,7 @@ impl MuxelApp {
             }
         }
         self.seed_adopted_layout(pid, remote_key);
+        self.rehide_held_panes(pid);
         if self.active_instance.is_some_and(|a| closed.contains(&a)) {
             self.active_instance = self
                 .workspace
@@ -12894,10 +12889,9 @@ impl MuxelApp {
     /// very pane that was just bound), and the push would snap that pane back.
     fn seed_adopted_layout(&mut self, pid: Uuid, remote_key: String) {
         let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        let Some(p) = self.workspace.project(pid) else {
+        let Some(doc) = self.sync_capture(pid, now_epoch) else {
             return;
         };
-        let doc = RemoteLayout::capture(p, &self.workspace, now_epoch);
         let key = doc.content_key();
         self.remote_push_due.remove(&pid);
         if key != remote_key {
@@ -17156,9 +17150,6 @@ impl MuxelApp {
     /// sessions a peer can attach to over SSH). Without tmux a local project has no
     /// attachable sessions, so there's nothing to share.
     fn project_syncs_layout(&self, pid: Uuid) -> bool {
-        if self.project_has_closes(pid) {
-            return false;
-        }
         self.workspace
             .project(pid)
             .is_some_and(|p| p.remote.is_some() || self.use_tmux)
@@ -17330,9 +17321,8 @@ impl MuxelApp {
         if !self.remote_synced.contains(&pid) || !self.project_syncs_layout(pid) {
             return None;
         }
-        let project = self.workspace.project(pid)?;
         // `updated_at` is not part of the edit key, so any `now` does.
-        let edit = RemoteLayout::capture(project, &self.workspace, 0).edit_key();
+        let edit = self.sync_capture(pid, 0)?.edit_key();
         (self.layout_edit_keys.get(&pid) == Some(&edit)).then_some(pid)
     }
 
@@ -17346,11 +17336,10 @@ impl MuxelApp {
         project.layout_updated_at = Some(muxel_core::observed_close_revision(
             project.layout_updated_at,
         ));
-        let Some(project) = self.workspace.project(pid) else {
+        let Some(doc) = self.sync_capture(pid, 0) else {
             return;
         };
-        let edit = RemoteLayout::capture(project, &self.workspace, 0).edit_key();
-        self.layout_edit_keys.insert(pid, edit);
+        self.layout_edit_keys.insert(pid, doc.edit_key());
         self.persist();
     }
 
@@ -17370,10 +17359,12 @@ impl MuxelApp {
             if !self.project_syncs_layout(pid) {
                 continue;
             }
-            let Some(proj) = self.workspace.project(pid) else {
+            // Held panes stay in the document until their close is final, so a
+            // hold or its Undo is no edit. The final close is one, made now on
+            // top of every peer layout adopted meanwhile.
+            let Some(doc) = self.sync_capture(pid, now_epoch) else {
                 continue;
             };
-            let doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
             let key = doc.content_key();
             if self.layout_keys.get(&pid) != Some(&key) {
                 self.layout_keys.insert(pid, key);
@@ -17447,7 +17438,9 @@ impl MuxelApp {
         };
         let name = proj.name.clone();
         let local_rev = proj.layout_updated_at.unwrap_or(0);
-        let mut doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
+        let Some(mut doc) = self.sync_capture(pid, now_epoch) else {
+            return;
+        };
         let key = doc.content_key();
         let synced = self.layout_synced_keys.get(&pid).cloned();
         // The file already holds this layout, as far as this machine knows.
@@ -17456,7 +17449,6 @@ impl MuxelApp {
         }
         self.remote_push_inflight.insert(pid);
         *self.layout_push_epoch.entry(pid).or_default() += 1;
-        let push_epoch = self.layout_push_epoch[&pid];
         cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -17489,11 +17481,6 @@ impl MuxelApp {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.remote_push_inflight.remove(&pid);
-                if this.project_has_closes(pid)
-                    || this.layout_push_epoch.get(&pid).copied().unwrap_or(0) != push_epoch
-                {
-                    return;
-                }
                 match res {
                     Ok(Pushed::Written(key, moved)) => {
                         this.remember_layout_synced(pid, key);
@@ -17562,7 +17549,9 @@ impl MuxelApp {
         };
         let name = project.name.clone();
         let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        let local = RemoteLayout::capture(project, &self.workspace, now_epoch);
+        let Some(local) = self.sync_capture(pid, now_epoch) else {
+            return;
+        };
         let unseen = muxel_core::unseen_peer_panes(
             &file,
             self.layout_synced_keys.get(&pid).map(String::as_str),
@@ -17659,9 +17648,6 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.project_has_closes(pid) {
-            return;
-        }
         self.remote_synced.insert(pid);
         let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
         let Some(proj) = self.workspace.project(pid) else {
@@ -17673,12 +17659,14 @@ impl MuxelApp {
             Some(r) => r.remote_root.clone(),
             None => proj.root_path.display().to_string(),
         };
-        let local = RemoteLayout::capture(proj, &self.workspace, now_epoch);
-        let local_key = local.content_key();
-        let local_edit = local.edit_key();
         let local_rev = proj.layout_updated_at.unwrap_or(0);
         // The doc as this machine last wrote or adopted it, by fingerprint.
         let synced = proj.layout_synced.clone();
+        let Some(local) = self.sync_capture(pid, now_epoch) else {
+            return;
+        };
+        let local_key = local.content_key();
+        let local_edit = local.edit_key();
         let remote = fetched
             .as_deref()
             .and_then(|j| RemoteLayout::parse(j, &layout_root));
@@ -17749,10 +17737,9 @@ impl MuxelApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.project_has_closes(pid) {
-            return;
-        }
         self.backup_local_layout(pid, &local, remote.updated_at);
+        // Held panes are replaced with the rest, then hidden again.
+        self.show_held_panes(pid);
         let remote_key = remote.content_key();
 
         // Light teardown: drop the local views (kill the ssh client / local PTY),
@@ -17817,6 +17804,7 @@ impl MuxelApp {
             p.layout_updated_at = Some(updated_at);
         }
         self.seed_adopted_layout(pid, remote_key);
+        self.rehide_held_panes(pid);
         self.active_instance = self
             .workspace
             .project(pid)

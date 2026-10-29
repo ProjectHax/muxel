@@ -386,6 +386,24 @@ mod tests {
     }
 
     #[test]
+    fn held_pane_comes_back_where_an_adopted_peer_layout_put_it() {
+        // While 2 was held, a peer moved it into its own split below 3.
+        let adopted = Some(branch(
+            SplitDirection::Horizontal,
+            vec![
+                leaf(&[1], 0),
+                branch(SplitDirection::Vertical, vec![leaf(&[3], 0), leaf(&[2], 0)]),
+            ],
+        ));
+        let mut current = adopted.clone();
+        let gone = muxel_core::recoverable_close::rehide_held(&mut current, &[id(2)]);
+        assert!(gone.is_empty());
+        assert!(current.as_ref().unwrap().find_path(id(2)).is_none());
+        restore_layout(&mut current, &adopted, &HashSet::from([id(2)]));
+        assert_same(&current, &adopted);
+    }
+
+    #[test]
     fn separate_groups_restore_flat_split_sizes_in_either_order() {
         let original = Some(branch(
             SplitDirection::Horizontal,

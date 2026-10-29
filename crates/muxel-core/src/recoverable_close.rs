@@ -1,7 +1,7 @@
 //! Pure close admission and expiry checks. The app supplies current launch facts.
 
-use crate::TerminalLaunchReason;
 use crate::control::AgentState;
+use crate::{PaneNode, TerminalLaunchReason, remove};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,14 +161,35 @@ pub fn undo_launch(held: HeldLaunch, view: HeldView) -> UndoLaunch {
     }
 }
 
+/// After a peer layout was adopted over the durable layout (`layout`, with the
+/// held panes in it): take the held panes it still lists out again, keeping it
+/// as their place to come back to. Returns the held panes it no longer lists.
+/// The peer closed those, so the adoption already dropped them here.
+pub fn rehide_held(layout: &mut Option<PaneNode>, held: &[Uuid]) -> Vec<Uuid> {
+    let listed = layout
+        .as_ref()
+        .map(PaneNode::collect_instances)
+        .unwrap_or_default();
+    let mut gone = Vec::new();
+    for &iid in held {
+        if listed.contains(&iid) {
+            remove(layout, iid);
+        } else {
+            gone.push(iid);
+        }
+    }
+    gone
+}
+
 #[cfg(test)]
 mod recoverable_close_policy_tests {
     use super::{
         CloseDecision, CloseEvidence, CloseFacts, HeldLaunch, HeldView, UndoLaunch, decide,
-        exit_proves_closed, held_launch, may_finalize, shell_close_evidence, undo_launch,
+        exit_proves_closed, held_launch, may_finalize, rehide_held, shell_close_evidence,
+        undo_launch,
     };
-    use crate::TerminalLaunchReason;
     use crate::control::AgentState;
+    use crate::{PaneNode, SplitDirection, TerminalLaunchReason, split};
     use uuid::Uuid;
 
     fn quiet() -> CloseFacts {
@@ -539,5 +560,21 @@ mod recoverable_close_policy_tests {
             ..now
         };
         assert!(exit_proves_closed(direct));
+    }
+
+    #[test]
+    fn adopted_layout_keeps_held_panes_hidden_at_their_new_place() {
+        let id = Uuid::from_u128;
+        // A peer moved pane 2 and split 3 off it while 2 was held here.
+        let mut adopted = Some(PaneNode::leaf(id(1)));
+        split(&mut adopted, id(1), SplitDirection::Vertical, id(2));
+        split(&mut adopted, id(2), SplitDirection::Horizontal, id(3));
+        let durable = adopted.clone();
+        let gone = rehide_held(&mut adopted, &[id(2), id(4)]);
+        // Pane 4 is no longer listed: the peer closed it.
+        assert_eq!(gone, vec![id(4)]);
+        let shown = adopted.as_ref().unwrap().collect_instances();
+        assert_eq!(shown, vec![id(1), id(3)]);
+        assert!(durable.unwrap().find_path(id(2)).is_some());
     }
 }

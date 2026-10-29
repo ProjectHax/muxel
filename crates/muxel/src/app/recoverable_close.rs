@@ -4,9 +4,10 @@ use super::*;
 use muxel_core::control::AgentState;
 use muxel_core::recoverable_close::{
     CloseDecision, CloseEvidence, CloseFacts, HeldLaunch, HeldView, UndoLaunch, decide,
-    exit_proves_closed, held_launch, may_finalize, shell_close_evidence, undo_launch,
+    exit_proves_closed, held_launch, may_finalize, rehide_held, shell_close_evidence, undo_launch,
 };
 use muxel_terminal::TerminalStatusReason;
+use std::borrow::Cow;
 
 pub(super) const CLOSE_GRACE: Duration = Duration::from_secs(15);
 
@@ -416,9 +417,6 @@ impl MuxelApp {
             self.terminal_restarts.cancel(iid);
             self.terminal_launching.remove(&iid);
             self.bump_session_binding_generation(iid);
-            if let Some(held) = self.closing.get(&iid) {
-                *self.layout_push_epoch.entry(held.project).or_default() += 1;
-            }
             self.clear_notifications_for(iid);
             self.readings.queue.retain(|&queued| queued != iid);
             self.stop_reading(iid, cx);
@@ -470,20 +468,103 @@ impl MuxelApp {
 
     pub(super) fn workspace_with_closes_restored(&self) -> Workspace {
         let mut workspace = self.workspace.clone();
+        for project in &mut workspace.projects {
+            self.restore_held_layout(project.id, &mut project.layout);
+        }
+        workspace
+    }
+
+    /// Put every held pane of project `pid` back into `layout`, where the
+    /// durable document keeps it until its close is final.
+    fn restore_held_layout(&self, pid: Uuid, layout: &mut Option<PaneNode>) {
         for group in self.close_groups.iter().rev() {
+            let Some(original) = group.layouts.get(&pid) else {
+                continue;
+            };
             let ids: HashSet<_> = group
                 .members
                 .iter()
-                .filter(|iid| self.closing.contains_key(iid) && workspace.instance(**iid).is_some())
+                .filter(|iid| {
+                    self.closing.contains_key(iid) && self.workspace.instance(**iid).is_some()
+                })
                 .copied()
                 .collect();
-            for (&pid, original) in &group.layouts {
-                if let Some(project) = workspace.project_mut(pid) {
-                    recoverable_layout::restore_layout(&mut project.layout, original, &ids);
-                }
+            recoverable_layout::restore_layout(layout, original, &ids);
+        }
+    }
+
+    /// The project as the saved and shared documents hold it: a held pane is
+    /// still in its place until its close is final, so nothing a peer sees
+    /// changes while it can be undone.
+    pub(super) fn durable_project(&self, pid: Uuid) -> Option<Cow<'_, Project>> {
+        let project = self.workspace.project(pid)?;
+        if !self.project_has_closes(pid) {
+            return Some(Cow::Borrowed(project));
+        }
+        let mut project = project.clone();
+        self.restore_held_layout(pid, &mut project.layout);
+        Some(Cow::Owned(project))
+    }
+
+    /// The layout document layout sync compares and pushes for `pid`.
+    pub(super) fn sync_capture(&self, pid: Uuid, now: u64) -> Option<RemoteLayout> {
+        let project = self.durable_project(pid)?;
+        Some(RemoteLayout::capture(&project, &self.workspace, now))
+    }
+
+    fn held_in_project(&self, pid: Uuid) -> Vec<Uuid> {
+        self.close_groups
+            .iter()
+            .flat_map(|group| &group.members)
+            .copied()
+            .filter(|iid| {
+                self.closing
+                    .get(iid)
+                    .is_some_and(|held| held.project == pid)
+            })
+            .collect()
+    }
+
+    /// Before a peer layout is adopted over project `pid`: show its held panes
+    /// in the layout, still held, so the adoption treats them as the panes the
+    /// shared document lists. [`Self::rehide_held_panes`] hides them again.
+    pub(super) fn show_held_panes(&mut self, pid: Uuid) {
+        let Some(layout) = self
+            .durable_project(pid)
+            .map(|project| project.layout.clone())
+        else {
+            return;
+        };
+        if let Some(project) = self.workspace.project_mut(pid) {
+            project.layout = layout;
+        }
+    }
+
+    /// After an adoption: hide the held panes the adopted layout still lists,
+    /// and make it their place to come back to. A held pane it dropped was
+    /// closed by the peer, and the adoption already dropped it here too.
+    pub(super) fn rehide_held_panes(&mut self, pid: Uuid) {
+        let held = self.held_in_project(pid);
+        if held.is_empty() {
+            return;
+        }
+        let Some(project) = self.workspace.project_mut(pid) else {
+            return;
+        };
+        let durable = project.layout.clone();
+        let gone = rehide_held(&mut project.layout, &held);
+        for group in &mut self.close_groups {
+            if let Some(original) = group.layouts.get_mut(&pid) {
+                *original = durable.clone();
             }
         }
-        workspace
+        for iid in gone {
+            muxel_store::append_event_log(&format!("close: a peer closed held pane [{iid}]"));
+            self.forget_close(iid);
+        }
+        if self.active_instance.is_some_and(|iid| self.is_closing(iid)) {
+            self.active_instance = self.workspace.active().and_then(Project::first_instance);
+        }
     }
 
     pub(super) fn undo_close(&mut self, gid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
