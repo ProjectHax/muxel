@@ -1401,7 +1401,13 @@ feature is added or changed, update the matching entry here in the same change**
   kept as a one-level backup on each side. A machine coming back after changing
   nothing takes the host's copy whenever it differs from the one it last saw, so
   its old copy never overwrites what other machines recorded meanwhile — which
-  conversation each pane is in, which tmux server its session runs on. Automatic
+  conversation each pane is in, which tmux server its session runs on. A machine
+  waking from sleep that finds a pane's session ended (another machine closed it)
+  closes the pane without counting that as a newer change, so it takes the host's
+  layout instead of pushing its old one over panes opened meanwhile. When both
+  machines changed the layout while apart, the newer change wins, but panes the
+  other machine opened in the meantime are kept, attached to their running agents,
+  rather than dropped. Automatic
   for every remote project; no setup required. **Changes sync live**: while connected, each side re-reads the
   shared file every few seconds and applies a peer's changes in place — panes a peer
   adds appear, attached to their running tmux sessions; panes it closes go away;

@@ -13618,10 +13618,14 @@ impl MuxelApp {
                 tf("{title}: closed on exit", &[("title", &title)]),
                 t("The process exited cleanly.").to_string(),
             );
+            let session_end = self.session_end_close(iid);
             // Closing a pane tears its tmux session down too (a *dropped* SSH
             // connection exits abnormally and tombstones instead, staying
             // reconnectable).
             self.close_instance_inner(iid, "auto-close (exit)", cx); // re-renders on its own
+            if let Some(pid) = session_end {
+                self.stamp_session_end_close(pid);
+            }
         }
 
         for iid in to_read_aloud {
@@ -17163,6 +17167,46 @@ impl MuxelApp {
         .detach();
     }
 
+    /// The layout-synced project of a tmux pane about to close on a clean exit, when
+    /// that close should be stamped as its session ending rather than as an edit
+    /// ([`Self::stamp_session_end_close`]). A tmux client exits cleanly when its
+    /// session ends (a peer closed the pane, or the program in it quit), which every
+    /// machine showing the pane sees for itself.
+    ///
+    /// Not while an edit made here since the last tick is still waiting for its
+    /// revision: the close is then stamped with it, as before, so that edit keeps a
+    /// revision of its own.
+    fn session_end_close(&self, iid: Uuid) -> Option<Uuid> {
+        let instance = self.workspace.instance(iid)?;
+        InstanceTmux::capture(instance)?.recorded_session?;
+        let pid = instance.project_id;
+        if !self.remote_synced.contains(&pid) || !self.project_syncs_layout(pid) {
+            return None;
+        }
+        let project = self.workspace.project(pid)?;
+        // `updated_at` is not part of the edit key, so any `now` does.
+        let edit = RemoteLayout::capture(project, &self.workspace, 0).edit_key();
+        (self.layout_edit_keys.get(&pid) == Some(&edit)).then_some(pid)
+    }
+
+    /// Record a session-end close ([`Self::session_end_close`]) under
+    /// [`muxel_core::observed_close_revision`] instead of letting the sync tick stamp
+    /// it as an edit made now. It is still pushed, as a content change.
+    fn stamp_session_end_close(&mut self, pid: Uuid) {
+        let Some(project) = self.workspace.project_mut(pid) else {
+            return;
+        };
+        project.layout_updated_at = Some(muxel_core::observed_close_revision(
+            project.layout_updated_at,
+        ));
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
+        let edit = RemoteLayout::capture(project, &self.workspace, 0).edit_key();
+        self.layout_edit_keys.insert(pid, edit);
+        self.persist();
+    }
+
     /// Remote-layout sync heartbeat, driven from `tick()`. For every remote project
     /// already reconciled this session, detect a real layout change (by content,
     /// ignoring timestamps), stamp a new version if it is an edit, and schedule a
@@ -17234,6 +17278,9 @@ impl MuxelApp {
             Written(String, Vec<(Uuid, String)>),
             /// The file holds a peer's newer layout (its JSON), left in place.
             PeerAhead(String),
+            /// The file holds panes a peer opened that this machine never had (its
+            /// JSON), left in place until they are taken in.
+            Unseen(String),
         }
         if !self.project_syncs_layout(pid) {
             return;
@@ -17278,6 +17325,12 @@ impl MuxelApp {
                         ) {
                             return Ok(Pushed::PeerAhead(current));
                         }
+                        // This machine's change is newer, but writing it would drop
+                        // panes a peer opened meanwhile, never closed anywhere.
+                        if !muxel_core::unseen_peer_panes(&file, synced.as_deref(), &doc).is_empty()
+                        {
+                            return Ok(Pushed::Unseen(current));
+                        }
                         // Overwriting the file must not move a pane back onto Default.
                         moved =
                             muxel_core::keep_moves_off_default(&mut doc.instances, &file.instances);
@@ -17301,6 +17354,10 @@ impl MuxelApp {
                         this.remote_push_due
                             .entry(pid)
                             .or_insert_with(|| Instant::now() + Duration::from_secs(1));
+                    }
+                    // Taking them in is an edit, which the sync tick pushes again.
+                    Ok(Pushed::Unseen(current)) => {
+                        this.take_unseen_peer_panes(pid, &current, window, cx);
                     }
                     Err(e) => {
                         // Retry quietly: a peer must eventually see this layout even
@@ -17326,6 +17383,72 @@ impl MuxelApp {
             });
         })
         .detach();
+    }
+
+    /// Before a newer local layout is written over the shared file (`json`), add the
+    /// panes a peer opened there that this machine never had
+    /// ([`muxel_core::unseen_peer_panes`]), attached to their running sessions. The
+    /// newer change still wins everything else, but these panes were never closed:
+    /// written over, they'd be gone everywhere while their agents ran on.
+    fn take_unseen_peer_panes(
+        &mut self,
+        pid: Uuid,
+        json: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
+        let layout_root = match &project.remote {
+            Some(r) => r.remote_root.clone(),
+            None => project.root_path.display().to_string(),
+        };
+        let Some(file) = RemoteLayout::parse(json, &layout_root) else {
+            return;
+        };
+        let name = project.name.clone();
+        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
+        let local = RemoteLayout::capture(project, &self.workspace, now_epoch);
+        let unseen = muxel_core::unseen_peer_panes(
+            &file,
+            self.layout_synced_keys.get(&pid).map(String::as_str),
+            &local,
+        );
+        let Some(peer_layout) = file.layout.as_ref().filter(|_| !unseen.is_empty()) else {
+            return;
+        };
+        let peer_instances = file
+            .instances
+            .iter()
+            .filter(|i| unseen.contains(&i.id))
+            .cloned()
+            .collect();
+        let mut instances = muxel_core::merge_peer_instances(&[], peer_instances, pid);
+        self.bind_peer_sessions(pid, &mut instances);
+        for wt in &file.worktrees {
+            if self.workspace.worktree(wt.id).is_none()
+                && instances.iter().any(|i| i.worktree_id == Some(wt.id))
+            {
+                let mut wt = wt.clone();
+                wt.project_id = pid;
+                self.workspace.add_worktree(wt);
+            }
+        }
+        for instance in instances {
+            self.workspace.remove_instance_meta(instance.id);
+            self.workspace.add_instance(instance);
+        }
+        if let Some(project) = self.workspace.project_mut(pid) {
+            muxel_core::place_peer_panes(&mut project.layout, peer_layout, &unseen);
+        }
+        self.persist();
+        muxel_store::append_event_log(&format!(
+            "layout: kept {} pane(s) a peer opened in \"{name}\"",
+            unseen.len()
+        ));
+        self.spawn_project_terminals_now(pid, window, cx);
+        cx.notify();
     }
 
     /// After a push kept a peer's move off Default that this machine's layout

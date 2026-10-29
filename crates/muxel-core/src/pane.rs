@@ -935,6 +935,45 @@ pub fn set_active_tab(tree: &mut Option<PaneNode>, instance: Uuid) -> bool {
     true
 }
 
+/// Add `panes`, which sit in a peer's layout `peer`, to this layout. A pane joins
+/// the tab group of a pane it shares one with in `peer`, when this layout has that
+/// pane, leaving the group's active tab as it was. Otherwise it opens in a split
+/// beside the last pane, or as the only pane of an empty layout. Panes already here
+/// are skipped.
+pub fn place_peer_panes(tree: &mut Option<PaneNode>, peer: &PaneNode, panes: &[Uuid]) {
+    for &pane in panes {
+        let present = |tree: &Option<PaneNode>, id: Uuid| {
+            tree.as_ref()
+                .is_some_and(|root| root.find_path(id).is_some())
+        };
+        if present(tree, pane) {
+            continue;
+        }
+        let mate = peer.tab_group(pane).and_then(|group| {
+            group
+                .iter()
+                .copied()
+                .find(|&id| id != pane && present(tree, id))
+        });
+        let Some(root) = tree.as_ref() else {
+            *tree = Some(PaneNode::leaf(pane));
+            continue;
+        };
+        if let Some(mate) = mate {
+            let active = root.leaf_containing(mate).and_then(|leaf| match leaf {
+                PaneNode::Leaf(ld) => Some(ld.active_instance()),
+                PaneNode::Split { .. } => None,
+            });
+            add_tab(tree, mate, pane);
+            if let Some(active) = active {
+                set_active_tab(tree, active);
+            }
+        } else if let Some(last) = root.last_instance() {
+            split(tree, last, SplitDirection::Horizontal, pane);
+        }
+    }
+}
+
 /// Move `dragged` out of wherever it sits and append it as the active tab of the
 /// pane holding `target` (drag-to-tabify). No-op (`false`) if `dragged == target`
 /// or both are already in the same pane; otherwise see [`move_tab_to`].
@@ -1190,6 +1229,43 @@ pub fn set_split_sizes(tree: &mut Option<PaneNode>, key: &str, sizes: &[f32]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn place_peer_panes_keeps_tab_mates_together_and_the_active_tab() {
+        let (a, b, c, d, e) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        // The peer has C as a tab beside A, and D and E in a pane of their own.
+        let mut peer = Some(PaneNode::leaf(a));
+        assert!(add_tab(&mut peer, a, c));
+        assert!(split(&mut peer, a, SplitDirection::Vertical, d));
+        assert!(add_tab(&mut peer, d, e));
+        let peer = peer.unwrap();
+
+        // Here A sits beside B, with A active in its group.
+        let mut tree = Some(PaneNode::leaf(a));
+        assert!(split(&mut tree, a, SplitDirection::Horizontal, b));
+        place_peer_panes(&mut tree, &peer, &[c, d, e, a]);
+        let root = tree.as_ref().unwrap();
+        assert_eq!(root.tab_group(a), Some(&[a, c][..]));
+        let Some(PaneNode::Leaf(ld)) = root.leaf_containing(a) else {
+            panic!("A is in a leaf");
+        };
+        assert_eq!(ld.active_instance(), a);
+        // D has no mate here, so it opens beside the last pane; E then joins it.
+        assert_eq!(root.tab_group(d), Some(&[d, e][..]));
+        assert_eq!(root.neighbor_of(d).map(|(id, ..)| id), Some(b));
+        assert_eq!(root.collect_instances().len(), 5);
+
+        // An empty layout takes the first as its only pane.
+        let mut empty = None;
+        place_peer_panes(&mut empty, &peer, &[d]);
+        assert_eq!(empty.and_then(|t| t.first_instance()), Some(d));
+    }
 
     #[test]
     fn leaf_containing_returns_the_whole_tab_group() {
