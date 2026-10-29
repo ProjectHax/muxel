@@ -641,8 +641,8 @@ const TERMINAL_LAUNCH_DEADLINE: Duration = Duration::from_secs(20);
 /// so recovery cannot stall forever. This is separate from restore admission.
 const REATTACH_PENDING_LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A pane's launch in flight: the token that owns it, and when its worker was
-/// dispatched (when it was reserved, until then).
+/// A pane's launch in flight: its owner token, admitted reason, and reservation
+/// time. Lookup and preparation count toward its bounded restore admission.
 #[derive(Clone, Debug)]
 struct LaunchTicket {
     token: u64,
@@ -4882,6 +4882,9 @@ impl ReplySource {
 
 /// The last `max` bytes of a file, lossily decoded (a torn first line is the
 /// caller's to skip).
+/// Physical store paths are required: a redirected `.claude` uses screen fallback.
+/// Supporting redirects needs a trusted root resolved off UI with refresh rules;
+/// this reader must never canonicalize a peer-supplied path to establish trust.
 fn read_file_tail(path: &std::path::Path, max: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     // Validate directories from the trusted-store side toward the file. Never
