@@ -82,7 +82,7 @@ impl ControlTurn {
         }
     }
 
-    fn awaiting_reply(
+    pub(super) fn awaiting_reply(
         &self,
         status: Option<AgentState>,
         activity: &muxel_core::AgentActivity,
@@ -250,6 +250,8 @@ struct ClaimStart {
 /// Typing into an agent, already checked against the agent's own state.
 struct Typing {
     iid: Uuid,
+    input_epoch: u64,
+    admitted_launch: Uuid,
     input: Input,
     /// `None` for keys that start no turn (`esc`, arrows): no claim either.
     turn: Option<Turn>,
@@ -412,6 +414,13 @@ fn check_send_state(admission: SendAdmission) -> CtlResult<()> {
 }
 
 impl MuxelApp {
+    pub(super) fn cancel_pending_control_startup(&mut self, iid: Uuid) {
+        if let Some(turn) = self.control_turns.get(&iid)
+            && let Some(startup) = &turn.startup
+        {
+            startup.cancel();
+        }
+    }
     /// Start or stop the control server to match the setting. Idempotent; called
     /// each tick (so a settings Cancel is honored too) and by the checkbox.
     pub(super) fn sync_control(&mut self, cx: &mut Context<Self>) {
@@ -1008,16 +1017,21 @@ impl MuxelApp {
 
     /// Every pane of every project: each project's layout in order, then any of
     /// its panes popped out into their own windows.
-    fn control_instances(&self) -> Vec<&Instance> {
+    pub(super) fn control_instances(&self) -> Vec<&Instance> {
         let mut out: Vec<&Instance> = Vec::new();
         for project in &self.workspace.projects {
             for iid in project.instances() {
-                if let Some(inst) = self.workspace.instance(iid) {
+                if let Some(inst) = self
+                    .workspace
+                    .instance(iid)
+                    .filter(|_| !self.is_closing(iid))
+                {
                     out.push(inst);
                 }
             }
             for inst in &self.workspace.instances {
                 if inst.project_id == project.id
+                    && !self.is_closing(inst.id)
                     && self.popouts.contains_key(&inst.id)
                     && !out.iter().any(|o| o.id == inst.id)
                 {
@@ -1028,8 +1042,14 @@ impl MuxelApp {
         out
     }
 
-    fn control_resolve(&self, query: &str) -> CtlResult<Uuid> {
-        let instances = self.control_instances();
+    pub(super) fn control_resolve(&self, query: &str) -> CtlResult<Uuid> {
+        let mut instances = self.control_instances();
+        instances.extend(
+            self.workspace
+                .instances
+                .iter()
+                .filter(|inst| self.is_closing(inst.id)),
+        );
         let entries: Vec<AgentEntry> = instances
             .iter()
             .map(|inst| AgentEntry {
@@ -1041,7 +1061,11 @@ impl MuxelApp {
                     .map_or("", |p| p.name.as_str()),
             })
             .collect();
-        ctl::resolve_agent(query, &entries, self.active_instance).map_err(Into::into)
+        let iid = ctl::resolve_agent(query, &entries, self.active_instance)?;
+        if let Some(until) = self.closing_until(iid) {
+            return Err(ctl::Error::closing(until));
+        }
+        Ok(iid)
     }
 
     fn control_resolve_for_typing(
@@ -1056,7 +1080,7 @@ impl MuxelApp {
     }
 
     /// What a terminal pane is doing. `None` for editors, diffs and browsers.
-    fn control_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
+    pub(super) fn control_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
         if inst.kind != InstanceKind::Terminal {
             return None;
         }
@@ -1318,7 +1342,10 @@ impl MuxelApp {
     // --- Typing into an agent ----------------------------------------------------
 
     /// The session outside control may type into, or why it may not.
-    fn control_writable(&self, iid: Uuid, cx: &App) -> CtlResult<Arc<TerminalSession>> {
+    pub(super) fn control_writable(&self, iid: Uuid, cx: &App) -> CtlResult<Arc<TerminalSession>> {
+        if let Some(until) = self.closing_until(iid) {
+            return Err(ctl::Error::closing(until));
+        }
         // Admission checked this too, but delayed Enters and keys write later.
         if !self.settings.control_enabled {
             return Err(ctl::creation_refusal(ErrorCode::ControlDisabled));
@@ -1409,8 +1436,11 @@ impl MuxelApp {
             .workspace
             .instance(iid)
             .ok_or("that agent has just closed")?;
+        let admitted = self.control_writable(iid, cx)?;
         Ok(Typing {
             iid,
+            input_epoch: admitted.input_epoch(),
+            admitted_launch: admitted.id,
             input,
             turn,
             site: self.control_claim_site(inst),
@@ -1590,6 +1620,8 @@ impl MuxelApp {
         };
         let Typing {
             iid,
+            input_epoch,
+            admitted_launch,
             turn,
             reply,
             launch_id,
@@ -1597,6 +1629,18 @@ impl MuxelApp {
             in_flight,
             ..
         } = typing;
+        if session.id != admitted_launch {
+            return Task::ready(Err(ctl::Error::new(
+                ErrorCode::LaunchMismatch,
+                "the queued input's terminal was replaced",
+            )));
+        }
+        if !session.accepts_input_epoch(input_epoch) {
+            return Task::ready(Err(ctl::Error::new(
+                ErrorCode::InputChanged,
+                "closing cancelled this queued input",
+            )));
+        }
         match typing.input {
             Input::Prompt(text) => {
                 // This is the same UI update as local keyboard input and PTY
@@ -1627,6 +1671,7 @@ impl MuxelApp {
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                         .await;
                     let enter = this.update(cx, |app, cx| -> CtlResult<ControlWrite> {
+                        if !session.accepts_input_epoch(input_epoch) { return Err(ctl::Error::new(ErrorCode::InputChanged, "closing cancelled this queued Enter").after_paste()); }
                         let live = app.control_writable(iid, cx);
                         enter_verdict(live, &session, pasted, session.input_rev())?;
                         if attempt.as_ref().is_some_and(|attempt| {
@@ -1664,6 +1709,7 @@ impl MuxelApp {
                     loop {
                         let action = this
                             .update(cx, |app, cx| -> Result<_, Unconfirmed> {
+                                if !session.accepts_input_epoch(input_epoch) { return Err(Unconfirmed::Interrupted); }
                                 confirmation_verdict(
                                     app.control_writable(iid, cx),
                                     &session,
@@ -1744,6 +1790,12 @@ impl MuxelApp {
                                 let current_session = app.control_writable(iid, cx)?;
                                 if !Arc::ptr_eq(&session, &current_session) {
                                     return Err("the pane restarted".into());
+                                }
+                                if !session.accepts_input_epoch(input_epoch) {
+                                    return Err(ctl::Error::new(
+                                        ErrorCode::InputChanged,
+                                        "closing cancelled these queued keys",
+                                    ));
                                 }
                                 // A press that submits is an Enter (`key_submits`).
                                 // It goes as the submit, so the turn counts as
@@ -1947,7 +1999,9 @@ fn enter_verdict<T>(
     match live {
         Ok(live) if Arc::ptr_eq(&live, pasted_into) => {}
         Ok(_) => return Err(ctl::Error::from("the pane restarted after the prompt was pasted, so Enter wasn't pressed: check its `screen`").after_paste()),
-        Err(why) => return Err(ctl::Error::from(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`")).after_paste()),
+        // Refusal codes promise nothing was typed, so a post-paste failure
+        // drops its code; a closing pane's undo deadline still applies.
+        Err(why) => return Err(ctl::Error { undo_until: why.undo_until, ..ctl::Error::from(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`")) }.after_paste()),
     }
     if now != pasted {
         return Err(ctl::Error::new(
@@ -2056,17 +2110,23 @@ fn enter_failed(error: ControlWriteError) -> ctl::Error {
 }
 
 /// A `keys` request that stopped at press `i` of `total`. Once earlier presses
-/// went in it fails with `pasted: true`, whatever stopped this one, so its
-/// claim stays (see [`release_claim_after_result`]).
+/// went in it fails as `keys_partly_pressed` with `pasted: true`, whatever
+/// stopped this one, so its claim stays (see [`release_claim_after_result`]):
+/// a refusal's own code would say nothing was typed. A closing pane's undo
+/// deadline still applies.
 fn keys_stopped(error: ctl::Error, i: usize, total: usize) -> ctl::Error {
-    let error = ctl::Error {
-        message: format!(
-            "{}; {i} of {total} keys were pressed before it",
-            error.message
-        ),
-        ..error
-    };
-    if i > 0 { error.after_paste() } else { error }
+    let message = format!(
+        "{}; {i} of {total} keys were pressed before it",
+        error.message
+    );
+    if i == 0 {
+        return ctl::Error { message, ..error };
+    }
+    ctl::Error {
+        undo_until: error.undo_until,
+        ..ctl::Error::new(ErrorCode::KeysPartlyPressed, message)
+    }
+    .after_paste()
 }
 
 /// A failed key press, after `pressed_before` earlier presses went in. Once
@@ -2777,6 +2837,46 @@ mod prompt_submission_tests {
         assert!(!releases(later));
     }
 
+    /// A refusal that stops keys after some went in must not keep its own
+    /// code, which promises nothing was typed. One before the first keeps it.
+    #[test]
+    fn keys_refused_after_some_went_in_are_partly_pressed() {
+        use super::keys_stopped;
+        use muxel_core::control::{Error, ErrorCode};
+        let deadline = 1_800_000_000_015;
+        let first = keys_stopped(Error::closing(deadline), 0, 3);
+        assert_eq!(first.code, Some(ErrorCode::Closing));
+        assert_eq!(first.pasted, None);
+        assert_eq!(first.undo_until, Some(deadline));
+        let later = keys_stopped(Error::closing(deadline), 2, 3);
+        assert_eq!(later.code, Some(ErrorCode::KeysPartlyPressed));
+        assert_eq!(later.pasted, Some(true));
+        assert_eq!(later.undo_until, Some(deadline));
+        assert!(
+            later
+                .message
+                .ends_with("2 of 3 keys were pressed before it")
+        );
+        for refusal in [
+            ErrorCode::Starting,
+            ErrorCode::Exited,
+            ErrorCode::InputChanged,
+        ] {
+            let later = keys_stopped(Error::new(refusal, "no").with_reason("why"), 1, 2);
+            assert_eq!(
+                later.code,
+                Some(ErrorCode::KeysPartlyPressed),
+                "{refusal:?}"
+            );
+            assert_eq!(
+                (later.reason, later.pasted),
+                (None, Some(true)),
+                "{refusal:?}"
+            );
+            assert_eq!(later.undo_until, None, "{refusal:?}");
+        }
+    }
+
     /// A terminal whose ctl input goes through a fake tmux. Its agent pane is
     /// `%7`, and each `send-keys` waits for the next answer on the returned
     /// sender: `true` presses it, `false` refuses it.
@@ -3147,6 +3247,43 @@ mod prompt_submission_tests {
         assert_eq!(replaced.code, None);
         let changed = enter_verdict(Ok(original.clone()), &original, 7, 8).unwrap_err();
         assert_eq!(changed.code, Some(ErrorCode::InputChanged));
+    }
+
+    #[test]
+    fn post_paste_refusals_drop_their_code_but_keep_the_undo_deadline() {
+        let session = Arc::new(1_u8);
+        let deadline = 1_800_000_000_015;
+        let closing = enter_verdict(
+            Err(muxel_core::control::Error::closing(deadline)),
+            &session,
+            7,
+            7,
+        )
+        .unwrap_err();
+        assert_eq!(
+            closing.code, None,
+            "a refusal code would say nothing was typed"
+        );
+        assert_eq!(closing.reason, None);
+        assert_eq!(closing.pasted, Some(true));
+        assert_eq!(closing.undo_until, Some(deadline));
+        let starting = enter_verdict(
+            Err(
+                muxel_core::control::Error::new(ErrorCode::Starting, "starting")
+                    .with_reason("launching"),
+            ),
+            &session,
+            7,
+            7,
+        )
+        .unwrap_err();
+        assert_eq!((starting.code, starting.reason), (None, None));
+        assert_eq!(starting.pasted, Some(true));
+        assert_eq!(starting.undo_until, None);
+        let wire = serde_json::to_value(muxel_core::control::Response::err(closing)).unwrap();
+        assert!(wire.get("code").is_none());
+        assert_eq!(wire["pasted"], true);
+        assert_eq!(wire["undo_until"], deadline);
     }
 
     #[test]
@@ -3832,7 +3969,7 @@ mod prompt_submission_tests {
     fn delayed_writes_recheck_that_outside_control_is_still_on() {
         // Enters and keys run on timers after admission, through this gate.
         let gate = include_str!("control_api.rs")
-            .split("    fn control_writable(")
+            .split("fn control_writable(")
             .nth(1)
             .unwrap();
         assert!(

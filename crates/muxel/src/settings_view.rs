@@ -36,6 +36,7 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("SplitRight", "ctrl-shift-l", None),
     ("SplitDown", "ctrl-shift-j", None),
     ("ClosePane", "ctrl-shift-w", None),
+    ("UndoClose", "ctrl-alt-z", None),
     ("FocusNext", "ctrl-shift-]", None),
     ("FocusPrev", "ctrl-shift-[", None),
     ("FocusLeft", "ctrl-alt-left", None),

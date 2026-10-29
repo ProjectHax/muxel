@@ -648,6 +648,58 @@ mod tests {
     }
 
     #[test]
+    fn a_closing_refusal_keeps_its_deadline_through_socket_and_cli_json() {
+        let dir = scratch("closing");
+        let (tx, rx) = async_channel::unbounded();
+        let server = Server::start_in(&dir, tx).unwrap();
+        let deadline = 1_800_000_000_015;
+        let app = std::thread::spawn(move || {
+            let incoming = rx.recv_blocking().unwrap();
+            assert!(matches!(incoming.command, Command::Keys { .. }));
+            incoming
+                .reply
+                .send(Response::err(control::Error::closing(deadline)))
+                .unwrap();
+        });
+        let error = request_at(
+            &dir.join(control::ENDPOINT_FILE),
+            Command::Keys {
+                agent: "claude".into(),
+                keys: vec!["enter".into()],
+                force: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, Some(ErrorCode::Closing));
+        assert_eq!(error.undo_until, Some(deadline));
+        let json = failure_body(error);
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["code"], "closing");
+        assert_eq!(json["undo_until"], deadline);
+        assert!(json["host"].is_string());
+        let decoded: Response = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            decoded.into_result().unwrap_err().undo_until,
+            Some(deadline)
+        );
+        app.join().unwrap();
+        drop(server);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cli_failures_without_an_undo_deadline_omit_the_field() {
+        for error in [
+            control::Error::new(ErrorCode::Working, "busy"),
+            control::Error::from("no match"),
+        ] {
+            let reply = failure_body(error);
+            assert!(reply.get("undo_until").is_none());
+            assert!(reply.get("result").is_none());
+        }
+    }
+
+    #[test]
     fn cli_failure_body_keeps_reason_and_pasted() {
         let busy = failure_body(
             control::Error::new(ErrorCode::Working, "prior turn is open")

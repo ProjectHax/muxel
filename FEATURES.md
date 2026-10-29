@@ -105,8 +105,45 @@ feature is added or changed, update the matching entry here in the same change**
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
   button returns it to its original location. Re-docking a working agent clears
   that pane's stale finished or needs-input card.
-- **Close terminates** — closing a pop-out window kills its terminal (with a
-  confirmation). Editors and browser panes just close.
+- **Recoverable terminal close** — a closed terminal stays alive, hidden, for
+  15 seconds. The title-bar chip or Ctrl+Alt+Z restores its tabs and live process;
+  a popped-out terminal returns to the main window. Busy or uncertain terminals
+  ask first; confirmed busy closes still get Undo. Quiet closes recheck launch,
+  binding, input and completion before expiry; changed work gets Close / Keep.
+  An OSC 7501 report counts as quiet only while idle or finished; an `error`
+  report asks, and any turn a report finishes during the countdown is changed
+  work. Batch closes offer Close all, Close only the idle ones, or Cancel.
+  Queued input, written to the terminal or sent through tmux, is cancelled
+  across close and Undo, and hidden panes leave ctl listings; writes refuse
+  with `closing` and `undo_until`. A shell counts down only with prompt
+  evidence, so local tmux shells on Unix, which can't pass OSC 133 through,
+  always ask. A tmux pane that only looks dead here (never connected, a
+  failed restart, a detached client) asks too, since closing it kills a
+  session that may still run its agent; its client exiting mid-countdown also
+  turns into Close / Keep. Undo reattaches a pane whose launch or reconnect was
+  in flight, and restarts only a pane whose restart was queued. A held pane
+  stays in the shared layout until its close is final, so other machines and
+  the iOS app keep syncing, and their edits are adopted, while it counts down.
+  A countdown that runs out finishes only after the next read of the shared
+  layout, showing "Checking before close…" until then, so edits a peer made
+  while this machine slept are adopted, not overwritten. When that layout
+  can't be read (its host is offline or reconnecting, or no read lands within
+  30 seconds), the close asks Close or Keep instead.
+- **Resource and worktree close** — dirty editors offer Save / Don't Save /
+  Cancel; clean editors, diffs and browsers close immediately. The last pane of
+  a muxel worktree with changes or unmerged commits uses its disposal choice
+  directly; a clean, landed worktree follows the terminal countdown policy. A
+  pane opened in that worktree while its question is showing gets its own
+  prompt and countdown, and a pane brought back by Undo leaves the question.
+  Client checks show progress, beside any running countdown, with their own
+  Cancel; a batch member closed during the check leaves the others to their
+  decision. Ordinary saves preserve held panes for crash recovery; workspace
+  switch and quit (or logout) finish running countdowns, but keep a pane
+  still being checked or waiting for Close / Keep, which reopens next time.
+  Removing a project waits for that decision. If that save fails, the first
+  switch stops with a notice and the next one leaves anyway; the pane reopens
+  next time. Saving an untitled editor on close writes the path picked in the
+  save dialog on this machine, as Save As does.
 - **Workspace changes** — switching workspaces closes the previous workspace's
   pop-out and per-monitor project windows without interrupting the switch.
 
@@ -1583,12 +1620,9 @@ feature is added or changed, update the matching entry here in the same change**
   to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
   (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
-  confirmation, per-kind close confirmation (terminal on, editor/diff off by
-  default), and auto-close a pane when its process exits **cleanly** (an
-  abnormal exit always leaves a tombstone pane instead). The terminal
-  confirmation is skipped for an untouched **shell** pane — one sitting idle at
-  its prompt with no foreground command and no other tabs — since closing it
-  loses nothing.
+  confirmation, "Ask before closing a busy terminal" (on by default; see
+  Recoverable terminal close), and auto-close a pane when its process exits
+  **cleanly** (an abnormal exit always leaves a tombstone pane instead).
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
   whenever `tmux` is installed, so local panes survive a muxel restart and reattach
   (matching remote panes); the toggle greys out and has no effect when tmux isn't

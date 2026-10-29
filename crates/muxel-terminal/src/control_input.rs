@@ -247,9 +247,12 @@ struct Shared {
     /// again too soon.
     backoff: Mutex<PinBackoff>,
     closed: AtomicBool,
+    /// The terminal's close hold. A job admitted in an epoch the hold has
+    /// since ended is never delivered.
+    gate: Arc<crate::session::InputGate>,
 }
 
-struct Job(ControlInput, async_channel::Sender<Delivered>);
+struct Job(ControlInput, u64, async_channel::Sender<Delivered>);
 
 /// A terminal's tmux route and its ordered input worker. ctl writes to one
 /// terminal run one at a time, in the order they were made.
@@ -260,13 +263,14 @@ pub(crate) struct TmuxInput {
 }
 
 impl TmuxInput {
-    pub(crate) fn new(route: TmuxInputRoute) -> Self {
+    pub(crate) fn new(route: TmuxInputRoute, gate: Arc<crate::session::InputGate>) -> Self {
         Self {
             route,
             shared: Arc::new(Shared {
                 pin: Mutex::new(None),
                 backoff: Mutex::new(PinBackoff::default()),
                 closed: AtomicBool::new(false),
+                gate,
             }),
             worker: Mutex::new(None),
         }
@@ -277,10 +281,15 @@ impl TmuxInput {
         self.shared.pin.lock().clone()
     }
 
-    /// Queue `input` for the agent's pane, which the first write looks up.
-    pub(crate) fn deliver(&self, input: ControlInput) -> async_channel::Receiver<Delivered> {
+    /// Queue `input`, admitted in input `epoch`, for the agent's pane, which
+    /// the first write looks up.
+    pub(crate) fn deliver(
+        &self,
+        input: ControlInput,
+        epoch: u64,
+    ) -> async_channel::Receiver<Delivered> {
         let (tx, rx) = async_channel::bounded(1);
-        if let Err(Job(_, tx)) = self.send(Job(input, tx)) {
+        if let Err(Job(_, _, tx)) = self.send(Job(input, epoch, tx)) {
             let _ = tx.try_send(Err(ControlWriteError::Refused(
                 "muxel couldn't start its tmux input worker".into(),
             )));
@@ -319,9 +328,13 @@ impl Drop for TmuxInput {
 }
 
 fn work(route: &TmuxInputRoute, shared: &Shared, jobs: mpsc::Receiver<Job>) {
-    while let Ok(Job(input, done)) = jobs.recv() {
+    while let Ok(Job(input, epoch, done)) = jobs.recv() {
         let result = if shared.closed.load(Ordering::Acquire) {
             Err(ControlWriteError::Refused("the terminal closed".into()))
+        } else if !shared.gate.accepts(epoch) {
+            // As a held PTY write fails: the pane closed, or was closed and
+            // brought back, after this write was queued.
+            Err(ControlWriteError::Closed("terminal is closing".into()))
         } else {
             pinned_pane(route, shared, Instant::now())
                 .and_then(|pane| deliver(&route.run, &pane, &input))
@@ -548,7 +561,7 @@ mod tests {
     }
 
     fn deliver(input: &TmuxInput, write: ControlInput) -> Result<(), ControlWriteError> {
-        input.deliver(write).recv_blocking().unwrap()
+        input.deliver(write, 0).recv_blocking().unwrap()
     }
 
     /// Drive a write to its end, as the app's foreground task awaits it.
@@ -568,7 +581,7 @@ mod tests {
     #[test]
     fn writes_go_in_order_to_the_agents_pane_found_once() {
         let (route, calls) = route(|_| Ok(output(0, "", "")));
-        let input = TmuxInput::new(route);
+        let input = TmuxInput::new(route, Arc::default());
         assert_eq!(
             input.pinned_pane(),
             None,
@@ -608,7 +621,7 @@ mod tests {
     #[test]
     fn a_key_outside_ascii_is_pasted_raw_between_the_named_keys() {
         let (route, calls) = route(|_| Ok(output(0, "", "")));
-        let input = TmuxInput::new(route);
+        let input = TmuxInput::new(route, Arc::default());
         deliver(
             &input,
             ControlInput::Keys {
@@ -641,7 +654,7 @@ mod tests {
                 _ => output(0, "", ""),
             })
         });
-        let input = TmuxInput::new(route);
+        let input = TmuxInput::new(route, Arc::default());
         let press = |keys: Vec<Key>| ControlInput::Keys {
             keys,
             app_cursor: false,
@@ -776,6 +789,78 @@ mod tests {
         }
     }
 
+    /// Held for closing, a tmux client's pane takes no ctl input, and a write
+    /// queued before the hold stays dead after Undo, as a PTY write does.
+    #[test]
+    fn a_close_hold_stops_ctl_input_through_tmux_and_queued_writes_stay_dead() {
+        let calls: Calls = Arc::default();
+        let seen = calls.clone();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let route = TmuxInputRoute::new(
+            "muxel_p_1",
+            true,
+            move |args: &[String], stdin: Option<&[u8]>| {
+                seen.lock().push((args.to_vec(), stdin.map(<[u8]>::to_vec)));
+                Ok(match args[0].as_str() {
+                    "list-panes" => output(0, AGENT_PANES, ""),
+                    // Each key press waits to be let through, so the writes
+                    // behind it stay queued.
+                    "send-keys" => {
+                        let _ = released.lock().recv();
+                        output(0, "", "")
+                    }
+                    _ => output(0, "", ""),
+                })
+            },
+        );
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) =
+            TerminalSession::spawn(spec.with_tmux_input(route), 80, 24).expect("spawn PTY");
+        let pressing = session.control_write(ControlInput::Keys {
+            keys: vec![Key::Enter],
+            app_cursor: false,
+        });
+        let queued = session.control_write(ControlInput::Submit);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !commands(&calls).contains(&"send-keys".to_string()) {
+            assert!(Instant::now() < deadline, "the first press never ran");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        session.hold_input();
+        let held = session.control_write(ControlInput::Paste("held".into()));
+        assert!(
+            matches!(held.ready(), Some(Err(ControlWriteError::Closed(_)))),
+            "{held:?}"
+        );
+        // Undo, then let the press in flight finish.
+        session.resume_input();
+        release.send(()).unwrap();
+        finish(pressing).unwrap();
+        let dead = finish(queued);
+        assert!(
+            matches!(dead, Err(ControlWriteError::Closed(_))),
+            "{dead:?}"
+        );
+        assert!(!session.has_submitted_turn());
+
+        // Input made after Undo goes through.
+        release.send(()).unwrap();
+        finish(session.control_write(ControlInput::Submit)).unwrap();
+        assert!(session.has_submitted_turn());
+        let typed: Vec<_> = commands(&calls)
+            .into_iter()
+            .filter(|command| command != "list-panes")
+            .collect();
+        assert_eq!(typed, ["send-keys", "send-keys"]);
+        session.kill();
+    }
+
     #[test]
     fn a_refused_paste_reports_failure_and_deletes_its_buffer() {
         let (route, calls) = route(|args| {
@@ -786,7 +871,7 @@ mod tests {
                 _ => output(0, "", ""),
             })
         });
-        let input = TmuxInput::new(route);
+        let input = TmuxInput::new(route, Arc::default());
         let error = deliver(&input, ControlInput::Paste("x".into())).unwrap_err();
         assert_eq!(
             error,
@@ -814,7 +899,7 @@ mod tests {
     fn a_pinned_pane_that_has_gone_is_unresolved_and_never_replaced() {
         // Every command on the pane, its existence check included.
         let (route, calls) = route(|_| Ok(output(1, "", "can't find pane: %7\n")));
-        let input = TmuxInput::new(route);
+        let input = TmuxInput::new(route, Arc::default());
         for write in [
             ControlInput::Paste("x".into()),
             ControlInput::Submit,
@@ -841,7 +926,7 @@ mod tests {
     #[test]
     fn an_unanswered_command_is_reported_as_unknown_not_refused() {
         let (route, _) = route(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")));
-        let input = TmuxInput::new(route);
+        let input = TmuxInput::new(route, Arc::default());
         let error = deliver(&input, ControlInput::Submit).unwrap_err();
         assert!(matches!(error, ControlWriteError::Unknown(_)), "{error:?}");
         assert!(error.may_have_typed());
@@ -860,7 +945,7 @@ mod tests {
                 Ok(output(0, "muxel_p_1:%9:0\n", ""))
             },
         );
-        let input = TmuxInput::new(route);
+        let input = TmuxInput::new(route, Arc::default());
         let error = deliver(&input, ControlInput::Paste("x".into())).unwrap_err();
         assert!(
             matches!(&error, ControlWriteError::Unresolved(why) if why.contains("created with has gone")),
@@ -932,6 +1017,7 @@ mod tests {
             pin: Mutex::new(None),
             backoff: Mutex::new(PinBackoff::default()),
             closed: AtomicBool::new(false),
+            gate: Arc::default(),
         };
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);

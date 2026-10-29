@@ -3,12 +3,67 @@
 use muxel_core::tmux::{ClosedSession, SessionTarget, Socket};
 use muxel_core::{Instance, Workspace};
 use std::collections::{HashMap, hash_map::Entry};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+#[derive(Default)]
+struct CommandState {
+    cancelled: bool,
+    in_flight: usize,
+}
+
+/// Shared with workers before dispatch. Cancellation never revives this lease;
+/// a newer restart gets a different state even when the pane ID is unchanged.
+#[derive(Clone, Default)]
+pub(super) struct RestartLease {
+    state: Arc<Mutex<CommandState>>,
+}
+
+/// Tracks admitted work without retaining a mutex guard across I/O.
+pub(super) struct CommandGuard {
+    state: Arc<Mutex<CommandState>>,
+}
+
+impl RestartLease {
+    pub fn begin_command(&self) -> Option<CommandGuard> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.cancelled {
+            return None;
+        }
+        state.in_flight = state.in_flight.checked_add(1)?;
+        Some(CommandGuard {
+            state: Arc::clone(&self.state),
+        })
+    }
+
+    pub fn is_in_flight(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .in_flight
+            > 0
+    }
+
+    fn cancel(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancelled = true;
+    }
+}
+
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.in_flight -= 1;
+    }
+}
 
 struct Restart {
     token: Uuid,
     project: Uuid,
     recorded: Option<SessionTarget>,
+    lease: RestartLease,
 }
 
 #[derive(Default)]
@@ -41,12 +96,17 @@ impl PendingRestarts {
             token,
             project: instance.project_id,
             recorded: target(instance),
+            lease: RestartLease::default(),
         });
         Some(token)
     }
 
     pub fn contains(&self, iid: Uuid) -> bool {
         self.pending.contains_key(&iid)
+    }
+
+    pub fn lease(&self, iid: Uuid) -> Option<RestartLease> {
+        self.pending.get(&iid).map(|restart| restart.lease.clone())
     }
 
     pub fn current(&self, iid: Uuid, token: Uuid) -> bool {
@@ -133,15 +193,23 @@ impl PendingRestarts {
     }
 
     pub fn finish(&mut self, iid: Uuid, token: Uuid) -> bool {
-        self.current(iid, token) && self.pending.remove(&iid).is_some()
+        if !self.current(iid, token) {
+            return false;
+        }
+        self.cancel(iid);
+        true
     }
 
     pub fn cancel(&mut self, iid: Uuid) {
-        self.pending.remove(&iid);
+        if let Some(restart) = self.pending.remove(&iid) {
+            restart.lease.cancel();
+        }
     }
 
     pub fn clear(&mut self) {
-        self.pending.clear();
+        for (_, restart) in self.pending.drain() {
+            restart.lease.cancel();
+        }
         self.owner_generations.clear();
     }
 }
@@ -176,6 +244,79 @@ mod tests {
             name: "muxel_repo_namesake".into(),
             socket: Some(socket),
         }
+    }
+
+    #[test]
+    fn cancelled_command_lease_cannot_revive_for_a_new_restart_token() {
+        let (workspace, iid) = fixture();
+        let mut restarts = PendingRestarts::default();
+        let first = restarts.begin(workspace.instance(iid).unwrap()).unwrap();
+        let old = restarts.lease(iid).unwrap();
+        restarts.cancel(iid);
+        let second = restarts.begin(workspace.instance(iid).unwrap()).unwrap();
+        let new = restarts.lease(iid).unwrap();
+        assert_ne!(first, second);
+        assert!(old.begin_command().is_none());
+        let guard = new
+            .begin_command()
+            .expect("new restart owns a distinct lease");
+        assert!(new.is_in_flight());
+        assert!(!old.is_in_flight());
+        assert!(old.begin_command().is_none());
+        drop(guard);
+        assert!(!new.is_in_flight());
+    }
+
+    #[test]
+    fn cancelled_lease_keeps_admitted_commands_observable_until_all_guards_drop() {
+        let (workspace, iid) = fixture();
+        let mut restarts = PendingRestarts::default();
+        restarts.begin(workspace.instance(iid).unwrap()).unwrap();
+        let lease = restarts.lease(iid).unwrap();
+        let observer = lease.clone();
+        let first = lease.begin_command().unwrap();
+        let second = lease.begin_command().unwrap();
+        restarts.cancel(iid);
+        assert!(observer.is_in_flight());
+        assert!(observer.begin_command().is_none());
+        drop(first);
+        assert!(observer.is_in_flight());
+        drop(second);
+        assert!(!observer.is_in_flight());
+        assert!(observer.begin_command().is_none());
+    }
+
+    #[test]
+    fn finish_clear_and_owner_change_permanently_cancel_captured_leases() {
+        let (workspace, iid) = fixture();
+        for action in 0..3 {
+            let mut restarts = PendingRestarts::default();
+            let token = restarts.begin(workspace.instance(iid).unwrap()).unwrap();
+            let lease = restarts.lease(iid).unwrap();
+            let guard = lease.begin_command().unwrap();
+            match action {
+                0 => assert!(restarts.finish(iid, token)),
+                1 => restarts.clear(),
+                _ => restarts.owner_changed(iid),
+            }
+            assert!(!restarts.contains(iid));
+            assert!(lease.begin_command().is_none());
+            assert!(lease.is_in_flight());
+            drop(guard);
+            assert!(!lease.is_in_flight());
+        }
+    }
+
+    #[test]
+    fn stale_finish_does_not_cancel_the_new_command_lease() {
+        let (workspace, iid) = fixture();
+        let mut restarts = PendingRestarts::default();
+        let first = restarts.begin(workspace.instance(iid).unwrap()).unwrap();
+        restarts.cancel(iid);
+        restarts.begin(workspace.instance(iid).unwrap()).unwrap();
+        let lease = restarts.lease(iid).unwrap();
+        assert!(!restarts.finish(iid, first));
+        assert!(lease.begin_command().is_some());
     }
 
     #[test]

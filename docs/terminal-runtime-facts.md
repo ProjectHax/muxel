@@ -60,7 +60,9 @@ bar the card isn't read and the title's Working stands.
   unless it names a different id than the pinned one;
 - `snapshot_seq`: advances when the status, its reason, whether it is
   attributable (see below), the binding, completion readiness, coverage, or
-  completion revision changes;
+  completion revision changes, and when the launch observes a completion in
+  any binding (`TerminalView::launch_completion_revision`, which a held close
+  compares and a binding switch doesn't reset);
 - `input_rev`: advances before ordinary non-empty input writes reach
   the PTY writer; fallible control submissions commit it after successful writer
   admission. Keys, pastes, sends, and mouse and wheel reports count. Focus

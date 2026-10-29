@@ -21,6 +21,7 @@ pub mod outage;
 mod pane;
 pub mod path_paste;
 pub mod readaloud;
+pub mod recoverable_close;
 pub mod remote_ops;
 pub mod session_discovery;
 mod shell;
@@ -2581,11 +2582,12 @@ pub struct Settings {
     /// Close a pane automatically when its process exits.
     #[serde(default = "default_true")]
     pub close_on_exit: bool,
-    /// Ask for confirmation before closing a pane, per kind. Terminals default
-    /// on (they hold a running process); editors/diffs default off (cheap to
-    /// reopen, nothing is lost).
+    /// Ask before closing a busy or uncertain terminal (default on). A quiet
+    /// one counts down with Undo either way.
     #[serde(default = "default_true")]
     pub confirm_close_terminal: bool,
+    /// No longer used: a dirty editor always offers Save, and a clean editor
+    /// or diff pane closes at once. Kept so older settings still load.
     #[serde(default)]
     pub confirm_close_editor: bool,
     #[serde(default)]
@@ -3770,6 +3772,31 @@ mod settings_tests {
     }
 
     #[test]
+    fn retired_close_confirmations_still_load_and_keep_their_values() {
+        // Settings from before the close rule replaced per-kind confirmation.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        let fields = v.as_object_mut().unwrap();
+        fields.insert("confirm_close_editor".into(), true.into());
+        fields.insert("confirm_close_diff".into(), true.into());
+        fields.insert("confirm_close_terminal".into(), false.into());
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert!(s.confirm_close_editor && s.confirm_close_diff);
+        assert!(!s.confirm_close_terminal);
+        // Missing, the busy-terminal question stays on.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        for key in [
+            "confirm_close_terminal",
+            "confirm_close_editor",
+            "confirm_close_diff",
+        ] {
+            v.as_object_mut().unwrap().remove(key);
+        }
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert!(s.confirm_close_terminal);
+        assert!(!s.confirm_close_editor && !s.confirm_close_diff);
+    }
+
+    #[test]
     fn settings_terminal_mouse_default_and_round_trip() {
         assert_eq!(Settings::default().terminal_mouse, "copy_paste");
         // An old config missing the key still loads, defaulting to copy_paste.
@@ -4387,6 +4414,68 @@ mod remote_layout_tests {
         assert!(!push_overwrites_peer(&peer, Some(&synced), &ours, 300));
         // With nothing new from the peer, the close is pushed as it is.
         assert!(!push_overwrites_peer(&base, Some(&synced), &ours, rev));
+    }
+
+    #[test]
+    fn a_held_close_lands_on_top_of_peer_edits_adopted_while_it_was_held() {
+        // Both machines show shells A and H (rev 100). This one closes H, which
+        // counts down with H still in the shared document.
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let a = Instance::shell(proj.id);
+        let held = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::leaf(a.id));
+        assert!(pane::add_tab(&mut proj.layout, a.id, held.id));
+        proj.layout_updated_at = Some(100);
+        ws.instances = vec![a.clone(), held.clone()];
+        ws.projects = vec![proj.clone()];
+        let base = RemoteLayout::capture(&proj, &ws, 100);
+        let base_key = base.content_key();
+
+        // Meanwhile the peer renames A (rev 200). The live poll still runs, and
+        // this machine's document is unchanged by the hold: it adopts the rename.
+        let mut peer = base.clone();
+        peer.instances
+            .iter_mut()
+            .find(|i| i.id == a.id)
+            .unwrap()
+            .custom_name = Some("Reviewer".into());
+        peer.updated_at = 200;
+        let peer_key = peer.content_key();
+        assert_eq!(
+            peer_layout_action(&peer_key, 200, Some(&base_key), &base_key, 100),
+            PeerLayoutAction::Adopt
+        );
+
+        // The close becomes final at 300, an edit on top of the adopted layout.
+        let mut adopted = peer.clone();
+        assert!(pane::remove(&mut adopted.layout, held.id));
+        adopted.instances.retain(|i| i.id != held.id);
+        adopted.updated_at = 300;
+        assert!(!push_overwrites_peer(
+            &peer,
+            Some(&peer_key),
+            &adopted.content_key(),
+            300
+        ));
+        assert_eq!(
+            adopted.instances[0].custom_name.as_deref(),
+            Some("Reviewer"),
+            "the pushed close keeps the peer's rename"
+        );
+
+        // Frozen for the hold, this machine never saw the rename. Its close, newer
+        // than the peer's write, went out over it and undid the rename everywhere.
+        let mut frozen = base.clone();
+        assert!(pane::remove(&mut frozen.layout, held.id));
+        frozen.instances.retain(|i| i.id != held.id);
+        assert!(!push_overwrites_peer(
+            &peer,
+            Some(&base_key),
+            &frozen.content_key(),
+            300
+        ));
+        assert_eq!(frozen.instances[0].custom_name, None);
     }
 
     #[test]
