@@ -239,7 +239,6 @@ struct RuntimeStatusState {
     working_marker: bool,
     blocked_marker: bool,
     provider_screen: Option<AgentStatus>,
-    composer_present: bool,
     prev_raw: Option<AgentStatus>,
     done_latch: bool,
     completion_armed: bool,
@@ -272,7 +271,6 @@ impl RuntimeStatusState {
             working_marker: false,
             blocked_marker: false,
             provider_screen: None,
-            composer_present: false,
             prev_raw: None,
             done_latch: false,
             completion_armed: false,
@@ -326,7 +324,6 @@ impl RuntimeStatusState {
             self.done_latch = false;
             self.completion_armed = false;
             self.provider_settled = false;
-            self.composer_present = false;
             self.grok_blocked_at = None;
             self.grok_screen_working_at = None;
             self.last_screen_capture = None;
@@ -405,10 +402,8 @@ impl RuntimeStatusState {
         }
         let mut title = sticky_title_status(self.semantic_title_status, observed_title);
 
-        let needs_provider_screen_scan = matches!(
-            title_provider,
-            TitleProvider::Claude | TitleProvider::Codex | TitleProvider::Grok
-        );
+        let needs_provider_screen_scan =
+            matches!(title_provider, TitleProvider::Claude | TitleProvider::Grok);
         let content_generation = session.content_generation();
         let has_visible_sources = !working_markers.is_empty()
             || !blocked_markers.is_empty()
@@ -425,12 +420,19 @@ impl RuntimeStatusState {
                 self.content_generation = content_generation;
                 self.last_screen_capture = Some(now);
                 let captured = session.startup_screen();
-                let (screen, composer_present) = status_screen_context(title_provider, &captured);
-                self.composer_present = composer_present;
-                self.working_marker =
-                    status_marker_matches(title_provider, working_markers, &screen);
-                self.blocked_marker =
-                    status_marker_matches(title_provider, blocked_markers, &screen);
+                let screen = status_screen_context(title_provider, &captured);
+                self.working_marker = status_marker_matches(
+                    title_provider,
+                    working_markers,
+                    CLAUDE_WORKING_MARKERS,
+                    &screen,
+                );
+                self.blocked_marker = status_marker_matches(
+                    title_provider,
+                    blocked_markers,
+                    CLAUDE_BLOCKED_MARKERS,
+                    &screen,
+                );
                 self.provider_screen = provider_screen_status(title_provider, &screen);
             }
             StatusScreenCapture::At(deadline) => next_deadline = Some(deadline),
@@ -441,7 +443,6 @@ impl RuntimeStatusState {
                 self.working_marker = false;
                 self.blocked_marker = false;
                 self.provider_screen = None;
-                self.composer_present = false;
             }
             StatusScreenCapture::None => {}
         }
@@ -521,29 +522,11 @@ impl RuntimeStatusState {
         let hook = (title_provider == TitleProvider::Muse && !exited)
             .then(|| muse_hook_status(self.muse_hook_state, title, screen_working))
             .flatten();
-        let mut raw =
-            hook.unwrap_or_else(|| combine_title_status(exited, base, title, screen_working));
-        let codex_idle_confirmed = title_provider != TitleProvider::Codex
-            || self.semantic_title_status.is_some()
-            || self.composer_present;
-        if !codex_idle_confirmed
-            && !exited
-            && provider_screen.is_none()
-            && matches!(raw, AgentStatus::Idle | AgentStatus::Done)
-            && (submitted_turn
-                || matches!(
-                    self.prev_raw,
-                    Some(AgentStatus::Working | AgentStatus::Blocked)
-                ))
-        {
-            // An unknown modal or partial repaint cannot finish a live Codex
-            // turn. Keep it busy until its editor or owned status returns.
-            raw = AgentStatus::Working;
-        }
+        let raw = hook.unwrap_or_else(|| combine_title_status(exited, base, title, screen_working));
         let can_latch = can_latch_completion(
             !working_markers.is_empty(),
-            self.semantic_title_status.is_some() || needs_provider_screen_scan,
-        ) && codex_idle_confirmed;
+            self.semantic_title_status.is_some(),
+        );
         let raw_reason = if hook == Some(raw) {
             TerminalStatusReason::ProviderHook
         } else {
@@ -888,33 +871,40 @@ fn sticky_title_status(
     observed.or(previous)
 }
 
-/// Exclude the provider's input region before any screen-based status source runs.
-fn status_screen_context(
-    provider: TitleProvider,
-    screen: &crate::startup::Screen,
-) -> (Cow<'_, str>, bool) {
-    let context = match provider {
-        TitleProvider::Claude => screen.claude_status_context(),
-        TitleProvider::Codex => screen.codex_status_context(),
-        _ => None,
-    };
-    let composer_present = context.is_some();
-    (
-        context.map_or_else(|| Cow::Borrowed(screen.text.as_str()), Cow::Owned),
-        composer_present,
-    )
+/// Claude's built-in marker lists, as the app's `default_markers` supplies them
+/// and the seeded Claude preset stores its working list.
+const CLAUDE_WORKING_MARKERS: &[&str] = &["esc to interrupt"];
+const CLAUDE_BLOCKED_MARKERS: &[&str] = &["❯ 1.", "Do you want to proceed"];
+
+/// Leave Claude's input box out of every screen-based status source.
+fn status_screen_context(provider: TitleProvider, screen: &crate::startup::Screen) -> Cow<'_, str> {
+    if provider == TitleProvider::Claude
+        && let Some(context) = screen.claude_status_context()
+    {
+        return Cow::Owned(context);
+    }
+    Cow::Borrowed(&screen.text)
 }
 
-fn status_marker_matches(provider: TitleProvider, markers: &[String], screen: &str) -> bool {
-    markers.iter().any(|marker| {
-        // Claude's built-ins predate the strict UI parser. Quoted prose is not chrome.
-        !(provider == TitleProvider::Claude
-            && matches!(
-                marker.as_str(),
-                "esc to interrupt" | "❯ 1." | "Do you want to proceed"
-            ))
-            && screen.contains(marker)
-    })
+/// Claude's strict UI parsers replace its built-in marker list: quoted prose is
+/// not chrome. Any other list is the user's own and matches as written, even
+/// where it repeats a built-in string. A stored preset can't tell the seeded
+/// list from the same list typed in, so an exact copy counts as the built-in.
+fn status_marker_matches(
+    provider: TitleProvider,
+    markers: &[String],
+    builtin: &[&str],
+    screen: &str,
+) -> bool {
+    let is_builtin = provider == TitleProvider::Claude
+        && markers
+            .iter()
+            .map(String::as_str)
+            .eq(builtin.iter().copied());
+    !is_builtin
+        && markers
+            .iter()
+            .any(|marker| screen.contains(marker.as_str()))
 }
 
 /// Provider-owned visible UI that adds state not carried by the terminal title.
@@ -924,10 +914,6 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
         TitleProvider::Claude if claude_screen_has_current_work(screen) => {
             Some(AgentStatus::Working)
         }
-        TitleProvider::Codex if is_codex_question(screen) || is_codex_approval(screen) => {
-            Some(AgentStatus::Blocked)
-        }
-        TitleProvider::Codex if codex_screen_has_current_work(screen) => Some(AgentStatus::Working),
         TitleProvider::Grok if is_grok_question(screen) => Some(AgentStatus::Blocked),
         TitleProvider::Grok
             if screen.lines().any(|line| {
@@ -945,81 +931,9 @@ fn provider_screen_status(provider: TitleProvider, screen: &str) -> Option<Agent
     }
 }
 
-fn codex_screen_has_current_work(screen: &str) -> bool {
-    let mut rows = screen.lines().rev().filter(|line| !line.trim().is_empty());
-    let Some(footer) = rows.next() else {
-        return false;
-    };
-    if !crate::startup::codex_footer(footer) {
-        return false;
-    }
-    rows.next().is_some_and(|line| {
-        let Some(body) = line.strip_prefix("• ").or_else(|| line.strip_prefix("◦ ")) else {
-            return false;
-        };
-        let Some(elapsed) = body
-            .trim_end()
-            .strip_prefix("Working (")
-            .and_then(|body| body.strip_suffix(" • esc to interrupt)"))
-        else {
-            return false;
-        };
-        is_claude_elapsed(elapsed)
-    })
-}
-
-fn is_codex_question(screen: &str) -> bool {
-    let rows: Vec<_> = screen
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    if rows.last() != Some(&"tab to add notes | enter to submit answer | esc to interrupt") {
-        return false;
-    }
-    let rows = &rows[rows.len().saturating_sub(16)..];
-    let header = rows.iter().any(|row| {
-        let Some((position, pending)) = row.strip_prefix("Question ").and_then(|row| row.split_once(" (")) else { return false; };
-        let Some((index, total)) = position.split_once('/') else { return false; };
-        let Some(pending) = pending.strip_suffix(" unanswered)") else { return false; };
-        matches!((index.parse::<usize>(), total.parse::<usize>(), pending.parse::<usize>()),
-            (Ok(index), Ok(total), Ok(pending)) if index > 0 && index <= total && pending > 0 && pending <= total)
-    });
-    header
-        && rows
-            .iter()
-            .filter(|row| {
-                let row = row.trim_start_matches('›').trim();
-                row.split_once(". ").is_some_and(|(number, label)| {
-                    number.parse::<usize>().is_ok_and(|number| number > 0)
-                        && !label.trim().is_empty()
-                })
-            })
-            .count()
-            >= 2
-}
-
-fn is_codex_approval(screen: &str) -> bool {
-    let rows: Vec<_> = screen
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    rows.last() == Some(&"Press enter to confirm or esc to cancel")
-        && rows.contains(&"Would you like to run the following command?")
-        && rows.iter().any(|row| row.starts_with("$ "))
-        && rows.iter().any(|row| {
-            row.trim_start_matches('›')
-                .trim()
-                .starts_with("1. Yes, proceed")
-        })
-        && rows.iter().any(|row| {
-            row.trim_start_matches('›')
-                .trim()
-                .starts_with("2. No, and tell Codex")
-        })
-}
-
+/// Grok's unanswered question card, read only while the card's own footer is
+/// the screen's last row: a card quoted above the composer is not one. Under a
+/// tmux status bar the card isn't read, and the title's Working stands.
 fn is_grok_question(screen: &str) -> bool {
     let rows: Vec<_> = screen
         .lines()
@@ -6406,7 +6320,24 @@ mod provider_switch_tests {
         };
         use std::time::Instant;
 
-        fn claude_sample(text: &str, cursor_row: usize, cursor_column: usize) -> AgentStatus {
+        fn markers(values: &[&str]) -> Vec<String> {
+            values.iter().map(|value| value.to_string()).collect()
+        }
+
+        /// The marker lists the app supplies for Claude when none are edited.
+        fn builtin() -> (Vec<String>, Vec<String>) {
+            (
+                markers(&["esc to interrupt"]),
+                markers(&["❯ 1.", "Do you want to proceed"]),
+            )
+        }
+
+        fn claude_sample_with(
+            text: &str,
+            (cursor_row, cursor_column): (usize, usize),
+            working: &[String],
+            blocked: &[String],
+        ) -> AgentStatus {
             let (session, _receiver) = fixture();
             session.process_output(
                 format!(
@@ -6421,14 +6352,19 @@ mod provider_switch_tests {
             runtime.reconcile(
                 &session,
                 TitleProvider::Claude,
-                &["esc to interrupt".to_string()],
-                &["❯ 1.".to_string(), "Do you want to proceed".to_string()],
+                working,
+                blocked,
                 false,
                 Instant::now(),
             );
             let status = runtime.snapshot(&session).status;
             session.kill();
             status
+        }
+
+        fn claude_sample(text: &str, cursor_row: usize, cursor_column: usize) -> AgentStatus {
+            let (working, blocked) = builtin();
+            claude_sample_with(text, (cursor_row, cursor_column), &working, &blocked)
         }
 
         #[test]
@@ -6450,42 +6386,41 @@ mod provider_switch_tests {
         }
 
         #[test]
-        fn hidden_composers_cannot_supply_status_or_authorize_input() {
+        fn draft_with_its_own_rule_line_is_still_removed() {
+            // Draft rows sit under the prompt, two columns in. A rule typed
+            // there, even one as long as the box's edges, is not an edge, so
+            // the whole box is still found and left out.
+            let text = "Claude Code\n────────────\n❯ Check this:\n  ────────────\n  Do you want to proceed?\n  1. Yes\n  3. No\n  Esc to cancel\n────────────\n? for shortcuts";
+            assert_eq!(claude_sample(text, 7, 15), AgentStatus::Idle);
+        }
+
+        #[test]
+        fn hidden_composer_cannot_supply_status_or_authorize_input() {
             use crate::startup::Screen;
             use crate::view::{
-                provider_screen_status, status_marker_matches, status_screen_context,
+                CLAUDE_BLOCKED_MARKERS, provider_screen_status, status_marker_matches,
+                status_screen_context,
             };
-            for (provider, text, cursor_row) in [
-                (
-                    TitleProvider::Claude,
-                    "Previous output\n────────────\n❯ Do you want to proceed?\n  1. Yes\n  3. No\n  Esc to cancel\n────────────\n? for shortcuts",
-                    5,
-                ),
-                (
-                    TitleProvider::Codex,
-                    "Previous output\n› Do you want to proceed?\n  • Working (0s • esc to interrupt)\n  custom blocked\n\n  Daybreak Blue low · [project]",
-                    3,
-                ),
-            ] {
-                let screen = Screen {
-                    text: text.to_string(),
-                    cursor_row,
-                    cursor_column: 15,
-                    cursor_visible: false,
-                    bracketed_paste: true,
-                };
-                let (context, composer_present) = status_screen_context(provider, &screen);
-                assert!(composer_present);
-                assert!(!context.contains("Do you want to proceed"));
-                assert_eq!(provider_screen_status(provider, &context), None);
-                assert!(!status_marker_matches(
-                    provider,
-                    &["custom blocked".to_string()],
-                    &context
-                ));
-                assert!(screen.claude_composer_context(false).is_none());
-                assert!(screen.codex_composer_context(false).is_none());
-            }
+            let screen = Screen {
+                text: "Previous output\n────────────\n❯ Do you want to proceed?\n  1. Yes\n  3. No\n  Esc to cancel\n────────────\n? for shortcuts".to_string(),
+                cursor_row: 5,
+                cursor_column: 15,
+                cursor_visible: false,
+                bracketed_paste: true,
+            };
+            let context = status_screen_context(TitleProvider::Claude, &screen);
+            assert!(!context.contains("Do you want to proceed"));
+            assert_eq!(
+                provider_screen_status(TitleProvider::Claude, &context),
+                None
+            );
+            assert!(!status_marker_matches(
+                TitleProvider::Claude,
+                &markers(&["Esc to cancel"]),
+                CLAUDE_BLOCKED_MARKERS,
+                &context
+            ));
+            assert!(screen.claude_composer_context(false).is_none());
         }
 
         #[test]
@@ -6495,73 +6430,61 @@ mod provider_switch_tests {
         }
 
         #[test]
-        fn custom_markers_remain_available_outside_the_composer() {
-            use crate::startup::Screen;
-            use crate::view::{status_marker_matches, status_screen_context};
-            let screen = Screen {
-                text: "custom busy\n────────────\n❯ custom blocked\n────────────\n? for shortcuts"
-                    .to_string(),
-                cursor_row: 2,
-                cursor_column: 16,
-                cursor_visible: true,
-                bracketed_paste: true,
-            };
-            let (context, _) = status_screen_context(TitleProvider::Claude, &screen);
-            assert!(status_marker_matches(
-                TitleProvider::Claude,
-                &["custom busy".to_string()],
-                &context
-            ));
-            assert!(!status_marker_matches(
-                TitleProvider::Claude,
-                &["custom blocked".to_string()],
-                &context
-            ));
+        fn custom_markers_match_as_written_outside_the_input_box() {
+            // Any list but the built-in one is the user's own, even where it
+            // repeats a built-in string.
+            let reply = "The quoted phrase is esc to interrupt\n────────────\n❯ Explain that phrase\n────────────\n? for shortcuts";
+            let busy = markers(&["esc to interrupt", "custom busy"]);
+            assert_eq!(
+                claude_sample_with(reply, (2, 20), &busy, &[]),
+                AgentStatus::Working
+            );
+            let quoted = "Reply quoted: Do you want to proceed?\n────────────\n❯ Explain the phrase\n────────────\n? for shortcuts";
+            let asking = markers(&["Do you want to proceed"]);
+            assert_eq!(
+                claude_sample_with(quoted, (2, 20), &[], &asking),
+                AgentStatus::Blocked
+            );
+            // Inside the input box the user's own marker still doesn't match.
+            let draft =
+                "Earlier output\n────────────\n❯ custom busy\n────────────\n? for shortcuts";
+            assert_eq!(
+                claude_sample_with(draft, (2, 13), &markers(&["custom busy"]), &[]),
+                AgentStatus::Idle
+            );
         }
 
         #[test]
-        fn quoted_question_cards_above_an_idle_composer_do_not_block() {
-            use crate::startup::Screen;
-            use crate::view::{provider_screen_status, status_screen_context};
+        fn grok_question_card_counts_only_while_its_footer_ends_the_screen() {
+            // Grok's input box is not removed. A quoted card above the idle
+            // composer is rejected because the card's footer must be the last row.
+            use crate::view::provider_screen_status;
             let data: serde_json::Value =
                 serde_json::from_str(include_str!("fixtures/provider-state-screens.json")).unwrap();
-            for (provider, kind) in [
-                ("codex", TitleProvider::Codex),
-                ("grok", TitleProvider::Grok),
-            ] {
-                let samples = &data["providers"][provider];
-                let quote = samples["blocked"]["text"].as_str().unwrap();
-                let idle = &samples["idle"];
-                let lines = quote.lines().count() + 1;
-                let screen = Screen {
-                    text: format!("{quote}\n\n{}", idle["text"].as_str().unwrap()),
-                    cursor_row: idle["cursor_row"].as_i64().unwrap() as i32 + lines as i32,
-                    cursor_column: idle["cursor_column"].as_u64().unwrap() as usize,
-                    cursor_visible: true,
-                    bracketed_paste: true,
-                };
-                let (context, _) = status_screen_context(kind, &screen);
-                assert_eq!(provider_screen_status(kind, &context), None, "{provider}");
-            }
+            let samples = &data["providers"]["grok"];
+            let card = samples["blocked"]["text"].as_str().unwrap().trim_end();
+            let idle = samples["idle"]["text"].as_str().unwrap();
+            assert_eq!(
+                provider_screen_status(TitleProvider::Grok, card),
+                Some(AgentStatus::Blocked)
+            );
+            let quoted = format!("{card}\n\n{idle}");
+            assert_eq!(provider_screen_status(TitleProvider::Grok, &quoted), None);
+            // Under a tmux status bar the card isn't read, and the Working
+            // that Grok's title reports stands, as on master.
+            let tmux = format!(
+                "{card}\n[0] 0:grok*                              \"host\" 14:32 29-Oct-26"
+            );
+            assert_eq!(provider_screen_status(TitleProvider::Grok, &tmux), None);
         }
 
         fn provider_fixture(provider: &str, state: &str, expected: AgentStatus) {
-            provider_fixture_with_overlay(provider, state, expected, None);
-        }
-
-        fn provider_fixture_with_overlay(
-            provider: &str,
-            state: &str,
-            expected: AgentStatus,
-            overlay: Option<&str>,
-        ) {
             use crate::session::{CommandSpec, LaunchBinding, TerminalSession};
             use std::time::Duration;
             let data: serde_json::Value =
                 serde_json::from_str(include_str!("fixtures/provider-state-screens.json")).unwrap();
             let provider_kind = match provider {
                 "claude" => TitleProvider::Claude,
-                "codex" => TitleProvider::Codex,
                 "grok" => TitleProvider::Grok,
                 _ => unreachable!(),
             };
@@ -6573,10 +6496,8 @@ mod provider_switch_tests {
             );
             #[cfg(unix)]
             let command = CommandSpec::program("/bin/cat", vec![]);
-            let known = (provider == "codex")
-                .then(|| samples["idle"]["title"].as_str().unwrap().to_string());
             let (session, _receiver) =
-                TerminalSession::spawn(command.with_binding(LaunchBinding::Known(known)), 120, 40)
+                TerminalSession::spawn(command.with_binding(LaunchBinding::Known(None)), 120, 40)
                     .unwrap();
             let draw = |sample: &serde_json::Value| {
                 let mut wire = format!(
@@ -6604,10 +6525,7 @@ mod provider_switch_tests {
                 session.process_output(wire.as_bytes());
             };
             let (working, blocked) = if provider == "claude" {
-                (
-                    vec!["esc to interrupt".to_string()],
-                    vec!["❯ 1.".to_string(), "Do you want to proceed".to_string()],
-                )
+                builtin()
             } else {
                 (vec![], vec![])
             };
@@ -6617,13 +6535,7 @@ mod provider_switch_tests {
             runtime.reconcile(&session, provider_kind, &working, &blocked, false, now);
             if state != "idle" {
                 session.mark_turn_submitted();
-                draw(
-                    &samples[if matches!(state, "done" | "approval") {
-                        "working"
-                    } else {
-                        state
-                    }],
-                );
+                draw(&samples[if state == "done" { "working" } else { state }]);
                 runtime.reconcile(
                     &session,
                     provider_kind,
@@ -6633,38 +6545,8 @@ mod provider_switch_tests {
                     now + Duration::from_millis(100),
                 );
             }
-            if matches!(state, "done" | "approval") {
-                if let Some(text) = overlay {
-                    // A DEC 2026 repaint hides even its clearing operations
-                    // until commit. Neither that boundary nor an empty next
-                    // frame can manufacture completion before the editor returns.
-                    session.process_output(b"\x1b[?2026h\x1b[2J");
-                    runtime.reconcile(
-                        &session,
-                        provider_kind,
-                        &working,
-                        &blocked,
-                        false,
-                        now + Duration::from_millis(150),
-                    );
-                    assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
-                    session.process_output(b"\x1b[?2026l");
-                    runtime.reconcile(
-                        &session,
-                        provider_kind,
-                        &working,
-                        &blocked,
-                        false,
-                        now + Duration::from_millis(175),
-                    );
-                    assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
-                    let mut sample = samples["done"].clone();
-                    sample["text"] = serde_json::json!(text);
-                    sample["cursor_visible"] = serde_json::json!(false);
-                    draw(&sample);
-                } else {
-                    draw(&samples[state]);
-                }
+            if state == "done" {
+                draw(&samples["done"]);
                 runtime.reconcile(
                     &session,
                     provider_kind,
@@ -6679,63 +6561,7 @@ mod provider_switch_tests {
             if state == "done" {
                 assert!(snapshot.completion_ready);
             }
-            if overlay.is_some() {
-                session.process_output(b"\x07");
-                runtime.reconcile(
-                    &session,
-                    provider_kind,
-                    &working,
-                    &blocked,
-                    false,
-                    now + Duration::from_millis(250),
-                );
-                assert_eq!(runtime.snapshot(&session).status, AgentStatus::Working);
-                draw(&samples["done"]);
-                runtime.reconcile(
-                    &session,
-                    provider_kind,
-                    &working,
-                    &blocked,
-                    false,
-                    now + Duration::from_millis(350),
-                );
-                assert_eq!(runtime.snapshot(&session).status, AgentStatus::Done);
-            }
             session.kill();
-        }
-
-        #[test]
-        fn codex_unknown_modal_is_not_completion() {
-            provider_fixture_with_overlay(
-                "codex",
-                "done",
-                AgentStatus::Working,
-                Some("An unrecognized approval or authentication form\nContinue?"),
-            );
-        }
-
-        #[test]
-        fn codex_named_model_fast_footer_keeps_the_live_input_guard() {
-            use crate::startup::Screen;
-            let data: serde_json::Value =
-                serde_json::from_str(include_str!("fixtures/provider-state-screens.json")).unwrap();
-            let idle = &data["providers"]["codex"]["idle"];
-            let mut screen = Screen {
-                text: idle["text"]
-                    .as_str()
-                    .unwrap()
-                    .replace("Daybreak Blue low", "Daybreak Blue low fast"),
-                cursor_row: idle["cursor_row"].as_i64().unwrap() as i32,
-                cursor_column: idle["cursor_column"].as_u64().unwrap() as usize,
-                cursor_visible: true,
-                bracketed_paste: true,
-            };
-            assert!(screen.codex_composer_context(true).is_some());
-            screen.text = screen.text.replace(
-                "Daybreak Blue low fast",
-                "Daybreak Blue low fast · enter continue",
-            );
-            assert!(screen.codex_composer_context(true).is_none());
         }
 
         macro_rules! fixture_test {
@@ -6750,15 +6576,199 @@ mod provider_switch_tests {
         fixture_test!(claude_working_fixture, "claude", "working", Working);
         fixture_test!(claude_blocked_fixture, "claude", "blocked", Blocked);
         fixture_test!(claude_done_fixture, "claude", "done", Done);
-        fixture_test!(codex_idle_fixture, "codex", "idle", Idle);
-        fixture_test!(codex_working_fixture, "codex", "working", Working);
-        fixture_test!(codex_blocked_fixture, "codex", "blocked", Blocked);
-        fixture_test!(codex_done_fixture, "codex", "done", Done);
-        fixture_test!(codex_command_approval_fixture, "codex", "approval", Blocked);
         fixture_test!(grok_idle_fixture, "grok", "idle", Idle);
         fixture_test!(grok_working_fixture, "grok", "working", Working);
         fixture_test!(grok_blocked_fixture, "grok", "blocked", Blocked);
         fixture_test!(grok_done_fixture, "grok", "done", Done);
+    }
+
+    /// Ryan's #111 review scenarios on Codex 0.164, whose title is a bare
+    /// thread UUID and which has no markers. Its screen is not a status
+    /// source, so each sequence reduces exactly as on master: Idle until the
+    /// bell rings, then Done.
+    mod codex_master_parity_tests {
+        use super::{AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TitleProvider};
+        use crate::session::{CommandSpec, LaunchBinding, TerminalSession};
+        use std::time::{Duration, Instant};
+
+        const THREAD: &str = "00000000-0000-4000-8000-000000000001";
+        const DAYBREAK: &str = "Daybreak Blue low · [project]";
+        const SUNSET: &str = "Sunset Gold low · [project]";
+        const BANNER: &str = "\n  >_ OpenAI Codex (v0.164.0)\n     [project]\n";
+        const WORKING: &str = "• Working (0s • esc to interrupt)";
+        const FINISHED: &str = "• B1_OK\n\n  Worked for 3s • 06:53";
+
+        fn editor(footer: &str) -> String {
+            format!("› Ask Codex to do anything\n\n  {footer}")
+        }
+
+        fn idle(footer: &str) -> String {
+            format!("{BANNER}\n{}", editor(footer))
+        }
+
+        /// A turn's screen: the submitted prompt, its activity, then whatever
+        /// Codex draws below that (its editor and footer, or a popup).
+        fn turn(activity: &str, bottom: &str) -> String {
+            format!(
+                "{BANNER}\n› Reply with exactly B1_OK. Do not use tools.\n\n{activity}\n\n{bottom}"
+            )
+        }
+
+        /// Reconcile each `(ms, screen, bell)` step `ms` after the start,
+        /// drawing a non-empty screen and then ringing the bell where marked.
+        /// The turn is submitted after the first step, as its Enter would be.
+        /// Returns each step's status and snapshot sequence.
+        fn reduce(steps: &[(u64, &str, bool)]) -> Vec<(AgentStatus, u64)> {
+            #[cfg(windows)]
+            let command = CommandSpec::program(
+                "cmd.exe",
+                vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+            );
+            #[cfg(unix)]
+            let command = CommandSpec::program("/bin/cat", vec![]);
+            let binding = LaunchBinding::Known(Some(THREAD.to_string()));
+            let (session, _receiver) =
+                TerminalSession::spawn(command.with_binding(binding), 120, 40).unwrap();
+            let mut runtime = RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible);
+            let start = Instant::now();
+            let mut seen = Vec::new();
+            for (index, (ms, screen, bell)) in steps.iter().enumerate() {
+                if index == 1 {
+                    session.mark_turn_submitted();
+                }
+                let mut wire = String::new();
+                if !screen.is_empty() {
+                    wire.push_str(&format!("\x1b[2J\x1b[H\x1b]0;{THREAD}\x07\x1b[?2004h"));
+                    let rows: Vec<_> = screen.lines().collect();
+                    for (row, line) in rows.iter().enumerate() {
+                        wire.push_str(&format!("\x1b[{};1H{line}", row + 1));
+                    }
+                    let editor = rows
+                        .iter()
+                        .rposition(|line| line.starts_with('›'))
+                        .unwrap_or_default();
+                    wire.push_str(&format!("\x1b[{};3H\x1b[?25h", editor + 1));
+                }
+                if *bell {
+                    wire.push('\x07');
+                }
+                session.process_output(wire.as_bytes());
+                runtime.reconcile(
+                    &session,
+                    TitleProvider::Codex,
+                    &[],
+                    &[],
+                    false,
+                    start + Duration::from_millis(*ms),
+                );
+                let snapshot = runtime.snapshot(&session);
+                seen.push((snapshot.status, snapshot.snapshot_seq));
+            }
+            session.kill();
+            seen
+        }
+
+        fn statuses(steps: &[(u64, &str, bool)]) -> Vec<AgentStatus> {
+            reduce(steps)
+                .into_iter()
+                .map(|(status, _)| status)
+                .collect()
+        }
+
+        #[test]
+        fn codex_reasoning_header_stays_idle_as_on_master() {
+            let working = turn(WORKING, &editor(DAYBREAK));
+            let reasoning = turn(
+                "• Exploring the repository (4s • esc to interrupt)",
+                &editor(DAYBREAK),
+            );
+            assert_eq!(
+                statuses(&[
+                    (100, &idle(DAYBREAK), false),
+                    (200, &working, false),
+                    (300, &reasoning, false),
+                    (400, &reasoning, false),
+                ]),
+                [AgentStatus::Idle; 4]
+            );
+        }
+
+        #[test]
+        fn codex_queued_follow_up_row_stays_idle_as_on_master() {
+            let working = turn(WORKING, &editor(DAYBREAK));
+            let queued = turn(
+                "• Working (4s • esc to interrupt)\n\n  ↳ Also update the changelog.",
+                &editor(DAYBREAK),
+            );
+            assert_eq!(
+                statuses(&[
+                    (100, &idle(DAYBREAK), false),
+                    (200, &working, false),
+                    (300, &queued, false),
+                    (400, &queued, false),
+                ]),
+                [AgentStatus::Idle; 4]
+            );
+        }
+
+        #[test]
+        fn codex_unrecognised_model_footer_is_done_on_the_bell_as_on_master() {
+            let working = turn(WORKING, &editor(SUNSET));
+            let finished = turn(FINISHED, &editor(SUNSET));
+            assert_eq!(
+                statuses(&[
+                    (100, &idle(SUNSET), false),
+                    (200, &working, false),
+                    (300, &finished, false),
+                    (400, "", true),
+                    // Ten minutes later, nothing has changed it.
+                    (600_400, "", false),
+                ]),
+                [
+                    AgentStatus::Idle,
+                    AgentStatus::Idle,
+                    AgentStatus::Idle,
+                    AgentStatus::Done,
+                    AgentStatus::Done,
+                ]
+            );
+        }
+
+        #[test]
+        fn codex_popups_after_a_turn_publish_nothing_as_on_master() {
+            let working = turn(WORKING, &editor(DAYBREAK));
+            let finished = turn(FINISHED, &editor(DAYBREAK));
+            let slash = turn(
+                FINISHED,
+                "› /\n\n  /model     choose what model and reasoning effort to use\n  /review    review my current changes and find issues\n  /new       start a new chat during a conversation",
+            );
+            let esc_again = turn(
+                FINISHED,
+                "› Ask Codex to do anything\n\n  esc again to edit previous message",
+            );
+            let ctrl_c = turn(
+                FINISHED,
+                "› Ask Codex to do anything\n\n  ctrl + c again to quit",
+            );
+            let seen = reduce(&[
+                (100, &idle(DAYBREAK), false),
+                (200, &working, false),
+                (300, &finished, false),
+                (400, &slash, false),
+                (500, &esc_again, false),
+                (600, &ctrl_c, false),
+                (700, &finished, false),
+            ]);
+            assert!(
+                seen.iter().all(|(status, _)| *status == AgentStatus::Idle),
+                "{seen:?}"
+            );
+            // Once the turn has finished, no popup publishes a change.
+            assert!(
+                seen[2..].iter().all(|(_, seq)| *seq == seen[2].1),
+                "{seen:?}"
+            );
+        }
     }
 
     fn drained(reads: &[(&str, SystemTime)]) -> PtyOutput {

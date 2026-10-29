@@ -320,13 +320,6 @@ impl Screen {
         )
     }
 
-    /// Status excludes a recognized composer whether it holds a draft or a placeholder.
-    pub(crate) fn codex_status_context(&self) -> Option<String> {
-        let rows: Vec<_> = self.text.lines().collect();
-        let region = self.codex_composer_rows_inner(&rows, None)?;
-        Some(self.context_without_rows(region))
-    }
-
     /// Ctl receipts must exclude the geometry-proven live composer regardless
     /// of its height. The general read-aloud scan has a bounded footer reach;
     /// a long retained draft must never become its own submitted-user receipt.
@@ -565,15 +558,7 @@ impl Screen {
     }
 
     fn codex_composer_rows(&self, rows: &[&str], empty: bool) -> Option<std::ops::Range<usize>> {
-        self.codex_composer_rows_inner(rows, Some(empty))
-    }
-
-    fn codex_composer_rows_inner(
-        &self,
-        rows: &[&str],
-        empty: Option<bool>,
-    ) -> Option<std::ops::Range<usize>> {
-        if (empty.is_some() && !self.cursor_visible) || !self.bracketed_paste {
+        if !self.cursor_visible || !self.bracketed_paste {
             return None;
         }
         let cursor = usize::try_from(self.cursor_row).ok()?;
@@ -585,14 +570,14 @@ impl Screen {
                 .strip_prefix('›')
                 .is_some_and(|after| after.is_empty() || after.starts_with(char::is_whitespace))
         })?;
-        if top >= bottom || (empty.is_some() && (cursor < top || cursor >= bottom)) {
+        if top >= bottom || cursor < top || cursor >= bottom {
             return None;
         }
         let prefix = rows[top]
             .chars()
             .take_while(|ch| ch.is_whitespace())
             .count();
-        if empty.is_some_and(|empty| (cursor == top && self.cursor_column == prefix + 2) != empty) {
+        if (cursor == top && self.cursor_column == prefix + 2) != empty {
             return None;
         }
         Some(top..bottom)
@@ -657,6 +642,8 @@ impl Screen {
         Some(self.context_without_rows(composer))
     }
 
+    /// Status leaves out Claude's input box whether it holds a draft or the
+    /// placeholder, and wherever a repaint left the cursor.
     pub(crate) fn claude_status_context(&self) -> Option<String> {
         let composer = self.composer_rows_inner(None)?;
         Some(self.context_without_rows(composer))
@@ -676,6 +663,8 @@ impl Screen {
         self.composer_rows_inner(Some(empty))
     }
 
+    /// `empty` is the startup-input test, which needs the visible cursor inside
+    /// the box. `None` finds the box for status alone and never grants input.
     fn composer_rows_inner(&self, empty: Option<bool>) -> Option<std::ops::Range<usize>> {
         if !self.bracketed_paste || (empty.is_some() && !self.cursor_visible) {
             return None;
@@ -699,10 +688,15 @@ impl Screen {
                 .map(|offset| cursor + 1 + offset)?;
             (top, bottom)
         } else {
-            // Repaints can leave a hidden cursor on a live status row. The final
-            // framed editor still belongs to the composer, but never grants input.
+            // A repaint can leave the cursor anywhere, so take the final box.
+            // Its edges are the same full-width rule. Draft rows are drawn
+            // under the prompt, two columns in, so a rule typed into a draft
+            // never matches an edge and can't cut the box short.
             let bottom = rows.iter().rposition(|row| rule(row))?;
-            let top = rows[..bottom].iter().rposition(|row| rule(row))?;
+            let edge = rows[bottom].trim_end();
+            let top = rows[..bottom]
+                .iter()
+                .rposition(|row| row.trim_end() == edge)?;
             (top, bottom)
         };
         // The final framed region belongs to the composer, not an earlier turn.
@@ -731,7 +725,7 @@ impl Screen {
 /// so a status line must open with a model-like token and no later segment may
 /// read as a key hint. A segment that merely is such a word (a project folder
 /// named `continue`) is not one.
-pub(crate) fn codex_footer(row: &str) -> bool {
+fn codex_footer(row: &str) -> bool {
     let row = row.trim();
     if row.starts_with("? for shortcuts") || row.contains("% context left") {
         return true;
@@ -754,16 +748,7 @@ pub(crate) fn codex_footer(row: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
         && (openai || id.bytes().any(|b| b.is_ascii_digit()));
     let mut rest = segments.peekable();
-    // Codex 0.164 can display a named model instead of its machine-readable id.
-    let named_model = row.split(" · ").next().is_some_and(|model| {
-        model.strip_prefix("Daybreak Blue ").is_some_and(|effort| {
-            !effort.is_empty()
-                && effort
-                    .split_whitespace()
-                    .all(|word| word.bytes().all(|byte| byte.is_ascii_lowercase()))
-        })
-    });
-    (model_like || named_model) && rest.peek().is_some() && !rest.any(key_hint)
+    model_like && rest.peek().is_some() && !rest.any(key_hint)
 }
 
 /// `enter to confirm`, `esc quit`, `press enter …`, `ctrl+t transcript`,
@@ -1388,6 +1373,21 @@ mod tests {
         );
         assert!(!draft.claude_composer(true));
         assert!(draft.claude_composer(false));
+    }
+    #[test]
+    fn status_box_edges_ignore_a_rule_typed_into_the_draft() {
+        let mut draft = screen(
+            "Claude Code\n────────────\n❯ Check this:\n  ────────────\n  Esc to cancel\n────────────\nmode",
+            4,
+            15,
+        );
+        draft.cursor_visible = false;
+        assert_eq!(
+            draft.claude_status_context().as_deref(),
+            Some("Claude Code\n────────────\n────────────\nmode")
+        );
+        // Neither status nor a hidden cursor grants startup input.
+        assert!(!draft.claude_composer(false));
     }
     #[test]
     fn trust_choice_quoted_transcript_and_wrong_terminal_modes_are_not_ready() {
