@@ -21,6 +21,7 @@ pub mod outage;
 mod pane;
 pub mod path_paste;
 pub mod readaloud;
+pub mod recoverable_close;
 pub mod remote_ops;
 pub mod session_discovery;
 mod shell;

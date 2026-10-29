@@ -339,12 +339,19 @@ pub fn attach_parent_console() {
 }
 
 fn fail(error: control::Error, status: i32) -> i32 {
-    let reply = match error.code {
-        Some(code) => json!({ "ok": false, "code": code, "error": error.message }),
-        None => json!({ "ok": false, "error": error.message }),
-    };
-    emit(&with_host(reply).to_string());
+    emit(&failure_reply(error).to_string());
     status
+}
+
+fn failure_reply(error: control::Error) -> Value {
+    let mut reply = json!({ "ok": false, "error": error.message });
+    if let Some(code) = error.code {
+        reply["code"] = json!(code);
+    }
+    if let Some(undo_until) = error.undo_until {
+        reply["undo_until"] = json!(undo_until);
+    }
+    with_host(reply)
 }
 
 /// Print one reply. A reader that stops early (`muxel ctl panes | head`, `grep
@@ -621,7 +628,7 @@ fn wait(agent: &str, timeout: Duration, full: bool) -> Result<Value, control::Er
 #[cfg(test)]
 mod tests {
     use super::{
-        Server, dispatch, process_alive, read_endpoint, request_at, same_secret,
+        Server, dispatch, failure_reply, process_alive, read_endpoint, request_at, same_secret,
         wait_creation_with, write_endpoint,
     };
     use muxel_core::control::{self, Command, Endpoint, ErrorCode, PROTOCOL_VERSION, Response};
@@ -633,6 +640,57 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("muxel-ctl-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_closing_refusal_keeps_its_deadline_through_socket_and_cli_json() {
+        let dir = scratch("closing");
+        let (tx, rx) = async_channel::unbounded();
+        let server = Server::start_in(&dir, tx).unwrap();
+        let deadline = 1_800_000_000_015;
+        let app = std::thread::spawn(move || {
+            let incoming = rx.recv_blocking().unwrap();
+            assert!(matches!(incoming.command, Command::Keys { .. }));
+            incoming
+                .reply
+                .send(Response::err(control::Error::closing(deadline)))
+                .unwrap();
+        });
+        let error = request_at(
+            &dir.join(control::ENDPOINT_FILE),
+            Command::Keys {
+                agent: "claude".into(),
+                keys: vec!["enter".into()],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, Some(ErrorCode::Closing));
+        assert_eq!(error.undo_until, Some(deadline));
+        let json = failure_reply(error);
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["code"], "closing");
+        assert_eq!(json["undo_until"], deadline);
+        assert!(json["host"].is_string());
+        let decoded: Response = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            decoded.into_result().unwrap_err().undo_until,
+            Some(deadline)
+        );
+        app.join().unwrap();
+        drop(server);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cli_failures_without_an_undo_deadline_omit_the_field() {
+        for error in [
+            control::Error::new(ErrorCode::Working, "busy"),
+            control::Error::from("no match"),
+        ] {
+            let reply = failure_reply(error);
+            assert!(reply.get("undo_until").is_none());
+            assert!(reply.get("result").is_none());
+        }
     }
 
     #[test]

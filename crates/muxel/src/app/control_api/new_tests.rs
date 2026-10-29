@@ -763,7 +763,7 @@ fn control_write_policy_remote_agents_need_no_local_installation() {
 fn control_new_policy_write_entry_points_recheck_permission() {
     let source = include_str!("../control_api.rs");
     let write_boundary = source
-        .split("    fn control_writable(")
+        .split("fn control_writable(")
         .nth(1)
         .unwrap()
         .split("    fn control_claim_site(")
@@ -1043,7 +1043,7 @@ fn control_new_policy_production_queue_enters_the_tested_mutation_boundary() {
     assert!(compact.contains("app.control_new(prepared.pid,prepared.options,approved,window,cx)"));
     assert!(!queue.contains("place_and_spawn"));
     let write_boundary = source
-        .split("    fn control_writable(")
+        .split("fn control_writable(")
         .nth(1)
         .unwrap()
         .split("    fn control_claim_site(")

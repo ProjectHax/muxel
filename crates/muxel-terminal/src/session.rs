@@ -30,6 +30,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
+#[path = "input_hold.rs"]
+mod input_hold;
+use input_hold::{InputGate, ShellMarks, ShellPrompt};
+
 type SharedChildKiller = Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>;
 
 /// Identity and timestamp attached to one PTY read while profiling is enabled.
@@ -864,6 +868,54 @@ const NO_MOUSE_PRESS: u8 = u8::MAX;
 struct QueuedWrite {
     bytes: Vec<u8>,
     queued_at: Option<Instant>,
+    /// Protocol query replies have no actor epoch and keep flowing while held.
+    epoch: Option<u64>,
+}
+
+impl QueuedWrite {
+    fn admitted(&self, gate: &InputGate) -> bool {
+        self.epoch.is_none_or(|epoch| gate.accepts(epoch))
+    }
+}
+
+#[cfg(test)]
+mod input_hold_queue_tests {
+    use super::{ChannelWriter, InputGate, QueuedWrite};
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn queued_ctl_writes_die_with_the_close_even_after_undo() {
+        let gate = Arc::new(InputGate::default());
+        let (tx, rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
+        let mut actor = ChannelWriter {
+            tx: tx.clone(),
+            profile: false,
+            closed: Arc::new(AtomicBool::new(false)),
+            gate: Some(gate.clone()),
+        };
+        let mut protocol = ChannelWriter {
+            tx,
+            profile: false,
+            closed: actor.closed.clone(),
+            gate: None,
+        };
+        actor.write_all(b"queued keys").unwrap();
+        actor.write_all(b"\r").unwrap();
+        gate.hold();
+        assert!(actor.write_all(b"held").is_err());
+        protocol.write_all(b"\x1b[0n").unwrap();
+        gate.resume();
+        actor.write_all(b"new input").unwrap();
+        let accepted: Vec<_> = rx
+            .try_iter()
+            .flatten()
+            .filter(|write| write.admitted(&gate))
+            .map(|write| write.bytes)
+            .collect();
+        assert_eq!(accepted, [b"\x1b[0n".to_vec(), b"new input".to_vec()]);
+    }
 }
 
 fn queue_delay_excluding_profiler(
@@ -884,6 +936,7 @@ struct ChannelWriter {
     tx: std::sync::mpsc::Sender<Option<QueuedWrite>>,
     profile: bool,
     closed: Arc<AtomicBool>,
+    gate: Option<Arc<InputGate>>,
 }
 
 impl Write for ChannelWriter {
@@ -894,10 +947,23 @@ impl Write for ChannelWriter {
                 "pty child exited",
             ));
         }
+        let epoch = self.gate.as_ref().map(|gate| gate.epoch());
+        if self
+            .gate
+            .as_ref()
+            .zip(epoch)
+            .is_some_and(|(gate, epoch)| !gate.accepts(epoch))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "terminal is closing",
+            ));
+        }
         self.tx
             .send(Some(QueuedWrite {
                 bytes: buf.to_vec(),
                 queued_at: self.profile.then(Instant::now),
+                epoch,
             }))
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty writer gone"))?;
         Ok(buf.len())
@@ -1152,6 +1218,8 @@ pub struct TerminalSession {
     /// on Unix the reader harvests the child status after EOF.
     killer: SharedChildKiller,
     input_closed: Arc<AtomicBool>,
+    input_gate: Arc<InputGate>,
+    shell_prompt: Arc<ShellPrompt>,
     input_stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
     /// The PTY child's pid (the shell/agent), captured at spawn. Compared against
     /// the terminal's foreground process group to tell whether the child is idle
@@ -1502,6 +1570,9 @@ impl TerminalSession {
         let profile_writes = instance_id.filter(|_| crate::profile::is_enabled());
         let (write_tx, write_rx) = std::sync::mpsc::channel::<Option<QueuedWrite>>();
         let input_closed = Arc::new(AtomicBool::new(false));
+        let input_gate = Arc::new(InputGate::default());
+        let worker_gate = input_gate.clone();
+        let shell_prompt = Arc::new(ShellPrompt::default());
         let worker_closed = input_closed.clone();
         let writer_handle = std::thread::Builder::new()
             .name("muxel-pty-writer".to_string())
@@ -1521,6 +1592,9 @@ impl TerminalSession {
                         )
                     });
                     let write_started = write.queued_at.map(|_| Instant::now());
+                    if !write.admitted(&worker_gate) {
+                        continue;
+                    }
                     let result = pipe_writer.write_all(&write.bytes);
                     if result.is_ok() {
                         let _ = pipe_writer.flush();
@@ -1547,6 +1621,7 @@ impl TerminalSession {
             tx: write_tx.clone(),
             profile: profile_writes.is_some(),
             closed: input_closed.clone(),
+            gate: Some(input_gate.clone()),
         })));
         // The Windows slave shares ConPTY ownership with the master. Release
         // it before the monitor can close the console after a fast child exit.
@@ -1567,7 +1642,13 @@ impl TerminalSession {
 
         let palette = Arc::new(Mutex::new(TerminalPalette::default()));
         let term_config = term_config();
-        let replies = Arc::new(Replies::new(writer.clone()));
+        let reply_writer: SharedWriter = Arc::new(Mutex::new(Box::new(ChannelWriter {
+            tx: write_tx.clone(),
+            profile: profile_writes.is_some(),
+            closed: input_closed.clone(),
+            gate: None,
+        })));
+        let replies = Arc::new(Replies::new(reply_writer));
         let immediate_replies =
             ImmediateReplies::new(replies.clone(), palette.clone(), &term_config);
         let output_queue = tx.queue_state();
@@ -1578,6 +1659,7 @@ impl TerminalSession {
             .spawn({
                 let input_closed = input_closed.clone();
                 let input_stop = write_tx.clone();
+                let shell_prompt = shell_prompt.clone();
                 move || {
                     read_loop(
                         reader,
@@ -1589,6 +1671,7 @@ impl TerminalSession {
                         InputShutdown {
                             closed: input_closed,
                             stop: input_stop,
+                            shell_prompt,
                         },
                     )
                 }
@@ -1664,6 +1747,8 @@ impl TerminalSession {
             output_queue,
             killer,
             input_closed,
+            input_gate,
+            shell_prompt,
             input_stop: write_tx,
             child_pid,
             title,
@@ -1995,6 +2080,12 @@ impl TerminalSession {
     /// PTY. An error means the terminal's writer is gone (its program exited and
     /// a write has already failed); `Ok` only means the bytes were queued.
     pub fn try_write_input(&self, data: &[u8]) -> std::io::Result<()> {
+        if !self.accepts_input_epoch(self.input_epoch()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "terminal is closing",
+            ));
+        }
         self.scroll_input_to_bottom();
         if !data.is_empty() {
             let submitted_enter = self.submission_pending.swap(false, Ordering::AcqRel);
@@ -2006,7 +2097,9 @@ impl TerminalSession {
             // interaction window even if stream output is already queued.
             self.mark_interactive();
         }
-        self.try_write_raw(data)
+        self.try_write_raw(data)?;
+        self.shell_prompt.submitted(data);
+        Ok(())
     }
 
     /// Admit a complete submission (Enter, or text ending in Enter) and commit
@@ -2014,6 +2107,12 @@ impl TerminalSession {
     /// submission evidence unchanged, with no marker for a later key to consume.
     /// Success means queued bytes, not confirmation that the child consumed them.
     pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
+        if !self.accepts_input_epoch(self.input_epoch()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "terminal is closing",
+            ));
+        }
         self.scroll_input_to_bottom();
         let mut writer = self.writer.lock();
         // The child can react as soon as write_all publishes bytes. Keep the
@@ -2023,6 +2122,7 @@ impl TerminalSession {
         self.submission_pending.store(false, Ordering::Release);
         writer.write_all(data)?;
         writer.flush()?;
+        self.shell_prompt.submitted(data);
         if !data.is_empty() {
             self.evidence.lock().record_submission(submitted_at);
             self.turn_submitted.store(true, Ordering::Relaxed);
@@ -2050,6 +2150,30 @@ impl TerminalSession {
     /// Input from another client of the same tmux session is not counted.
     pub fn input_rev(&self) -> u64 {
         self.input_snapshot().0
+    }
+
+    /// Hide-time cancellation: old queued input stays invalid after Undo.
+    pub fn hold_input(&self) {
+        self.input_gate.hold();
+        self.submission_pending.store(false, Ordering::Release);
+    }
+
+    pub fn resume_input(&self) {
+        self.input_gate.resume();
+    }
+
+    pub fn input_epoch(&self) -> u64 {
+        self.input_gate.epoch()
+    }
+
+    pub fn accepts_input_epoch(&self, epoch: u64) -> bool {
+        self.input_gate.accepts(epoch)
+    }
+
+    /// Only launch-local OSC 133 A/B establish a shell prompt. No output means
+    /// unknown, including Windows shells without shell integration.
+    pub fn shell_at_prompt(&self) -> bool {
+        self.shell_prompt.at_prompt()
     }
 
     /// [`Self::write_input`] for input the user produced themselves — a key typed
@@ -2103,6 +2227,9 @@ impl TerminalSession {
     /// Announce that the next input write submits a turn. Call it just before
     /// writing the Enter (or the text ending in one).
     pub fn mark_turn_submitted(&self) {
+        if !self.accepts_input_epoch(self.input_epoch()) {
+            return;
+        }
         self.evidence.lock().record_submission(SystemTime::now());
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.submission_pending.store(true, Ordering::Release);
@@ -2196,6 +2323,9 @@ impl TerminalSession {
     /// advances the input revision, but it isn't text: the draft bit and the
     /// scroll position stay as they were.
     fn write_pointer(&self, data: &[u8]) {
+        if !self.accepts_input_epoch(self.input_epoch()) {
+            return;
+        }
         if !data.is_empty() {
             self.advance_input(None);
         }
@@ -3624,11 +3754,12 @@ impl HangupChild {
     }
 }
 
-/// The writer's existing closed flag and stop channel, handed to the reader
-/// together so ending its stream stops input before reaping the child.
+/// Shared input state handed to the reader. Ending its stream stops input
+/// before reaping the child; OSC 133 evidence is observed before UI admission.
 struct InputShutdown {
     closed: Arc<AtomicBool>,
     stop: std::sync::mpsc::Sender<Option<QueuedWrite>>,
+    shell_prompt: Arc<ShellPrompt>,
 }
 
 /// Drain PTY output before publishing Exit. Windows gets child status from a
@@ -3647,6 +3778,7 @@ fn read_loop(
     #[cfg(unix)]
     let mut child = HangupChild::new(child, tx.queue_state());
     let mut buf = [0u8; PTY_READ_BUFFER_BYTES];
+    let mut shell_marks = ShellMarks::default();
     // Only a clean EOF or a real error ends the session. EINTR is a signal
     // interruption, not an exit — retrying it keeps a healthy pane from being
     // torn down. Any other error is recorded so the app can log/show it.
@@ -3688,6 +3820,7 @@ fn read_loop(
                 // Before the bytes reach the UI: replies that wait on the UI's
                 // drain can miss the asker's window and be read as typing.
                 immediate_replies.advance(&buf[..n]);
+                shell_marks.advance(&buf[..n], &input_shutdown.shell_prompt);
                 if !tx.send_output(buf[..n].to_vec(), timing, read_at) {
                     // The stream has ended: the receiver dropped, or the
                     // session dropped while the receiver was behind. Stop the

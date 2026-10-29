@@ -105,8 +105,27 @@ feature is added or changed, update the matching entry here in the same change**
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
   button returns it to its original location. Re-docking a working agent clears
   that pane's stale finished or needs-input card.
-- **Close terminates** — closing a pop-out window kills its terminal (with a
-  confirmation). Editors and browser panes just close.
+- **Recoverable terminal close** — a closed terminal stays alive, hidden, for
+  15 seconds. The title-bar chip or Ctrl+Alt+Z restores its tabs and live process;
+  a popped-out terminal returns to the main window. Busy or uncertain terminals
+  ask first; confirmed busy closes still get Undo. Quiet closes recheck launch,
+  binding, input and completion before expiry; changed work gets Close / Keep.
+  Batch closes offer Close all, Close only the idle ones, or Cancel. Queued input
+  is cancelled across close and Undo, and hidden panes leave ctl listings;
+  writes refuse with `closing` and `undo_until`. A shell counts down only with
+  prompt evidence, so local tmux shells on Unix, which can't pass OSC 133
+  through, always ask.
+- **Resource and worktree close** — dirty editors offer Save / Don't Save /
+  Cancel; clean editors, diffs and browsers close immediately. The last pane of
+  a muxel worktree with changes or unmerged commits uses its disposal choice
+  directly; a clean, landed worktree follows the terminal countdown policy. A
+  pane opened in that worktree while its question is showing gets its own
+  prompt and countdown, and a pane brought back by Undo leaves the question.
+  Client checks show progress, beside any running countdown, with their own
+  Cancel; a batch member closed during the check leaves the others to their
+  decision. Ordinary saves preserve held panes for crash recovery; workspace
+  switch and quit finalize them. If that save fails, the first switch stops
+  with a notice and the next one leaves anyway; the pane reopens next time.
 - **Workspace changes** — switching workspaces closes the previous workspace's
   pop-out and per-monitor project windows without interrupting the switch.
 

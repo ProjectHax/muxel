@@ -241,6 +241,10 @@ struct RuntimeStatusState {
     prev_raw: Option<AgentStatus>,
     done_latch: bool,
     completion_armed: bool,
+    /// Fresh completion edges observed during this PTY launch, including
+    /// title round trips coalesced into a single UI drain. Never reset on a
+    /// provider binding change; the held-close checkpoint spans that change.
+    completion_revision: u64,
     provider_settled: bool,
     completion_ready: bool,
     semantic_title_status: Option<AgentStatus>,
@@ -273,6 +277,7 @@ impl RuntimeStatusState {
             prev_raw: None,
             done_latch: false,
             completion_armed: false,
+            completion_revision: 0,
             provider_settled: false,
             completion_ready: false,
             semantic_title_status: None,
@@ -374,10 +379,25 @@ impl RuntimeStatusState {
         }
 
         let mut working_to_nonworking = false;
+        let mut title_completions = 0_u64;
         if !title_overflowed {
             let statuses = title_status_trace(title_provider, muse_cwd_label, &title_events);
             working_to_nonworking = has_working_to_nonworking_edge(&statuses);
+            let (mut previous, mut latched, mut armed) =
+                (self.prev_raw, self.done_latch, self.completion_armed);
             for status in statuses {
+                // Observe the existing latch rules over each ordered edge,
+                // without changing the reducer's level/debounce decisions.
+                let (_, next_latch, next_armed) = latch_done_after_readiness(
+                    previous,
+                    status,
+                    latched,
+                    true,
+                    armed,
+                    submitted_turn,
+                );
+                title_completions += u64::from(next_latch && !latched);
+                (previous, latched, armed) = (Some(status), next_latch, next_armed);
                 self.provider_settled = provider_settled_after_title(
                     self.provider_settled,
                     Some(status),
@@ -543,6 +563,17 @@ impl RuntimeStatusState {
             // it disappears. Keep the new binding's explicit submission only.
             (raw, false, submitted_turn)
         };
+        // Title, marker, hook and bell evidence can describe the same edge.
+        // Count it once; retain additional title completions from this batch.
+        let mut completions = if raw_attributable {
+            title_completions.max(u64::from(latch && !self.done_latch))
+        } else {
+            0
+        };
+        if exited && self.reason != TerminalStatusReason::ProcessExit {
+            completions = completions.max(1);
+        }
+        self.completion_revision = self.completion_revision.wrapping_add(completions);
         self.prev_raw = raw_attributable.then_some(raw);
         self.done_latch = latch;
         self.completion_armed = armed;
@@ -577,6 +608,7 @@ impl RuntimeStatusState {
             || reason != self.reason
             || attributable != self.attributable
             || binding_changed
+            || completions > 0
             || completion_ready != self.completion_ready;
         if public_changed {
             self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
@@ -2133,6 +2165,7 @@ fn controlled_startup_deadline(startup_delay_ms: u32, auto_mode_presses: u8) -> 
 /// The terminal side of [`quiet_startup`], so its timing can be tested
 /// without a PTY.
 trait QuietStartupTarget {
+    fn accepts_input_epoch(&self, epoch: u64) -> bool;
     fn has_output(&self) -> bool;
     fn idle_for(&self) -> Duration;
     fn write_input(&self, data: &[u8]);
@@ -2141,6 +2174,9 @@ trait QuietStartupTarget {
 }
 
 impl QuietStartupTarget for TerminalSession {
+    fn accepts_input_epoch(&self, epoch: u64) -> bool {
+        TerminalSession::accepts_input_epoch(self, epoch)
+    }
     fn has_output(&self) -> bool {
         TerminalSession::has_output(self)
     }
@@ -2178,14 +2214,21 @@ struct QuietStartup {
 /// so this works the same under tmux, for any agent and any Codex footer.
 async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Output = ()>>(
     target: &T,
+    input_epoch: u64,
     mut timer: impl FnMut(u64) -> F,
     plan: QuietStartup,
     mut event: impl FnMut(&'static str, usize),
 ) {
+    if !target.accepts_input_epoch(input_epoch) {
+        return;
+    }
     // Wait for the agent's first output (it has started up).
     let mut waited = 0u64;
     while !target.has_output() && waited < STARTUP_MAX_WAIT_MS {
         timer(STARTUP_POLL_MS).await;
+        if !target.accepts_input_epoch(input_epoch) {
+            return;
+        }
         waited += STARTUP_POLL_MS;
     }
     event("automation-first-output", 0);
@@ -2193,10 +2236,16 @@ async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Ou
         // Preset-configured fixed delay after first output — for agents that
         // keep loading well past their first draw (e.g. opencode).
         timer(plan.startup_delay_ms as u64).await;
+        if !target.accepts_input_epoch(input_epoch) {
+            return;
+        }
     } else {
         // Auto: wait until output goes quiet (UI finished drawing).
         while waited < STARTUP_MAX_WAIT_MS && target.idle_for().as_millis() < STARTUP_SETTLE_MS {
             timer(STARTUP_POLL_MS).await;
+            if !target.accepts_input_epoch(input_epoch) {
+                return;
+            }
             waited += STARTUP_POLL_MS;
         }
     }
@@ -2204,19 +2253,31 @@ async fn quiet_startup<T: QuietStartupTarget + ?Sized, F: std::future::Future<Ou
     for _ in 0..plan.auto_mode_presses {
         target.write_input(SHIFT_TAB);
         timer(STARTUP_KEY_GAP_MS).await;
+        if !target.accepts_input_epoch(input_epoch) {
+            return;
+        }
     }
     // Confirm the mode switch with a single Enter.
     if plan.auto_mode_presses > 0 {
         target.write_input(b"\r");
         timer(STARTUP_KEY_GAP_MS).await;
+        if !target.accepts_input_epoch(input_epoch) {
+            return;
+        }
     }
     if let Some(input) = plan.input {
         timer(STARTUP_PRE_TYPE_MS).await;
+        if !target.accepts_input_epoch(input_epoch) {
+            return;
+        }
         target.paste(&input);
         event("automation-pasted", input.len());
         // On restore, leave the prompt typed but unsubmitted.
         if plan.submit {
             timer(STARTUP_SUBMIT_DELAY_MS).await;
+            if !target.accepts_input_epoch(input_epoch) {
+                return;
+            }
             target.mark_turn_submitted();
             target.write_input(b"\r");
             event("automation-submitted", 1);
@@ -2792,6 +2853,9 @@ impl TerminalView {
             .detach();
         } else if auto_mode_presses > 0 || startup_input.is_some() {
             let session = session.clone();
+            // Capture before queuing the future: a close/Undo can happen
+            // before its first poll as well as between its timed writes.
+            let input_epoch = session.input_epoch();
             let automation_program = startup_program.clone();
             let plan = QuietStartup {
                 input: startup_input,
@@ -2803,6 +2867,7 @@ impl TerminalView {
                 let executor = cx.background_executor().clone();
                 quiet_startup(
                     &*session,
+                    input_epoch,
                     |ms| executor.timer(Duration::from_millis(ms)),
                     plan,
                     |phase, bytes| {
@@ -3260,6 +3325,12 @@ impl TerminalView {
 
     pub fn runtime_snapshot(&self) -> TerminalRuntimeSnapshot {
         self.runtime.snapshot(&self.session)
+    }
+
+    /// Fresh completion edges observed in this PTY launch. Cached reads do
+    /// not advance it; provider binding changes preserve the launch history.
+    pub fn completion_revision(&self) -> u64 {
+        self.runtime.completion_revision
     }
 
     /// Pure immutable projection used by render/sidebar callers.
@@ -4045,6 +4116,7 @@ mod startup_readiness_tests {
 
     struct FakeUi {
         clock: std::rc::Rc<std::cell::Cell<u64>>,
+        epoch_session: Option<std::sync::Arc<crate::session::TerminalSession>>,
         output_at: Option<u64>,
         never_quiet: bool,
         writes: std::cell::RefCell<Vec<(u64, Vec<u8>)>>,
@@ -4052,6 +4124,11 @@ mod startup_readiness_tests {
     }
 
     impl QuietStartupTarget for FakeUi {
+        fn accepts_input_epoch(&self, epoch: u64) -> bool {
+            self.epoch_session
+                .as_ref()
+                .map_or(epoch == 0, |session| session.accepts_input_epoch(epoch))
+        }
         fn has_output(&self) -> bool {
             self.output_at.is_some_and(|at| self.clock.get() >= at)
         }
@@ -4093,6 +4170,7 @@ mod startup_readiness_tests {
         let clock = std::rc::Rc::new(std::cell::Cell::new(0));
         let ui = FakeUi {
             clock: clock.clone(),
+            epoch_session: None,
             output_at,
             never_quiet,
             writes: Default::default(),
@@ -4101,6 +4179,7 @@ mod startup_readiness_tests {
         let mut events = Vec::new();
         run_now(quiet_startup(
             &ui,
+            0,
             |ms| {
                 clock.set(clock.get() + ms);
                 std::future::ready(())
@@ -4114,6 +4193,143 @@ mod startup_readiness_tests {
             |phase, _| events.push(phase),
         ));
         (ui.writes.into_inner(), ui.submitted.get(), events)
+    }
+
+    #[test]
+    fn quiet_startup_hold_and_undo_drop_old_enter_but_allow_a_fresh_run() {
+        #[cfg(windows)]
+        let spec = crate::session::CommandSpec::program(
+            "cmd.exe",
+            vec!["/d".into(), "/q".into(), "/c".into(), "more".into()],
+        );
+        #[cfg(unix)]
+        let spec = crate::session::CommandSpec::program("/bin/cat", vec![]);
+        let (session, _receiver) = crate::session::TerminalSession::spawn(spec, 80, 24).unwrap();
+        let clock = std::rc::Rc::new(std::cell::Cell::new(0));
+        let ui = FakeUi {
+            clock: clock.clone(),
+            epoch_session: Some(session.clone()),
+            output_at: Some(0),
+            never_quiet: false,
+            writes: Default::default(),
+            submitted: Default::default(),
+        };
+        let plan = || QuietStartup {
+            input: Some("review the diff".into()),
+            auto_mode_presses: 0,
+            startup_delay_ms: 0,
+            submit: true,
+        };
+        let admitted_epoch = session.input_epoch();
+        let mut events = Vec::new();
+        run_now(quiet_startup(
+            &ui,
+            admitted_epoch,
+            |ms| {
+                clock.set(clock.get() + ms);
+                if ms == STARTUP_SUBMIT_DELAY_MS {
+                    assert_eq!(ui.writes.borrow().last().unwrap().1, b"review the diff");
+                    session.hold_input();
+                    session.resume_input();
+                }
+                std::future::ready(())
+            },
+            plan(),
+            |phase, _| events.push(phase),
+        ));
+        assert_eq!(
+            ui.writes
+                .borrow()
+                .iter()
+                .map(|(_, bytes)| bytes.clone())
+                .collect::<Vec<_>>(),
+            [b"review the diff".to_vec()]
+        );
+        assert!(!ui.submitted.get());
+        assert!(!events.contains(&"automation-submitted"));
+
+        // New automation admitted after Undo uses the new epoch and completes.
+        ui.writes.borrow_mut().clear();
+        run_now(quiet_startup(
+            &ui,
+            session.input_epoch(),
+            |ms| {
+                clock.set(clock.get() + ms);
+                std::future::ready(())
+            },
+            plan(),
+            |_, _| {},
+        ));
+        assert_eq!(
+            ui.writes
+                .borrow()
+                .iter()
+                .map(|(_, bytes)| bytes.clone())
+                .collect::<Vec<_>>(),
+            [b"review the diff".to_vec(), b"\r".to_vec()]
+        );
+        assert!(ui.submitted.get());
+
+        // Capture at admission, rather than first poll of a queued future.
+        ui.writes.borrow_mut().clear();
+        ui.submitted.set(false);
+        let queued_epoch = session.input_epoch();
+        session.hold_input();
+        session.resume_input();
+        run_now(quiet_startup(
+            &ui,
+            queued_epoch,
+            |ms| {
+                clock.set(clock.get() + ms);
+                std::future::ready(())
+            },
+            plan(),
+            |_, _| {},
+        ));
+        assert!(ui.writes.borrow().is_empty());
+        assert!(!ui.submitted.get());
+
+        // Each later timer is a distinct actor-write boundary: the next
+        // Shift+Tab, mode Enter, paste, and submission Enter all stay cancelled.
+        let full_sequence = [SHIFT_TAB, SHIFT_TAB, b"\r", b"review the diff", b"\r"];
+        for (cancel_at, expected_writes) in [(1, 1), (2, 2), (3, 3), (4, 3), (5, 4)] {
+            clock.set(100_000);
+            ui.writes.borrow_mut().clear();
+            ui.submitted.set(false);
+            let mut waits = 0;
+            run_now(quiet_startup(
+                &ui,
+                session.input_epoch(),
+                |ms| {
+                    clock.set(clock.get() + ms);
+                    waits += 1;
+                    if waits == cancel_at {
+                        session.hold_input();
+                        session.resume_input();
+                    }
+                    std::future::ready(())
+                },
+                QuietStartup {
+                    auto_mode_presses: 2,
+                    ..plan()
+                },
+                |_, _| {},
+            ));
+            assert_eq!(
+                ui.writes
+                    .borrow()
+                    .iter()
+                    .map(|(_, bytes)| bytes.clone())
+                    .collect::<Vec<_>>(),
+                full_sequence[..expected_writes]
+                    .iter()
+                    .map(|bytes| bytes.to_vec())
+                    .collect::<Vec<_>>(),
+                "cancellation at delay {cancel_at}",
+            );
+            assert!(!ui.submitted.get());
+        }
+        session.kill();
     }
 
     #[test]
@@ -6887,6 +7103,105 @@ mod provider_switch_tests {
             )]));
             assert_eq!(viewer.sample(&session), (AgentStatus::Done, true));
         }
+    }
+
+    #[test]
+    fn completion_revision_counts_submitted_turns_without_counting_cached_reads() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Claude);
+        session.process_drained(&drained(&[(
+            "\x1b]0;\u{2733} Topic\x07",
+            SystemTime::now(),
+        )]));
+        viewer.sample(&session);
+        assert_eq!(viewer.runtime.completion_revision, 0);
+        for expected in 1..=2 {
+            session.try_submit_input(b"\r").unwrap();
+            session.process_drained(&drained(&[(
+                "\x1b]0;\u{280b} Topic\x07",
+                SystemTime::now(),
+            )]));
+            viewer.sample(&session);
+            assert_eq!(viewer.runtime.completion_revision, expected - 1);
+            session.process_drained(&drained(&[(
+                "\x1b]0;\u{2733} Topic\x07",
+                SystemTime::now(),
+            )]));
+            assert_eq!(viewer.sample(&session).0, AgentStatus::Done);
+            assert_eq!(viewer.runtime.completion_revision, expected);
+            for _ in 0..3 {
+                let _ = viewer.runtime.snapshot(&session);
+                viewer.sample(&session);
+                assert_eq!(viewer.runtime.completion_revision, expected);
+            }
+        }
+        session.kill();
+    }
+
+    #[test]
+    fn completion_revision_keeps_every_coalesced_title_completion() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Claude);
+        session.process_drained(&drained(&[(
+            "\x1b]0;\u{2733} Topic\x07",
+            SystemTime::now(),
+        )]));
+        viewer.sample(&session);
+        let trace = "\x1b]0;\u{280b} Topic\x07\x1b]0;\u{2733} Topic\x07";
+        session.process_drained(&drained(&[(trace, SystemTime::now())]));
+        viewer.sample(&session);
+        assert_eq!(viewer.runtime.completion_revision, 1);
+        // The entire next pair of turns is hidden inside one UI drain. The
+        // input checkpoint and final cached Done badge are unchanged.
+        let before = viewer.runtime.snapshot(&session);
+        session.process_drained(&drained(&[(&trace.repeat(2), SystemTime::now())]));
+        viewer.sample(&session);
+        let after = viewer.runtime.snapshot(&session);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.input_rev, before.input_rev);
+        assert_eq!(viewer.runtime.completion_revision, 3);
+        viewer.sample(&session);
+        assert_eq!(viewer.runtime.completion_revision, 3);
+        session.kill();
+    }
+
+    #[test]
+    fn completion_revision_preserves_launch_history_across_binding_and_exit() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Claude);
+        session.try_submit_input(b"\r").unwrap();
+        session.process_drained(&drained(&[(
+            "\x1b]0;\u{280b} Topic\x07\x1b]0;\u{2733} Topic\x07",
+            SystemTime::now(),
+        )]));
+        viewer.sample(&session);
+        assert_eq!(viewer.runtime.completion_revision, 1);
+        let switched = SystemTime::now();
+        session.provider_switched(switched, switched);
+        viewer.sample(&session);
+        assert_eq!(
+            viewer.runtime.completion_revision, 1,
+            "a binding switch is not completion"
+        );
+        for _ in 0..2 {
+            viewer.runtime.reconcile(
+                &session,
+                TitleProvider::Claude,
+                &[],
+                &[],
+                true,
+                Instant::now(),
+            );
+            assert_eq!(
+                viewer.runtime.completion_revision, 2,
+                "exit is one observed edge"
+            );
+        }
+        assert_eq!(
+            RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible).completion_revision,
+            0
+        );
+        session.kill();
     }
 
     #[test]

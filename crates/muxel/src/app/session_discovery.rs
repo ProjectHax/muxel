@@ -667,7 +667,10 @@ impl MuxelApp {
     pub(super) fn begin_codex_restore_lookup(&mut self, iid: Uuid, cx: &mut Context<Self>) {
         // A running pane already has its conversation; only title capture may
         // rebind it.
-        if self.discovery_terminal(iid).is_some() || self.failed_launches.contains_key(&iid) {
+        if self.is_closing(iid)
+            || self.discovery_terminal(iid).is_some()
+            || self.failed_launches.contains_key(&iid)
+        {
             return;
         }
         let app: &App = cx;
@@ -694,7 +697,10 @@ impl MuxelApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let generation = this.session_discoveries.binding_generation(iid);
+                // Hold bumps the binding generation, so the pre-hold answer
+                // stays stale even when Undo makes the pane visible again.
                 if this.codex_restore_lookups.finish(iid, generation)
+                    && !this.is_closing(iid)
                     && apply_codex_restore_found(&mut this.workspace, iid, &query, found)
                 {
                     this.bump_session_binding_generation(iid);
@@ -715,11 +721,12 @@ impl MuxelApp {
     ) {
         while this
             .read_with(cx, |this, _| {
-                this.codex_restore_lookups.holds_launch(
-                    iid,
-                    Instant::now(),
-                    CODEX_RESTORE_LOOKUP_BUDGET,
-                )
+                !this.is_closing(iid)
+                    && this.codex_restore_lookups.holds_launch(
+                        iid,
+                        Instant::now(),
+                        CODEX_RESTORE_LOOKUP_BUDGET,
+                    )
             })
             .unwrap_or(false)
         {
@@ -745,7 +752,8 @@ impl MuxelApp {
     ) -> Option<SessionDiscoveryKey> {
         let iid = instance.id;
         let project = self.workspace.project(instance.project_id)?;
-        if instance.literal_argv
+        if self.is_closing(iid)
+            || instance.literal_argv
             || project.remote.is_some()
             || self.terminal_launching.contains_key(&iid)
         {
@@ -1031,6 +1039,8 @@ impl MuxelApp {
             .collect();
         #[cfg(not(windows))]
         let _ = cx;
+        // Hidden panes still own their saved and accepted identities. Filtering
+        // held panes here would let another pane adopt the live conversation.
         for (index, instance) in self.workspace.instances.iter().enumerate() {
             ownership.positions.entry(instance.id).or_insert(index);
             if let Some(id) = &instance.session_id {
@@ -1068,6 +1078,9 @@ impl MuxelApp {
         iid: Uuid,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
+        if self.is_closing(iid) {
+            anyhow::bail!(crate::i18n::t("This terminal is closing.").to_string());
+        }
         let Some(instance) = self.workspace.instance(iid) else {
             return Ok(());
         };
@@ -1137,6 +1150,9 @@ impl MuxelApp {
         interval: (SystemTime, SystemTime),
         cx: &App,
     ) -> Option<SessionBindingUpdate> {
+        if self.is_closing(key.pane) {
+            return None;
+        }
         // Called only for an accepted worker result after its read is recorded.
         // Durable metadata can still say A after a failed save of live B.
         let observation = self
@@ -1165,6 +1181,10 @@ impl MuxelApp {
         binding: Option<session_binding::ClaudeBinding>,
         cx: &App,
     ) -> Option<SessionBindingUpdate> {
+        if self.is_closing(iid) {
+            session_binding::defer_claude_binding(record);
+            return None;
+        }
         let Some(binding) = binding else {
             session_binding::defer_claude_binding(record);
             return None;
@@ -1216,6 +1236,9 @@ impl MuxelApp {
         recorded: Option<SystemTime>,
         cx: &mut Context<Self>,
     ) -> Option<SessionBindingUpdate> {
+        if self.is_closing(iid) {
+            return None;
+        }
         let bound = self.workspace.instance(iid)?.session_id.as_deref();
         let switched = bound.is_some_and(|bound| bound != metadata.session_id);
         let candidate = SessionCandidate {
@@ -1242,6 +1265,9 @@ impl MuxelApp {
         candidate: SessionCandidate,
         force_boundary: bool,
     ) -> Option<SessionBindingUpdate> {
+        if self.is_closing(iid) {
+            return None;
+        }
         let instance = self.workspace.instance_mut(iid)?;
         let same_id = instance.session_id.as_deref() == Some(candidate.id.as_str());
         let path = candidate
@@ -1686,6 +1712,91 @@ mod grok_regressions {
             muxel_store::data_dir().as_deref(),
             cx,
         );
+    }
+
+    #[test]
+    fn held_discovery_keeps_ownership_and_rejects_late_results_after_undo() {
+        for undo in [false, true] {
+            with_app(|cx, window| {
+                checked_update(window, cx, |app, window, cx| {
+                    app._status_timer = gpui::Task::ready(());
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let (id, session) = pane(app, window, cx);
+                    let _stop = StopChild(session);
+                    let instance = app.workspace.instance(id).unwrap();
+                    let saved = instance.session_id.clone().unwrap();
+                    let project = instance.project_id;
+                    app.workspace.project_mut(project).unwrap().layout =
+                        Some(muxel_core::PaneNode::leaf(id));
+                    let key = app.session_discovery_key(id, cx).unwrap();
+                    let request = app.session_discoveries.begin(key, Instant::now()).unwrap();
+                    let group = app.hold_closes(vec![(id, true)], None, cx).unwrap();
+                    assert!(app.session_discovery_key(id, cx).is_none());
+                    assert!(app.workspace.project(project).unwrap().layout.is_none());
+                    assert!(
+                        app.session_ownership(cx)
+                            .bound_elsewhere(Uuid::new_v4(), &saved)
+                    );
+                    if undo {
+                        app.undo_close(group, window, cx);
+                        assert!(app.session_discovery_key(id, cx).is_some());
+                    }
+                    let now = SystemTime::now();
+                    app.apply_discovery_batch(
+                        DiscoveryBatch {
+                            results: vec![(
+                                request,
+                                DiscoveryCandidate::Session {
+                                    candidate: SessionCandidate {
+                                        id: Uuid::new_v4().to_string(),
+                                        path: None,
+                                    },
+                                    switched: Some((now, now)),
+                                },
+                                None,
+                                None,
+                            )],
+                            grok_read: Some((now, now)),
+                        },
+                        muxel_store::data_dir().as_deref(),
+                        cx,
+                    );
+                    assert_eq!(
+                        app.workspace.instance(id).unwrap().session_id.as_deref(),
+                        Some(saved.as_str())
+                    );
+                    assert!(!app.grok_observations.contains_key(&id));
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn held_codex_restore_does_not_begin_a_history_lookup() {
+        with_app(|cx, window| {
+            checked_update(window, cx, |app, _window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.current_workspace = Some(Uuid::new_v4());
+                let preset = AgentPreset::codex();
+                let project = app
+                    .workspace
+                    .add_project(Project::new("held Codex", "/held-codex"));
+                let mut instance = Instance::from_preset(project, &preset);
+                instance.session_started = true;
+                let id = instance.id;
+                app.presets.push(preset);
+                app.workspace.add_instance(instance);
+                app.workspace.project_mut(project).unwrap().layout =
+                    Some(muxel_core::PaneNode::leaf(id));
+                app.hold_closes(vec![(id, true)], None, cx).unwrap();
+                app.begin_codex_restore_lookup(id, cx);
+                assert!(!app.codex_restore_lookups.holds_launch(
+                    id,
+                    Instant::now(),
+                    super::CODEX_RESTORE_LOOKUP_BUDGET,
+                ));
+            });
+        });
     }
 
     #[test]

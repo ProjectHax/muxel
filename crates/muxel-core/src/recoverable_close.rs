@@ -1,0 +1,367 @@
+//! Pure close admission and expiry checks. The app supplies current launch facts.
+
+use crate::control::AgentState;
+use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseEvidence {
+    Process,
+    Program,
+    Hook,
+    Title,
+    Screen,
+    Bell,
+    Output,
+    Quiet,
+    Settling,
+    ShellPrompt,
+}
+
+/// Non-agent prompt evidence, separate from the platform foreground query so
+/// its policy can be exercised on every test host.
+pub fn shell_close_evidence(
+    program: Option<&str>,
+    via_client: bool,
+    foreground_idle: bool,
+    osc133_prompt: bool,
+) -> CloseEvidence {
+    // Foreground ownership proves a prompt only for the direct default shell.
+    // A client or explicit program can own that group while remote work runs.
+    if osc133_prompt || program.is_none() && !via_client && foreground_idle {
+        CloseEvidence::ShellPrompt
+    } else {
+        CloseEvidence::Quiet
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloseFacts {
+    pub status: AgentState,
+    pub evidence: CloseEvidence,
+    pub attributable: bool,
+    pub awaiting_reply: bool,
+    pub another_tmux_client: bool,
+    pub launch_id: Option<Uuid>,
+    pub binding_rev: u64,
+    pub input_rev: u64,
+    pub completion_rev: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseDecision {
+    Immediate,
+    Ask,
+    Hold { forced: bool },
+}
+
+pub fn decide(facts: CloseFacts, ask_busy: bool) -> CloseDecision {
+    if matches!(
+        facts.status,
+        AgentState::Exited | AgentState::NotRunning | AgentState::Failed
+    ) {
+        return CloseDecision::Immediate;
+    }
+    let quiet = matches!(facts.status, AgentState::Idle | AgentState::Done)
+        && facts.attributable
+        && !facts.awaiting_reply
+        && !facts.another_tmux_client
+        && matches!(
+            facts.evidence,
+            CloseEvidence::Program
+                | CloseEvidence::Hook
+                | CloseEvidence::Title
+                | CloseEvidence::Screen
+                | CloseEvidence::ShellPrompt
+        );
+    if quiet {
+        CloseDecision::Hold { forced: false }
+    } else if ask_busy {
+        CloseDecision::Ask
+    } else {
+        CloseDecision::Hold { forced: true }
+    }
+}
+
+pub fn may_finalize(before: CloseFacts, now: CloseFacts, forced: bool) -> bool {
+    forced || before == now && decide(now, true) == CloseDecision::Hold { forced: false }
+}
+
+#[cfg(test)]
+mod recoverable_close_policy_tests {
+    use super::{
+        CloseDecision, CloseEvidence, CloseFacts, decide, may_finalize, shell_close_evidence,
+    };
+    use crate::control::AgentState;
+    use uuid::Uuid;
+
+    fn quiet() -> CloseFacts {
+        CloseFacts {
+            status: AgentState::Idle,
+            evidence: CloseEvidence::Title,
+            attributable: true,
+            awaiting_reply: false,
+            another_tmux_client: false,
+            launch_id: Some(Uuid::new_v4()),
+            binding_rev: 3,
+            input_rev: 7,
+            completion_rev: 2,
+        }
+    }
+
+    #[test]
+    fn non_agent_foreground_ownership_does_not_prove_a_shell_prompt() {
+        for program in ["ssh", "python", "node", "wrapper.sh", "bash"] {
+            let evidence = shell_close_evidence(Some(program), false, true, false);
+            assert_eq!(evidence, CloseEvidence::Quiet, "explicit program {program}");
+            assert_eq!(
+                decide(
+                    CloseFacts {
+                        evidence,
+                        ..quiet()
+                    },
+                    true
+                ),
+                CloseDecision::Ask
+            );
+        }
+    }
+
+    #[test]
+    fn default_shell_foreground_proof_excludes_tmux_and_remote_clients() {
+        assert_eq!(
+            shell_close_evidence(None, false, true, false),
+            CloseEvidence::ShellPrompt
+        );
+        assert_eq!(
+            shell_close_evidence(None, false, false, false),
+            CloseEvidence::Quiet
+        );
+        // Both tmux and an SSH connection can own the child foreground group
+        // while a command is running beyond that client.
+        let evidence = shell_close_evidence(None, true, true, false);
+        assert_eq!(evidence, CloseEvidence::Quiet);
+        assert_eq!(
+            decide(
+                CloseFacts {
+                    evidence,
+                    ..quiet()
+                },
+                true
+            ),
+            CloseDecision::Ask
+        );
+    }
+
+    #[test]
+    fn explicit_osc133_prompt_remains_protocol_evidence() {
+        for program in [None, Some("custom-shell"), Some("wrapper.sh")] {
+            for via_client in [false, true] {
+                let evidence = shell_close_evidence(program, via_client, false, true);
+                assert_eq!(evidence, CloseEvidence::ShellPrompt);
+                assert_eq!(
+                    decide(
+                        CloseFacts {
+                            evidence,
+                            ..quiet()
+                        },
+                        true
+                    ),
+                    CloseDecision::Hold { forced: false }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idle_agent_close_uses_rechecked_countdown() {
+        for evidence in [
+            CloseEvidence::Title,
+            CloseEvidence::Screen,
+            CloseEvidence::Hook,
+            CloseEvidence::Program,
+        ] {
+            for status in [AgentState::Idle, AgentState::Done] {
+                let facts = CloseFacts {
+                    status,
+                    evidence,
+                    ..quiet()
+                };
+                assert_eq!(decide(facts, true), CloseDecision::Hold { forced: false });
+                assert!(may_finalize(facts, facts, false));
+            }
+        }
+    }
+
+    #[test]
+    fn working_agent_close_asks_and_confirm_counts_down_without_recheck() {
+        let facts = CloseFacts {
+            status: AgentState::Working,
+            ..quiet()
+        };
+        assert_eq!(decide(facts, true), CloseDecision::Ask);
+        assert!(may_finalize(facts, facts, true));
+    }
+
+    #[test]
+    fn settling_quiet_or_bell_only_agent_asks() {
+        for evidence in [
+            CloseEvidence::Settling,
+            CloseEvidence::Quiet,
+            CloseEvidence::Bell,
+            CloseEvidence::Output,
+        ] {
+            let facts = CloseFacts {
+                evidence,
+                ..quiet()
+            };
+            assert_eq!(decide(facts, true), CloseDecision::Ask, "{evidence:?}");
+        }
+        assert_eq!(
+            decide(
+                CloseFacts {
+                    attributable: false,
+                    ..quiet()
+                },
+                true
+            ),
+            CloseDecision::Ask
+        );
+        assert_eq!(
+            decide(
+                CloseFacts {
+                    status: AgentState::Starting,
+                    ..quiet()
+                },
+                true
+            ),
+            CloseDecision::Ask
+        );
+        assert_eq!(
+            decide(
+                CloseFacts {
+                    status: AgentState::Blocked,
+                    ..quiet()
+                },
+                true
+            ),
+            CloseDecision::Ask
+        );
+    }
+
+    #[test]
+    fn busy_close_with_setting_off_counts_down_without_asking() {
+        assert_eq!(
+            decide(
+                CloseFacts {
+                    status: AgentState::Working,
+                    ..quiet()
+                },
+                false
+            ),
+            CloseDecision::Hold { forced: true }
+        );
+        assert_eq!(
+            decide(quiet(), false),
+            CloseDecision::Hold { forced: false }
+        );
+    }
+
+    #[test]
+    fn expiry_rechecks_and_turns_started_work_into_a_decision() {
+        let before = quiet();
+        for now in [
+            CloseFacts {
+                status: AgentState::Working,
+                ..before
+            },
+            CloseFacts {
+                status: AgentState::Done,
+                ..before
+            },
+            CloseFacts {
+                binding_rev: 4,
+                ..before
+            },
+            CloseFacts {
+                input_rev: 8,
+                ..before
+            },
+            CloseFacts {
+                completion_rev: 3,
+                ..before
+            },
+            CloseFacts {
+                launch_id: Some(Uuid::new_v4()),
+                ..before
+            },
+            CloseFacts {
+                attributable: false,
+                ..before
+            },
+            CloseFacts {
+                awaiting_reply: true,
+                ..before
+            },
+            CloseFacts {
+                another_tmux_client: true,
+                ..before
+            },
+        ] {
+            assert!(!may_finalize(before, now, false), "{now:?}");
+        }
+    }
+
+    #[test]
+    fn forced_close_skips_expiry_recheck() {
+        assert!(may_finalize(
+            quiet(),
+            CloseFacts {
+                status: AgentState::Working,
+                attributable: false,
+                ..quiet()
+            },
+            true
+        ));
+    }
+
+    #[test]
+    fn pending_turn_or_second_tmux_client_never_proves_quiet() {
+        for facts in [
+            CloseFacts {
+                awaiting_reply: true,
+                ..quiet()
+            },
+            CloseFacts {
+                another_tmux_client: true,
+                ..quiet()
+            },
+        ] {
+            assert_eq!(decide(facts, true), CloseDecision::Ask);
+        }
+    }
+
+    #[test]
+    fn shell_requires_current_prompt_evidence_and_exit_is_immediate() {
+        assert_eq!(
+            decide(
+                CloseFacts {
+                    evidence: CloseEvidence::ShellPrompt,
+                    ..quiet()
+                },
+                true
+            ),
+            CloseDecision::Hold { forced: false }
+        );
+        assert_eq!(
+            decide(
+                CloseFacts {
+                    status: AgentState::Exited,
+                    evidence: CloseEvidence::Process,
+                    ..quiet()
+                },
+                true
+            ),
+            CloseDecision::Immediate
+        );
+    }
+}

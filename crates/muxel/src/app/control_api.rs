@@ -79,7 +79,7 @@ impl ControlTurn {
         }
     }
 
-    fn awaiting_reply(
+    pub(super) fn awaiting_reply(
         &self,
         status: Option<AgentState>,
         activity: &muxel_core::AgentActivity,
@@ -200,6 +200,8 @@ struct ClaimSite {
 /// Typing into an agent, already checked against the agent's own state.
 struct Typing {
     iid: Uuid,
+    input_epoch: u64,
+    admitted_launch: Uuid,
     input: Input,
     /// `None` for keys that start no turn (`esc`, arrows): no claim either.
     turn: Option<Turn>,
@@ -295,6 +297,13 @@ fn check_send_state(state: Option<AgentState>, force: bool) -> CtlResult<()> {
 }
 
 impl MuxelApp {
+    pub(super) fn cancel_pending_control_startup(&mut self, iid: Uuid) {
+        if let Some(turn) = self.control_turns.get(&iid)
+            && let Some(startup) = &turn.startup
+        {
+            startup.cancel();
+        }
+    }
     /// Start or stop the control server to match the setting. Idempotent; called
     /// each tick (so a settings Cancel is honored too) and by the checkbox.
     pub(super) fn sync_control(&mut self, cx: &mut Context<Self>) {
@@ -864,16 +873,21 @@ impl MuxelApp {
 
     /// Every pane of every project: each project's layout in order, then any of
     /// its panes popped out into their own windows.
-    fn control_instances(&self) -> Vec<&Instance> {
+    pub(super) fn control_instances(&self) -> Vec<&Instance> {
         let mut out: Vec<&Instance> = Vec::new();
         for project in &self.workspace.projects {
             for iid in project.instances() {
-                if let Some(inst) = self.workspace.instance(iid) {
+                if let Some(inst) = self
+                    .workspace
+                    .instance(iid)
+                    .filter(|_| !self.is_closing(iid))
+                {
                     out.push(inst);
                 }
             }
             for inst in &self.workspace.instances {
                 if inst.project_id == project.id
+                    && !self.is_closing(inst.id)
                     && self.popouts.contains_key(&inst.id)
                     && !out.iter().any(|o| o.id == inst.id)
                 {
@@ -884,8 +898,14 @@ impl MuxelApp {
         out
     }
 
-    fn control_resolve(&self, query: &str) -> CtlResult<Uuid> {
-        let instances = self.control_instances();
+    pub(super) fn control_resolve(&self, query: &str) -> CtlResult<Uuid> {
+        let mut instances = self.control_instances();
+        instances.extend(
+            self.workspace
+                .instances
+                .iter()
+                .filter(|inst| self.is_closing(inst.id)),
+        );
         let entries: Vec<AgentEntry> = instances
             .iter()
             .map(|inst| AgentEntry {
@@ -897,11 +917,15 @@ impl MuxelApp {
                     .map_or("", |p| p.name.as_str()),
             })
             .collect();
-        ctl::resolve_agent(query, &entries, self.active_instance).map_err(Into::into)
+        let iid = ctl::resolve_agent(query, &entries, self.active_instance)?;
+        if let Some(until) = self.closing_until(iid) {
+            return Err(ctl::Error::closing(until));
+        }
+        Ok(iid)
     }
 
     /// What a terminal pane is doing. `None` for editors, diffs and browsers.
-    fn control_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
+    pub(super) fn control_state(&self, inst: &Instance, cx: &App) -> Option<AgentState> {
         if inst.kind != InstanceKind::Terminal {
             return None;
         }
@@ -1163,7 +1187,10 @@ impl MuxelApp {
     // --- Typing into an agent ----------------------------------------------------
 
     /// The session outside control may type into, or why it may not.
-    fn control_writable(&self, iid: Uuid, cx: &App) -> CtlResult<Arc<TerminalSession>> {
+    pub(super) fn control_writable(&self, iid: Uuid, cx: &App) -> CtlResult<Arc<TerminalSession>> {
+        if let Some(until) = self.closing_until(iid) {
+            return Err(ctl::Error::closing(until));
+        }
         // Admission checked this too, but delayed Enters and keys write later.
         if !self.settings.control_enabled {
             return Err(ctl::creation_refusal(ErrorCode::ControlDisabled));
@@ -1254,8 +1281,11 @@ impl MuxelApp {
             .workspace
             .instance(iid)
             .ok_or("that agent has just closed")?;
+        let admitted = self.control_writable(iid, cx)?;
         Ok(Typing {
             iid,
+            input_epoch: admitted.input_epoch(),
+            admitted_launch: admitted.id,
             input,
             turn,
             site: self.control_claim_site(inst),
@@ -1410,11 +1440,25 @@ impl MuxelApp {
         };
         let Typing {
             iid,
+            input_epoch,
+            admitted_launch,
             turn,
             reply,
             launch_id,
             ..
         } = typing;
+        if session.id != admitted_launch {
+            return Task::ready(Err(ctl::Error::new(
+                ErrorCode::LaunchMismatch,
+                "the queued input's terminal was replaced",
+            )));
+        }
+        if !session.accepts_input_epoch(input_epoch) {
+            return Task::ready(Err(ctl::Error::new(
+                ErrorCode::InputChanged,
+                "closing cancelled this queued input",
+            )));
+        }
         match typing.input {
             Input::Prompt(text) => {
                 let attempt = self
@@ -1430,6 +1474,7 @@ impl MuxelApp {
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                         .await;
                     let mut revision = this.update(cx, |app, cx| -> CtlResult<u64> {
+                        if !session.accepts_input_epoch(input_epoch) { return Err(ctl::Error::new(ErrorCode::InputChanged, "closing cancelled this queued Enter")); }
                         let live = app.control_writable(iid, cx);
                         enter_verdict(live, &session, pasted, session.input_rev())?;
                         if attempt.as_ref().is_some_and(|attempt| {
@@ -1459,6 +1504,7 @@ impl MuxelApp {
                     loop {
                         let action = this
                             .update(cx, |app, cx| -> Result<_, Unconfirmed> {
+                                if !session.accepts_input_epoch(input_epoch) { return Err(Unconfirmed::Interrupted); }
                                 confirmation_verdict(
                                     app.control_writable(iid, cx),
                                     &session,
@@ -1513,7 +1559,9 @@ impl MuxelApp {
                                 let Ok(current_session) = app.control_writable(iid, cx) else {
                                     return false;
                                 };
-                                if !Arc::ptr_eq(&session, &current_session) {
+                                if !Arc::ptr_eq(&session, &current_session)
+                                    || !session.accepts_input_epoch(input_epoch)
+                                {
                                     return false;
                                 }
                                 if submit {
@@ -1695,7 +1743,7 @@ fn enter_verdict<T>(
     match live {
         Ok(live) if Arc::ptr_eq(&live, pasted_into) => {}
         Ok(_) => return Err("the pane restarted after the prompt was pasted, so Enter wasn't pressed: check its `screen`".into()),
-        Err(why) => return Err(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`").into()),
+        Err(mut why) => { why.message = format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`"); return Err(why); },
     }
     if now != pasted {
         return Err(ctl::Error::new(
@@ -2045,7 +2093,7 @@ mod prompt_submission_tests {
     fn delayed_writes_recheck_that_outside_control_is_still_on() {
         // Enters and keys run on timers after admission, through this gate.
         let gate = include_str!("control_api.rs")
-            .split("    fn control_writable(")
+            .split("fn control_writable(")
             .nth(1)
             .unwrap();
         assert!(

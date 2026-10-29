@@ -2370,6 +2370,209 @@ pub fn claude_conversation_summary(path: &Path) -> Option<String> {
     muxel_core::import::conversation_summary(&String::from_utf8_lossy(&head))
 }
 
+/// Read the number of clients attached to this exact tmux session.
+/// Blocking, for background callers only. Socket discovery and the query share
+/// a two-second deadline; unavailable sessions and invalid replies are errors.
+pub fn attached_tmux_clients(loc: &RepoLoc, target: &SessionTarget) -> Result<usize> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut target = profile_tmux_target(target);
+    if matches!(loc, RepoLoc::Local(_)) {
+        target = resolve_tmux_owner_with(&target, |socket| {
+            local_tmux_has_session_confirmed(socket, &target.name, deadline)
+        })?;
+    }
+    let cmd = attached_tmux_clients_command(loc, &target)?;
+    let out = run_tmux_output_until(cmd, deadline)?;
+    parse_attached_tmux_clients(&target.name, out.status.success(), &out.stdout, &out.stderr)
+}
+
+fn attached_tmux_clients_command(loc: &RepoLoc, target: &SessionTarget) -> Result<Command> {
+    // Include the session name because display-message can succeed with an
+    // empty/default format context when the requested target has disappeared.
+    let args = vec![
+        "display-message".into(),
+        "-p".into(),
+        "-t".into(),
+        format!("={}:", target.name),
+        "#{session_name}:#{session_attached}".into(),
+    ];
+    let mut cmd = match loc {
+        RepoLoc::Local(_) => {
+            let socket = target
+                .socket
+                .as_ref()
+                .context("tmux session owner is unknown")?;
+            let mut cmd = tmux_on(socket);
+            cmd.args(&args);
+            cmd
+        }
+        RepoLoc::Remote(conn) => {
+            if conn.host.os.is_windows() {
+                bail!("tmux is unavailable on Windows remote hosts");
+            }
+            remote_ssh_command(conn, ssh::session_tmux_command(target, &args))
+        }
+    };
+    cmd.stdin(Stdio::null());
+    Ok(cmd)
+}
+
+fn parse_attached_tmux_clients(
+    session: &str,
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<usize> {
+    if !success {
+        bail!(
+            "couldn't query attached tmux clients: {}",
+            String::from_utf8_lossy(stderr).trim()
+        );
+    }
+    let reply = std::str::from_utf8(stdout).context("invalid tmux client count encoding")?;
+    let reply = reply.strip_suffix('\n').unwrap_or(reply);
+    let reply = reply.strip_suffix('\r').unwrap_or(reply);
+    let count = reply
+        .strip_prefix(session)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .filter(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()))
+        .context("tmux client count did not identify the requested session")?;
+    count.parse().context("invalid tmux client count")
+}
+
+#[cfg(test)]
+mod attached_tmux_client_tests {
+    use super::{RepoLoc, attached_tmux_clients_command, parse_attached_tmux_clients};
+    use muxel_core::tmux::{SessionTarget, Socket};
+    use muxel_core::{RemoteHost, RemoteOs, ssh};
+    use std::path::Path;
+
+    #[test]
+    fn attached_count_accepts_zero_one_and_multiple_clients() {
+        for count in [0, 1, 2, 23, usize::MAX] {
+            for ending in ["", "\n", "\r\n"] {
+                let reply = format!("work :{count}{ending}");
+                assert_eq!(
+                    parse_attached_tmux_clients("work ", true, reply.as_bytes(), b"").unwrap(),
+                    count
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attached_count_rejects_missing_wrong_or_malformed_session_reply() {
+        for reply in [
+            "",
+            "0",
+            "work2:0",
+            "work:",
+            "work:-1",
+            "work:+1",
+            "work:1 2",
+            "work: 1",
+            "work:1\nwork:0",
+            "work:1\n\n",
+            "work:1.0",
+            "work:999999999999999999999999999999999999999999999999",
+        ] {
+            assert!(parse_attached_tmux_clients("work", true, reply.as_bytes(), b"").is_err());
+        }
+        assert!(parse_attached_tmux_clients("work", true, b"work:\xff", b"").is_err());
+        assert!(parse_attached_tmux_clients("work", false, b"work:0\n", b"no server").is_err());
+    }
+
+    #[test]
+    fn attached_count_local_command_uses_exact_target_and_recorded_socket() {
+        let target = SessionTarget::new("work '名", Some(Socket::Named("peer 'socket".into())));
+        let cmd =
+            attached_tmux_clients_command(&RepoLoc::Local("/unused".into()), &target).unwrap();
+        assert_eq!(cmd.get_program(), "tmux");
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "-L",
+                "peer 'socket",
+                "display-message",
+                "-p",
+                "-t",
+                "=work '名:",
+                "#{session_name}:#{session_attached}",
+            ]
+        );
+    }
+
+    #[test]
+    fn attached_count_isolated_command_never_selects_regular_sockets() {
+        let target =
+            SessionTarget::new("work", None).for_profile(Some(Path::new("/isolated-count")));
+        let cmd =
+            attached_tmux_clients_command(&RepoLoc::Local("/unused".into()), &target).unwrap();
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(&args[..2], target.socket.as_ref().unwrap().args());
+        assert!(!args.contains(&"mxl"));
+        assert!(
+            attached_tmux_clients_command(
+                &RepoLoc::Local("/unused".into()),
+                &SessionTarget::new("work", None)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn attached_count_remote_command_quotes_session_and_socket_and_reuses_connection() {
+        let target =
+            SessionTarget::new("work '名;echo", Some(Socket::Named("peer 'socket".into())));
+        let loc = RepoLoc::remote(
+            RemoteHost::new("test", "test.example"),
+            "/unused".into(),
+            "/control-count".into(),
+            None,
+        );
+        let cmd = attached_tmux_clients_command(&loc, &target).unwrap();
+        assert_eq!(cmd.get_program(), "ssh");
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(
+            args.contains(&"ControlPath=/control-count"),
+            cfg!(not(target_os = "windows"))
+        );
+        assert!(args.contains(&"BatchMode=yes"));
+        let script = args.last().unwrap();
+        assert!(script.contains(&ssh::sh_quote("=work '名;echo:")));
+        assert!(script.contains(&ssh::sh_quote("peer 'socket")));
+        assert!(script.ends_with("'#{session_name}:#{session_attached}'"));
+    }
+
+    #[test]
+    fn attached_count_refuses_windows_remote_hosts() {
+        let mut host = RemoteHost::new("test", "test.example");
+        host.os = RemoteOs::Windows;
+        let loc = RepoLoc::remote(host, "C:/unused".into(), "/control-count".into(), None);
+        let target = SessionTarget::new("work", Some(Socket::Private));
+        assert!(attached_tmux_clients_command(&loc, &target).is_err());
+    }
+
+    #[test]
+    fn attached_count_isolated_remote_query_has_no_legacy_socket_probe() {
+        let target = SessionTarget::new("work", Some(Socket::Default))
+            .for_profile(Some(Path::new("/isolated-count")));
+        let loc = RepoLoc::remote(
+            RemoteHost::new("test", "test.example"),
+            "/unused".into(),
+            "/control-count".into(),
+            None,
+        );
+        let cmd = attached_tmux_clients_command(&loc, &target).unwrap();
+        let args: Vec<_> = cmd.get_args().collect();
+        let script = args.last().unwrap().to_str().unwrap();
+        let socket_args = target.socket.as_ref().unwrap().args();
+        assert!(script.contains(&socket_args[1]));
+        assert!(!script.contains("has-session"));
+    }
+}
+
 /// Run `tmux <args>` on the server holding `session`, where its project's sessions
 /// live: on this machine, or on its SSH host (reusing the host's ControlMaster).
 /// `None` for a Windows host, which has no tmux.
@@ -2643,11 +2846,47 @@ fn run_tmux_until(
     Ok(status)
 }
 
-/// Kill a tmux session on its owner, resolving legacy bindings first. Best-effort.
-pub fn kill_tmux_session(session: &SessionTarget) {
-    let _ = tmux_on(local_tmux_socket(session))
-        .args(muxel_core::tmux::kill_session_args(&session.name))
-        .output();
+/// Close a local tmux session on its recorded or confirmed legacy owner.
+/// Discovery, kill and absence confirmation share one deadline. Every child is
+/// supervised and reaped by the bounded runner; failure never authorizes a kill
+/// on another server or a migration to it. Run only on a background executor.
+pub fn close_local_tmux(session: &SessionTarget, deadline: Instant) -> Result<()> {
+    let session = profile_tmux_target(session);
+    close_local_tmux_with(
+        &session,
+        deadline,
+        |socket, deadline| local_tmux_has_session_confirmed(socket, &session.name, deadline),
+        |owner, deadline| {
+            let socket = owner
+                .socket
+                .as_ref()
+                .context("tmux close owner is unknown")?;
+            let mut cmd = tmux_on(socket);
+            cmd.args(muxel_core::tmux::kill_session_args(&owner.name));
+            // kill-session can fail because the session already exited. Only
+            // the checked absence probe below decides whether close succeeded.
+            run_tmux_output_until(cmd, deadline)?;
+            Ok(())
+        },
+    )
+}
+
+fn close_local_tmux_with(
+    session: &SessionTarget,
+    deadline: Instant,
+    mut probe: impl FnMut(&Socket, Instant) -> Result<bool>,
+    kill: impl FnOnce(&SessionTarget, Instant) -> Result<()>,
+) -> Result<()> {
+    let owner = resolve_tmux_owner_with(session, |socket| probe(socket, deadline))?;
+    kill(&owner, deadline)?;
+    let socket = owner
+        .socket
+        .as_ref()
+        .context("tmux close owner is unknown")?;
+    if probe(socket, deadline)? {
+        bail!("tmux session “{owner}” is still running");
+    }
+    Ok(())
 }
 
 /// Restart requires a confirmed teardown; a failed kill must never turn into a
@@ -2769,11 +3008,16 @@ fn restart_local_tmux_with(
     Ok((owner, next))
 }
 
-pub fn restart_remote_tmux(
+/// Restart a pinned remote owner. `begin_command` admits each kill and the
+/// subsequent migration/verification phase immediately before command planning.
+/// Its returned guard stays alive through that phase's I/O, so cancellation can
+/// refuse new work while the caller waits for already-admitted work to drain.
+pub fn restart_remote_tmux<G>(
     loc: &RepoLoc,
     session: &SessionTarget,
     instance: uuid::Uuid,
     deadline: Instant,
+    begin_command: impl FnMut() -> Option<G>,
 ) -> Result<SessionTarget> {
     let RepoLoc::Remote(conn) = loc else {
         bail!("not a remote project")
@@ -2798,24 +3042,45 @@ pub fn restart_remote_tmux(
                     .any(|row| &row.socket == socket && row.name == target.name))
         })?;
     }
-    let cmd = remote_ssh_command(conn, ssh::kill_and_confirm_command(&session));
-    let out = run_tmux_output_until(cmd, deadline)?;
-    if !out.status.success() {
-        bail!("{}", ssh_error_message(&out))
+    guarded_remote_restart(
+        begin_command,
+        || {
+            let cmd = remote_ssh_command(conn, ssh::kill_and_confirm_command(&session));
+            let out = run_tmux_output_until(cmd, deadline)?;
+            if !out.status.success() {
+                bail!("{}", ssh_error_message(&out))
+            }
+            Ok(())
+        },
+        || {
+            if session.socket == Some(Socket::Default) {
+                remote_tmux_launch_target(loc, &session, instance, true, deadline)
+            } else {
+                let rows = ssh::parse_session_listings_for_migration_on(
+                    &remote_session_names(conn, session.socket.as_slice(), deadline)?,
+                    session.socket.as_slice(),
+                )
+                .context("couldn't confirm the tmux session's owner")?;
+                if rows.iter().any(|row| row.name == session.name) {
+                    bail!("tmux session “{session}” is still running");
+                }
+                Ok(session.clone())
+            }
+        },
+    )
+}
+
+fn guarded_remote_restart<G>(
+    mut begin_command: impl FnMut() -> Option<G>,
+    kill: impl FnOnce() -> Result<()>,
+    next_target: impl FnOnce() -> Result<SessionTarget>,
+) -> Result<SessionTarget> {
+    {
+        let _command = begin_command().context("remote restart was cancelled before kill")?;
+        kill()?;
     }
-    if session.socket == Some(Socket::Default) {
-        remote_tmux_launch_target(loc, &session, instance, true, deadline)
-    } else {
-        let rows = ssh::parse_session_listings_for_migration_on(
-            &remote_session_names(conn, session.socket.as_slice(), deadline)?,
-            session.socket.as_slice(),
-        )
-        .context("couldn't confirm the tmux session's owner")?;
-        if rows.iter().any(|row| row.name == session.name) {
-            bail!("tmux session “{session}” is still running");
-        }
-        Ok(session.clone())
-    }
+    let _command = begin_command().context("remote restart was cancelled before migration")?;
+    next_target()
 }
 
 /// Resolve a legacy close without mutating either server. The caller must save
@@ -3875,6 +4140,164 @@ fn clear_read_only(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_close_resolves_legacy_owner_and_shares_one_deadline_without_migration() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let killed = std::cell::Cell::new(false);
+        let probes = std::cell::RefCell::new(Vec::new());
+        let target = SessionTarget::new("work", None);
+        close_local_tmux_with(
+            &target,
+            deadline,
+            |socket, observed_deadline| {
+                assert_eq!(observed_deadline, deadline);
+                probes.borrow_mut().push(socket.clone());
+                Ok(!killed.get() && *socket == Socket::Default)
+            },
+            |owner, observed_deadline| {
+                assert_eq!(observed_deadline, deadline);
+                assert_eq!(owner.name, "work");
+                assert_eq!(owner.socket, Some(Socket::Default));
+                killed.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(killed.get());
+        assert_eq!(
+            *probes.borrow(),
+            [Socket::Private, Socket::Default, Socket::Default]
+        );
+    }
+
+    #[test]
+    fn local_close_keeps_named_owner_and_fails_closed_on_uncertain_or_live_session() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let target = SessionTarget::new("work", Some(Socket::Named("recorded-peer".into())));
+        let killed = std::cell::Cell::new(false);
+        assert!(
+            close_local_tmux_with(
+                &target,
+                deadline,
+                |socket, _| {
+                    assert_eq!(Some(socket), target.socket.as_ref());
+                    assert!(killed.get(), "recorded owner needs no discovery probes");
+                    Ok(true)
+                },
+                |owner, _| {
+                    assert_eq!(owner, &target);
+                    killed.set(true);
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        let uncertain = SessionTarget::new("work", None);
+        assert!(
+            close_local_tmux_with(
+                &uncertain,
+                deadline,
+                |_, _| anyhow::bail!("socket discovery timed out"),
+                |_, _| panic!("unconfirmed legacy owner must never be killed"),
+            )
+            .is_err()
+        );
+        assert!(
+            close_local_tmux_with(
+                &target,
+                deadline,
+                |_, _| panic!("failed kill must not query another server"),
+                |_, _| anyhow::bail!("kill timed out"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_close_expired_deadline_refuses_before_running_a_command() {
+        let target = SessionTarget::new("work", Some(Socket::Private));
+        assert!(close_local_tmux(&target, Instant::now()).is_err());
+    }
+
+    #[test]
+    fn cancelled_remote_restart_refuses_before_planning_a_kill() {
+        let planned = std::cell::Cell::new(false);
+        let result = guarded_remote_restart(
+            || None::<()>,
+            || {
+                planned.set(true);
+                Ok(())
+            },
+            || panic!("cancelled restart must not plan migration or verification"),
+        );
+        assert!(result.is_err());
+        assert!(!planned.get());
+    }
+
+    #[test]
+    fn remote_restart_rechecks_admission_before_migration_after_a_kill() {
+        let active = std::cell::Cell::new(true);
+        let migrated = std::cell::Cell::new(false);
+        let admissions = std::cell::Cell::new(0);
+        let result = guarded_remote_restart(
+            || {
+                admissions.set(admissions.get() + 1);
+                active.get().then_some(())
+            },
+            || {
+                active.set(false); // Hold lands while the admitted kill runs.
+                Ok(())
+            },
+            || {
+                migrated.set(true);
+                Ok(SessionTarget::new("work", Some(Socket::Private)))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(admissions.get(), 2);
+        assert!(!migrated.get());
+    }
+
+    #[test]
+    fn remote_restart_retains_each_command_guard_until_its_operation_returns() {
+        struct Guard<'a>(&'a std::cell::Cell<usize>);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        let in_flight = std::cell::Cell::new(0);
+        let target = SessionTarget::new("work", Some(Socket::Private));
+        let result = guarded_remote_restart(
+            || {
+                in_flight.set(in_flight.get() + 1);
+                Some(Guard(&in_flight))
+            },
+            || {
+                assert_eq!(in_flight.get(), 1);
+                Ok(())
+            },
+            || {
+                assert_eq!(in_flight.get(), 1);
+                Ok(target.clone())
+            },
+        );
+        assert_eq!(result.unwrap(), target);
+        assert_eq!(in_flight.get(), 0);
+        assert!(
+            guarded_remote_restart(
+                || {
+                    in_flight.set(in_flight.get() + 1);
+                    Some(Guard(&in_flight))
+                },
+                || anyhow::bail!("kill failed"),
+                || panic!("failed kill must not migrate"),
+            )
+            .is_err()
+        );
+        assert_eq!(in_flight.get(), 0);
+    }
 
     #[test]
     fn launch_inventory_pins_the_profile_and_preserves_named_owner_coverage() {

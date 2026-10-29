@@ -168,6 +168,9 @@ pub struct Response {
     pub code: Option<ErrorCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Deadline (unix ms) until which the user can undo this pane's close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_until: Option<i64>,
 }
 
 impl Response {
@@ -177,6 +180,7 @@ impl Response {
             result: Some(result),
             code: None,
             error: None,
+            undo_until: None,
         }
     }
 
@@ -187,6 +191,7 @@ impl Response {
             result: None,
             code: error.code,
             error: Some(error.message),
+            undo_until: error.undo_until,
         }
     }
 
@@ -200,6 +205,7 @@ impl Response {
             message: self
                 .error
                 .unwrap_or_else(|| "muxel refused the request".into()),
+            undo_until: self.undo_until,
         })
     }
 }
@@ -240,6 +246,8 @@ pub enum ErrorCode {
     Blocked,
     /// The agent is still starting: try again in a moment.
     Starting,
+    /// The pane is held for closing; the user can undo before `undo_until`.
+    Closing,
     /// The pane isn't running this session, or its program failed to start.
     NotRunning,
     /// The agent's program has exited.
@@ -263,6 +271,7 @@ pub enum ErrorCode {
 pub struct Error {
     pub code: Option<ErrorCode>,
     pub message: String,
+    pub undo_until: Option<i64>,
 }
 
 impl Error {
@@ -270,6 +279,16 @@ impl Error {
         Self {
             code: Some(code),
             message: message.into(),
+            undo_until: None,
+        }
+    }
+
+    pub fn closing(undo_until: i64) -> Self {
+        Self {
+            code: Some(ErrorCode::Closing),
+            message: "the pane is closing: undo the close in muxel before sending more input"
+                .into(),
+            undo_until: Some(undo_until),
         }
     }
 }
@@ -279,6 +298,7 @@ impl From<String> for Error {
         Self {
             code: None,
             message,
+            undo_until: None,
         }
     }
 }
@@ -1569,6 +1589,7 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
   again in a moment.
 - `not_running`, `exited` - the agent isn't running; the user has to open it.
 - `claimed_elsewhere` - another request holds the shared tmux claim.
+- `closing` - the pane is closing; `undo_until` is its undo deadline (unix ms). Undo in muxel before sending more input.
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.
@@ -1721,6 +1742,56 @@ mod tests {
     }
 
     #[test]
+    fn closing_refusal_round_trips_its_undo_deadline() {
+        let deadline = 1_800_000_000_015;
+        let error = Error::closing(deadline);
+        assert_eq!(error.code, Some(ErrorCode::Closing));
+        assert_eq!(error.undo_until, Some(deadline));
+        let wire = serde_json::to_value(Response::err(error.clone())).unwrap();
+        assert_eq!(wire["code"], "closing");
+        assert_eq!(wire["undo_until"], deadline);
+        assert_eq!(wire["ok"], false);
+        let response: Response = serde_json::from_value(wire).unwrap();
+        assert_eq!(response.into_result(), Err(error));
+    }
+
+    #[test]
+    fn replies_without_undo_deadlines_keep_their_legacy_shape() {
+        for wire in [
+            r#"{"ok":false,"code":"working","error":"busy"}"#,
+            r#"{"ok":false,"error":"no match"}"#,
+            r#"{"ok":true,"result":{"sent":true}}"#,
+        ] {
+            let response: Response = serde_json::from_str(wire).unwrap();
+            assert_eq!(response.undo_until, None);
+            assert_eq!(
+                serde_json::to_value(&response).unwrap(),
+                serde_json::from_str::<serde_json::Value>(wire).unwrap()
+            );
+            if !response.ok {
+                assert_eq!(response.into_result().unwrap_err().undo_until, None);
+            }
+        }
+        assert_eq!(Error::new(ErrorCode::Working, "busy").undo_until, None);
+        assert_eq!(Error::from("no match").undo_until, None);
+    }
+
+    #[test]
+    fn unknown_refusal_codes_preserve_the_message_and_undo_deadline() {
+        let response: Response = serde_json::from_str(
+            r#"{"ok":false,"code":"from_later","error":"keep this message","undo_until":1800000000015}"#,
+        )
+        .unwrap();
+        let error = response.into_result().unwrap_err();
+        assert_eq!(error.code, None);
+        assert_eq!(error.message, "keep this message");
+        assert_eq!(error.undo_until, Some(1_800_000_000_015));
+        let reemitted = serde_json::to_value(Response::err(error)).unwrap();
+        assert!(reemitted.get("code").is_none());
+        assert_eq!(reemitted["undo_until"], 1_800_000_000_015_i64);
+    }
+
+    #[test]
     fn a_failure_carries_a_code_when_there_is_something_to_act_on() {
         let line = |reply: &Response| serde_json::to_string(reply).unwrap();
         let working = Response::err(Error::new(ErrorCode::Working, "the agent is working"));
@@ -1751,6 +1822,7 @@ mod tests {
             (ErrorCode::Working, "working"),
             (ErrorCode::Blocked, "blocked"),
             (ErrorCode::Starting, "starting"),
+            (ErrorCode::Closing, "closing"),
             (ErrorCode::NotRunning, "not_running"),
             (ErrorCode::Exited, "exited"),
             (ErrorCode::ClaimedElsewhere, "claimed_elsewhere"),
@@ -1913,6 +1985,7 @@ mod tests {
             ErrorCode::Working,
             ErrorCode::Blocked,
             ErrorCode::Starting,
+            ErrorCode::Closing,
             ErrorCode::NotRunning,
             ErrorCode::Exited,
             ErrorCode::ClaimedElsewhere,
