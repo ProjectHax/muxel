@@ -1025,6 +1025,19 @@ fn claim_field(s: &str) -> String {
         .collect()
 }
 
+fn claim_command_field(s: &str) -> String {
+    claim_field(s)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 impl Claim {
     pub fn encode(&self) -> String {
         let mut value = format!(
@@ -1033,6 +1046,24 @@ impl Claim {
             claim_field(&self.host),
             self.at,
             self.grace_ms
+        );
+        if let Some(nonce) = self.nonce {
+            value.push('|');
+            value.push_str(&nonce.to_string());
+        }
+        value
+    }
+
+    /// A claim for a nested tmux command string. Keep `encode`'s host display
+    /// compatibility, but replace metacharacters before this value is parsed by
+    /// tmux 2.x, which cannot decode octal escapes in that position.
+    pub fn encode_tmux_command(&self) -> String {
+        let mut value = format!(
+            "v1|{}|{}|{}|{}",
+            claim_command_field(&self.owner),
+            claim_command_field(&self.host),
+            self.at,
+            self.grace_ms,
         );
         if let Some(nonce) = self.nonce {
             value.push('|');
@@ -2631,6 +2662,10 @@ Steps:
         };
         let value = claim.encode();
         assert_eq!(value, "v1|a1b2c3d4e5f6|Sam's-Mac-mini|1790000000000|30000");
+        assert_eq!(
+            claim.encode_tmux_command(),
+            "v1|a1b2c3d4e5f6|Sam-s-Mac-mini|1790000000000|30000"
+        );
         let back = super::Claim::decode(&value).unwrap();
         assert_eq!(back.owner, claim.owner);
         assert_eq!(back.host, "Sam's-Mac-mini");

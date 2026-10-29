@@ -2572,6 +2572,53 @@ pub fn set_tmux_option_if(
     Ok(())
 }
 
+/// Rewrite one legacy escaped claim only if its raw bytes have not changed.
+/// A unique temporary option holds the expected value outside the command
+/// string, where tmux 2.x would otherwise keep octal escapes literally.
+pub fn normalize_tmux_option_if_raw(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    raw: &str,
+    normalized: &str,
+) -> Result<()> {
+    let temp = format!("@muxel-ctl-expected-{}", uuid::Uuid::new_v4().simple());
+    let set = muxel_core::tmux::set_option_args(&session.name, &temp, raw);
+    let Some(set_out) = tmux_at(loc, session, &set) else {
+        bail!("tmux isn't reachable for session “{session}”");
+    };
+    if !set_out.status.success() {
+        bail!(
+            "tmux could not prepare claim repair: {}",
+            String::from_utf8_lossy(&set_out.stderr).trim()
+        );
+    }
+    let update =
+        muxel_core::tmux::set_option_if_option_args(&session.name, option, &temp, normalized)
+            .ok_or_else(|| anyhow::anyhow!("can't prepare conditional tmux claim repair safely"))?;
+    let updated = tmux_at(loc, session, &update);
+    let cleanup = vec![
+        "set-option".to_string(),
+        "-qu".to_string(),
+        "-t".to_string(),
+        format!("={}:", session.name),
+        temp,
+    ];
+    if tmux_at(loc, session, &cleanup).is_none_or(|out| !out.status.success()) {
+        log::warn!("muxel ctl: couldn't clean temporary claim comparison option for {session}");
+    }
+    let Some(out) = updated else {
+        bail!("tmux isn't reachable for session “{session}” during claim repair");
+    };
+    if !out.status.success() {
+        bail!(
+            "tmux conditional claim repair failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Give claim cleanup two seconds before terminating its command.
 pub fn unset_tmux_option_if(
     loc: &RepoLoc,

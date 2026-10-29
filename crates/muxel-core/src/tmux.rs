@@ -1111,7 +1111,8 @@ pub fn unset_option_if_args(session: &str, option: &str, pattern: &str) -> Optio
 
 /// Atomically publish a claim only if the option is still absent or still
 /// matches the value observed before the paste. The caller reads it back to
-/// distinguish a successful set from the false branch of `if-shell`.
+/// distinguish a successful set from the false branch of `if-shell`. The value
+/// is a plain tmux argument: tmux 2.x does not decode `\NNN` inside this string.
 pub fn set_option_if_args(
     session: &str,
     option: &str,
@@ -1131,6 +1132,10 @@ pub fn set_option_if_args(
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "|*-_.".contains(c))
         })
+        || value.is_empty()
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "|-_.".contains(c))
     {
         return None;
     }
@@ -1144,11 +1149,30 @@ pub fn set_option_if_args(
         "-t".into(),
         format!("={session}:"),
         condition,
-        format!(
-            "set-option -q -t '={session}:' {option} {}",
-            tmux_string(value.as_bytes())
-        ),
+        format!("set-option -q -t '={session}:' {option} {value}"),
     ])
+}
+
+/// Replace a malformed old claim only while its raw value still equals the
+/// value held in a unique temporary option. Both values stay out of the tmux
+/// command string, so even tmux 2.x can compare them without octal decoding.
+pub fn set_option_if_option_args(
+    session: &str,
+    option: &str,
+    expected_option: &str,
+    value: &str,
+) -> Option<Vec<String>> {
+    let expected_name = expected_option.strip_prefix('@')?;
+    if expected_name.is_empty()
+        || !expected_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let mut args = set_option_if_args(session, option, None, value)?;
+    args[4] = format!("#{{==:#{{{option}}},#{{{expected_option}}}}}");
+    Some(args)
 }
 
 #[cfg(test)]
@@ -1175,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_publish_is_conditional_and_quotes_the_new_value() {
+    fn claim_publish_is_conditional_and_uses_a_plain_value_for_tmux_2x() {
         assert_eq!(
             set_option_if_args("pane", "@muxel-ctl", None, "v1|me|desk|10|30000").unwrap(),
             [
@@ -1184,7 +1208,7 @@ mod tests {
                 "-t",
                 "=pane:",
                 "#{==:#{@muxel-ctl},}",
-                "set-option -q -t '=pane:' @muxel-ctl \"v1\\174me\\174desk\\17410\\17430000\""
+                "set-option -q -t '=pane:' @muxel-ctl v1|me|desk|10|30000"
             ]
         );
         let expected = "v1|me|*|*|*|nonce";
@@ -1193,6 +1217,24 @@ mod tests {
         assert!(set_option_if_args("it's", "@muxel-ctl", None, "new").is_none());
         assert!(set_option_if_args("pane", "@bad option", None, "new").is_none());
         assert!(set_option_if_args("pane", "@muxel-ctl", Some("bad,pattern"), "new").is_none());
+        assert!(set_option_if_args("pane", "@muxel-ctl", None, "bad;value").is_none());
+    }
+
+    #[test]
+    fn legacy_claim_repair_compares_raw_value_through_a_temp_option() {
+        let args = set_option_if_option_args(
+            "pane",
+            "@muxel-ctl",
+            "@muxel-ctl-expected-123",
+            "v1|me|desk|10|30000",
+        )
+        .unwrap();
+        assert_eq!(args[4], "#{==:#{@muxel-ctl},#{@muxel-ctl-expected-123}}");
+        assert_eq!(
+            args[5],
+            "set-option -q -t '=pane:' @muxel-ctl v1|me|desk|10|30000"
+        );
+        assert!(set_option_if_option_args("pane", "@muxel-ctl", "@bad;option", "new").is_none());
     }
 
     #[test]
