@@ -51,8 +51,9 @@ pub use diff::{SplitRow, split_diff};
 pub use gui_path::{augmented_linux_path, augmented_macos_path};
 pub use pane::{
     FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
-    move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove, set_active_tab,
-    set_split_sizes, set_tab_order, split, split_beside, swap_instances, swap_panes,
+    move_into_split, move_into_tabs, move_pane_beside, move_tab_to, place_peer_panes, remove,
+    set_active_tab, set_split_sizes, set_tab_order, split, split_beside, swap_instances,
+    swap_panes,
 };
 pub use readaloud::{ReadAloudAuto, ReadAloudScope};
 pub use shell::{join_words, split_words};
@@ -1681,6 +1682,69 @@ pub fn push_overwrites_peer(
         local_key,
         local_rev,
     ) == PeerLayoutAction::Adopt
+}
+
+/// Panes in the shared file a peer opened that this machine has never had: neither
+/// in the doc it last wrote or adopted (`synced`, a [`RemoteLayout::content_key`])
+/// nor in its own layout (`local`), not even as another pane on the same tmux
+/// session. In the file's reading order.
+///
+/// A push whose own change is newer than the file's would write over them, though
+/// they were never closed: their panes would be gone on every machine while their
+/// agents ran on. Without `synced` nothing is reported, since a pane this machine
+/// closed then looks the same as one it never had.
+pub fn unseen_peer_panes(
+    file: &RemoteLayout,
+    synced: Option<&str>,
+    local: &RemoteLayout,
+) -> Vec<Uuid> {
+    let Some(seen) = synced.and_then(content_key_instances) else {
+        return Vec::new();
+    };
+    let Some(layout) = &file.layout else {
+        return Vec::new();
+    };
+    let shown_here = |session: &Option<String>| {
+        session.is_some() && local.instances.iter().any(|i| i.tmux_session == *session)
+    };
+    layout
+        .collect_instances()
+        .into_iter()
+        .filter(|id| {
+            !seen.contains(id)
+                && !local.instances.iter().any(|i| i.id == *id)
+                && file
+                    .instances
+                    .iter()
+                    .any(|i| i.id == *id && !shown_here(&i.tmux_session))
+        })
+        .collect()
+}
+
+/// The pane ids a [`RemoteLayout::content_key`] lists.
+fn content_key_instances(key: &str) -> Option<std::collections::HashSet<Uuid>> {
+    let key: serde_json::Value = serde_json::from_str(key).ok()?;
+    Some(
+        key.get("instances")?
+            .as_array()?
+            .iter()
+            .filter_map(|instance| instance.get("id")?.as_str()?.parse().ok())
+            .collect(),
+    )
+}
+
+/// The revision for closing a tmux pane because its session ended (a peer closed the
+/// pane, or the program in it quit), given the revision the project had.
+///
+/// Every machine showing the pane closes it when its client exits, but one back from
+/// sleep only notices then. Stamped with that moment, its close outranked everything
+/// its peers did meanwhile, and newer-wins pushed its stale copy of the layout over
+/// theirs: a pane a peer opened while it slept was dropped there, its agent left
+/// running with no pane. One past the revision it had orders the close after what
+/// this machine has seen and behind any edit a peer made since, so the push takes
+/// the peer's layout instead ([`push_overwrites_peer`]).
+pub fn observed_close_revision(current: Option<u64>) -> u64 {
+    current.unwrap_or(0).saturating_add(1)
 }
 
 /// A peer layout's instances as this machine should hold them: every one the peer
@@ -4123,6 +4187,97 @@ mod remote_layout_tests {
             &ours.content_key(),
             102
         ));
+    }
+
+    #[test]
+    fn a_close_noticed_after_sleep_takes_the_peers_newer_pane() {
+        // Both machines show shell S (rev 100). This one sleeps; the other closes S,
+        // which ends its tmux session, and opens agent C (rev 200).
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let shell = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::leaf(shell.id));
+        proj.layout_updated_at = Some(100);
+        ws.instances = vec![shell.clone()];
+        ws.projects = vec![proj.clone()];
+        let base = RemoteLayout::capture(&proj, &ws, 100);
+        let agent = Instance::shell(proj.id);
+        let mut peer = base.clone();
+        peer.layout = Some(PaneNode::leaf(agent.id));
+        peer.instances = vec![agent];
+        peer.updated_at = 200;
+
+        // Awake again, this machine sees S's client exit cleanly and closes S.
+        let mut closed = proj;
+        closed.layout = None;
+        let ours = RemoteLayout::capture(&closed, &ws, 300).content_key();
+        let synced = base.content_key();
+
+        // Stamped as the session's end, the close ranks behind the peer's edit:
+        // the push takes the peer's layout, with C in it.
+        let rev = observed_close_revision(Some(100));
+        assert!(push_overwrites_peer(&peer, Some(&synced), &ours, rev));
+        // Stamped when it was noticed, it outranked the peer and wrote this
+        // machine's empty layout over C.
+        assert!(!push_overwrites_peer(&peer, Some(&synced), &ours, 300));
+        // With nothing new from the peer, the close is pushed as it is.
+        assert!(!push_overwrites_peer(&base, Some(&synced), &ours, rev));
+    }
+
+    #[test]
+    fn unseen_peer_panes_are_the_peers_new_ones_not_this_machines_closes() {
+        // Both machines show shells A and B (rev 100).
+        let mut ws = Workspace::default();
+        let mut proj = Project::new("proj", "/local/proj");
+        let a = Instance::shell(proj.id);
+        let b = Instance::shell(proj.id);
+        proj.layout = Some(PaneNode::leaf(a.id));
+        assert!(pane::split(
+            &mut proj.layout,
+            a.id,
+            SplitDirection::Horizontal,
+            b.id
+        ));
+        proj.layout_updated_at = Some(100);
+        ws.instances = vec![a.clone(), b.clone()];
+        ws.projects = vec![proj.clone()];
+        let base = RemoteLayout::capture(&proj, &ws, 100);
+        let synced = base.content_key();
+
+        // Apart, the peer opens agent C beside A (rev 200), and this machine closes
+        // B and opens shell D (rev 300): this push is newer and would win.
+        let c = Instance::shell(proj.id);
+        let mut peer = base.clone();
+        assert!(pane::add_tab(&mut peer.layout, a.id, c.id));
+        peer.instances.push(c.clone());
+        peer.updated_at = 200;
+        let d = Instance::shell(proj.id);
+        assert!(pane::remove(&mut proj.layout, b.id));
+        assert!(pane::add_tab(&mut proj.layout, a.id, d.id));
+        ws.instances = vec![a, d.clone()];
+        let ours = RemoteLayout::capture(&proj, &ws, 300);
+        assert!(!push_overwrites_peer(
+            &peer,
+            Some(&synced),
+            &ours.content_key(),
+            300
+        ));
+
+        // Only C is the peer's own: B is this machine's close, D its new pane.
+        assert_eq!(unseen_peer_panes(&peer, Some(&synced), &ours), vec![c.id]);
+        // Unless this machine already shows C's session, in a pane of its own.
+        let session = |doc: &mut RemoteLayout, id: Uuid| {
+            let pane = doc.instances.iter_mut().find(|i| i.id == id).unwrap();
+            pane.tmux_session = Some("muxel_proj_0c0c0c0c".into());
+        };
+        let (mut shown, mut ours_shown) = (peer.clone(), ours.clone());
+        session(&mut shown, c.id);
+        session(&mut ours_shown, d.id);
+        assert!(unseen_peer_panes(&shown, Some(&synced), &ours_shown).is_empty());
+        // The file as this machine left it holds nothing unseen.
+        assert!(unseen_peer_panes(&base, Some(&synced), &ours).is_empty());
+        // Without the doc it last synced, a close can't be told from a new pane.
+        assert!(unseen_peer_panes(&peer, None, &ours).is_empty());
     }
 
     #[test]
