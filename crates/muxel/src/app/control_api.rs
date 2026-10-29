@@ -1917,7 +1917,9 @@ fn enter_verdict<T>(
     match live {
         Ok(live) if Arc::ptr_eq(&live, pasted_into) => {}
         Ok(_) => return Err(ctl::Error::from("the pane restarted after the prompt was pasted, so Enter wasn't pressed: check its `screen`").after_paste()),
-        Err(mut why) => { why.message = format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`"); return Err(why.after_paste()); },
+        // Refusal codes promise nothing was typed, so a post-paste failure
+        // drops its code; a closing pane's undo deadline still applies.
+        Err(why) => return Err(ctl::Error { undo_until: why.undo_until, ..ctl::Error::from(format!("{why}; the prompt was pasted but Enter wasn't pressed: check its `screen`")) }.after_paste()),
     }
     if now != pasted {
         return Err(ctl::Error::new(
@@ -2785,6 +2787,43 @@ mod prompt_submission_tests {
         assert_eq!(replaced.code, None);
         let changed = enter_verdict(Ok(original.clone()), &original, 7, 8).unwrap_err();
         assert_eq!(changed.code, Some(ErrorCode::InputChanged));
+    }
+
+    #[test]
+    fn post_paste_refusals_drop_their_code_but_keep_the_undo_deadline() {
+        let session = Arc::new(1_u8);
+        let deadline = 1_800_000_000_015;
+        let closing = enter_verdict(
+            Err(muxel_core::control::Error::closing(deadline)),
+            &session,
+            7,
+            7,
+        )
+        .unwrap_err();
+        assert_eq!(
+            closing.code, None,
+            "a refusal code would say nothing was typed"
+        );
+        assert_eq!(closing.reason, None);
+        assert_eq!(closing.pasted, Some(true));
+        assert_eq!(closing.undo_until, Some(deadline));
+        let starting = enter_verdict(
+            Err(
+                muxel_core::control::Error::new(ErrorCode::Starting, "starting")
+                    .with_reason("launching"),
+            ),
+            &session,
+            7,
+            7,
+        )
+        .unwrap_err();
+        assert_eq!((starting.code, starting.reason), (None, None));
+        assert_eq!(starting.pasted, Some(true));
+        assert_eq!(starting.undo_until, None);
+        let wire = serde_json::to_value(muxel_core::control::Response::err(closing)).unwrap();
+        assert!(wire.get("code").is_none());
+        assert_eq!(wire["pasted"], true);
+        assert_eq!(wire["undo_until"], deadline);
     }
 
     #[test]
