@@ -50,6 +50,13 @@ impl Fixture {
     fn new() -> Self {
         IO.with_borrow_mut(|spy| *spy = IoSpy::default());
         let home = std::env::temp_dir().join(format!("muxel-pr108-read-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        // TEMP may use an 8.3 alias on hosted Windows. This fixture tests the
+        // verbatim namespace prefix, not filesystem alias resolution: use one
+        // physical spelling for both its trusted home and transcript paths.
+        let home = std::fs::canonicalize(home).unwrap();
+        #[cfg(windows)]
+        let home = PathBuf::from(home.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
         let id = Uuid::new_v4().to_string();
         let path = home
             .join(".claude/projects/project")
