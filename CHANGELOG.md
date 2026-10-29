@@ -5,6 +5,38 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-10-26
+
+### Added
+- **Other tools can open panes in muxel** — `muxel ctl new PROJECT` lets a script
+  or another agent open a tab or split in a project, from one of your presets or
+  from a command it spells out, with its own folder, tab name, and, for presets
+  set up for them, model and effort. `--prompt` gives the new agent its first task:
+  muxel waits until the agent is ready to take it, types it once, and reports
+  whether the agent actually accepted it instead of assuming so. It is off by
+  default: turn on **Outside terminal creation** in Settings → Grok Bot, next to
+  the existing outside-control setting. **Ask** shows a card for each request with
+  who says they're asking, what it will run, where, and the whole task, and waits
+  up to two minutes for you to click Allow once or Deny. **Allow** opens your
+  agent presets (Claude, Codex, Grok, opencode, Amp, and the other built-in agents)
+  without a click; shells, other programs, and spelled-out commands still ask
+  every time, and also need "Also allow typing into shell panes". New panes open
+  in the background so they don't take your keystrokes, unless the caller asks
+  for focus and you approved it with a click. A pane opened from a spelled-out
+  command comes back stopped after a restart, with a **Run again** button, and
+  its task is never typed twice. Thanks to
+  [@railapex](https://github.com/railapex) ([#96](https://github.com/ProjectHax/muxel/pull/96)).
+- **Muse Code panes resume their own conversation** — restarting a Muse Code pane
+  started a new conversation, and you had to find the old one with `/resume`
+  yourself. Each Muse pane on this computer now remembers the conversation it was
+  in and picks it back up after a restart, even with several in one folder. The
+  status dot follows Muse working and finishing, a permission prompt shows the
+  pane as blocked, and file links, shared memory, and your custom instructions
+  reach Muse when the session starts, without sending it a turn. A Muse preset
+  you saved with startup instructions turned off can opt in by choosing **At
+  session start**. Thanks to
+  [@railapex](https://github.com/railapex) ([#84](https://github.com/ProjectHax/muxel/pull/84)).
+
 ### Changed
 - **Better built-in Review and Security Review prompts** — both runners now tell
   the agent not to edit anything on its own (they start in auto mode, so an agent
@@ -18,8 +50,67 @@ All notable changes to muxel are documented here. This project adheres to
   only the ones you pick. Run-time details you type take priority over the
   defaults. If you never edited these prompts, upgrading replaces them; an edited
   prompt keeps your text.
+- **Outside tools need the shell permission to type into anything but an agent** —
+  with "Also allow typing into shell panes" off, `muxel ctl` could still type into
+  a preset that runs `ssh`, `wsl.exe`, `python`, `node`, or anything else that
+  isn't a plain shell, and into the shell a pane falls back to when its agent
+  fails to start. Typing into those now needs that setting too; a pane whose
+  agent starts again normally goes back to the agent rules. If you run an agent
+  that isn't one of muxel's built-in presets, outside tools now need the setting
+  to type into it as well. Thanks to
+  [@railapex](https://github.com/railapex) ([#100](https://github.com/ProjectHax/muxel/pull/100)).
 
 ### Fixed
+- **`muxel ctl send` tells you whether the agent took the prompt** — `send`
+  reported success as soon as it pressed Enter, even when the prompt never went
+  in: Codex on Windows sometimes takes that Enter as a new line in its composer,
+  and the prompt sat there until someone pressed Enter by hand. For Codex, Claude,
+  and Grok, `send` now watches for about ten seconds for the agent to show it
+  accepted the prompt, and its reply says whether it did, or that it couldn't tell.
+  Once Enter is in, the reply is never an error, so a script isn't led to paste
+  the same prompt twice. When muxel can see that Codex on Windows turned the Enter
+  into a blank line, it presses Enter once more; it never pastes the text again.
+  Thanks to
+  [@railapex](https://github.com/railapex) ([#106](https://github.com/ProjectHax/muxel/pull/106)).
+- **Switching conversations no longer finishes the old one or closes your pane** —
+  after a `/resume` in a running agent, output from around the switch could mark a
+  turn done or notify you for the conversation you had just left. Status now holds
+  until the new conversation shows its own state, and in the meantime `muxel ctl`
+  treats the pane as busy. A scheduled loop whose pane switched conversations,
+  including a fresh Claude pane's first `/resume`, now lets go of that pane instead
+  of closing it under you when the loop is set to exit. Thanks to
+  [@railapex](https://github.com/railapex) ([#94](https://github.com/ProjectHax/muxel/pull/94), [#99](https://github.com/ProjectHax/muxel/pull/99)).
+- **Restoring Codex panes no longer stalls the window** — a restored Codex pane
+  muxel hadn't learned a conversation for searched Codex's history on the thread
+  that draws the window, which could freeze muxel with a large history. Those
+  panes now start fresh, and panes with a known conversation resume exactly that
+  one. Local Codex panes under tmux, where Codex's title never reached muxel, now
+  learn their conversation too. Thanks to
+  [@railapex](https://github.com/railapex) ([#91](https://github.com/ProjectHax/muxel/pull/91)).
+- **A Codex pane doesn't resume the wrong conversation** — when the newest Codex
+  conversation file for a folder couldn't be read, muxel picked an older one, and
+  the pane resumed a conversation you weren't in. It now starts fresh instead.
+  Thanks to
+  [@railapex](https://github.com/railapex) ([#102](https://github.com/ProjectHax/muxel/pull/102)).
+- **Panes move to muxel's own tmux server without a second agent** — a session an
+  earlier muxel left on your default tmux server now moves to muxel's own server
+  on its next start, but only once muxel has confirmed the old one is gone and
+  nothing of the same name is already running there. If something is, the pane
+  stops and says so rather than starting a second copy of the agent. A restart
+  that can't save which server owns its session now stops with an error instead of
+  quietly reattaching the old agent, and a restart no longer finishes against a
+  session another muxel sharing the project just moved, where pressing Restart
+  again could kill it. A layout shared with a newer muxel or the iOS app is no
+  longer thrown away when it names a tmux server this version doesn't know.
+  Thanks to
+  [@railapex](https://github.com/railapex) ([#95](https://github.com/ProjectHax/muxel/pull/95), [#101](https://github.com/ProjectHax/muxel/pull/101)).
+- **Remote panes reconnect instead of starting over every second** — once a remote
+  tmux pane's connection had been dropping long enough, muxel started a fresh
+  reconnect attempt every second, and each one threw away the lookup the last had
+  started, so a slow host never got reconnected and was asked the same question
+  every second. An attempt in progress now keeps its place, and one stuck for more
+  than a minute gives way to a new one. Thanks to
+  [@railapex](https://github.com/railapex) ([#103](https://github.com/ProjectHax/muxel/pull/103)).
 - **Panes no longer inherit the environment of whatever restarted muxel's tmux
   server** — tmux points every pane at its own server, so an agent in a muxel pane
   that ran `tmux kill-server` and then `tmux new-session` stopped every session, then
@@ -29,8 +120,12 @@ All notable changes to muxel are documented here. This project adheres to
   the agent's own variables. muxel now marks the tmux server it starts. When it finds
   one it didn't start, it gives that server muxel's environment before opening a pane
   there, and notes what it removed in the event log (local panes, tmux 3.1 or newer).
-  `FEATURES.md` no longer claims that a bare `tmux` command can't reach muxel's
-  server: run inside one of its panes, it can.
+  A bare `tmux` command run inside one of muxel's panes does still reach muxel's
+  server.
+- **A closed pane lets go right away on macOS** — on macOS, a closed pane could keep
+  its process and terminal until some unrelated program muxel had started around
+  the same time, such as git, ssh, or another pane's shell, exited. Closing a pane
+  now lets it go promptly every time.
 
 ## [0.3.2] — 2026-10-20
 

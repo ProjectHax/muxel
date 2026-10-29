@@ -147,6 +147,8 @@ struct LaunchInstanceView: View {
         case let .cliFlag(flag): return "passed via \(flag)"
         case .typeIn: return "typed in after the agent starts"
         case .none: return "this preset ignores a system prompt"
+        case .sessionHook: return "added as session context only by local desktop launches"
+        case .unknown: return "this preset's delivery needs a newer muxel"
         }
     }
 }

@@ -24,16 +24,27 @@ pub(super) use approval::PreparedCreation;
 #[cfg(test)]
 #[path = "control_api/new_tests.rs"]
 mod new_tests;
+#[cfg(all(test, windows))]
+mod startup_reservation_tests;
 
 /// Shared command permission for typing into an existing terminal. This is
 /// rechecked on every write, including panes created before the opt-in was revoked.
-fn control_program_writable(inst: &Instance, allow_shells: bool) -> Result<(), String> {
-    if !allow_shells && (inst.literal_argv || !readaloud::is_agent_program(inst.program.as_deref()))
+fn control_program_writable(
+    inst: &Instance,
+    allow_shells: bool,
+    fallback_shell: bool,
+) -> Result<(), String> {
+    // Existing panes may run remotely. Match the provider name without
+    // resolving local executables on the UI thread.
+    if !allow_shells
+        && (fallback_shell
+            || inst.literal_argv
+            || !muxel_core::is_known_agent_program(inst.program.as_deref()))
     {
         let name = inst.display_name();
         return Err(format!(
             "typing into '{name}' requires command execution permission in Settings > \
-             Grok Bot > \"Also allow typing into shell panes\""
+             Outside control > \"Also allow typing into shell panes\""
         ));
     }
     Ok(())
@@ -211,9 +222,16 @@ fn owner_id() -> &'static str {
 /// Shortest wait between writing a claim and reading it back.
 const CLAIM_SETTLE_MIN: Duration = Duration::from_millis(200);
 
-/// Matches the startup prompt's pause before its Enter: the agent has taken in
-/// the pasted text, so the Enter submits it instead of adding a line to it.
+/// Give the child a head start before its first Enter. This pause does not
+/// establish consumption; provider acceptance is checked separately below.
 const SUBMIT_DELAY_MS: u64 = 400;
+/// These are observation allowances, not a bound on the child's input queue.
+/// Codex 0.163's Windows detector needs >60ms of processed-character quiet;
+/// sleeping before a pipe write cannot establish that. Retry only visible proof.
+const SUBMISSION_RETRY_MS: u64 = 5_000;
+const SUBMISSION_CONFIRM_MS: u64 = 10_000;
+const SUBMISSION_RETRY_GRACE_MS: u64 = 3_000;
+const SUBMISSION_POLL_MS: u64 = 100;
 /// Pause between the keys of one `keys` request.
 const KEY_GAP_MS: u64 = 80;
 
@@ -318,12 +336,12 @@ impl MuxelApp {
         }
     }
 
-    // --- Settings → Grok Bot --------------------------------------------------------
+    // --- Settings → Outside control ------------------------------------------------
 
-    /// Settings → Grok Bot: setting Grok Bot (or any agent that can run commands
-    /// on this computer) up to drive muxel, step by step — turn outside control on,
-    /// let Grok Bot run commands here, give it the skill, check it works.
-    pub(super) fn render_settings_grok_bot(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Settings → Outside control: setting an agent that can run commands on this
+    /// computer (Grok Bot, …) up to drive muxel, step by step — turn outside control
+    /// on, let the agent run commands here, give it the skill, check it works.
+    pub(super) fn render_settings_outside_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (muted, border, radius) = (theme.muted_foreground, theme.border, theme.radius);
         let (accent, accent_fg) = (theme.primary, theme.primary_foreground);
@@ -405,11 +423,11 @@ impl MuxelApp {
         } else {
             (
                 muted,
-                t("Off. Grok Bot can't reach muxel until this is on."),
+                t("Off. Other agents can't reach muxel until this is on."),
             )
         };
 
-        let test_result = match &self.settings_ui.grok_test {
+        let test_result = match &self.settings_ui.control_test {
             RemoteTestState::Idle => None,
             RemoteTestState::Testing => Some(hint(t("Testing…"))),
             RemoteTestState::Ok(msg) => Some(
@@ -428,9 +446,9 @@ impl MuxelApp {
             ),
         };
 
-        let preview = self.settings_ui.grok_skill_preview.then(|| {
+        let preview = self.settings_ui.control_skill_preview.then(|| {
             div()
-                .id("grok-skill-preview")
+                .id("control-skill-preview")
                 .max_h(px(300.0))
                 .overflow_y_scroll()
                 .p_2()
@@ -447,12 +465,12 @@ impl MuxelApp {
             .gap_3()
             .max_w(px(560.0))
             .child(text(t(
-                "Grok Bot, xAI's agent app, can work with the agents you run in muxel: list your projects and agents, see which are working or waiting on you, read their replies, send them prompts and answer their questions. It does this by running the muxel ctl command on this computer. Set it up in four steps.",
+                "Another agent, such as xAI's Grok Bot, a coding agent or a script, can work with the agents you run in muxel: list your projects and agents, see which are working or waiting on you, read their replies, send them prompts and answer their questions. It does this by running the muxel ctl command on this computer. Set it up in four steps.",
             )))
             .child(
                 step(1, t("Turn on outside control"))
                     .child(check(
-                        Checkbox::new("grok-control")
+                        Checkbox::new("control-enabled")
                             .checked(enabled)
                             .on_click(cx.listener(|this, c: &bool, _w, cx| {
                                 this.set_control_enabled(*c, cx)
@@ -465,7 +483,7 @@ impl MuxelApp {
                         (ctl::CreationPolicy::Ask, t("Ask")),
                         (ctl::CreationPolicy::Allow, t("Allow")),
                     ].into_iter().map(|(policy, label)| {
-                        Button::new(SharedString::from(format!("grok-control-new-{policy:?}")))
+                        Button::new(SharedString::from(format!("control-new-{policy:?}")))
                             .ghost().label(label).selected(self.settings.control_allow_new == policy)
                             .disabled(!enabled)
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -479,7 +497,7 @@ impl MuxelApp {
                         "Off by default, including upgrades. Ask requires a click for each request. Allow opens presets that run a known agent (Claude, Codex, Grok, opencode, Amp, …) from an absolute path or PATH entry without a click; any other program, such as ssh, wsl or python, and any relative path still Asks. Literal commands and shell presets always Ask and also require the shell/command permission below. Approvals expire after 120 seconds. Turning creation or outside control off refuses all pending requests. Outside control off also stops the control server. Existing panes, admitted launches and typing permissions are unchanged. Toolbar creation is unaffected.",
                     )))
                     .child(check(
-                        Checkbox::new("grok-control-shells")
+                        Checkbox::new("control-shells")
                             .checked(self.settings.control_allow_shells)
                             .disabled(!enabled)
                             .on_click(cx.listener(|this, c: &bool, _w, cx| {
@@ -507,15 +525,15 @@ impl MuxelApp {
                     ),
             )
             .child(
-                step(2, t("Let Grok Bot run commands on this computer"))
+                step(2, t("Let the agent run commands on this computer"))
                     .child(text(t(
-                        "Grok Bot works on a cloud computer unless you allow it to run commands on yours. In Grok Bot, open Settings → General → Bot → Execution on Local Computer and choose \"Ask every time\" (you approve each command, which shows exactly what it will run) or \"Always allow\".",
+                        "The agent has to run muxel ctl on this computer, not in a cloud sandbox. Grok Bot, for one, works on a cloud computer unless you allow it to run commands on yours: in Grok Bot, open Settings → General → Bot → Execution on Local Computer and choose \"Ask every time\" (you approve each command, which shows exactly what it will run) or \"Always allow\".",
                     ))),
             )
             .child(
-                step(3, t("Give Grok Bot the muxel skill"))
+                step(3, t("Give the agent the muxel skill"))
                     .child(text(t(
-                        "The skill teaches Grok Bot the muxel commands and the rules for using them: one prompt at a time, wait for the reply, and leave your agents' permission prompts to you unless you've told it otherwise.",
+                        "The skill teaches the agent the muxel commands and the rules for using them: one prompt at a time, wait for the reply, and leave your agents' permission prompts to you unless you've told it otherwise.",
                     )))
                     .child(
                         div()
@@ -524,56 +542,56 @@ impl MuxelApp {
                             .items_center()
                             .gap_2()
                             .child(
-                                Button::new("grok-copy-skill")
+                                Button::new("control-copy-skill")
                                     .primary()
                                     .icon(IconName::Copy)
                                     .label(t("Copy skill"))
-                                    .on_click(cx.listener(|this, _e, _w, cx| this.copy_grok_skill(cx))),
+                                    .on_click(cx.listener(|this, _e, _w, cx| this.copy_control_skill(cx))),
                             )
                             .child(
-                                Button::new("grok-preview-skill")
+                                Button::new("control-preview-skill")
                                     .ghost()
-                                    .label(if self.settings_ui.grok_skill_preview {
+                                    .label(if self.settings_ui.control_skill_preview {
                                         t("Hide skill")
                                     } else {
                                         t("Show skill")
                                     })
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.settings_ui.grok_skill_preview =
-                                            !this.settings_ui.grok_skill_preview;
+                                        this.settings_ui.control_skill_preview =
+                                            !this.settings_ui.control_skill_preview;
                                         cx.notify();
                                     })),
                             )
-                            .children(self.settings_ui.grok_skill_copied.then(|| {
+                            .children(self.settings_ui.control_skill_copied.then(|| {
                                 div()
                                     .text_xs()
                                     .text_color(success)
-                                    .child(t("✓ Copied. Paste it into Grok Bot."))
+                                    .child(t("✓ Copied. Paste it into the agent."))
                             })),
                     )
                     .child(hint(t(
-                        "In Grok Bot, add a new skill and paste this in. Grok Bot's skills are shared by all your Bots, and one copy works on every computer you run muxel on: it tells Grok Bot how to find muxel on each one.",
+                        "Add it to the agent as a skill, or to its instructions. One copy works on every computer you run muxel on: it tells the agent how to find muxel on each one. In Grok Bot, add a new skill; its skills are shared by all your Bots.",
                     )))
                     .children(preview),
             )
             .child(
                 step(4, t("Check it works"))
                     .child(text(t(
-                        "Test runs the same command Grok Bot will, and reports what muxel answered.",
+                        "Test runs the same command the agent will, and reports what muxel answered.",
                     )))
                     .child(
                         div().flex().items_center().gap_2().child(
-                            Button::new("grok-test")
+                            Button::new("control-test")
                                 .ghost()
                                 .icon(IconName::Play)
                                 .label(t("Test"))
                                 .disabled(!listening)
-                                .on_click(cx.listener(|this, _e, _w, cx| this.run_grok_test(cx))),
+                                .on_click(cx.listener(|this, _e, _w, cx| this.run_control_test(cx))),
                         ),
                     )
                     .children(test_result)
                     .child(hint(t(
-                        "Then ask Grok Bot something like \"Which of my muxel agents are waiting on me?\"",
+                        "Then ask the agent something like \"Which of my muxel agents are waiting on me?\"",
                     ))),
             )
             .child(self.settings_label(&t("The muxel command on this computer"), cx))
@@ -594,7 +612,7 @@ impl MuxelApp {
                             .child(format!("{} ctl", muxel_core::ssh::sh_quote(&exe))),
                     )
                     .child(
-                        Button::new("grok-copy-exe")
+                        Button::new("control-copy-exe")
                             .ghost()
                             .small()
                             .icon(IconName::Copy)
@@ -607,7 +625,7 @@ impl MuxelApp {
             )
             .child(
                 div().flex().child(
-                    Button::new("grok-docs")
+                    Button::new("control-grok-docs")
                         .ghost()
                         .small()
                         .icon(IconName::ExternalLink)
@@ -620,17 +638,17 @@ impl MuxelApp {
             .into_any_element()
     }
 
-    fn copy_grok_skill(&mut self, cx: &mut Context<Self>) {
+    fn copy_control_skill(&mut self, cx: &mut Context<Self>) {
         let skill = ctl::skill(&crate::control::exe_path());
         cx.write_to_clipboard(ClipboardItem::new_string(skill));
-        self.settings_ui.grok_skill_copied = true;
+        self.settings_ui.control_skill_copied = true;
         cx.notify();
     }
 
-    /// Settings → Grok Bot → Test: run this muxel's own `muxel ctl projects`, as
-    /// Grok Bot will, and show what came back.
-    fn run_grok_test(&mut self, cx: &mut Context<Self>) {
-        self.settings_ui.grok_test = RemoteTestState::Testing;
+    /// Settings → Outside control → Test: run this muxel's own `muxel ctl projects`,
+    /// as the agent will, and show what came back.
+    fn run_control_test(&mut self, cx: &mut Context<Self>) {
+        self.settings_ui.control_test = RemoteTestState::Testing;
         cx.notify();
         let exe = crate::control::exe_path();
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
@@ -645,8 +663,8 @@ impl MuxelApp {
                     let reply: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
                     match reply["projects"].as_array() {
                         Some(projects) => RemoteTestState::Ok(tn(
-                            "Grok Bot can reach muxel on {host}: it sees {count} project.",
-                            "Grok Bot can reach muxel on {host}: it sees {count} projects.",
+                            "Agents can reach muxel on {host}: it sees {count} project.",
+                            "Agents can reach muxel on {host}: it sees {count} projects.",
                             projects.len(),
                             &[
                                 ("host", reply["host"].as_str().unwrap_or("this computer")),
@@ -665,7 +683,7 @@ impl MuxelApp {
                 }
             };
             let _ = this.update(cx, |app, cx| {
-                app.settings_ui.grok_test = state;
+                app.settings_ui.control_test = state;
                 cx.notify();
             });
         })
@@ -1146,6 +1164,10 @@ impl MuxelApp {
 
     /// The session outside control may type into, or why it may not.
     fn control_writable(&self, iid: Uuid, cx: &App) -> CtlResult<Arc<TerminalSession>> {
+        // Admission checked this too, but delayed Enters and keys write later.
+        if !self.settings.control_enabled {
+            return Err(ctl::creation_refusal(ErrorCode::ControlDisabled));
+        }
         let inst = self
             .workspace
             .instance(iid)
@@ -1162,7 +1184,13 @@ impl MuxelApp {
             )
             .into());
         }
-        control_program_writable(inst, self.settings.control_allow_shells)?;
+        // A failed agent launch leaves its saved program intact while a shell
+        // runs instead. Check the current launch at every write, including the
+        // delayed Enter/key callbacks, so a relaunch cannot retain an old grant.
+        let fallback_shell = self
+            .terminal_view(iid)
+            .is_some_and(|view| view.read(cx).launch_error().is_some());
+        control_program_writable(inst, self.settings.control_allow_shells, fallback_shell)?;
         let refuse = |code, message: String| Err(ctl::Error::new(code, message));
         match self.control_state(inst, cx) {
             Some(AgentState::Exited) => {
@@ -1367,8 +1395,8 @@ impl MuxelApp {
     }
 
     /// Type `typing` into its agent, and note the turn it starts at `at` (when a
-    /// claim fixed it) or when its Enter lands. The reply to a prompt comes once
-    /// its Enter is written, or withheld.
+    /// claim fixed it) or when its Enter lands. Known providers then get a
+    /// bounded acceptance check; a writer receipt never proves consumption.
     fn control_press(
         &mut self,
         typing: Typing,
@@ -1389,7 +1417,10 @@ impl MuxelApp {
         } = typing;
         match typing.input {
             Input::Prompt(text) => {
-                let reply = match paste_prompt(&session, iid, &text, launch_id) {
+                let attempt = self
+                    .terminal_view(iid)
+                    .and_then(|view| view.read(cx).begin_prompt_submission(&text));
+                let mut reply = match paste_prompt(&session, iid, &text, launch_id) {
                     Ok(reply) => reply,
                     Err(error) => return Task::ready(Err(error)),
                 };
@@ -1398,16 +1429,73 @@ impl MuxelApp {
                     cx.background_executor()
                         .timer(Duration::from_millis(SUBMIT_DELAY_MS))
                         .await;
-                    this.update(cx, |app, cx| {
+                    let mut revision = this.update(cx, |app, cx| -> CtlResult<u64> {
                         let live = app.control_writable(iid, cx);
                         enter_verdict(live, &session, pasted, session.input_rev())?;
+                        if attempt.as_ref().is_some_and(|attempt| {
+                            app.terminal_view(iid).is_none_or(|view| {
+                                view.read(cx).observe_prompt_submission(attempt)
+                                    == muxel_terminal::PromptSubmissionState::Interrupted
+                            })
+                        }) {
+                            return Err("the provider conversation changed after the paste, so Enter was withheld: check its `screen`".into());
+                        }
                         press_prompt_enter(&session, pasted)?;
                         // Claim timestamps predict settlement. Local wait starts
                         // at the actual Enter admission, never at the prediction.
                         app.note_control_turn(iid, turn, now_ms());
-                        Ok(reply)
+                        Ok(session.input_rev())
                     })
-                    .unwrap_or_else(|_| Err("muxel is shutting down".into()))
+                    .unwrap_or_else(|_| Err("muxel is shutting down".into()))?;
+                    // Enter is in. Whatever happens next, the reply is this
+                    // receipt: an error would read as "Enter withheld".
+                    let Some(attempt) = attempt.filter(|attempt| attempt.observable()) else {
+                        submission_receipt(&mut reply, None, 0);
+                        return Ok(reply);
+                    };
+                    let started = std::time::Instant::now();
+                    let mut confirmation = PromptConfirmation::default();
+                    let mut retries = 0_u8;
+                    loop {
+                        let action = this
+                            .update(cx, |app, cx| -> Result<_, Unconfirmed> {
+                                confirmation_verdict(
+                                    app.control_writable(iid, cx),
+                                    &session,
+                                    revision,
+                                    session.input_rev(),
+                                )?;
+                                let view = app.terminal_view(iid).ok_or(Unconfirmed::Interrupted)?;
+                                let observation = view.read(cx).observe_prompt_submission(&attempt);
+                                if observation == muxel_terminal::PromptSubmissionState::Interrupted {
+                                    return Err(Unconfirmed::Interrupted);
+                                }
+                                let action = confirmation.observe(started.elapsed(), observation);
+                                if action == PromptConfirmationAction::RetryEnter {
+                                    // Observation and admission share this UI turn. The
+                                    // same permission, launch and input guards still apply.
+                                    press_prompt_enter(&session, revision)
+                                        .map_err(|_| Unconfirmed::Interrupted)?;
+                                    revision = session.input_rev();
+                                    retries += 1;
+                                }
+                                Ok(action)
+                            })
+                            .unwrap_or(Err(Unconfirmed::Interrupted));
+                        let outcome = match action {
+                            Ok(PromptConfirmationAction::Confirmed) => Ok(()),
+                            Ok(PromptConfirmationAction::Unconfirmed) => Err(Unconfirmed::TimedOut),
+                            Ok(PromptConfirmationAction::Observe | PromptConfirmationAction::RetryEnter) => {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(SUBMISSION_POLL_MS))
+                                    .await;
+                                continue;
+                            }
+                            Err(stop) => Err(stop),
+                        };
+                        submission_receipt(&mut reply, Some(outcome), retries);
+                        return Ok(reply);
+                    }
                 })
             }
             Input::Keys(presses) => {
@@ -1483,6 +1571,111 @@ impl MuxelApp {
             .get(&iid)
             .and_then(|turn| turn.startup.as_ref())?
             .claim()
+    }
+
+    /// Continue a discovery reservation without replacing its generation or
+    /// claiming a second startup owner for an already prepared launch.
+    pub(super) fn claim_reserved_control_startup(&mut self, iid: Uuid, token: u64) {
+        if !self
+            .terminal_launching
+            .get(&iid)
+            .is_some_and(|ticket| ticket.token == token && ticket.startup.is_none())
+        {
+            return;
+        }
+        let startup = self.claim_control_startup(iid);
+        self.terminal_launching.get_mut(&iid).unwrap().startup = startup;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptConfirmationAction {
+    Observe,
+    RetryEnter,
+    Confirmed,
+    Unconfirmed,
+}
+
+#[derive(Default)]
+struct PromptConfirmation {
+    retried_at: Option<Duration>,
+}
+
+impl PromptConfirmation {
+    fn observe(
+        &mut self,
+        elapsed: Duration,
+        observation: muxel_terminal::PromptSubmissionState,
+    ) -> PromptConfirmationAction {
+        use muxel_terminal::PromptSubmissionState;
+        if observation == PromptSubmissionState::Accepted {
+            return PromptConfirmationAction::Confirmed;
+        }
+        // A late retry still gets time to show its receipt.
+        let confirm = Duration::from_millis(SUBMISSION_CONFIRM_MS);
+        let deadline = self.retried_at.map_or(confirm, |at| {
+            confirm.max(at + Duration::from_millis(SUBMISSION_RETRY_GRACE_MS))
+        });
+        if elapsed >= deadline {
+            return PromptConfirmationAction::Unconfirmed;
+        }
+        if elapsed >= Duration::from_millis(SUBMISSION_RETRY_MS)
+            && self.retried_at.is_none()
+            && observation == PromptSubmissionState::Retryable
+        {
+            self.retried_at = Some(elapsed);
+            return PromptConfirmationAction::RetryEnter;
+        }
+        PromptConfirmationAction::Observe
+    }
+}
+
+/// Why checking ended without a provider receipt. Enter was already admitted,
+/// so each of these is reported in the receipt, never as an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unconfirmed {
+    TimedOut,
+    /// Other input reached the pane; no further Enter is sent.
+    InputChanged,
+    /// The pane closed, restarted, switched conversation or lost permission.
+    Interrupted,
+}
+
+impl Unconfirmed {
+    fn code(self) -> &'static str {
+        match self {
+            Self::TimedOut => "timed_out",
+            Self::InputChanged => "input_changed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+fn confirmation_verdict<T>(
+    live: CtlResult<Arc<T>>,
+    original: &Arc<T>,
+    expected: u64,
+    current: u64,
+) -> Result<(), Unconfirmed> {
+    if !live.as_ref().is_ok_and(|live| Arc::ptr_eq(live, original)) {
+        return Err(Unconfirmed::Interrupted);
+    }
+    if current != expected {
+        return Err(Unconfirmed::InputChanged);
+    }
+    Ok(())
+}
+
+/// `outcome` is `None` when this pane can show no receipt, so none was awaited.
+fn submission_receipt(
+    reply: &mut Value,
+    outcome: Option<Result<(), Unconfirmed>>,
+    enter_retries: u8,
+) {
+    reply["submission_confirmed"] = outcome.map_or(Value::Null, |outcome| json!(outcome.is_ok()));
+    reply["enter_retries"] = json!(enter_retries);
+    if let Some(Err(reason)) = outcome {
+        reply["unconfirmed_reason"] = json!(reason.code());
     }
 }
 
@@ -1680,10 +1873,14 @@ fn show_value(
 
 #[cfg(test)]
 mod prompt_submission_tests {
-    use super::{enter_verdict, paste_prompt, press_prompt_enter};
+    use super::{
+        PromptConfirmation, PromptConfirmationAction, Unconfirmed, confirmation_verdict,
+        enter_verdict, paste_prompt, press_prompt_enter, submission_receipt,
+    };
     use muxel_core::control::ErrorCode;
-    use muxel_terminal::{CommandSpec, TerminalSession};
-    use std::sync::Arc;
+    use muxel_terminal::{CommandSpec, PromptSubmissionState, TerminalSession};
+    use serde_json::json;
+    use std::{sync::Arc, time::Duration};
     use uuid::Uuid;
 
     #[test]
@@ -1777,6 +1974,111 @@ mod prompt_submission_tests {
         assert_eq!(replaced.code, None);
         let changed = enter_verdict(Ok(original.clone()), &original, 7, 8).unwrap_err();
         assert_eq!(changed.code, Some(ErrorCode::InputChanged));
+    }
+
+    #[test]
+    fn submission_retry_needs_positive_proof_and_can_happen_only_once() {
+        use PromptConfirmationAction::{Confirmed, Observe, RetryEnter, Unconfirmed};
+        use PromptSubmissionState::{Accepted, Retryable, Unconfirmed as Unknown};
+        let mut confirm = PromptConfirmation::default();
+        assert_eq!(
+            confirm.observe(Duration::from_millis(4_999), Retryable),
+            Observe
+        );
+        assert_eq!(confirm.observe(Duration::from_secs(5), Unknown), Observe);
+        assert_eq!(
+            confirm.observe(Duration::from_secs(6), Retryable),
+            RetryEnter
+        );
+        assert_eq!(confirm.observe(Duration::from_secs(7), Retryable), Observe);
+        assert_eq!(
+            confirm.observe(Duration::from_secs(10), Retryable),
+            Unconfirmed
+        );
+        // A genuine receipt is still usable when it arrives at the deadline.
+        assert_eq!(
+            confirm.observe(Duration::from_secs(10), Accepted),
+            Confirmed
+        );
+        let mut fast = PromptConfirmation::default();
+        assert_eq!(fast.observe(Duration::ZERO, Accepted), Confirmed);
+    }
+
+    #[test]
+    fn a_late_retry_keeps_time_to_confirm() {
+        use PromptConfirmationAction::{Observe, RetryEnter, Unconfirmed};
+        use PromptSubmissionState::{Retryable, Unconfirmed as Unknown};
+        let mut confirm = PromptConfirmation::default();
+        assert_eq!(
+            confirm.observe(Duration::from_millis(9_900), Retryable),
+            RetryEnter
+        );
+        assert_eq!(confirm.observe(Duration::from_secs(12), Unknown), Observe);
+        assert_eq!(
+            confirm.observe(Duration::from_millis(12_900), Unknown),
+            Unconfirmed
+        );
+    }
+
+    #[test]
+    fn confirmation_stops_after_intervening_input_permission_loss_or_replacement() {
+        let session = Arc::new(1_u8);
+        assert_eq!(
+            confirmation_verdict(Ok(session.clone()), &session, 9, 9),
+            Ok(())
+        );
+        assert_eq!(
+            confirmation_verdict(Ok(session.clone()), &session, 9, 10),
+            Err(Unconfirmed::InputChanged)
+        );
+        assert_eq!(
+            confirmation_verdict(Err("permission revoked".into()), &session, 9, 9),
+            Err(Unconfirmed::Interrupted)
+        );
+        assert_eq!(
+            confirmation_verdict(Ok(Arc::new(1)), &session, 9, 9),
+            Err(Unconfirmed::Interrupted)
+        );
+    }
+
+    #[test]
+    fn delayed_writes_recheck_that_outside_control_is_still_on() {
+        // Enters and keys run on timers after admission, through this gate.
+        let gate = include_str!("control_api.rs")
+            .split("    fn control_writable(")
+            .nth(1)
+            .unwrap();
+        assert!(
+            gate.find("if !self.settings.control_enabled").unwrap()
+                < gate.find("let inst = self").unwrap()
+        );
+    }
+
+    #[test]
+    fn checking_after_enter_only_ever_extends_the_success_receipt() {
+        let pasted = json!({"pasted": true, "launch_id": "L"});
+        let mut unwatched = pasted.clone();
+        submission_receipt(&mut unwatched, None, 0);
+        assert_eq!(
+            unwatched,
+            json!({"pasted": true, "launch_id": "L", "submission_confirmed": null, "enter_retries": 0})
+        );
+        let mut confirmed = pasted.clone();
+        submission_receipt(&mut confirmed, Some(Ok(())), 1);
+        assert_eq!(confirmed["submission_confirmed"], json!(true));
+        assert_eq!(confirmed["enter_retries"], json!(1));
+        assert!(confirmed.get("unconfirmed_reason").is_none());
+        for (reason, code) in [
+            (Unconfirmed::TimedOut, "timed_out"),
+            (Unconfirmed::InputChanged, "input_changed"),
+            (Unconfirmed::Interrupted, "interrupted"),
+        ] {
+            let mut stopped = pasted.clone();
+            submission_receipt(&mut stopped, Some(Err(reason)), 0);
+            assert_eq!(stopped["pasted"], json!(true));
+            assert_eq!(stopped["submission_confirmed"], json!(false));
+            assert_eq!(stopped["unconfirmed_reason"], json!(code));
+        }
     }
 }
 

@@ -180,6 +180,8 @@ pub enum TerminalStatusReason {
     ProviderTitle,
     ProviderScreen,
     Bell,
+    /// A provider's own lifecycle hook (Muse's root-session hooks).
+    ProviderHook,
     RecentOutput,
     Quiet,
 }
@@ -244,6 +246,10 @@ struct RuntimeStatusState {
     semantic_title_status: Option<AgentStatus>,
     grok_blocked_at: Option<Instant>,
     grok_screen_working_at: Option<Instant>,
+    /// Muse titles name the pane's working directory; a hook can report a new one.
+    muse_cwd_label: Option<String>,
+    /// Latest state reported by Muse's root-session hooks.
+    muse_hook_state: Option<muxel_core::muse::MuseState>,
     deadline: Option<Instant>,
     timer_generation: u64,
 }
@@ -272,6 +278,8 @@ impl RuntimeStatusState {
             semantic_title_status: None,
             grok_blocked_at: None,
             grok_screen_working_at: None,
+            muse_cwd_label: None,
+            muse_hook_state: None,
             deadline: None,
             timer_generation: 0,
         }
@@ -343,8 +351,12 @@ impl RuntimeStatusState {
             .map(|at| now + at.duration_since(wall).unwrap_or_default() + Duration::from_millis(1));
         let (title_events, title_overflowed) = (evidence.titles, evidence.overflowed);
         let (_, title_text) = session.title_snapshot();
-        let observed_title =
-            title_status(title_provider, title_text.as_deref(), session.title_age());
+        let muse_cwd_label = self.muse_cwd_label.as_deref();
+        let observed_title = if title_provider == TitleProvider::Muse {
+            muse_title_status(title_text.as_deref(), muse_cwd_label)
+        } else {
+            title_status(title_provider, title_text.as_deref(), session.title_age())
+        };
         // Only a submission in the current binding arms its completion: the
         // Enter that picked a conversation in `/resume` ran no turn in it.
         let submitted_turn = evidence.submitted;
@@ -363,7 +375,7 @@ impl RuntimeStatusState {
 
         let mut working_to_nonworking = false;
         if !title_overflowed {
-            let statuses = title_status_trace(title_provider, &title_events);
+            let statuses = title_status_trace(title_provider, muse_cwd_label, &title_events);
             working_to_nonworking = has_working_to_nonworking_edge(&statuses);
             for status in statuses {
                 self.provider_settled = provider_settled_after_title(
@@ -424,12 +436,21 @@ impl RuntimeStatusState {
         }
         let bell = session.has_bell();
         let idle = session.idle_for();
+        // Until Muse's own title is read (never, on a remote or tmux pane), it
+        // is judged by output activity like an unknown terminal. Its hooks
+        // still report blocked and finished turns.
+        let activity_fallback = working_markers.is_empty()
+            && match title_provider {
+                TitleProvider::Other => true,
+                TitleProvider::Muse => self.semantic_title_status.is_none(),
+                _ => false,
+            };
         let base = classify_facts(
             exited,
             self.working_marker,
             self.blocked_marker,
             bell,
-            title_provider == TitleProvider::Other && working_markers.is_empty(),
+            activity_fallback,
             idle,
         );
         let provider_screen = self.provider_screen;
@@ -486,20 +507,27 @@ impl RuntimeStatusState {
             title = provider_screen;
         }
 
-        let raw = combine_title_status(exited, base, title, screen_working);
+        let hook = (title_provider == TitleProvider::Muse && !exited)
+            .then(|| muse_hook_status(self.muse_hook_state, title, screen_working))
+            .flatten();
+        let raw = hook.unwrap_or_else(|| combine_title_status(exited, base, title, screen_working));
         let can_latch = can_latch_completion(
             !working_markers.is_empty(),
             self.semantic_title_status.is_some(),
         );
-        let raw_reason = status_reason(
-            raw,
-            exited,
-            bell,
-            title,
-            provider_screen,
-            working_marker,
-            blocked_marker,
-        );
+        let raw_reason = if hook == Some(raw) {
+            TerminalStatusReason::ProviderHook
+        } else {
+            status_reason(
+                raw,
+                exited,
+                bell,
+                title,
+                provider_screen,
+                working_marker,
+                blocked_marker,
+            )
+        };
         let raw_attributable = status_is_attributable(settling, self.screen_held, raw_reason);
         let (status, latch, armed) = if raw_attributable {
             latch_done_after_readiness(
@@ -519,29 +547,27 @@ impl RuntimeStatusState {
         self.done_latch = latch;
         self.completion_armed = armed;
 
-        if let Some(deadline) = fallback_status_deadline(
-            now,
-            idle,
-            status,
-            title_provider,
-            !working_markers.is_empty(),
-        )
-        .into_iter()
-        .chain(settle_deadline)
-        .min()
+        if let Some(deadline) = fallback_status_deadline(now, idle, status, activity_fallback)
+            .into_iter()
+            .chain(settle_deadline)
+            .min()
         {
             next_deadline = Some(next_deadline.map_or(deadline, |old| old.min(deadline)));
         }
 
-        let reason = status_reason(
-            status,
-            exited,
-            bell,
-            title,
-            provider_screen,
-            working_marker,
-            blocked_marker,
-        );
+        let reason = if hook == Some(status) {
+            TerminalStatusReason::ProviderHook
+        } else {
+            status_reason(
+                status,
+                exited,
+                bell,
+                title,
+                provider_screen,
+                working_marker,
+                blocked_marker,
+            )
+        };
         let attributable = status_is_attributable(settling, self.screen_held, reason);
         if exited {
             next_deadline = None;
@@ -569,6 +595,7 @@ enum TitleProvider {
     Claude,
     Codex,
     Grok,
+    Muse,
     Other,
 }
 
@@ -579,6 +606,12 @@ struct AgentTitleFrame {
 }
 
 impl TitleProvider {
+    /// Whether a `ctl new --prompt` task may be typed: only these providers
+    /// have a verified readiness and acceptance protocol.
+    fn has_startup_protocol(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Grok)
+    }
+
     fn from_program(program: &str) -> Self {
         let leaf = program
             .trim()
@@ -595,6 +628,7 @@ impl TitleProvider {
             "claude" => Self::Claude,
             "codex" => Self::Codex,
             "grok" => Self::Grok,
+            "muse" => Self::Muse,
             _ => Self::Other,
         }
     }
@@ -697,6 +731,17 @@ fn parse_agent_title(provider: TitleProvider, title: Option<&str>) -> Option<Age
                 name: (!name.is_empty()).then_some(name),
             })
         }
+        TitleProvider::Muse => {
+            let name = title
+                .split_once(' ')
+                .filter(|(spinner, _)| is_codex_spinner(spinner))
+                .map(|(_, name)| name)
+                .unwrap_or(title);
+            (!name.is_empty() && !name.contains(['/', '\\', ':'])).then(|| AgentTitleFrame {
+                status: None,
+                name: Some(name.to_string()),
+            })
+        }
         TitleProvider::Other => None,
     }
 }
@@ -752,11 +797,46 @@ fn title_status(
     parse_agent_title(provider, title).and_then(|frame| frame.status)
 }
 
-fn title_status_trace(provider: TitleProvider, titles: &[Option<String>]) -> Vec<AgentStatus> {
+fn title_status_trace(
+    provider: TitleProvider,
+    muse_cwd_label: Option<&str>,
+    titles: &[Option<String>],
+) -> Vec<AgentStatus> {
     titles
         .iter()
-        .filter_map(|title| title_status(provider, title.as_deref(), None))
+        .filter_map(|title| match provider {
+            TitleProvider::Muse => muse_title_status(title.as_deref(), muse_cwd_label),
+            provider => title_status(provider, title.as_deref(), None),
+        })
         .collect()
+}
+
+/// Muse's title carries state only as the pane's cwd label, spinner-prefixed
+/// while working; any other title says nothing about this pane.
+fn muse_title_status(title: Option<&str>, cwd_label: Option<&str>) -> Option<AgentStatus> {
+    match muxel_core::muse::title_state(title?, cwd_label?)? {
+        muxel_core::muse::MuseState::Working => Some(AgentStatus::Working),
+        _ => Some(AgentStatus::Idle),
+    }
+}
+
+/// Muse's root-session hooks. A permission prompt outranks Muse's
+/// still-spinning title, and a finished turn stays Done until a title or the
+/// screen shows new work. Hooked work adds nothing: an interrupted turn fires
+/// no hook, so titles or output activity tell when work stops.
+fn muse_hook_status(
+    hook: Option<muxel_core::muse::MuseState>,
+    title: Option<AgentStatus>,
+    screen_working: bool,
+) -> Option<AgentStatus> {
+    use muxel_core::muse::MuseState;
+    match hook? {
+        MuseState::Blocked => Some(AgentStatus::Blocked),
+        MuseState::Done if !screen_working && title != Some(AgentStatus::Working) => {
+            Some(AgentStatus::Done)
+        }
+        MuseState::Idle | MuseState::Working | MuseState::Done => None,
+    }
 }
 
 fn has_working_to_nonworking_edge(statuses: &[AgentStatus]) -> bool {
@@ -1429,18 +1509,16 @@ fn status_screen_capture_plan(
     StatusScreenCapture::Now
 }
 
+/// When Working read from recent output expires, for a terminal judged by
+/// output activity.
 fn fallback_status_deadline(
     now: Instant,
     idle: Duration,
     status: AgentStatus,
-    provider: TitleProvider,
-    has_working_markers: bool,
+    activity_fallback: bool,
 ) -> Option<Instant> {
-    (status == AgentStatus::Working
-        && provider == TitleProvider::Other
-        && !has_working_markers
-        && idle < Duration::from_secs(2))
-    .then(|| now + (Duration::from_secs(2) - idle))
+    (status == AgentStatus::Working && activity_fallback && idle < Duration::from_secs(2))
+        .then(|| now + (Duration::from_secs(2) - idle))
 }
 
 /// The wall-clock time `at` stands for.
@@ -1598,6 +1676,44 @@ pub struct TerminalView {
 /// cycle.
 pub type TerminalFocusObserver = fn(Uuid, bool, &mut Window, &mut App);
 
+/// Provider evidence for one ctl paste-and-submit operation. Capture before
+/// pasting; the caller owns deadlines, input-revision guards and the one retry.
+pub struct PromptSubmission {
+    session: std::sync::Weak<TerminalSession>,
+    binding_revision: u64,
+    provider: TitleProvider,
+    instance_id: Uuid,
+    input: String,
+    expected_input: String,
+    before_title: u64,
+    allow_working_title: bool,
+    before_prompt: Option<String>,
+    origin: Option<PromptOriginProof>,
+    observable: bool,
+}
+
+impl PromptSubmission {
+    /// Whether this pane can show a receipt for this prompt at all. Without
+    /// one, waiting for confirmation only delays the caller.
+    pub fn observable(&self) -> bool {
+        self.observable
+    }
+}
+
+struct PromptOriginProof {
+    frame: crate::startup::CodexCtlOrigin,
+    title_generation: u64,
+    resize_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptSubmissionState {
+    Accepted,
+    Retryable,
+    Unconfirmed,
+    Interrupted,
+}
+
 fn with_startup_view<R>(
     view: &WeakEntity<TerminalView>,
     session: &Arc<TerminalSession>,
@@ -1714,6 +1830,9 @@ struct StartupAttempt<'a> {
     input: &'a str,
     expected_input: String,
     before_title: u64,
+    // ctl sends begun during an existing turn need matching transcript proof.
+    // Startup attempts keep their existing title-based confirmation.
+    allow_working_title: bool,
     before_prompt: Option<String>,
     instance_id: Uuid,
 }
@@ -1751,7 +1870,8 @@ fn startup_provider_accepted(
     let fresh_user_row = startup_has_fresh_user_row(attempt, prompt)
         && startup_empty_composer(attempt.provider, screen);
     fresh_user_row
-        || (title_generation != attempt.before_title
+        || (attempt.allow_working_title
+            && title_generation != attempt.before_title
             && startup_title_working(attempt.provider, title))
 }
 
@@ -1764,6 +1884,146 @@ fn startup_title(
     match probe {
         Some(probe) => probe.snapshot(),
         None => session.title_snapshot(),
+    }
+}
+
+fn ctl_title_can_confirm(
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    status: AgentStatus,
+) -> bool {
+    matches!(status, AgentStatus::Idle | AgentStatus::Done)
+        && !matches!(
+            parse_agent_title(provider, title).and_then(|frame| frame.status),
+            Some(AgentStatus::Working | AgentStatus::Blocked)
+        )
+        && !matches!(
+            provider_screen_status(provider, &screen.text),
+            Some(AgentStatus::Working | AgentStatus::Blocked)
+        )
+}
+
+/// A ctl receipt is either a working title after an idle one, which needs a
+/// provider status title muxel can read (tmux hides OSC titles), or a fresh
+/// transcript row beside an empty composer. Those readers stop at the first
+/// blank line, so only a prompt without one can match; a row repeating the
+/// previous prompt is never fresh; and Grok's composer is never known empty.
+fn ctl_acceptance_observable(
+    provider: TitleProvider,
+    title: Option<&str>,
+    allow_working_title: bool,
+    input: &str,
+    before_prompt: Option<&str>,
+) -> bool {
+    let title_receipt = allow_working_title
+        && parse_agent_title(provider, title)
+            .and_then(|frame| frame.status)
+            .is_some();
+    let transcript_receipt = matches!(provider, TitleProvider::Claude | TitleProvider::Codex)
+        && !input.trim().lines().any(|line| line.trim().is_empty())
+        && before_prompt != Some(crate::startup::normalized(input).as_str());
+    title_receipt || transcript_receipt
+}
+
+fn prompt_submission_state(
+    attempt: &StartupAttempt<'_>,
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    title_generation: u64,
+    prompt: Option<&str>,
+    marker_sets: [&[String]; 2],
+    origin: Option<&PromptOriginProof>,
+) -> PromptSubmissionState {
+    if startup_provider_accepted(attempt, screen, title, title_generation, prompt) {
+        PromptSubmissionState::Accepted
+    } else if cfg!(windows)
+        && attempt.provider == TitleProvider::Codex
+        && !startup_has_fresh_user_row(attempt, prompt)
+        && origin.is_some_and(|proof| {
+            proof.title_generation == title_generation
+                && screen.codex_ctl_retry_draft(attempt.input, &proof.frame)
+        })
+        && codex_ctl_ready(screen, title, marker_sets, false)
+    {
+        PromptSubmissionState::Retryable
+    } else {
+        PromptSubmissionState::Unconfirmed
+    }
+}
+
+/// Existing panes may deliberately publish only their thread name. A strict
+/// ctl editor proof does not require a semantic Idle title, but positive work,
+/// permission and menu evidence must still veto the retry.
+fn codex_ctl_ready(
+    screen: &crate::startup::Screen,
+    title: Option<&str>,
+    marker_sets: [&[String]; 2],
+    empty: bool,
+) -> bool {
+    let Some(context) = screen.codex_composer_context(empty) else {
+        return false;
+    };
+    if matches!(
+        parse_agent_title(TitleProvider::Codex, title).and_then(|frame| frame.status),
+        Some(AgentStatus::Working | AgentStatus::Blocked)
+    ) {
+        return false;
+    }
+    if title.is_some_and(|title| {
+        matches!(
+            title.trim().to_ascii_lowercase().as_str(),
+            "working" | "thinking" | "starting" | "waiting" | "blocked" | "action required"
+        )
+    }) {
+        return false;
+    }
+    if title
+        .and_then(|title| title.rsplit_once(" | "))
+        .is_some_and(|(_, state)| {
+            let state = state.trim().to_ascii_lowercase();
+            matches!(
+                state.split_whitespace().next(),
+                Some("working" | "thinking" | "starting" | "waiting" | "blocked")
+            ) || state.starts_with("action required")
+        })
+    {
+        return false;
+    }
+    let lower = context.to_ascii_lowercase();
+    ![
+        "esc to interrupt",
+        "esc interrupt",
+        "ctrl+c to interrupt",
+        "trust this folder?",
+        "folder access",
+        "enter continue · esc quit",
+        "↑",
+        "↓",
+        "enter to select",
+        "enter to confirm",
+        "tab to select",
+        "esc to cancel",
+        "esc to dismiss",
+        "type to filter",
+    ]
+    .iter()
+    .any(|chrome| lower.contains(chrome))
+        && !marker_sets
+            .into_iter()
+            .flatten()
+            .any(|marker| !marker.is_empty() && context.contains(marker))
+}
+
+fn ctl_transcript_prompt(
+    provider: TitleProvider,
+    screen: &crate::startup::Screen,
+    history: impl FnOnce() -> String,
+) -> Option<String> {
+    if provider == TitleProvider::Codex {
+        screen.codex_ctl_transcript_prompt()
+    } else {
+        muxel_core::readaloud::prompt_from_screen(&history())
     }
 }
 
@@ -2267,6 +2527,12 @@ impl TerminalView {
         let startup_program = spec.program.clone();
         let title_provider =
             TitleProvider::from_program(spec.status_program.as_deref().unwrap_or(&startup_program));
+        let muse_cwd_label = spec
+            .cwd
+            .as_deref()
+            .filter(|_| title_provider == TitleProvider::Muse)
+            .and_then(|cwd| muxel_core::muse::cwd_label(std::path::Path::new(cwd)))
+            .map(str::to_string);
         let focus_handle = cx.focus_handle();
 
         // Forward focus in/out to the PTY (DECSET 1004) so agents like Claude
@@ -2321,7 +2587,7 @@ impl TerminalView {
         {
             let session = session.clone();
             let automation_program = startup_program.clone();
-            let known_provider = title_provider != TitleProvider::Other;
+            let known_provider = title_provider.has_startup_protocol();
             let framed_readiness =
                 matches!(title_provider, TitleProvider::Claude | TitleProvider::Codex);
             let armed_at = Instant::now();
@@ -2464,6 +2730,7 @@ impl TerminalView {
                                 input: &input,
                                 expected_input: crate::startup::normalized(&input),
                                 before_title: startup_title(&session, probe).0,
+                                allow_working_title: true,
                                 before_prompt: muxel_core::readaloud::prompt_from_screen(
                                     &session.recent_text(500),
                                 )
@@ -2731,7 +2998,10 @@ impl TerminalView {
             working_markers,
             blocked_markers,
             title_provider,
-            runtime: RuntimeStatusState::new(coverage),
+            runtime: RuntimeStatusState {
+                muse_cwd_label,
+                ..RuntimeStatusState::new(coverage)
+            },
             last_paint_notify: std::cell::Cell::new(std::time::Instant::now()),
             profile_notify_generation: std::cell::Cell::new(0),
             profile_last_notify_cause: std::cell::Cell::new(None),
@@ -2748,6 +3018,134 @@ impl TerminalView {
 
     pub fn session(&self) -> &Arc<TerminalSession> {
         &self.session
+    }
+
+    /// Snapshot evidence before the caller pastes. This never marks a turn as
+    /// submitted and does not authorize any subsequent write.
+    pub fn begin_prompt_submission(&self, text: &str) -> Option<PromptSubmission> {
+        if self.exited
+            || !matches!(
+                self.title_provider,
+                TitleProvider::Codex | TitleProvider::Claude | TitleProvider::Grok
+            )
+            || text.trim().is_empty()
+        {
+            return None;
+        }
+        let binding_revision = self.session.binding_revision();
+        let resize_revision = self.session.resize_revision();
+        let (before_title, title) = self.session.title_snapshot();
+        let screen = self.session.startup_screen();
+        let allow_working_title = ctl_title_can_confirm(
+            self.title_provider,
+            &screen,
+            title.as_deref(),
+            self.status(),
+        );
+        let before_prompt = ctl_transcript_prompt(self.title_provider, &screen, || {
+            self.session.recent_text(500)
+        })
+        .map(|prompt| crate::startup::normalized(&prompt));
+        let origin = if cfg!(windows)
+            && self.title_provider == TitleProvider::Codex
+            && codex_ctl_ready(
+                &screen,
+                title.as_deref(),
+                [&self.working_markers, &self.blocked_markers],
+                true,
+            ) {
+            screen
+                .codex_ctl_origin()
+                .filter(|_| {
+                    before_title == self.session.title_snapshot().0
+                        && resize_revision == self.session.resize_revision()
+                        && binding_revision == self.session.binding_revision()
+                })
+                .map(|frame| PromptOriginProof {
+                    frame,
+                    title_generation: before_title,
+                    resize_revision,
+                })
+        } else {
+            None
+        };
+        let observable = origin.is_some()
+            || ctl_acceptance_observable(
+                self.title_provider,
+                title.as_deref(),
+                allow_working_title,
+                text,
+                before_prompt.as_deref(),
+            );
+        // Preserve this generation even if it changes while reading history.
+        // Returning None would incorrectly downgrade a switch to an unsupported
+        // provider and skip the caller's pre-Enter interruption check.
+        Some(PromptSubmission {
+            session: Arc::downgrade(&self.session),
+            binding_revision,
+            provider: self.title_provider,
+            instance_id: self.instance_id,
+            input: text.to_owned(),
+            expected_input: crate::startup::normalized(text),
+            before_title,
+            allow_working_title,
+            before_prompt,
+            origin,
+            observable,
+        })
+    }
+
+    /// Observe real provider receipts. Retryable is only a Windows Codex draft
+    /// proof; the app must still recheck lifetime, permissions and input revision.
+    pub fn observe_prompt_submission(&self, snapshot: &PromptSubmission) -> PromptSubmissionState {
+        let current = || {
+            !self.exited
+                && snapshot.instance_id == self.instance_id
+                && snapshot.provider == self.title_provider
+                && snapshot.session.ptr_eq(&Arc::downgrade(&self.session))
+                && snapshot.binding_revision == self.session.binding_revision()
+        };
+        if !current() {
+            return PromptSubmissionState::Interrupted;
+        }
+        let resize_revision = self.session.resize_revision();
+        let (generation, title) = self.session.title_snapshot();
+        let screen = self.session.startup_screen();
+        let prompt = ctl_transcript_prompt(self.title_provider, &screen, || {
+            self.session.recent_text(500)
+        });
+        let attempt = StartupAttempt {
+            provider: snapshot.provider,
+            input: &snapshot.input,
+            expected_input: snapshot.expected_input.clone(),
+            before_title: snapshot.before_title,
+            allow_working_title: snapshot.allow_working_title,
+            before_prompt: snapshot.before_prompt.clone(),
+            instance_id: snapshot.instance_id,
+        };
+        let observed = prompt_submission_state(
+            &attempt,
+            &screen,
+            title.as_deref(),
+            generation,
+            prompt.as_deref(),
+            [&self.working_markers, &self.blocked_markers],
+            snapshot
+                .origin
+                .as_ref()
+                .filter(|proof| proof.resize_revision == resize_revision),
+        );
+        if current()
+            && observed == PromptSubmissionState::Retryable
+            && (resize_revision != self.session.resize_revision()
+                || generation != self.session.title_snapshot().0)
+        {
+            PromptSubmissionState::Unconfirmed
+        } else if current() {
+            observed
+        } else {
+            PromptSubmissionState::Interrupted
+        }
     }
 
     pub fn exited(&self) -> bool {
@@ -2882,6 +3280,21 @@ impl TerminalView {
     /// submitted turn. Fallback PTY quiet is not startup-readiness evidence.
     pub fn completion_ready(&self) -> bool {
         self.runtime_snapshot().completion_ready
+    }
+
+    /// Report the latest hook from this Muse pane's root session.
+    pub fn set_muse_hook_state(
+        &mut self,
+        metadata: &muxel_core::muse::MuseMetadata,
+        cx: &mut Context<Self>,
+    ) {
+        let label = muxel_core::muse::cwd_label(&metadata.cwd).map(str::to_string);
+        let state = Some(metadata.state);
+        if self.runtime.muse_cwd_label != label || self.runtime.muse_hook_state != state {
+            self.runtime.muse_cwd_label = label;
+            self.runtime.muse_hook_state = state;
+            self.refresh_runtime(cx);
+        }
     }
 
     /// Whether `needle` appears in the current visible grid — used by the app to
@@ -3243,12 +3656,46 @@ mod launch_identity_tests {
             if allow_fallback {
                 let launch = result.expect("ordinary UI preset retains its fallback");
                 let deadline = Instant::now() + Duration::from_secs(15);
-                while !marker.is_file() && Instant::now() < deadline {
+                let marker_complete = loop {
+                    if std::fs::read_to_string(&marker).ok().as_deref() == Some("fallback") {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
                     std::thread::sleep(Duration::from_millis(10));
-                }
+                };
+                // File creation precedes the completed write, and kill does not
+                // wait for the writer to release its Windows file handle.
                 launch.session.kill();
-                assert!(marker.is_file(), "the injected fallback must really run");
-                std::fs::remove_file(&marker).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    match launch.rx.try_recv() {
+                        Ok(ProfiledPtyChunk::Exit { .. }) => break,
+                        Err(async_channel::TryRecvError::Closed) => break,
+                        Ok(ProfiledPtyChunk::Output { .. }) => {}
+                        Err(async_channel::TryRecvError::Empty) => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let cleanup = loop {
+                    match std::fs::remove_file(&marker) {
+                        Ok(()) => break Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => break Ok(()),
+                        Err(error) if Instant::now() >= deadline => break Err(error),
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                };
+                assert!(
+                    marker_complete,
+                    "the injected fallback must finish its write"
+                );
+                cleanup.expect("remove fallback marker after bounded retries");
             } else {
                 assert!(
                     result.is_err(),
@@ -3569,9 +4016,11 @@ sleep 30
 #[cfg(test)]
 mod startup_readiness_tests {
     use super::{
-        QuietStartup, QuietStartupTarget, SHIFT_TAB, STARTUP_KEY_GAP_MS, STARTUP_MAX_WAIT_MS,
-        STARTUP_PRE_TYPE_MS, STARTUP_SUBMIT_DELAY_MS, StartupAttempt, TitleProvider,
-        claude_startup_ready, controlled_startup_deadline, quiet_startup,
+        PromptOriginProof, PromptSubmissionState, QuietStartup, QuietStartupTarget, SHIFT_TAB,
+        STARTUP_KEY_GAP_MS, STARTUP_MAX_WAIT_MS, STARTUP_PRE_TYPE_MS, STARTUP_SUBMIT_DELAY_MS,
+        StartupAttempt, TitleProvider, claude_startup_ready, codex_ctl_ready,
+        controlled_startup_deadline, ctl_acceptance_observable, ctl_title_can_confirm,
+        ctl_transcript_prompt, prompt_submission_state, quiet_startup, startup_has_fresh_user_row,
         startup_provider_accepted, startup_ready, startup_retry_allowed,
     };
     use crate::startup::Screen;
@@ -3785,12 +4234,491 @@ mod startup_readiness_tests {
     }
 
     #[test]
+    fn ctl_busy_send_cannot_confirm_from_a_previous_turns_title() {
+        use super::AgentStatus;
+
+        // A paste can still be invisible while an earlier turn publishes work.
+        let empty = codex_screen("Ask Codex to do anything");
+        for (provider, working) in [
+            (TitleProvider::Codex, "scratch | Working"),
+            (TitleProvider::Claude, "◐ scratch"),
+            (TitleProvider::Grok, "⠋ - Thinking - scratch - grok"),
+        ] {
+            for status in [AgentStatus::Working, AgentStatus::Blocked] {
+                assert!(!ctl_title_can_confirm(provider, &empty, None, status));
+            }
+            assert!(!ctl_title_can_confirm(
+                provider,
+                &empty,
+                Some(working),
+                AgentStatus::Idle
+            ));
+            let attempt = StartupAttempt {
+                provider,
+                input: "task",
+                expected_input: "task".into(),
+                before_title: 8,
+                allow_working_title: false,
+                before_prompt: None,
+                instance_id: uuid::Uuid::new_v4(),
+            };
+            assert_eq!(
+                prompt_submission_state(&attempt, &empty, Some(working), 9, None, [&[], &[]], None),
+                PromptSubmissionState::Unconfirmed
+            );
+            if provider == TitleProvider::Codex {
+                assert_eq!(
+                    prompt_submission_state(
+                        &attempt,
+                        &empty,
+                        Some(working),
+                        9,
+                        Some("task"),
+                        [&[], &[]],
+                        None
+                    ),
+                    PromptSubmissionState::Accepted
+                );
+            }
+        }
+        for status in [AgentStatus::Idle, AgentStatus::Done] {
+            assert!(ctl_title_can_confirm(
+                TitleProvider::Codex,
+                &empty,
+                Some("scratch | Ready"),
+                status
+            ));
+        }
+    }
+
+    #[test]
+    fn ctl_send_waits_only_where_a_receipt_can_be_seen() {
+        let multi = "first paragraph\n\nsecond paragraph";
+        for (provider, idle) in [
+            (TitleProvider::Codex, "scratch | Ready"),
+            (TitleProvider::Claude, "✳ scratch"),
+            (TitleProvider::Grok, "scratch - grok"),
+        ] {
+            // A readable status title confirms any prompt sent while idle.
+            assert!(ctl_acceptance_observable(
+                provider,
+                Some(idle),
+                true,
+                multi,
+                Some("first paragraph")
+            ));
+            // tmux hides the title and a busy pane can't use it either; then
+            // only a fresh transcript row the readers return whole can confirm.
+            for (title, allow) in [(None, true), (Some(idle), false)] {
+                assert!(!ctl_acceptance_observable(
+                    provider, title, allow, multi, None
+                ));
+                assert_eq!(
+                    ctl_acceptance_observable(provider, title, allow, "one\nparagraph\n", None),
+                    provider != TitleProvider::Grok
+                );
+                // The same prompt again leaves the newest row unchanged.
+                assert!(!ctl_acceptance_observable(
+                    provider,
+                    title,
+                    allow,
+                    "continue ",
+                    Some("continue")
+                ));
+            }
+        }
+        // A Codex thread-only title carries no run state to watch.
+        assert!(!ctl_acceptance_observable(
+            TitleProvider::Codex,
+            Some("scratch"),
+            true,
+            multi,
+            None
+        ));
+    }
+
+    #[test]
+    fn ctl_prompt_confirmation_requires_fresh_provider_evidence() {
+        let empty = codex_screen("Ask Codex to do anything");
+        for (provider, working) in [
+            (TitleProvider::Codex, "scratch | Working"),
+            (TitleProvider::Claude, "◐ scratch"),
+            (TitleProvider::Grok, "⠋ - Thinking - scratch - grok"),
+        ] {
+            let attempt = StartupAttempt {
+                provider,
+                input: "task",
+                expected_input: "task".into(),
+                before_title: 8,
+                allow_working_title: true,
+                before_prompt: None,
+                instance_id: uuid::Uuid::new_v4(),
+            };
+            assert_eq!(
+                prompt_submission_state(&attempt, &empty, Some(working), 8, None, [&[], &[]], None),
+                PromptSubmissionState::Unconfirmed
+            );
+            assert_eq!(
+                prompt_submission_state(&attempt, &empty, Some(working), 9, None, [&[], &[]], None),
+                PromptSubmissionState::Accepted
+            );
+        }
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: "task",
+            expected_input: "task".into(),
+            before_title: 8,
+            allow_working_title: true,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(
+            prompt_submission_state(
+                &attempt,
+                &empty,
+                Some("scratch | Ready"),
+                9,
+                Some("task"),
+                [&[], &[]],
+                None
+            ),
+            PromptSubmissionState::Accepted
+        );
+        let repeated = StartupAttempt {
+            before_prompt: Some("task".into()),
+            ..attempt
+        };
+        assert_eq!(
+            prompt_submission_state(
+                &repeated,
+                &empty,
+                Some("scratch | Ready"),
+                9,
+                Some("task"),
+                [&[], &[]],
+                None
+            ),
+            PromptSubmissionState::Unconfirmed
+        );
+    }
+
+    fn ctl_grid(draft: &[&str], consumed: bool) -> Screen {
+        let mut rows = vec![String::new(); 51];
+        rows[0] = "OpenAI Codex".into();
+        let top = 49 - 1 - draft.len() - usize::from(consumed);
+        for (index, piece) in draft.iter().enumerate() {
+            rows[top + index] = format!("{}{piece}", if index == 0 { "› " } else { "  " });
+        }
+        rows[49] = "  GPT-6.1-Sol · scratch".into();
+        rows[50] = "  ? for shortcuts".into();
+        Screen {
+            text: rows
+                .iter()
+                .map(|row| format!("{row}{}", " ".repeat(41 - row.chars().count())))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            cursor_row: (top + draft.len() - usize::from(!consumed)) as i32,
+            cursor_column: if consumed {
+                2
+            } else {
+                2 + draft.last().unwrap().chars().count()
+            },
+            cursor_visible: true,
+            bracketed_paste: true,
+        }
+    }
+
+    fn ctl_set_row(screen: &mut Screen, index: usize, text: &str) {
+        let mut rows = screen.text.lines().map(str::to_owned).collect::<Vec<_>>();
+        rows[index] = format!("{text}{}", " ".repeat(41 - text.chars().count()));
+        screen.text = rows.join("\n");
+    }
+
+    fn ctl_origin_proof() -> PromptOriginProof {
+        let mut empty = ctl_grid(&["Ask Codex to do anything"], false);
+        empty.cursor_column = 2;
+        assert!(codex_ctl_ready(&empty, None, [&[], &[]], true));
+        PromptOriginProof {
+            frame: empty.codex_ctl_origin().unwrap(),
+            title_generation: 8,
+            resize_revision: 0,
+        }
+    }
+
+    #[test]
+    fn ctl_prompt_retry_is_windows_codex_only_and_fresh_receipts_veto_it() {
+        let proof = ctl_origin_proof();
+        let retained = ctl_grid(&["task"], true);
+        let pending = ctl_grid(&["task"], false);
+        for (provider, title) in [
+            (TitleProvider::Codex, "scratch | Ready"),
+            (TitleProvider::Claude, "✳ scratch"),
+            (TitleProvider::Grok, "scratch - grok"),
+        ] {
+            let attempt = StartupAttempt {
+                provider,
+                input: "task",
+                expected_input: "task".into(),
+                before_title: 8,
+                allow_working_title: true,
+                before_prompt: None,
+                instance_id: uuid::Uuid::new_v4(),
+            };
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &pending,
+                    Some(title),
+                    8,
+                    None,
+                    [&[], &[]],
+                    Some(&proof)
+                ),
+                PromptSubmissionState::Unconfirmed,
+                "end cursor does not prove the first CR was read"
+            );
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &retained,
+                    Some(title),
+                    8,
+                    None,
+                    [&[], &[]],
+                    Some(&proof)
+                ),
+                if cfg!(windows) && provider == TitleProvider::Codex {
+                    PromptSubmissionState::Retryable
+                } else {
+                    PromptSubmissionState::Unconfirmed
+                }
+            );
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &retained,
+                    Some(title),
+                    8,
+                    Some("task"),
+                    [&[], &[]],
+                    Some(&proof)
+                ),
+                PromptSubmissionState::Unconfirmed,
+                "fresh matching user receipt vetoes retry"
+            );
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &retained,
+                    Some(title),
+                    8,
+                    None,
+                    [&[], &[]],
+                    None
+                ),
+                PromptSubmissionState::Unconfirmed,
+                "no compact initial origin proof"
+            );
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &retained,
+                    Some(title),
+                    9,
+                    None,
+                    [&[], &[]],
+                    Some(&proof)
+                ),
+                PromptSubmissionState::Unconfirmed,
+                "any title-generation change vetoes retry"
+            );
+        }
+    }
+
+    fn long_codex_ctl_screen() -> (String, Screen) {
+        // One 31-column word per 38-column textarea row; eighteen rows exceed
+        // the general read-aloud scan's bounded composer reach.
+        let words: Vec<_> = (0..18)
+            .map(|index| format!("segment{index:02}abcdefghijklmnopqrstuv"))
+            .collect();
+        let pieces = words.iter().map(String::as_str).collect::<Vec<_>>();
+        (words.join(" "), ctl_grid(&pieces, true))
+    }
+
+    #[test]
+    fn ctl_codex_no_title_long_own_composer_is_not_a_transcript_receipt() {
+        let (task, retained) = long_codex_ctl_screen();
+        let generic = muxel_core::readaloud::prompt_from_screen(&retained.text).unwrap();
+        assert_eq!(
+            crate::startup::normalized(&generic),
+            task,
+            "reproduce generic long-composer echo"
+        );
+        assert_eq!(
+            ctl_transcript_prompt(TitleProvider::Codex, &retained, || retained.text.clone()),
+            None
+        );
+        let proof = ctl_origin_proof();
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: &task,
+            expected_input: task.clone(),
+            before_title: 8,
+            allow_working_title: true,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        for title in [
+            None,
+            Some("a thread name without semantic status"),
+            Some("scratch | Ready"),
+        ] {
+            assert!(codex_ctl_ready(&retained, title, [&[], &[]], false));
+            assert!(
+                !startup_ready(TitleProvider::Codex, &retained, None, &[], false),
+                "startup title admission stays unchanged"
+            );
+            assert_eq!(
+                prompt_submission_state(
+                    &attempt,
+                    &retained,
+                    title,
+                    8,
+                    None,
+                    [&[], &[]],
+                    Some(&proof)
+                ),
+                if cfg!(windows) {
+                    PromptSubmissionState::Retryable
+                } else {
+                    PromptSubmissionState::Unconfirmed
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn ctl_codex_readiness_vetoes_explicit_work_chrome_and_both_marker_sets() {
+        let (_, retained) = long_codex_ctl_screen();
+        for title in [
+            "scratch | Working",
+            "scratch | Starting",
+            "scratch | Waiting",
+            "scratch | Blocked",
+            "scratch | Action Required",
+            "[ ! ] Action Required | scratch",
+            "Working",
+            "Blocked",
+        ] {
+            assert!(
+                !codex_ctl_ready(&retained, Some(title), [&[], &[]], false),
+                "{title}"
+            );
+        }
+        // Only provider chrome owns configured markers, not a quoted task.
+        let quoted = vec!["segment07".into()];
+        assert!(codex_ctl_ready(&retained, None, [&quoted, &quoted], false));
+        let custom = vec!["OpenAI Codex".into()];
+        assert!(!codex_ctl_ready(&retained, None, [&custom, &[]], false));
+        assert!(!codex_ctl_ready(&retained, None, [&[], &custom], false));
+        for chrome in [
+            "esc to interrupt",
+            "Trust this folder?",
+            "Enter to select",
+            "Type to filter",
+        ] {
+            let mut blocked = long_codex_ctl_screen().1;
+            ctl_set_row(&mut blocked, 0, chrome);
+            assert!(
+                !codex_ctl_ready(&blocked, None, [&[], &[]], false),
+                "{chrome}"
+            );
+            let mut origin = ctl_grid(&[""], false);
+            ctl_set_row(&mut origin, 0, chrome);
+            assert!(
+                !codex_ctl_ready(&origin, None, [&[], &[]], true),
+                "origin: {chrome}"
+            );
+        }
+        let origin = ctl_grid(&[""], false);
+        assert!(!codex_ctl_ready(&origin, Some("Working"), [&[], &[]], true));
+        assert!(!codex_ctl_ready(&origin, None, [&custom, &[]], true));
+        assert!(!codex_ctl_ready(&origin, None, [&[], &custom], true));
+    }
+
+    #[test]
+    fn ctl_codex_fresh_rendered_transcript_vetoes_retry_and_can_confirm_empty_editor() {
+        let (task, mut retained) = long_codex_ctl_screen();
+        let proof = ctl_origin_proof();
+        let attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: &task,
+            expected_input: task.clone(),
+            before_title: 8,
+            allow_working_title: true,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        for (index, word) in task.split(' ').enumerate() {
+            ctl_set_row(
+                &mut retained,
+                index + 1,
+                &format!("{}{word}", if index == 0 { "› " } else { "  " }),
+            );
+        }
+        let prompt =
+            ctl_transcript_prompt(TitleProvider::Codex, &retained, || retained.text.clone());
+        assert_eq!(prompt.as_deref(), Some(task.as_str()));
+        assert!(startup_has_fresh_user_row(&attempt, prompt.as_deref()));
+        assert_eq!(
+            prompt_submission_state(
+                &attempt,
+                &retained,
+                None,
+                8,
+                prompt.as_deref(),
+                [&[], &[]],
+                Some(&proof)
+            ),
+            PromptSubmissionState::Unconfirmed
+        );
+        let mut empty = ctl_grid(&["Ask Codex to do anything"], false);
+        empty.cursor_column = 2;
+        ctl_set_row(&mut empty, 1, "› task");
+        ctl_set_row(&mut empty, 2, "Assistant reply");
+        let prompt = ctl_transcript_prompt(TitleProvider::Codex, &empty, || empty.text.clone());
+        assert_eq!(prompt.as_deref(), Some("task"));
+        let small_attempt = StartupAttempt {
+            provider: TitleProvider::Codex,
+            input: "task",
+            expected_input: "task".into(),
+            before_title: 8,
+            allow_working_title: true,
+            before_prompt: None,
+            instance_id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(
+            prompt_submission_state(
+                &small_attempt,
+                &empty,
+                None,
+                8,
+                prompt.as_deref(),
+                [&[], &[]],
+                None
+            ),
+            PromptSubmissionState::Accepted
+        );
+    }
+
+    #[test]
     fn startup_acceptance_rejects_own_echo_stale_work_and_boot_activity() {
         let attempt = StartupAttempt {
             provider: TitleProvider::Codex,
             input: "task",
             expected_input: "task".into(),
             before_title: 8,
+            allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),
         };
@@ -3858,6 +4786,7 @@ mod startup_readiness_tests {
             input: "a  b",
             expected_input: "a b".into(),
             before_title: 2,
+            allow_working_title: true,
             before_prompt: None,
             instance_id: uuid::Uuid::new_v4(),
         };
@@ -4037,33 +4966,15 @@ mod tests {
     fn activity_fallback_has_one_exact_deadline() {
         let now = Instant::now();
         assert_eq!(
-            fallback_status_deadline(
-                now,
-                Duration::from_millis(1250),
-                AgentStatus::Working,
-                TitleProvider::Other,
-                false,
-            ),
+            fallback_status_deadline(now, Duration::from_millis(1250), AgentStatus::Working, true,),
             Some(now + Duration::from_millis(750))
         );
         assert_eq!(
-            fallback_status_deadline(
-                now,
-                Duration::from_secs(2),
-                AgentStatus::Working,
-                TitleProvider::Other,
-                false,
-            ),
+            fallback_status_deadline(now, Duration::from_secs(2), AgentStatus::Working, true,),
             None
         );
         assert_eq!(
-            fallback_status_deadline(
-                now,
-                Duration::ZERO,
-                AgentStatus::Working,
-                TitleProvider::Claude,
-                false,
-            ),
+            fallback_status_deadline(now, Duration::ZERO, AgentStatus::Working, false,),
             None
         );
     }
@@ -4675,7 +5586,7 @@ mod tests {
             Some("Thread | Working ⠋".to_string()),
             Some("Thread | Ready".to_string()),
         ];
-        let statuses = title_status_trace(TitleProvider::Codex, &titles);
+        let statuses = title_status_trace(TitleProvider::Codex, None, &titles);
         assert_eq!(statuses, vec![AgentStatus::Working, AgentStatus::Idle]);
         assert!(has_working_to_nonworking_edge(&statuses));
     }
@@ -4704,7 +5615,7 @@ mod tests {
         // What `update_runtime` feeds the reducer after the binding reset.
         let evidence = session.runtime_evidence(None);
         assert!(!evidence.overflowed);
-        let statuses = title_status_trace(TitleProvider::Codex, &evidence.titles);
+        let statuses = title_status_trace(TitleProvider::Codex, None, &evidence.titles);
         assert!(has_working_to_nonworking_edge(&statuses));
         let submitted = evidence.submitted;
         let (status, _, armed) = latch_done_after_readiness(
@@ -5297,7 +6208,8 @@ mod provider_switch_tests {
     // Import specifically: see `tests`.
     use super::{
         AgentStatus, RuntimeStatusState, TerminalStatusCoverage, TerminalStatusReason,
-        TitleProvider, screen_hold_after, status_is_attributable, title_status_trace, wall_time_at,
+        TitleProvider, muse_title_status, screen_hold_after, status_is_attributable,
+        title_status_trace, wall_time_at,
     };
     use crate::listener::{SWITCH_SETTLE, SWITCH_SLACK};
     use crate::session::{CommandSpec, PtyOutput, TerminalSession};
@@ -5321,6 +6233,201 @@ mod provider_switch_tests {
             output.push(bytes.as_bytes(), *read_at);
         }
         output
+    }
+
+    #[test]
+    fn only_providers_with_a_startup_protocol_receive_a_ctl_task() {
+        for program in ["claude", "codex.exe", "grok"] {
+            assert!(TitleProvider::from_program(program).has_startup_protocol());
+        }
+        for program in ["muse", "muse.cmd", "opencode", "bash"] {
+            assert!(!TitleProvider::from_program(program).has_startup_protocol());
+        }
+    }
+
+    #[test]
+    fn muse_titles_count_only_as_this_panes_cwd_label() {
+        use AgentStatus::{Idle, Working};
+        assert_eq!(muse_title_status(Some("repo"), Some("repo")), Some(Idle));
+        assert_eq!(
+            muse_title_status(Some("\u{280b} repo"), Some("repo")),
+            Some(Working)
+        );
+        assert_eq!(
+            muse_title_status(Some("\u{280b} other"), Some("repo")),
+            None
+        );
+        assert_eq!(
+            muse_title_status(Some("C:/bin/muse.exe"), Some("repo")),
+            None
+        );
+        assert_eq!(muse_title_status(Some("repo"), None), None);
+        let trace = title_status_trace(
+            TitleProvider::Muse,
+            Some("repo"),
+            &[
+                Some("\u{280b} repo".into()),
+                Some("elsewhere".into()),
+                Some("repo".into()),
+            ],
+        );
+        assert_eq!(trace, vec![Working, Idle]);
+    }
+
+    #[test]
+    fn muse_hooks_mark_permission_and_completion_while_activity_tells_hidden_work() {
+        use AgentStatus::{Blocked, Done, Working};
+        use TerminalStatusReason::{ProviderHook, RecentOutput};
+        use muxel_core::muse::MuseState;
+        let (session, _receiver) = fixture();
+        let mut runtime = RuntimeStatusState {
+            muse_cwd_label: Some("repo".into()),
+            ..RuntimeStatusState::new(TerminalStatusCoverage::ProviderVisible)
+        };
+        let observe = |runtime: &mut RuntimeStatusState, hook| {
+            runtime.muse_hook_state = Some(hook);
+            runtime.reconcile(
+                &session,
+                TitleProvider::Muse,
+                &[],
+                &[],
+                false,
+                Instant::now(),
+            );
+            (runtime.status, runtime.reason)
+        };
+        // No title reaches a tmux or remote pane's view. Output activity tells
+        // work, since an interrupted turn fires no hook; hooks report blocked
+        // and finished turns.
+        assert_eq!(
+            observe(&mut runtime, MuseState::Working),
+            (Working, RecentOutput)
+        );
+        assert_eq!(
+            observe(&mut runtime, MuseState::Blocked),
+            (Blocked, ProviderHook)
+        );
+        assert_eq!(observe(&mut runtime, MuseState::Done), (Done, ProviderHook));
+        // A spinning title is new work after a finished turn, but Muse keeps
+        // spinning through a permission prompt.
+        session.process_drained(&drained(&[("\x1b]0;\u{280b} repo\x07", SystemTime::now())]));
+        assert_eq!(observe(&mut runtime, MuseState::Done).0, Working);
+        assert_eq!(
+            observe(&mut runtime, MuseState::Blocked),
+            (Blocked, ProviderHook)
+        );
+        // Once titles arrive they, not output, tell work.
+        session.process_drained(&drained(&[("\x1b]0;repo\x07", SystemTime::now())]));
+        assert_eq!(observe(&mut runtime, MuseState::Done), (Done, ProviderHook));
+        let (_, reason) = observe(&mut runtime, MuseState::Working);
+        assert!(!matches!(reason, ProviderHook | RecentOutput), "{reason:?}");
+        // A process exit outranks every hook.
+        runtime.reconcile(
+            &session,
+            TitleProvider::Muse,
+            &[],
+            &[],
+            true,
+            Instant::now(),
+        );
+        assert_eq!(runtime.reason, TerminalStatusReason::ProcessExit);
+        session.kill();
+    }
+
+    #[test]
+    fn split_old_osc_title_cannot_rebind_on_a_fresh_terminator() {
+        let (session, _receiver) = fixture();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let c = uuid::Uuid::new_v4();
+        let old = SystemTime::now() - Duration::from_secs(3);
+        let hook = old + Duration::from_secs(1);
+        let fresh = hook + Duration::from_secs(4);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{a} | Ready\x07"),
+            old - Duration::from_secs(1),
+        )]));
+        session.process_drained(&drained(&[(&format!("\x1b]0;{b} | Ready"), old)]));
+        session.provider_switched_at(hook, hook, SystemTime::now());
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[("\x07", fresh)]));
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&a.to_string())
+        );
+
+        // A title whose opening bytes were read after the hook still binds.
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{c} | Ready\x07"),
+            fresh + Duration::from_millis(1),
+        )]));
+        assert!(session.binding_revision() > switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&c.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn synchronized_old_title_keeps_its_opening_read_time() {
+        let (session, _receiver) = fixture();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let old = SystemTime::now() - Duration::from_secs(3);
+        let hook = old + Duration::from_secs(1);
+        let fresh = hook + Duration::from_secs(4);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{a} | Working\x07"),
+            old - Duration::from_secs(1),
+        )]));
+        session.process_drained(&drained(&[(
+            &format!("\x1b[?2026h\x1b]0;{b} | Ready\x07"),
+            old,
+        )]));
+        session.provider_switched_at(hook, hook, SystemTime::now());
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[("\x1b[?2026l", fresh)]));
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&a.to_string())
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn escape_controls_keep_an_old_title_old_but_a_fresh_bell_fresh() {
+        let (session, _receiver) = fixture();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let old = SystemTime::now() - Duration::from_secs(3);
+        let hook = old + Duration::from_secs(1);
+        let fresh = hook + Duration::from_secs(4);
+        session.process_drained(&drained(&[(
+            &format!("\x1b]0;{a} | Working\x07"),
+            old - Duration::from_secs(1),
+        )]));
+        session.process_drained(&drained(&[("\x1b", old)]));
+        session.provider_switched_at(hook, hook, SystemTime::now());
+        let switched = session.binding_revision();
+        session.process_drained(&drained(&[(&format!("\x00\x07]0;{b} | Ready\x07"), fresh)]));
+        assert!(session.has_bell());
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&a.to_string())
+        );
+        session.kill();
     }
 
     #[test]
@@ -5884,6 +6991,7 @@ mod provider_switch_tests {
             ProviderTitle,
             ProviderScreen,
             Bell,
+            ProviderHook,
             RecentOutput,
             Quiet,
         ] {
@@ -6013,6 +7121,52 @@ mod provider_switch_tests {
         let fresh = hook + SWITCH_SLACK + SWITCH_SETTLE + Duration::from_secs(1);
         session.process_drained(&drained(&[(working, fresh)]));
         let (snapshot, _) = viewer.sample_at(&session, late + Duration::from_millis(60));
+        assert!(!viewer.runtime.screen_held);
+        assert!(snapshot.attributable);
+        session.kill();
+    }
+
+    #[test]
+    fn a_split_title_opened_inside_the_window_cannot_release_a_screen_hold() {
+        let (session, _receiver) = fixture();
+        let mut viewer = Viewer::new(TitleProvider::Grok);
+        let clock = viewer.clock;
+        let hook = SystemTime::now() - Duration::from_secs(1);
+        let row = "◎ 1 command still running · send a message to interrupt";
+        let working_prefix = "\x1b]0;\u{2839} - Responding - Topic - grok";
+        let working = "\x1b]0;\u{2839} - Responding - Topic - grok\x07";
+        session.process_drained(&drained(&[
+            (row, hook + Duration::from_millis(90)),
+            (working_prefix, hook + Duration::from_millis(100)),
+        ]));
+        session.provider_switched_at(hook, hook, hook + Duration::from_millis(400));
+        let (_, deadline) = viewer.sample_at(&session, clock);
+        assert!(viewer.runtime.screen_held);
+
+        // VTE dispatches the title on this later BEL, but its read time is
+        // still the prefix's time inside the switch window.
+        let after_window = hook + SWITCH_SLACK + Duration::from_millis(100);
+        session.process_drained(&drained(&[("\x07", after_window)]));
+        let late = deadline.expect("a settle deadline") + Duration::from_secs(5);
+        let (snapshot, _) = viewer.sample_at(&session, late);
+        assert!(
+            !session
+                .runtime_evidence_at(None, wall_time_at(late))
+                .title_fresh
+        );
+        assert_eq!(snapshot.status, AgentStatus::Working);
+        assert!(!snapshot.attributable);
+        assert!(viewer.runtime.screen_held);
+
+        // A newly opened title read after the window confirms the marker.
+        let fresh = after_window + Duration::from_secs(1);
+        session.process_drained(&drained(&[(working, fresh)]));
+        let (snapshot, _) = viewer.sample_at(&session, late + Duration::from_millis(60));
+        assert!(
+            session
+                .runtime_evidence_at(None, wall_time_at(late))
+                .title_fresh
+        );
         assert!(!viewer.runtime.screen_held);
         assert!(snapshot.attributable);
         session.kill();
@@ -6164,7 +7318,7 @@ mod provider_switch_tests {
         assert!(!evidence.settling);
         assert!(evidence.submitted);
         assert_eq!(
-            title_status_trace(TitleProvider::Claude, &evidence.titles),
+            title_status_trace(TitleProvider::Claude, None, &evidence.titles),
             vec![AgentStatus::Working, AgentStatus::Idle]
         );
         let (status, _, _) = viewer.completion(&session);

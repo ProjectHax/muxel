@@ -42,6 +42,8 @@ pub enum InjectionMode {
     CliFlag { flag: String },
     /// Type it into the terminal and press Enter shortly after the agent starts.
     TypeIn,
+    /// Add context through Muse's SessionStart hook, without a user turn.
+    SessionHook,
 }
 
 /// An environment variable applied to an agent's process.
@@ -467,15 +469,13 @@ impl AgentPreset {
             effort_flag: Some("--reasoning-effort".to_string()),
             args: Vec::new(),
             system_prompt: None,
-            // No verified hidden instruction transport; never type into a live prompt.
-            injection: InjectionMode::None,
+            injection: InjectionMode::SessionHook,
             env: Vec::new(),
             working_markers: Vec::new(),
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
-            // Muse can resume by id, but muxel does not capture its session id.
             session_id_flag: None,
-            resume_flag: None,
+            resume_flag: Some("resume".to_string()),
         }
     }
 
@@ -558,6 +558,14 @@ impl AgentPreset {
         out.extend(self.args.iter().cloned());
         out
     }
+
+    /// Muse presets saved by v18 predate capture support. Detect the capability
+    /// without replaying settings migrations or rewriting users' presets.
+    pub fn effective_resume_flag(&self) -> Option<&str> {
+        self.resume_flag
+            .as_deref()
+            .or_else(|| crate::muse::is_program(self.program.as_deref()).then_some("resume"))
+    }
 }
 
 /// Whether `program` runs one of muxel's built-in agent providers — the program
@@ -628,6 +636,8 @@ pub struct ResolvedLaunch {
     pub args: Vec<String>,
     /// Text to type into the terminal once the agent is ready (TypeIn injection).
     pub startup_input: Option<String>,
+    /// Invocation-only context supplied by a provider SessionStart hook.
+    pub session_context: Option<String>,
     /// Number of Shift+Tab presses to send before typing (runner "auto mode").
     pub auto_mode_presses: u8,
     /// Press Enter to submit after typing `startup_input`.
@@ -653,6 +663,7 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
             program: instance.program.clone(),
             args: instance.args.clone(),
             startup_input: None,
+            session_context: None,
             auto_mode_presses: 0,
             submit: false,
             env: instance
@@ -664,6 +675,7 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
     }
     let mut args = instance.args.clone();
     let mut startup_input = None;
+    let mut session_context = None;
 
     if let Some(prompt) = instance.system_prompt.as_ref().filter(|p| !p.is_empty()) {
         if instance.control_prompt {
@@ -685,6 +697,12 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
                 }
                 InjectionMode::TypeIn => {}
                 InjectionMode::None => {}
+                InjectionMode::SessionHook
+                    if crate::muse::is_program(instance.program.as_deref()) =>
+                {
+                    session_context = Some(prompt.clone());
+                }
+                InjectionMode::SessionHook => {}
             }
         }
     }
@@ -699,6 +717,7 @@ pub fn resolve_launch_for_session(instance: &Instance, resuming: bool) -> Resolv
         program: instance.program.clone(),
         args,
         startup_input,
+        session_context,
         auto_mode_presses: instance.auto_mode_presses,
         submit,
         env: instance
@@ -726,7 +745,12 @@ pub fn session_resume_args(preset: &AgentPreset, instance: &Instance) -> Option<
     if instance.literal_argv {
         return None;
     }
-    let resume_flag = preset.resume_flag.as_deref()?;
+    if crate::muse::is_program(instance.program.as_deref())
+        && instance.args.iter().any(|arg| arg == "--no-session-log")
+    {
+        return None;
+    }
+    let resume_flag = preset.effective_resume_flag()?;
     if instance.session_started {
         let id = instance.session_id.as_deref()?;
         return Some(vec![resume_flag.to_string(), id.to_string()]);
@@ -997,45 +1021,44 @@ pub fn codex_latest_session_id(home: &Path, cwd: &Path) -> Option<String> {
     if !root.is_dir() {
         return None;
     }
-    let mut best: Option<(std::time::SystemTime, String)> = None;
+    let mut rollouts = Vec::new();
+    let mut unknown_time = false;
     walk_jsonl(&root, &mut |path| {
         let Ok(meta) = std::fs::metadata(path) else {
-            return false;
+            unknown_time = true;
+            return true;
         };
         let Ok(mtime) = meta.modified() else {
-            return false;
+            unknown_time = true;
+            return true;
         };
-        let Some((id, session_cwd)) = codex_session_meta(path) else {
-            return false;
-        };
-        if !paths_loosely_equal(Path::new(&session_cwd), cwd) {
-            return false;
-        }
-        if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
-            best = Some((mtime, id));
-        }
+        rollouts.push((mtime, codex_sessions::filename_id(path), path.to_path_buf()));
         false // scan every rollout to find the newest
-    });
-    best.map(|(_, id)| id)
+    })?;
+    if unknown_time {
+        return None;
+    }
+    codex_sessions::newest_matches(rollouts.into_iter(), cwd, 1, &mut || false)?
+        .into_iter()
+        .next()
+        .map(|session| session.id)
 }
 
 /// Walk Codex rollout files (`*.jsonl` and compressed `*.jsonl.zst`) under `dir`,
-/// calling `visit` on each. `visit` returns `true` to stop the walk early (used by
-/// existence checks); returns whether the walk was stopped.
-fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
+/// calling `visit` on each. `visit` returns `true` to stop the walk early;
+/// returns whether the walk was stopped, or `None` if any
+/// directory or entry could not be read.
+fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> Option<bool> {
     #[cfg(test)]
     codex_lookup_tests::record_directory(dir);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+        let file_type = entry.file_type().ok()?;
         if file_type.is_dir() {
-            if walk_jsonl(&path, visit) {
-                return true;
+            if walk_jsonl(&path, visit)? {
+                return Some(true);
             }
         } else if path
             .file_name()
@@ -1043,25 +1066,33 @@ fn walk_jsonl(dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
             .is_some_and(|n| n.ends_with(".jsonl") || n.ends_with(".jsonl.zst"))
             && visit(&path)
         {
-            return true;
+            return Some(true);
         }
     }
-    false
+    Some(false)
 }
 
-/// First top-level `session_meta` line → `(thread id, cwd)`.
-fn codex_session_meta(path: &Path) -> Option<(String, String)> {
-    use std::io::{BufRead, BufReader};
+/// First top-level `session_meta` line → `(thread id, cwd)`. Only a confirmed
+/// subagent is `Ok(None)`; unreadable or incomplete metadata remains unresolved.
+fn codex_session_meta(path: &Path) -> std::io::Result<Option<(String, String)>> {
+    use std::io::{self, BufRead, BufReader};
+    let invalid_meta = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unresolved Codex session metadata",
+        )
+    };
     #[cfg(test)]
     codex_lookup_tests::record_open(path);
-    let file = std::fs::File::open(path).ok()?;
+    let file = std::fs::File::open(path)?;
     for line in BufReader::new(file).lines().take(8) {
-        let line = line.ok()?;
-        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-        if v.get("type")?.as_str()? != "session_meta" {
+        let line = line?;
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
             continue;
         }
-        let payload = v.get("payload")?;
+        let payload = v.get("payload").ok_or_else(invalid_meta)?;
         // A subagent shares its parent's session_id but owns a different thread.
         // Neither its thread nor its parent's id describes this terminal pane.
         if payload
@@ -1071,17 +1102,22 @@ fn codex_session_meta(path: &Path) -> Option<(String, String)> {
                 source.as_str() == Some("subagent") || source.get("subagent").is_some()
             })
         {
-            return None;
+            return Ok(None);
         }
         let id = payload
             .get("id")
-            .or_else(|| payload.get("session_id"))?
-            .as_str()?
+            .or_else(|| payload.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid_meta)?
             .to_string();
-        let cwd = payload.get("cwd")?.as_str()?.to_string();
-        return Some((id, cwd));
+        let cwd = payload
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid_meta)?
+            .to_string();
+        return Ok(Some((id, cwd)));
     }
-    None
+    Err(invalid_meta())
 }
 
 pub(crate) fn paths_loosely_equal(a: &Path, b: &Path) -> bool {
@@ -1559,8 +1595,106 @@ mod tests {
             ["--model", "configured-model", "--reasoning-effort", "high"]
         );
         assert_eq!(launch.startup_input, None);
-        assert_eq!(preset.injection, InjectionMode::None);
+        assert_eq!(preset.injection, InjectionMode::SessionHook);
+        assert_eq!(
+            launch.session_context.as_deref(),
+            Some("Project instructions\nwith details")
+        );
         assert_eq!(session_resume_args(&preset, &inst), None);
+    }
+
+    #[test]
+    fn muse_resume_uses_bound_id_and_preserves_overrides() {
+        let mut preset = AgentPreset::muse();
+        preset.model = Some("configured-model".into());
+        preset.effort = Some("medium".into());
+        preset.args = vec!["--worktree".into(), "off".into()];
+        let mut pane = instance(&preset, Some("launch context"));
+        assert_eq!(session_resume_args(&preset, &pane), None);
+        pane.session_id = Some("01a14039-60e8-7532-9187-0cd6f75f15a0".into());
+        pane.session_started = true;
+        let mut args = session_resume_args(&preset, &pane).unwrap();
+        let launch = resolve_launch_for_session(&pane, true);
+        args.extend(launch.args);
+        assert_eq!(
+            args,
+            [
+                "resume",
+                "01a14039-60e8-7532-9187-0cd6f75f15a0",
+                "--model",
+                "configured-model",
+                "--reasoning-effort",
+                "medium",
+                "--worktree",
+                "off"
+            ]
+        );
+        assert!(launch.startup_input.is_none());
+        preset.resume_flag = None;
+        assert!(session_resume_args(&preset, &pane).is_some());
+        pane.args.push("--no-session-log".into());
+        assert!(session_resume_args(&preset, &pane).is_none());
+    }
+
+    #[test]
+    fn muse_full_launch_places_hook_config_before_a_preserved_positional_tail() {
+        let sid = "01a14039-60e8-7532-9187-0cd6f75f15a0";
+        let config = "managed_hooks_path=\"C:/Muxel data/hooks.json\"";
+        for resuming in [false, true] {
+            for positional in [false, true] {
+                let mut preset = AgentPreset::muse();
+                preset.model = Some("configured-model".into());
+                preset.effort = Some("medium".into());
+                preset.args = if positional {
+                    ["--", "preserved prompt", "--literal-tail", "-chooks={}"]
+                        .map(str::to_string)
+                        .to_vec()
+                } else {
+                    ["--worktree", "off"].map(str::to_string).to_vec()
+                };
+                let mut pane = instance(&preset, None);
+                pane.session_id = Some(sid.into());
+                pane.session_started = resuming;
+                let launch = resolve_launch_for_session(&pane, resuming);
+                let mut args = session_resume_args(&preset, &pane).unwrap_or_default();
+                args.extend(launch.args);
+                crate::muse::insert_hook_config(&mut args, config.into());
+                let mut expected = if resuming {
+                    vec!["resume".to_string(), sid.into()]
+                } else {
+                    Vec::new()
+                };
+                expected.extend(
+                    [
+                        "--model",
+                        "configured-model",
+                        "--reasoning-effort",
+                        "medium",
+                    ]
+                    .map(str::to_string),
+                );
+                if positional {
+                    expected.extend(
+                        [
+                            "--config",
+                            config,
+                            "--",
+                            "preserved prompt",
+                            "--literal-tail",
+                            "-chooks={}",
+                        ]
+                        .map(str::to_string),
+                    );
+                } else {
+                    expected.extend(["--worktree", "off", "--config", config].map(str::to_string));
+                }
+                assert_eq!(
+                    args, expected,
+                    "resuming={resuming}, positional={positional}"
+                );
+                assert!(launch.startup_input.is_none());
+            }
+        }
     }
 
     #[test]

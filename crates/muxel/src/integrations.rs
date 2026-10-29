@@ -2401,7 +2401,7 @@ fn tmux_command_at(loc: &RepoLoc, session: &SessionTarget, args: &[String]) -> O
 }
 
 /// Run this muxel's own `ctl` command (`exe ctl <args>`), the way an outside
-/// agent does — Settings → Grok Bot's Test.
+/// agent does — Settings → Outside control's Test.
 pub fn run_muxel_ctl(exe: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
     command(exe)
         .arg("ctl")

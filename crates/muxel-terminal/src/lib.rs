@@ -28,11 +28,12 @@ pub use profile::startup_event;
 pub use session::{
     CommandSpec, LaunchBinding, PTY_OUTPUT_QUEUE_BYTE_CAPACITY, PTY_OUTPUT_QUEUE_CHUNK_CAPACITY,
     PtyChunk, PtyOutputQueueStats, PtyReceiver, TerminalSession, TitleSource,
-    literal_program_for_spawn,
+    literal_program_for_spawn, muse_config_supported,
 };
 pub use view::{
     AgentStatus, LocalPaste, LocalPasteHandler, OpenLink, OpenLinkBackground,
-    PathPasteErrorHandler, TerminalFocusObserver, TerminalFocusProfile, TerminalLaunch,
-    TerminalMouseMode, TerminalNotifyCause, TerminalRuntimeSnapshot, TerminalStatusCoverage,
-    TerminalStatusReason, TerminalView, clean_agent_title, paste_clipboard_into_session,
+    PathPasteErrorHandler, PromptSubmission, PromptSubmissionState, TerminalFocusObserver,
+    TerminalFocusProfile, TerminalLaunch, TerminalMouseMode, TerminalNotifyCause,
+    TerminalRuntimeSnapshot, TerminalStatusCoverage, TerminalStatusReason, TerminalView,
+    clean_agent_title, paste_clipboard_into_session,
 };

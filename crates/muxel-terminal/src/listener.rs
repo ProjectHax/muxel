@@ -455,7 +455,9 @@ impl EventListener for MuxelListener {
                 let mut evidence = self.evidence.lock();
                 let at = evidence.output_time();
                 let seq = evidence.record_title(Some(title.clone()), at);
-                if let Some(next) = session_thread_field(&title) {
+                if evidence.output_is_fresh(at)
+                    && let Some(next) = session_thread_field(&title)
+                {
                     let changed = match hint.as_deref().and_then(session_thread_field) {
                         Some(previous) => previous != next,
                         None => evidence.first_thread_switches(next),
@@ -631,12 +633,26 @@ mod tests {
         listener.send_event(Event::Title(format!("{other} | Ready")));
         assert_eq!(listener.evidence.lock().binding_rev(), 1);
 
-        // After a switch reported out of band, the first title begins the
-        // next binding, in exact order.
+        // After a switch reported out of band, a title in its ambiguity
+        // window stays visible but cannot begin another binding.
         let listener = listener_for(LaunchBinding::Known(Some(pinned.into())));
         let now = SystemTime::now();
         listener.evidence.lock().switch_binding(now, now, now);
-        listener.send_event(Event::Title(format!("{pinned} | Ready")));
+        let pinned_title = format!("{pinned} | Ready");
+        listener.send_event(Event::Title(pinned_title.clone()));
+        assert_eq!(listener.evidence.lock().binding_rev(), 2);
+        assert_eq!(
+            listener.title.lock().as_deref(),
+            Some(pinned_title.as_str())
+        );
+        assert!(listener.session_id_hint.lock().is_none());
+        // Its first fresh UUID title can then establish the replacement.
+        listener
+            .evidence
+            .lock()
+            .begin_read(now + SWITCH_SLACK + Duration::from_millis(1));
+        listener.send_event(Event::Title(pinned_title));
+        listener.evidence.lock().end_read();
         assert_eq!(listener.evidence.lock().binding_rev(), 3);
 
         // An unknown launch's first title is its first identity.

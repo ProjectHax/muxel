@@ -711,6 +711,8 @@ pub struct CommandSpec {
     pub startup_delay_ms: u32,
     /// The provider conversation this launch opens, if muxel knows it.
     pub binding: LaunchBinding,
+    /// Whether the command actually resumes an existing provider conversation.
+    pub launch_resumed: bool,
 }
 
 impl CommandSpec {
@@ -740,6 +742,7 @@ impl CommandSpec {
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
+            launch_resumed: false,
         }
     }
 
@@ -765,6 +768,7 @@ impl CommandSpec {
             blocked_markers: Vec::new(),
             startup_delay_ms: 0,
             binding: LaunchBinding::Unknown,
+            launch_resumed: false,
         }
     }
 
@@ -830,6 +834,11 @@ impl CommandSpec {
 
     pub fn with_binding(mut self, binding: LaunchBinding) -> Self {
         self.binding = binding;
+        self
+    }
+
+    pub fn with_launch_resumed(mut self, resumed: bool) -> Self {
+        self.launch_resumed = resumed;
         self
     }
 
@@ -995,10 +1004,144 @@ pub(crate) struct PointerHit {
     pub rows: u16,
 }
 
+/// Read times for controls whose VTE callback can arrive in a later PTY read.
+/// This only finds boundaries; VTE still decides whether bytes form an event.
+#[derive(Default)]
+struct OutputReadClock {
+    osc_since: Option<SystemTime>,
+    escape_at: Option<SystemTime>,
+    sync_since: Option<SystemTime>,
+    next_sync_since: Option<SystemTime>,
+    sync_prefix_len: usize,
+    sync_prefix_at: Option<SystemTime>,
+}
+
+enum OutputBoundary {
+    Plain,
+    ExecutedControl,
+    SyncStart(SystemTime),
+    SyncEnd,
+}
+
+impl OutputReadClock {
+    fn unbuffered_at(&self, read_at: SystemTime) -> SystemTime {
+        [self.osc_since, self.escape_at]
+            .into_iter()
+            .flatten()
+            .fold(read_at, SystemTime::min)
+    }
+
+    fn effective_at(&self, read_at: SystemTime) -> SystemTime {
+        let unbuffered = self.unbuffered_at(read_at);
+        self.sync_since.map_or(unbuffered, |at| at.min(unbuffered))
+    }
+
+    fn executed_control_at(&self, read_at: SystemTime) -> SystemTime {
+        self.sync_since.map_or(read_at, |at| at.min(read_at))
+    }
+
+    /// Split after an OSC ends, an Escape-state C0 executes, or DEC 2026
+    /// changes frames so the next event in the same read gets its own origin.
+    fn scan(&mut self, byte: u8, read_at: SystemTime) -> Option<OutputBoundary> {
+        let mut boundary = None;
+        if self.osc_since.is_some() {
+            match byte {
+                0x07 | 0x18 | 0x1a => {
+                    self.osc_since = None;
+                    boundary = Some(OutputBoundary::Plain);
+                }
+                0x1b => {
+                    self.osc_since = None;
+                    self.escape_at = Some(read_at);
+                    boundary = Some(OutputBoundary::Plain);
+                }
+                _ => {}
+            }
+        } else if let Some(escape_at) = self.escape_at {
+            // vte 0.15's Escape state: these C0 bytes execute without leaving
+            // it; ESC, DEL, and high bytes are ignored; CAN/SUB abort it.
+            match byte {
+                b']' => {
+                    self.escape_at = None;
+                    self.osc_since = Some(escape_at);
+                }
+                0x18 | 0x1a => {
+                    self.escape_at = None;
+                    boundary = Some(OutputBoundary::ExecutedControl);
+                }
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+                    boundary = Some(OutputBoundary::ExecutedControl);
+                }
+                0x1b | 0x7f..=0xff => {}
+                _ => {
+                    self.escape_at = None;
+                    boundary = Some(OutputBoundary::Plain);
+                }
+            }
+        } else if byte == 0x1b {
+            self.escape_at = Some(read_at);
+        }
+
+        const PREFIX: &[u8] = b"\x1b[?2026";
+        if self.sync_prefix_len == 0 {
+            if byte == 0x1b {
+                self.sync_prefix_len = 1;
+                self.sync_prefix_at = Some(read_at);
+            }
+        } else if self.sync_prefix_len < PREFIX.len() && byte == PREFIX[self.sync_prefix_len] {
+            self.sync_prefix_len += 1;
+        } else if self.sync_prefix_len == PREFIX.len() && matches!(byte, b'h' | b'l') {
+            let started = self.sync_prefix_at.take().unwrap_or(read_at);
+            self.sync_prefix_len = 0;
+            boundary = Some(if byte == b'h' {
+                OutputBoundary::SyncStart(started)
+            } else {
+                OutputBoundary::SyncEnd
+            });
+        } else {
+            self.sync_prefix_len = usize::from(byte == 0x1b);
+            self.sync_prefix_at = (byte == 0x1b).then_some(read_at);
+        }
+        boundary
+    }
+
+    fn after_segment(
+        &mut self,
+        boundary: Option<OutputBoundary>,
+        active: bool,
+        read_at: SystemTime,
+    ) {
+        match boundary {
+            Some(OutputBoundary::SyncStart(started)) if active => {
+                if self.sync_since.is_some() {
+                    self.next_sync_since.get_or_insert(started);
+                } else {
+                    self.sync_since = Some(started);
+                }
+            }
+            Some(OutputBoundary::SyncEnd) if active => {
+                if let Some(started) = self.next_sync_since.take() {
+                    self.sync_since = Some(started);
+                }
+            }
+            _ => {}
+        }
+        if !active {
+            self.sync_since = None;
+            self.next_sync_since = None;
+        } else if self.sync_since.is_none() {
+            // VTE can also end a frame at its buffer limit.
+            self.sync_since = Some(read_at);
+        }
+    }
+}
+
 pub struct TerminalSession {
     pub id: Uuid,
+    launch_resumed: bool,
     term: Arc<Mutex<Term<MuxelListener>>>,
     processor: Mutex<Processor>,
+    read_clock: Mutex<OutputReadClock>,
     writer: SharedWriter,
     output_queue: Arc<OutputQueueState>,
     // `MasterPty` is Send but not Sync. Access is rare (settled resize and a
@@ -1041,6 +1184,8 @@ pub struct TerminalSession {
     scrollbar_drag: Mutex<Option<f32>>,
     /// Resize debounce state (skips redundant resizes + coalesces bursts).
     resize: Mutex<ResizeState>,
+    /// A resize away and back still invalidates a controller's input-frame proof.
+    resize_revision: AtomicU64,
     /// Active search needle (lowercased not required — matching is ASCII-insensitive).
     /// Empty = no search; the element highlights matches of this each paint.
     search: Mutex<Vec<char>>,
@@ -1202,6 +1347,10 @@ pub(crate) struct PaintDrawList {
 }
 
 impl TerminalSession {
+    pub fn launch_resumed(&self) -> bool {
+        self.launch_resumed
+    }
+
     /// Spawn a PTY running `spec` at the given initial grid size. Returns the
     /// session plus the receiver the UI drains for output/exit events.
     pub fn spawn(spec: CommandSpec, cols: u16, rows: u16) -> Result<(Arc<Self>, PtyReceiver)> {
@@ -1506,8 +1655,10 @@ impl TerminalSession {
 
         let session = Arc::new(Self {
             id: Uuid::new_v4(),
+            launch_resumed: spec.launch_resumed,
             term: Arc::new(Mutex::new(term)),
             processor: Mutex::new(Processor::new()),
+            read_clock: Mutex::new(OutputReadClock::default()),
             writer,
             master,
             output_queue,
@@ -1532,6 +1683,7 @@ impl TerminalSession {
                 target: (cols, rows),
                 since: Instant::now(),
             }),
+            resize_revision: AtomicU64::new(0),
             search: Mutex::new(Vec::new()),
             local_paste: Mutex::new(None),
             path_paste_error: Mutex::new(None),
@@ -1571,8 +1723,8 @@ impl TerminalSession {
     }
 
     /// Feed PTY output through the VTE parser into the terminal grid. Evidence
-    /// it raises (a title, a bell) is stamped as read now; the view's drain uses
-    /// [`Self::process_drained`], which stamps it with when it was read.
+    /// uses this read time, or the opening read of a title or synchronized frame
+    /// that began earlier. The view's drain uses the reader's timestamps.
     pub(crate) fn process_output(&self, data: &[u8]) {
         self.parse([(data, SystemTime::now())]);
     }
@@ -1585,18 +1737,111 @@ impl TerminalSession {
         self.parse(output.chunks());
     }
 
+    fn advance_timed_segment(
+        &self,
+        processor: &mut Processor,
+        term: &mut Term<MuxelListener>,
+        clock: &mut OutputReadClock,
+        bytes: &[u8],
+        effective_at: SystemTime,
+        incoming_at: SystemTime,
+    ) {
+        // VTE 0.15 replays its synchronized buffer on capacity overflow, then
+        // parses the incoming bytes in the same advance call. Give the replay
+        // its old time and the new bytes their own time.
+        const VTE_SYNC_BUFFER_SIZE: usize = 0x20_0000;
+        if processor.sync_timeout().sync_timeout().is_some()
+            && processor.sync_bytes_count().saturating_add(bytes.len()) >= VTE_SYNC_BUFFER_SIZE - 1
+        {
+            self.evidence
+                .lock()
+                .begin_read(clock.sync_since.unwrap_or(effective_at));
+            processor.stop_sync(term);
+            clock.sync_since = None;
+            clock.next_sync_since = None;
+            self.evidence.lock().begin_read(incoming_at);
+        } else {
+            self.evidence.lock().begin_read(effective_at);
+        }
+        processor.advance(term, bytes);
+    }
+
     /// Collects alacritty damage for the next paint (partial row rebuild) and
     /// for paint-priority scheduling (recent interaction vs stream).
     fn parse<'a>(&self, chunks: impl IntoIterator<Item = (&'a [u8], SystemTime)>) {
         let mut term = self.term.lock();
         let mut processor = self.processor.lock();
+        let mut clock = self.read_clock.lock();
         let mut parsed = false;
         for (bytes, read_at) in chunks {
             if bytes.is_empty() {
                 continue;
             }
-            self.evidence.lock().begin_read(read_at);
-            processor.advance(&mut *term, bytes);
+            let mut start = 0;
+            let mut effective_at = clock.effective_at(read_at);
+            let mut unbuffered_at = clock.unbuffered_at(read_at);
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                if let Some(boundary) = clock.scan(byte, read_at) {
+                    if matches!(boundary, OutputBoundary::ExecutedControl) {
+                        if start < index {
+                            self.advance_timed_segment(
+                                &mut processor,
+                                &mut term,
+                                &mut clock,
+                                &bytes[start..index],
+                                effective_at,
+                                unbuffered_at,
+                            );
+                            clock.after_segment(
+                                None,
+                                processor.sync_timeout().sync_timeout().is_some(),
+                                read_at,
+                            );
+                        }
+                        let control_at = clock.executed_control_at(read_at);
+                        self.advance_timed_segment(
+                            &mut processor,
+                            &mut term,
+                            &mut clock,
+                            &bytes[index..=index],
+                            control_at,
+                            read_at,
+                        );
+                    } else {
+                        self.advance_timed_segment(
+                            &mut processor,
+                            &mut term,
+                            &mut clock,
+                            &bytes[start..=index],
+                            effective_at,
+                            unbuffered_at,
+                        );
+                    }
+                    clock.after_segment(
+                        Some(boundary),
+                        processor.sync_timeout().sync_timeout().is_some(),
+                        read_at,
+                    );
+                    start = index + 1;
+                    effective_at = clock.effective_at(read_at);
+                    unbuffered_at = clock.unbuffered_at(read_at);
+                }
+            }
+            if start < bytes.len() {
+                self.advance_timed_segment(
+                    &mut processor,
+                    &mut term,
+                    &mut clock,
+                    &bytes[start..],
+                    effective_at,
+                    unbuffered_at,
+                );
+                clock.after_segment(
+                    None,
+                    processor.sync_timeout().sync_timeout().is_some(),
+                    read_at,
+                );
+            }
             parsed = true;
         }
         // Synchronized updates (DECSET 2026): vte BUFFERS everything between
@@ -1604,14 +1849,19 @@ impl TerminalSession {
         // embedder's job (alacritty services this in its event loop; vte's
         // deadline is 150ms). Without this check, an app that opens a window
         // and never closes it would freeze the grid until it next goes idle.
-        // Checking here bounds the freeze to deadline + one batch gap. What it
-        // applies was read by the last chunk at the latest, and is stamped so.
+        // Checking here bounds the freeze to deadline + one batch gap. Replay
+        // keeps the opening read time of the buffered frame.
         if processor
             .sync_timeout()
             .sync_timeout()
             .is_some_and(|d| Instant::now() >= d)
         {
+            self.evidence
+                .lock()
+                .begin_read(clock.effective_at(SystemTime::now()));
             processor.stop_sync(&mut *term);
+            clock.sync_since = None;
+            clock.next_sync_since = None;
             profile::sync_expired();
         }
         self.evidence.lock().end_read();
@@ -2060,6 +2310,10 @@ impl TerminalSession {
         self.resize.lock().applied
     }
 
+    pub(crate) fn resize_revision(&self) -> u64 {
+        self.resize_revision.load(Ordering::Relaxed)
+    }
+
     /// Resize the PTY and emulator grid, **debounced**: the requested size must
     /// hold steady for [`RESIZE_SETTLE`] before it's applied, so a burst of
     /// changes from a pane close / divider drag collapses into one resize (one
@@ -2076,6 +2330,7 @@ impl TerminalSession {
             return false; // already at this size
         }
         if st.target != (cols, rows) {
+            self.resize_revision.fetch_add(1, Ordering::Relaxed);
             // New target: start (or restart) the settle window.
             st.target = (cols, rows);
             st.since = Instant::now();
@@ -2097,6 +2352,7 @@ impl TerminalSession {
             .lock()
             .resize(TermSize::new(cols as usize, rows as usize));
         st.applied = (cols, rows);
+        self.resize_revision.fetch_add(1, Ordering::Relaxed);
         self.bump_content();
         self.trigger_runtime();
         false
@@ -2743,6 +2999,19 @@ fn resolve_program_for_spawn(program: &str) -> String {
     }
 }
 
+/// Hook configuration contains JSON and must never cross cmd.exe reparsing.
+pub fn muse_config_supported(program: &str) -> bool {
+    #[cfg(windows)]
+    {
+        !is_windows_batch_program(&resolve_program_for_spawn(program))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = program;
+        true
+    }
+}
+
 fn command_builder_for_spawn(program: &str, args: &[String]) -> CommandBuilder {
     #[cfg(not(windows))]
     {
@@ -2829,6 +3098,20 @@ fn resolve_program_for_spawn_windows(program: &str) -> String {
     use std::path::{Path, PathBuf};
 
     fn prefer_packaged_codex(path: PathBuf) -> PathBuf {
+        if path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("muse"))
+            && is_windows_batch_program(&path.to_string_lossy())
+            && let Some(parent) = path.parent()
+            && let Ok(version) = std::fs::read_to_string(parent.join(".muse-version"))
+            && let Some(name) = muxel_core::muse::native_binary_name(version.trim())
+        {
+            let native = parent.join(name);
+            if native.is_file() {
+                return native;
+            }
+        }
         let is_codex_batch = path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -3948,6 +4231,41 @@ mod wheel_report_tests {
 }
 
 #[cfg(test)]
+mod ctl_resize_tests {
+    use super::{CommandSpec, RESIZE_SETTLE, TerminalSession};
+    use std::{thread, time::Duration};
+
+    #[test]
+    fn ctl_retry_frame_is_invalidated_by_resize_requests_and_application() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, _rx) = TerminalSession::spawn(spec, 80, 24).expect("spawn PTY");
+        let initial = session.resize_revision();
+        let pending = session.resize(81, 24);
+        let requested = session.resize_revision();
+        let still_pending = session.resize(81, 24);
+        let repeated = session.resize_revision();
+        thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
+        let applied = session.resize(81, 24);
+        let after_apply = session.resize_revision();
+        let away_again = session.resize(80, 24);
+        let after_away = session.resize_revision();
+        session.kill();
+        assert!(pending && still_pending && away_again);
+        assert!(!applied);
+        assert!(requested > initial);
+        assert_eq!(
+            requested, repeated,
+            "identical pending requests do not redraw"
+        );
+        assert!(after_apply > requested && after_away > after_apply);
+    }
+}
+
+#[cfg(test)]
 mod profiler_transport_tests {
     use super::*;
 
@@ -4312,7 +4630,7 @@ mod profiler_transport_tests {
 
 #[cfg(all(test, windows))]
 mod windows_child_exit_tests {
-    use super::{CommandSpec, PtyChunk, RESIZE_SETTLE, TerminalSession};
+    use super::{CommandSpec, PtyChunk, TerminalSession};
     use std::io::Write;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -4332,13 +4650,24 @@ mod windows_child_exit_tests {
     }
 
     fn wait_ready(session: &TerminalSession, rx: &super::PtyReceiver) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        wait_output(session, rx, "FIXTURE_READY", Duration::from_secs(10));
+    }
+
+    fn wait_output(
+        session: &TerminalSession,
+        rx: &super::PtyReceiver,
+        marker: &str,
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
         while Instant::now() < deadline {
             match rx.try_recv() {
                 Ok(PtyChunk::Output(bytes)) => {
                     session.process_output(&bytes);
-                    if session.visible_text().contains("FIXTURE_READY") {
-                        return;
+                    output.extend_from_slice(&bytes);
+                    if session.visible_text().contains(marker) {
+                        return output;
                     }
                 }
                 Ok(PtyChunk::Exit { .. }) => panic!("fixture exited before becoming ready"),
@@ -4348,7 +4677,15 @@ mod windows_child_exit_tests {
                 }
             }
         }
-        panic!("fixture never became ready");
+        panic!(
+            "fixture did not produce {marker}: input_closed={}, reader_finished={}, monitor_finished={}, output={:?}",
+            session
+                .input_closed
+                .load(std::sync::atomic::Ordering::Acquire),
+            session._reader.is_finished(),
+            session._monitor.is_finished(),
+            String::from_utf8_lossy(&output),
+        );
     }
 
     #[test]
@@ -4402,9 +4739,18 @@ mod windows_child_exit_tests {
     }
 
     fn wait_exit(session: &TerminalSession, rx: &super::PtyReceiver) -> (Option<i32>, Vec<u8>) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        wait_exit_with_timeout(session, rx, Duration::from_secs(10))
+    }
+
+    fn wait_exit_with_timeout(
+        session: &TerminalSession,
+        rx: &super::PtyReceiver,
+        shutdown_timeout: Duration,
+    ) -> (Option<i32>, Vec<u8>) {
+        let shutdown_deadline = Instant::now() + shutdown_timeout;
+        let mut exit_deadline = None;
         let mut output = Vec::new();
-        while Instant::now() < deadline {
+        loop {
             match rx.try_recv() {
                 Ok(PtyChunk::Output(bytes)) => {
                     // Feed the parser as the GUI does, including terminal replies.
@@ -4431,8 +4777,25 @@ mod windows_child_exit_tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
+            // Both the process monitor and the reader can close input. Exit
+            // follows final output and status collection, so give its delivery
+            // a separate bounded window after input shutdown.
+            let input_closed = session
+                .input_closed
+                .load(std::sync::atomic::Ordering::Acquire);
+            let deadline = if input_closed {
+                *exit_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(10))
+            } else {
+                shutdown_deadline
+            };
+            assert!(
+                Instant::now() < deadline,
+                "child exit was not reported: input_closed={input_closed}, reader_finished={}, monitor_finished={}, output={:?}",
+                session._reader.is_finished(),
+                session._monitor.is_finished(),
+                String::from_utf8_lossy(&output),
+            );
         }
-        panic!("child exit was not reported while its terminal session stayed alive");
     }
 
     #[test]
@@ -4582,16 +4945,26 @@ mod windows_child_exit_tests {
     #[test]
     fn a_live_child_still_receives_input_and_resizes() {
         let (session, rx) = spawn(
-            "[Console]::WriteLine('FIXTURE_READY'); $null = [Console]::ReadLine(); [Console]::WriteLine(('WIDTH_' + [Console]::WindowWidth)); exit 0",
+            "[Console]::WriteLine('FIXTURE_READY'); while ([Console]::WindowWidth -ne 101) { Start-Sleep -Milliseconds 5 }; [Console]::WriteLine(('WIDTH_' + [Console]::WindowWidth)); $line = [Console]::ReadLine(); [Console]::WriteLine(('INPUT_' + $line)); exit 0",
         );
-        wait_ready(&session, &rx);
+        // These are wall-clock scheduling backstops for real PowerShell/ConPTY
+        // work on loaded CI; readiness comes from the child's output below.
+        let process_timeout = Duration::from_secs(30);
+        wait_output(&session, &rx, "FIXTURE_READY", process_timeout);
         assert!(session.resize(101, 24));
-        std::thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
+        let resize_deadline = Instant::now() + process_timeout;
+        while session.resize(101, 24) {
+            assert!(Instant::now() < resize_deadline, "resize did not settle");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(!session.resize(101, 24));
+        let mut output = wait_output(&session, &rx, "WIDTH_101", process_timeout);
         session.write_input(b"finish\r");
-        let (code, output) = wait_exit(&session, &rx);
+        let (code, final_output) = wait_exit_with_timeout(&session, &rx, process_timeout);
+        output.extend_from_slice(&final_output);
         assert_eq!(code, Some(0));
         assert!(output.windows(9).any(|bytes| bytes == b"WIDTH_101"));
+        assert!(output.windows(12).any(|bytes| bytes == b"INPUT_finish"));
     }
 }
 
@@ -5258,6 +5631,27 @@ mod windows_spawn_resolve {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn muse_windows_shim_resolves_only_its_selected_native_binary() {
+        let dir = std::env::temp_dir().join(format!("muxel-muse-resolve-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("muse.cmd");
+        let native = dir.join("muse-bin-1.4.8-R6256.1.exe");
+        std::fs::write(&shim, "@exit /b 0").unwrap();
+        std::fs::write(dir.join(".muse-version"), "1.4.8-R6256.1\n").unwrap();
+        std::fs::write(&native, []).unwrap();
+        assert_eq!(
+            resolve_program_for_spawn_windows(shim.to_str().unwrap()),
+            native.to_string_lossy()
+        );
+        std::fs::write(dir.join(".muse-version"), "../other").unwrap();
+        assert_eq!(
+            resolve_program_for_spawn_windows(shim.to_str().unwrap()),
+            shim.to_string_lossy()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Manual installed-tool smoke test for the full PTY launch path. Ignored in
     /// CI because Codex is not a repo dependency; run it on Windows when changing
     /// npm shim resolution or launch-time instructions.
@@ -5305,6 +5699,7 @@ mod runtime_fact_tests {
     use super::{
         CommandSpec, PtyOutput, RESIZE_SETTLE, TerminalSession, draft_after_input, next_input_state,
     };
+    use crate::listener::SWITCH_SLACK;
     use async_channel::TryRecvError;
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -5385,6 +5780,102 @@ mod runtime_fact_tests {
         std::thread::sleep(RESIZE_SETTLE + Duration::from_millis(10));
         assert!(!session.resize(81, 24));
         assert_eq!(events.try_recv(), Ok(()));
+        session.kill();
+    }
+
+    #[test]
+    fn capacity_replay_keeps_new_title_and_bell_on_their_fresh_read() {
+        const FILL: usize = 0x20_0000 - 2;
+        for title_event in [true, false] {
+            let session = fixture();
+            let first = uuid::Uuid::new_v4();
+            let next = uuid::Uuid::new_v4();
+            session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+
+            let old = SystemTime::now() - Duration::from_secs(10);
+            let mut frame = b"\x1b[?2026h".to_vec();
+            frame.resize(frame.len() + FILL, 0);
+            let mut output = PtyOutput::default();
+            output.push(&frame, old);
+            session.process_drained(&output);
+            assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+
+            let hook = SystemTime::now();
+            session.provider_switched(hook, hook);
+            let switched = session.binding_revision();
+            let fresh = hook + SWITCH_SLACK + Duration::from_secs(1);
+            let mut output = PtyOutput::default();
+            if title_event {
+                output.push(format!("\x1b]0;{next} | Ready\x07").as_bytes(), fresh);
+            } else {
+                output.push(b"\x07", fresh);
+            }
+            session.process_drained(&output);
+            if title_event {
+                assert!(
+                    session.binding_revision() > switched,
+                    "a fresh UUID title must bind after capacity replay"
+                );
+                assert!(
+                    session
+                        .session_id_hint()
+                        .unwrap()
+                        .starts_with(&next.to_string())
+                );
+            } else {
+                assert!(
+                    session.has_bell(),
+                    "a fresh bell must survive capacity replay"
+                );
+            }
+            session.kill();
+        }
+    }
+
+    #[test]
+    fn capacity_replay_preserves_an_osc_that_started_in_the_old_frame() {
+        const FILL: usize = 0x20_0000 - 2;
+        let session = fixture();
+        let first = uuid::Uuid::new_v4();
+        let stale = uuid::Uuid::new_v4();
+        let fresh = uuid::Uuid::new_v4();
+        session.process_probe_output(format!("\x1b]0;{first} | Working\x07").as_bytes());
+
+        let old = SystemTime::now() - Duration::from_secs(10);
+        let prefix = format!("\x1b]0;{stale} | Ready");
+        let mut frame = b"\x1b[?2026h".to_vec();
+        frame.resize(frame.len() + FILL - prefix.len(), 0);
+        frame.extend_from_slice(prefix.as_bytes());
+        let mut output = PtyOutput::default();
+        output.push(&frame, old);
+        session.process_drained(&output);
+        assert_eq!(session.processor.lock().sync_bytes_count(), FILL);
+
+        let hook = SystemTime::now();
+        session.provider_switched(hook, hook);
+        let switched = session.binding_revision();
+        let fresh_at = hook + SWITCH_SLACK + Duration::from_secs(1);
+        let mut output = PtyOutput::default();
+        output.push(b"\x07", fresh_at);
+        session.process_drained(&output);
+        assert_eq!(session.binding_revision(), switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&first.to_string())
+        );
+
+        let mut output = PtyOutput::default();
+        output.push(format!("\x1b]0;{fresh} | Ready\x07").as_bytes(), fresh_at);
+        session.process_drained(&output);
+        assert!(session.binding_revision() > switched);
+        assert!(
+            session
+                .session_id_hint()
+                .unwrap()
+                .starts_with(&fresh.to_string())
+        );
         session.kill();
     }
 

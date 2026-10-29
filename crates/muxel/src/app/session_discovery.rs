@@ -533,6 +533,11 @@ enum DiscoveryCandidate {
         snapshot: session_binding::ClaudeBindingSnapshot,
         binding: Option<session_binding::ClaudeBinding>,
     },
+    /// The current launch's latest root-session hook, and when it was written.
+    Muse {
+        metadata: muxel_core::muse::MuseMetadata,
+        recorded: Option<SystemTime>,
+    },
 }
 
 impl DiscoveryCandidate {
@@ -543,6 +548,7 @@ impl DiscoveryCandidate {
             Self::Claude { binding, .. } => {
                 binding.as_ref().map(|binding| binding.session_id.as_str())
             }
+            Self::Muse { metadata, .. } => Some(&metadata.session_id),
         }
     }
 }
@@ -592,6 +598,8 @@ struct SessionBindingUpdate {
     previous_auto_name: Option<String>,
     switched: Option<(SystemTime, SystemTime)>,
     claude: Option<ClaudeCommit>,
+    /// Hook state shown once the binding it belongs to is saved.
+    muse: Option<muxel_core::muse::MuseMetadata>,
 }
 
 /// A pane can reserve its saved ID and an accepted ID whose save is pending.
@@ -777,6 +785,8 @@ impl MuxelApp {
             (SessionProvider::Codex, hint, tmux_session)
         } else if is_claude_program(instance.program.as_deref()) {
             (SessionProvider::Claude, None, None)
+        } else if muxel_core::muse::is_program(instance.program.as_deref()) {
+            (SessionProvider::Muse, None, None)
         } else if cfg!(windows)
             && is_grok_program(instance.program.as_deref())
             && instance.tmux_session.is_none()
@@ -830,12 +840,13 @@ impl MuxelApp {
             .into_iter()
             .filter_map(|key| self.session_discoveries.begin(key, now))
             .collect();
-        let mut groups: [Vec<SessionDiscoveryRequest>; 3] = Default::default();
+        let mut groups: [Vec<SessionDiscoveryRequest>; 4] = Default::default();
         for request in requests {
             let index = match request.key.provider {
                 SessionProvider::Codex => 0,
                 SessionProvider::Claude => 1,
                 SessionProvider::Grok => 2,
+                SessionProvider::Muse => 3,
             };
             groups[index].push(request);
         }
@@ -957,6 +968,9 @@ impl MuxelApp {
                         session_binding::defer_claude_binding(record);
                         None
                     }
+                }
+                DiscoveryCandidate::Muse { metadata, recorded } if unowned => {
+                    self.stage_discovered_muse(iid, metadata, recorded, cx)
                 }
                 DiscoveryCandidate::Session {
                     candidate,
@@ -1155,14 +1169,19 @@ impl MuxelApp {
             session_binding::defer_claude_binding(record);
             return None;
         };
-        let launch = self.discovery_terminal(iid)?.read(cx).session().id;
+        let terminal = self.discovery_terminal(iid)?;
+        let (launch, launch_resumed) = {
+            let view = terminal.read(cx);
+            let session = view.session();
+            (session.id, session.launch_resumed())
+        };
         let seen = self
             .claude_hook_seen
             .get(&iid)
             .filter(|(seen_launch, _)| *seen_launch == launch)
             .map(|(_, nonce)| *nonce);
         let bound = self.workspace.instance(iid)?.session_id.as_deref();
-        if !session_binding::claude_record_switches(&binding, seen, bound) {
+        if !session_binding::claude_record_switches(&binding, seen, bound, launch_resumed) {
             self.remember_claude_hook(iid, Some(launch), binding.stamp);
             session_binding::acknowledge_claude_binding(record);
             return None;
@@ -1188,6 +1207,35 @@ impl MuxelApp {
         Some(update)
     }
 
+    /// A Muse record that names another conversation than the bound one is a
+    /// switch inside the running process; its hook state applies either way.
+    fn stage_discovered_muse(
+        &mut self,
+        iid: Uuid,
+        metadata: muxel_core::muse::MuseMetadata,
+        recorded: Option<SystemTime>,
+        cx: &mut Context<Self>,
+    ) -> Option<SessionBindingUpdate> {
+        let bound = self.workspace.instance(iid)?.session_id.as_deref();
+        let switched = bound.is_some_and(|bound| bound != metadata.session_id);
+        let candidate = SessionCandidate {
+            id: metadata.session_id.clone(),
+            path: None,
+        };
+        let Some(mut update) = self.stage_discovered_session(iid, candidate, false) else {
+            if let Some(view) = self.discovery_terminal(iid).cloned() {
+                view.update(cx, |view, cx| view.set_muse_hook_state(&metadata, cx));
+            }
+            return None;
+        };
+        if switched {
+            let at = recorded.unwrap_or_else(SystemTime::now);
+            update.switched = Some((at, at));
+        }
+        update.muse = Some(metadata);
+        Some(update)
+    }
+
     fn stage_discovered_session(
         &mut self,
         iid: Uuid,
@@ -1210,11 +1258,12 @@ impl MuxelApp {
             previous_auto_name: instance.auto_name.clone(),
             switched: None,
             claude: None,
+            muse: None,
         };
         instance.session_id = Some(candidate.id);
         instance.session_path = path;
         instance.session_started = true;
-        if !same_id {
+        if !same_id || force_boundary {
             instance.auto_name = None;
         }
         self.bump_session_binding_generation(iid);
@@ -1239,6 +1288,11 @@ impl MuxelApp {
                     && let Some(view) = self.discovery_terminal(update.pane)
                 {
                     view.read(cx).provider_switched(from, to);
+                }
+                if let Some(metadata) = update.muse
+                    && let Some(view) = self.discovery_terminal(update.pane).cloned()
+                {
+                    view.update(cx, |view, cx| view.set_muse_hook_state(&metadata, cx));
                 }
             }
             cx.notify();
@@ -1348,6 +1402,17 @@ fn discover_sessions(
                             session_binding::claude_binding_from_record(&snapshot.bytes, home);
                         DiscoveryCandidate::Claude { snapshot, binding }
                     }),
+                SessionProvider::Muse => data_dir
+                    .and_then(|data_dir| {
+                        session_binding::read_muse_binding(
+                            data_dir,
+                            key.pane,
+                            key.binding.as_deref(),
+                        )
+                    })
+                    .map_or(DiscoveryCandidate::Unresolved, |(metadata, recorded)| {
+                        DiscoveryCandidate::Muse { metadata, recorded }
+                    }),
                 SessionProvider::Grok => {
                     #[cfg(windows)]
                     {
@@ -1418,10 +1483,118 @@ fn claim_validated_claude_record(
 }
 
 #[cfg(all(test, windows))]
+mod binding_regressions {
+    use super::SessionCandidate;
+    use crate::app::restart_completion_tests::with_app;
+    use muxel_core::{Instance, Project};
+    use uuid::Uuid;
+
+    #[test]
+    fn same_id_provider_boundary_clears_name_but_path_upgrade_preserves_it() {
+        with_app(|cx, window| {
+            window
+                .update(cx, |app, _, cx| {
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let root = muxel_store::data_dir().unwrap();
+                    let project = app
+                        .workspace
+                        .add_project(Project::new("Claude binding", root.clone()));
+                    let mut instance = Instance::shell(project);
+                    let identity = Uuid::new_v4().to_string();
+                    instance.session_id = Some(identity.clone());
+                    instance.auto_name = Some("Previous conversation".into());
+                    let id = instance.id;
+                    app.workspace.add_instance(instance);
+                    let path = root.join("exact-transcript.jsonl");
+                    let candidate = || SessionCandidate {
+                        id: identity.clone(),
+                        path: Some(path.clone()),
+                    };
+
+                    let update = app
+                        .stage_discovered_session(id, candidate(), false)
+                        .unwrap();
+                    assert!(app.finish_discovered_sessions(vec![update], cx));
+                    let instance = app.workspace.instance(id).unwrap();
+                    assert_eq!(instance.auto_name.as_deref(), Some("Previous conversation"));
+                    assert_eq!(instance.session_path.as_deref(), Some(path.as_path()));
+
+                    // A new Claude nonce can report A -> B -> A between reads.
+                    // Its unchanged final UUID still creates a provider boundary.
+                    let update = app.stage_discovered_session(id, candidate(), true).unwrap();
+                    assert_eq!(app.workspace.instance(id).unwrap().auto_name, None);
+                    assert!(app.finish_discovered_sessions(vec![update], cx));
+                    let doc =
+                        muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                    let saved = muxel_store::load_workspace_from(&doc).unwrap();
+                    assert_eq!(saved.instance(id).unwrap().auto_name, None);
+                    assert_eq!(
+                        saved.instance(id).unwrap().session_id.as_deref(),
+                        Some(identity.as_str())
+                    );
+                    assert_eq!(
+                        saved.instance(id).unwrap().session_path.as_deref(),
+                        Some(path.as_path())
+                    );
+                    assert!(
+                        app.stage_discovered_session(id, candidate(), false)
+                            .is_none()
+                    );
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn discovered_boundary_save_failure_restores_the_previous_name() {
+        with_app(|cx, window| {
+            window
+                .update(cx, |app, _, cx| {
+                    app.current_workspace = Some(Uuid::new_v4());
+                    let project = app.workspace.add_project(Project::new(
+                        "Claude binding",
+                        muxel_store::data_dir().unwrap(),
+                    ));
+                    let mut instance = Instance::shell(project);
+                    let identity = Uuid::new_v4().to_string();
+                    instance.session_id = Some(identity.clone());
+                    instance.auto_name = Some("Previous conversation".into());
+                    let id = instance.id;
+                    let before = serde_json::to_value(&instance).unwrap();
+                    app.workspace.add_instance(instance);
+                    assert!(app.try_persist());
+                    let doc =
+                        muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                    std::fs::remove_file(&doc).unwrap();
+                    std::fs::create_dir(&doc).unwrap();
+
+                    let candidate = || SessionCandidate {
+                        id: identity.clone(),
+                        path: None,
+                    };
+                    let update = app.stage_discovered_session(id, candidate(), true).unwrap();
+                    assert_eq!(app.workspace.instance(id).unwrap().auto_name, None);
+                    assert!(!app.finish_discovered_sessions(vec![update], cx));
+                    assert_eq!(
+                        serde_json::to_value(app.workspace.instance(id).unwrap()).unwrap(),
+                        before
+                    );
+                    std::fs::remove_dir(&doc).unwrap();
+                    let update = app.stage_discovered_session(id, candidate(), true).unwrap();
+                    assert!(app.finish_discovered_sessions(vec![update], cx));
+                    assert_eq!(app.workspace.instance(id).unwrap().auto_name, None);
+                })
+                .unwrap();
+        });
+    }
+}
+
+#[cfg(all(test, windows))]
 mod grok_regressions {
     use super::super::{
         AgentStatus, GrokActiveSession, GrokRegistryRead, LoopCleanup, LoopRun, MuxelApp,
-        PostRunAction, grok_switch_interval, popout_lifecycle_tests::with_app,
+        PostRunAction, conpty_test_support::ChildHandle, grok_switch_interval,
+        popout_lifecycle_tests::with_app,
     };
     use super::{DiscoveryBatch, DiscoveryCandidate, SessionCandidate};
     use gpui::{AppContext as _, Context, TestAppContext, Window, WindowHandle};
@@ -1433,48 +1606,11 @@ mod grok_regressions {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
     use uuid::Uuid;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-    };
 
     struct StopChild(Arc<TerminalSession>);
     impl Drop for StopChild {
         fn drop(&mut self) {
             self.0.kill();
-        }
-    }
-
-    struct ChildHandle(HANDLE);
-    impl ChildHandle {
-        fn new(session: &TerminalSession) -> Self {
-            // SAFETY: this is the PTY created by this fixture. Retain the handle
-            // before Restart so PID reuse cannot satisfy a liveness assertion.
-            Self(unsafe {
-                OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                    false,
-                    session.child_pid().unwrap(),
-                )
-                .unwrap()
-            })
-        }
-
-        fn running(&self) -> bool {
-            // SAFETY: the retained handle stays open until this guard drops.
-            let status = unsafe { WaitForSingleObject(self.0, 0) };
-            if status == WAIT_TIMEOUT {
-                true
-            } else {
-                assert_eq!(status, WAIT_OBJECT_0);
-                false
-            }
-        }
-    }
-    impl Drop for ChildHandle {
-        fn drop(&mut self) {
-            // SAFETY: this guard exclusively owns the retained process handle.
-            let _ = unsafe { CloseHandle(self.0) };
         }
     }
 
@@ -1555,10 +1691,13 @@ mod grok_regressions {
     #[test]
     fn gasq_restart_preserves_unsaved_grok_and_then_resumes_its_accepted_identity() {
         with_app(|cx, window| {
-            let (old_process, replacement, report, identity) = checked_update(
+            let (old_process, replacement, report, identity, pane) = checked_update(
                 window,
                 cx,
                 |app, window, cx| {
+                    // Pump terminal replies below without polling real provider
+                    // registries or running unrelated status ticks.
+                    app._status_timer = gpui::Task::ready(());
                     app.current_workspace = Some(Uuid::new_v4());
                     app.use_tmux = false;
                     app.use_worktree = false;
@@ -1628,33 +1767,40 @@ mod grok_regressions {
                         saved.instance(id).unwrap().session_id.as_deref(),
                         Some(identity.as_str())
                     );
-                    (old_process, replacement, report, identity)
+                    (old_process, replacement, report, identity, id)
                 },
             );
-            let cap = Instant::now() + Duration::from_secs(10);
-            let mut cursor_reply = Instant::now() - Duration::from_secs(1);
+            let replacement_process = ChildHandle::new(&replacement.0);
+            // PowerShell and the batch fixture are real OS processes; the
+            // virtual GPUI clock cannot accelerate their startup on loaded CI.
+            let cap = Instant::now() + Duration::from_secs(30);
             loop {
-                let selected = std::fs::read_to_string(&report).unwrap_or_default();
+                cx.executor().advance_clock(Duration::from_millis(10));
+                cx.run_until_parked();
+                let selected = std::fs::read_to_string(&report);
                 if !old_process.running()
-                    && selected.lines().collect::<Vec<_>>() == ["--resume", identity.as_str()]
+                    && selected
+                        .as_ref()
+                        .is_ok_and(|selected| selected.lines().eq(["--resume", identity.as_str()]))
                 {
                     break;
                 }
-                // Headless ConPTY can wait for a cursor-position response before
-                // starting cmd. Supply the same reply as the batch-runner test
-                // without pumping the app's provider-registry polling tasks.
-                if selected.is_empty() && cursor_reply.elapsed() >= Duration::from_millis(100) {
-                    replacement.0.write_input(b"\x1b[1;1R");
-                    cursor_reply = Instant::now();
-                }
                 assert!(
                     Instant::now() < cap,
-                    "Restart fixture did not select the accepted identity at {}: {selected:?}",
-                    report.display()
+                    "Restart fixture did not select the accepted identity at {}: {selected:?}; old_running={}, replacement_running={}, output={:?}",
+                    report.display(),
+                    old_process.running(),
+                    replacement_process.running(),
+                    window
+                        .update(cx, |app, _, cx| {
+                            app.terminal_view(pane)
+                                .map(|view| view.read(cx).visible_text())
+                        })
+                        .unwrap(),
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(replacement.0.child_pid().is_some());
+            assert!(replacement_process.running());
         });
     }
 
@@ -2152,6 +2298,72 @@ mod tests {
     }
 
     #[test]
+    fn muse_worker_reads_the_current_launch_record_with_its_state_and_time() {
+        let root = std::env::temp_dir().join(format!("muxel-discovery-muse-{}", Uuid::new_v4()));
+        let (data, share) = (root.join("data"), root.join("share"));
+        let env = [
+            ("XDG_CONFIG_HOME", root.join("config")),
+            ("XDG_DATA_HOME", share.clone()),
+        ]
+        .map(|(key, path)| (key.to_string(), path.display().to_string()));
+        let pane = Uuid::new_v4();
+        assert!(session_binding::prepare_muse_hooks(&data, pane, &env, &[], None, false).is_some());
+        let launch = data.join(format!("provider-session-bindings/muse/{pane}/launch.json"));
+        let launch: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(launch).unwrap()).unwrap();
+        let nonce: Uuid = serde_json::from_value(launch["launch_id"].clone()).unwrap();
+        let session = Uuid::new_v4().to_string();
+        let log = share.join(format!("muse/sessions/2026/10/26/{session}"));
+        std::fs::create_dir_all(&log).unwrap();
+        std::fs::write(log.join("session.jsonl"), "").unwrap();
+        let event = json!({
+            "session_id": session, "cwd": root.join("repo"),
+            "hook_event_name": "Notification", "notification_type": "permission_prompt"
+        });
+        session_binding::write_muse_binding_from_reader(
+            &data,
+            pane,
+            nonce,
+            &session,
+            std::io::Cursor::new(event.to_string()),
+        )
+        .unwrap();
+        let request = SessionDiscovery::default()
+            .begin(
+                SessionDiscoveryKey {
+                    pane,
+                    provider: SessionProvider::Muse,
+                    launch: Instant::now(),
+                    child_pid: None,
+                    binding_generation: 0,
+                    binding: None,
+                    binding_path: None,
+                    cwd: root.join("repo"),
+                    hint: None,
+                    tmux_session: None,
+                    tmux_socket: None,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        let (home, worker_data) = (root.join("home"), data.clone());
+        let mut batch = std::thread::spawn(move || {
+            discover_sessions(vec![request], &home, Some(&worker_data), Default::default())
+        })
+        .join()
+        .unwrap();
+        match batch.results.pop().unwrap().1 {
+            DiscoveryCandidate::Muse { metadata, recorded } => {
+                assert_eq!(metadata.session_id, session);
+                assert_eq!(metadata.state, muxel_core::muse::MuseState::Blocked);
+                assert!(recorded.is_some());
+            }
+            _ => panic!("expected the pane's Muse record"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn claude_worker_snapshot_preserves_nonce_and_leaves_hook_unclaimed() {
         let fixture = ClaudeFixture::new();
         let identity = Uuid::new_v4();
@@ -2283,6 +2495,7 @@ mod w8lm_tests {
             DiscoveryCandidate::Session { candidate, .. } => Some(candidate),
             DiscoveryCandidate::Unresolved => None,
             DiscoveryCandidate::Claude { .. } => panic!("a Codex lookup found a Claude record"),
+            DiscoveryCandidate::Muse { .. } => panic!("a Codex lookup found a Muse record"),
             DiscoveryCandidate::CachedSiblingRejection(id) => {
                 panic!("cached sibling rejection is not a validated candidate: {id}")
             }

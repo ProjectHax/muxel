@@ -12,13 +12,20 @@ struct Restart {
 }
 
 #[derive(Default)]
-pub(super) struct PendingRestarts(HashMap<Uuid, Restart>);
+pub(super) struct PendingRestarts {
+    pending: HashMap<Uuid, Restart>,
+    /// Changes only when a peer changes this pane's tmux owner. Discovery's
+    /// binding generation also changes for unrelated layout adoption.
+    owner_generations: HashMap<Uuid, u64>,
+}
 
 pub(super) struct RemoteRestartCompletion {
     pub instance: Uuid,
     pub project: Uuid,
     pub workspace: Option<Uuid>,
     pub token: Uuid,
+    /// Tmux owner generation observed before remote resolution and kill began.
+    pub owner_generation: u64,
     pub host: String,
     pub session: String,
     pub killed: anyhow::Result<()>,
@@ -26,7 +33,7 @@ pub(super) struct RemoteRestartCompletion {
 
 impl PendingRestarts {
     pub fn begin(&mut self, instance: &Instance) -> Option<Uuid> {
-        let Entry::Vacant(entry) = self.0.entry(instance.id) else {
+        let Entry::Vacant(entry) = self.pending.entry(instance.id) else {
             return None;
         };
         let token = Uuid::new_v4();
@@ -39,13 +46,25 @@ impl PendingRestarts {
     }
 
     pub fn contains(&self, iid: Uuid) -> bool {
-        self.0.contains_key(&iid)
+        self.pending.contains_key(&iid)
     }
 
     pub fn current(&self, iid: Uuid, token: Uuid) -> bool {
-        self.0
+        self.pending
             .get(&iid)
             .is_some_and(|restart| restart.token == token)
+    }
+
+    pub fn owner_generation(&self, iid: Uuid) -> u64 {
+        self.owner_generations.get(&iid).copied().unwrap_or(0)
+    }
+
+    /// A peer took this pane's tmux session or socket elsewhere. Release the
+    /// old restart lease before attaching to the peer's new owner.
+    pub fn owner_changed(&mut self, iid: Uuid) {
+        self.cancel(iid);
+        let generation = self.owner_generations.entry(iid).or_default();
+        *generation = generation.wrapping_add(1);
     }
 
     /// Validate the asynchronous result before changing the durable owner. A
@@ -58,7 +77,11 @@ impl PendingRestarts {
         token: Uuid,
         closed: &ClosedSession,
     ) -> bool {
-        let Some(restart) = self.0.get(&iid).filter(|restart| restart.token == token) else {
+        let Some(restart) = self
+            .pending
+            .get(&iid)
+            .filter(|restart| restart.token == token)
+        else {
             return false;
         };
         let Some(instance) = workspace.instance_mut(iid) else {
@@ -87,7 +110,11 @@ impl PendingRestarts {
         expected: &SessionTarget,
         replacement: &SessionTarget,
     ) -> bool {
-        let Some(restart) = self.0.get(&iid).filter(|restart| restart.token == token) else {
+        let Some(restart) = self
+            .pending
+            .get(&iid)
+            .filter(|restart| restart.token == token)
+        else {
             return false;
         };
         let Some(instance) = workspace.instance_mut(iid) else {
@@ -106,15 +133,16 @@ impl PendingRestarts {
     }
 
     pub fn finish(&mut self, iid: Uuid, token: Uuid) -> bool {
-        self.current(iid, token) && self.0.remove(&iid).is_some()
+        self.current(iid, token) && self.pending.remove(&iid).is_some()
     }
 
     pub fn cancel(&mut self, iid: Uuid) {
-        self.0.remove(&iid);
+        self.pending.remove(&iid);
     }
 
     pub fn clear(&mut self) {
-        self.0.clear();
+        self.pending.clear();
+        self.owner_generations.clear();
     }
 }
 

@@ -62,12 +62,16 @@ mod claude_capture_tests;
 mod claude_launch;
 #[cfg(all(test, windows))]
 mod codex_capture_tests;
+#[cfg(all(test, windows))]
+mod conpty_test_support;
 mod control_api;
 mod hotbar;
 mod libraries_ui;
 mod popout_lifecycle;
 #[cfg(all(test, windows))]
 mod popout_lifecycle_tests;
+#[cfg(all(test, windows))]
+mod remote_reconnect_tests;
 #[cfg(all(test, windows))]
 mod restart_completion_tests;
 mod restart_guard;
@@ -625,15 +629,22 @@ fn restore_startup_holds_admission(
 /// How long a running launch holds restore admission for the other panes. The
 /// deadline only stops one slow launch from holding back the others: past it
 /// the launch keeps running, its pane keeps showing that it is starting, and
-/// its result is installed when it lands. Only Restart, closing the pane or
-/// leaving the project supersedes it.
+/// its result is installed when it lands. Restart, closing the pane or leaving
+/// the project supersedes it immediately; recovery of a dead view has its own
+/// longer timeout for an unresponsive launch.
 const TERMINAL_LAUNCH_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Ticks must let an in-flight owner probe or PTY launch land before retrying
+/// the exited view it will replace. A hung worker eventually yields ownership
+/// so recovery cannot stall forever. This is separate from restore admission.
+const REATTACH_PENDING_LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A pane's launch in flight: the token that owns it, and when its worker was
 /// dispatched (when it was reserved, until then).
 #[derive(Clone, Debug)]
 struct LaunchTicket {
     token: u64,
+    reason: muxel_core::TerminalLaunchReason,
     since: Instant,
     startup: Option<muxel_core::control::StartupTurnOwner>,
 }
@@ -2113,7 +2124,7 @@ mod launch_instruction_transport_tests {
     }
 
     #[test]
-    fn muse_launch_assembly_sends_no_automatic_input_or_instructions() {
+    fn muse_launch_assembly_supplies_hidden_session_context_without_a_user_turn() {
         let mut project = Project::new("repo", "/tmp/repo");
         project.memory_enabled = true;
         let instance = Instance::from_preset(project.id, &AgentPreset::muse());
@@ -2131,6 +2142,9 @@ mod launch_instruction_transport_tests {
         );
         assert_eq!(launch.startup_input, None);
         assert_eq!(launch.auto_mode_presses, 0);
+        let context = launch.session_context.expect("SessionStart context");
+        assert!(context.contains("MEMORY.md"));
+        assert!(context.contains("file:"));
 
         // A transport-bearing preset still receives the same assembled bundle.
         let control = Instance::from_preset(project.id, &AgentPreset::opencode());
@@ -3336,13 +3350,29 @@ fn launch_binding(
     if let Some(args) = resume_args {
         return LaunchBinding::Known(args.get(1).cloned());
     }
-    let agent_minted = preset
-        .is_some_and(|preset| preset.resume_flag.is_some() && preset.session_id_flag.is_none());
+    // Muse mints its own id but names it only through a hook, never in a
+    // title, so a fresh launch begins in the conversation it opened.
+    if muxel_core::muse::is_program(program) {
+        return LaunchBinding::Known(None);
+    }
+    let agent_minted = preset.is_some_and(|preset| {
+        preset.effective_resume_flag().is_some() && preset.session_id_flag.is_none()
+    });
     if agent_minted || is_codex_program(program) {
         LaunchBinding::Unknown
     } else {
         LaunchBinding::Known(None)
     }
+}
+
+/// Only muxel's own generated resume flag grants a first hook's startup
+/// exemption. Configured provider arguments are opaque: parsing them here can
+/// mistake an option value for a resume flag, and tmux might only attach to an
+/// existing process. An unproven receipt switches conservatively.
+fn generated_resume_receipt(preset: Option<&AgentPreset>, resume_args: Option<&[String]>) -> bool {
+    preset
+        .and_then(|preset| Some((preset.effective_resume_flag()?, resume_args?)))
+        .is_some_and(|(flag, args)| args.first().is_some_and(|arg| arg == flag))
 }
 
 fn effective_local_cwd(
@@ -3356,22 +3386,56 @@ fn effective_local_cwd(
         .map(|path| path.display().to_string())
 }
 
-/// A generic early exit does not prove a saved Codex or Claude conversation is
-/// gone. Only a provider-specific missing-session message can recover Codex;
-/// Claude's transcript probe decides before launch because a cwd mismatch can
-/// produce the same message as a missing conversation.
+/// Create a local pane's working folder when it is missing, so its program
+/// starts there. Otherwise the PTY starts it in the home folder on Unix and
+/// fails the launch on Windows. A folder that can't be created refuses the
+/// launch rather than starting the program somewhere else.
+fn create_missing_cwd(spec: &CommandSpec) -> anyhow::Result<()> {
+    let Some(cwd) = spec.cwd.as_deref().filter(|cwd| !cwd.is_empty()) else {
+        return Ok(());
+    };
+    if Path::new(cwd).is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(cwd).map_err(|error| {
+        anyhow::Error::msg(tf(
+            "Could not create the folder {folder}: {error}",
+            &[("folder", cwd), ("error", &error.to_string())],
+        ))
+    })?;
+    muxel_store::append_event_log(&format!("launch: created missing folder {cwd}"));
+    Ok(())
+}
+
+/// A generic early exit does not prove a saved Codex, Claude or Muse
+/// conversation is gone. Only a provider-specific missing-session message can
+/// recover Codex. Claude's transcript probe decides before launch because a
+/// cwd mismatch can produce the same message as a missing conversation, and
+/// Muse's session-store probe decides before its launch too.
 fn should_recover_expired_session(
     program: Option<&str>,
     explicit_missing: bool,
     early_nonzero_exit: bool,
 ) -> bool {
-    if is_claude_program(program) {
+    if is_claude_program(program) || muxel_core::muse::is_program(program) {
         return false;
     }
     if is_codex_program(program) {
         return explicit_missing;
     }
     explicit_missing || early_nonzero_exit
+}
+
+/// Whether a Muse conversation is gone from the store its pane's environment
+/// names. An unreadable store does not prove an exact identity expired.
+fn muse_session_gone(env: &[muxel_core::EnvVar], session_id: &str) -> bool {
+    let env = env
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.value.clone()))
+        .collect::<Vec<_>>();
+    crate::session_binding::muse_data_dir(&env).is_some_and(|root| {
+        crate::session_binding::muse_session_exists(&root, session_id).is_ok_and(|exists| !exists)
+    })
 }
 
 fn resume_missing_message(program: Option<&str>, id: Option<&str>, text: &str) -> bool {
@@ -3416,10 +3480,66 @@ fn tmux_codex_resume_ended(armed: bool, exit_code: Option<i32>, recent_resume: b
 #[cfg(test)]
 mod claude_resume_tests {
     use super::{
-        SessionTarget, arms_tmux_resume_recovery, claude_hook_writer_survives, effective_local_cwd,
-        resume_missing_message, should_recover_expired_session, tmux_codex_resume_ended,
+        AgentPreset, CommandSpec, Instance, SessionTarget, arms_tmux_resume_recovery,
+        claude_hook_writer_survives, create_missing_cwd, effective_local_cwd,
+        generated_resume_receipt, resume_missing_message, should_recover_expired_session,
+        tmux_codex_resume_ended,
     };
     use std::path::Path;
+    use std::time::SystemTime;
+    use uuid::Uuid;
+
+    #[test]
+    fn only_muxel_generated_resume_exempts_the_first_claude_receipt() {
+        let mut preset = AgentPreset::claude();
+        let mut instance = Instance::from_preset(Uuid::new_v4(), &preset);
+        let id = Uuid::new_v4().to_string();
+        instance.session_id = Some(id.clone());
+        let receipt = crate::session_binding::ClaudeBinding {
+            session_id: id.clone(),
+            cwd: Default::default(),
+            path: Default::default(),
+            stamp: Some(crate::session_binding::ClaudeHookStamp {
+                nonce: Uuid::new_v4(),
+                recorded_at: SystemTime::now(),
+            }),
+        };
+        let generated_args = vec!["--resume".into(), id.clone()];
+        let generated = generated_resume_receipt(Some(&preset), Some(&generated_args));
+        assert!(generated);
+        assert!(!crate::session_binding::claude_record_switches(
+            &receipt,
+            None,
+            Some(&id),
+            generated,
+        ));
+
+        preset.resume_flag = None;
+        preset.session_id_flag = None;
+        for args in [
+            vec!["--resume".into(), id.clone()],
+            vec![format!("--resume={id}")],
+            vec!["--resume".into()],
+            vec!["--continue".into()],
+            vec!["-r".into(), id.clone()],
+            vec!["-c".into()],
+            vec![format!("-r{id}")],
+            vec!["--append-system-prompt".into(), format!("--resume={id}")],
+        ] {
+            instance.args = args.clone();
+            let generated = generated_resume_receipt(Some(&preset), Some(&instance.args));
+            assert!(
+                !generated,
+                "configured Claude args {args:?} do not prove muxel's resume decision"
+            );
+            assert!(crate::session_binding::claude_record_switches(
+                &receipt,
+                None,
+                Some(&id),
+                generated,
+            ));
+        }
+    }
 
     #[test]
     fn only_a_reattach_to_a_live_tmux_session_keeps_its_writers_hook_records() {
@@ -3454,12 +3574,36 @@ mod claude_resume_tests {
     }
 
     #[test]
+    fn a_missing_launch_folder_is_created_and_an_impossible_one_refused() {
+        let root = std::env::temp_dir().join(format!("muxel-cwd-{}", Uuid::new_v4()));
+        // The creation is logged; keep that out of the real event log.
+        let _storage = muxel_store::test_support::set_root(root.clone());
+        let folder = root.join("deleted").join("project");
+        let spec = CommandSpec::shell().with_cwd(folder.display().to_string());
+        create_missing_cwd(&spec).expect("creates the folder and its parents");
+        assert!(folder.is_dir());
+        create_missing_cwd(&spec).expect("an existing folder is left alone");
+
+        // A file where the folder should be can't become one.
+        let file = root.join("file");
+        std::fs::write(&file, "").unwrap();
+        let spec = CommandSpec::shell().with_cwd(file.display().to_string());
+        assert!(create_missing_cwd(&spec).is_err());
+        assert!(file.is_file());
+
+        // No folder to make.
+        create_missing_cwd(&CommandSpec::shell()).expect("no cwd");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn unrelated_claude_resume_failure_preserves_the_saved_uuid() {
         assert!(!should_recover_expired_session(Some("claude"), false, true));
         assert!(!should_recover_expired_session(Some("claude"), true, false));
         assert!(!should_recover_expired_session(Some("codex"), false, true));
         assert!(should_recover_expired_session(Some("codex"), true, false));
         assert!(should_recover_expired_session(Some("grok"), false, true));
+        assert!(!should_recover_expired_session(Some("muse"), true, true));
     }
 
     #[test]
@@ -3772,17 +3916,23 @@ mod loop_cleanup_tests {
 
     /// A fresh Claude loop pane as `command_for` launches it: muxel mints the
     /// conversation's `--session-id`.
-    fn claude_loop_pane() -> (std::sync::Arc<TerminalSession>, muxel_terminal::PtyReceiver) {
+    fn claude_loop_pane() -> (
+        std::sync::Arc<TerminalSession>,
+        muxel_terminal::PtyReceiver,
+        String,
+    ) {
         let claude = AgentPreset::claude();
         let mut instance = Instance::from_preset(Uuid::new_v4(), &claude);
         instance.session_id = Some(Uuid::new_v4().to_string());
         let args = muxel_core::session_resume_args(&claude, &instance).unwrap();
         assert_eq!(args[0], "--session-id");
-        session_into(launch_binding(
+        let binding = instance.session_id.clone().unwrap();
+        let (session, receiver) = session_into(launch_binding(
             Some(&claude),
             claude.program.as_deref(),
             Some(&args),
-        ))
+        ));
+        (session, receiver, binding)
     }
 
     /// One scheduled-loop heartbeat over a docked pane whose runtime shows
@@ -3861,6 +4011,12 @@ mod loop_cleanup_tests {
             launch_binding(None, Some("opencode"), None),
             LaunchBinding::Known(None)
         );
+        // Muse names its conversation only through its hook.
+        let muse = AgentPreset::muse();
+        assert_eq!(
+            launch_binding(Some(&muse), muse.program.as_deref(), None),
+            LaunchBinding::Known(None)
+        );
     }
 
     #[test]
@@ -3903,7 +4059,7 @@ mod loop_cleanup_tests {
 
     #[test]
     fn a_claude_loop_finishes_its_turn_and_closes_its_exit_pane() {
-        let (session, _receiver) = claude_loop_pane();
+        let (session, _receiver, _) = claude_loop_pane();
         // The startup prompt, typed before Claude has shown any identity.
         session.mark_turn_submitted();
         assert_eq!(
@@ -3923,7 +4079,7 @@ mod loop_cleanup_tests {
         assert!(runs.is_empty(), "and stops blocking the next fire");
         session.kill();
 
-        let (session, _receiver) = claude_loop_pane();
+        let (session, _receiver, _) = claude_loop_pane();
         session.mark_turn_submitted();
         let mut left = run(session.id);
         left.post_run = PostRunAction::Leave;
@@ -3936,7 +4092,7 @@ mod loop_cleanup_tests {
 
     #[test]
     fn a_claude_loop_never_owns_the_conversation_a_clear_replaces_it_with() {
-        let (session, _receiver) = claude_loop_pane();
+        let (session, _receiver, _) = claude_loop_pane();
         session.mark_turn_submitted();
         let pane = Uuid::new_v4();
         let mut runs = HashMap::from([(pane, run(session.id))]);
@@ -3951,6 +4107,36 @@ mod loop_cleanup_tests {
             );
         }
         assert!(runs.is_empty(), "the old run is abandoned");
+        session.kill();
+    }
+
+    #[test]
+    fn a_fresh_claude_loops_first_same_id_resume_abandons_exit_cleanup() {
+        let (session, _receiver, bound) = claude_loop_pane();
+        assert!(!session.launch_resumed());
+        session.mark_turn_submitted();
+        let pane = Uuid::new_v4();
+        let mut runs = HashMap::from([(pane, run(session.id))]);
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Working).is_empty());
+        let hook = crate::session_binding::ClaudeBinding {
+            session_id: bound.clone(),
+            cwd: Default::default(),
+            path: Default::default(),
+            stamp: Some(crate::session_binding::ClaudeHookStamp {
+                nonce: Uuid::new_v4(),
+                recorded_at: SystemTime::now(),
+            }),
+        };
+        assert!(crate::session_binding::claude_record_switches(
+            &hook,
+            None,
+            Some(bound.as_str()),
+            session.launch_resumed()
+        ));
+        let now = SystemTime::now();
+        session.provider_switched(now, now);
+        assert!(heartbeat(&mut runs, pane, &session, AgentStatus::Done).is_empty());
+        assert!(runs.is_empty(), "the resumed pane must stay open");
         session.kill();
     }
 
@@ -7722,6 +7908,28 @@ impl MuxelApp {
             .map(|h| h.effective(&self.identities))
     }
 
+    /// The tmux session of every pane that runs on remote host `host_id`, or on
+    /// this machine for `None`, under the name each pane launches with. A literal
+    /// pane runs no session, whatever stale tmux fields a peer left on it.
+    fn pane_sessions_on(&self, host_id: Option<Uuid>) -> Vec<SessionTarget> {
+        self.workspace
+            .instances
+            .iter()
+            .filter(|i| !i.literal_argv)
+            .filter_map(|i| {
+                let project = self.workspace.project(i.project_id)?;
+                match (project.remote.as_ref(), host_id) {
+                    (Some(r), Some(host_id)) if r.host_id == host_id => {
+                        let host = self.remotes.iter().find(|h| h.id == host_id)?;
+                        Some(i.tmux_target(&host.name))
+                    }
+                    (None, None) => Some(i.tmux_target(&project.name)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Program/args (+ extra env) to run an instance's command on a remote host
     /// over SSH: `ssh [opts] host -- '…'`, or `sshpass -e ssh …` for password
     /// auth (the password — keychain or this session — is passed via `$SSHPASS`).
@@ -7865,6 +8073,8 @@ impl MuxelApp {
                 Some(SessionProvider::Claude)
             } else if is_grok_program(program) {
                 Some(SessionProvider::Grok)
+            } else if muxel_core::muse::is_program(program) {
+                Some(SessionProvider::Muse)
             } else {
                 None
             };
@@ -7884,7 +8094,7 @@ impl MuxelApp {
                                 })
                         })
                         .is_some_and(|preset| {
-                            args.first().map(String::as_str) == preset.resume_flag.as_deref()
+                            args.first().map(String::as_str) == preset.effective_resume_flag()
                         });
                     if resuming {
                         ui_profile::SessionLookupOutcome::Resume
@@ -7915,7 +8125,12 @@ impl MuxelApp {
                 .preset_id
                 .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                 .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
-            preset.resume_flag.as_ref()?;
+            preset.effective_resume_flag()?;
+            if muxel_core::muse::is_program(inst.program.as_deref())
+                && inst.args.iter().any(|arg| arg == "--no-session-log")
+            {
+                return None;
+            }
             let project = self.workspace.project(inst.project_id);
             let cwd = inst
                 .working_directory()
@@ -7957,6 +8172,12 @@ impl MuxelApp {
                 )
                 .with_context(|| t("Could not recover this conversation before launch."))?;
             }
+        }
+        // Muse's hook names the root session it switched to; adopt the last
+        // record before choosing this launch's `resume` id.
+        if local && muxel_core::muse::is_program(preset.program.as_deref()) {
+            let _phase = ui_profile::phase("activation", "muse-binding", Some(iid));
+            self.adopt_muse_session_binding(iid);
         }
         let Some(inst) = self.workspace.instance_mut(iid) else {
             return Ok(None);
@@ -8009,6 +8230,16 @@ impl MuxelApp {
                         unconfirmed_resume = true;
                     }
                 }
+            } else if local
+                && muxel_core::muse::is_program(preset.program.as_deref())
+                && inst.session_id.as_deref().is_some_and(|id| {
+                    let _phase = ui_profile::phase("activation", "muse-session-exists", Some(iid));
+                    muse_session_gone(&inst.env, id)
+                })
+            {
+                inst.session_id = None;
+                inst.session_path = None;
+                inst.session_started = false;
             }
         }
         let snapshot = inst.clone();
@@ -8042,6 +8273,7 @@ impl MuxelApp {
                 crate::user_data_dir::is_isolated(),
             )
         }) {
+            create_missing_cwd(&spec)?;
             return Ok(spec);
         }
         // Resume-capable agents (e.g. Claude): give the pane a stable session id and
@@ -8064,9 +8296,7 @@ impl MuxelApp {
                 .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                 .or_else(|| self.presets.iter().find(|p| p.name == i.preset))
         });
-        let resuming = session_preset
-            .and_then(|preset| Some((preset.resume_flag.as_deref()?, resume_args?)))
-            .is_some_and(|(flag, args)| args.first().is_some_and(|arg| arg == flag));
+        let resuming = generated_resume_receipt(session_preset, resume_args.map(Vec::as_slice));
         // Build one instruction bundle, then let the preset's injection transport
         // deliver it. CliFlag and Codex are hidden launch-time instructions;
         // TypeIn submits one visible turn only for a new conversation. Codex's
@@ -8078,6 +8308,7 @@ impl MuxelApp {
                 program: None,
                 args: Vec::new(),
                 startup_input: None,
+                session_context: None,
                 auto_mode_presses: 0,
                 submit: true,
                 env: Vec::new(),
@@ -8094,6 +8325,31 @@ impl MuxelApp {
             agent_program.as_deref(),
             session_resume.as_ref().map(|(args, _)| args.as_slice()),
         );
+        // Muse reports its root session through a managed hook file added for
+        // this launch. A tmux reattach keeps the surviving process's launch.
+        if muxel_core::muse::is_program(agent_program.as_deref())
+            && project.is_some_and(|project| project.remote.is_none())
+            && agent_program
+                .as_deref()
+                .is_some_and(muxel_terminal::muse_config_supported)
+            && let Some(data_dir) = muxel_store::data_dir()
+            && let Some(config) = crate::session_binding::prepare_muse_hooks(
+                &data_dir,
+                instance_id,
+                &resolved.env,
+                &resolved.args,
+                resolved.session_context.as_deref(),
+                inst.and_then(|i| {
+                    let name = i.tmux_session.clone()?;
+                    Some(SessionTarget::new(name, i.tmux_socket.clone()))
+                })
+                .is_some_and(|session| {
+                    session_discovery::tmux_session_running(&session) == Some(true)
+                }),
+            )
+        {
+            muxel_core::muse::insert_hook_config(&mut resolved.args, config);
+        }
 
         // Claude emits an exact SessionStart event for an in-process `/resume`.
         // Add one process-local hook through an invocation-only settings file. A file
@@ -8162,7 +8418,11 @@ impl MuxelApp {
                 project.map(|p| p.root_path.as_path()),
             );
             // If this instance uses tmux, wrap the command in `tmux new-session -A`
-            // so it persists and re-attaches across restarts.
+            // so it persists and re-attaches across restarts. Whether tmux
+            // creates Claude or attaches to an existing process is decided
+            // when this command runs, after the launch spec is built. The
+            // generated resume flag can therefore over-exempt an attach's
+            // first same-ID hook; do not infer a result from configured args.
             let (spec, extra_env) = match inst.and_then(|i| {
                 i.tmux_session
                     .as_ref()
@@ -8236,6 +8496,7 @@ impl MuxelApp {
         if let Some(cwd) = local_cwd {
             spec = spec.with_cwd(cwd);
         }
+        create_missing_cwd(&spec)?;
         if let Some(input) = resolved.startup_input.clone() {
             spec = spec.with_startup_input(input);
         }
@@ -8310,7 +8571,8 @@ impl MuxelApp {
             spec.with_status_program(agent_program)
                 .with_startup_delay(startup_delay)
                 .with_markers(working, blocked)
-                .with_binding(binding),
+                .with_binding(binding)
+                .with_launch_resumed(resuming),
         ))
     }
 
@@ -8468,7 +8730,7 @@ impl MuxelApp {
                         .iter()
                         .find(|preset| preset.name == inst.preset)
                 })
-                .is_some_and(|preset| preset.resume_flag.is_some())
+                .is_some_and(|preset| preset.effective_resume_flag().is_some())
         })
     }
 
@@ -8560,6 +8822,7 @@ impl MuxelApp {
             instance_id,
             LaunchTicket {
                 token,
+                reason,
                 since: Instant::now(),
                 startup,
             },
@@ -8569,6 +8832,7 @@ impl MuxelApp {
     }
 
     fn fail_tmux_launch(&mut self, iid: Uuid, message: String) {
+        self.cancel_control_startup(iid);
         self.terminal_launching.remove(&iid);
         self.failed_launches.insert(iid, message.clone());
         self.add_event(NotifKind::Error, t("Launch failed"), message);
@@ -8635,7 +8899,7 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(instance) = self.workspace.instance(iid) else {
+        let Some(instance) = self.workspace.instance(iid).filter(|i| !i.literal_argv) else {
             return false;
         };
         let pid = instance.project_id;
@@ -8664,6 +8928,7 @@ impl MuxelApp {
                     iid,
                     LaunchTicket {
                         token,
+                        reason,
                         since: Instant::now(),
                         startup: None,
                     },
@@ -8671,26 +8936,42 @@ impl MuxelApp {
                 token
             }
         };
+        #[cfg(all(test, windows))]
+        let probe = remote_reconnect_tests::next_owner_probe();
         cx.spawn_in(window, async move |this, cx| {
-            let pending = expected.clone();
-            let prepared = cx
-                .background_executor()
-                .spawn(async move {
-                    integrations::remote_tmux_launch_target(
-                        &loc,
-                        &pending,
-                        iid,
-                        false,
-                        Instant::now() + Duration::from_secs(10),
-                    )
-                })
-                .await;
+            let prepared = async {
+                #[cfg(all(test, windows))]
+                if let Some(probe) = probe {
+                    return probe
+                        .recv()
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("test owner probe cancelled")));
+                }
+                let pending = expected.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        integrations::remote_tmux_launch_target(
+                            &loc,
+                            &pending,
+                            iid,
+                            false,
+                            Instant::now() + Duration::from_secs(10),
+                        )
+                    })
+                    .await
+            }
+            .await;
             // `Some(false)`: the binding changed meanwhile (a peer layout rebound
             // the pane), so this answer is about the wrong owner.
             let landed = Self::in_project_or_main(&this, Some(pid), cx, |this, window, cx| {
                 if this.current_workspace != workspace
                     || !launch_token_current(&this.terminal_launching, iid, token)
                 {
+                    return true;
+                }
+                if !this.launch_permitted(iid, reason) {
+                    this.cancel_control_startup(iid);
+                    this.terminal_launching.remove(&iid);
                     return true;
                 }
                 let Some(instance) = this.workspace.instance_mut(iid) else {
@@ -8737,8 +9018,28 @@ impl MuxelApp {
         true
     }
 
-    /// Build the owned command after the pane has painted. The token check
-    /// prevents a closed or superseded pane from doing discovery work.
+    /// Check the admitted generation and its current permission before provider
+    /// I/O or command construction. Refusal also cancels an unclaimed first task.
+    fn permitted_launch_ticket(
+        &mut self,
+        instance_id: Uuid,
+        token: u64,
+    ) -> Option<muxel_core::TerminalLaunchReason> {
+        let reason = self
+            .terminal_launching
+            .get(&instance_id)
+            .filter(|ticket| ticket.token == token)?
+            .reason;
+        if !self.launch_permitted(instance_id, reason) {
+            self.cancel_control_startup(instance_id);
+            self.terminal_launching.remove(&instance_id);
+            return None;
+        }
+        Some(reason)
+    }
+
+    /// Build the owned command after the pane has painted. Claude preparation
+    /// retains the admitted reason while its transcript worker is running.
     fn prepare_reserved_terminal_spawn(
         &mut self,
         instance_id: Uuid,
@@ -8746,7 +9047,7 @@ impl MuxelApp {
         reason: muxel_core::TerminalLaunchReason,
         cx: &mut Context<Self>,
     ) -> Option<TerminalPreparation> {
-        if !launch_token_current(&self.terminal_launching, instance_id, token) {
+        if self.permitted_launch_ticket(instance_id, token)? != reason {
             return None;
         }
         if let Some(pending) = self.prepare_claude_launch_with_reason(instance_id, token, reason) {
@@ -8766,18 +9067,17 @@ impl MuxelApp {
     ) -> Option<(TerminalSpawnMeta, CommandSpec, (u16, u16))> {
         let _phase =
             ui_profile::phase("activation", "prepare-reserved-terminal", Some(instance_id));
-        if !launch_token_current(&self.terminal_launching, instance_id, token) {
-            return None;
-        }
-        // A peer/workspace update can change metadata while the task yields.
-        // Recheck before discovery so a restore reservation cannot replay argv.
-        if !self.launch_permitted(instance_id, reason) {
-            self.terminal_launching.remove(&instance_id);
+        // Permission belongs to the admitted generation, including after a
+        // Claude transcript worker yields to peer/workspace metadata updates.
+        if self.permitted_launch_ticket(instance_id, token)? != reason {
             return None;
         }
         if !self.prepare_local_tmux_owner(instance_id) {
             return None;
         }
+        // Owner discovery retains a ticket without owning the first task. Claim
+        // it only after preparation succeeds, without re-reserving the launch.
+        self.claim_reserved_control_startup(instance_id, token);
         let started = self.terminal_launching.get(&instance_id)?.since;
         let spec = match self.command_for(instance_id, resume_cwd) {
             Ok(spec) => spec,
@@ -9350,18 +9650,7 @@ impl MuxelApp {
                             // not adopted a second time.
                             if let Some(sessions) = sessions {
                                 if let Some(host) = this.remote_host_for_project(pid) {
-                                    let instances =
-                                        this.workspace.instances.iter_mut().filter(|instance| {
-                                            instance.project_id == pid
-                                                && instance.kind == InstanceKind::Terminal
-                                                && host.use_tmux(instance.use_tmux)
-                                        });
-                                    muxel_core::tmux::bind_session_owners(
-                                        &host.name,
-                                        instances,
-                                        &sessions,
-                                        integrations::profile_tmux_socket(),
-                                    );
+                                    this.bind_connect_session_owners(pid, &host, &sessions);
                                     this.persist();
                                 }
                                 // Finish any close whose kill never landed *first*,
@@ -9505,22 +9794,17 @@ impl MuxelApp {
         let Some(project) = self.workspace.project(pid) else {
             return;
         };
-        let Some(root) = project.remote.as_ref().map(|r| r.remote_root.clone()) else {
-            return;
-        };
-        let host_name = project
+        let Some((root, host_id)) = project
             .remote
             .as_ref()
-            .and_then(|r| self.remotes.iter().find(|h| h.id == r.host_id))
-            .map(|h| h.name.clone())
-            .unwrap_or_default();
-        let owned: Vec<SessionTarget> = self
-            .workspace
-            .instances
-            .iter()
-            .filter(|i| i.project_id == pid)
-            .map(|i| i.tmux_target(&host_name))
-            .collect();
+            .map(|r| (r.remote_root.clone(), r.host_id))
+        else {
+            return;
+        };
+        // Every pane on this host owns its session, not just this project's: a
+        // project nested in this one's tree, or a second entry for the same root,
+        // already shows its own panes' sessions.
+        let owned = self.pane_sessions_on(Some(host_id));
         // A pane the user closed must not come back as a pane: neither one whose kill
         // is still unconfirmed (`reap_closed_sessions` is working on it) nor one whose
         // kill was confirmed after `sessions` was listed.
@@ -9903,6 +10187,63 @@ impl MuxelApp {
             .iter()
             .find(|h| h.id == r.host_id)
             .map(|h| h.effective(&self.identities))
+    }
+
+    fn bind_connect_session_owners(
+        &mut self,
+        pid: Uuid,
+        host: &RemoteHost,
+        sessions: &[muxel_core::tmux::RemoteSession],
+    ) {
+        let eligible = |instance: &Instance| {
+            instance.project_id == pid
+                && instance.kind == InstanceKind::Terminal
+                && host.use_tmux(instance.use_tmux)
+        };
+        let before: Vec<_> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|instance| eligible(instance))
+            .map(|instance| {
+                (
+                    instance.id,
+                    instance.tmux_session.clone(),
+                    instance.tmux_socket.clone(),
+                )
+            })
+            .collect();
+        let instances = self
+            .workspace
+            .instances
+            .iter_mut()
+            .filter(|instance| eligible(instance));
+        muxel_core::tmux::bind_session_owners(
+            &host.name,
+            instances,
+            sessions,
+            integrations::profile_tmux_socket(),
+        );
+        // Connection inventory can establish a new owner without changing the
+        // peer layout. A restart still targeting the old owner must give up its
+        // lease before the connection attempts to spawn this pane.
+        let changed: Vec<_> = self
+            .workspace
+            .instances
+            .iter()
+            .filter(|instance| eligible(instance))
+            .zip(before)
+            .filter_map(|(now, (iid, old_session, old_socket))| {
+                debug_assert_eq!(now.id, iid);
+                (!now.literal_argv
+                    && (now.tmux_session != old_session || now.tmux_socket != old_socket))
+                    .then_some(iid)
+            })
+            .collect();
+        for iid in changed {
+            self.terminal_restarts.owner_changed(iid);
+            self.failed_launches.remove(&iid);
+        }
     }
 
     /// Spawn any missing terminals/editors for a project's panes (no remote
@@ -10735,13 +11076,42 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Uuid {
-        let project = Project::new(name, root);
+        // A folder already worked in from elsewhere — a remote project another
+        // machine keeps on this one, or the iOS app — has its panes saved in
+        // `.muxel/workspace.json`, their agents still running in tmux here. It isn't
+        // new: it opens with those panes, and with the shared memory and
+        // accomplishment log its doc records rather than this machine's defaults.
+        let saved = self.use_tmux && Self::folder_has_saved_panes(&root);
+        let project = if saved {
+            Project::new(name, root)
+        } else {
+            self.settings.new_project(name, root)
+        };
         let pid = project.id;
-        let preset = self.current_agent_preset();
-        let instance = Instance::from_preset(pid, &preset);
-
         self.workspace.add_project(project);
         self.workspace.active_project = Some(pid);
+        if saved {
+            // Its first sync, against an empty layout, takes the saved one and
+            // launches its panes, which attach to the sessions still running.
+            self.ensure_project_terminals(pid, window, cx);
+            self.start_new_project_logs(pid, cx);
+            if self.show_file_browser {
+                self.load_file_browser(pid, cx);
+            }
+            if let Some(iid) = self
+                .workspace
+                .project(pid)
+                .and_then(|p| p.preferred_instance())
+            {
+                self.focus_instance(iid, window, cx);
+            }
+            self.persist();
+            cx.notify();
+            return pid;
+        }
+        let preset = self.current_agent_preset();
+        let instance = Instance::from_preset(pid, &preset);
+        self.start_new_project_logs(pid, cx);
         // Point the open file browser at the new project right away.
         if self.show_file_browser {
             self.load_file_browser(pid, cx);
@@ -10763,6 +11133,14 @@ impl MuxelApp {
         pid
     }
 
+    /// Whether `root` has panes saved in its `.muxel/workspace.json` for a project
+    /// at that same root.
+    fn folder_has_saved_panes(root: &std::path::Path) -> bool {
+        integrations::fetch_remote_layout(&integrations::RepoLoc::Local(root.to_path_buf()))
+            .and_then(|json| RemoteLayout::parse(&json, &root.display().to_string()))
+            .is_some_and(|doc| doc.has_panes())
+    }
+
     /// Create a project that lives on a remote host (over SSH). `root_path` is set
     /// cosmetically to the remote path; the real working dir comes from the
     /// [`RemoteRef`].
@@ -10774,7 +11152,7 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Uuid {
-        let mut project = Project::new(name, PathBuf::from(&remote_dir));
+        let mut project = self.settings.new_project(name, PathBuf::from(&remote_dir));
         project.remote = Some(RemoteRef {
             host_id,
             remote_root: remote_dir,
@@ -10788,6 +11166,7 @@ impl MuxelApp {
         self.workspace.add_instance(instance);
         self.workspace.add_project(project);
         self.workspace.active_project = Some(pid);
+        self.start_new_project_logs(pid, cx);
         // Point the open file browser at the new project right away.
         if self.show_file_browser {
             self.load_file_browser(pid, cx);
@@ -10799,6 +11178,26 @@ impl MuxelApp {
         self.persist();
         cx.notify();
         pid
+    }
+
+    /// Set up the shared memory and accomplishment log a new project starts with
+    /// (Settings → Projects), the way turning each one on does.
+    fn start_new_project_logs(&mut self, pid: Uuid, cx: &mut Context<Self>) {
+        let Some(project) = self.workspace.project(pid) else {
+            return;
+        };
+        let (memory, accomplishments) = (project.memory_enabled, project.accomplishments_enabled);
+        if memory && self.memory_ensured.insert(pid) {
+            self.ensure_project_memory(pid, cx);
+            self.memory_upkeep.check_soon();
+        }
+        if accomplishments {
+            if self.accomplishments_ensured.insert(pid) {
+                self.ensure_project_accomplishments(pid, cx);
+            }
+            self.accomplishments_checked_at = None;
+            self.accomplishments_generation += 1;
+        }
     }
 
     /// Open the new-remote-project wizard (defaults the host to the first saved).
@@ -12180,7 +12579,7 @@ impl MuxelApp {
         ) {
             muxel_core::PeerLayoutAction::Ignore => {}
             muxel_core::PeerLayoutAction::InSync => {
-                self.layout_synced_keys.insert(pid, remote_key);
+                self.remember_layout_synced(pid, remote_key);
             }
             muxel_core::PeerLayoutAction::Adopt => self.adopt_peer_layout(pid, remote, window, cx),
         }
@@ -12242,6 +12641,9 @@ impl MuxelApp {
             self.browsers.remove(&iid);
             self.last_status.remove(&iid);
             self.failed_launches.remove(&iid);
+            if let Some(data_dir) = muxel_store::data_dir() {
+                crate::session_binding::clear_muse_binding(&data_dir, iid);
+            }
             self.workspace.remove_instance_meta(iid);
         }
         for instance in instances {
@@ -12288,6 +12690,8 @@ impl MuxelApp {
     /// pane can now attach to. Restart would instead kill what the peer started.
     fn retry_rebound_launches(&mut self, before: &[Instance], after: &[Instance]) {
         for iid in muxel_core::rebound_instances(before, after) {
+            // The old restart no longer owns the peer's new session.
+            self.terminal_restarts.owner_changed(iid);
             self.failed_launches.remove(&iid);
         }
     }
@@ -12313,7 +12717,22 @@ impl MuxelApp {
         }
         self.layout_keys.insert(pid, key);
         self.layout_edit_keys.insert(pid, doc.edit_key());
-        self.layout_synced_keys.insert(pid, remote_key);
+        self.remember_layout_synced(pid, remote_key);
+    }
+
+    /// Record `key` as the shared doc this machine last wrote or adopted for `pid`:
+    /// in memory for the live poll, and by fingerprint in the workspace so the next
+    /// connect can tell a peer's write from this machine's own
+    /// (`muxel_core::connect_layout_action`).
+    fn remember_layout_synced(&mut self, pid: Uuid, key: String) {
+        let fingerprint = RemoteLayout::fingerprint(&key);
+        self.layout_synced_keys.insert(pid, key);
+        if let Some(project) = self.workspace.project_mut(pid)
+            && project.layout_synced.as_deref() != Some(fingerprint.as_str())
+        {
+            project.layout_synced = Some(fingerprint);
+            self.persist();
+        }
     }
 
     /// Bind a local project's terminal panes that a peer created without recording
@@ -12377,7 +12796,7 @@ impl MuxelApp {
             .workspace
             .instance(iid)
             .and_then(|instance| instance.session_id.as_deref());
-        if !crate::session_binding::claude_record_switches(&binding, seen, bound) {
+        if !crate::session_binding::claude_record_switches(&binding, seen, bound, true) {
             self.remember_claude_hook(iid, launch, binding.stamp);
             return Ok((Handled, cwd));
         }
@@ -12414,6 +12833,45 @@ impl MuxelApp {
                     "Could not save the recovered conversation. Fix the workspace save error and retry the launch."
                 )
             )
+        }
+    }
+
+    /// Adopt the root session named by a Muse pane's last hook record before
+    /// its next launch. Recurring reads run in session discovery.
+    fn adopt_muse_session_binding(&mut self, iid: Uuid) {
+        let Some(data) = muxel_store::data_dir() else {
+            return;
+        };
+        let Some(instance) = self.workspace.instance(iid) else {
+            return;
+        };
+        let current = instance.session_id.as_deref();
+        let Some((metadata, _)) = crate::session_binding::read_muse_binding(&data, iid, current)
+        else {
+            return;
+        };
+        if session_id_bound_elsewhere(&self.workspace.instances, iid, &metadata.session_id) {
+            return;
+        }
+        let Some(instance) = self.workspace.instance_mut(iid) else {
+            return;
+        };
+        if instance.session_id.as_deref() == Some(metadata.session_id.as_str()) {
+            return;
+        }
+        let previous = (
+            instance.session_id.replace(metadata.session_id),
+            std::mem::replace(&mut instance.session_started, true),
+            instance.auto_name.take(),
+        );
+        if !self.try_persist()
+            && let Some(instance) = self.workspace.instance_mut(iid)
+        {
+            (
+                instance.session_id,
+                instance.session_started,
+                instance.auto_name,
+            ) = previous;
         }
     }
 
@@ -12883,6 +13341,10 @@ impl MuxelApp {
             let tmux_lost = exited
                 && tmux_session.is_some()
                 && (exit_signal.is_some() || exit_code != Some(0))
+                && self
+                    .terminal_launching
+                    .get(&iid)
+                    .is_none_or(|launch| launch.since.elapsed() >= REATTACH_PENDING_LAUNCH_TIMEOUT)
                 && self.terminal_launches.get(&iid).is_none_or(|&(at, _)| {
                     at.elapsed() >= reattach_backoff(self.reconnecting.get(&iid).copied())
                 });
@@ -15694,14 +16156,17 @@ impl MuxelApp {
         worktree_cleanup: muxel_core::WorktreeCleanup,
         cx: &mut Context<Self>,
     ) {
+        if let Some(data_dir) = muxel_store::data_dir() {
+            crate::session_binding::clear_muse_binding(&data_dir, iid);
+        }
         let is_remote = self
             .workspace
             .project(project_id)
             .is_some_and(|p| p.is_remote());
-        // Remote tmux session: closing a pane always tears its session down —
-        // a *dropped* SSH connection never reaches here (an abnormal exit leaves
-        // a tombstone pane instead of auto-closing), so reconnectability is
-        // preserved where it matters. Killed over ssh in the background, over the
+        // Remote tmux session: closing a pane tears its session down unless another
+        // pane still shows it — a *dropped* SSH connection never reaches here (an
+        // abnormal exit leaves a tombstone pane instead of auto-closing), so
+        // reconnectability is preserved where it matters. Killed over ssh in the background, over the
         // host's commands master — never the pane's own, which is going away.
         //
         // Gated on the host having tmux *at all*, not on tmux being its current
@@ -15726,13 +16191,18 @@ impl MuxelApp {
             // at one costs a single round trip and nothing else.
             (Some(tmux), Some(host)) => {
                 let session = tmux.on_host(&host.name);
-                self.reap_remote_session(project_id, iid, host, session, cx);
+                if !self.session_kept_for_another_pane(Some(host.id), &session) {
+                    self.reap_remote_session(project_id, iid, host, session, cx);
+                }
             }
             // A remote instance's session lives on the host, not here; killing the
             // recorded name locally would be a no-op at best.
             (Some(tmux), None) if !is_remote => {
                 if let Some(session) = tmux.recorded_session {
-                    integrations::kill_tmux_session(&SessionTarget::new(session, tmux.socket));
+                    let session = SessionTarget::new(session, tmux.socket);
+                    if !self.session_kept_for_another_pane(None, &session) {
+                        integrations::kill_tmux_session(&session);
+                    }
                 }
             }
             _ => {}
@@ -15753,6 +16223,25 @@ impl MuxelApp {
             }
             muxel_core::WorktreeCleanup::None => {}
         }
+    }
+
+    /// Whether a closed pane's `session` stays running because another pane on the
+    /// same host (`None`: this machine) still shows it — see
+    /// `tmux::session_still_shown`. The closed pane must already be gone from the
+    /// workspace. A kept session is noted in the event log, so a close that left an
+    /// agent running can be told apart from a kill that failed.
+    fn session_kept_for_another_pane(
+        &self,
+        host_id: Option<Uuid>,
+        session: &SessionTarget,
+    ) -> bool {
+        let kept = muxel_core::tmux::session_still_shown(session, &self.pane_sessions_on(host_id));
+        if kept {
+            muxel_store::append_event_log(&format!(
+                "close: kept “{session}” running — another pane still shows it"
+            ));
+        }
+        kept
     }
 
     /// Kill the tmux session a closed pane left on a remote host, and keep at it
@@ -16687,7 +17176,7 @@ impl MuxelApp {
                 this.remote_push_inflight.remove(&pid);
                 match res {
                     Ok(Pushed::Written(key, moved)) => {
-                        this.layout_synced_keys.insert(pid, key);
+                        this.remember_layout_synced(pid, key);
                         this.layout_push_failing.remove(&pid);
                         this.take_moves_off_default(pid, &moved, window, cx);
                     }
@@ -16753,6 +17242,8 @@ impl MuxelApp {
                 continue;
             }
             instance.tmux_socket = Some(Socket::Private);
+            // Free launch admission before trying to attach to the peer's owner.
+            self.terminal_restarts.owner_changed(iid);
             self.bump_session_binding_generation(iid);
             self.failed_launches.remove(&iid);
             changed = true;
@@ -16793,6 +17284,8 @@ impl MuxelApp {
         let local_key = local.content_key();
         let local_edit = local.edit_key();
         let local_rev = proj.layout_updated_at.unwrap_or(0);
+        // The doc as this machine last wrote or adopted it, by fingerprint.
+        let synced = proj.layout_synced.clone();
         let remote = fetched
             .as_deref()
             .and_then(|j| RemoteLayout::parse(j, &layout_root));
@@ -16801,19 +17294,32 @@ impl MuxelApp {
         // the field existed says nothing — see below.
         let recorded_memory = remote.as_ref().and_then(|r| r.memory_enabled);
 
-        match remote {
-            // Remote is strictly newer and actually different → adopt it.
-            Some(r) if r.updated_at > local_rev && r.content_key() != local_key => {
+        let action = remote.as_ref().map(|r| {
+            muxel_core::connect_layout_action(r, synced.as_deref(), &local_key, local_rev)
+        });
+        match (remote, action) {
+            // A peer wrote it since this machine last synced, and either nothing
+            // changed here or the peer's change is newer → adopt it.
+            (Some(r), Some(muxel_core::PeerLayoutAction::Adopt)) => {
                 self.pull_remote_layout(pid, local, r, window, cx);
             }
             // Already in sync → just arm change detection.
-            Some(r) if r.content_key() == local_key => {
+            (Some(_), Some(muxel_core::PeerLayoutAction::InSync)) => {
                 self.layout_keys.insert(pid, local_key.clone());
                 self.layout_edit_keys.insert(pid, local_edit);
-                self.layout_synced_keys.insert(pid, local_key);
+                self.remember_layout_synced(pid, local_key);
             }
-            // Local is newer, or there's no usable remote doc → push local up.
-            _ => {
+            // This machine has changes on top of the file (or the newer ones), or
+            // there's no usable remote doc → push local up.
+            (remote, _) => {
+                // A file still as this machine left it is its own last write: the
+                // push must not mistake it for a peer's (`push_overwrites_peer`).
+                if let Some(r) = remote {
+                    let key = r.content_key();
+                    if synced.as_deref() == Some(RemoteLayout::fingerprint(&key).as_str()) {
+                        self.layout_synced_keys.insert(pid, key);
+                    }
+                }
                 self.layout_keys.insert(pid, local_key);
                 self.layout_edit_keys.insert(pid, local_edit);
                 self.remote_push_due.insert(pid, Instant::now());
@@ -19322,6 +19828,7 @@ impl MuxelApp {
         if !inst.permits_launch(muxel_core::TerminalLaunchReason::Restart) {
             return;
         }
+        let owner_generation = self.terminal_restarts.owner_generation(iid);
         let Some(restart) = self.terminal_restarts.begin(inst) else {
             return;
         };
@@ -19417,7 +19924,9 @@ impl MuxelApp {
                 Ok(closed) => {
                     let saved = this
                         .update(cx, |this, _| {
-                            if this.current_workspace != workspace {
+                            if this.current_workspace != workspace
+                                || this.terminal_restarts.owner_generation(iid) != owner_generation
+                            {
                                 return false;
                             }
                             if !this.terminal_restarts.record_owner(
@@ -19454,8 +19963,11 @@ impl MuxelApp {
                         match prepared {
                             Ok(next) => this
                                 .update(cx, |this, _| {
-                                    if this.current_workspace != workspace {
-                                        anyhow::bail!("workspace changed during restart");
+                                    if this.current_workspace != workspace
+                                        || this.terminal_restarts.owner_generation(iid)
+                                            != owner_generation
+                                    {
+                                        anyhow::bail!("the pane's binding changed during restart");
                                     }
                                     this.save_restart_migration(iid, restart, &expected, &next)
                                 })
@@ -19479,6 +19991,7 @@ impl MuxelApp {
                     project,
                     workspace,
                     token: restart,
+                    owner_generation,
                     host: host_name,
                     session: label,
                     killed,
@@ -19546,6 +20059,7 @@ impl MuxelApp {
             project,
             workspace,
             token: restart,
+            owner_generation,
             host: host_name,
             session: label,
             killed,
@@ -19555,11 +20069,15 @@ impl MuxelApp {
             .err()
             .map(|error| format!("{label}: {error:#}"));
         let completed = Self::in_project_or_main(this, Some(project), cx, |this, window, cx| {
-            if this.current_workspace != workspace
-                || !this.terminal_restarts.finish(iid, restart)
+            if this.current_workspace != workspace {
+                return;
+            }
+            let same_binding = this.terminal_restarts.owner_generation(iid) == owner_generation;
+            if !this.terminal_restarts.finish(iid, restart)
+                || !same_binding
                 || this.workspace.instance(iid).is_none()
             {
-                return; // closed while the kill was in flight
+                return; // closed or rebound while the kill was in flight
             }
             if let Err(e) = killed {
                 this.fail_restart(
@@ -19590,9 +20108,12 @@ impl MuxelApp {
             // whichever window now shows the project.
             let project = this
                 .update(cx, |this, cx| {
-                    if this.current_workspace != workspace
-                        || !this.terminal_restarts.finish(iid, restart)
-                    {
+                    if this.current_workspace != workspace {
+                        return None;
+                    }
+                    let same_binding =
+                        this.terminal_restarts.owner_generation(iid) == owner_generation;
+                    if !this.terminal_restarts.finish(iid, restart) || !same_binding {
                         return None;
                     }
                     if let Some(error) = &failure {
@@ -27547,6 +28068,7 @@ impl MuxelApp {
                 },
             },
             InjectionMode::TypeIn => InjectionMode::TypeIn,
+            InjectionMode::SessionHook => InjectionMode::SessionHook,
             InjectionMode::None => InjectionMode::None,
         };
         let kind = self.settings_ui.p_kind;
@@ -30360,7 +30882,7 @@ impl MuxelApp {
             (t("Speech"), SettingsSection::Speech),
             (t("Read Aloud"), SettingsSection::ReadAloud),
             (t("Agents"), SettingsSection::Agents),
-            (t("Grok Bot"), SettingsSection::GrokBot),
+            (t("Outside control"), SettingsSection::OutsideControl),
             (t("Runners"), SettingsSection::Runners),
             (t("Snippets"), SettingsSection::Snippets),
             (t("Loops"), SettingsSection::Loops),
@@ -30397,7 +30919,7 @@ impl MuxelApp {
             SettingsSection::Speech => self.render_settings_speech(cx),
             SettingsSection::ReadAloud => self.render_settings_read_aloud(cx),
             SettingsSection::Agents => self.render_settings_agents(cx),
-            SettingsSection::GrokBot => self.render_settings_grok_bot(cx),
+            SettingsSection::OutsideControl => self.render_settings_outside_control(cx),
             SettingsSection::Runners => self.render_settings_runners(cx),
             SettingsSection::Snippets => self.render_settings_snippets(cx),
             SettingsSection::Loops => self.render_settings_loops(cx),
@@ -32004,6 +32526,7 @@ impl MuxelApp {
         let ui = &self.settings_ui;
         let inj = ui.p_injection.clone();
         let is_flag = matches!(inj, InjectionMode::CliFlag { .. });
+        let is_muse = muxel_core::muse::is_program(Some(ui.p_program.read(cx).value().as_ref()));
         v_flex()
             .gap_2()
             .max_w(px(560.0))
@@ -32124,7 +32647,21 @@ impl MuxelApp {
                                     .on_click(cx.listener(|this, _e, _w, cx| {
                                         this.set_editor_injection(InjectionMode::TypeIn, cx)
                                     })),
-                            ),
+                            )
+                            .children((is_muse || matches!(inj, InjectionMode::SessionHook)).then(
+                                || {
+                                    Button::new("inj-session")
+                                        .ghost()
+                                        .selected(matches!(inj, InjectionMode::SessionHook))
+                                        .label(t("At session start"))
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.set_editor_injection(
+                                                InjectionMode::SessionHook,
+                                                cx,
+                                            )
+                                        }))
+                                },
+                            )),
                     )
                     .children(is_flag.then(|| {
                         v_flex()
@@ -32272,8 +32809,36 @@ impl MuxelApp {
                     )),
             );
 
+        // Global: what a project starts with. Existing projects keep their own.
+        let new_projects = v_flex()
+            .gap_1()
+            .child(self.settings_label(&t("New projects"), cx))
+            .child(self.setting_check(
+                "new-project-memory",
+                self.settings.new_project_memory,
+                &t("Turn on shared memory"),
+                cx,
+                |s, on| s.new_project_memory = on,
+            ))
+            .child(self.setting_check(
+                "new-project-accomplishments",
+                self.settings.new_project_accomplishments,
+                &t("Turn on the accomplishment log"),
+                cx,
+                |s, on| s.new_project_accomplishments = on,
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t(
+                        "Applies to projects added from now on. Change an existing project from its menu in the sidebar.",
+                    )),
+            );
+
         v_flex()
             .gap_4()
+            .child(new_projects)
             .child(retention)
             .child(
                 div()
@@ -33379,6 +33944,7 @@ mod restore_wave_policy_tests {
                     iid,
                     LaunchTicket {
                         token,
+                        reason: muxel_core::TerminalLaunchReason::Restore,
                         since,
                         startup: None,
                     },
@@ -33396,6 +33962,7 @@ mod restore_wave_policy_tests {
             iid,
             LaunchTicket {
                 token: 1,
+                reason: muxel_core::TerminalLaunchReason::NewPane,
                 since: Instant::now(),
                 startup: old.claim(),
             },
@@ -33410,6 +33977,7 @@ mod restore_wave_policy_tests {
             iid,
             LaunchTicket {
                 token: 2,
+                reason: muxel_core::TerminalLaunchReason::NewPane,
                 since: Instant::now(),
                 startup: current.claim(),
             },
@@ -33746,6 +34314,7 @@ mod restore_wave_policy_tests {
             a,
             LaunchTicket {
                 token: 8,
+                reason: muxel_core::TerminalLaunchReason::Restore,
                 since: deadline,
                 startup: None,
             },

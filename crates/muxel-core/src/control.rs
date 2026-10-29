@@ -1078,7 +1078,7 @@ usage: muxel ctl <command> [args]
 AGENT is an id from `panes`, a name, project/name, or `focused`.
 Everything after `--` is taken literally (for text that starts with --).
 For `new` without --prompt, presets/defaults keep toolbar injection, resume and hooks; raw argv bypasses them.
-ALL `new` requests require outside control AND Settings > Grok Bot > Outside terminal creation set to Ask or Allow.
+ALL `new` requests require outside control AND Settings > Outside control > Outside terminal creation set to Ask or Allow.
 Ask requires a click for every request. Allow covers configured non-shell terminal presets.
 Literal argv and shell presets always Ask; the click card never takes keyboard focus.
 Each card disables Allow and Deny for 750 ms after appearing and ignores double-clicks.
@@ -1104,7 +1104,7 @@ Raw argv panes restore stopped; only Run again replays their saved command.
 `new` launch directories are never owned, registered or deleted by muxel.
 On Windows, raw argv requires a native executable; use --preset for batch wrappers.
 `new` opens terminal panes; browser presets (including a browser default) are not supported yet.
-muxel must be running with Settings > Grok Bot > \"Allow outside tools to control muxel\" on.
+muxel must be running with Settings > Outside control > \"Allow outside tools to control muxel\" on.
 To reach a muxel started with --user-data-dir DIR, run `muxel --user-data-dir DIR ctl ...`;
 its own panes reach it without the flag.
 
@@ -1374,7 +1374,7 @@ Every command prints JSON. A failure exits non-zero and prints
 `{"ok": false, "error": "..."}` - the error says what went wrong and what to do,
 and a `code` is added when there is something to act on (see Errors below). If
 it says muxel isn't running or outside control is off, ask the user to open
-muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
+muxel and turn on Settings > Outside control > "Allow outside tools to control muxel".
 
 ## Commands
 
@@ -1414,7 +1414,7 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   and activates its window. `--background` is accepted as a compatibility no-op,
   including alongside `--focus`. JSON callers use `focus` (default false);
   the legacy `background` field remains accepted and does not control focus.
-  Every `new` request requires outside control plus Settings > Grok Bot >
+  Every `new` request requires outside control plus Settings > Outside control >
   Outside terminal creation set to Ask or Allow. Ask requires a click for every
   request; Allow permits configured non-shell terminal presets. All literal argv,
   even an agent
@@ -1497,6 +1497,23 @@ muxel and turn on Settings > Grok Bot > "Allow outside tools to control muxel".
   includes the actual `launch_id` and `"pasted": true` for admission to the PTY
   writer, not confirmation of agent delivery. A lost reply does not make a
   retry safe; inspect the agent before typing again.
+  Codex, Claude and Grok sends also observe provider acceptance for about ten
+  seconds (three more after a retry). `submission_confirmed` is true only for a fresh provider receipt and
+  false when acceptance remains unknown, with `unconfirmed_reason` `timed_out`,
+  `input_changed` (other input arrived; no further Enter is sent) or
+  `interrupted` (the pane closed, restarted, switched conversation or lost
+  permission). Once Enter is in, the reply is this receipt, never an error.
+  It is null, without waiting, when the pane can't show a receipt: an
+  unsupported provider, or no readable idle status title (tmux hides titles)
+  with a Grok, multi-paragraph or repeated prompt.
+  `enter_retries` reports zero or one additional Enter. Windows Codex alone may
+  receive that retry after five seconds while its exact, fully visible ASCII
+  prose remains in the idle composer and no local input intervened. Clipped,
+  multiline, Unicode or completion drafts get no retry. Text is never pasted
+  twice. Retry also requires a compact composer frame from before the paste
+  and an added blank cursor line proving that the first Enter was consumed;
+  a pending Enter never authorizes another.
+  An unconfirmed receipt requires inspecting `screen` before more input.
 - `muxel ctl wait AGENT [--timeout SECS] [--full]` - wait until the agent's turn
   ends (or it blocks on a question, or exits), then print what `show` prints.
   Startup tasks stay pending until fresh provider-owned acceptance, not merely

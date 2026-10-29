@@ -24,6 +24,7 @@ muxel-tray.workspace = true
 anyhow.workspace = true
 log.workspace = true
 uuid.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 # Stable receipt identities; already resolved through the webview dependencies.
 sha2 = "0.10"

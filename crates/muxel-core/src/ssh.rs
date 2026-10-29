@@ -4,8 +4,8 @@
 //! own.
 //!
 //! A remote pane runs `ssh [opts] [user@]host -t -- '<remote command>'`, where
-//! the remote command is `cd <dir> && exec <program>` (or a `tmux new-session
-//! -A` for a persistent, reconnectable session). Connections to a host ride
+//! the remote command is `mkdir -p <dir> && cd <dir> && exec <program>` (or a
+//! `tmux new-session -A` for a persistent, reconnectable session). Connections to a host ride
 //! ControlMaster sockets, so repeated connections reuse an authenticated one: the
 //! panes share a few masters, and muxel's own commands (git, layout sync, tmux
 //! queries) share another. See [`Master`].
@@ -871,11 +871,14 @@ fn windows_remote_command(spec: &SshSpec) -> String {
     // survive the outer shell's parsing — see `crate::winshell`.
     let mut script = String::new();
     if let Some(cwd) = spec.remote_cwd {
-        // -LiteralPath, because a project directory containing `[` or `]` is a
-        // wildcard to -Path and would not be found.
+        // A missing folder is created first, so the program starts in it rather
+        // than in the home folder. `CreateDirectory` (no-op when it exists) and
+        // -LiteralPath both take the path literally, where a project directory
+        // containing `[` or `]` is a wildcard to -Path and would not be found.
+        let cwd = winshell::ps_quote(cwd);
         script.push_str(&format!(
-            "Set-Location -LiteralPath {}",
-            winshell::ps_quote(cwd)
+            "$null = [System.IO.Directory]::CreateDirectory({cwd}); \
+             Set-Location -LiteralPath {cwd}"
         ));
     }
     if let Some(program) = spec.program {
@@ -909,6 +912,7 @@ fn windows_remote_command(spec: &SshSpec) -> String {
 /// cmd has no scripting worth the trouble and no way to quote that survives
 /// nesting, so muxel keeps this minimal and offers PowerShell as the default.
 /// `cd /d` rather than a bare `cd`, which silently does nothing across drives.
+/// Unlike every other pane, it does not create a missing folder.
 fn cmd_remote_command(spec: &SshSpec) -> String {
     let mut inner = String::new();
     if let Some(cwd) = spec.remote_cwd {
@@ -985,6 +989,13 @@ fn remote_command(spec: &SshSpec) -> String {
             cmd.push_str(&sh_quote(&a));
         }
         cmd.push_str("; fi; ");
+        // A new session starts in its folder, so create a missing one; tmux would
+        // otherwise start it in the home folder. After the server starts, whose
+        // command line must not name the project. Best effort: a failure must not
+        // keep a running session from being reattached.
+        if let Some(cwd) = spec.remote_cwd {
+            cmd.push_str(&format!("mkdir -p -- {}; ", sh_quote(cwd)));
+        }
         // Attaching makes a client the window's latest, and under tmux's default
         // `window-size latest` the window takes its size — so a pane reconnecting
         // on an unattended laptop resized the session under whoever was using it
@@ -1027,9 +1038,9 @@ fn remote_command(spec: &SshSpec) -> String {
     } else {
         let mut cmd = String::new();
         if let Some(cwd) = spec.remote_cwd {
-            cmd.push_str("cd ");
-            cmd.push_str(&sh_quote(cwd));
-            cmd.push_str(" && ");
+            // Create a missing folder rather than fail the `cd`.
+            let cwd = sh_quote(cwd);
+            cmd.push_str(&format!("mkdir -p -- {cwd} && cd {cwd} && "));
         }
         cmd.push_str("exec ");
         match spec.program {
@@ -1142,7 +1153,11 @@ mod tests {
         });
         assert!(cmd.starts_with("powershell.exe -NoLogo -NoExit -EncodedCommand "));
         let script = decode_encoded(&cmd);
-        assert_eq!(script, r"Set-Location -LiteralPath 'C:\src\my app'");
+        assert_eq!(
+            script,
+            "$null = [System.IO.Directory]::CreateDirectory('C:\\src\\my app'); \
+             Set-Location -LiteralPath 'C:\\src\\my app'"
+        );
     }
 
     /// A program pane must end with its program, the way the Unix `exec` does —
@@ -1164,7 +1179,8 @@ mod tests {
         let script = decode_encoded(&cmd);
         assert_eq!(
             script,
-            "Set-Location -LiteralPath 'C:/src/app'; & 'claude' '--model' 'be terse'"
+            "$null = [System.IO.Directory]::CreateDirectory('C:/src/app'); \
+             Set-Location -LiteralPath 'C:/src/app'; & 'claude' '--model' 'be terse'"
         );
     }
 
@@ -1234,7 +1250,10 @@ mod tests {
             tmux_socket: None,
             tmux_client_tag: None,
         });
-        assert_eq!(cmd, "cd /srv/app && exec ${SHELL:-/bin/sh} -l");
+        assert_eq!(
+            cmd,
+            "mkdir -p -- /srv/app && cd /srv/app && exec ${SHELL:-/bin/sh} -l"
+        );
     }
 
     #[test]
@@ -1557,7 +1576,8 @@ mod tests {
         assert_eq!(v[v.len() - 2], "--");
         assert_eq!(
             v.last().unwrap(),
-            "cd /srv/app && exec \"${SHELL:-/bin/sh}\" -ilc 'exec claude --model opus'"
+            "mkdir -p -- /srv/app && cd /srv/app && \
+             exec \"${SHELL:-/bin/sh}\" -ilc 'exec claude --model opus'"
         );
     }
 
@@ -1577,7 +1597,7 @@ mod tests {
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
-            "cd /srv/app && exec ${SHELL:-/bin/sh} -l"
+            "mkdir -p -- /srv/app && cd /srv/app && exec ${SHELL:-/bin/sh} -l"
         );
     }
 
@@ -1606,6 +1626,7 @@ mod tests {
                  && tmux has-session -t '=muxel-abc123' 2>/dev/null; \
                  then set --; else set -- -L mxl; fi; \
                  if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off; fi; \
+                 mkdir -p -- /srv/app; \
                  exec tmux \"$@\" -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s muxel-abc123 -c /srv/app \
                  -- \"${{SHELL:-/bin/sh}}\" -ilc 'exec claude'",
@@ -2142,6 +2163,33 @@ mod tests {
         );
     }
 
+    /// tmux starts a session whose folder is missing in the home folder instead,
+    /// so the folder is created before either attach path can start one.
+    #[test]
+    fn a_missing_remote_folder_is_created_before_a_tmux_session_starts() {
+        let h = host();
+        let spec = |remote_cwd| SshSpec {
+            host: &h,
+            control_path: "/s",
+            remote_cwd,
+            program: Some("claude"),
+            args: &[],
+            use_tmux: true,
+            tmux_session: Some("s"),
+            tmux_socket: None,
+            tmux_client_tag: Some("ab12"),
+        };
+        let cmd = ssh_args(&spec(Some("/srv/my app"))).last().unwrap().clone();
+        let (before, after) = cmd
+            .split_once("mkdir -p -- '/srv/my app'; ")
+            .expect("creates the folder");
+        assert!(!before.contains("exec "), "{cmd}");
+        assert_eq!(after.matches("exec tmux ").count(), 2, "{cmd}");
+
+        let cmd = ssh_args(&spec(None)).last().unwrap().clone();
+        assert!(!cmd.contains("mkdir"), "{cmd}");
+    }
+
     /// The server must be forked by its own short-lived `tmux` process, *before* the
     /// `exec`, so the long-lived server never inherits a command line naming the
     /// project. A `pkill -f <project>` on the remote host would otherwise match the
@@ -2312,7 +2360,8 @@ mod tests {
         };
         assert_eq!(
             ssh_args(&spec).last().unwrap(),
-            "cd '/srv/my app' && exec \"${SHELL:-/bin/sh}\" -ilc 'exec bash'"
+            "mkdir -p -- '/srv/my app' && cd '/srv/my app' && \
+             exec \"${SHELL:-/bin/sh}\" -ilc 'exec bash'"
         );
     }
 

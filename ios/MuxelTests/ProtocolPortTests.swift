@@ -117,6 +117,29 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertFalse(cmd.contains("-L"))
     }
 
+    // Port of `a_session_another_pane_still_shows_outlives_the_close`: two panes on
+    // one session, their records disagreeing about the server. Closing either leaves
+    // it to the other; only the last pane to close stops it.
+    func testASessionAnotherPaneStillShowsOutlivesTheClose() {
+        let name = "muxel_p_12345678"
+        var original = Instance(id: "12345678-0000-4000-8000-000000000000", projectId: "p",
+                                title: "Claude", program: "claude", args: [])
+        original.tmuxSession = name
+        original.tmuxSocket = "default"
+        var adopted = Instance(id: "abcdef12-0000-4000-8000-000000000000", projectId: "p",
+                               title: "Claude", program: "claude", args: [])
+        adopted.tmuxSession = name
+        adopted.tmuxSocket = TmuxCommands.socketName
+        let both = [original, adopted]
+        XCTAssertTrue(TmuxCommands.sessionStillShown(name, closing: [adopted.id], in: both))
+        XCTAssertTrue(TmuxCommands.sessionStillShown(name, closing: [original.id], in: both))
+        XCTAssertFalse(TmuxCommands.sessionStillShown(name, closing: [original.id, adopted.id], in: both))
+        XCTAssertFalse(TmuxCommands.sessionStillShown("muxel_p_87654321", closing: [original.id], in: both))
+        var literal = adopted
+        literal.literalArgv = true
+        XCTAssertFalse(TmuxCommands.sessionStillShown(name, closing: [original.id], in: [original, literal]))
+    }
+
     // sshd runs an exec channel's command with its bare default PATH and no profile, so a
     // Mac's Homebrew tmux (`/opt/homebrew/bin/tmux` on Apple silicon) is not on it and every
     // tmux command fails with `command not found: tmux`. Port of `ssh::tmux_path_prelude`.
@@ -148,6 +171,7 @@ final class ProtocolPortTests: XCTestCase {
             session: "muxel_h_abcdef12", cwd: "/work", program: "claude", args: ["--model", "opus"])
         XCTAssertTrue(cmd.hasPrefix(
             "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("muxel_h_abcdef12")); "
+            + "mkdir -p -- '/work'; "
             + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
             + "new-session -d -s 'muxel_h_abcdef12' -c '/work' "
             + "-- \"${SHELL:-/bin/sh}\" -ilc "))
@@ -157,7 +181,7 @@ final class ProtocolPortTests: XCTestCase {
         // No program → tmux's own default login shell, no wrapping.
         XCTAssertEqual(
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; "
                 + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -d -s 's' -c '/w'")
     }
@@ -170,7 +194,7 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(TmuxCommands.instanceIdEnv, "MUXEL_INSTANCE_ID")
         XCTAssertEqual(
             TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: nil, args: []),
-            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); clear; "
+            "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; clear; "
                 + "exec tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -A -s 's' -c '/w'")
         // Cleared in the same tmux command list, ahead of the session it would leak into.

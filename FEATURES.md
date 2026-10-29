@@ -41,6 +41,13 @@ feature is added or changed, update the matching entry here in the same change**
   positions.
 - **Per-project focus** — switching away from a project and back restores the
   pane that was last focused there, falling back safely if that pane was removed.
+- **Missing folders are created** — a pane whose folder doesn't exist on its host
+  (the project's, a worktree's or its own launch folder: deleted, or never made on
+  the machine a synced layout was opened on) creates it, parents included, before
+  starting its program — locally and on a remote host. Before, the program started
+  in the home folder instead. A local folder that can't be created stops the
+  launch with the reason. A remote Windows pane using cmd still needs its folder
+  to exist.
 - **Responsive cold project restore** — opening a project whose agents have not
   started yet paints the selected pane first and admits the remaining terminal
   processes in bounded waves. On Windows the next pair starts only after every
@@ -125,9 +132,24 @@ feature is added or changed, update the matching entry here in the same change**
   --model glm-5.2:cloud`); change the agent or model in the preset's args.
 - **Muse Code** — launches Meta's installed `muse` CLI, with optional model and
   reasoning-effort overrides. It uses Muse's configured defaults otherwise.
-  Startup instruction injection is disabled; the preset sends no automatic turn.
-  Resume through Muse's own `/resume` or `muse resume`; automatic conversation
-  capture on pane restart is not yet integrated.
+  Local retained sessions bind to their pane through Muse's root lifecycle
+  hooks and resume the exact conversation after restart, including panes in
+  the same folder. The status dot follows Muse's spinner and completion title,
+  with permission notifications marking a blocked turn. Where the title can't
+  be read (under tmux, or on a remote host) the dot follows output activity,
+  and local hooks still mark blocked and finished turns. Hook records are read
+  in the background. SessionStart context
+  delivers file-link, memory and custom instructions without submitting a turn.
+  Hooks are configured per launch outside the project; existing user, project
+  and managed hooks are preserved. Only permission notifications invoke the
+  notification helper, whose work is limited to one second and exits successfully
+  on unavailable data or blocked I/O. Windows uses the native binary selected by
+  the installed launcher. Custom hook overrides and nonstandard batch wrappers
+  keep their own configuration; automatic capture requires the native hook route.
+  Strict managed-hook schemas also launch with their configuration unchanged.
+  Positional input after `--` is preserved when configuring hooks.
+  Reattaching to a surviving local tmux pane retains its hook binding; a new
+  process rotates it. Closing a pane removes its generated hook metadata.
 - **Configurable launch** — per agent: program, model + model flag, effort +
   effort flag, extra args (shell-style quoting: `--append-system-prompt "be terse"`
   stays one argument, matching the iOS companion's parser; an unbalanced quote
@@ -170,6 +192,13 @@ feature is added or changed, update the matching entry here in the same change**
     the lookup at most two seconds; an unbound pane whose lookup finds nothing,
     is skipped, or runs out of time starts fresh, and Import can still find an
     older conversation.
+    An unreadable rollout that could change the chosen conversation leaves
+    discovery unresolved, including shortened title hints and Import; confirmed
+    subagent rollouts remain excluded. In restore and Import, a confirmed
+    subagent also excludes its unreadable compression siblings.
+    Discovery checks equally recent candidates before binding a pane, keeps
+    verified newer conversations when an older candidate is unresolved, and can
+    use a readable copy when a compression sibling cannot be read.
     The immutable
     `thread-id` title field preserves that binding across conversation renames; shortened
     UUIDs resolve in their timestamp's local day directory, with one neighboring day
@@ -333,6 +362,7 @@ feature is added or changed, update the matching entry here in the same change**
   `MUXEL_MEMORY_FILE` env var. Enable it on a project (sidebar right-click or
   Settings → Projects); a memory button on the project row opens the manager. Plain
   shells are skipped.
+  Settings → Projects → **New projects** can turn it on for every project added later.
 - **Self-maintaining memory** — each fact is one `##` section carrying a machine
   meta line (id, dates, tags). muxel maintains the file **on its own**, with or
   without the memory panel open: a section an agent adds is stamped within about a
@@ -369,6 +399,7 @@ feature is added or changed, update the matching entry here in the same change**
   opens a connection by itself). muxel rewrites the file only when something
   actually changes. Works for local and remote SSH projects; local agents also get
   the path in `MUXEL_ACCOMPLISHMENTS_FILE`.
+  Settings → Projects → **New projects** can turn it on for every project added later.
 - **Accomplishments panel** — a check button on the project row opens a docked,
   resizable panel (sharing the file-browser/memory slot) listing the log by day,
   newest first, with colored type tags, per-type totals, search, delete, and a
@@ -425,6 +456,9 @@ feature is added or changed, update the matching entry here in the same change**
   activity row still on screen stays uncertain until it goes or a new title
   confirms it.
   A Grok conversation switch releases old loop ownership even if saving fails.
+  A confirmed provider switch clears the previous conversation's automatic name,
+  including a switch back to the same UUID between reads; a transcript path
+  upgrade alone keeps the name.
   Each pane uses its own discovery history, so another pane's refresh cannot
   discard its valid current title.
   The snapshot carries a launch id and
@@ -675,8 +709,8 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Outside control (`muxel ctl`)
 
-- **Let another agent drive muxel** — Settings → Grok Bot → "Allow outside tools
-  to control muxel" (off by default) lets a program on the same computer — an
+- **Let another agent drive muxel** — Settings → Outside control → "Allow outside
+  tools to control muxel" (off by default) lets a program on the same computer — an
   orchestrating agent such as xAI's Grok Bot, a script, another coding agent — work
   the agents running in muxel through the `muxel ctl` command: list projects, the
   pane layout and every agent (program, model, worktree, focus), see each one's
@@ -706,6 +740,8 @@ feature is added or changed, update the matching entry here in the same change**
   file-link and memory instructions use the preset's separate flag/config
   transport when available, and are omitted for TypeIn-only presets.
   The task text is discarded after first launch.
+  Remote tmux owner discovery keeps the task pending until that same launch
+  can prepare its terminal; refused ownership or launch permission cancels it.
   Restart, restore and resume neither re-type nor resubmit it, including launches without a resumable
   conversation. A duplicate of the pane starts without it, and the phone never
   types or submits it. Literal, shell and browser launches refuse prompts with
@@ -725,7 +761,7 @@ feature is added or changed, update the matching entry here in the same change**
   compatibility no-op. JSON uses `focus` (default false); the legacy `background`
   field is accepted and ignored. The JSON reply identifies the pane and launch.
   ALL outside creation requires both "Allow outside tools to control muxel" and
-  the separate **Outside terminal creation** policy in Settings → Grok Bot.
+  the separate **Outside terminal creation** policy in Settings → Outside control.
   It defaults to **Off**. **Ask** requires a click for each request; **Allow**
   opens only presets whose program is a known agent provider (the built-in agent
   presets' programs — Claude, Codex, Grok, opencode, Amp, Muse, Hermes, Ollama,
@@ -814,8 +850,13 @@ feature is added or changed, update the matching entry here in the same change**
   writes require global control and this command grant even when creation is off.
   Turning "Also allow typing into shell panes" off refuses subsequent control
   writes to every literal argv pane, even agent-looking or interpreter programs,
-  and panes classified as shells.
-  Configured non-literal agents remain controllable while outside control is on;
+  and every program outside the known built-in agent providers, including SSH
+  and WSL shell presets. Existing-pane writes recognize known agents by executable
+  name, including custom paths and agents in remote projects.
+  An agent that falls back to a shell after a failed launch requires the same
+  shell-input grant, including restored panes. A successful agent relaunch uses
+  the agent policy again.
+  Configured non-literal known agents remain controllable while outside control is on;
   disabling all outside control is a separate setting. Delayed Enter and keys
   recheck the shell-input grant and terminal/session availability before writing.
   Revocation does not stop processes
@@ -836,6 +877,23 @@ feature is added or changed, update the matching entry here in the same change**
 - **Scripted control** — `ctl` exposes refusal codes and launch IDs, and
   `send --launch-id ID` checks the launch again before pasting. Its success
   receipt confirms writer admission with `pasted: true`.
+  Codex, Claude and Grok sends then observe fresh provider acceptance for about
+  ten seconds (three more after a retry) and report `submission_confirmed` and
+  `enter_retries`. Unknown acceptance is reported as false with an
+  `unconfirmed_reason` (`timed_out`, `input_changed` or `interrupted`); once
+  Enter is in, the reply is always this receipt, never an error. muxel doesn't
+  wait when the pane can't show a receipt — an unsupported provider, or no
+  readable idle status title (tmux hides titles) with a Grok, multi-paragraph or
+  repeated prompt — and reports null. Turning outside control off stops the
+  later Enters and keys of `send`, `answer` and `keys`. Only Windows Codex may
+  receive one extra Enter after five seconds, with the same launch, permission
+  and input guards and an exact fully visible ASCII prose draft in its idle
+  composer. A compact composer frame captured before paste and an added blank
+  cursor line must prove that its first Enter was consumed, with no resize or
+  title change. Wrapped prose is supported; clipped, multiline, Unicode,
+  completion or ambiguous drafts are left for inspection. Claude and Grok get no
+  automatic retry. Text is never pasted again, and an unconfirmed receipt does
+  not authorize resending it.
 - **Never touches your sessions to read them** — every read (`screen`, `show`,
   `wait`, and read-aloud) is answered from muxel's own terminal buffer, which holds
   10,000 lines per pane — five times the most any of these commands will return. It
@@ -868,15 +926,16 @@ feature is added or changed, update the matching entry here in the same change**
   trusted. The check goes by process id alone, so if that id has since gone to
   another process, the file still passes. On Linux and macOS that is any process;
   on Windows it is one the user may open, such as one of their own.
-- **Settings → Grok Bot** — a setup page that walks through connecting Grok Bot
-  in four steps: turn on outside control (with a live status: on and listening,
-  starting, or off), allow command execution on this computer in Grok Bot's own
-  settings (where to find it), copy the skill (with a preview of exactly what gets
-  pasted), and **Test**, which runs the same `muxel ctl` command Grok Bot will and
-  shows what muxel answered — or why it couldn't. It also shows this computer's
-  muxel command, with a copy button, and links to Grok Bot's documentation.
-- **Instructions for the other agent** — `muxel ctl skill` (or Settings → Grok Bot
-  → "Copy skill") produces a ready-made skill: the commands, what each status
+- **Settings → Outside control** — a setup page that walks through connecting
+  another agent in four steps: turn on outside control (with a live status: on and
+  listening, starting, or off), let the agent run commands on this computer (with
+  where to allow it in Grok Bot's own settings), copy the skill (with a preview of
+  exactly what gets pasted), and **Test**, which runs the same `muxel ctl` command
+  the agent will and shows what muxel answered — or why it couldn't. It also shows
+  this computer's muxel command, with a copy button, and links to Grok Bot's
+  documentation.
+- **Instructions for the other agent** — `muxel ctl skill` (or Settings → Outside
+  control → "Copy skill") produces a ready-made skill: the commands, what each status
   means, and the rules — one prompt at a time, `wait` after `send`, and permission
   prompts left to the user unless they've said otherwise. Paste it into Grok Bot
   (whose "Execution on Local Computer" setting must allow it to run commands here)
@@ -1200,7 +1259,11 @@ feature is added or changed, update the matching entry here in the same change**
   back mid-conversation, exactly where it was, rather than starting a second one
   beside it. It adopts only muxel's own sessions, only within the project, and never
   one a pane already owns or one you deliberately closed — your own tmux is left
-  alone.
+  alone. A pane already owns its session even when its saved record names the
+  wrong tmux server, as a copy of the layout from before a restart moved the
+  session does, and a pane in another project on the same host (one nested in
+  this project's folder, say) owns its own, so neither comes back as a second
+  pane on the same agent.
 - **Closing a remote agent really stops it** — closing a remote pane kills its tmux
   session on the host, and muxel *confirms* the session is gone rather than assuming
   the kill landed. A kill that fails (a blip, a host that is busy or briefly
@@ -1304,7 +1367,10 @@ feature is added or changed, update the matching entry here in the same change**
   and muxel keeps retrying on its own — backing off to one attempt every 30s, for as
   long as the outage lasts — until the host is reachable and reattaches the agent
   right where it left off. Resuming a laptop whose Wi-Fi isn't up yet just costs a
-  retry or two. The notification feed reports an outage once per host, not per pane:
+  retry or two. An owner lookup or terminal launch already recovering a pane keeps
+  its place across retry ticks; an attempt still pending after 60 seconds yields
+  to a new attempt so a hung worker cannot stall recovery forever.
+  The notification feed reports an outage once per host, not per pane:
   one entry counts the panes still reconnecting and turns into "reconnected" when
   they're all back, so waking with a dozen agents running is one line, not two dozen
   (dismiss it and it stays dismissed until the next outage). On a laptop, a drop
@@ -1332,8 +1398,11 @@ feature is added or changed, update the matching entry here in the same change**
   machine restores the whole session (the tmux-backed panes re-attach to their
   still-running agents). muxel pushes the layout as you rearrange panes and, on
   connect, loads whichever copy — local or remote — is newer; the replaced copy is
-  kept as a one-level backup on each side. Automatic for every remote project; no
-  setup required. **Changes sync live**: while connected, each side re-reads the
+  kept as a one-level backup on each side. A machine coming back after changing
+  nothing takes the host's copy whenever it differs from the one it last saw, so
+  its old copy never overwrites what other machines recorded meanwhile — which
+  conversation each pane is in, which tmux server its session runs on. Automatic
+  for every remote project; no setup required. **Changes sync live**: while connected, each side re-reads the
   shared file every few seconds and applies a peer's changes in place — panes a peer
   adds appear, attached to their running tmux sessions; panes it closes go away;
   renames carry over — without restarting any pane both sides share. Only real
@@ -1351,7 +1420,9 @@ feature is added or changed, update the matching entry here in the same change**
   Panes a peer creates over SSH — the iOS app, or muxel on another machine that
   opened this one as a remote project — show up in the local window within a few
   seconds, attached to the peer's tmux session (found by the pane id at the end of
-  the session name when the peer didn't record one).
+  the session name when the peer didn't record one). Opening a folder that another
+  machine already has as a remote project (or the iOS app works in) brings up its
+  saved panes, attached to their running agents, instead of a fresh pane.
 - **Reconnect on failure** — when a remote project's SSH connection fails (or
   drops), the pane area shows the error with **Reconnect** (re-runs the connect
   pre-flight, re-syncs the layout, respawns panes) and **Scan for projects**
@@ -1492,9 +1563,11 @@ feature is added or changed, update the matching entry here in the same change**
   it left off (tmux scrollback is the only casualty). A deliberate `tmux kill-session`,
   and an agent simply quitting, still close the pane normally. The feed says which
   happened — *reattached* (session survived) or *session restored* (agent resumed).
-- **tmux lifecycle** — closing a **pane** always kills its tmux session (local or
-  remote); a *dropped* SSH connection never auto-closes — it leaves a tombstone
-  pane, keeping the remote session reconnectable. Quitting the **app** leaves
+- **tmux lifecycle** — closing a **pane** kills its tmux session (local or
+  remote), unless another pane still shows that session: then it keeps running
+  for that pane, and closing the last pane on it stops it. A *dropped* SSH
+  connection never auto-closes — it leaves a tombstone pane, keeping the remote
+  session reconnectable. Quitting the **app** leaves
   sessions alive by design (they reattach next launch): when any exist, the quit
   dialog offers two checkboxes — **Also kill local tmux sessions** and **Also
   kill remote tmux sessions** — both off by default; the kills are
