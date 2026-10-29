@@ -29218,6 +29218,22 @@ impl MuxelApp {
     }
 
     fn delete_project(&mut self, pid: Uuid, cx: &mut Context<Self>) {
+        // Removing the project would kill a pane whose close is not decided.
+        if let Some(iid) = self.project_close_undecided(pid) {
+            let name = self
+                .workspace
+                .instance(iid)
+                .map(|inst| inst.display_name().to_string())
+                .unwrap_or_default();
+            self.add_event(
+                NotifKind::Error,
+                t("Project not removed"),
+                tf("Close or keep {name} first.", &[("name", name.as_str())]),
+            );
+            self.show_close_list = true;
+            cx.notify();
+            return;
+        }
         self.finalize_project_closes(pid, cx);
         let iids: Vec<_> = self
             .workspace

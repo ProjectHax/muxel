@@ -108,6 +108,26 @@ pub fn may_finalize(before: CloseFacts, now: CloseFacts, forced: bool) -> bool {
     forced || before == now && decide(now, true) == CloseDecision::Hold { forced: false }
 }
 
+/// Where a close group is in its life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseStage {
+    /// Inside its Undo window.
+    CountingDown,
+    /// Past its deadline, checking again before it finishes.
+    Checking,
+    /// The check found new work: Close or Keep is the user's call.
+    AwaitingDecision,
+    /// Undo is waiting for an interrupted restart to settle.
+    Undoing,
+}
+
+/// Leaving the workspace (quit, logout, switch) finishes only a running
+/// countdown. A group being checked, waiting for Close / Keep, or being
+/// restored keeps its panes: nobody decided to close what they now hold.
+pub fn departure_finalizes(stage: CloseStage) -> bool {
+    stage == CloseStage::CountingDown
+}
+
 /// What a held pane's launch was doing when its close began.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeldLaunch {
@@ -184,9 +204,9 @@ pub fn rehide_held(layout: &mut Option<PaneNode>, held: &[Uuid]) -> Vec<Uuid> {
 #[cfg(test)]
 mod recoverable_close_policy_tests {
     use super::{
-        CloseDecision, CloseEvidence, CloseFacts, HeldLaunch, HeldView, UndoLaunch, decide,
-        exit_proves_closed, held_launch, may_finalize, rehide_held, shell_close_evidence,
-        undo_launch,
+        CloseDecision, CloseEvidence, CloseFacts, CloseStage, HeldLaunch, HeldView, UndoLaunch,
+        decide, departure_finalizes, exit_proves_closed, held_launch, may_finalize, rehide_held,
+        shell_close_evidence, undo_launch,
     };
     use crate::control::AgentState;
     use crate::{PaneNode, SplitDirection, TerminalLaunchReason, split};
@@ -576,5 +596,17 @@ mod recoverable_close_policy_tests {
         let shown = adopted.as_ref().unwrap().collect_instances();
         assert_eq!(shown, vec![id(1), id(3)]);
         assert!(durable.unwrap().find_path(id(2)).is_some());
+    }
+
+    #[test]
+    fn leaving_finishes_only_running_countdowns() {
+        assert!(departure_finalizes(CloseStage::CountingDown));
+        for stage in [
+            CloseStage::Checking,
+            CloseStage::AwaitingDecision,
+            CloseStage::Undoing,
+        ] {
+            assert!(!departure_finalizes(stage), "{stage:?}");
+        }
     }
 }

@@ -3,8 +3,9 @@
 use super::*;
 use muxel_core::control::AgentState;
 use muxel_core::recoverable_close::{
-    CloseDecision, CloseEvidence, CloseFacts, HeldLaunch, HeldView, UndoLaunch, decide,
-    exit_proves_closed, held_launch, may_finalize, rehide_held, shell_close_evidence, undo_launch,
+    CloseDecision, CloseEvidence, CloseFacts, CloseStage, HeldLaunch, HeldView, UndoLaunch, decide,
+    departure_finalizes, exit_proves_closed, held_launch, may_finalize, rehide_held,
+    shell_close_evidence, undo_launch,
 };
 use muxel_terminal::TerminalStatusReason;
 use std::borrow::Cow;
@@ -37,6 +38,20 @@ pub(super) struct CloseGroup {
     pub layouts: HashMap<Uuid, Option<PaneNode>>,
     pub focus: Option<Uuid>,
     pub caller: Option<String>,
+}
+
+impl CloseGroup {
+    pub fn stage(&self) -> CloseStage {
+        if self.undoing {
+            CloseStage::Undoing
+        } else if self.needs_decision {
+            CloseStage::AwaitingDecision
+        } else if self.checking {
+            CloseStage::Checking
+        } else {
+            CloseStage::CountingDown
+        }
+    }
 }
 
 pub(super) struct ClientCount {
@@ -826,16 +841,49 @@ impl MuxelApp {
         cx.notify();
     }
 
+    /// Leaving the workspace: finish every running countdown, and keep the
+    /// panes of a group still being checked, waiting for Close / Keep, or being
+    /// restored. A kept pane is back in its layout, so the save reopens it.
     pub(super) fn finalize_all_closes(&mut self, cx: &mut Context<Self>) -> bool {
         let had_closes = !self.close_groups.is_empty();
         let was_preserving = self.preserve_close_worktrees;
         self.preserve_close_worktrees = true;
-        let groups: Vec<_> = self.close_groups.iter().map(|group| group.id).collect();
-        for group in groups {
-            self.finalize_close_group(group, cx);
+        let groups: Vec<_> = self
+            .close_groups
+            .iter()
+            .map(|group| (group.id, departure_finalizes(group.stage())))
+            .collect();
+        for (gid, finalize) in groups {
+            if finalize {
+                self.finalize_close_group(gid, cx);
+            } else if let Some(index) = self.close_groups.iter().position(|g| g.id == gid) {
+                for (iid, _) in self.release_close_group(index, cx).1 {
+                    if let Some(inst) = self.workspace.instance(iid) {
+                        muxel_store::append_event_log(&format!(
+                            "close: kept \"{}\" [{iid}], its close was not decided",
+                            inst.display_name()
+                        ));
+                    }
+                }
+            }
         }
         self.preserve_close_worktrees = was_preserving;
         had_closes
+    }
+
+    /// The first held pane of project `pid` whose close is not just counting
+    /// down. Removing the project would kill it before anyone decided.
+    pub(super) fn project_close_undecided(&self, pid: Uuid) -> Option<Uuid> {
+        self.close_groups
+            .iter()
+            .filter(|group| !departure_finalizes(group.stage()))
+            .flat_map(|group| &group.members)
+            .copied()
+            .find(|iid| {
+                self.closing
+                    .get(iid)
+                    .is_some_and(|held| held.project == pid)
+            })
     }
 
     pub(super) fn finalize_project_closes(&mut self, pid: Uuid, cx: &mut Context<Self>) {

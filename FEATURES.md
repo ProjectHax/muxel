@@ -130,8 +130,11 @@ feature is added or changed, update the matching entry here in the same change**
   Client checks show progress, beside any running countdown, with their own
   Cancel; a batch member closed during the check leaves the others to their
   decision. Ordinary saves preserve held panes for crash recovery; workspace
-  switch and quit finalize them. If that save fails, the first switch stops
-  with a notice and the next one leaves anyway; the pane reopens next time.
+  switch and quit (or logout) finish running countdowns, but keep a pane
+  still being checked or waiting for Close / Keep, which reopens next time.
+  Removing a project waits for that decision. If that save fails, the first
+  switch stops with a notice and the next one leaves anyway; the pane reopens
+  next time.
 - **Workspace changes** — switching workspaces closes the previous workspace's
   pop-out and per-monitor project windows without interrupting the switch.
 
