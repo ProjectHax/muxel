@@ -2126,6 +2126,15 @@ impl TerminalSession {
     /// submission evidence unchanged, with no marker for a later key to consume.
     /// Success means queued bytes, not confirmation that the child consumed them.
     pub fn try_submit_input(&self, data: &[u8]) -> std::io::Result<()> {
+        // This API admits a known prompt after `paste_prompt` has checked
+        // the pane and input revision. Generic keyboard Enter uses
+        // `mark_turn_submitted` and cannot prove prompt intent.
+        self.try_submit(data, true)
+    }
+
+    /// [`Self::try_submit_input`], committing a prompt submission when `prompt`
+    /// and a plain one otherwise.
+    fn try_submit(&self, data: &[u8], prompt: bool) -> std::io::Result<()> {
         self.scroll_input_to_bottom();
         let mut writer = self.writer.lock();
         // The child can react as soon as write_all publishes bytes. Keep the
@@ -2136,17 +2145,23 @@ impl TerminalSession {
         writer.write_all(data)?;
         writer.flush()?;
         if !data.is_empty() {
-            self.commit_submission(submitted_at);
+            self.commit_submission(submitted_at, prompt);
         }
         Ok(())
     }
 
-    /// The facts an admitted submission commits together. It admits a known
-    /// prompt after `paste_prompt` has checked the pane and input revision.
-    /// Generic keyboard Enter uses `mark_turn_submitted` and cannot prove
-    /// prompt intent.
-    pub(crate) fn commit_submission(&self, submitted_at: SystemTime) {
-        self.evidence.lock().record_prompt_submission(submitted_at);
+    /// The facts an admitted submission commits together. A `prompt` one
+    /// follows a known prompt, as [`Self::mark_prompt_submitted`] records; any
+    /// other is a bare Enter, as [`Self::mark_turn_submitted`] records.
+    pub(crate) fn commit_submission(&self, submitted_at: SystemTime, prompt: bool) {
+        {
+            let mut evidence = self.evidence.lock();
+            if prompt {
+                evidence.record_prompt_submission(submitted_at);
+            } else {
+                evidence.record_submission(submitted_at);
+            }
+        }
         self.turn_submitted.store(true, Ordering::Relaxed);
         self.advance_input(Some(true));
         self.mark_interactive();
@@ -2172,16 +2187,18 @@ impl TerminalSession {
                         .collect::<Vec<u8>>(),
                 ),
                 ControlInput::Submit => self.try_submit_input(b"\r"),
+                ControlInput::SubmitKey => self.try_submit(b"\r", false),
             };
             return ControlWrite::done(
                 written.map_err(|error| ControlWriteError::Closed(error.to_string())),
             );
         };
         let submit = match &input {
-            ControlInput::Submit => {
+            ControlInput::Submit | ControlInput::SubmitKey => {
                 self.scroll_input_to_bottom();
                 self.submission_pending.store(false, Ordering::Release);
-                Some((self.clone(), SystemTime::now()))
+                let prompt = input == ControlInput::Submit;
+                Some((self.clone(), SystemTime::now(), prompt))
             }
             ControlInput::Paste(text) => {
                 self.admit_input(!text.is_empty());

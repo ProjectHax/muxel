@@ -189,7 +189,9 @@ pub struct Response {
     /// A stable detail of a refusal, when its code alone is too broad.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Present and true after a paste attempt. A writer error may leave partial input.
+    /// Present and true once input may have reached the pane: after a paste that
+    /// may have gone in, or a key of `keys` or `answer`. A writer error may leave
+    /// partial input; a paste tmux refused typed nothing and leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pasted: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1794,7 +1796,8 @@ muxel and turn on Settings > Outside control > "Allow outside tools to control m
   writer (for an agent kept in tmux: tmux pasted it into the agent's tmux pane),
   not confirmation of agent delivery. A lost reply does not make a
   retry safe; inspect the agent before typing again. A failure with `pasted: true`
-  means a paste was attempted and the input may be partial. Check `screen` before
+  means the prompt may have reached the agent, in whole or in part; a paste tmux
+  refused typed nothing and has no `pasted`. Check `screen` before
   retrying. A `working` error with `reason: just_submitted` means the prior
   control turn is still in its grace on a pane with provider status or configured
   screen markers; `wait` for its reply. Activity-only panes allow a later send.
@@ -1843,7 +1846,8 @@ own, the one its tmux session was created with, whichever pane or window the
 user has opened or made active. A prompt arrives as tmux's own `paste-buffer -p`
 pastes: line breaks as CR, without ESC. The reply to `keys` comes once tmux
 has taken every key, one tmux command per key; over SSH without a shared
-connection each is a new login. If the agent's pane is gone or can't be
+connection each is a new login. A `keys` or `answer` failure once a key may
+have gone in has `pasted: true`. If the agent's pane is gone or can't be
 reached, input is refused with `tmux_pane_unresolved` and nothing is typed;
 after a failed lookup the next waits a little longer each time, up to two
 minutes. A remote agent's input needs muxel's background SSH commands to that

@@ -230,7 +230,8 @@ struct ClaimSite {
 }
 
 /// A forced send has inspected the shared option but has not changed it. It
-/// publishes its claim only after paste; a pre-paste refusal leaves the earlier
+/// publishes its claim only once its paste is in (through tmux, once tmux has
+/// run it); a refusal before then, or a paste tmux refused, leaves the earlier
 /// claim exactly as found.
 #[derive(Debug)]
 struct DeferredClaim {
@@ -259,7 +260,8 @@ struct Typing {
     force: bool,
     /// `send --launch-id`: checked again immediately before the paste.
     launch_id: Option<Uuid>,
-    /// A prompt holds its pane from admission until its Enter is admitted.
+    /// A prompt holds its pane from admission until its Enter is in: admitted,
+    /// or through tmux, taken by tmux.
     in_flight: Option<SendInFlight>,
     reply: Value,
 }
@@ -267,8 +269,11 @@ struct Typing {
 /// A `send` from this process between its admission and its Enter. While one
 /// is held, an ordinary send to the same pane is refused: its paste could land
 /// between the first send's paste and Enter, and that Enter would submit both
-/// texts. The tmux claim can't see this when the first send's SSH write or
-/// readback outlasts [`LOCAL_CLAIM_PENDING_MS`]; this marker never ages.
+/// texts. The tmux claim can't see this when the first send outlasts
+/// [`LOCAL_CLAIM_PENDING_MS`]: its claim's SSH write or readback can, and for a
+/// pane kept in tmux so can its paste and Enter, which are tmux commands too
+/// (see [`TerminalSession::control_write`]). This marker never ages, and goes
+/// only once the Enter is in, through tmux once tmux has taken it.
 /// `--force` passes it, as it passes the other busy refusals.
 #[derive(Debug)]
 struct SendInFlight(Uuid);
@@ -322,7 +327,9 @@ fn owner_id() -> &'static str {
 /// Shortest wait between writing a claim and reading it back.
 const CLAIM_SETTLE_MIN: Duration = Duration::from_millis(200);
 /// A same-process claim can be replaced after the predicted Enter plus this
-/// scheduling margin. Peers still honor the claim's full reply grace.
+/// margin. Peers still honor the claim's full reply grace. A pane kept in tmux
+/// takes its paste and Enter as tmux commands, which can take longer than this;
+/// [`SendInFlight`] holds the pane until that Enter is in.
 const LOCAL_CLAIM_PENDING_MS: i64 = 2_000;
 
 /// Give the child a head start before its first Enter. This pause does not
@@ -1633,15 +1640,16 @@ impl MuxelApp {
                         press_prompt_enter(&session, pasted)
                     })
                     .unwrap_or_else(|_| Err(ctl::Error::from("muxel is shutting down").after_paste()))?;
-                    enter.finish().await.map_err(enter_failed)?;
+                    // The pane is held until this Enter is in. Nothing runs on
+                    // this thread between its release and noting the turn, so
+                    // no send is admitted in between.
+                    finish_prompt_enter(enter, in_flight).await?;
                     // Claim timestamps predict settlement. Local wait starts
                     // at the actual Enter admission, never at the prediction.
                     let revision = this.update(cx, |app, _| {
                         app.note_control_turn(iid, turn, now_ms());
                         session.input_rev()
                     });
-                    // A later send's paste can no longer join this prompt.
-                    drop(in_flight);
                     // Enter is in. Whatever happens next, the reply is this
                     // receipt: an error would read as "Enter withheld".
                     let (Ok(mut revision), Some(attempt)) =
@@ -1739,10 +1747,11 @@ impl MuxelApp {
                                 }
                                 // A press that submits is an Enter (`key_submits`).
                                 // It goes as the submit, so the turn counts as
-                                // submitted only once the Enter is taken.
+                                // submitted only once the Enter is taken. With no
+                                // prompt of its own, it isn't a prompt submission.
                                 let input = if submit {
                                     debug_assert!(keys == [ctl::Key::Enter]);
-                                    ControlInput::Submit
+                                    ControlInput::SubmitKey
                                 } else {
                                     ControlInput::Keys { keys, app_cursor }
                                 };
@@ -1756,13 +1765,7 @@ impl MuxelApp {
                             Err(error) => Err(error),
                         };
                         if let Err(error) = written {
-                            return Err(ctl::Error {
-                                message: format!(
-                                    "{}; {i} of {total} keys were pressed before it",
-                                    error.message
-                                ),
-                                ..error
-                            });
+                            return Err(keys_stopped(error, i, total));
                         }
                     }
                     Ok(receipt)
@@ -1976,6 +1979,9 @@ fn paste_prompt(
     Ok((ctl::pasted_prompt_receipt(pane, session.id), paste))
 }
 
+/// Whether a failed request typed nothing, so its claim goes back to what was
+/// there before. A failure that may have typed (`pasted: true`: after a paste
+/// that may have gone in, or once a key may have) keeps it.
 fn release_claim_after_result(result: &CtlResult<Value>) -> bool {
     result
         .as_ref()
@@ -1994,13 +2000,29 @@ fn press_prompt_enter(session: &Arc<TerminalSession>, pasted: u64) -> CtlResult<
     Ok(enter)
 }
 
-/// Why a prompt wasn't pasted. Only an unanswered tmux command leaves it
-/// unknown; every other failure typed nothing.
+/// Wait until a prompt's Enter is in, then give back the pane its send held. A
+/// direct Enter is in already; one through tmux is in only once tmux has taken
+/// it, never when it was queued, since until then a later send's paste could
+/// still land ahead of it and that Enter would submit both.
+async fn finish_prompt_enter(
+    enter: ControlWrite,
+    in_flight: Option<SendInFlight>,
+) -> CtlResult<()> {
+    let entered = enter.finish().await.map_err(enter_failed);
+    drop(in_flight);
+    entered
+}
+
+/// Why a prompt wasn't pasted. A paste that may have typed
+/// ([`ControlWriteError::may_have_typed`]) fails with `pasted: true`; one tmux
+/// refused, or that found no pane to go to, typed nothing.
 fn paste_failed(error: ControlWriteError) -> ctl::Error {
-    match error {
-        ControlWriteError::Closed(why) => {
-            format!("couldn't admit the prompt to the PTY writer: {why}").into()
-        }
+    let typed = error.may_have_typed();
+    let failed: ctl::Error = match error {
+        ControlWriteError::Closed(why) => format!(
+            "couldn't finish pasting the prompt ({why}); input may be partial: check its `screen`"
+        )
+        .into(),
         ControlWriteError::Unresolved(why) => ctl::Error::new(
             ErrorCode::TmuxPaneUnresolved,
             format!("{why}. Nothing was typed"),
@@ -2012,11 +2034,14 @@ fn paste_failed(error: ControlWriteError) -> ctl::Error {
             "couldn't confirm the paste through tmux: {error}. Check its `screen` before sending again"
         )
         .into(),
-    }
+    };
+    if typed { failed.after_paste() } else { failed }
 }
 
+/// Why the Enter after a paste wasn't pressed. Its prompt is in, so every one
+/// fails with `pasted: true`.
 fn enter_failed(error: ControlWriteError) -> ctl::Error {
-    match error {
+    ctl::Error::from(match error {
         ControlWriteError::Closed(why) => {
             format!("the prompt was pasted but Enter couldn't be admitted ({why}): check its `screen`")
         }
@@ -2026,15 +2051,31 @@ fn enter_failed(error: ControlWriteError) -> ctl::Error {
         ControlWriteError::Unknown(why) | ControlWriteError::Partial(why) => format!(
             "the prompt was pasted but tmux didn't answer whether it pressed Enter ({why}): check its `screen` before sending again"
         ),
-    }
-    .into()
+    })
+    .after_paste()
+}
+
+/// A `keys` request that stopped at press `i` of `total`. Once earlier presses
+/// went in it fails with `pasted: true`, whatever stopped this one, so its
+/// claim stays (see [`release_claim_after_result`]).
+fn keys_stopped(error: ctl::Error, i: usize, total: usize) -> ctl::Error {
+    let error = ctl::Error {
+        message: format!(
+            "{}; {i} of {total} keys were pressed before it",
+            error.message
+        ),
+        ..error
+    };
+    if i > 0 { error.after_paste() } else { error }
 }
 
 /// A failed key press, after `pressed_before` earlier presses went in. Once
 /// any key of the request went in, the reply never says nothing was typed:
-/// it is `keys_partly_pressed`, whatever stopped the rest.
+/// it is `keys_partly_pressed`, whatever stopped the rest. Whenever a key may
+/// have gone in, it fails with `pasted: true`, so the claim stays.
 fn keys_failed(error: ControlWriteError, pressed_before: usize) -> ctl::Error {
-    if pressed_before > 0 || matches!(error, ControlWriteError::Partial(_)) {
+    let typed = pressed_before > 0 || error.may_have_typed();
+    let failed = if pressed_before > 0 || matches!(error, ControlWriteError::Partial(_)) {
         let then = match error {
             ControlWriteError::Refused(why) | ControlWriteError::Unresolved(why) => {
                 format!("tmux refused the next ({why})")
@@ -2045,20 +2086,24 @@ fn keys_failed(error: ControlWriteError, pressed_before: usize) -> ctl::Error {
             ControlWriteError::Closed(why) => format!("the terminal's input closed ({why})"),
             ControlWriteError::Partial(why) => why,
         };
-        return ctl::Error::new(
+        ctl::Error::new(
             ErrorCode::KeysPartlyPressed,
             format!(
                 "some keys were pressed, then {then}. Check its `screen` before pressing them again"
             ),
-        );
-    }
-    match error {
-        ControlWriteError::Unresolved(why) => ctl::Error::new(ErrorCode::TmuxPaneUnresolved, why),
-        ControlWriteError::Closed(why) => {
-            format!("couldn't admit a key to the PTY writer: {why}").into()
+        )
+    } else {
+        match error {
+            ControlWriteError::Unresolved(why) => {
+                ctl::Error::new(ErrorCode::TmuxPaneUnresolved, why)
+            }
+            ControlWriteError::Closed(why) => {
+                format!("couldn't admit a key to the PTY writer: {why}").into()
+            }
+            error => format!("couldn't press a key through tmux: {error}").into(),
         }
-        error => format!("couldn't press a key through tmux: {error}").into(),
-    }
+    };
+    if typed { failed.after_paste() } else { failed }
 }
 
 fn restore_claim(site: &ClaimSite, claim: &ctl::Claim, previous: Option<&ctl::Claim>) {
@@ -2286,8 +2331,9 @@ fn publish_deferred_claim_with(
 /// if any earlier turn with it is still open, then claim it for this one. A
 /// conditional tmux write and readback keep a peer from claiming the same idle
 /// pane between our read and write. The claim settles for twice the read's round
-/// trip (at least [`CLAIM_SETTLE_MIN`]). A pre-paste refusal conditionally restores
-/// the earlier claim. A prompt's local turn uses its actual Enter admission time.
+/// trip (at least [`CLAIM_SETTLE_MIN`]). A refusal that typed nothing (before the
+/// paste, or a paste tmux refused) conditionally restores the earlier claim. A
+/// prompt's local turn uses its actual Enter admission time.
 ///
 /// If tmux cannot accept the write, typing proceeds without a shared claim.
 /// If the write succeeds but readback cannot confirm it, typing is refused
@@ -2679,6 +2725,156 @@ mod prompt_submission_tests {
             "{}",
             enter.message
         );
+    }
+
+    /// A failure that may have typed is `pasted: true` and keeps its claim; one
+    /// that typed nothing (tmux refused it, or found no pane) releases it. Every
+    /// Enter failure follows a paste.
+    #[test]
+    fn a_failure_that_may_have_typed_is_pasted_and_keeps_its_claim() {
+        use super::{
+            enter_failed, keys_failed, keys_stopped, paste_failed, release_claim_after_result,
+        };
+        use muxel_terminal::ControlWriteError;
+        let kinds = || {
+            [
+                ControlWriteError::Closed("writer gone".into()),
+                ControlWriteError::Unresolved("pane gone".into()),
+                ControlWriteError::Refused("lost server".into()),
+                ControlWriteError::Unknown("no answer within 10 seconds".into()),
+                ControlWriteError::Partial("tmux refused the rest (x)".into()),
+            ]
+        };
+        let releases = |error: muxel_core::control::Error| release_claim_after_result(&Err(error));
+        for error in kinds() {
+            let typed = error.may_have_typed();
+            let paste = paste_failed(error.clone());
+            assert_eq!(paste.pasted == Some(true), typed, "{error:?}");
+            assert_eq!(releases(paste), !typed, "{error:?}");
+            let enter = enter_failed(error.clone());
+            assert_eq!(enter.pasted, Some(true), "{error:?}");
+            assert!(!releases(enter), "{error:?}");
+            // A first key that may have gone in keeps the claim, as does any
+            // failure once an earlier key went in.
+            assert_eq!(releases(keys_failed(error.clone(), 0)), !typed, "{error:?}");
+            assert!(!releases(keys_failed(error, 1)));
+        }
+        // Not just tmux's failures: a refusal before a later key (the pane
+        // restarted, say) keeps the claim once an earlier key went in.
+        let restarted = || muxel_core::control::Error::from("the pane restarted");
+        let first = keys_stopped(restarted(), 0, 3);
+        assert_eq!(first.pasted, None);
+        assert!(releases(first));
+        let later = keys_stopped(restarted(), 2, 3);
+        assert_eq!(later.pasted, Some(true));
+        assert!(
+            later
+                .message
+                .ends_with("2 of 3 keys were pressed before it"),
+            "{}",
+            later.message
+        );
+        assert!(!releases(later));
+    }
+
+    /// A terminal whose ctl input goes through a fake tmux. Its agent pane is
+    /// `%7`, and each `send-keys` waits for the next answer on the returned
+    /// sender: `true` presses it, `false` refuses it.
+    fn tmux_routed_terminal() -> (
+        Arc<TerminalSession>,
+        muxel_terminal::PtyReceiver,
+        std::sync::mpsc::Sender<bool>,
+    ) {
+        #[cfg(unix)]
+        fn exit(code: i32) -> std::process::ExitStatus {
+            <std::process::ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        fn exit(code: i32) -> std::process::ExitStatus {
+            <std::process::ExitStatus as std::os::windows::process::ExitStatusExt>::from_raw(
+                code as u32,
+            )
+        }
+        let output = |code, stdout: &str, stderr: &str| std::process::Output {
+            status: exit(code),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let (answer, answers) = std::sync::mpsc::channel::<bool>();
+        let answers = std::sync::Mutex::new(answers);
+        let route = muxel_terminal::TmuxInputRoute::new(
+            "muxel_p_1",
+            true,
+            move |args: &[String], _: Option<&[u8]>| {
+                Ok(match args[0].as_str() {
+                    "list-panes" => output(0, "muxel_p_1:%7:1\n", ""),
+                    "display-message" => output(0, "%7\n", ""),
+                    "send-keys" => match answers.lock().unwrap().recv() {
+                        Ok(true) => output(0, "", ""),
+                        _ => output(1, "", "lost server\n"),
+                    },
+                    _ => output(0, "", ""),
+                })
+            },
+        );
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        let (session, rx) =
+            TerminalSession::spawn(spec.with_tmux_input(route), 80, 24).expect("spawn PTY");
+        (session, rx, answer)
+    }
+
+    /// Poll `future` as the app's foreground task would, until it is done.
+    fn drive<T>(future: impl std::future::Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let std::task::Poll::Ready(done) = future.as_mut().poll(&mut cx) {
+                return done;
+            }
+            assert!(std::time::Instant::now() < deadline, "tmux never answered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Through tmux the Enter is a queued tmux command. The send holds its pane
+    /// until tmux has taken that Enter, not merely queued it, so a second send's
+    /// paste can't land ahead of it; a refused Enter gives the pane back.
+    #[test]
+    fn a_send_holds_its_pane_until_tmux_takes_its_enter() {
+        use super::finish_prompt_enter;
+        let (session, _rx, answer) = tmux_routed_terminal();
+        let pane = Uuid::new_v4();
+        let in_flight = SendInFlight::begin(pane, false).unwrap();
+        let pasted = session.input_rev();
+        let enter = press_prompt_enter(&session, pasted).unwrap();
+        assert!(enter.is_queued());
+        let mut finishing = std::pin::pin!(finish_prompt_enter(enter, Some(in_flight)));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        // Give the worker time to run the Enter, which waits for its answer.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(finishing.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            SendInFlight::begin(pane, false).is_err(),
+            "the pane was released while tmux still had its Enter"
+        );
+        assert!(!session.has_submitted_turn());
+        answer.send(true).unwrap();
+        assert_eq!(drive(finishing), Ok(()));
+        assert!(session.has_submitted_turn());
+        drop(SendInFlight::begin(pane, false).expect("the Enter is in"));
+
+        let in_flight = SendInFlight::begin(pane, false).unwrap();
+        let enter = press_prompt_enter(&session, session.input_rev()).unwrap();
+        answer.send(false).unwrap();
+        let refused = drive(finish_prompt_enter(enter, Some(in_flight))).unwrap_err();
+        assert_eq!(refused.pasted, Some(true));
+        assert!(SendInFlight::begin(pane, false).is_ok());
+        session.kill();
     }
 
     #[test]

@@ -75,9 +75,13 @@ pub enum ControlInput {
     /// written terminal's arrow bytes are encoded for; tmux encodes keys for its
     /// own pane's modes.
     Keys { keys: Vec<Key>, app_cursor: bool },
-    /// The Enter that submits a turn. Its lifecycle facts are recorded only once
-    /// the Enter is admitted.
+    /// The Enter that submits a pasted prompt or task. Its lifecycle facts are
+    /// recorded only once the Enter is admitted, as a prompt submission.
     Submit,
+    /// An Enter pressed on its own (`keys enter`). It submits a turn as
+    /// [`Self::Submit`] does, but proves no prompt (it may pick a resume item),
+    /// so it records a plain submission, as keyboard Enter does.
+    SubmitKey,
 }
 
 /// Runs `tmux <args>` on the server holding a terminal's tmux session, on this
@@ -184,7 +188,8 @@ enum WriteState {
     Done(Delivered),
     Queued {
         delivered: async_channel::Receiver<Delivered>,
-        submit: Option<(Arc<crate::TerminalSession>, SystemTime)>,
+        /// A submit's terminal, input time and whether it follows a prompt.
+        submit: Option<(Arc<crate::TerminalSession>, SystemTime, bool)>,
     },
 }
 
@@ -195,7 +200,7 @@ impl ControlWrite {
 
     pub(crate) fn queued(
         delivered: async_channel::Receiver<Delivered>,
-        submit: Option<(Arc<crate::TerminalSession>, SystemTime)>,
+        submit: Option<(Arc<crate::TerminalSession>, SystemTime, bool)>,
     ) -> Self {
         Self(WriteState::Queued { delivered, submit })
     }
@@ -225,9 +230,9 @@ impl ControlWrite {
                     ))
                 });
                 if result.is_ok()
-                    && let Some((session, at)) = submit
+                    && let Some((session, at, prompt)) = submit
                 {
-                    session.commit_submission(at);
+                    session.commit_submission(at, prompt);
                 }
                 result
             }
@@ -411,7 +416,9 @@ fn deliver_once(run: &TmuxRunner, pane: &str, input: &ControlInput) -> Delivered
             }
             Ok(())
         }
-        ControlInput::Submit => step(run, &tmux::control_keys_args(pane, &[Key::Enter]), None),
+        ControlInput::Submit | ControlInput::SubmitKey => {
+            step(run, &tmux::control_keys_args(pane, &[Key::Enter]), None)
+        }
     }
 }
 
@@ -733,6 +740,40 @@ mod tests {
         finish(session.control_write(ControlInput::Submit)).unwrap();
         assert!(session.has_submitted_turn());
         session.kill();
+    }
+
+    /// A submit tmux takes commits what the same submit written to the PTY
+    /// does: a prompt's Enter is a prompt submission, which a first provider
+    /// binding can take as its initial prompt, and a bare `keys enter` (which
+    /// may pick a resume item) is a plain one.
+    #[test]
+    fn a_submit_through_tmux_records_what_a_direct_one_does() {
+        let spec = if cfg!(windows) {
+            CommandSpec::program("cmd.exe", vec!["/D".into(), "/Q".into(), "/K".into()])
+        } else {
+            CommandSpec::program("/bin/cat", vec![])
+        };
+        for (input, prompt) in [
+            (ControlInput::Submit, true),
+            (ControlInput::SubmitKey, false),
+        ] {
+            let (tmux, _tmux_rx, _calls) = tmux_terminal(Arc::default());
+            let (direct, _direct_rx) =
+                TerminalSession::spawn(spec.clone(), 80, 24).expect("spawn PTY");
+            for (session, how) in [(tmux, "through tmux"), (direct, "direct")] {
+                assert_eq!(session.delivers_through_tmux(), how == "through tmux");
+                finish(session.control_write(input.clone())).unwrap();
+                assert!(session.has_submitted_turn(), "{input:?} {how}");
+                session.process_output(b"\x1b]0;019f95d7-db31-7db0-904d-9e08330e0011 | Ready\x07");
+                assert_eq!(session.binding_revision(), 1, "{input:?} {how}");
+                assert_eq!(
+                    session.initial_unbound_submission(),
+                    prompt,
+                    "{input:?} {how}"
+                );
+                session.kill();
+            }
+        }
     }
 
     #[test]

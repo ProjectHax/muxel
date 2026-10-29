@@ -826,7 +826,7 @@ fn control_new_policy_write_entry_points_recheck_permission() {
             // recorded only once the Enter is taken, never marked ahead of a
             // write that tmux may refuse.
             assert!(!callback.contains("mark_turn_submitted"));
-            assert!(callback.contains("ControlInput::Submit"));
+            assert!(callback.contains("ControlInput::SubmitKey"));
             (
                 callback
                     .find("Arc::ptr_eq(&session,&current_session)")
