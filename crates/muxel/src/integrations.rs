@@ -2572,9 +2572,9 @@ pub fn set_tmux_option_if(
     Ok(())
 }
 
-/// Rewrite one legacy escaped claim only if its raw bytes have not changed.
-/// A unique temporary option holds the expected value outside the command
-/// string, where tmux 2.x would otherwise keep octal escapes literally.
+/// Replace an unreadable or uncomparable claim only if its raw bytes have not
+/// changed. A unique temporary option holds the expected value outside the
+/// command string, where arbitrary option bytes cannot become tmux syntax.
 pub fn normalize_tmux_option_if_raw(
     loc: &RepoLoc,
     session: &SessionTarget,
@@ -2619,6 +2619,20 @@ pub fn normalize_tmux_option_if_raw(
     Ok(())
 }
 
+/// Restore the displaced claim after a pre-paste refusal with the same bounded
+/// conditional command used by claim cleanup.
+pub fn restore_tmux_option_if(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    option: &str,
+    pattern: &str,
+    value: &str,
+) -> Result<()> {
+    let args = muxel_core::tmux::set_option_if_args(&session.name, option, Some(pattern), value)
+        .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim restoration safely"))?;
+    run_bounded_tmux_claim_command(loc, session, args)
+}
+
 /// Give claim cleanup two seconds before terminating its command.
 pub fn unset_tmux_option_if(
     loc: &RepoLoc,
@@ -2626,11 +2640,19 @@ pub fn unset_tmux_option_if(
     option: &str,
     pattern: &str,
 ) -> Result<()> {
+    let args = muxel_core::tmux::unset_option_if_args(&session.name, option, pattern)
+        .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim cleanup safely"))?;
+    run_bounded_tmux_claim_command(loc, session, args)
+}
+
+fn run_bounded_tmux_claim_command(
+    loc: &RepoLoc,
+    session: &SessionTarget,
+    args: Vec<String>,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let lifecycle = GitEnv::production();
     let session = profile_tmux_target(session);
-    let args = muxel_core::tmux::unset_option_if_args(&session.name, option, pattern)
-        .ok_or_else(|| anyhow::anyhow!("can't quote tmux claim cleanup safely"))?;
     let cmd = match loc {
         RepoLoc::Local(_) => {
             let socket = bounded_tmux_socket(&session, deadline, &lifecycle, |socket| {

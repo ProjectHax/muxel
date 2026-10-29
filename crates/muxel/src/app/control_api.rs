@@ -109,7 +109,12 @@ fn just_submitted_turn(
     activity: &AgentActivity,
     now: i64,
 ) -> bool {
-    let in_grace = turn.startup.is_some() || now < turn.sent_at.saturating_add(turn.grace_ms);
+    let in_grace = match turn.startup.as_ref().map(ctl::StartupTurn::state) {
+        Some(ctl::StartupTurnState::Submitted(at)) => now < at.saturating_add(turn.grace_ms),
+        Some(ctl::StartupTurnState::Pending | ctl::StartupTurnState::AwaitingAcceptance(_)) => true,
+        Some(ctl::StartupTurnState::Cancelled | ctl::StartupTurnState::Failed(_)) => false,
+        None => now < turn.sent_at.saturating_add(turn.grace_ms),
+    };
     in_grace && turn_has_reply_evidence(turn, coverage) && turn.awaiting_reply(state, activity, now)
 }
 
@@ -797,19 +802,14 @@ impl MuxelApp {
                         .background_executor()
                         .spawn(async move {
                             if force {
-                                if let Err(error) = read_claim_for_admission(&claim_site) {
-                                    log::warn!(
-                                        "muxel ctl: --force skipped claim repair on {}: {error}",
-                                        claim_site.session
-                                    );
-                                }
+                                read_claim_for_admission(&claim_site)?;
                                 let observed = integrations::tmux_option(
                                     &claim_site.loc,
                                     &claim_site.session,
                                     ctl::CLAIM_OPTION,
                                 );
-                                forced_claim(observed.as_deref(), grace_ms, lead_ms)
-                                    .map(|(claim, deferred)| (claim, deferred, None))
+                                deferred_claim(observed.as_deref(), grace_ms, lead_ms)
+                                    .map(|deferred| (deferred.claim.clone(), Some(deferred), None))
                             } else {
                                 claim_agent(
                                     &claim_site,
@@ -1876,11 +1876,11 @@ fn restore_claim(site: &ClaimSite, claim: &ctl::Claim, previous: Option<&ctl::Cl
         claim,
         previous,
         |pattern, value| {
-            if let Err(error) = integrations::set_tmux_option_if(
+            if let Err(error) = integrations::restore_tmux_option_if(
                 &site.loc,
                 &site.session,
                 ctl::CLAIM_OPTION,
-                Some(pattern),
+                pattern,
                 value,
             ) {
                 log::warn!("muxel ctl: couldn't restore {}: {error:#}", site.session);
@@ -1918,79 +1918,77 @@ fn read_claim(site: &ClaimSite) -> Option<ctl::Claim> {
         .and_then(|value| ctl::Claim::decode(&value))
 }
 
-/// tmux 2.x stored the old `tmux_string` octal escapes literally when they
-/// appeared inside an `if-shell` command. Accept only that encoding, with or
-/// without the quotes its parser may preserve, for a conditional repair.
-fn decode_legacy_tmux_claim(raw: &str) -> Option<ctl::Claim> {
-    let encoded = raw
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(raw);
-    if !encoded.starts_with("v1\\174") {
-        return None;
-    }
-    let bytes = encoded.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            let octal = bytes.get(i + 1..i + 4)?;
-            if !octal.iter().all(|b| (b'0'..=b'7').contains(b)) {
-                return None;
-            }
-            let value = u16::from(octal[0] - b'0') * 64
-                + u16::from(octal[1] - b'0') * 8
-                + u16::from(octal[2] - b'0');
-            decoded.push(u8::try_from(value).ok()?);
-            i += 4;
-        } else {
-            // Old `tmux_string` allowed these ASCII literals. All other
-            // bytes had to be octal escapes.
-            if !(bytes[i].is_ascii_alphanumeric() || b"_./:,+@=-".contains(&bytes[i])) {
-                return None;
-            }
-            decoded.push(bytes[i]);
-            i += 1;
-        }
-    }
-    let decoded = String::from_utf8(decoded).ok()?;
-    if !matches!(decoded.split('|').count(), 5 | 6) {
-        return None;
-    }
-    ctl::Claim::decode(&decoded)
+fn read_claim_for_admission(site: &ClaimSite) -> CtlResult<Option<ctl::Claim>> {
+    read_claim_for_admission_with(
+        || integrations::tmux_option(&site.loc, &site.session, ctl::CLAIM_OPTION),
+        |raw, normalized| {
+            integrations::normalize_tmux_option_if_raw(
+                &site.loc,
+                &site.session,
+                ctl::CLAIM_OPTION,
+                raw,
+                normalized,
+            )
+            .map_err(|error| {
+                ctl::Error::new(
+                    ErrorCode::ClaimedElsewhere,
+                    format!("couldn't repair a tmux claim before typing ({error:#})"),
+                )
+            })
+        },
+    )
 }
 
-fn read_claim_for_admission(site: &ClaimSite) -> CtlResult<Option<ctl::Claim>> {
-    let Some(raw) = integrations::tmux_option(&site.loc, &site.session, ctl::CLAIM_OPTION) else {
+fn read_claim_for_admission_with(
+    read: impl Fn() -> Option<String>,
+    normalize: impl Fn(&str, &str) -> CtlResult<()>,
+) -> CtlResult<Option<ctl::Claim>> {
+    let Some(raw) = read() else {
         return Ok(None);
     };
-    if let Some(claim) = ctl::Claim::decode(&raw) {
-        return Ok(Some(claim));
+    let decoded = ctl::Claim::decode(&raw);
+    if decoded
+        .as_ref()
+        .is_some_and(|claim| claim.compare_pattern().is_some())
+    {
+        return Ok(decoded);
     }
-    let Some(legacy) = decode_legacy_tmux_claim(&raw) else {
-        return Ok(None);
-    };
-    integrations::normalize_tmux_option_if_raw(
-        &site.loc,
-        &site.session,
-        ctl::CLAIM_OPTION,
-        &raw,
-        &legacy.encode_tmux_command(),
-    )
-    .map_err(|error| {
+    // Keep a readable claim's turn and grace when only its bytes are unsafe
+    // for tmux's conditional pattern. For unreadable data, install a stale
+    // marker so the normal conditional claim can serialize competing senders.
+    let replacement = decoded.unwrap_or_else(|| ctl::Claim {
+        owner: "muxel-repair".into(),
+        host: "unknown".into(),
+        at: 0,
+        grace_ms: 0,
+        nonce: Some(Uuid::new_v4()),
+    });
+    normalize(&raw, &replacement.encode_tmux_command())?;
+    let current = read().ok_or_else(|| {
         ctl::Error::new(
             ErrorCode::ClaimedElsewhere,
-            format!("couldn't repair an old tmux claim before typing ({error:#})"),
+            "the tmux claim could not be read after repair; no input was sent",
         )
     })?;
-    let current = integrations::tmux_option(&site.loc, &site.session, ctl::CLAIM_OPTION);
-    if current.as_deref() == Some(raw.as_str()) {
+    if current == raw {
         return Err(ctl::Error::new(
             ErrorCode::ClaimedElsewhere,
-            "the old tmux claim changed during repair; no input was sent",
+            "the tmux claim could not be repaired; no input was sent",
         ));
     }
-    Ok(current.as_deref().and_then(ctl::Claim::decode))
+    let claim = ctl::Claim::decode(&current).ok_or_else(|| {
+        ctl::Error::new(
+            ErrorCode::ClaimedElsewhere,
+            "another muxel changed the tmux claim during repair; no input was sent",
+        )
+    })?;
+    if claim.compare_pattern().is_none() {
+        return Err(ctl::Error::new(
+            ErrorCode::ClaimedElsewhere,
+            "the repaired tmux claim still cannot be compared safely; no input was sent",
+        ));
+    }
+    Ok(Some(claim))
 }
 
 fn deferred_claim(observed: Option<&str>, grace_ms: i64, lead_ms: i64) -> CtlResult<DeferredClaim> {
@@ -2017,21 +2015,6 @@ fn deferred_claim(observed: Option<&str>, grace_ms: i64, lead_ms: i64) -> CtlRes
         },
         published: Arc::new(AtomicBool::new(false)),
     })
-}
-
-fn forced_claim(
-    observed: Option<&str>,
-    grace_ms: i64,
-    lead_ms: i64,
-) -> CtlResult<(ctl::Claim, Option<DeferredClaim>)> {
-    match deferred_claim(observed, grace_ms, lead_ms) {
-        Ok(deferred) => Ok((deferred.claim.clone(), Some(deferred))),
-        Err(error) => {
-            log::warn!("muxel ctl: --force bypassed an unreadable shared claim: {error}");
-            let unclaimed = deferred_claim(None, grace_ms, lead_ms)?;
-            Ok((unclaimed.claim, None))
-        }
-    }
 }
 
 fn publish_deferred_claim(site: &ClaimSite, deferred: DeferredClaim) -> CtlResult<()> {
@@ -2274,9 +2257,9 @@ fn show_value(
 mod prompt_submission_tests {
     use super::{
         ClaimAttempt, PromptConfirmation, PromptConfirmationAction, SendAdmission, Unconfirmed,
-        claim_agent_with, confirmation_verdict, decode_legacy_tmux_claim, deferred_claim,
-        enter_verdict, forced_claim, just_submitted_turn, now_ms, owner_id, paste_prompt,
-        press_prompt_enter, publish_deferred_claim_with, restore_claim_with, submission_receipt,
+        claim_agent_with, confirmation_verdict, deferred_claim, enter_verdict, just_submitted_turn,
+        now_ms, owner_id, paste_prompt, press_prompt_enter, publish_deferred_claim_with,
+        read_claim_for_admission_with, restore_claim_with, submission_receipt,
     };
     use muxel_core::{AgentActivity, control::ErrorCode};
     use muxel_terminal::{CommandSpec, PromptSubmissionState, TerminalSession};
@@ -2631,26 +2614,40 @@ mod prompt_submission_tests {
     }
 
     #[test]
-    fn old_tmux_2x_escaped_claim_can_be_normalized() {
-        let claim = muxel_core::control::Claim {
-            owner: "me".into(),
-            host: "desk".into(),
-            at: 10,
+    fn any_unreadable_or_uncomparable_claim_is_conditionally_repaired() {
+        let no_nonce = muxel_core::control::Claim {
+            owner: "peer".into(),
+            host: "desk'name".into(),
+            at: 100,
             grace_ms: 30_000,
-            nonce: Some(Uuid::nil()),
+            nonce: None,
         };
-        let escaped = format!("\"{}\"", claim.encode().replace('|', "\\174"));
-        assert_eq!(decode_legacy_tmux_claim(&escaped), Some(claim.clone()));
-        assert_eq!(
-            decode_legacy_tmux_claim(&escaped[1..escaped.len() - 1]),
-            Some(claim)
-        );
-        assert_eq!(decode_legacy_tmux_claim("unrecognized"), None);
-        let (_, deferred) = forced_claim(Some("unrecognized"), 30_000, 400).unwrap();
-        assert!(
-            deferred.is_none(),
-            "explicit force must not stay blocked by unreadable data"
-        );
+        assert!(no_nonce.compare_pattern().is_none());
+        for raw in [
+            "\"v1\\174me\\174desk\\17410\\17430000\"".to_string(),
+            "v1174me174desk1741017430000".to_string(),
+            "unrecognized".to_string(),
+            no_nonce.encode(),
+        ] {
+            let stored = RefCell::new(Some(raw.clone()));
+            let repairs = Cell::new(0);
+            let result = read_claim_for_admission_with(
+                || stored.borrow().clone(),
+                |expected, normalized| {
+                    assert_eq!(expected, raw);
+                    repairs.set(repairs.get() + 1);
+                    *stored.borrow_mut() = Some(normalized.to_string());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(repairs.get(), 1, "raw claim was not repaired: {raw}");
+            assert!(result.is_some_and(|claim| claim.compare_pattern().is_some()));
+            assert!(
+                deferred_claim(stored.borrow().as_deref(), 30_000, 400).is_ok(),
+                "--force could not publish after repair: {raw}"
+            );
+        }
     }
 
     #[test]
@@ -2676,6 +2673,29 @@ mod prompt_submission_tests {
             Some(super::AgentState::Working),
             &activity,
             6_000
+        ));
+    }
+
+    #[test]
+    fn submitted_startup_turn_stops_being_just_submitted_at_grace_deadline() {
+        let turn = super::ControlTurn::startup("startup prompt".into());
+        let owner = turn.startup.as_ref().unwrap().claim().unwrap();
+        owner.submitted(1_000);
+        let grace = muxel_core::control::REPLY_GRACE_MS;
+        let activity = AgentActivity::default();
+        assert!(just_submitted_turn(
+            &turn,
+            None,
+            Some(super::AgentState::Working),
+            &activity,
+            1_000 + grace - 1,
+        ));
+        assert!(!just_submitted_turn(
+            &turn,
+            None,
+            Some(super::AgentState::Working),
+            &activity,
+            1_000 + grace,
         ));
     }
 
