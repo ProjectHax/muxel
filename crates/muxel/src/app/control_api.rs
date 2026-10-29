@@ -24,6 +24,8 @@ pub(super) use approval::PreparedCreation;
 #[cfg(test)]
 #[path = "control_api/new_tests.rs"]
 mod new_tests;
+#[cfg(all(test, windows))]
+mod startup_reservation_tests;
 
 /// Shared command permission for typing into an existing terminal. This is
 /// rechecked on every write, including panes created before the opt-in was revoked.
@@ -1569,6 +1571,20 @@ impl MuxelApp {
             .get(&iid)
             .and_then(|turn| turn.startup.as_ref())?
             .claim()
+    }
+
+    /// Continue a discovery reservation without replacing its generation or
+    /// claiming a second startup owner for an already prepared launch.
+    pub(super) fn claim_reserved_control_startup(&mut self, iid: Uuid, token: u64) {
+        if !self
+            .terminal_launching
+            .get(&iid)
+            .is_some_and(|ticket| ticket.token == token && ticket.startup.is_none())
+        {
+            return;
+        }
+        let startup = self.claim_control_startup(iid);
+        self.terminal_launching.get_mut(&iid).unwrap().startup = startup;
     }
 }
 

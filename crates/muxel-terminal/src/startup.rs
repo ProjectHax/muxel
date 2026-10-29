@@ -435,8 +435,8 @@ impl Screen {
         })
     }
 
-    /// Match the entire visible ASCII task across word-boundary wraps. Never
-    /// infer a missing prefix/suffix or allow completion-owned Enter semantics.
+    /// Match the entire visible ASCII task across soft wraps. Codex can split a
+    /// hyphenated word without consuming a space at the row boundary.
     fn codex_ctl_draft_frame(&self, input: &str) -> Option<CodexCtlDraft> {
         if input.is_empty()
             || !input.is_ascii()
@@ -517,8 +517,30 @@ impl Screen {
                 || !piece.is_ascii()
                 || piece.starts_with(' ')
                 || piece.bytes().any(|byte| byte.is_ascii_control())
-        }) || pieces.join(" ") != input
-        {
+        }) {
+            return None;
+        }
+        let mut remaining = input;
+        for (index, piece) in pieces.iter().enumerate() {
+            remaining = remaining.strip_prefix(*piece)?;
+            if let Some(next) = pieces.get(index + 1) {
+                if let Some(rest) = remaining.strip_prefix(' ') {
+                    remaining = rest;
+                } else {
+                    // An ordinary row break consumes a space. A no-space
+                    // break needs proof that the next word could not fit, or
+                    // that the current row filled the editor width.
+                    let used = prefix + piece.len();
+                    let next_word = next.split(' ').next()?;
+                    let limit = columns.saturating_sub(2);
+                    if !(used >= limit || (piece.ends_with('-') && used + next_word.len() > limit))
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        if !remaining.is_empty() {
             return None;
         }
         let end_column = prefix + pieces.last()?.len();
@@ -873,7 +895,7 @@ mod tests {
         assert!(!residual_menu.codex_draft_matches("task"));
     }
 
-    fn ctl_screen(draft: &[&str], consumed: bool) -> Screen {
+    fn ctl_screen_with_width(draft: &[&str], consumed: bool, width: usize) -> Screen {
         let mut rows = vec![String::new(); 51];
         rows[0] = "OpenAI Codex".into();
         let top = 49 - 1 - draft.len() - usize::from(consumed);
@@ -884,7 +906,7 @@ mod tests {
         rows[50] = "  ? for shortcuts".into();
         let text = rows
             .iter()
-            .map(|row| format!("{row}{}", " ".repeat(41 - row.chars().count())))
+            .map(|row| format!("{row}{}", " ".repeat(width - row.chars().count())))
             .collect::<Vec<_>>()
             .join("\n");
         screen(
@@ -896,6 +918,10 @@ mod tests {
                 2 + draft.last().unwrap().chars().count()
             },
         )
+    }
+
+    fn ctl_screen(draft: &[&str], consumed: bool) -> Screen {
+        ctl_screen_with_width(draft, consumed, 41)
     }
 
     fn ctl_origin(text: &str) -> Screen {
@@ -1000,6 +1026,38 @@ mod tests {
         assert!(retained.codex_ctl_retry_draft(&task, &origin));
         assert!(!ctl_screen(&pieces, false).codex_ctl_retry_draft(&task, &origin));
         assert!(!retained.codex_exact_retry_draft(&task));
+    }
+
+    #[test]
+    fn ctl_codex_retry_matches_hyphen_wrap_in_long_prompt() {
+        // Codex 0.164 wrapped the real ctl send at `force-` with no space.
+        // The first Enter became a blank editor row, leaving this draft idle.
+        let pieces = [
+            "Kobol: B2 is briefed. Read the new 'Task B2 ... detailed 2026-10-28' section in D:/dev/muxel-desk/handoffs/2026-10-26-b8-status.md.",
+            "Step 0 first: rebase feat/osc-7501-master and fix/status-user-text onto upstream master 442ac310 (origin = ProjectHax), re-gate, force-",
+            "push-with-lease fork drafts #54/#56, then build combo/status-20261028 if B1 and 7501+A conflict. Then Step 1, B2 on rebased 7501+A.",
+            "Cargo lock as always. Report after Step 0, then after B2.",
+        ];
+        let task = concat!(
+            "Kobol: B2 is briefed. Read the new 'Task B2 ... detailed 2026-10-28' section in D:/dev/muxel-desk/handoffs/2026-10-26-b8-status.md. ",
+            "Step 0 first: rebase feat/osc-7501-master and fix/status-user-text onto upstream master 442ac310 (origin = ProjectHax), re-gate, force-push-with-lease fork drafts #54/#56, then build combo/status-20261028 if B1 and 7501+A conflict. Then Step 1, B2 on rebased 7501+A. ",
+            "Cargo lock as always. Report after Step 0, then after B2.",
+        );
+        assert_eq!(task.len(), 456);
+        let origin = ctl_screen_with_width(&[""], false, 140)
+            .codex_ctl_origin()
+            .unwrap();
+        let retained = ctl_screen_with_width(&pieces, true, 140);
+        assert!(!ctl_screen_with_width(&pieces, false, 140).codex_ctl_retry_draft(task, &origin));
+        assert!(retained.codex_ctl_retry_draft(task, &origin));
+        assert!(
+            !retained.codex_ctl_retry_draft(&task.replace("force-push", "force-ship"), &origin)
+        );
+        let narrow_origin = ctl_origin("").codex_ctl_origin().unwrap();
+        assert!(
+            !ctl_screen(&["Run force-", "push-with-lease now."], true)
+                .codex_ctl_retry_draft("Run force-push-with-lease now.", &narrow_origin)
+        );
     }
 
     #[test]

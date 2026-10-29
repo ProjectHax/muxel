@@ -2,6 +2,7 @@
 
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
 use std::hash::{Hash as _, Hasher as _};
@@ -913,42 +914,22 @@ pub(crate) struct ClaudeHookStamp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClaudeBinding {
     pub session_id: String,
+    pub path: PathBuf,
+    pub cwd: PathBuf,
     pub from_resume: bool,
     /// `None` for a record written by an older muxel's hook.
     pub stamp: Option<ClaudeHookStamp>,
 }
 
-/// Stamped invocations use their nonce; an older hook's exact bytes and
-/// preserved write time distinguish a new receipt from an acknowledgement retry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ClaudeReceiptIdentity {
-    Stamped(Uuid),
-    Legacy {
-        modified: Option<SystemTime>,
-        bytes: Vec<u8>,
-    },
-}
-
-pub(crate) fn claude_receipt_identity(
-    binding: &ClaudeBinding,
-    modified: Option<SystemTime>,
-    bytes: &[u8],
-) -> ClaudeReceiptIdentity {
-    binding.stamp.map_or_else(
-        || ClaudeReceiptIdentity::Legacy {
-            modified,
-            bytes: bytes.to_vec(),
-        },
-        |stamp| ClaudeReceiptIdentity::Stamped(stamp.nonce),
-    )
-}
-
 /// Every unseen receipt starts a binding, even for the bound UUID, except a
 /// proven startup receipt for this launch. Retrying the same receipt never does.
+/// `current` and `seen` are receipt identities ([`ClaimedClaudeRecord::identity`]):
+/// a record's exact bytes and preserved write time, so a stamped invocation and
+/// an older hook's unstamped one are both told apart from an acknowledgement retry.
 pub(crate) fn claude_record_switches(
     binding: &ClaudeBinding,
-    current: &ClaudeReceiptIdentity,
-    seen: Option<&ClaudeReceiptIdentity>,
+    current: &str,
+    seen: Option<&str>,
     bound: Option<&str>,
     confirms_launch: bool,
 ) -> bool {
@@ -1113,7 +1094,7 @@ pub(crate) fn claude_binding_path(data_dir: &Path, instance_id: Uuid) -> PathBuf
         .join(format!("{instance_id}.json"))
 }
 
-fn write_claude_binding_from_reader(
+pub(crate) fn write_claude_binding_from_reader(
     data_dir: &Path,
     instance_id: Uuid,
     reader: impl std::io::Read,
@@ -1262,6 +1243,8 @@ pub(crate) fn claude_binding_from_record(record: &[u8], home: &Path) -> Option<C
     }
     Some(ClaudeBinding {
         session_id: session_id.to_string(),
+        path: transcript.to_path_buf(),
+        cwd: PathBuf::from(event.get("cwd")?.as_str()?),
         from_resume: source == "resume",
         stamp: claude_hook_stamp(&event),
     })
@@ -1306,6 +1289,10 @@ pub(crate) struct ClaimedClaudeRecord {
 }
 
 impl ClaimedClaudeRecord {
+    pub(crate) fn identity(&self) -> String {
+        claude_record_identity(&self.bytes, self.modified)
+    }
+
     /// Whether the hook has written a newer record since this one was claimed.
     fn superseded(&self) -> Result<bool> {
         self.shared
@@ -1438,6 +1425,196 @@ pub(crate) fn defer_claude_binding(record: ClaimedClaudeRecord) {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ClaudeLookupBinding {
+    pub id: String,
+    pub path: PathBuf,
+    pub pending_write: bool,
+    /// Old producers did not assign each publication a distinct record id.
+    pub legacy: bool,
+    pub cwd: PathBuf,
+}
+
+pub(crate) type ClaudeHookIdentity = std::result::Result<Option<String>, String>;
+
+pub(crate) struct ClaudeLookupSnapshot {
+    pub record: ClaudeHookIdentity,
+    pub binding: std::result::Result<Option<ClaudeLookupBinding>, String>,
+}
+
+struct ClaudeRecord {
+    identity: String,
+    bytes: Vec<u8>,
+}
+
+fn read_claude_record(path: &Path) -> std::result::Result<Option<ClaudeRecord>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let modified = file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .modified()
+        .ok();
+    let mut bytes = Vec::new();
+    file.take(MAX_HOOK_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_HOOK_INPUT_BYTES {
+        return Err(format!(
+            "Claude hook record exceeds {MAX_HOOK_INPUT_BYTES} bytes"
+        ));
+    }
+    Ok(Some(ClaudeRecord {
+        identity: claude_record_identity(&bytes, modified),
+        bytes,
+    }))
+}
+
+fn claude_record_identity(bytes: &[u8], modified: Option<SystemTime>) -> String {
+    let (sign, time) = match modified.map(|time| time.duration_since(std::time::UNIX_EPOCH)) {
+        None => (0_u8, std::time::Duration::ZERO),
+        Some(Ok(time)) => (1, time),
+        Some(Err(error)) => (2, error.duration()),
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"muxel-claude-hook-v1\0");
+    hash.update([sign]);
+    hash.update(time.as_secs().to_le_bytes());
+    hash.update(time.subsec_nanos().to_le_bytes());
+    hash.update(bytes);
+    format!("v1:{:x}", hash.finalize())
+}
+
+/// A bounded own-data receipt check. Transcript validation stays on the worker.
+pub(crate) fn claude_hook_identity(data: &Path, pane: Uuid) -> ClaudeHookIdentity {
+    let record = match read_claude_record(&claude_claimed_binding_path(data, pane))? {
+        Some(record) => Some(record),
+        None => read_claude_record(&claude_binding_path(data, pane))?,
+    };
+    Ok(record.map(|record| record.identity))
+}
+
+/// One directory snapshot, including no file opens for panes without a record.
+/// Keep records after async reads: deleting by name could erase a newer hook.
+pub(crate) fn claude_bindings_for_batch(
+    data_dir: &Path,
+    panes: &std::collections::HashSet<Uuid>,
+    home: &Path,
+) -> std::io::Result<std::collections::HashMap<Uuid, ClaudeLookupSnapshot>> {
+    let mut result = std::collections::HashMap::new();
+    #[cfg(test)]
+    BINDING_BATCH_OPERATIONS.with_borrow_mut(|ops| ops.push("directory"));
+    let entries = match std::fs::read_dir(data_dir.join(CLAUDE_BINDING_DIR)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(error) => return Err(error),
+    };
+    let mut selected = std::collections::HashMap::<Uuid, (bool, PathBuf)>::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some((id, claimed)) = name.to_str().and_then(|name| {
+            let stem = name.strip_suffix(".json")?;
+            let claimed = stem.ends_with(".claimed");
+            let id = if claimed {
+                stem.strip_suffix(".claimed")?
+            } else {
+                stem
+            };
+            Some((Uuid::parse_str(id).ok()?, claimed))
+        }) else {
+            continue;
+        };
+        if !panes.contains(&id) {
+            continue;
+        }
+        if claimed || !selected.contains_key(&id) {
+            selected.insert(id, (claimed, entry.path()));
+        }
+    }
+    let mut projects = None;
+    for (id, (_, path)) in selected {
+        #[cfg(test)]
+        BINDING_BATCH_OPERATIONS.with_borrow_mut(|ops| ops.push("read"));
+        let snapshot = match read_claude_record(&path) {
+            Ok(None) => continue,
+            Err(error) => ClaudeLookupSnapshot {
+                record: Err(error.clone()),
+                binding: Err(error),
+            },
+            Ok(Some(record)) => {
+                let binding = match serde_json::from_slice(&record.bytes) {
+                    Err(_) => Ok(None),
+                    Ok(event) => {
+                        let projects = projects
+                            .get_or_insert_with(|| home.join(".claude/projects").canonicalize());
+                        match projects {
+                            Ok(projects) => Ok(validated_claude_binding(event, projects)),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                };
+                ClaudeLookupSnapshot {
+                    record: Ok(Some(record.identity)),
+                    binding,
+                }
+            }
+        };
+        result.insert(id, snapshot);
+    }
+    Ok(result)
+}
+
+fn validated_claude_binding(event: Value, projects: &Path) -> Option<ClaudeLookupBinding> {
+    validate_claude_event(&event).ok()?;
+    let session_id = event.get("session_id")?.as_str()?;
+    let source = event.get("source")?.as_str()?;
+    let transcript = Path::new(event.get("transcript_path")?.as_str()?);
+    let expected_name = format!("{session_id}.jsonl");
+    if transcript.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return None;
+    }
+
+    // `/clear` and `/fork` may announce the new UUID before Claude writes its
+    // first transcript record. Validate the existing project directory in that
+    // case; resumed sessions must already have a real transcript.
+    let project = transcript.parent()?.canonicalize().ok()?;
+    if project.parent()? != projects {
+        return None;
+    }
+    let pending_write = match transcript.canonicalize() {
+        Ok(resolved) if resolved.is_file() && resolved.parent() == Some(project.as_path()) => false,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(source, "clear" | "fork") =>
+        {
+            true
+        }
+        _ => return None,
+    };
+    Some(ClaudeLookupBinding {
+        id: session_id.to_string(),
+        path: transcript.to_path_buf(),
+        pending_write,
+        legacy: claude_hook_stamp(&event).is_none()
+            && event
+                .get("muxel_record_id")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_none(),
+        cwd: PathBuf::from(event.get("cwd")?.as_str()?),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static BINDING_BATCH_OPERATIONS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1469,10 +1646,42 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn claimed_hook_precedes_new_shared_record_in_launch_batch() {
+        let root = temp_dir();
+        let data = root.join("data");
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let pane = Uuid::new_v4();
+        let first = Uuid::new_v4().to_string();
+        let second = Uuid::new_v4().to_string();
+        resume_hook(&data, &home, &cwd, pane, &first);
+        let first_receipt = claude_hook_identity(&data, pane).unwrap();
+        let claimed = claim_claude_binding(&data, pane).unwrap();
+        resume_hook(&data, &home, &cwd, pane, &second);
+
+        let snapshots =
+            claude_bindings_for_batch(&data, &std::collections::HashSet::from([pane]), &home)
+                .unwrap();
+        let snapshot = snapshots.get(&pane).unwrap();
+        assert_eq!(snapshot.record, Ok(first_receipt.clone()));
+        let binding = snapshot.binding.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(binding.id, first);
+        assert!(!binding.legacy);
+        assert_eq!(claude_hook_identity(&data, pane), Ok(first_receipt));
+        drop(claimed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn claimed_session(record: &ClaimedClaudeRecord, home: &Path) -> String {
         claude_binding_from_record(&record.bytes, home)
             .unwrap()
             .session_id
+    }
+
+    /// The receipt identity of the pane's pending record, as a claim reads it.
+    fn pending_receipt(data: &Path, pane: Uuid) -> String {
+        claude_hook_identity(data, pane).unwrap().unwrap()
     }
 
     struct PendingResume {
@@ -2022,7 +2231,7 @@ mod tests {
         assert!(first.stamp.is_some());
         assert!(claude_record_switches(
             &first,
-            &claude_receipt_identity(&first, None, &[]),
+            &pending_receipt(&data, instance_id),
             None,
             Some(a.as_str()),
             false
@@ -2047,7 +2256,7 @@ mod tests {
         assert_eq!(last.session_id, a);
         assert!(claude_record_switches(
             &last,
-            &claude_receipt_identity(&last, None, &[]),
+            &pending_receipt(&data, instance_id),
             None,
             Some(a.as_str()),
             false,
@@ -2071,7 +2280,7 @@ mod tests {
         resume(&a);
         let first = read_claude_binding(&data, instance_id, &home).unwrap();
         let stamp = first.stamp.expect("the hook stamps its record");
-        let first_identity = claude_receipt_identity(&first, None, &[]);
+        let first_identity = pending_receipt(&data, instance_id);
         assert!(before <= stamp.recorded_at && stamp.recorded_at <= SystemTime::now());
         assert!(!claude_record_switches(
             &first,
@@ -2086,12 +2295,12 @@ mod tests {
         resume(&a);
         let last = read_claude_binding(&data, instance_id, &home).unwrap();
         assert_eq!(last.session_id, a);
-        let last_identity = claude_receipt_identity(&last, None, &[]);
+        let last_identity = pending_receipt(&data, instance_id);
         assert!(
             claude_record_switches(
                 &last,
                 &last_identity,
-                Some(&first_identity),
+                Some(first_identity.as_str()),
                 Some(a.as_str()),
                 true,
             ),
@@ -2101,7 +2310,7 @@ mod tests {
         assert!(!claude_record_switches(
             &last,
             &last_identity,
-            Some(&last_identity),
+            Some(last_identity.as_str()),
             Some(a.as_str()),
             true
         ));
@@ -2115,13 +2324,17 @@ mod tests {
         let submitted_at = receipt_at + Duration::from_millis(10);
         let binding = ClaudeBinding {
             session_id: Uuid::new_v4().to_string(),
+            // Transcript metadata is independent of this receipt timing rule.
+            path: PathBuf::new(),
+            cwd: PathBuf::new(),
             from_resume: true,
             stamp: Some(ClaudeHookStamp {
                 nonce: Uuid::new_v4(),
                 recorded_at: receipt_at,
             }),
         };
-        let identity = claude_receipt_identity(&binding, None, &[]);
+        // Any receipt identity this launch hasn't seen.
+        let identity = "unseen receipt";
         for (receipt, resumed, submission, expected) in [
             (Some(receipt_at), true, None, true),
             (Some(receipt_at), true, Some(submitted_at), true),
@@ -2142,7 +2355,7 @@ mod tests {
             assert_eq!(
                 claude_record_switches(
                     &binding,
-                    &identity,
+                    identity,
                     None,
                     Some(&binding.session_id),
                     confirms,
@@ -2193,7 +2406,7 @@ mod tests {
         assert_eq!(record.modified, Some(written));
         let binding = claude_binding_from_record(&record.bytes, &home).unwrap();
         assert_eq!(binding.stamp, None);
-        let current = claude_receipt_identity(&binding, record.modified, &record.bytes);
+        let current = record.identity();
         // Legacy receipts now retire a same-ID binding too. Retrying that
         // exact claimed record after a failed acknowledgement must not do so again.
         assert!(claude_record_switches(
@@ -2206,17 +2419,16 @@ mod tests {
         assert!(!claude_record_switches(
             &binding,
             &current,
-            Some(&current),
+            Some(current.as_str()),
             Some(session_id.as_str()),
             false
         ));
         let retry = claim_claude_binding(&data, instance_id).unwrap();
         let retry_binding = claude_binding_from_record(&retry.bytes, &home).unwrap();
-        let retry_identity = claude_receipt_identity(&retry_binding, retry.modified, &retry.bytes);
         assert!(!claude_record_switches(
             &retry_binding,
-            &retry_identity,
-            Some(&current),
+            &retry.identity(),
+            Some(current.as_str()),
             Some(session_id.as_str()),
             false,
         ));
@@ -2227,11 +2439,10 @@ mod tests {
         std::fs::write(&path, format!("{event}\n")).unwrap();
         let next = claim_claude_binding(&data, instance_id).unwrap();
         let next_binding = claude_binding_from_record(&next.bytes, &home).unwrap();
-        let next_identity = claude_receipt_identity(&next_binding, next.modified, &next.bytes);
         assert!(claude_record_switches(
             &next_binding,
-            &next_identity,
-            Some(&current),
+            &next.identity(),
+            Some(current.as_str()),
             Some(session_id.as_str()),
             false,
         ));
