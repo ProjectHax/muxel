@@ -1943,6 +1943,7 @@ mod tests {
             name: target.name.clone(),
             socket: None,
             instance: uuid::Uuid::nil(),
+            local_close_token: None,
         };
         assert_eq!(
             legacy

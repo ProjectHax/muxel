@@ -763,6 +763,7 @@ impl MuxelApp {
         let mut restored = Vec::new();
         for iid in group.members {
             if let Some(held) = self.closing.remove(&iid) {
+                self.cancel_deferred_worktree_closes(&[iid]);
                 // A pane brought back is no longer going away. A disposal
                 // question that counted it must ask again before it acts.
                 for pending in &mut self.pending_worktree_dispose {
@@ -1167,7 +1168,7 @@ impl MuxelApp {
         }
     }
 
-    /// A worktree choice is the sole confirmation and finalizes before touching git.
+    /// Ask about files before planning the terminal's busy check and Undo hold.
     /// Returns the ids to plan here, or `None` once a disposal question owns them.
     pub(super) fn preflight_close_worktrees(
         &mut self,
@@ -1230,6 +1231,13 @@ impl MuxelApp {
             let Some(worktree) = self.workspace.worktree(wid) else {
                 continue;
             };
+            if self
+                .deferred_worktree_dispose
+                .get(&worktree.project_id)
+                .is_some_and(|choices| choices.contains_key(&wid))
+            {
+                continue;
+            }
             let root = self
                 .workspace
                 .project(worktree.project_id)
@@ -1246,6 +1254,7 @@ impl MuxelApp {
                 continue;
             }
             self.pending_worktree_dispose.push_back(WorktreeDispose {
+                project_id: worktree.project_id,
                 wid,
                 name: worktree.name.clone(),
                 color: worktree.color,
@@ -1300,15 +1309,6 @@ impl MuxelApp {
             return None;
         }
         Some(choice)
-    }
-
-    pub(super) fn finalize_worktree_choice(&mut self, ids: &[Uuid], cx: &mut Context<Self>) {
-        let was_preserving = self.preserve_close_worktrees;
-        self.preserve_close_worktrees = true;
-        for &iid in ids {
-            self.close_instance_inner(iid, "close (worktree decision)", cx);
-        }
-        self.preserve_close_worktrees = was_preserving;
     }
 
     pub(super) fn save_editor_before_close(

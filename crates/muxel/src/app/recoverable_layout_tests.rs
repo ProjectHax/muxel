@@ -233,6 +233,130 @@ fn poll_clears_inflight_even_if_its_window_closes() {
     });
 }
 
+#[test]
+fn review_close_retry_forgets_a_session_imported_into_another_pane() {
+    with_app(|cx, window, pid, iid| {
+        window
+            .update(cx, |app, window, cx| {
+                let target = muxel_core::tmux::SessionTarget::new(
+                    "imported-session",
+                    Some(muxel_core::tmux::Socket::Private),
+                );
+                // Import creates a fresh pane id bound to the still-running target.
+                app.workspace
+                    .project_mut(pid)
+                    .unwrap()
+                    .remember_closed_session(target.clone(), Uuid::new_v4());
+                app.workspace.project_mut(pid).unwrap().closed_sessions[0].local_close_token =
+                    Some(Uuid::new_v4());
+                let inst = app.workspace.instance_mut(iid).unwrap();
+                inst.tmux_session = Some(target.name);
+                inst.tmux_socket = target.socket;
+                app.ensure_project_terminals(pid, window, cx);
+                assert!(
+                    app.local_closes_inflight.is_empty(),
+                    "retry started under an imported pane"
+                );
+                assert!(
+                    app.workspace
+                        .project(pid)
+                        .unwrap()
+                        .closed_sessions
+                        .is_empty()
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn review_close_reconciles_the_peer_layout_before_replaying_a_kill() {
+    with_app(|cx, window, pid, iid| {
+        window
+            .update(cx, |app, window, cx| {
+                let inst = app.workspace.instance_mut(iid).unwrap();
+                inst.tmux_session = Some("peer-kept-session".into());
+                inst.tmux_socket = Some(muxel_core::tmux::Socket::Private);
+                let mut peer = app.sync_capture(pid, 1).unwrap();
+                peer.updated_at = u64::MAX / 2;
+                let root = app.workspace.project(pid).unwrap().root_path.clone();
+                std::fs::create_dir_all(root.join(".muxel")).unwrap();
+                std::fs::write(root.join(".muxel/workspace.json"), peer.to_json()).unwrap();
+                app.workspace.remove_instance_meta(iid);
+                let project = app.workspace.project_mut(pid).unwrap();
+                project.layout = None;
+                project.remember_closed_session(
+                    muxel_core::tmux::SessionTarget::new(
+                        "peer-kept-session",
+                        Some(muxel_core::tmux::Socket::Private),
+                    ),
+                    iid,
+                );
+                project.closed_sessions[0].local_close_token = Some(Uuid::new_v4());
+                app.remote_synced.remove(&pid);
+                // Keep the fixture headless if reconciliation restores the pane.
+                app.ensure_project_terminals_deferred(pid, window, cx);
+                assert!(
+                    app.local_closes_inflight.is_empty(),
+                    "retry ran before the peer pane was restored"
+                );
+                assert!(app.workspace.instance(iid).is_some());
+                assert!(
+                    app.workspace
+                        .project(pid)
+                        .unwrap()
+                        .closed_sessions
+                        .is_empty()
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn review_close_a_recreated_panes_new_intent_supersedes_its_inflight_close() {
+    with_app(|cx, window, pid, iid| {
+        window
+            .update(cx, |app, _, cx| {
+                let target = muxel_core::tmux::SessionTarget::new(
+                    "recreated-pane",
+                    Some(muxel_core::tmux::Socket::Private),
+                );
+                let original = app.workspace.instance_mut(iid).unwrap();
+                original.tmux_session = Some(target.name.clone());
+                original.tmux_socket = target.socket.clone();
+                app.close_instance_inner(iid, "close (first intent)", cx);
+                let first = app.workspace.project(pid).unwrap().closed_sessions[0]
+                    .local_close_token
+                    .unwrap();
+                // A peer recreates the same instance before the first async job runs.
+                let mut recreated = Instance::shell(pid);
+                recreated.id = iid;
+                recreated.tmux_session = Some(target.name);
+                recreated.tmux_socket = target.socket;
+                app.workspace.add_instance(recreated);
+                app.workspace.project_mut(pid).unwrap().layout = Some(PaneNode::leaf(iid));
+                app.close_instance_inner(iid, "close (replacement intent)", cx);
+                let project = app.workspace.project(pid).unwrap();
+                assert_eq!(project.closed_sessions.len(), 1);
+                let second = project.closed_sessions[0].local_close_token.unwrap();
+                assert_ne!(
+                    first, second,
+                    "an old in-flight job discarded the replacement's new durable close"
+                );
+                let saved = muxel_store::load_workspace_from(
+                    &muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    saved.project(pid).unwrap().closed_sessions[0].local_close_token,
+                    Some(second)
+                );
+            })
+            .unwrap();
+    });
+}
+
 #[cfg(unix)]
 struct OwnedTmux(String);
 
@@ -322,6 +446,17 @@ fn local_activation_retries_a_persisted_kill_on_its_recorded_server() {
         "{}",
         String::from_utf8_lossy(&launched.stderr)
     );
+    let token = Uuid::new_v4();
+    tmux_fixture(
+        &socket,
+        &[
+            "set-option",
+            "-t",
+            &format!("={session}:"),
+            muxel_core::tmux::LOCAL_CLOSE_GENERATION_OPTION,
+            &token.to_string(),
+        ],
+    );
     with_app(|cx, window, pid, iid| {
         window
             .update(cx, |app, _, _| {
@@ -339,6 +474,8 @@ fn local_activation_retries_a_persisted_kill_on_its_recorded_server() {
                         ),
                         iid,
                     );
+                app.workspace.project_mut(pid).unwrap().closed_sessions[0].local_close_token =
+                    Some(token);
                 assert!(app.try_persist());
             })
             .unwrap();
@@ -374,4 +511,122 @@ fn local_activation_retries_a_persisted_kill_on_its_recorded_server() {
                 .success()
         );
     });
+}
+
+#[cfg(unix)]
+fn tmux_fixture(socket: &str, args: &[&str]) -> String {
+    let output = std::process::Command::new("tmux")
+        .args(["-L", socket])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "tmux {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn review_close_retry_preserves_peer_replacements_including_a_restarted_server() {
+    for restart_server in [false, true] {
+        let socket = format!("muxel-close-test-{}", Uuid::new_v4());
+        let _server = OwnedTmux(socket.clone());
+        let session = "peer-replacement-fixture";
+        let token = Uuid::new_v4();
+        tmux_fixture(&socket, &["new-session", "-d", "-s", session, "sleep 120"]);
+        let original_id = tmux_fixture(
+            &socket,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &format!("={session}:"),
+                "#{session_id}",
+            ],
+        );
+        tmux_fixture(
+            &socket,
+            &[
+                "set-option",
+                "-t",
+                &format!("={session}:"),
+                muxel_core::tmux::LOCAL_CLOSE_GENERATION_OPTION,
+                &token.to_string(),
+            ],
+        );
+        if restart_server {
+            tmux_fixture(&socket, &["kill-server"]);
+        } else {
+            tmux_fixture(
+                &socket,
+                &["new-session", "-d", "-s", "sentinel", "sleep 120"],
+            );
+            tmux_fixture(&socket, &["kill-session", "-t", &format!("={session}")]);
+        }
+        tmux_fixture(&socket, &["new-session", "-d", "-s", session, "sleep 120"]);
+        let replacement_id = tmux_fixture(
+            &socket,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &format!("={session}:"),
+                "#{session_id}",
+            ],
+        );
+        assert_eq!(
+            original_id == replacement_id,
+            restart_server,
+            "fixture must exercise id reuse after server restart"
+        );
+        with_app(|cx, window, pid, iid| {
+            window
+                .update(cx, |app, window, cx| {
+                    app.workspace.remove_instance_meta(iid);
+                    let project = app.workspace.project_mut(pid).unwrap();
+                    project.layout = None;
+                    project.remember_closed_session(
+                        muxel_core::tmux::SessionTarget::new(
+                            session,
+                            Some(muxel_core::tmux::Socket::Named(socket.clone())),
+                        ),
+                        iid,
+                    );
+                    project.closed_sessions[0].local_close_token = Some(token);
+                    assert!(app.try_persist());
+                    app.ensure_project_terminals(pid, window, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            tmux_fixture(&socket, &["has-session", "-t", &format!("={session}")]);
+            assert_eq!(
+                tmux_fixture(
+                    &socket,
+                    &[
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &format!("={session}:"),
+                        "#{session_id}"
+                    ]
+                ),
+                replacement_id
+            );
+            window
+                .read_with(cx, |app, _| {
+                    assert!(
+                        app.workspace
+                            .project(pid)
+                            .unwrap()
+                            .closed_sessions
+                            .is_empty()
+                    );
+                    assert!(app.local_closes_inflight.is_empty());
+                })
+                .unwrap();
+        });
+    }
 }

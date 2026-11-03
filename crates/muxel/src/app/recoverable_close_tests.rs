@@ -913,12 +913,16 @@ fn git_fixture(root: &Path, args: &[&str]) {
 }
 
 #[test]
-fn worktree_last_pane_dispose_answer_is_final() {
+fn review_close_dirty_worktree_keep_preserves_the_busy_agent_and_undo() {
     with_app(|cx, window| {
         let pid = project(cx, window);
-        let (pane, _, child) = terminal(cx, window, pid);
+        let (pane, view, child) = title_terminal(cx, window, pid, "dirty busy fixture", "Working");
+        wait_for_view(cx, window, &view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                && view.status() == AgentStatus::Working
+        });
         window
-            .update(cx, |app, _, cx| {
+            .update(cx, |app, window, cx| {
                 let root = app.workspace.project(pid).unwrap().root_path.clone();
                 git_fixture(&root, &["init", "--initial-branch=main"]);
                 git_fixture(&root, &["commit", "--allow-empty", "-m", "fixture"]);
@@ -965,25 +969,27 @@ fn worktree_last_pane_dispose_answer_is_final() {
                     "preflight killed the terminal before the choice"
                 );
                 app.dispose_worktree_keep(cx);
-                assert!(app.workspace.instance(pane).is_none());
-                assert!(app.terminal_view(pane).is_none());
-                assert!(!app.is_closing(pane));
                 assert!(
-                    app.close_groups.is_empty(),
-                    "worktree choice must not count down"
+                    app.workspace.instance(pane).is_some(),
+                    "Keep killed the busy agent"
                 );
+                assert!(
+                    app.confirm.is_some(),
+                    "busy worktree close must ask before holding"
+                );
+                app.run_confirm(window, cx);
+                assert!(app.is_closing(pane));
+                assert!(app.closing_until(pane).is_some());
+                assert!(!child.exited(), "the Undo hold killed the busy agent");
                 assert!(app.pending_worktree_dispose.is_empty());
-                assert!(app.workspace.worktree(wid).unwrap().detached);
                 assert_eq!(std::fs::read_to_string(&draft).unwrap(), "keep this work\n");
-                app.expire_closes(Instant::now() + Duration::from_secs(60), cx);
-                assert!(
-                    app.pending_worktree_dispose.is_empty(),
-                    "a second dispose question appeared at expiry"
-                );
+                app.undo_latest_close(window, cx);
+                assert!(!app.is_closing(pane));
+                assert!(app.workspace.instance(pane).is_some());
+                assert!(!child.exited());
                 assert!(worktree_path.is_dir());
             })
             .unwrap();
-        wait_for_exit(cx, &child);
     });
 }
 
@@ -1204,6 +1210,15 @@ fn clean_worktree(
         .update(cx, |app, _, _| {
             let root = app.workspace.project(pid).unwrap().root_path.clone();
             git_fixture(&root, &["init", "--initial-branch=main"]);
+            for (key, value) in [
+                ("core.hooksPath", "NUL"),
+                ("commit.gpgsign", "false"),
+                ("core.autocrlf", "false"),
+                ("user.name", "Muxel test"),
+                ("user.email", "muxel-test@example.invalid"),
+            ] {
+                git_fixture(&root, &["config", "--local", key, value]);
+            }
             git_fixture(&root, &["commit", "--allow-empty", "-m", "fixture"]);
             let path = git_fixture_path(
                 muxel_store::data_dir()
@@ -1243,6 +1258,51 @@ fn clean_worktree(
             (wid, path)
         })
         .unwrap()
+}
+
+fn review_legacy_close(dirty: bool, shared: bool) {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, _child) = terminal(cx, window, pid);
+        let (_, path) = clean_worktree(cx, window, pid, pane);
+        window
+            .update(cx, |app, _, cx| {
+                app.workspace.instance_mut(pane).unwrap().worktree_id = None;
+                if dirty {
+                    std::fs::write(path.join("draft.txt"), "keep legacy work").unwrap();
+                }
+                if shared {
+                    let mut other = Instance::shell(pid);
+                    other.worktree_path = Some(path.clone());
+                    let other_id = other.id;
+                    app.workspace.add_instance(other);
+                    add_tab(
+                        &mut app.workspace.project_mut(pid).unwrap().layout,
+                        pane,
+                        other_id,
+                    );
+                }
+                app.close_instance_inner(pane, "close (legacy regression)", cx);
+                assert!(path.is_dir(), "legacy close removed dirty or shared files");
+                if dirty {
+                    assert_eq!(
+                        std::fs::read_to_string(path.join("draft.txt")).unwrap(),
+                        "keep legacy work"
+                    );
+                }
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn review_close_legacy_worktree_keeps_dirty_files() {
+    review_legacy_close(true, false);
+}
+
+#[test]
+fn review_close_legacy_worktree_keeps_a_live_panes_files() {
+    review_legacy_close(false, true);
 }
 
 #[test]
@@ -2056,6 +2116,14 @@ fn pane_opened_during_a_worktree_question_gets_its_own_prompt_and_undo() {
                 assert!(asked.contains(&captured) && asked.contains(&fresh));
 
                 app.dispose_worktree_keep(cx);
+                assert!(
+                    app.confirm.is_some(),
+                    "captured busy pane still needs confirmation"
+                );
+                app.run_confirm(window, cx);
+                assert!(app.is_closing(captured) && app.is_closing(fresh));
+                assert!(!captured_child.exited() && !fresh_child.exited());
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
                 assert!(app.workspace.instance(captured).is_none());
                 assert!(app.workspace.instance(fresh).is_none());
                 assert!(app.pending_worktree_dispose.is_empty());
@@ -2149,5 +2217,170 @@ fn undo_during_a_worktree_question_keeps_the_pane_out_of_its_answer() {
                 app.cancel_confirm(cx);
             })
             .unwrap();
+    });
+}
+
+#[test]
+fn review_close_worktree_actions_wait_for_expiry_and_cancel_with_undo() {
+    for choice in ["discard", "commit", "merge"] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (pane, view, child) =
+                title_terminal(cx, window, pid, "deferred file fixture", "Working");
+            wait_for_view(cx, window, &view, |view| {
+                view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                    && view.status() == AgentStatus::Working
+            });
+            let (wid, path) = clean_worktree(cx, window, pid, pane);
+            let draft = path.join("draft.txt");
+            std::fs::write(&draft, "hold these files\n").unwrap();
+            window
+                .update(cx, |app, window, cx| {
+                    app._status_timer = gpui::Task::ready(());
+                    app.request_close_instance(pane, cx);
+                    match choice {
+                        "discard" => app.dispose_worktree_discard(cx),
+                        "commit" => app.dispose_worktree_commit(cx),
+                        "merge" => app.dispose_worktree_merge(window, cx),
+                        _ => unreachable!(),
+                    }
+                    assert!(app.confirm.is_some());
+                    assert!(!child.exited());
+                    assert_eq!(
+                        std::fs::read_to_string(&draft).unwrap(),
+                        "hold these files\n"
+                    );
+                    // Cancel at the busy confirmation is also a cancellation of git.
+                    if choice == "commit" {
+                        app.cancel_confirm(cx);
+                    } else {
+                        app.run_confirm(window, cx);
+                        assert!(app.is_closing(pane));
+                        assert!(path.is_dir());
+                        assert!(!child.exited());
+                        app.undo_latest_close(window, cx);
+                    }
+                    assert!(app.deferred_worktree_dispose.is_empty());
+                    assert!(app.workspace.instance(pane).is_some());
+                    assert!(app.workspace.worktree(wid).is_some());
+                    assert!(!app.workspace.worktree(wid).unwrap().detached);
+                    assert!(!child.exited());
+                    assert_eq!(
+                        std::fs::read_to_string(&draft).unwrap(),
+                        "hold these files\n"
+                    );
+                    assert!(
+                        super::integrations::worktree_change_count(&path) > 0,
+                        "git ran before Undo expired"
+                    );
+                })
+                .unwrap();
+        });
+    }
+}
+
+#[test]
+fn review_close_worktree_actions_execute_only_after_the_hold_finishes() {
+    for choice in ["discard", "commit", "merge", "keep"] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (pane, view, child) =
+                title_terminal(cx, window, pid, "expiry file fixture", "Working");
+            wait_for_view(cx, window, &view, |view| {
+                view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                    && view.status() == AgentStatus::Working
+            });
+            let (wid, path) = clean_worktree(cx, window, pid, pane);
+            std::fs::write(path.join("draft.txt"), "saved after the hold\n").unwrap();
+            window
+                .update(cx, |app, window, cx| {
+                    app._status_timer = gpui::Task::ready(());
+                    let root = app.workspace.project(pid).unwrap().root_path.clone();
+                    app.request_close_instance(pane, cx);
+                    match choice {
+                        "discard" => app.dispose_worktree_discard(cx),
+                        "commit" => app.dispose_worktree_commit(cx),
+                        "merge" => app.dispose_worktree_merge(window, cx),
+                        "keep" => app.dispose_worktree_keep(cx),
+                        _ => unreachable!(),
+                    }
+                    app.run_confirm(window, cx);
+                    assert!(app.is_closing(pane));
+                    assert!(path.join("draft.txt").is_file());
+                    assert!(!child.exited());
+                    app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                    assert!(app.workspace.instance(pane).is_none());
+                    assert_eq!(path.is_dir(), choice == "keep");
+                    assert_eq!(app.workspace.worktree(wid).is_some(), choice == "keep");
+                    assert!(app.pending_worktree_dispose.is_empty());
+                    if choice == "merge" {
+                        assert_eq!(
+                            std::fs::read_to_string(root.join("draft.txt")).unwrap(),
+                            "saved after the hold\n"
+                        );
+                    } else if choice == "commit" {
+                        let output = std::process::Command::new("git")
+                            .current_dir(&root)
+                            .args(["show", "muxel/clean-close-fixture:draft.txt"])
+                            .output()
+                            .unwrap();
+                        assert!(output.status.success());
+                        assert_eq!(
+                            String::from_utf8(output.stdout).unwrap(),
+                            "saved after the hold\n"
+                        );
+                    }
+                })
+                .unwrap();
+            wait_for_exit(cx, &child);
+        });
+    }
+}
+
+#[test]
+fn review_close_uncaptured_member_invalidates_discard_even_if_it_exits_first() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, view, child) = title_terminal(cx, window, pid, "membership fixture", "Working");
+        wait_for_view(cx, window, &view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                && view.status() == AgentStatus::Working
+        });
+        let (wid, path) = clean_worktree(cx, window, pid, pane);
+        let draft = path.join("draft.txt");
+        std::fs::write(&draft, "new member owns this work\n").unwrap();
+        window
+            .update(cx, |app, window, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.request_close_instance(pane, cx);
+                app.dispose_worktree_discard(cx);
+                app.run_confirm(window, cx);
+                assert!(app.is_closing(pane));
+            })
+            .unwrap();
+        let (fresh, _, fresh_child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, _, cx| {
+                join_worktree(app, fresh, wid, &path);
+                // The new member is already absent when the old countdown ends.
+                app.close_instance_inner(fresh, "close (new member exited)", cx);
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(
+                    path.is_dir(),
+                    "stale Discard removed an uncaptured member's files"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&draft).unwrap(),
+                    "new member owns this work\n"
+                );
+                assert_eq!(
+                    app.pending_worktree_dispose.len(),
+                    1,
+                    "new work needs a new file decision"
+                );
+            })
+            .unwrap();
+        wait_for_exit(cx, &child);
+        wait_for_exit(cx, &fresh_child);
     });
 }

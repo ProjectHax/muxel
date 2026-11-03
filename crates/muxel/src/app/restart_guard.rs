@@ -243,6 +243,7 @@ mod tests {
             instance: iid,
             name: "muxel_repo_namesake".into(),
             socket: Some(socket),
+            local_close_token: None,
         }
     }
 

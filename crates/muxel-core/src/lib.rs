@@ -1172,11 +1172,21 @@ impl Project {
     /// Remote history is capped, oldest first. Local pending kills must all
     /// survive: local inventory cannot adopt an orphan whose kill was forgotten.
     pub fn remember_closed_session(&mut self, session: tmux::SessionTarget, instance: Uuid) {
+        let local_close_token = self
+            .closed_sessions
+            .iter()
+            .find(|closed| {
+                closed.instance == instance
+                    && closed.name == session.name
+                    && (closed.socket == session.socket || closed.socket.is_none())
+            })
+            .and_then(|closed| closed.local_close_token);
         self.closed_sessions.retain(|c| c.instance != instance);
         self.closed_sessions.push(tmux::ClosedSession {
             name: session.name,
             socket: session.socket,
             instance,
+            local_close_token,
         });
         if self.is_remote() {
             let over = self
@@ -3832,11 +3842,22 @@ mod closed_session_tests {
             .map(|n| {
                 let id = Uuid::new_v4();
                 project.remember_closed_session(format!("local-{n}").into(), id);
+                project
+                    .closed_sessions
+                    .last_mut()
+                    .unwrap()
+                    .local_close_token = Some(id);
                 id
             })
             .collect();
         let saved = serde_json::to_vec(&project).unwrap();
         let restored: Project = serde_json::from_slice(&saved).unwrap();
+        assert!(
+            restored
+                .closed_sessions
+                .iter()
+                .all(|entry| entry.local_close_token == Some(entry.instance))
+        );
         let retryable: std::collections::HashSet<_> = restored
             .closed_sessions
             .iter()
@@ -3853,8 +3874,10 @@ mod closed_session_tests {
         let mut p = Project::new("app", "/srv/app");
         let iid = Uuid::new_v4();
         p.remember_closed_session("muxel_app_1".into(), iid);
+        p.closed_sessions[0].local_close_token = Some(iid);
         p.remember_closed_session("muxel_app_1".into(), iid);
         assert_eq!(p.closed_sessions.len(), 1);
+        assert_eq!(p.closed_sessions[0].local_close_token, Some(iid));
         assert!(p.forget_closed_session(iid), "a confirmed kill clears it");
         assert!(p.closed_sessions.is_empty());
         assert!(

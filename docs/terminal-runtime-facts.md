@@ -27,14 +27,30 @@ confirmed missing local layout does. Unreadable layouts offer an explicit
 Close without reading or Keep. Quit and workspace departure restore shared
 closes instead of committing removal without a fresh comparison.
 
-Local tmux removal saves a pending kill in the project's close ledger before
-teardown, then saves the resolved server owner before killing. A crash before
-the save leaves the old pane attachable; a crash afterwards leaves a retry on
-project activation. Kill and confirmation share a ten-second bound. A failed
-kill keeps its ledger entry and worktree. Automatic local tmux worktree cleanup
-runs only after confirmation; unconfirmed remote teardown keeps the worktree
-and logs why. A disposal choice that also starts tmux teardown keeps the
-worktree for another review after teardown.
+Local tmux removal saves a pending kill and a fresh close token in the project's
+ledger before I/O, then saves any resolved legacy server owner before killing.
+Only the original in-memory attempt can stamp that token on the session. A
+retry never stamps; the tmux server compares the saved token and observed
+session id before killing that exact id. A replacement, including a new server
+reusing an id, does not inherit the stamp. A mismatch preserves the session
+and files; an unknown or failed query retains the ledger. The ten-second bound
+starts before scheduling the attempt. As with the original close, the first
+stamp identifies the session present when that bounded attempt runs.
+
+Activation reconciles shared layout before replay, and cancels any close whose
+instance reappeared or whose target a current pane shows. Closes without a
+verifiable token are cancelled without killing. The event log retains the target's
+name and any known server. Import keeps its existing discovery scope; an arbitrary
+recorded server outside that scope needs an explicit reattach. Import excludes
+pending closes from every project on the same host. Automatic worktree cleanup
+runs only after confirmed local session death; unconfirmed remote teardown
+keeps the worktree and logs why.
+
+Worktree choices still pass through busy confirmation and the Undo countdown.
+The selected file action waits until the captured panes have closed and the
+project's tmux ledger is clear. Undo, Cancel, a new worktree member or a preserved
+session cancels the pending file action. Dirty, unmerged or shared legacy
+worktrees are kept rather than force-removed.
 Project removal preserves the project's pending-kill ledger until confirmation;
 remove the empty project again once its sessions have stopped.
 

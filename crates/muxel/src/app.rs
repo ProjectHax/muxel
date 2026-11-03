@@ -2688,6 +2688,7 @@ fn scan_importable(
     root: &str,
     presets: &[AgentPreset],
     owned: &[SessionTarget],
+    closed: &[muxel_core::tmux::ClosedSession],
     live: &[String],
     own_pid: u32,
     home: Option<&std::path::Path>,
@@ -2710,7 +2711,7 @@ fn scan_importable(
     let Some(sessions) = sessions else {
         return Err(t("Couldn't list tmux sessions there.").to_string());
     };
-    let mut tmux_rows = import::tmux_candidates(&sessions, owned, root, presets);
+    let mut tmux_rows = import::tmux_candidates(&sessions, owned, closed, root, presets);
     for row in &mut tmux_rows {
         // A pane's title is the agent's own statement of what it is doing
         // (`✳ Review changes`). `clean_agent_title` drops the lifecycle
@@ -5453,7 +5454,7 @@ pub struct MuxelApp {
     /// A workspace switch already stopped once for that unsaved removal.
     close_flush_warned: bool,
     close_tmux_kills: Vec<Task<()>>,
-    local_closes_inflight: HashSet<Uuid>,
+    local_closes_inflight: HashMap<Uuid, Uuid>,
     close_departure: Option<CloseDeparture>,
     close_departure_task: Option<Task<()>>,
     workspace: Workspace,
@@ -5879,6 +5880,8 @@ pub struct MuxelApp {
     confirm: Option<PendingConfirm>,
     /// Dirty worktrees awaiting a Commit/Discard/Keep decision (modal shows front).
     pending_worktree_dispose: std::collections::VecDeque<WorktreeDispose>,
+    deferred_worktree_dispose:
+        HashMap<Uuid, HashMap<Uuid, (WorktreeDispose, WorktreeDisposeAction)>>,
     /// Reused commit-message input for the worktree dispose modal.
     dispose_commit_input: Entity<InputState>,
     /// Project git modal (commit / new branch) + its reused input.
@@ -6637,6 +6640,7 @@ enum PasswordAction {
 /// (uncommitted changes and/or unmerged commits), awaiting a Commit / Merge /
 /// Discard / Keep decision (shown in the dispose modal).
 struct WorktreeDispose {
+    project_id: Uuid,
     close_after: Vec<Uuid>,
     close_rest: Vec<Uuid>,
     wid: Uuid,
@@ -6652,6 +6656,13 @@ struct WorktreeDispose {
     unmerged: usize,
     /// Base branch name for display (e.g. `main`), or "base" when detached.
     base_label: String,
+}
+
+enum WorktreeDisposeAction {
+    Keep,
+    Discard,
+    Commit(String),
+    Merge(String),
 }
 
 /// What an in-app notification is about (drives its color/label). `Blocked`/`Done`
@@ -7853,7 +7864,7 @@ impl MuxelApp {
             close_persist_pending: false,
             close_flush_warned: false,
             close_tmux_kills: Vec::new(),
-            local_closes_inflight: HashSet::new(),
+            local_closes_inflight: HashMap::new(),
             close_departure: None,
             close_departure_task: None,
             workspace: Workspace::default(),
@@ -7980,6 +7991,7 @@ impl MuxelApp {
             pane_drop: None,
             confirm: None,
             pending_worktree_dispose: std::collections::VecDeque::new(),
+            deferred_worktree_dispose: HashMap::new(),
             dispose_commit_input,
             git_modal: None,
             git_action_input,
@@ -10096,24 +10108,6 @@ impl MuxelApp {
             self.ensure_project_accomplishments(pid, cx);
         }
         let is_remote = self.workspace.project(pid).is_some_and(|p| p.is_remote());
-        if !is_remote {
-            // A previous process may have saved removal and died before tmux
-            // answered. Local inventory does not adopt those orphan sessions.
-            let pending = self
-                .workspace
-                .project(pid)
-                .map(|p| p.closed_sessions.clone())
-                .unwrap_or_default();
-            for closed in pending {
-                self.reap_local_session(
-                    pid,
-                    closed.instance,
-                    closed.target(),
-                    muxel_core::WorktreeCleanup::None,
-                    cx,
-                );
-            }
-        }
         // The first time we reach a layout-synced project this session, reconcile its
         // layout with the shared `.muxel/workspace.json` even if it has no local panes
         // yet — an empty local layout is exactly when another machine's session should
@@ -10137,6 +10131,9 @@ impl MuxelApp {
                     && !self.browsers.contains_key(&iid)
             });
         if !needs && !first_sync {
+            if !is_remote {
+                self.retry_local_closes(pid, cx);
+            }
             return;
         }
 
@@ -10312,6 +10309,9 @@ impl MuxelApp {
             let has_memory = loc.as_ref().is_some_and(integrations::memory_file_exists);
             self.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
         }
+        if !is_remote {
+            self.retry_local_closes(pid, cx);
+        }
         if defer_spawns {
             self.spawn_project_terminals_deferred(pid, cx);
         } else {
@@ -10399,7 +10399,7 @@ impl MuxelApp {
         // A pane the user closed must not come back as a pane: neither one whose kill
         // is still unconfirmed (`reap_closed_sessions` is working on it) nor one whose
         // kill was confirmed after `sessions` was listed.
-        let closed = self.closed_sessions_of(pid);
+        let closed = self.closed_sessions_on(project.remote.as_ref().map(|remote| remote.host_id));
 
         let orphans = muxel_core::tmux::orphan_sessions(sessions, &root, &owned, &closed);
         if orphans.is_empty() {
@@ -10503,6 +10503,7 @@ impl MuxelApp {
             .collect();
         let home = home_dir();
         let own_pid = std::process::id();
+        let closed = self.closed_sessions_on(project.remote.as_ref().map(|remote| remote.host_id));
 
         cx.spawn_in(window, async move |this, cx| {
             let found = cx
@@ -10513,6 +10514,7 @@ impl MuxelApp {
                         &root,
                         &presets,
                         &owned,
+                        &closed,
                         &live,
                         own_pid,
                         home.as_deref(),
@@ -11524,6 +11526,7 @@ impl MuxelApp {
         self.close_flush_warned = false;
         self.close_requests.clear();
         self.close_client_counts.clear();
+        self.deferred_worktree_dispose.clear();
         self.show_close_list = false;
 
         self.failed_launches.clear();
@@ -16853,6 +16856,18 @@ impl MuxelApp {
         worktree_cleanup: muxel_core::WorktreeCleanup,
         cx: &mut Context<Self>,
     ) {
+        if let muxel_core::WorktreeCleanup::Registered(wid) = &worktree_cleanup {
+            let uncaptured = self
+                .deferred_worktree_dispose
+                .get(&project_id)
+                .and_then(|choices| choices.get(wid))
+                .is_some_and(|(choice, _)| !choice.close_after.contains(&iid));
+            if uncaptured {
+                // This member may be gone before the original hold expires.
+                // Its files were never covered by the earlier answer.
+                self.take_deferred_worktree_dispose(project_id, *wid);
+            }
+        }
         if let Some(data_dir) = muxel_store::data_dir() {
             crate::session_binding::clear_muse_binding(&data_dir, iid);
         }
@@ -16943,7 +16958,36 @@ impl MuxelApp {
             }
             muxel_core::WorktreeCleanup::Legacy(path) => {
                 if let Some(root) = root {
-                    integrations::remove_worktree(&root, &path);
+                    let registered: HashSet<_> = self
+                        .workspace
+                        .worktrees
+                        .iter()
+                        .filter(|w| w.path == path)
+                        .map(|w| w.id)
+                        .collect();
+                    let shared = self.workspace.instances.iter().any(|inst| {
+                        inst.worktree_path.as_ref() == Some(&path)
+                            || inst
+                                .worktree_id
+                                .is_some_and(|wid| registered.contains(&wid))
+                    });
+                    let pending = self
+                        .workspace
+                        .project(project_id)
+                        .is_some_and(|p| !p.closed_sessions.is_empty());
+                    let base = integrations::repo_head(&root);
+                    let changed = integrations::worktree_change_count(&path);
+                    let unmerged = base
+                        .as_deref()
+                        .map(|base| integrations::worktree_unmerged_count(&path, base));
+                    if shared || pending || changed > 0 || unmerged.is_none_or(|count| count > 0) {
+                        muxel_store::append_event_log(&format!(
+                            "close: kept legacy worktree {} (shared, pending teardown, or work not confirmed landed)",
+                            path.display()
+                        ));
+                    } else {
+                        integrations::remove_worktree(&root, &path);
+                    }
                 }
             }
             muxel_core::WorktreeCleanup::None => {}
@@ -16961,74 +17005,187 @@ impl MuxelApp {
         cleanup: muxel_core::WorktreeCleanup,
         cx: &mut Context<Self>,
     ) {
-        if !self.local_closes_inflight.insert(iid) {
-            return;
-        }
+        let deadline = Instant::now() + Duration::from_secs(10);
         let Some(project) = self.workspace.project_mut(project_id) else {
-            self.local_closes_inflight.remove(&iid);
             return;
         };
         let session = integrations::profile_tmux_target(&session);
-        let owner_was_saved = session.socket.is_some();
         project.remember_closed_session(session.clone(), iid);
+        let closed = project
+            .closed_sessions
+            .iter_mut()
+            .find(|closed| closed.instance == iid)
+            .unwrap();
+        closed.local_close_token = Some(Uuid::new_v4());
+        let closed = closed.clone();
         if !self.try_persist() {
-            self.local_closes_inflight.remove(&iid);
             self.log_kept_close_worktree(iid, &cleanup);
             muxel_store::append_event_log(
                 "close: local tmux kill deferred; couldn't save its ledger",
             );
             return;
         }
+        self.start_local_close(project_id, closed, cleanup, true, deadline, cx);
+    }
+
+    fn local_close_is_owned(&self, iid: Uuid, target: &SessionTarget) -> bool {
+        self.workspace.instance(iid).is_some()
+            || muxel_core::tmux::session_still_shown(target, &self.pane_sessions_on(None))
+    }
+
+    fn cancel_local_close(&mut self, pid: Uuid, iid: Uuid) {
+        // A kept/replaced session also cancels file actions that were waiting
+        // for its project ledger. They must never run as successful teardown.
+        if let Some(choices) = self.deferred_worktree_dispose.remove(&pid) {
+            let used: HashSet<_> = self
+                .workspace
+                .instances
+                .iter()
+                .filter_map(|inst| inst.worktree_id)
+                .collect();
+            for worktree in &mut self.workspace.worktrees {
+                if choices.contains_key(&worktree.id) && !used.contains(&worktree.id) {
+                    worktree.detached = true;
+                }
+            }
+        }
+        if let Some(project) = self.workspace.project_mut(pid) {
+            project.forget_closed_session(iid);
+        }
+        if let Some(reaped) = self.reaped_sessions.get_mut(&pid) {
+            reaped.retain(|closed| closed.instance != iid);
+        }
+        self.persist();
+    }
+
+    fn retry_local_closes(&mut self, pid: Uuid, cx: &mut Context<Self>) {
+        let pending = self
+            .workspace
+            .project(pid)
+            .map(|p| p.closed_sessions.clone())
+            .unwrap_or_default();
+        for closed in pending {
+            if self.local_close_is_owned(closed.instance, &closed.target())
+                || closed.local_close_token.is_none()
+            {
+                muxel_store::append_event_log(&format!(
+                    "close: cancelled local retry for [{}] {}; a pane owns it or its generation is unverified; session kept",
+                    closed.instance,
+                    closed.target()
+                ));
+                self.cancel_local_close(pid, closed.instance);
+                continue;
+            }
+            self.start_local_close(
+                pid,
+                closed,
+                muxel_core::WorktreeCleanup::None,
+                false,
+                Instant::now() + Duration::from_secs(10),
+                cx,
+            );
+        }
+    }
+
+    fn start_local_close(
+        &mut self,
+        project_id: Uuid,
+        closed: muxel_core::tmux::ClosedSession,
+        cleanup: muxel_core::WorktreeCleanup,
+        initialize: bool,
+        deadline: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        let iid = closed.instance;
+        let Some(token) = closed.local_close_token else {
+            return;
+        };
+        if self.local_closes_inflight.get(&iid) == Some(&token) {
+            return;
+        }
+        self.local_closes_inflight.insert(iid, token);
+        let session = integrations::profile_tmux_target(&closed.target());
+        let owner_was_saved = session.socket.is_some();
         let workspace = self.current_workspace;
         self.close_tmux_kills.retain(|task| !task.is_ready());
         let task = cx.spawn(async move |this, cx| {
-            let deadline = Instant::now() + Duration::from_secs(10);
             let resolved = cx
                 .background_executor()
                 .spawn(async move { integrations::resolve_local_tmux_close(&session, deadline) })
                 .await;
             let result = match resolved {
                 Ok(owner) => {
-                    // GPUI drops windows before awaiting quit hooks. A known
-                    // owner was saved above, so its kill needs no live app.
-                    // Only legacy discovery needs another durable save.
-                    let saved = owner_was_saved
-                        || this
-                            .update(cx, |app, _| {
-                                if app.current_workspace != workspace {
-                                    return false;
-                                }
-                                let Some(project) = app.workspace.project_mut(project_id) else {
-                                    return false;
-                                };
-                                project.remember_closed_session(owner.clone(), iid);
-                                app.try_persist()
-                            })
-                            .unwrap_or(false);
-                    if saved {
-                        cx.background_executor()
-                            .spawn(async move {
-                                integrations::close_local_tmux(&owner, deadline).map(|()| owner)
-                            })
-                            .await
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "couldn't save local tmux owner before teardown"
-                        ))
+                    let permission = this
+                        .update(cx, |app, _| -> anyhow::Result<bool> {
+                            if app.current_workspace != workspace {
+                                return Ok(false);
+                            }
+                            if app.local_close_is_owned(iid, &owner) {
+                                app.cancel_local_close(project_id, iid);
+                                return Ok(false);
+                            }
+                            // A later close or cancellation supersedes this job.
+                            if !app.workspace.project(project_id).is_some_and(|project| {
+                                project.closed_sessions.iter().any(|entry| {
+                                    entry.instance == iid && entry.local_close_token == Some(token)
+                                })
+                            }) {
+                                return Ok(false);
+                            }
+                            if owner_was_saved {
+                                return Ok(true);
+                            }
+                            let Some(project) = app.workspace.project_mut(project_id) else {
+                                return Ok(false);
+                            };
+                            project.remember_closed_session(owner.clone(), iid);
+                            anyhow::ensure!(
+                                app.try_persist(),
+                                "couldn't save local tmux owner before teardown"
+                            );
+                            Ok(true)
+                        })
+                        // GPUI drops windows before awaiting quit jobs. The
+                        // known owner and token are already durably saved.
+                        .unwrap_or(Ok(owner_was_saved));
+                    match permission {
+                        Ok(true) => {
+                            cx.background_executor()
+                                .spawn(async move {
+                                    integrations::close_local_tmux(
+                                        &owner, token, initialize, deadline,
+                                    )
+                                    .map(|outcome| Some((owner, outcome)))
+                                })
+                                .await
+                        }
+                        Ok(false) => Ok(None),
+                        Err(error) => Err(error),
                     }
                 }
                 Err(error) => Err(error),
             };
             let _ = this.update(cx, |app, cx| {
+                if app.local_closes_inflight.get(&iid) != Some(&token) {
+                    return;
+                }
                 app.local_closes_inflight.remove(&iid);
                 if app.current_workspace != workspace {
                     return;
                 }
                 match result {
-                    Ok(owner) => {
-                        app.finish_closed_session(project_id, iid, &owner);
+                    Ok(Some((owner, integrations::LocalTmuxClose::Gone))) => {
+                        app.finish_closed_session(project_id, iid, &owner, cx);
                         app.cleanup_closed_worktree(project_id, cleanup, cx);
                     }
+                    Ok(Some((owner, integrations::LocalTmuxClose::Preserved))) => {
+                        app.cancel_local_close(project_id, iid);
+                        app.log_kept_close_worktree(iid, &cleanup);
+                        muxel_store::append_event_log(&format!(
+                            "close: generation changed for [{iid}] {owner}; session and files kept"
+                        ));
+                    }
+                    Ok(None) => {}
                     Err(error) => {
                         muxel_store::append_event_log(&format!(
                             "close: local tmux teardown for [{iid}] pending retry: {error:#}"
@@ -17091,6 +17248,7 @@ impl MuxelApp {
             name: session.name,
             socket: session.socket,
             instance: iid,
+            local_close_token: None,
         };
         let control_path = Self::commands_control_path(host.id);
         let password = (host.auth == SshAuth::Password)
@@ -17187,7 +17345,7 @@ impl MuxelApp {
                     return;
                 }
                 match err {
-                    None => this.finish_closed_session(project_id, iid, &session),
+                    None => this.finish_closed_session(project_id, iid, &session, cx),
                     Some(msg) => {
                         // Not an error dialog: the session is remembered, the pane stays
                         // closed, and the next connect to the host finishes the job.
@@ -17218,7 +17376,13 @@ impl MuxelApp {
     /// the close also covers a session that comes back on its own after the kill —
     /// a pane closed while its ssh was still connecting can start it on the host
     /// after the kill has run.
-    fn finish_closed_session(&mut self, project_id: Uuid, iid: Uuid, session: &SessionTarget) {
+    fn finish_closed_session(
+        &mut self,
+        project_id: Uuid,
+        iid: Uuid,
+        session: &SessionTarget,
+        cx: &mut Context<Self>,
+    ) {
         debug_assert!(
             session.socket.is_some(),
             "completed closes retain their owner"
@@ -17229,12 +17393,24 @@ impl MuxelApp {
                 name: session.name.clone(),
                 socket: session.socket.clone(),
                 instance: iid,
+                local_close_token: None,
             });
         }
         if let Some(p) = self.workspace.project_mut(project_id)
             && p.forget_closed_session(iid)
         {
+            let settled = p.closed_sessions.is_empty();
             self.persist();
+            if settled {
+                let worktrees: Vec<_> = self
+                    .deferred_worktree_dispose
+                    .get(&project_id)
+                    .map(|choices| choices.keys().copied().collect())
+                    .unwrap_or_default();
+                for wid in worktrees {
+                    self.dispose_worktree_if_orphaned(wid, cx);
+                }
+            }
         }
     }
 
@@ -17256,6 +17432,23 @@ impl MuxelApp {
             );
         }
         closed
+    }
+
+    fn closed_sessions_on(&self, host_id: Option<Uuid>) -> Vec<muxel_core::tmux::ClosedSession> {
+        let mut seen = HashSet::new();
+        self.workspace
+            .projects
+            .iter()
+            .filter(|project| project.remote.as_ref().map(|remote| remote.host_id) == host_id)
+            .flat_map(|project| {
+                project
+                    .closed_sessions
+                    .iter()
+                    .chain(self.reaped_sessions.get(&project.id).into_iter().flatten())
+            })
+            .filter(|closed| seen.insert(closed.instance))
+            .cloned()
+            .collect()
     }
 
     /// Connect-time half of [`Self::reap_remote_session`]: reconcile a project's
@@ -17298,7 +17491,7 @@ impl MuxelApp {
         for (iid, name, live) in pending {
             match live {
                 Some(session) => self.reap_remote_session(pid, iid, host.clone(), session, cx),
-                None => self.finish_closed_session(pid, iid, &name),
+                None => self.finish_closed_session(pid, iid, &name, cx),
             }
         }
     }
@@ -17399,6 +17592,9 @@ impl MuxelApp {
     /// worktree (clean tree + nothing unmerged); otherwise queue the dispose modal
     /// so uncommitted changes / unmerged commits aren't lost silently.
     fn dispose_worktree_if_orphaned(&mut self, wid: Uuid, cx: &mut Context<Self>) {
+        if self.finish_deferred_worktree_dispose(wid, cx) {
+            return;
+        }
         // A question already showing for it decides; never queue a second one.
         if !self.workspace.instances_using(wid).is_empty()
             || self.pending_worktree_dispose.iter().any(|d| d.wid == wid)
@@ -17411,6 +17607,9 @@ impl MuxelApp {
         let Some(w) = self.workspace.worktree(wid) else {
             return;
         };
+        if w.detached {
+            return;
+        }
         let path = w.path.clone();
         let name = w.name.clone();
         let color = w.color;
@@ -17436,6 +17635,7 @@ impl MuxelApp {
             integrations::repo_current_branch(&integrations::RepoLoc::Local(root.clone()))
                 .unwrap_or_else(|| "base".to_string());
         self.pending_worktree_dispose.push_back(WorktreeDispose {
+            project_id: w.project_id,
             close_after: Vec::new(),
             close_rest: Vec::new(),
             wid,
@@ -17489,6 +17689,7 @@ impl MuxelApp {
             integrations::repo_current_branch(&integrations::RepoLoc::Local(root.clone()))
                 .unwrap_or_else(|| "base".to_string());
         self.pending_worktree_dispose.push_back(WorktreeDispose {
+            project_id: w.project_id,
             close_after: Vec::new(),
             close_rest: Vec::new(),
             wid,
@@ -17524,31 +17725,150 @@ impl MuxelApp {
         pending
     }
 
-    /// A disposal answer can close panes, but doesn't prove an asynchronous
-    /// tmux teardown has finished. Keep their files and let the user review
-    /// disposal again after teardown, rather than racing git against an agent.
-    fn prepare_worktree_removal(&mut self, d: &WorktreeDispose, cx: &mut Context<Self>) -> bool {
-        let pending = d.close_after.iter().any(|iid| {
-            self.workspace
-                .instance(*iid)
-                .is_some_and(|inst| self.close_session_may_outlive(inst))
-        });
-        self.finalize_worktree_choice(&d.close_after, cx);
-        self.request_recoverable_close(d.close_rest.clone(), cx);
-        if !pending && self.keep_worktree_for_pending_close(d.wid, cx) {
-            return false;
+    /// A file choice authorizes a later git action, never an immediate terminal
+    /// kill. Busy confirmation and the Undo hold still own the close.
+    fn choose_worktree_dispose(
+        &mut self,
+        d: WorktreeDispose,
+        action: WorktreeDisposeAction,
+        cx: &mut Context<Self>,
+    ) {
+        let live = d
+            .close_after
+            .iter()
+            .any(|iid| self.workspace.instance(*iid).is_some());
+        let pending = self
+            .workspace
+            .project(d.project_id)
+            .is_some_and(|p| !p.closed_sessions.is_empty());
+        if !live && !pending {
+            let rest = d.close_rest.clone();
+            self.execute_worktree_dispose(d, action, cx);
+            self.request_recoverable_close(rest, cx);
+            return;
         }
-        if pending {
-            if let Some(worktree) = self.workspace.worktree_mut(d.wid) {
-                worktree.detached = true;
+        let ids = d.close_after.iter().chain(&d.close_rest).copied().collect();
+        self.deferred_worktree_dispose
+            .entry(d.project_id)
+            .or_default()
+            .insert(d.wid, (d, action));
+        self.request_recoverable_close(ids, cx);
+    }
+
+    fn cancel_deferred_worktree_closes(&mut self, ids: &[Uuid]) {
+        let worktrees: HashSet<_> = ids
+            .iter()
+            .filter_map(|iid| {
+                let inst = self.workspace.instance(*iid)?;
+                Some((inst.project_id, inst.worktree_id?))
+            })
+            .collect();
+        for (pid, wid) in worktrees {
+            if let Some(choices) = self.deferred_worktree_dispose.get_mut(&pid) {
+                choices.remove(&wid);
             }
-            self.add_event(NotifKind::Error, t("Worktree kept"),
-                t("The tmux session is still stopping. Review this worktree again after it has stopped."));
-            self.persist();
-            cx.notify();
+        }
+        self.deferred_worktree_dispose
+            .retain(|_, choices| !choices.is_empty());
+    }
+
+    fn take_deferred_worktree_dispose(
+        &mut self,
+        pid: Uuid,
+        wid: Uuid,
+    ) -> Option<(WorktreeDispose, WorktreeDisposeAction)> {
+        let choices = self.deferred_worktree_dispose.get_mut(&pid)?;
+        let choice = choices.remove(&wid);
+        if choices.is_empty() {
+            self.deferred_worktree_dispose.remove(&pid);
+        }
+        choice
+    }
+
+    /// True while a prior answer owns disposal, including while a tmux close
+    /// is unconfirmed. A new pane invalidates that captured answer.
+    fn finish_deferred_worktree_dispose(&mut self, wid: Uuid, cx: &mut Context<Self>) -> bool {
+        let Some(pid) = self.workspace.worktree(wid).map(|w| w.project_id) else {
+            return false;
+        };
+        let Some((d, _)) = self
+            .deferred_worktree_dispose
+            .get(&pid)
+            .and_then(|choices| choices.get(&wid))
+        else {
+            return false;
+        };
+        let captured: HashSet<_> = d.close_after.iter().copied().collect();
+        let members = self.workspace.instances_using(wid);
+        if members.iter().any(|iid| !captured.contains(iid)) {
+            self.take_deferred_worktree_dispose(pid, wid);
             return false;
         }
+        if !members.is_empty()
+            || self
+                .workspace
+                .project(pid)
+                .is_some_and(|p| !p.closed_sessions.is_empty())
+        {
+            return true;
+        }
+        let (d, action) = self.take_deferred_worktree_dispose(pid, wid).unwrap();
+        self.execute_worktree_dispose(d, action, cx);
         true
+    }
+
+    fn execute_worktree_dispose(
+        &mut self,
+        d: WorktreeDispose,
+        action: WorktreeDisposeAction,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.workspace.instances_using(d.wid).is_empty()
+            || self.keep_worktree_for_pending_close(d.wid, cx)
+        {
+            return;
+        }
+        let result = match &action {
+            WorktreeDisposeAction::Keep => Ok(()),
+            WorktreeDisposeAction::Discard => Ok(()),
+            WorktreeDisposeAction::Commit(message) => {
+                integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), message)
+                    .map(|_| ())
+            }
+            WorktreeDisposeAction::Merge(message) => {
+                // Recheck at execution: the agent could edit during its hold.
+                let commit = if integrations::worktree_change_count(&d.path) > 0 {
+                    integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), message)
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                };
+                commit.and_then(|()| {
+                    integrations::merge_worktree_branch(&d.root, &d.branch).map(|_| ())
+                })
+            }
+        };
+        let keep = matches!(action, WorktreeDisposeAction::Keep) || result.is_err();
+        if let Err(error) = result {
+            log::warn!("worktree disposal failed, keeping it: {error}");
+            self.add_event(NotifKind::Error, t("Worktree kept"), error.to_string());
+        }
+        if keep {
+            if let Some(w) = self.workspace.worktree_mut(d.wid) {
+                w.detached = true;
+            }
+        } else {
+            integrations::remove_worktree(&d.root, &d.path);
+            if matches!(
+                action,
+                WorktreeDisposeAction::Discard | WorktreeDisposeAction::Merge(_)
+            ) {
+                integrations::delete_branch(&d.root, &d.branch);
+            }
+            self.workspace.remove_worktree_meta(d.wid);
+        }
+        self.persist();
+        cx.notify();
     }
 
     /// Commit the front pending worktree (message = the input, or its name), then
@@ -17557,9 +17877,6 @@ impl MuxelApp {
         let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
-        if !self.prepare_worktree_removal(&d, cx) {
-            return;
-        }
         let typed = self
             .dispose_commit_input
             .read(cx)
@@ -17571,20 +17888,7 @@ impl MuxelApp {
         } else {
             typed
         };
-        match integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), &msg) {
-            Ok(_) => {
-                integrations::remove_worktree(&d.root, &d.path);
-                self.workspace.remove_worktree_meta(d.wid);
-            }
-            Err(e) => {
-                log::warn!("worktree commit failed, keeping it: {e}");
-                if let Some(w) = self.workspace.worktree_mut(d.wid) {
-                    w.detached = true;
-                }
-            }
-        }
-        self.persist();
-        cx.notify();
+        self.choose_worktree_dispose(d, WorktreeDisposeAction::Commit(msg), cx);
     }
 
     /// Discard the front pending worktree: force-remove it AND delete its branch,
@@ -17593,14 +17897,7 @@ impl MuxelApp {
         let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
-        if !self.prepare_worktree_removal(&d, cx) {
-            return;
-        }
-        integrations::remove_worktree(&d.root, &d.path);
-        integrations::delete_branch(&d.root, &d.branch);
-        self.workspace.remove_worktree_meta(d.wid);
-        self.persist();
-        cx.notify();
+        self.choose_worktree_dispose(d, WorktreeDisposeAction::Discard, cx);
     }
 
     /// Merge the front pending worktree's branch into the base, then remove the
@@ -17610,55 +17907,18 @@ impl MuxelApp {
         let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
-        if !self.prepare_worktree_removal(&d, cx) {
-            return;
-        }
-        // Land any uncommitted changes onto the branch first, so the merge
-        // includes them. On failure, keep the worktree (no work lost).
-        if d.changed > 0 {
-            let typed = self
-                .dispose_commit_input
-                .read(cx)
-                .value()
-                .trim()
-                .to_string();
-            let msg = if typed.is_empty() {
-                d.name.clone()
-            } else {
-                typed
-            };
-            if let Err(e) =
-                integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), &msg)
-            {
-                log::warn!("worktree commit failed, keeping it: {e}");
-                if let Some(w) = self.workspace.worktree_mut(d.wid) {
-                    w.detached = true;
-                }
-                self.persist();
-                cx.notify();
-                return;
-            }
-        }
-        match integrations::merge_worktree_branch(&d.root, &d.branch) {
-            Ok(()) => {
-                integrations::remove_worktree(&d.root, &d.path);
-                integrations::delete_branch(&d.root, &d.branch);
-                self.workspace.remove_worktree_meta(d.wid);
-            }
-            Err(e) => {
-                log::warn!("worktree merge failed, keeping it: {e}");
-                if let Some(w) = self.workspace.worktree_mut(d.wid) {
-                    w.detached = true;
-                }
-                self.add_event(
-                    NotifKind::Error,
-                    tf("Couldn't merge {name}", &[("name", &d.name.to_string())]),
-                    tf("{e} — the worktree was kept.", &[("e", &e.to_string())]),
-                );
-            }
-        }
-        self.persist();
-        cx.notify();
+        let typed = self
+            .dispose_commit_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let msg = if typed.is_empty() {
+            d.name.clone()
+        } else {
+            typed
+        };
+        self.choose_worktree_dispose(d, WorktreeDisposeAction::Merge(msg), cx);
     }
 
     /// Keep the front pending worktree on disk (detached, resumable later).
@@ -17666,13 +17926,7 @@ impl MuxelApp {
         let Some(d) = self.take_worktree_dispose(cx) else {
             return;
         };
-        self.finalize_worktree_choice(&d.close_after, cx);
-        self.request_recoverable_close(d.close_rest.clone(), cx);
-        if let Some(w) = self.workspace.worktree_mut(d.wid) {
-            w.detached = true;
-        }
-        self.persist();
-        cx.notify();
+        self.choose_worktree_dispose(d, WorktreeDisposeAction::Keep, cx);
     }
 
     /// Run a (possibly slow) git/gh operation off the main thread, toasting the
@@ -20513,6 +20767,14 @@ impl MuxelApp {
     }
 
     fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = &self.confirm {
+            let ids = match &pending.action {
+                ConfirmAction::CloseBatch(ids) => ids.clone(),
+                ConfirmAction::SaveEditorBeforeClose { rest, .. } => rest.clone(),
+                _ => Vec::new(),
+            };
+            self.cancel_deferred_worktree_closes(&ids);
+        }
         self.confirm = None;
         cx.notify();
     }
@@ -20857,6 +21119,7 @@ impl MuxelApp {
                                 name: owner.name.clone(),
                                 socket: owner.socket.clone(),
                                 instance: iid,
+                                local_close_token: None,
                             };
                             if self.terminal_restarts.record_owner(
                                 &mut self.workspace,
@@ -20907,6 +21170,7 @@ impl MuxelApp {
                 name: session.name,
                 socket: session.socket,
                 instance: iid,
+                local_close_token: None,
             };
             let resolved = cx
                 .background_executor()

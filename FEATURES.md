@@ -137,8 +137,10 @@ feature is added or changed, update the matching entry here in the same change**
   be read explicitly proceeds without it.
 - **Resource and worktree close** — dirty editors offer Save / Don't Save /
   Cancel; clean editors, diffs and browsers close immediately. The last pane of
-  a muxel worktree with changes or unmerged commits uses its disposal choice
-  directly; a clean, landed worktree follows the terminal countdown policy. A
+  a muxel worktree with changes or unmerged commits asks what to do with its files,
+  then follows the same busy confirmation and countdown with Undo as other
+  terminals. Commit / Merge / Discard / Keep run only after the close finishes
+  and tmux teardown is confirmed; Undo or Cancel cancels the file action. A
   pane opened in that worktree while its question is showing gets its own
   prompt and countdown, and a pane brought back by Undo leaves the question.
   Client checks show progress, beside any running countdown, with their own
@@ -148,9 +150,14 @@ feature is added or changed, update the matching entry here in the same change**
   closes until a fresh layout read can run on the next visit. They also keep a pane
   still being checked or waiting for Close / Keep, which reopens next time.
   Local tmux closes save a pending kill before teardown and retry it on project
-  activation after a crash. Their worktree cleanup waits for confirmed session
-  death. Unconfirmed remote cleanup and disposal choices made while tmux is
-  still stopping keep the worktree and report why; review it again after teardown.
+  activation after layout reconciliation. A pane that reappeared or now shows
+  that session cancels its retry. Retries match the original close's generation
+  token; a same-name replacement is kept, and unverified legacy closes are
+  cancelled without killing. The event log records the retained target; Import
+  keeps its existing server-discovery scope and excludes pending kills on that host.
+  Their worktree cleanup waits for confirmed session death. Unconfirmed remote
+  cleanup keeps the worktree and reports why. Legacy worktrees are kept when
+  dirty, unmerged or still shared by another pane.
   Project removal keeps the retry ledger until teardown is confirmed; remove
   the empty project again after its sessions have stopped.
   Removing a project waits for that decision. If that save fails, the first
