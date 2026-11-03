@@ -1117,7 +1117,7 @@ pub struct Project {
     pub layout_updated_at: Option<u64>,
     /// Panes closed on this project's host whose tmux session muxel has not yet
     /// confirmed dead. Persisted because the confirmation may have to wait for the
-    /// next connect — see [`tmux::ClosedSession`]. Local bookkeeping, never part of
+    /// next connect or local project activation — see [`tmux::ClosedSession`]. Local bookkeeping, never part of
     /// the synced layout doc.
     #[serde(default)]
     pub closed_sessions: Vec<tmux::ClosedSession>,
@@ -1169,9 +1169,8 @@ impl Project {
     /// the host confirms it is gone. Idempotent per instance: closing, failing to
     /// confirm, and closing again leaves one entry.
     ///
-    /// Capped, oldest first: a host that is never reachable again would otherwise
-    /// grow the ledger without bound, and an entry that old has long stopped
-    /// protecting anything — its instance is gone from the workspace.
+    /// Remote history is capped, oldest first. Local pending kills must all
+    /// survive: local inventory cannot adopt an orphan whose kill was forgotten.
     pub fn remember_closed_session(&mut self, session: tmux::SessionTarget, instance: Uuid) {
         self.closed_sessions.retain(|c| c.instance != instance);
         self.closed_sessions.push(tmux::ClosedSession {
@@ -1179,11 +1178,13 @@ impl Project {
             socket: session.socket,
             instance,
         });
-        let over = self
-            .closed_sessions
-            .len()
-            .saturating_sub(MAX_CLOSED_SESSIONS);
-        self.closed_sessions.drain(..over);
+        if self.is_remote() {
+            let over = self
+                .closed_sessions
+                .len()
+                .saturating_sub(MAX_CLOSED_SESSIONS);
+            self.closed_sessions.drain(..over);
+        }
     }
 
     /// Forget a close whose session the host has confirmed gone.
@@ -3825,6 +3826,29 @@ mod closed_session_tests {
     use uuid::Uuid;
 
     #[test]
+    fn local_close_ledger_survives_a_large_batch_and_restart() {
+        let mut project = Project::new("local", "/local");
+        let ids: std::collections::HashSet<_> = (0..128)
+            .map(|n| {
+                let id = Uuid::new_v4();
+                project.remember_closed_session(format!("local-{n}").into(), id);
+                id
+            })
+            .collect();
+        let saved = serde_json::to_vec(&project).unwrap();
+        let restored: Project = serde_json::from_slice(&saved).unwrap();
+        let retryable: std::collections::HashSet<_> = restored
+            .closed_sessions
+            .iter()
+            .map(|c| c.instance)
+            .collect();
+        assert_eq!(
+            retryable, ids,
+            "a crash must not lose any unconfirmed local kill"
+        );
+    }
+
+    #[test]
     fn closing_the_same_pane_twice_leaves_one_entry() {
         let mut p = Project::new("app", "/srv/app");
         let iid = Uuid::new_v4();
@@ -3844,6 +3868,10 @@ mod closed_session_tests {
     #[test]
     fn the_ledger_is_capped_oldest_first() {
         let mut p = Project::new("app", "/srv/app");
+        p.remote = Some(super::RemoteRef {
+            host_id: Uuid::new_v4(),
+            remote_root: "/srv/app".into(),
+        });
         let ids: Vec<Uuid> = (0..MAX_CLOSED_SESSIONS + 10)
             .map(|n| {
                 let iid = Uuid::new_v4();

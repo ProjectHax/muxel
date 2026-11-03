@@ -565,7 +565,7 @@ fn control_new_policy_creation_opt_in_denies_all_launch_classes() {
 fn control_new_policy_creation_opt_in_is_checked_at_admission() {
     let source = include_str!("../control_api.rs");
     let admission = source
-        .split("    fn control_command(")
+        .split("fn control_command(")
         .nth(1)
         .unwrap()
         .split("    fn control_new_destination(")

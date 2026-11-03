@@ -181,7 +181,7 @@ fn idle_agent_close_holds_process_and_undo_restores_tab_order() {
 }
 
 #[test]
-fn held_panes_stay_out_of_ctl_listings_and_refuse_closing() {
+fn held_panes_allow_ctl_reads_but_refuse_input_with_current_close_state() {
     with_app(|cx, window| {
         let pid = project(cx, window);
         let (held, _, child) = terminal(cx, window, pid);
@@ -200,13 +200,203 @@ fn held_panes_stay_out_of_ctl_listings_and_refuse_closing() {
                     .expect("held write refused");
                 assert_eq!(error.code, Some(ErrorCode::Closing));
                 assert_eq!(error.undo_until, Some(deadline));
-                let error = app.control_resolve(&held.to_string()).unwrap_err();
-                assert_eq!(error.code, Some(ErrorCode::Closing));
-                assert_eq!(error.undo_until, Some(deadline));
+                assert_eq!(app.control_resolve(&held.to_string()).unwrap(), held);
+                for command in [
+                    muxel_core::control::Command::Status {
+                        agent: Some(held.to_string()),
+                    },
+                    muxel_core::control::Command::Show {
+                        agent: held.to_string(),
+                        full: false,
+                    },
+                    muxel_core::control::Command::Screen {
+                        agent: held.to_string(),
+                        lines: Some(10),
+                    },
+                ] {
+                    match app.control_command(command, None, cx) {
+                        super::control_api::Answer::Now(result) => {
+                            result.unwrap();
+                        }
+                        super::control_api::Answer::Later(read) => {
+                            read().unwrap();
+                        }
+                        _ => panic!("read requested an input operation"),
+                    }
+                }
+                for state in [
+                    "awaiting_decision",
+                    "checking",
+                    "restoring",
+                    "counting_down",
+                ] {
+                    let held_group = app.close_groups.iter_mut().find(|g| g.id == group).unwrap();
+                    held_group.needs_decision = state == "awaiting_decision";
+                    held_group.checking = state == "checking";
+                    held_group.undoing = state == "restoring";
+                    held_group.undo_until = 1;
+                    let refusal = app.control_writable(held, cx).err().unwrap();
+                    assert_eq!(refusal.code, Some(ErrorCode::Closing));
+                    assert_eq!(refusal.undo_until, None);
+                    assert_eq!(refusal.reason.as_deref(), Some(state));
+                }
+                app.close_groups
+                    .iter_mut()
+                    .find(|g| g.id == group)
+                    .unwrap()
+                    .undoing = false;
                 assert!(!child.exited());
                 app.undo_close(group, window, cx);
                 assert!(app.control_writable(held, cx).is_ok());
                 assert_eq!(app.control_resolve(&held.to_string()).unwrap(), held);
+                app.close_instance_inner(held, "close (wait disappearance)", cx);
+                let error = app.control_resolve(&held.to_string()).unwrap_err();
+                assert_eq!(error.code, Some(ErrorCode::Exited));
+                assert!(error.message.contains("closed"));
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn explicit_close_reads_shared_layout_before_removing_the_pane() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.use_tmux = true;
+                app.remote_synced.insert(pid);
+                let gid = app.hold_closes(vec![(pane, true)], None, cx).unwrap();
+                app.close_groups
+                    .iter_mut()
+                    .find(|g| g.id == gid)
+                    .unwrap()
+                    .needs_decision = true;
+                app.finalize_close_group(gid, cx);
+                assert!(
+                    app.workspace.instance(pane).is_some(),
+                    "Close bypassed the layout read"
+                );
+                assert!(!child.exited());
+                assert!(app.close_layout_poll);
+                let ticket = app.layout_reads.entry(pid).or_default().begin();
+                app.layout_reads.get_mut(&pid).unwrap().applied(ticket);
+                app.expire_closes(Instant::now(), cx);
+                assert!(app.workspace.instance(pane).is_none());
+            })
+            .unwrap();
+        wait_for_exit(cx, &child);
+    });
+}
+
+#[test]
+fn departure_keeps_a_close_whose_shared_layout_has_not_been_read() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, _, cx| {
+                app.use_tmux = true;
+                app.remote_synced.insert(pid);
+                app.hold_closes(vec![(pane, true)], None, cx).unwrap();
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(app.is_closing(pane));
+                app.finalize_all_closes(cx);
+                assert!(
+                    app.workspace.instance(pane).is_some(),
+                    "departure bypassed the layout read"
+                );
+                assert_eq!(app.workspace.project(pid).unwrap().instances(), vec![pane]);
+                assert!(!child.exited());
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn local_tmux_close_is_saved_for_retry_before_the_kill_runs() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, _child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, _, cx| {
+                let instance = app.workspace.instance_mut(pane).unwrap();
+                instance.tmux_session = Some("muxel-close-ledger-fixture".into());
+                instance.tmux_socket = Some(muxel_core::tmux::Socket::Named(format!(
+                    "muxel-close-test-{}",
+                    Uuid::new_v4()
+                )));
+                app.close_instance_inner(pane, "close (ledger regression)", cx);
+                let saved = muxel_store::load_workspace_from(
+                    &muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap(),
+                )
+                .unwrap();
+                assert!(saved.instance(pane).is_none());
+                assert_eq!(
+                    saved.project(pid).unwrap().closed_sessions.len(),
+                    1,
+                    "removed metadata was saved without a retryable tmux close"
+                );
+                assert_eq!(
+                    saved.project(pid).unwrap().closed_sessions[0].instance,
+                    pane
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn unconfirmed_tmux_close_keeps_its_worktree_and_blocks_disposal() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, _child) = terminal(cx, window, pid);
+        let (wid, path) = clean_worktree(cx, window, pid, pane);
+        window
+            .update(cx, |app, _, cx| {
+                let instance = app.workspace.instance_mut(pane).unwrap();
+                instance.tmux_session = Some("muxel-close-worktree-fixture".into());
+                instance.tmux_socket = Some(muxel_core::tmux::Socket::Named(format!(
+                    "muxel-close-test-{}",
+                    Uuid::new_v4()
+                )));
+                app.close_instance_inner(pane, "close (worktree safety regression)", cx);
+                assert!(
+                    path.is_dir(),
+                    "git removed files before the tmux kill was confirmed"
+                );
+                assert!(app.workspace.worktree(wid).is_some());
+                app.review_worktree(wid, cx);
+                assert!(
+                    path.is_dir(),
+                    "sidebar review bypassed unconfirmed teardown"
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn project_removal_preserves_the_local_tmux_retry_ledger() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, _child) = terminal(cx, window, pid);
+        window
+            .update(cx, |app, _, cx| {
+                let instance = app.workspace.instance_mut(pane).unwrap();
+                instance.tmux_session = Some("muxel-close-project-fixture".into());
+                instance.tmux_socket = Some(muxel_core::tmux::Socket::Named(format!(
+                    "muxel-close-test-{}",
+                    Uuid::new_v4()
+                )));
+                app.delete_project(pid, cx);
+                assert!(
+                    app.workspace.project(pid).is_some(),
+                    "project removal lost the pending kill ledger"
+                );
+                assert_eq!(app.workspace.project(pid).unwrap().closed_sessions.len(), 1);
             })
             .unwrap();
     });

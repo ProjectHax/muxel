@@ -115,7 +115,11 @@ feature is added or changed, update the matching entry here in the same change**
   work. Batch closes offer Close all, Close only the idle ones, or Cancel.
   Queued input, written to the terminal or sent through tmux, is cancelled
   across close and Undo, and hidden panes leave ctl listings; writes refuse
-  with `closing` and `undo_until`. A shell counts down only with prompt
+  with `closing`. Reads by id or name (`status`, `show`, `screen`, `wait`)
+  still work. `undo_until` is present only during the countdown; checks,
+  Close / Keep and restoration report their state without an expired deadline.
+  If the pane disappears while `wait` polls or collects its result, `wait`
+  returns `exited` with an explanation. A shell counts down only with prompt
   evidence, so local tmux shells on Unix, which can't pass OSC 133 through,
   always ask. A tmux pane that only looks dead here (never connected, a
   failed restart, a detached client) asks too, since closing it kills a
@@ -128,7 +132,9 @@ feature is added or changed, update the matching entry here in the same change**
   layout, showing "Checking before close…" until then, so edits a peer made
   while this machine slept are adopted, not overwritten. When that layout
   can't be read (its host is offline or reconnecting, or no read lands within
-  30 seconds), the close asks Close or Keep instead.
+  30 seconds), the close asks Close or Keep instead. Explicit Close also waits
+  for a read begun after the click; a Close offered because the layout cannot
+  be read explicitly proceeds without it.
 - **Resource and worktree close** — dirty editors offer Save / Don't Save /
   Cancel; clean editors, diffs and browsers close immediately. The last pane of
   a muxel worktree with changes or unmerged commits uses its disposal choice
@@ -138,8 +144,15 @@ feature is added or changed, update the matching entry here in the same change**
   Client checks show progress, beside any running countdown, with their own
   Cancel; a batch member closed during the check leaves the others to their
   decision. Ordinary saves preserve held panes for crash recovery; workspace
-  switch and quit (or logout) finish running countdowns, but keep a pane
+  switch and quit (or logout) finish unshared running countdowns, but keep shared
+  closes until a fresh layout read can run on the next visit. They also keep a pane
   still being checked or waiting for Close / Keep, which reopens next time.
+  Local tmux closes save a pending kill before teardown and retry it on project
+  activation after a crash. Their worktree cleanup waits for confirmed session
+  death. Unconfirmed remote cleanup and disposal choices made while tmux is
+  still stopping keep the worktree and report why; review it again after teardown.
+  Project removal keeps the retry ledger until teardown is confirmed; remove
+  the empty project again after its sessions have stopped.
   Removing a project waits for that decision. If that save fails, the first
   switch stops with a notice and the next one leaves anyway; the pane reopens
   next time. Saving an untitled editor on close writes the path picked in the

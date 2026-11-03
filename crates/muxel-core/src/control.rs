@@ -281,11 +281,16 @@ pub enum ErrorCode {
     Blocked,
     /// The agent is still starting: try again in a moment.
     Starting,
-    /// The pane is held for closing; the user can undo before `undo_until`.
+    /// Input is refused while the pane is held for closing. Reads still work.
+    /// `undo_until` is present only during its countdown; otherwise `reason`
+    /// describes `counting_down`, `checking`, `awaiting_decision` or `restoring`
+    /// with no deadline. A countdown whose wall-clock deadline elapsed (for
+    /// example across suspend) omits that expired deadline too.
     Closing,
     /// The pane isn't running this session, or its program failed to start.
     NotRunning,
-    /// The agent's program has exited.
+    /// The agent's program has exited, or the addressed UUID is no longer in
+    /// this workspace. A missing pane does not prove a remote process is dead.
     Exited,
     /// Another request holds the shared tmux claim, or another `send` from this
     /// muxel hasn't pressed its Enter yet.
@@ -474,7 +479,8 @@ pub struct AgentInfo {
     /// The pane the user has focused.
     pub focused: bool,
     /// The pane (tab group) it is a tab of, numbered in layout order from 1.
-    /// `None` when it is popped out into its own window.
+    /// `None` when popped out into its own window or held outside the layout
+    /// for a recoverable close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1914,7 +1920,7 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
 - `not_running`, `exited` - the agent isn't running; the user has to open it.
 - `claimed_elsewhere` - another request holds the shared tmux claim, or another
   `send` to the agent hasn't pressed Enter yet.
-- `closing` - the pane is closing; `undo_until` is its undo deadline (unix ms). Undo in muxel before sending more input.
+- `closing` - input is refused while a pane is held for close. Reads (`status`, `show`, `screen`, `wait`) still work by id/name. `undo_until` is the countdown deadline (unix ms); once that clock deadline expires it is omitted and `reason` is `counting_down`, `checking`, `awaiting_decision` or `restoring`. Use Keep or Undo in muxel, or wait for restoration, before sending input. If the pane closes while `wait` polls or collects its result, it returns `exited` with an explanation instead of waiting indefinitely.
 - `launch_mismatch` - the terminal was replaced since the supplied `launch_id`.
 - `input_changed` - the prompt was pasted but Enter was withheld. Inspect
   `screen` before retrying; the input is still there.

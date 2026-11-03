@@ -633,6 +633,25 @@ pub fn fetch_remote_layout(loc: &RepoLoc) -> Option<String> {
     }
 }
 
+/// A poll distinguishes a missing local layout from a failed/oversized read.
+/// Only a successful read (or confirmed absence) may release a pending close.
+pub fn fetch_layout_for_poll(loc: &RepoLoc) -> (bool, Option<String>) {
+    if let RepoLoc::Local(root) = loc {
+        let path = local_layout_abs(root);
+        match std::fs::metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (true, None),
+            Ok(metadata) if metadata.len() <= MAX_REMOTE_BYTES => {}
+            _ => return (false, None),
+        }
+        return match std::fs::read_to_string(path) {
+            Ok(json) => (true, Some(json)),
+            Err(_) => (false, None),
+        };
+    }
+    let json = fetch_remote_layout(loc);
+    (json.is_some(), json)
+}
+
 /// Push the project's pane-layout JSON to `<root>/.muxel/workspace.json`, backing up
 /// the previous copy to `workspace.bak.json` first and ensuring `.muxel/` is
 /// git-ignored — over SSH for a remote project, on the local filesystem for a local
@@ -3302,6 +3321,18 @@ fn run_tmux_until(
     let (child, status) = lifecycle.wait_until(child, deadline);
     lifecycle.reap(child);
     Ok(status)
+}
+
+/// Resolve a local close's owner so the caller can save it before teardown.
+/// Run on a background executor, sharing its deadline with the later kill.
+pub fn resolve_local_tmux_close(
+    session: &SessionTarget,
+    deadline: Instant,
+) -> Result<SessionTarget> {
+    let session = profile_tmux_target(session);
+    resolve_tmux_owner_with(&session, |socket| {
+        local_tmux_has_session_confirmed(socket, &session.name, deadline)
+    })
 }
 
 /// Close a local tmux session on its recorded or confirmed legacy owner.

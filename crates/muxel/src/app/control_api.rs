@@ -190,7 +190,7 @@ pub(super) fn control_launch_spec(
 
 /// A reply ready now, work to finish off the UI thread first, or typing to do
 /// once any other muxel's claim on the agent has been checked.
-enum Answer {
+pub(super) enum Answer {
     Now(CtlResult<Value>),
     Later(Box<dyn FnOnce() -> CtlResult<Value> + Send>),
     Type(Box<Typing>),
@@ -248,7 +248,7 @@ struct ClaimStart {
 }
 
 /// Typing into an agent, already checked against the agent's own state.
-struct Typing {
+pub(super) struct Typing {
     iid: Uuid,
     input_epoch: u64,
     admitted_launch: Uuid,
@@ -918,7 +918,7 @@ impl MuxelApp {
         }
     }
 
-    fn control_command(
+    pub(super) fn control_command(
         &mut self,
         command: Command,
         caller_instance_id: Option<Uuid>,
@@ -1061,11 +1061,15 @@ impl MuxelApp {
                     .map_or("", |p| p.name.as_str()),
             })
             .collect();
-        let iid = ctl::resolve_agent(query, &entries, self.active_instance)?;
-        if let Some(until) = self.closing_until(iid) {
-            return Err(ctl::Error::closing(until));
+        if let Ok(iid) = Uuid::parse_str(query)
+            && self.workspace.instance(iid).is_none()
+        {
+            return Err(ctl::Error::new(
+                ErrorCode::Exited,
+                "the pane has closed or is no longer in this workspace",
+            ));
         }
-        Ok(iid)
+        Ok(ctl::resolve_agent(query, &entries, self.active_instance)?)
     }
 
     fn control_resolve_for_typing(
@@ -1075,6 +1079,9 @@ impl MuxelApp {
         force: bool,
     ) -> CtlResult<Uuid> {
         let iid = self.control_resolve(query)?;
+        if let Some(error) = self.closing_control_error(iid) {
+            return Err(error);
+        }
         ctl::check_self_target(caller_instance_id, iid, force)?;
         Ok(iid)
     }
@@ -1343,8 +1350,8 @@ impl MuxelApp {
 
     /// The session outside control may type into, or why it may not.
     pub(super) fn control_writable(&self, iid: Uuid, cx: &App) -> CtlResult<Arc<TerminalSession>> {
-        if let Some(until) = self.closing_until(iid) {
-            return Err(ctl::Error::closing(until));
+        if let Some(error) = self.closing_control_error(iid) {
+            return Err(error);
         }
         // Admission checked this too, but delayed Enters and keys write later.
         if !self.settings.control_enabled {

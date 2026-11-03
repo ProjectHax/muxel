@@ -6,6 +6,38 @@ return the stored snapshot; they never parse terminal rows or advance status.
 Attribution also checks the session's current binding revision, so a switch
 invalidates cached facts before its queued reconciliation runs.
 
+## Recoverable close and outside control
+
+A held terminal keeps its process and runtime snapshot. It leaves ctl listings,
+but `status`, `show`, `screen` and `wait` can still address it by id or name.
+Input, including forced sends and delayed keys, refuses with `closing`.
+`undo_until` is present only during an active countdown. Otherwise `reason`
+is `counting_down`, `checking`, `awaiting_decision` or `restoring`, with no
+deadline. `counting_down` covers a hold whose monotonic grace period continues
+after its wall-clock deadline elapsed, such as across suspend. Keep or
+Undo in the app restores input. A pane removed while `wait` polls or collects
+its result returns an `exited` error explaining that it closed or left the
+workspace.
+
+For shared layouts, expiry waits for a read begun after the deadline was
+noticed. Explicit Close starts a fresh read barrier after the click, including
+when an earlier expiry read succeeded before suspend. Malformed or failed
+reads and reads overtaken by a local push do not release that barrier. A
+confirmed missing local layout does. Unreadable layouts offer an explicit
+Close without reading or Keep. Quit and workspace departure restore shared
+closes instead of committing removal without a fresh comparison.
+
+Local tmux removal saves a pending kill in the project's close ledger before
+teardown, then saves the resolved server owner before killing. A crash before
+the save leaves the old pane attachable; a crash afterwards leaves a retry on
+project activation. Kill and confirmation share a ten-second bound. A failed
+kill keeps its ledger entry and worktree. Automatic local tmux worktree cleanup
+runs only after confirmation; unconfirmed remote teardown keeps the worktree
+and logs why. A disposal choice that also starts tmux teardown keeps the
+worktree for another review after teardown.
+Project removal preserves the project's pending-kill ledger until confirmation;
+remove the empty project again once its sessions have stopped.
+
 ## Reconciliation edges
 
 The view reconciles after drained PTY output, process exit, a settled resize,

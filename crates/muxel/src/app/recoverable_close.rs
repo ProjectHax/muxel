@@ -34,10 +34,11 @@ pub(super) struct CloseGroup {
     pub undo_until: i64,
     pub needs_decision: bool,
     pub checking: bool,
+    /// Explicit Close is waiting for a fresh layout read, then skips the work check.
+    pub finalizing: bool,
     pub undoing: bool,
-    /// Past the deadline: when it was first seen passed, and each
-    /// layout-shared project's read mark then. The close waits for a later
-    /// read of each (`expired_close_sync`).
+    /// The deadline was seen passed, or Close was clicked: that moment and
+    /// each shared project's read mark. Wait for a later read of each.
     pub sync_marks: Option<(Instant, Vec<(Uuid, u64)>)>,
     /// The decision is whether to close without reading the shared layout.
     pub layout_unread: bool,
@@ -47,8 +48,8 @@ pub(super) struct CloseGroup {
 }
 
 impl CloseGroup {
-    /// Past its deadline, waiting to read what peers did to the shared
-    /// layout. Leaving the workspace still finishes it as a running countdown.
+    /// Waiting to read what peers did to the shared layout, before expiry or
+    /// an explicit Close can finish.
     pub fn syncing(&self) -> bool {
         self.sync_marks.is_some() && !self.checking && !self.needs_decision && !self.undoing
     }
@@ -58,7 +59,7 @@ impl CloseGroup {
             CloseStage::Undoing
         } else if self.needs_decision {
             CloseStage::AwaitingDecision
-        } else if self.checking {
+        } else if self.checking || self.syncing() {
             CloseStage::Checking
         } else {
             CloseStage::CountingDown
@@ -102,7 +103,43 @@ impl MuxelApp {
         self.close_groups
             .iter()
             .find(|g| g.id == held.group)
+            .filter(|g| {
+                g.stage() == CloseStage::CountingDown
+                    && !g.syncing()
+                    && Instant::now() < g.deadline
+                    && chrono::Local::now().timestamp_millis() < g.undo_until
+            })
             .map(|g| g.undo_until)
+    }
+
+    pub(super) fn closing_control_error(&self, iid: Uuid) -> Option<muxel_core::control::Error> {
+        let held = self.closing.get(&iid)?;
+        let group = self.close_groups.iter().find(|g| g.id == held.group)?;
+        if let Some(until) = self.closing_until(iid) {
+            return Some(muxel_core::control::Error::closing(until));
+        }
+        let (reason, message) = match group.stage() {
+            CloseStage::Undoing => (
+                "restoring",
+                "the pane is being restored. Wait for restoration before sending input",
+            ),
+            CloseStage::AwaitingDecision => (
+                "awaiting_decision",
+                "the pane is waiting for Close / Keep. Choose Keep in muxel before sending input",
+            ),
+            CloseStage::Checking => (
+                "checking",
+                "the pane is being checked before close. Use Undo in muxel before sending input",
+            ),
+            CloseStage::CountingDown => (
+                "counting_down",
+                "the pane is held for closing. Use Undo in muxel before sending input",
+            ),
+        };
+        Some(
+            muxel_core::control::Error::new(muxel_core::control::ErrorCode::Closing, message)
+                .with_reason(reason),
+        )
     }
 
     pub(super) fn project_has_closes(&self, pid: Uuid) -> bool {
@@ -126,7 +163,7 @@ impl MuxelApp {
     /// Whether closing this pane kills a tmux session, here or on its host,
     /// which may still be running the agent whatever the local client shows.
     /// The same panes `teardown_closed_instance` kills or ledgers a session for.
-    fn close_session_may_outlive(&self, inst: &Instance) -> bool {
+    pub(super) fn close_session_may_outlive(&self, inst: &Instance) -> bool {
         let remote_unix = match self.workspace.project(inst.project_id) {
             Some(project) if project.is_remote() => Some(
                 self.remote_host_for_instance(inst.id)
@@ -394,6 +431,7 @@ impl MuxelApp {
             undo_until: chrono::Local::now().timestamp_millis() + CLOSE_GRACE.as_millis() as i64,
             needs_decision: false,
             checking: false,
+            finalizing: false,
             undoing: false,
             sync_marks: None,
             layout_unread: false,
@@ -755,7 +793,12 @@ impl MuxelApp {
         let due: Vec<_> = self
             .close_groups
             .iter()
-            .filter(|g| !g.needs_decision && !g.checking && !g.undoing && now >= g.deadline)
+            .filter(|g| {
+                !g.needs_decision
+                    && !g.checking
+                    && !g.undoing
+                    && (g.finalizing || now >= g.deadline)
+            })
             .map(|g| g.id)
             .collect();
         for gid in due {
@@ -766,6 +809,14 @@ impl MuxelApp {
                     self.ask_close_without_layout(gid);
                     continue;
                 }
+            }
+            if self
+                .close_groups
+                .iter()
+                .any(|g| g.id == gid && g.finalizing)
+            {
+                self.finish_close_group(gid, cx);
+                continue;
             }
             // A confirmed close is final at its deadline. It must not wait for
             // unrelated quiet members' remote client-count probes.
@@ -925,6 +976,34 @@ impl MuxelApp {
     }
 
     pub(super) fn finalize_close_group(&mut self, gid: Uuid, cx: &mut Context<Self>) {
+        let Some(group) = self.close_groups.iter_mut().find(|group| group.id == gid) else {
+            return;
+        };
+        // A prior expiry read may predate suspend. A new explicit decision
+        // requires a read begun after the click. A labelled override for an
+        // unreadable layout remains an explicit choice to proceed without it.
+        if !group.layout_unread {
+            group.sync_marks = None;
+            group.needs_decision = false;
+            group.checking = false;
+            group.finalizing = true;
+            match self.close_layout_sync(gid, Instant::now()) {
+                ExpiredCloseSync::Wait => {
+                    cx.notify();
+                    return;
+                }
+                ExpiredCloseSync::Ask => {
+                    self.ask_close_without_layout(gid);
+                    cx.notify();
+                    return;
+                }
+                ExpiredCloseSync::Finish => {}
+            }
+        }
+        self.finish_close_group(gid, cx);
+    }
+
+    fn finish_close_group(&mut self, gid: Uuid, cx: &mut Context<Self>) {
         let Some(index) = self.close_groups.iter().position(|group| group.id == gid) else {
             return;
         };
@@ -939,7 +1018,7 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Leaving the workspace: finish every running countdown, and keep the
+    /// Leaving the workspace: finish unshared running countdowns, and keep the
     /// panes of a group still being checked, waiting for Close / Keep, or being
     /// restored. A kept pane is back in its layout, so the save reopens it.
     pub(super) fn finalize_all_closes(&mut self, cx: &mut Context<Self>) -> bool {
@@ -952,8 +1031,15 @@ impl MuxelApp {
             .map(|group| (group.id, departure_finalizes(group.stage())))
             .collect();
         for (gid, finalize) in groups {
+            // Leaving cannot wait on a window's polling loop. If no fresh read
+            // is available, restore the panes and save them for the next visit.
+            if let Some(group) = self.close_groups.iter_mut().find(|g| g.id == gid) {
+                group.sync_marks = None;
+            }
+            let finalize =
+                finalize && self.close_layout_sync(gid, Instant::now()) == ExpiredCloseSync::Finish;
             if finalize {
-                self.finalize_close_group(gid, cx);
+                self.finish_close_group(gid, cx);
             } else if let Some(index) = self.close_groups.iter().position(|g| g.id == gid) {
                 for (iid, _) in self.release_close_group(index, cx).1 {
                     if let Some(inst) = self.workspace.instance(iid) {
@@ -1396,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn a_close_waiting_on_the_shared_layout_is_still_a_running_countdown() {
+    fn a_close_waiting_on_the_shared_layout_is_an_undecided_check() {
         let mut group = CloseGroup {
             id: Uuid::new_v4(),
             members: Vec::new(),
@@ -1404,6 +1490,7 @@ mod tests {
             undo_until: 0,
             needs_decision: false,
             checking: false,
+            finalizing: false,
             undoing: false,
             sync_marks: None,
             layout_unread: false,
@@ -1413,10 +1500,11 @@ mod tests {
         };
         assert_eq!(group.stage(), CloseStage::CountingDown);
         assert!(!group.syncing());
-        // Past its deadline, waiting for a read: leaving still finishes it.
+        // Waiting for a read: departure and project removal must preserve it.
         group.sync_marks = Some((Instant::now(), vec![(Uuid::new_v4(), 3)]));
         assert!(group.syncing());
-        assert!(departure_finalizes(group.stage()));
+        assert_eq!(group.stage(), CloseStage::Checking);
+        assert!(!departure_finalizes(group.stage()));
         // Once read, the check, decision and Undo keep their own stages.
         for (checking, needs_decision, undoing, stage) in [
             (true, false, false, CloseStage::Checking),
