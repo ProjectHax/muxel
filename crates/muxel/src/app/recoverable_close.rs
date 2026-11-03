@@ -1053,6 +1053,15 @@ impl MuxelApp {
             }
         }
         self.preserve_close_worktrees = was_preserving;
+        // Commit, Merge and Discard run only through a hold's own final close,
+        // never on the way out. Files stay, and a pane-less worktree stays visible.
+        let abandoned: std::collections::HashSet<Uuid> = self
+            .deferred_worktree_dispose
+            .drain()
+            .flat_map(|(_, choices)| choices.into_keys())
+            .collect();
+        self.workspace
+            .detach_unused_worktrees(|worktree| abandoned.contains(&worktree.id));
         had_closes
     }
 

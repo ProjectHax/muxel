@@ -1413,6 +1413,26 @@ impl Workspace {
 
     /// Next color index for a new worktree in `project_id`: the lowest unused
     /// slot 0..8 among the project's live (non-detached) worktrees, wrapping.
+    /// Detach each worktree `candidate` selects that no pane uses. The sidebar
+    /// lists a pane-less worktree only when detached, so one left attached can't
+    /// be reached. Instances held for close still count as using theirs. Returns
+    /// whether anything changed.
+    pub fn detach_unused_worktrees(&mut self, candidate: impl Fn(&Worktree) -> bool) -> bool {
+        let used: std::collections::HashSet<Uuid> = self
+            .instances
+            .iter()
+            .filter_map(|i| i.worktree_id)
+            .collect();
+        let mut changed = false;
+        for worktree in &mut self.worktrees {
+            if !worktree.detached && !used.contains(&worktree.id) && candidate(worktree) {
+                worktree.detached = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn next_worktree_color(&self, project_id: Uuid) -> u8 {
         let used: Vec<u8> = self
             .worktrees

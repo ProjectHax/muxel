@@ -2384,3 +2384,81 @@ fn review_close_uncaptured_member_invalidates_discard_even_if_it_exits_first() {
         wait_for_exit(cx, &fresh_child);
     });
 }
+
+#[test]
+fn departure_keeps_deferred_worktrees_visible_without_running_answers() {
+    // Every answer waits in the same map, so one covers the workspace switch.
+    for (switch, choice) in [
+        (false, "discard"),
+        (false, "commit"),
+        (false, "merge"),
+        (false, "keep"),
+        (true, "discard"),
+    ] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (pane, view, child) = title_terminal(cx, window, pid, "departure files", "Working");
+            wait_for_view(cx, window, &view, |view| {
+                view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                    && view.status() == AgentStatus::Working
+            });
+            let (wid, path) = clean_worktree(cx, window, pid, pane);
+            let draft = path.join("draft.txt");
+            std::fs::write(&draft, "keep departure work\n").unwrap();
+            let before = super::integrations::repo_head(&path).unwrap();
+            window
+                .update(cx, |app, window, cx| {
+                    app._status_timer = gpui::Task::ready(());
+                    let previous = app.current_workspace.unwrap();
+                    let document = muxel_store::workspace_doc_path(previous).unwrap();
+                    app.request_close_instance(pane, cx);
+                    match choice {
+                        "discard" => app.dispose_worktree_discard(cx),
+                        "commit" => app.dispose_worktree_commit(cx),
+                        "merge" => app.dispose_worktree_merge(window, cx),
+                        "keep" => app.dispose_worktree_keep(cx),
+                        _ => unreachable!(),
+                    }
+                    app.run_confirm(window, cx);
+                    assert!(app.is_closing(pane));
+                    assert!(!child.exited());
+                    if switch {
+                        let next = Uuid::new_v4();
+                        app.workspaces.workspaces.extend([
+                            WorkspaceMeta {
+                                id: previous,
+                                name: "previous".into(),
+                            },
+                            WorkspaceMeta {
+                                id: next,
+                                name: "next".into(),
+                            },
+                        ]);
+                        app.enter_workspace(next, window, cx);
+                        assert_eq!(app.current_workspace, Some(next));
+                    } else {
+                        // These are the quit hook's finalization/save calls,
+                        // without invoking application-global Quit in a test.
+                        app.finalize_all_closes(cx);
+                        assert!(app.try_persist());
+                    }
+                    let saved = muxel_store::load_workspace_from(&document).unwrap();
+                    assert!(saved.instance(pane).is_none());
+                    let worktree = saved.worktree(wid).expect("departure keeps the registry");
+                    assert!(
+                        worktree.detached,
+                        "{choice} left a hidden worktree after departure (switch={switch})"
+                    );
+                    assert!(app.deferred_worktree_dispose.is_empty());
+                    assert_eq!(
+                        std::fs::read_to_string(&draft).unwrap(),
+                        "keep departure work\n"
+                    );
+                    assert_eq!(super::integrations::repo_head(&path).unwrap(), before);
+                    assert!(super::integrations::worktree_change_count(&path) > 0);
+                })
+                .unwrap();
+            wait_for_exit(cx, &child);
+        });
+    }
+}

@@ -8203,7 +8203,21 @@ impl MuxelApp {
         // mirror each other, and closing one would kill the session under the other.
         // Normally a no-op.
         muxel_core::dedupe_instances(&mut workspace);
+        // An earlier version could save a worktree attached with no pane, which
+        // the sidebar hides. Remote projects are left alone: a peer's panes may
+        // use theirs.
+        let local: HashSet<Uuid> = workspace
+            .projects
+            .iter()
+            .filter(|project| !project.is_remote())
+            .map(|project| project.id)
+            .collect();
+        let repaired =
+            workspace.detach_unused_worktrees(|worktree| local.contains(&worktree.project_id));
         self.workspace = workspace;
+        if repaired {
+            self.persist();
+        }
         let active = self
             .workspace
             .active_project
@@ -17037,17 +17051,8 @@ impl MuxelApp {
         // A kept/replaced session also cancels file actions that were waiting
         // for its project ledger. They must never run as successful teardown.
         if let Some(choices) = self.deferred_worktree_dispose.remove(&pid) {
-            let used: HashSet<_> = self
-                .workspace
-                .instances
-                .iter()
-                .filter_map(|inst| inst.worktree_id)
-                .collect();
-            for worktree in &mut self.workspace.worktrees {
-                if choices.contains_key(&worktree.id) && !used.contains(&worktree.id) {
-                    worktree.detached = true;
-                }
-            }
+            self.workspace
+                .detach_unused_worktrees(|worktree| choices.contains_key(&worktree.id));
         }
         if let Some(project) = self.workspace.project_mut(pid) {
             project.forget_closed_session(iid);
@@ -17188,7 +17193,7 @@ impl MuxelApp {
                     Ok(None) => {}
                     Err(error) => {
                         muxel_store::append_event_log(&format!(
-                            "close: local tmux teardown for [{iid}] pending retry: {error:#}"
+                            "close: local tmux teardown for [{iid}] failed: {error:#}; activation retries only a stamped session and otherwise keeps it"
                         ));
                         app.log_kept_close_worktree(iid, &cleanup);
                     }

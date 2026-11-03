@@ -634,3 +634,62 @@ fn review_close_retry_preserves_peer_replacements_including_a_restarted_server()
         });
     }
 }
+
+#[test]
+fn restore_shows_unused_registered_worktrees_and_leaves_used_ones() {
+    with_app(|cx, window, _, _| {
+        window
+            .update(cx, |app, window, cx| {
+                let root = muxel_store::data_dir().unwrap();
+                let mut workspace = muxel_core::Workspace::default();
+                let empty = workspace.add_project(Project::new("empty", root.join("empty")));
+                let used_project = workspace.add_project(Project::new("used", root.join("used")));
+                let orphan = Uuid::new_v4();
+                let used = Uuid::new_v4();
+                for (id, pid, name) in [(orphan, empty, "orphan"), (used, used_project, "used")] {
+                    let path = root.join(format!("load-{name}-worktree"));
+                    std::fs::create_dir_all(&path).unwrap();
+                    std::fs::write(path.join("draft.txt"), "keep registered files").unwrap();
+                    workspace.add_worktree(muxel_core::Worktree {
+                        id,
+                        project_id: pid,
+                        name: name.into(),
+                        path,
+                        branch: format!("muxel/{name}"),
+                        color: 0,
+                        detached: false,
+                    });
+                }
+                let mut pane = Instance::shell(used_project);
+                pane.worktree_id = Some(used);
+                pane.worktree_path = Some(workspace.worktree(used).unwrap().path.clone());
+                pane.worktree_branch = Some("muxel/used".into());
+                workspace.project_mut(used_project).unwrap().layout = Some(PaneNode::leaf(pane.id));
+                workspace.add_instance(pane);
+                workspace.active_project = Some(empty);
+                let document =
+                    muxel_store::workspace_doc_path(app.current_workspace.unwrap()).unwrap();
+                muxel_store::save_workspace_to(&document, &workspace).unwrap();
+                app.restore(
+                    muxel_store::load_workspace_from(&document).unwrap(),
+                    window,
+                    cx,
+                );
+                assert!(
+                    app.workspace.worktree(orphan).unwrap().detached,
+                    "load hid a registered worktree with no panes"
+                );
+                assert!(!app.workspace.worktree(used).unwrap().detached);
+                let saved = muxel_store::load_workspace_from(&document).unwrap();
+                assert!(saved.worktree(orphan).unwrap().detached);
+                assert!(!saved.worktree(used).unwrap().detached);
+                for tree in &saved.worktrees {
+                    assert_eq!(
+                        std::fs::read_to_string(tree.path.join("draft.txt")).unwrap(),
+                        "keep registered files"
+                    );
+                }
+            })
+            .unwrap();
+    });
+}

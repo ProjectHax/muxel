@@ -34,8 +34,16 @@ retry never stamps; the tmux server compares the saved token and observed
 session id before killing that exact id. A replacement, including a new server
 reusing an id, does not inherit the stamp. A mismatch preserves the session
 and files; an unknown or failed query retains the ledger. The ten-second bound
-starts before scheduling the attempt. As with the original close, the first
-stamp identifies the session present when that bounded attempt runs.
+starts at the final close, after any Undo hold. The first stamp identifies the
+session present when that attempt runs, not at the original click, and a forced
+close doesn't recheck the pane during its hold, so a peer's replacement in that
+window isn't detected. An attempt that fails before stamping leaves nothing to
+prove, so the next activation cancels it and keeps the session.
+
+Worktree answers run only through their hold's final close. Quit and workspace
+departure void them: files stay, and a worktree left without a pane is detached
+so the sidebar still lists it. Loading a workspace applies the same rule to local
+worktrees saved attached with no pane.
 
 Activation reconciles shared layout before replay, and cancels any close whose
 instance reappeared or whose target a current pane shows. Closes without a

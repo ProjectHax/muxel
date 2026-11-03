@@ -140,7 +140,8 @@ feature is added or changed, update the matching entry here in the same change**
   a muxel worktree with changes or unmerged commits asks what to do with its files,
   then follows the same busy confirmation and countdown with Undo as other
   terminals. Commit / Merge / Discard / Keep run only after the close finishes
-  and tmux teardown is confirmed; Undo or Cancel cancels the file action. A
+  and tmux teardown is confirmed; Undo, Cancel, Quit or switching workspace cancels
+  the file action and keeps the files, with the worktree listed in the sidebar. A
   pane opened in that worktree while its question is showing gets its own
   prompt and countdown, and a pane brought back by Undo leaves the question.
   Client checks show progress, beside any running countdown, with their own
