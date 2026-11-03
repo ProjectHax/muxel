@@ -356,6 +356,16 @@ fn play_stream(
     Ok(played)
 }
 
+/// Play one finished clip of mono audio (at `rate`), blocking until it has
+/// played or `stop` is raised. Alert sounds (`crate::sound`) share speech's
+/// output path rather than opening their own.
+pub(crate) fn play_clip(samples: Vec<f32>, rate: u32, stop: &AtomicBool) -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = tx.send((0, samples));
+    drop(tx);
+    play_stream(&rx, rate, stop, &AtomicUsize::new(0)).map(drop)
+}
+
 type Shared = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>;
 
 /// Resample a chunk to the device rate and queue it. Returns its length.

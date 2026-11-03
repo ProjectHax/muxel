@@ -32,6 +32,7 @@ use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
 use muxel_core::refresh_gate::RefreshGate;
+use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
@@ -83,6 +84,7 @@ mod remote_reconnect_tests;
 mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
+mod sound_alerts;
 #[cfg(test)]
 mod transcript_read_tests;
 use claude_launch::TerminalPreparation;
@@ -1294,6 +1296,24 @@ fn shown_terminal_status(
     let runtime = view.runtime_snapshot();
     let unprompted = unprompted_report_working(&runtime, view.session().has_submitted_turn());
     persisted_status(runtime.status, instance, restoring || unprompted)
+}
+
+/// The chime for an agent notification (Done/Blocked); other kinds have none.
+fn notif_alert_sound(kind: NotifKind) -> Option<AlertSound> {
+    match kind {
+        NotifKind::Done => Some(AlertSound::Done),
+        NotifKind::Blocked => Some(AlertSound::Blocked),
+        NotifKind::Success | NotifKind::Error => None,
+    }
+}
+
+/// The alert a pane in `status` is in, for the sound gate's settle check.
+fn status_alert_sound(status: AgentStatus) -> Option<AlertSound> {
+    match status {
+        AgentStatus::Done => Some(AlertSound::Done),
+        AgentStatus::Blocked => Some(AlertSound::Blocked),
+        AgentStatus::Working | AgentStatus::Idle => None,
+    }
 }
 
 fn attention_rank(runtime: Option<AgentStatus>, activity: Option<&AgentActivity>) -> Option<u8> {
@@ -3148,6 +3168,12 @@ static PENDING_NOTIFICATION_FOCUS: std::sync::Mutex<Option<Uuid>> = std::sync::M
 /// set, clicking the notification raises muxel and switches to that instance's
 /// project + pane.
 fn notify(summary: String, body: String, focus: Option<Uuid>) {
+    notify_with(summary, body, focus, false);
+}
+
+/// [`notify`], asking the desktop not to play its own sound when `quiet` — muxel
+/// is ringing its alert chime for the same event.
+fn notify_with(summary: String, body: String, focus: Option<Uuid>, quiet: bool) {
     std::thread::spawn(move || {
         let mut builder = notify_rust::Notification::new();
         builder
@@ -3164,6 +3190,13 @@ fn notify(summary: String, body: String, focus: Option<Uuid>) {
         // (NSUserNotification) or Windows (WinRT) backends.
         #[cfg(all(unix, not(target_os = "macos")))]
         builder.hint(notify_rust::Hint::DesktopEntry("muxel".to_string()));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if quiet {
+            builder.hint(notify_rust::Hint::SuppressSound(true));
+        }
+        // muxel's Windows and macOS toasts are silent already (no sound name).
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let _ = quiet;
         // "default" is the action GNOME invokes when the notification *body* is
         // clicked; only register it when there's a pane to jump to.
         if focus.is_some() {
@@ -5529,6 +5562,12 @@ pub struct MuxelApp {
     project_branch_lists: HashMap<Uuid, Vec<String>>,
     /// Prevent slow git probes from accumulating overlapping one-second refresh jobs.
     status_refresh_in_flight: bool,
+    /// When agent panes' Done/Blocked chimes ring (`muxel_core::sound_alert`).
+    alert_gate: AlertGate,
+    /// Raised to cut off the chime still playing when the next one starts.
+    alert_playback: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Settings → Sounds: why the last file tried for an alert won't play.
+    alert_sound_error: Option<(AlertSound, String)>,
     /// What the status probes last saw; moved into each `refresh_status` job.
     status_polls: StatusPolls,
     /// A git action ran from muxel: recount worktree changes on the next tick
@@ -7923,6 +7962,9 @@ impl MuxelApp {
             project_branches: HashMap::new(),
             project_branch_lists: HashMap::new(),
             status_refresh_in_flight: false,
+            alert_gate: AlertGate::default(),
+            alert_playback: None,
+            alert_sound_error: None,
             status_polls: StatusPolls::default(),
             worktree_changes_stale: false,
             codex_session_names: HashMap::new(),
@@ -13901,6 +13943,9 @@ impl MuxelApp {
         // Projects where an agent just finished a turn — when agents append to the
         // accomplishment log.
         let mut turns_finished: Vec<Uuid> = Vec::new();
+        // Each agent pane's present alert state, for the sound gate.
+        let mut alert_states: HashMap<Uuid, Option<AlertSound>> = HashMap::new();
+        let alert_now = Instant::now();
         let now_epoch = chrono::Utc::now().timestamp_millis();
         for Snap {
             iid,
@@ -14029,6 +14074,24 @@ impl MuxelApp {
             if effect.completed && self.auto_read_wanted(iid, pane_active) {
                 to_read_aloud.push(iid);
             }
+            // Chimes are for agents: a shell "finishes" every command it runs.
+            let agent = self
+                .workspace
+                .instance(iid)
+                .is_some_and(|i| muxel_core::readaloud::is_agent_program(i.program.as_deref()));
+            let chime = effect
+                .notify
+                .and_then(notif_alert_sound)
+                .filter(|sound| agent && sound.enabled(&self.settings));
+            if agent {
+                if attended {
+                    self.alert_gate.attended(iid);
+                }
+                if let Some(sound) = chime {
+                    self.alert_gate.arm(iid, sound, alert_now);
+                }
+                alert_states.insert(iid, status_alert_sound(status));
+            }
             if let Some(kind) = effect.notify {
                 // Collect the in-app entry regardless of the desktop toggle;
                 // only the OS popup respects `notifications_enabled`.
@@ -14037,10 +14100,11 @@ impl MuxelApp {
                 // raising a desktop toast over the app you're already looking
                 // at; the in-app feed already records it.
                 if self.notifications_enabled && !self.window_active {
-                    notify(
+                    notify_with(
                         format!("{title} {}", kind.label()),
                         project.clone(),
                         Some(iid),
+                        chime.is_some(),
                     );
                 }
             }
@@ -14161,6 +14225,13 @@ impl MuxelApp {
                 }
                 dirty = true;
             }
+        }
+        if let Some(sound) = self
+            .alert_gate
+            .due(|pane| alert_states.get(&pane).copied().flatten(), alert_now)
+            && sound.enabled(&self.settings)
+        {
+            self.ring_alert(sound);
         }
         // Read at most once per tick, and only when a remote pane wants back in.
         let mut lid_shut = None;
@@ -31834,6 +31905,7 @@ impl MuxelApp {
             (t("Appearance"), SettingsSection::Appearance),
             (t("Editor"), SettingsSection::Editor),
             (t("Behavior"), SettingsSection::Behavior),
+            (t("Sounds"), SettingsSection::Sounds),
             (t("Speech"), SettingsSection::Speech),
             (t("Read Aloud"), SettingsSection::ReadAloud),
             (t("Agents"), SettingsSection::Agents),
@@ -31871,6 +31943,7 @@ impl MuxelApp {
             SettingsSection::Appearance => self.render_settings_appearance(cx),
             SettingsSection::Editor => self.render_settings_editor(cx),
             SettingsSection::Behavior => self.render_settings_behavior(cx),
+            SettingsSection::Sounds => self.render_settings_sounds(cx),
             SettingsSection::Speech => self.render_settings_speech(cx),
             SettingsSection::ReadAloud => self.render_settings_read_aloud(cx),
             SettingsSection::Agents => self.render_settings_agents(cx),

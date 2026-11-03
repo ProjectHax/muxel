@@ -114,6 +114,8 @@ pub enum SettingsSection {
     Appearance,
     Editor,
     Behavior,
+    /// Alert sounds for agents that finish or get blocked.
+    Sounds,
     Speech,
     ReadAloud,
     Agents,
