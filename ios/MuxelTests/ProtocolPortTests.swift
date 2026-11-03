@@ -174,7 +174,10 @@ final class ProtocolPortTests: XCTestCase {
             + "mkdir -p -- '/work'; "
             + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
             + "new-session -d -s 'muxel_h_abcdef12' -c '/work' "
-            + "-- \"${SHELL:-/bin/sh}\" -ilc "))
+            + "-- sh -c "))
+        XCTAssertTrue(cmd.contains("@muxel_control_pane"))
+        XCTAssertTrue(cmd.contains("${SHELL:-/bin/sh}"))
+        XCTAssertTrue(cmd.contains("-ilc"))
         XCTAssertTrue(cmd.contains("exec"))
         XCTAssertTrue(cmd.contains("claude"))
         XCTAssertTrue(cmd.contains("opus"))

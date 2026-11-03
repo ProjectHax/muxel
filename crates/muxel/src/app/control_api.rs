@@ -1685,14 +1685,14 @@ impl MuxelApp {
                         press_prompt_enter(&session, pasted)
                     })
                     .unwrap_or_else(|_| Err(ctl::Error::from("muxel is shutting down").after_paste()))?;
-                    // The pane is held until this Enter is in. Nothing runs on
-                    // this thread between its release and noting the turn, so
-                    // no send is admitted in between.
-                    finish_prompt_enter(enter, in_flight).await?;
+                    // Note a turn whose Enter was admitted or may have landed
+                    // before releasing the pane, even if tmux never answered.
+                    finish_prompt_enter(enter, in_flight, || {
+                        let _ = this.update(cx, |app, _| app.note_control_turn(iid, turn, now_ms()));
+                    }).await?;
                     // Claim timestamps predict settlement. Local wait starts
                     // at the actual Enter admission, never at the prediction.
-                    let revision = this.update(cx, |app, _| {
-                        app.note_control_turn(iid, turn, now_ms());
+                    let revision = this.update(cx, |_, _| {
                         session.input_rev()
                     });
                     // Enter is in. Whatever happens next, the reply is this
@@ -2061,10 +2061,14 @@ fn press_prompt_enter(session: &Arc<TerminalSession>, pasted: u64) -> CtlResult<
 async fn finish_prompt_enter(
     enter: ControlWrite,
     in_flight: Option<SendInFlight>,
+    note_turn: impl FnOnce(),
 ) -> CtlResult<()> {
-    let entered = enter.finish().await.map_err(enter_failed);
+    let entered = enter.finish().await;
+    if entered.is_ok() || entered.as_ref().is_err_and(|error| error.may_have_typed()) {
+        note_turn();
+    }
     drop(in_flight);
-    entered
+    entered.map_err(enter_failed)
 }
 
 /// Why a prompt wasn't pasted. A paste that may have typed
@@ -2081,6 +2085,7 @@ fn paste_failed(error: ControlWriteError) -> ctl::Error {
             ErrorCode::TmuxPaneUnresolved,
             format!("{why}. Nothing was typed"),
         ),
+        ControlWriteError::InMode(why) => ctl::Error::new(ErrorCode::TmuxPaneInMode, why),
         ControlWriteError::Refused(_) => {
             format!("couldn't paste the prompt through tmux: {error}").into()
         }
@@ -2099,7 +2104,7 @@ fn enter_failed(error: ControlWriteError) -> ctl::Error {
         ControlWriteError::Closed(why) => {
             format!("the prompt was pasted but Enter couldn't be admitted ({why}): check its `screen`")
         }
-        ControlWriteError::Unresolved(why) | ControlWriteError::Refused(why) => {
+        ControlWriteError::Unresolved(why) | ControlWriteError::Refused(why) | ControlWriteError::InMode(why) => {
             format!("the prompt was pasted but tmux didn't press Enter ({why}): check its `screen`")
         }
         ControlWriteError::Unknown(why) | ControlWriteError::Partial(why) => format!(
@@ -2137,7 +2142,9 @@ fn keys_failed(error: ControlWriteError, pressed_before: usize) -> ctl::Error {
     let typed = pressed_before > 0 || error.may_have_typed();
     let failed = if pressed_before > 0 || matches!(error, ControlWriteError::Partial(_)) {
         let then = match error {
-            ControlWriteError::Refused(why) | ControlWriteError::Unresolved(why) => {
+            ControlWriteError::Refused(why)
+            | ControlWriteError::Unresolved(why)
+            | ControlWriteError::InMode(why) => {
                 format!("tmux refused the next ({why})")
             }
             ControlWriteError::Unknown(why) => format!(
@@ -2157,6 +2164,7 @@ fn keys_failed(error: ControlWriteError, pressed_before: usize) -> ctl::Error {
             ControlWriteError::Unresolved(why) => {
                 ctl::Error::new(ErrorCode::TmuxPaneUnresolved, why)
             }
+            ControlWriteError::InMode(why) => ctl::Error::new(ErrorCode::TmuxPaneInMode, why),
             ControlWriteError::Closed(why) => {
                 format!("couldn't admit a key to the PTY writer: {why}").into()
             }
@@ -2798,6 +2806,7 @@ mod prompt_submission_tests {
         use muxel_terminal::ControlWriteError;
         let kinds = || {
             [
+                ControlWriteError::InMode("copy mode".into()),
                 ControlWriteError::Closed("writer gone".into()),
                 ControlWriteError::Unresolved("pane gone".into()),
                 ControlWriteError::Refused("lost server".into()),
@@ -2883,7 +2892,7 @@ mod prompt_submission_tests {
     fn tmux_routed_terminal() -> (
         Arc<TerminalSession>,
         muxel_terminal::PtyReceiver,
-        std::sync::mpsc::Sender<bool>,
+        std::sync::mpsc::Sender<Option<bool>>,
     ) {
         #[cfg(unix)]
         fn exit(code: i32) -> std::process::ExitStatus {
@@ -2900,17 +2909,32 @@ mod prompt_submission_tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        let (answer, answers) = std::sync::mpsc::channel::<bool>();
+        let (answer, answers) = std::sync::mpsc::channel::<Option<bool>>();
         let answers = std::sync::Mutex::new(answers);
         let route = muxel_terminal::TmuxInputRoute::new(
             "muxel_p_1",
             true,
             move |args: &[String], _: Option<&[u8]>| {
+                let args: Vec<String> = if args[0] == "if-shell" {
+                    args.last()
+                        .unwrap()
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect()
+                } else {
+                    args.to_vec()
+                };
                 Ok(match args[0].as_str() {
-                    "list-panes" => output(0, "muxel_p_1:%7:1\n", ""),
+                    "list-panes" => output(0, "muxel_p_1:%7:1::3.4\n", ""),
                     "display-message" => output(0, "%7\n", ""),
                     "send-keys" => match answers.lock().unwrap().recv() {
-                        Ok(true) => output(0, "", ""),
+                        Ok(Some(true)) => output(0, "", ""),
+                        Ok(None) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "no answer",
+                            ));
+                        }
                         _ => output(1, "", "lost server\n"),
                     },
                     _ => output(0, "", ""),
@@ -2953,7 +2977,7 @@ mod prompt_submission_tests {
         let pasted = session.input_rev();
         let enter = press_prompt_enter(&session, pasted).unwrap();
         assert!(enter.is_queued());
-        let mut finishing = std::pin::pin!(finish_prompt_enter(enter, Some(in_flight)));
+        let mut finishing = std::pin::pin!(finish_prompt_enter(enter, Some(in_flight), || {}));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         // Give the worker time to run the Enter, which waits for its answer.
         std::thread::sleep(Duration::from_millis(50));
@@ -2963,18 +2987,64 @@ mod prompt_submission_tests {
             "the pane was released while tmux still had its Enter"
         );
         assert!(!session.has_submitted_turn());
-        answer.send(true).unwrap();
+        answer.send(Some(true)).unwrap();
         assert_eq!(drive(finishing), Ok(()));
         assert!(session.has_submitted_turn());
         drop(SendInFlight::begin(pane, false).expect("the Enter is in"));
 
         let in_flight = SendInFlight::begin(pane, false).unwrap();
         let enter = press_prompt_enter(&session, session.input_rev()).unwrap();
-        answer.send(false).unwrap();
-        let refused = drive(finish_prompt_enter(enter, Some(in_flight))).unwrap_err();
+        answer.send(Some(false)).unwrap();
+        let refused = drive(finish_prompt_enter(enter, Some(in_flight), || {
+            panic!("a refused Enter must not note a turn")
+        }))
+        .unwrap_err();
         assert_eq!(refused.pasted, Some(true));
         assert!(SendInFlight::begin(pane, false).is_ok());
         session.kill();
+    }
+
+    #[test]
+    fn an_unanswered_enter_guards_the_turn_before_releasing_the_pane() {
+        let (session, _rx, answer) = tmux_routed_terminal();
+        let pane = Uuid::new_v4();
+        let in_flight = SendInFlight::begin(pane, false).unwrap();
+        let enter = press_prompt_enter(&session, session.input_rev()).unwrap();
+        answer.send(None).unwrap();
+        let noted = std::cell::Cell::new(false);
+        let result = drive(super::finish_prompt_enter(enter, Some(in_flight), || {
+            assert!(SendInFlight::begin(pane, false).is_err());
+            noted.set(true);
+        }));
+        assert!(
+            noted.get(),
+            "an Enter that may have landed must set just_submitted"
+        );
+        assert_eq!(result.unwrap_err().pasted, Some(true));
+        assert!(SendInFlight::begin(pane, false).is_ok());
+        session.kill();
+    }
+
+    #[test]
+    fn copy_mode_is_retryable_only_before_any_input_went_in() {
+        let mode = || muxel_terminal::ControlWriteError::InMode("copy mode".into());
+        let paste = super::paste_failed(mode());
+        assert_eq!(
+            (paste.code, paste.pasted),
+            (Some(ErrorCode::TmuxPaneInMode), None)
+        );
+        let enter = super::enter_failed(mode());
+        assert_eq!((enter.code, enter.pasted), (None, Some(true)));
+        let first = super::keys_failed(mode(), 0);
+        assert_eq!(
+            (first.code, first.pasted),
+            (Some(ErrorCode::TmuxPaneInMode), None)
+        );
+        let later = super::keys_failed(mode(), 1);
+        assert_eq!(
+            (later.code, later.pasted),
+            (Some(ErrorCode::KeysPartlyPressed), Some(true))
+        );
     }
 
     #[test]

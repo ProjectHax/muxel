@@ -297,6 +297,8 @@ pub enum ErrorCode {
     /// A pane behind tmux takes ctl input only through tmux, at the agent's own
     /// tmux pane, and that pane couldn't be found or has gone. Nothing was typed.
     TmuxPaneUnresolved,
+    /// A tmux pane mode is open. Leave it before retrying; nothing was typed.
+    TmuxPaneInMode,
     /// Some of a `keys` request's keys were pressed, then the rest failed.
     KeysPartlyPressed,
     /// The caller selected its own pane without explicitly forcing the action.
@@ -1875,6 +1877,19 @@ after a failed lookup the next waits a little longer each time, up to two
 minutes. A remote agent's input needs muxel's background SSH commands to that
 host to work.
 
+Newly created agents record their pane id before the program starts. That
+record survives pane moves and splits; reattaches preserve it. Older or adopted
+sessions use the lowest-pane lookup. Copy mode refuses input with
+`tmux_pane_in_mode`, leaving the user's scroll position intact. Leave copy mode
+before retrying. If the prompt was already pasted before Enter was refused,
+the failure has `pasted: true`: inspect `screen` before resending. An unanswered
+Enter also guards the turn as just submitted, because it may have landed.
+Servers reporting version 2.4+ check mode and write in one tmux command queue.
+Older or unreported server versions check separately before each write, adding
+a round trip. That legacy path has a small race if the user enters copy mode
+between the check and Enter; stock 2.2/2.3 use it too (server version reporting
+arrived in 2.4). There is no new tmux version requirement.
+
 AGENT is an agent's `id` from `panes` (like `1a2b3c4d`), its name (`Claude`),
 `project/name` when names repeat, or `focused` for the pane the user is looking
 at. PROJECT is a project's id or name. muxels on different computers that share
@@ -1923,6 +1938,8 @@ Creation permission/approval refusals, typing refusals from `send`, `answer` or
   need to restart the agent.
 - `keys_partly_pressed` - some keys were pressed, then the rest failed. Inspect
   `screen` before pressing any again.
+- `tmux_pane_in_mode` - the pane is in copy mode; nothing was typed. Leave
+  copy mode before retrying. A failure after a paste instead has `pasted: true`.
 - `self_target` - this command would type into its caller's own pane; select a
   different target or pass `--force` deliberately.
 - `host_unavailable`, `stale_endpoint` - no running muxel to ask.
@@ -2208,6 +2225,7 @@ mod tests {
             (ErrorCode::LaunchMismatch, "launch_mismatch"),
             (ErrorCode::InputChanged, "input_changed"),
             (ErrorCode::TmuxPaneUnresolved, "tmux_pane_unresolved"),
+            (ErrorCode::TmuxPaneInMode, "tmux_pane_in_mode"),
             (ErrorCode::KeysPartlyPressed, "keys_partly_pressed"),
             (ErrorCode::SelfTarget, "self_target"),
             (ErrorCode::HostUnavailable, "host_unavailable"),

@@ -2666,7 +2666,20 @@ mod tests {
         assert_eq!(args[6..11], clear);
         assert_eq!(
             args[11..],
-            ["new-session", "-A", "-s", "s", "-e", &own, "--", "claude"]
+            [
+                "new-session",
+                "-A",
+                "-s",
+                "s",
+                "-e",
+                &own,
+                "--",
+                "sh",
+                "-c",
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\"; exec \"$@\"",
+                "muxel-agent",
+                "claude"
+            ]
         );
         // Older tmux has no `-e`: the program starts without an id rather than
         // with whichever pane's the server had.
@@ -2723,7 +2736,17 @@ mod tests {
         assert_eq!(launch.env.len(), 3);
         assert_eq!(
             &launch.args[new + 10..],
-            ["--", "agent", "two words", "", "--flag"]
+            [
+                "--",
+                "sh",
+                "-c",
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\"; exec \"$@\"",
+                "muxel-agent",
+                "agent",
+                "two words",
+                "",
+                "--flag"
+            ]
         );
         // No profile values are installed globally on this profile's server.
         assert_eq!(
