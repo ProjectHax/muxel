@@ -73,7 +73,7 @@ pub fn list_files(os: RemoteOs, root: &str, cap: usize) -> String {
         RemoteOs::Unix => {
             let q = sh_quote(root);
             format!(
-                "cd {q} && (git ls-files --cached --others --exclude-standard 2>/dev/null \
+                "cd {q} && (git --no-optional-locks ls-files --cached --others --exclude-standard 2>/dev/null \
                  || find . -type f -not -path '*/.git/*') | head -n {cap}"
             )
         }
@@ -88,7 +88,7 @@ pub fn list_files(os: RemoteOs, root: &str, cap: usize) -> String {
             // one thing to parse.
             ps(&format!(
                 "Set-Location -LiteralPath {q}; \
-                 $files = & git ls-files --cached --others --exclude-standard 2>$null; \
+                 $files = & git --no-optional-locks ls-files --cached --others --exclude-standard 2>$null; \
                  if ($LASTEXITCODE -ne 0 -or $null -eq $files) {{ \
                  $root = (Get-Location).Path; \
                  $files = Get-ChildItem -LiteralPath $root -Recurse -File -Force \
@@ -433,7 +433,10 @@ mod tests {
         assert_eq!(test_dir(UNIX, "/srv/app"), "test -d /srv/app");
         assert_eq!(test_file(UNIX, "/srv/a b"), "test -f '/srv/a b'");
         assert!(read_file(UNIX, "/tmp/x", 2_000_000).starts_with("if [ -f /tmp/x ]"));
-        assert!(list_files(UNIX, "/srv/app/", 500).starts_with("cd /srv/app && (git ls-files"));
+        assert!(
+            list_files(UNIX, "/srv/app/", 500)
+                .starts_with("cd /srv/app && (git --no-optional-locks ls-files")
+        );
     }
 
     #[test]
@@ -560,7 +563,7 @@ mod tests {
     fn windows_list_files_prefers_git_then_walks() {
         let s = script_of(&list_files(WIN, "C:/p", 42));
         assert!(
-            s.contains("git ls-files --cached --others --exclude-standard"),
+            s.contains("git --no-optional-locks ls-files --cached --others --exclude-standard"),
             "{s}"
         );
         assert!(s.contains("Get-ChildItem"), "{s}");
