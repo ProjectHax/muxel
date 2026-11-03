@@ -10,8 +10,14 @@ remote file listings, and library checks. Git may otherwise refresh the index du
 
 Local reads use the shared `git_read_command` / `read_only_git` policy. Reads at a
 `RepoLoc` use `git_output`, which applies the same policy locally and passes
-`--no-optional-locks -c diff.autoRefreshIndex=false` to git on an SSH host. Remote file listings also disable
-optional locks. New display commands should use these read helpers.
+`GIT_OPTIONAL_LOCKS=0` and `-c diff.autoRefreshIndex=false` on an SSH host. The
+environment form keeps commands compatible with Git versions predating the
+optional-locks command-line flag. Those versions ignore the environment setting;
+optional-lock suppression requires host Git support. Remote file listings use the
+same policy. New display commands should use these read helpers.
+
+The iOS companion uses GitCommands.readOnly for its remote diff viewer and
+repository probes, with the same optional-lock and diff-refresh settings.
 
 Writes use `git_write_output` or an ordinary git command. Staging, committing,
 merging, checking out branches, fetching/pulling/pushing, and creating or removing

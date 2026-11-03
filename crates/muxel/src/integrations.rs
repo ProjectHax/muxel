@@ -191,17 +191,11 @@ fn git_command_at(loc: &RepoLoc, args: &[&str], read_only: bool) -> Command {
             cmd
         }
         RepoLoc::Remote(c) => {
-            let read_args = read_only.then(|| {
-                ["--no-optional-locks", "-c", READ_ONLY_GIT_CONFIG]
-                    .into_iter()
-                    .chain(args.iter().copied())
-                    .collect::<Vec<_>>()
-            });
-            let remote = remote_ops::git(
-                c.host.os,
-                &c.remote_path,
-                read_args.as_deref().unwrap_or(args),
-            );
+            let remote = if read_only {
+                remote_ops::git_read_only(c.host.os, &c.remote_path, args)
+            } else {
+                remote_ops::git(c.host.os, &c.remote_path, args)
+            };
             remote_ssh_command(c, remote)
         }
     }

@@ -23,11 +23,14 @@ enum RemoteFiles {
     /// capped at `maxBytes`. Always exits 0 and prints its result.
     static func diffCommand(dir: String) -> String {
         let d = Shell.quote(dir)
+        let probe = GitCommands.readOnly(["-C", dir, "rev-parse", "--show-toplevel"])
+        let headDiff = GitCommands.readOnly(["-C", dir, "--no-pager", "diff", "HEAD", "--no-color", "--", "."])
+        let worktreeDiff = GitCommands.readOnly(["-C", dir, "--no-pager", "diff", "--no-color", "--", "."])
         return """
         dir=\(d)
-        if ! top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then printf '# %s\\n\\nNot a git repository.\\n' "$dir"; exit 0; fi
-        out=$(git -C "$dir" --no-pager diff HEAD --no-color -- . 2>/dev/null)
-        if [ -z "$out" ]; then out=$(git -C "$dir" --no-pager diff --no-color -- . 2>/dev/null); fi
+        if ! top=$(\(probe) 2>/dev/null); then printf '# %s\\n\\nNot a git repository.\\n' "$dir"; exit 0; fi
+        out=$(\(headDiff) 2>/dev/null)
+        if [ -z "$out" ]; then out=$(\(worktreeDiff) 2>/dev/null); fi
         out=$(printf '%s' "$out" | head -c \(maxBytes))
         printf '# Changes in %s\\n' "$dir"
         if [ "$top" != "$dir" ]; then printf '# (subfolder of git repo %s — changes under this folder only)\\n' "$top"; fi
