@@ -10,7 +10,9 @@
 /.muxel-local/
 /.perf-analysis/
 /term-prof*.log
+/term-prof*.log.[0-9]*
 /ui-prof*.log
+/ui-prof*.log.[0-9]*
 
 # local-only dev config (per-developer; not part of the public repo)
 /.claude/

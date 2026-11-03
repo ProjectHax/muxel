@@ -15,6 +15,11 @@
 //! 3. `$XDG_DATA_HOME/ui-prof.log`
 //! 4. `ui-prof.log` in cwd
 //!
+//! Both profilers share dated 2 MiB rolling logs. History defaults to 14 local
+//! dates and 256 MiB per family (`MUXEL_PROFILE_KEEP_DAYS` / `MUXEL_PROFILE_MAX_BYTES`).
+//! Steady discovery misses aggregate in per-minute summaries; hits, changes,
+//! calls of at least 5 ms, and every launch lookup retain individual records.
+//!
 //! When disabled: single OnceLock check, no flusher, no probe work.
 //!
 //! Render records distinguish `observation=callback` (an instrumented callback
@@ -24,9 +29,7 @@
 //! executing window after arbitrary native re-entry or display presentation.
 
 use std::cell::RefCell;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Mutex, OnceLock};
@@ -39,6 +42,8 @@ use gpui::{
 use uuid::Uuid;
 
 mod focus;
+mod lookups;
+use muxel_terminal::profile_log::{ProfileLog, ProfileLogLimits};
 
 #[cfg(target_os = "windows")]
 pub use focus::native_focus_edge_for_pane;
@@ -51,7 +56,7 @@ pub use focus::{focus_action_for_pane, register_focus_pane};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
-static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+static LOG_FILE: OnceLock<Mutex<ProfileLog>> = OnceLock::new();
 static STARTED: OnceLock<Instant> = OnceLock::new();
 static FLUSHER: AtomicBool = AtomicBool::new(false);
 static DEFERRED: OnceLock<SyncSender<DeferredRecord>> = OnceLock::new();
@@ -61,7 +66,6 @@ static NEXT_RENDER_TOKEN: AtomicU64 = AtomicU64::new(0);
 static RENDER_PUBLICATION: RenderPublication = RenderPublication::new();
 static NEXT_STATUS_NOTIFY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PENDING_RECORDS: usize = 4096;
 const SLOW_RENDER_US: u64 = 50_000;
 
@@ -71,7 +75,7 @@ pub(crate) enum SessionLookupKind {
     Launch,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionLookupOutcome {
     Found,
     Unresolved,
@@ -776,76 +780,28 @@ fn log_path() -> &'static PathBuf {
     })
 }
 
-fn open_log(path: &Path) -> Option<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if !prepare_log_path(path) {
-        return None;
-    }
-    OpenOptions::new().create(true).append(true).open(path).ok()
-}
-
-fn reopen_log(slot: &mut Option<std::fs::File>, path: &Path) {
-    *slot = None;
-    *slot = open_log(path);
-}
-
-fn rotated_log_path(path: &Path) -> PathBuf {
-    let mut rotated = path.as_os_str().to_owned();
-    rotated.push(".1");
-    PathBuf::from(rotated)
-}
-
-fn prepare_log_path(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return true;
-    };
-    if meta.len() < LOG_MAX_BYTES {
-        return true;
-    }
-    let rotated = rotated_log_path(path);
-    match std::fs::remove_file(&rotated) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {}
-    }
-    if std::fs::rename(path, &rotated).is_ok() {
-        return true;
-    }
-    OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .is_ok()
-}
-
 fn emit_at(at: SystemTime, line: &str) {
     if !is_enabled() {
         return;
     }
     let now = at.duration_since(UNIX_EPOCH).unwrap_or_default();
     let line = format!("[{}.{:03}] {line}", now.as_secs(), now.subsec_millis());
-    let path = log_path();
-    let slot = LOG_FILE.get_or_init(|| Mutex::new(open_log(path)));
+    let slot = LOG_FILE.get_or_init(|| {
+        Mutex::new(ProfileLog::new(
+            log_path().clone(),
+            ProfileLogLimits::from_env(),
+        ))
+    });
     if let Ok(mut g) = slot.lock() {
-        let reopen = g.as_ref().is_none_or(|f| {
-            f.metadata()
-                .map(|m| m.len() >= LOG_MAX_BYTES)
-                .unwrap_or(false)
-        });
-        if reopen {
-            reopen_log(&mut g, path);
-        }
-        if let Some(f) = g.as_mut() {
-            let _ = writeln!(f, "{line}");
-            let _ = f.flush();
-        }
+        let _ = g.append(&line);
     }
 }
 
 fn emit(line: &str) {
-    emit_at(SystemTime::now(), line);
+    defer_record(DeferredRecord::Line {
+        at: SystemTime::now(),
+        line: line.to_owned(),
+    });
 }
 
 fn deferred_sender() -> &'static SyncSender<DeferredRecord> {
@@ -859,12 +815,29 @@ fn deferred_sender() -> &'static SyncSender<DeferredRecord> {
 }
 
 fn deferred_writer(rx: Receiver<DeferredRecord>) {
-    while let Ok(record) = rx.recv() {
+    let mut lookups = lookups::Lookups::default();
+    let mut last_summary = Instant::now();
+    loop {
+        // Check even during a sustained queue flood. All summary formatting and
+        // history maintenance stays here, away from UI and discovery callers.
+        if last_summary.elapsed() >= Duration::from_secs(60) {
+            for line in lookups.summaries(Instant::now()) {
+                emit_at(SystemTime::now(), &line);
+            }
+            last_summary = Instant::now();
+        }
+        let record = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(record) => record,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
         match record {
             DeferredRecord::Line { at, line } => emit_at(at, &line),
             DeferredRecord::StaticLine { at, line } => emit_at(at, line),
             DeferredRecord::SessionLookup { at, record } => {
-                emit_at(at, &session_lookup_line(record))
+                if lookups.observe(record, Instant::now()) {
+                    emit_at(at, &session_lookup_line(record));
+                }
             }
             DeferredRecord::Phase {
                 at,
@@ -1752,35 +1725,6 @@ mod tests {
                 line: "second".into(),
             }
         ));
-    }
-
-    #[test]
-    fn ui_rotation_drops_the_live_handle_and_replaces_an_existing_backup() {
-        let dir = std::env::temp_dir().join(format!("muxel-ui-prof-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create rotation fixture");
-        let path = dir.join("ui-prof.log");
-        let rotated = rotated_log_path(&path);
-        std::fs::write(&path, vec![b'x'; LOG_MAX_BYTES as usize + 1])
-            .expect("write oversized live log");
-        std::fs::write(&rotated, b"stale backup").expect("write stale backup");
-        let mut slot = Some(
-            OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .expect("hold live log open"),
-        );
-
-        reopen_log(&mut slot, &path);
-
-        assert_eq!(
-            std::fs::metadata(&rotated).expect("rotated log").len(),
-            LOG_MAX_BYTES + 1
-        );
-        assert_eq!(std::fs::metadata(&path).expect("new live log").len(), 0);
-        writeln!(slot.as_mut().expect("reopened live log"), "bounded").unwrap();
-        drop(slot);
-        assert!(std::fs::metadata(&path).unwrap().len() < LOG_MAX_BYTES);
-        std::fs::remove_dir_all(dir).expect("remove rotation fixture");
     }
 
     #[test]

@@ -88,9 +88,33 @@ boolean branch.
 | `MUXEL_PROFILE=1` | enable **both** terminal + UI profilers |
 | `MUXEL_PROFILE_TERMINAL=1` | terminal key→next-read→process→paint only (`profile.rs`) |
 | `MUXEL_PROFILE_UI=1` | UI/present-pump/probe only (`ui_profile.rs`) |
-| `MUXEL_PROFILE_LOG` | terminal log path (append; rotates at 2 MB → `.1`) |
+| `MUXEL_PROFILE_LOG` | stable terminal log path (2 MiB live cap; dated archives) |
 | `MUXEL_PROFILE_UI_LOG` | UI log path (default: sibling `ui-prof*.log`) |
 | `MUXEL_PROFILE_STDERR=1` | also echo dump lines to stderr (default: file only) |
+| `MUXEL_PROFILE_KEEP_DAYS` | local calendar days retained, including today (default 14) |
+| `MUXEL_PROFILE_MAX_BYTES` | total bytes per log family, including reserved live capacity (default 268435456 / 256 MiB; minimum 2 MiB) |
+
+Both profilers share the same retention implementation. On the first record from
+a different local date, or before a record would exceed 2 MiB, the live file moves to
+`<live-path>.YYYY-MM-DD.NNNNNN` (for example
+`term-prof.log.2026-11-03.000001`). The date is the live file's previous local
+date, and the sequence increases within that date. Record timestamps choose the
+date even if a deferred record is written after midnight. At startup the first
+record supplies the live file's date, falling back to its modification date for
+older or malformed logs. Pruning uses the current local date, independently of
+record timestamps. The live path stays stable for tailers.
+Rolling and pruning run on the log workers, never PTY or paint paths.
+
+At startup and each roll, prune this family's oldest archives by date and then
+sequence. Age pruning keeps today and the preceding 13 local dates by default;
+the byte budget reserves a full 2 MiB for the live file. The previous `.1`
+backup counts toward the budget and uses its modification date for age.
+Invalid or nonpositive retention settings use defaults. Separate terminal and
+UI paths each receive their own budget. Use a distinct live path per process.
+If rename fails (for example, a Windows tailer lacks delete sharing), truncate
+the live file; if truncation or required pruning fails, skip writes rather than
+grow beyond the bounds. This fallback can lose history; tailers should share
+read, write, and delete access.
 
 **Terminal log** (`term-prof`): ~500 ms intervals while interesting work
 happens (keys, paint spikes, high felt latency). Fields: PTY writer queue/write,
@@ -99,7 +123,7 @@ position metadata. Terminal and input contents are never logged.
 Startup and slow per-pane lines cross a bounded nonblocking handoff; the
 channel and worker each retain at most 128 records, and interval lines report
 any saturation as `deferred_dropped=`.
-`term-prof[v8]` splits typing latency into `key→next-read`,
+`term-prof[v9]` splits typing latency into `key→next-read`,
 `read→process`, and `process→paint`; slow `term-lat[v8]` chains further split
 channel drain, intentional coalescing, UI-update queueing, notify, and paint. A
 `term-write[v1]` line names the pane when queueing or the ConPTY write itself
@@ -138,16 +162,38 @@ closes queue admission before closing the pseudoconsole. The receiver is still
 held by the spawn caller at that point, so it cannot drain a full queue while
 `ClosePseudoConsole` waits for the reader.
 
-`queue_high=<bytes>B/<chunks>chunks` in `term-prof[v8]` reports the largest
+`queue_high=<bytes>B/<chunks>chunks` in `term-prof[v9]` reports the largest
 occupancy any pane's queue reached during that log interval. Each queue records
 its peak when it admits a read, so a prompt dequeue cannot hide it. The public
 `PtyReceiver::stats()` and `TerminalSession::output_queue_stats()` expose current
 and high-water occupancy to diagnostics without terminal content.
 
+Intervals without keys, latency samples, spikes, sync expiry, dropped records,
+or slow drain/write/process/paint stages accumulate in `term-prof[v9 idle]`,
+emitted at most once every 30 seconds. `ticks=` counts consumed intervals;
+`Δ=` sums their durations, excluding busy intervals. Counts, bytes and duration
+sums are additive; maxima and queue high-water marks preserve the worst
+constituent tick. A busy interval keeps the full tick format with version v9.
+Detailed `term-lat[v8]`, startup and slow-write records retain their formats and
+are flushed on the usual cadence even when their interval is aggregated.
+
 **UI log** (`ui-prof`): present-pump cost, UI-queue probe RTT, coalesce rate,
 and 1m / 15m / hourly snapshots (working set). Use this for settings typing and
 cursor starvation (term-prof cannot see non-terminal keys). Spikes:
 `pump >8ms/>30ms`, `probe >50ms/>200ms`, `timeout=`.
+
+Background `ui-session-lookup[v1]` details log on a hit, a change of outcome or
+provider for that pane, or elapsed time of at least 5 ms. Steady unresolved
+polls are counted without individual lines. Launch-resume lookups always log.
+Once per minute, `ui-prof[session-lookups v1]` reports per-provider discovery
+`calls`, `found`, `slow`, `emitted`, `suppressed`, summed `elapsed_us` and
+`max_us`. Sum summary counts rather than counting detailed lines; a slow storm
+remains visible. Counts cover records accepted by the bounded worker queue;
+`deferred_dropped` still reports saturation separately. Outcome memory expires
+after an hour without a lookup and is bounded to 4096 panes.
+Periodic summaries are best effort: the unfinished interval is not persisted on
+process exit (up to 30 seconds of quiet terminal work or 60 seconds of discovery
+counts). Detailed input and slow-event records keep their usual flush cadence.
 
 When GPUI reports that nothing in the newly rendered dispatch tree owns focus,
 `ui-prof[focus path v2]` records fixed owner classes and pane UUIDs for the

@@ -1709,8 +1709,13 @@ feature is added or changed, update the matching entry here in the same change**
 ## Platform & distribution
 
 - **Opt-in session diagnostics** — `MUXEL_PROFILE=1` records background
-  session lookup durations and outcomes, plus the remaining launch-time resume
-  lookup. Records contain fixed labels, timings and short pane ids, with no
+  session lookup hits, outcome changes and slow calls, with per-minute counts
+  and maximum durations for all discovery polls. Launch-time resume lookups
+  always log. Both profiler logs keep stable live paths and dated history
+  (14 local dates and 256 MiB per family by default, tunable with
+  `MUXEL_PROFILE_KEEP_DAYS` and `MUXEL_PROFILE_MAX_BYTES`). Quiet terminal
+  intervals aggregate totals and maxima over 30 seconds. Records contain fixed
+  labels, timings and short pane ids, with no
   terminal content, session ids, titles or paths.
 - **Opt-in focus diagnostics** — the UI profiler correlates GPUI focus-path
   loss with redraw requests and native Windows ownership. WebView children

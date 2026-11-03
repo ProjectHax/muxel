@@ -5092,6 +5092,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "base64",
+ "chrono",
  "gpui",
  "libc",
  "log",
