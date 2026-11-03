@@ -137,7 +137,7 @@ pub(super) fn tmux_session_running(target: &SessionTarget) -> Option<bool> {
         .map_or_else(|| Socket::BOTH.to_vec(), |socket| vec![socket]);
     let mut answered = true;
     for socket in sockets {
-        let mut command = Command::new("tmux");
+        let mut command = muxel_core::child_env::command("tmux");
         command
             .args(socket.args())
             .args(muxel_core::tmux::has_session_args(&target.name));
@@ -210,7 +210,7 @@ fn bounded_command(
 }
 
 fn tmux_title_on(session: &str, socket: Socket) -> Option<String> {
-    let mut command = Command::new("tmux");
+    let mut command = muxel_core::child_env::command("tmux");
     command.args(socket.args()).args([
         "display-message",
         "-p",

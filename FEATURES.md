@@ -1712,6 +1712,9 @@ feature is added or changed, update the matching entry here in the same change**
   session lookup durations and outcomes, plus the remaining launch-time resume
   lookup. Records contain fixed labels, timings and short pane ids, with no
   terminal content, session ids, titles or paths.
+- **Profiler isolation** — muxel's profiler switches and log paths stay with the
+  process that enabled them. Panes, runners and helper commands start without
+  those settings; a nested muxel can enable its own profiler independently.
 - **Opt-in focus diagnostics** — the UI profiler correlates GPUI focus-path
   loss with redraw requests and native Windows ownership. WebView children
   must descend from a registered Muxel window; unrelated WRY apps remain

@@ -1572,7 +1572,7 @@ impl TerminalSession {
         ensure_utf8_locale(&mut builder);
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
-        // Last, so anything the instance/preset sets wins over muxel's defaults.
+        // Apply preset overrides, then filter settings owned by the parent.
         apply_spec_env(&mut builder, &spec);
         // These are private transport slots, not preset-overridable child env.
         // Reapply them after preset env so a collision cannot replace the batch
@@ -3693,14 +3693,19 @@ fn ensure_utf8_locale(builder: &mut CommandBuilder) {
 fn ensure_utf8_locale(_builder: &mut CommandBuilder) {}
 
 /// `spec`'s variables on top of what `builder` already has (muxel's own
-/// environment and its defaults), then without `spec.env_remove`, which covers
-/// both.
+/// environment and its defaults), then without `spec.env_remove` or the parent
+/// muxel's profiler settings. Removals cover both inherited and configured env.
 fn apply_spec_env(builder: &mut CommandBuilder, spec: &CommandSpec) {
     for (k, v) in &spec.env {
         builder.env(k, v);
     }
     for k in &spec.env_remove {
         builder.env_remove(k);
+    }
+    // Profiler settings belong to the parent muxel, even when a preset repeats
+    // them. Apply last so no configured override can leak them into a pane.
+    for key in muxel_core::child_env::PROFILER_VARS {
+        builder.env_remove(key);
     }
 }
 
@@ -4370,6 +4375,33 @@ mod wheel_report_tests {
         assert_eq!(builder.get_env("PATH"), None);
         assert_eq!(builder.get_env("MUXEL_TEST_SET"), None);
         assert_eq!(builder.get_env("MUXEL_TEST_KEEP"), Some("1".as_ref()));
+    }
+
+    #[test]
+    fn pane_environment_drops_parent_profiler_settings() {
+        let profilers = [
+            "MUXEL_PROFILE",
+            "MUXEL_PROFILE_TERMINAL",
+            "MUXEL_PROFILE_UI",
+            "MUXEL_PROFILE_LOG",
+            "MUXEL_PROFILE_UI_LOG",
+            "MUXEL_PROFILE_STDERR",
+            "MUXEL_PROFILE_CHAINS",
+        ];
+        let context = ["MUXEL_INSTANCE_ID", "MUXEL_USER_DATA_DIR", "MUXEL_CONTROL"];
+        let mut builder = portable_pty::CommandBuilder::new("unused");
+        let mut spec = CommandSpec::program("unused", Vec::new());
+        for key in profilers.iter().chain(context.iter()) {
+            builder.env(key, "inherited");
+            spec.env.push((key.to_string(), "configured".to_string()));
+        }
+        apply_spec_env(&mut builder, &spec);
+        for key in profilers {
+            assert_eq!(builder.get_env(key), None, "profiler leaked: {key}");
+        }
+        for key in context {
+            assert_eq!(builder.get_env(key), Some("configured".as_ref()));
+        }
     }
 
     #[test]
