@@ -334,7 +334,7 @@ fn local_activation_retries_a_persisted_kill_on_its_recorded_server() {
                     .unwrap()
                     .remember_closed_session(
                         muxel_core::tmux::SessionTarget::new(
-                            session.into(),
+                            session,
                             Some(muxel_core::tmux::Socket::Named(socket.clone())),
                         ),
                         iid,
