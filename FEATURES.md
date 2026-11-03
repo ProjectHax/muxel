@@ -102,6 +102,9 @@ feature is added or changed, update the matching entry here in the same change**
 - **Detach a pane** — pop a pane out into its own OS window without terminating it.
   Terminals and editors move across; a browser pane is re-created in the new window
   at the same URL (a native webview belongs to the window that built it).
+- **Independent refresh** — popouts follow their own pane's title, status and
+  content, theme changes, and their own close state. Unrelated app updates,
+  including sidebar and other panes' activity, do not request a popout render.
 - **Re-dock in place** — a popped-out pane remembers where it came from; the Dock
   button returns it to its original location. Re-docking a working agent clears
   that pane's stale finished or needs-input card.
