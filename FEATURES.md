@@ -488,7 +488,10 @@ feature is added or changed, update the matching entry here in the same change**
   by Claude and Grok remain **working** even when their titles look idle. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
-  Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
+  Grok redraw gaps do not forge completion. Panes judged by output activity
+  (shells, and agents whose titles can't be read) ignore a tmux status bar's
+  repaints, so its clock turning over doesn't flash an idle shell to **working**.
+  Ambiguous waiting rows do not claim
   active work. Local Codex `/rename` values are read
   from its session index by the pane's captured session UUID. The index is checked
   for changes and reread in full when it changes; truncating it rebuilds the names. Child commands
