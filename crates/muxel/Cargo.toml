@@ -73,6 +73,23 @@ keyring = { version = "3", features = [
 # Speech-to-text: cross-platform mic capture (WASAPI/CoreAudio/ALSA). In-process
 # whisper.cpp for offline local transcription is added per-target just below.
 cpal = "0.15"
+# Sound alerts: decode the user's own alert sound (Settings → Sounds) — WAV, AIFF,
+# CAF, MP3, OGG Vorbis, FLAC, M4A/AAC — in pure Rust, played through cpal like
+# speech. The built-in chimes are synthesized (`muxel_core::chime`) and need none
+# of this.
+symphonia = { version = "0.5.5", default-features = false, features = [
+    "wav",
+    "aiff",
+    "caf",
+    "pcm",
+    "adpcm",
+    "mp3",
+    "ogg",
+    "vorbis",
+    "flac",
+    "isomp4",
+    "aac",
+] }
 
 # --- Local neural voice (opt-in, OFF by default) ---
 # `tts.rs` can speak with Kokoro-82M in-process, fully offline. Nothing in muxel

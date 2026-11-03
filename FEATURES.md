@@ -488,7 +488,10 @@ feature is added or changed, update the matching entry here in the same change**
   by Claude and Grok remain **working** even when their titles look idle. Claude's
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
-  Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
+  Grok redraw gaps do not forge completion. Panes judged by output activity
+  (shells, and agents whose titles can't be read) ignore a tmux status bar's
+  repaints, so its clock turning over doesn't flash an idle shell to **working**.
+  Ambiguous waiting rows do not claim
   active work. Local Codex `/rename` values are read
   from its session index by the pane's captured session UUID. The index is checked
   for changes and reread in full when it changes; truncating it rebuilds the names. Child commands
@@ -749,6 +752,18 @@ feature is added or changed, update the matching entry here in the same change**
   focused — no toast pops over the app you're already looking at (the in-app feed
   still records it). Clicking the notification raises muxel and jumps to the pane
   that fired it.
+- **Sound alerts** (Settings → Sounds) — a chime when an agent finishes, and a
+  different one when it's blocked waiting on you, in a pane you aren't looking at
+  (even while muxel is focused, so another pane's agent can call you over). Agents
+  only — a shell finishing a command never chimes. The built-in sounds are
+  synthesized by muxel (a rising two-note chime for done, a double knock for
+  blocked); either can be replaced with your own WAV, AIFF, MP3, OGG, FLAC or M4A
+  file (Play to preview, cut to 10 s; a file that won't play falls back to the
+  built-in), with on/off per alert and a volume setting. No spam: an alert must
+  hold for a moment before it rings, a pane then stays quiet for that alert until
+  you've looked at it (or five minutes pass) however often it flips between working
+  and done, and alerts that land together play as one chime. The desktop toast for
+  the same event stays silent so the two never double up.
 - **In-app NOTIFICATIONS sidebar** — a category above PROJECTS collecting agent
   events **and** all app messages (git results, SSH connections, and save errors —
   workspace, settings, workspace list, project memory, and layout backups —
@@ -1606,8 +1621,8 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Settings & theming
 
-- **Settings modal** — sections for Appearance, Editor, Behavior, Speech, Read
-  Aloud, Agents, Runners, Snippets, Loops, Remotes, Identities, Projects, and
+- **Settings modal** — sections for Appearance, Editor, Behavior, Sounds, Speech,
+  Read Aloud, Agents, Runners, Snippets, Loops, Remotes, Identities, Projects, and
   Keybindings.
 - **Themes** — ~22 bundled themes with a switcher (Catppuccin, Gruvbox, Tokyo
   Night, Solarized, Ayu, Everforest, and more).

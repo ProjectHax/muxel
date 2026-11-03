@@ -1008,6 +1008,70 @@ pub fn repo_current_branch(loc: &RepoLoc) -> Option<String> {
     git_line_loc(loc, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD")
 }
 
+/// A cheap stamp of the git metadata [`repo_current_branch`] and [`list_branches`]
+/// read for a local `dir`: the git dir found, HEAD's contents, the loose branch
+/// names, and the size/mtime of `packed-refs` and reftable's `tables.list`. It
+/// takes a few `stat`s and no `git` subprocess, so the status poll re-runs git
+/// only when this moves. Not a repo (no `.git` up the tree) is a stamp too, so
+/// a `git init` there is noticed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitRefStamp {
+    git_dir: Option<PathBuf>,
+    head: Option<Vec<u8>>,
+    branches: Vec<PathBuf>,
+    packed_refs: Option<(std::time::SystemTime, u64)>,
+    reftable: Option<(std::time::SystemTime, u64)>,
+}
+
+pub fn git_ref_stamp(dir: &Path) -> GitRefStamp {
+    let Some(git_dir) = find_git_dir(dir) else {
+        return GitRefStamp::default();
+    };
+    // A linked worktree's branches live in the main repo's git dir.
+    let common = std::fs::read_to_string(git_dir.join("commondir"))
+        .map(|rel| git_dir.join(rel.trim()))
+        .unwrap_or_else(|_| git_dir.clone());
+    let file_stamp = |path: PathBuf| {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    };
+    let heads = common.join("refs").join("heads");
+    let mut branches = Vec::new();
+    let mut dirs = vec![heads.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(path);
+            } else if let Ok(name) = path.strip_prefix(&heads) {
+                branches.push(name.to_path_buf());
+            }
+        }
+    }
+    branches.sort();
+    GitRefStamp {
+        head: std::fs::read(git_dir.join("HEAD")).ok(),
+        branches,
+        packed_refs: file_stamp(common.join("packed-refs")),
+        reftable: file_stamp(common.join("reftable").join("tables.list")),
+        git_dir: Some(git_dir),
+    }
+}
+
+/// The git dir for `dir`, found as git does: the nearest `.git` up the tree —
+/// a directory, or (linked worktree, submodule) a file saying `gitdir: <path>`.
+fn find_git_dir(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors().find_map(|d| {
+        let dot = d.join(".git");
+        if std::fs::metadata(&dot).ok()?.is_dir() {
+            return Some(dot);
+        }
+        let file = std::fs::read_to_string(&dot).ok()?;
+        let target = file.lines().next()?.strip_prefix("gitdir:")?.trim();
+        Some(d.join(target))
+    })
+}
+
 /// Run a git command in `dir` and return its trimmed single-line stdout on
 /// success, else `None`.
 fn git_line(dir: &Path, args: &[&str]) -> Option<String> {
@@ -7219,6 +7283,56 @@ mod tests {
         );
         assert!(!marker.exists());
         lib_cleanup(&lib_dir);
+        lib_cleanup(&dir);
+    }
+
+    // ---- Branch-poll stamp ----
+
+    #[test]
+    fn git_ref_stamp_moves_with_head_and_branches() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let base = git_ref_stamp(repo.path());
+        assert_eq!(base, git_ref_stamp(repo.path()), "stable while untouched");
+        let deeper = repo.path().join("src").join("deep");
+        std::fs::create_dir_all(&deeper).unwrap();
+        assert_eq!(git_ref_stamp(&deeper), base, "found from a subdirectory");
+
+        repo.git(&["branch", "feature/x"]);
+        let created = git_ref_stamp(repo.path());
+        assert_ne!(created, base, "new nested branch");
+
+        repo.git(&["checkout", "-q", "feature/x"]);
+        let switched = git_ref_stamp(repo.path());
+        assert_ne!(switched, created, "checkout");
+
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["pack-refs", "--all"]);
+        let packed = git_ref_stamp(repo.path());
+        repo.git(&["branch", "-D", "feature/x"]);
+        assert_ne!(git_ref_stamp(repo.path()), packed, "packed branch deleted");
+    }
+
+    #[test]
+    fn git_ref_stamp_reads_a_linked_worktrees_branches_from_the_main_repo() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let wt = crate::test_support::short_temp_path();
+        repo.git(&["worktree", "add", "-q", "-b", "wt", &wt.to_string_lossy()]);
+        let before = git_ref_stamp(&wt);
+        assert_ne!(before, git_ref_stamp(repo.path()), "its own HEAD");
+        repo.git(&["branch", "other"]);
+        assert_ne!(git_ref_stamp(&wt), before, "branch made in the main repo");
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn git_ref_stamp_notices_git_init() {
+        let dir = lib_temp_dir();
+        let plain = git_ref_stamp(&dir);
+        assert_eq!(plain, git_ref_stamp(&dir));
+        git_out(&dir, &["init", "-q", "-b", "main"]);
+        assert_ne!(git_ref_stamp(&dir), plain);
         lib_cleanup(&dir);
     }
 }
