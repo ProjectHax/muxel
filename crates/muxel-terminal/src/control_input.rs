@@ -523,7 +523,9 @@ fn step(
     match run(guarded.as_deref().unwrap_or(args), stdin) {
         Ok(out)
             if out.status.success()
-                && String::from_utf8_lossy(&out.stdout).trim() == "muxel-ctl-pane-in-mode" =>
+                && String::from_utf8_lossy(&out.stdout)
+                    .trim_end()
+                    .ends_with("muxel-ctl-pane-in-mode") =>
         {
             Err(in_mode(pane))
         }
@@ -848,7 +850,7 @@ mod tests {
             seen.lock().push((args.to_vec(), None));
             Ok(match args[0].as_str() {
                 "list-panes" => output(0, AGENT_PANES, ""),
-                "if-shell" => output(0, "muxel-ctl-pane-in-mode\n", ""),
+                "if-shell" => output(0, "SSH startup text: muxel-ctl-pane-in-mode\n", ""),
                 _ => output(0, "", ""),
             })
         });
