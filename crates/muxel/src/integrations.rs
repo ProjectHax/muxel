@@ -3429,13 +3429,18 @@ fn local_close_generation(
     deadline: Instant,
 ) -> Result<Option<(String, Option<uuid::Uuid>)>> {
     let mut cmd = tmux_on(socket);
+    // Keep imported Unicode names intact even with the runner's C locale.
+    cmd.arg("-u");
     cmd.args([
         "display-message".to_string(),
         "-p".into(),
         "-t".into(),
         format!("={session}:"),
+        // tmux sanitizes control characters (including tabs) under the
+        // runner's LC_ALL=C. Colons remain printable; parse from the right
+        // so the session name cannot change the id/token boundaries.
         format!(
-            "#{{session_name}}\t#{{session_id}}\t#{{{}}}",
+            "#{{session_name}}:#{{session_id}}:#{{{}}}",
             muxel_core::tmux::LOCAL_CLOSE_GENERATION_OPTION
         ),
     ]);
@@ -3444,8 +3449,8 @@ fn local_close_generation(
         let text = String::from_utf8(out.stdout).context("tmux generation is not UTF-8")?;
         let line = text.strip_suffix('\n').unwrap_or(&text);
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some((prefix, token)) = line.rsplit_once('\t')
-            && let Some((name, id)) = prefix.rsplit_once('\t')
+        if let Some((prefix, token)) = line.rsplit_once(':')
+            && let Some((name, id)) = prefix.rsplit_once(':')
             && name == session
             && id.strip_prefix('$').is_some_and(|digits| {
                 !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
@@ -4168,6 +4173,9 @@ fn probe_ssh_command_config(
     ceiling: Option<&Path>,
     deadline: Instant,
 ) -> SshConfigProbe {
+    if Instant::now() >= deadline {
+        return SshConfigProbe::Failed;
+    }
     let Some(mut cmd) = env.base_command(cwd, ceiling) else {
         return SshConfigProbe::Failed;
     };

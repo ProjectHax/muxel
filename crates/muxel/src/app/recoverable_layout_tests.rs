@@ -531,10 +531,14 @@ fn tmux_fixture(socket: &str, args: &[&str]) -> String {
 #[cfg(unix)]
 #[test]
 fn review_close_retry_preserves_peer_replacements_including_a_restarted_server() {
-    for restart_server in [false, true] {
+    for (restart_server, session) in [
+        (false, "peer-replacement-fixture"),
+        (true, "peer-replacement-fixture"),
+        (false, "peer-replacement-café"),
+        (true, "peer-replacement-café"),
+    ] {
         let socket = format!("muxel-close-test-{}", Uuid::new_v4());
         let _server = OwnedTmux(socket.clone());
-        let session = "peer-replacement-fixture";
         let token = Uuid::new_v4();
         tmux_fixture(&socket, &["new-session", "-d", "-s", session, "sleep 120"]);
         let original_id = tmux_fixture(
