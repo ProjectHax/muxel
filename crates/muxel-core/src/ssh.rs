@@ -1069,9 +1069,10 @@ pub fn ssh_args(spec: &SshSpec) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     fn test_profile_cleanup() -> String {
-        crate::child_env::PROFILER_VARS
+        crate::child_env::profiler_env_keys(std::env::vars_os().map(|(key, _)| key))
             .iter()
-            .map(|key| format!("set-environment -g -u {key} ';' "))
+            .filter_map(|key| key.to_str())
+            .map(|key| format!("set-environment -g -u {} ';' ", sh_quote(key)))
             .collect()
     }
 

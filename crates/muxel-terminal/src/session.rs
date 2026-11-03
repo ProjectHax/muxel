@@ -3704,7 +3704,17 @@ fn apply_spec_env(builder: &mut CommandBuilder, spec: &CommandSpec) {
     }
     // Profiler settings belong to the parent muxel, even when a preset repeats
     // them. Apply last so no configured override can leak them into a pane.
-    for key in muxel_core::child_env::PROFILER_VARS {
+    let keys = muxel_core::child_env::profiler_env_keys(
+        std::env::vars_os()
+            .map(|(key, _)| key)
+            .chain(
+                builder
+                    .iter_full_env_as_str()
+                    .map(|(key, _)| OsString::from(key)),
+            )
+            .chain(spec.env.iter().map(|(key, _)| OsString::from(key))),
+    );
+    for key in keys {
         builder.env_remove(key);
     }
 }
@@ -4380,6 +4390,7 @@ mod wheel_report_tests {
     #[test]
     fn pane_environment_drops_parent_profiler_settings() {
         let profilers = [
+            "MUXEL_PROFILE_FUTURE",
             "MUXEL_PROFILE",
             "MUXEL_PROFILE_TERMINAL",
             "MUXEL_PROFILE_UI",
