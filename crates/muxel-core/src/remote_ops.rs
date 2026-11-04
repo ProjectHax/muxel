@@ -307,7 +307,8 @@ fn append_gitignore_ps(ignore_line: &str) -> String {
          ((Get-Content -LiteralPath $gi -ErrorAction SilentlyContinue | \
          ForEach-Object {{ $_.Trim() }}) -contains {ign}); \
          if (-not $have -and (Get-Command git -ErrorAction SilentlyContinue)) {{ \
-         & git check-ignore -q -- {ign} 2>$null; $have = $LASTEXITCODE -eq 0 }}; \
+         try {{ & git check-ignore -q -- {ign} 2>$null; $have = $LASTEXITCODE -eq 0 }} \
+         catch {{ $have = $false }} }}; \
          if (-not $have) {{ Add-Content -LiteralPath $gi -Value {ign} }}"
     )
 }
@@ -692,7 +693,10 @@ mod tests {
             ".muxel/",
         ));
         assert!(
-            s.contains("& git check-ignore -q -- '.muxel/' 2>$null; $have = $LASTEXITCODE -eq 0"),
+            s.contains(
+                "try { & git check-ignore -q -- '.muxel/' 2>$null; $have = $LASTEXITCODE -eq 0 } \
+                 catch { $have = $false }"
+            ),
             "{s}"
         );
         assert!(s.contains("Get-Command git"), "{s}");
