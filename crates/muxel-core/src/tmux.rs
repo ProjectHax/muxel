@@ -1352,11 +1352,23 @@ fn valid_control_pane(pane: &str) -> bool {
 /// Runs only in a newly created agent pane, never when `new-session -A`
 /// reattaches. `$TMUX` selects that pane's server; `$TMUX_PANE` is its immutable
 /// id. Keep argv separate from the script so shell metacharacters stay data.
+///
+/// tmux gives a lone command string to the user's shell and execs several words
+/// directly. The wrapper keeps both, because `npx opencode`, `~/bin/agent` and a
+/// PATH set only in a shell's own startup file rely on the first. The marker's
+/// failure stays quiet, as its stderr would land on the agent's terminal.
 pub fn control_pane_program(program: &str, args: &[String]) -> Vec<String> {
+    let launch = if args.is_empty() {
+        "exec \"${SHELL:-/bin/sh}\" -c \"$1\""
+    } else {
+        "exec \"$@\""
+    };
     let mut command = vec![
         "sh".into(),
         "-c".into(),
-        "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\"; exec \"$@\"".into(),
+        format!(
+            "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; {launch}"
+        ),
         "muxel-agent".into(),
         program.into(),
     ];
@@ -1539,6 +1551,57 @@ pub fn control_key_steps(keys: &[crate::control::Key]) -> Vec<KeyStep> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run the launch wrapper with no tmux server to reach, so its marker fails.
+    #[cfg(unix)]
+    fn run_control_pane_program(program: &str, args: &[String]) -> std::process::Output {
+        let empty = std::env::temp_dir().join(format!("muxel-wrapper-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let command = control_pane_program(program, args);
+        let output = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .env("SHELL", "/bin/sh")
+            .env("TMUX_TMPDIR", &empty)
+            .env("TMUX_PANE", "%0")
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(empty).unwrap();
+        output
+    }
+
+    /// tmux gives a lone command string to the user's shell, which is what makes
+    /// `npx opencode`, `~/bin/agent` and shell-only PATH work.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_with_no_arguments_still_goes_through_the_users_shell() {
+        let output = run_control_pane_program("X=shell; echo through-$X | tr a-z A-Z", &[]);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "THROUGH-SHELL\n",
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_with_arguments_runs_them_exactly() {
+        let output = run_control_pane_program("printf", &["[%s]".into(), "a  b; c".into()]);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "[a  b; c]");
+        assert!(output.status.success());
+    }
+
+    /// The agent's terminal is what the wrapper's stderr would land on.
+    #[cfg(unix)]
+    #[test]
+    fn the_launch_wrapper_says_nothing_when_it_cannot_mark_the_pane() {
+        for (program, args) in [("true", vec![]), ("true", vec!["ignored".to_string()])] {
+            let output = run_control_pane_program(program, &args);
+            assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+        }
+    }
 
     #[test]
     fn the_agent_pane_is_the_sessions_first_whichever_pane_is_active() {
@@ -2905,7 +2968,7 @@ mod tests {
                 "--",
                 "sh",
                 "-c",
-                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\"; exec \"$@\"",
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"${SHELL:-/bin/sh}\" -c \"$1\"",
                 "muxel-agent",
                 "claude"
             ]

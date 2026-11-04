@@ -359,7 +359,9 @@ An unanswered Enter may already have started a turn, so ctl sets its
 local `just_submitted` guard before releasing the send's in-flight marker.
 
 A new agent's launch records `$TMUX_PANE` in the session's
-`@muxel_control_pane` option before exec-ing the program. The launch wrapper
+`@muxel_control_pane` option before exec-ing the program. A program with no
+arguments still runs through the user's shell, as tmux does with a lone command
+string, so `npx opencode` and shell-only PATH keep working. The launch wrapper
 does not run on reattach. First ctl delivery caches that record, which remains
 authoritative after joins, moves and default-command splits. Sessions without
 the option retain the lowest-pane lookup; a vanished recorded pane never

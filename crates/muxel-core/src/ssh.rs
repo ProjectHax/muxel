@@ -831,8 +831,8 @@ pub fn claim_window_size_command(session: &crate::tmux::SessionTarget, tag: &str
 /// is the PATH the user gets on that host by hand. Login *and* interactive, because
 /// `PATH` is as often set in `.zshrc`/`.bashrc` (interactive-only) as in a profile.
 /// The inner `exec` keeps the agent as the pane's own process, so exit status and
-/// signals are unchanged. `$SHELL` is deliberately unquoted — the *remote* shell
-/// expands it.
+/// signals are unchanged. `${SHELL:-/bin/sh}` stays unexpanded here: the `sh -c`
+/// inside the remote pane expands it, so it names the remote user's shell.
 ///
 /// Ported from Swift's `TmuxCommands.launchAgent`, which fixed this on iOS first —
 /// keep the two in step.
@@ -1647,7 +1647,7 @@ mod tests {
                  mkdir -p -- /srv/app; \
                  exec tmux \"$@\" -u set -g mouse on ';' {profile_cleanup}set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s muxel-abc123 -c /srv/app \
-                 -- sh -c 'tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\"; exec \"$@\"' \
+                 -- sh -c 'tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"$@\"' \
                  muxel-agent sh -c '\"${{SHELL:-/bin/sh}}\" -ilc '\\''exec claude'\\'''",
                 tmux_path_prelude(),
                 profile_cleanup = test_profile_cleanup()

@@ -2677,7 +2677,7 @@ mod tests {
                 "--",
                 "sh",
                 "-c",
-                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\"; exec \"$@\"",
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"${SHELL:-/bin/sh}\" -c \"$1\"",
                 "muxel-agent",
                 "claude"
             ]
@@ -2742,7 +2742,7 @@ mod tests {
                 "--",
                 "sh",
                 "-c",
-                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\"; exec \"$@\"",
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"$@\"",
                 "muxel-agent",
                 "agent",
                 "two words",

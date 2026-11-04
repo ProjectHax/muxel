@@ -417,12 +417,23 @@ fn deliver(run: &TmuxRunner, pane: &str, input: &ControlInput, atomic: bool) -> 
     }
 }
 
+/// A remote shell's startup files can print before tmux does, on the same stdout.
+/// tmux's answer is the last line with anything on it.
+fn tmux_answer(stdout: &[u8]) -> String {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Whether tmux answered that `pane` doesn't exist. An unanswered or unstarted
 /// check says nothing either way.
 fn pane_gone(run: &TmuxRunner, pane: &str) -> bool {
-    run(&tmux::control_pane_exists_args(pane), None).is_ok_and(|out| {
-        !out.status.success() || String::from_utf8_lossy(&out.stdout).trim_end() != pane
-    })
+    run(&tmux::control_pane_exists_args(pane), None)
+        .is_ok_and(|out| !out.status.success() || tmux_answer(&out.stdout) != pane)
 }
 
 fn deliver_once(run: &TmuxRunner, pane: &str, input: &ControlInput, atomic: bool) -> Delivered {
@@ -509,7 +520,7 @@ fn step(
         if !out.status.success() {
             return Err(ControlWriteError::Refused(stderr_line(&out)));
         }
-        match String::from_utf8_lossy(&out.stdout).trim().parse::<usize>() {
+        match tmux_answer(&out.stdout).parse::<usize>() {
             Ok(0) => {}
             Ok(_) => return Err(in_mode(pane)),
             Err(_) => {
@@ -872,6 +883,51 @@ mod tests {
             args[0].as_str(),
             "list-panes" | "if-shell" | "display-message"
         )));
+    }
+
+    /// A remote shell's startup files print before tmux does, and ssh carries both
+    /// on stdout. Master tolerated this, so a legacy host must keep accepting writes.
+    #[test]
+    fn legacy_checks_read_tmuxs_answer_after_ssh_startup_output() {
+        const STARTUP: &str = "Welcome to the host\n\nLast login: never\n";
+        let panes = AGENT_PANES.replace("3.4", "2.1");
+        let in_mode = Arc::new(AtomicBool::new(false));
+        let write_fails = Arc::new(AtomicBool::new(false));
+        let route = {
+            let (in_mode, write_fails) = (in_mode.clone(), write_fails.clone());
+            TmuxInputRoute::new("muxel_p_1", true, move |args: &[String], _| {
+                let answer = |stdout: &str| output(0, &format!("{STARTUP}{stdout}"), "");
+                Ok(match args[0].as_str() {
+                    "list-panes" => answer(&panes),
+                    "display-message" if args.last().unwrap() == "#{pane_in_mode}" => {
+                        answer(if in_mode.load(Ordering::Acquire) {
+                            "1\n"
+                        } else {
+                            "0\n"
+                        })
+                    }
+                    "display-message" if args.last().unwrap() == "#{pane_id}" => answer("%7\n"),
+                    "load-buffer" if write_fails.load(Ordering::Acquire) => {
+                        output(1, STARTUP, "no buffer\n")
+                    }
+                    _ => answer(""),
+                })
+            })
+        };
+        let input = TmuxInput::new(route, Arc::default());
+        deliver(&input, ControlInput::Paste("accepted".into()))
+            .expect("startup output failed a write master accepted");
+        deliver(&input, ControlInput::Submit).unwrap();
+
+        in_mode.store(true, Ordering::Release);
+        let error = deliver(&input, ControlInput::Paste("refused".into())).unwrap_err();
+        assert!(matches!(error, ControlWriteError::InMode(_)), "{error:?}");
+        in_mode.store(false, Ordering::Release);
+
+        // The pane is still there, so this failure isn't "the pane is gone".
+        write_fails.store(true, Ordering::Release);
+        let error = deliver(&input, ControlInput::Paste("failed".into())).unwrap_err();
+        assert!(matches!(error, ControlWriteError::Refused(_)), "{error:?}");
     }
 
     #[test]
