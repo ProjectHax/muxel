@@ -402,7 +402,9 @@ enum TmuxCommands {
             + "new-session -d -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
-            cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"
+            cmd += " -- sh -c " + Shell.quote(
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; "
+                    + "exec \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))")
         }
         return cmd
     }
@@ -446,7 +448,9 @@ enum TmuxCommands {
             + "new-session -A -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
-            cmd += " -- \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))"
+            cmd += " -- sh -c " + Shell.quote(
+                "tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; "
+                    + "exec \"${SHELL:-/bin/sh}\" -ilc \(Shell.quote(inner))")
         }
         return cmd
     }

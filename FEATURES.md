@@ -967,13 +967,12 @@ feature is added or changed, update the matching entry here in the same change**
   Nothing goes through the attached tmux client, so tmux's prefix, `prefix2`,
   the user's `bind -n` keys and extended-key encodings in ctl input reach the
   agent as text and never open a window or run a tmux command, and agent panes
-  need no shell grant. The first ctl write to a terminal finds the agent's own
-  tmux pane, the one its session was created with (the session's lowest pane
-  id; in a session muxel created with a program, that pane must also have been
-  started with a command, which a plain shell split never is, though muxel
-  doesn't check which command), whichever pane the user left active, and keeps
-  it by pane id, so input stays with the agent after the user opens other
-  windows or splits. If it can't be found or has gone, input
+  need no shell grant. A newly created agent records its initial tmux pane id
+  before starting the program; reattaching keeps that record. Input stays with
+  that id even after `join-pane`, `move-pane`, or default-command splits.
+  Older or adopted sessions fall back to the lowest pane id (which must have
+  a start command for an agent). The first ctl write caches the id for the
+  terminal's life. If it can't be found or has gone, input
   is refused with `tmux_pane_unresolved` and nothing is typed, never
   redirected; after a failed lookup the next waits 2 seconds, doubling to at
   most 2 minutes, so a host that can't be reached isn't asked again on every
@@ -985,6 +984,17 @@ feature is added or changed, update the matching entry here in the same change**
   command, and so each key press, makes its own login. Panes not kept in tmux
   take the same input as PTY bytes, as before. This needs tmux 2.1 or later on
   a remote host; local tmux panes already need 3.2.
+  A pane in copy mode refuses input with `tmux_pane_in_mode`, preserving the
+  user's scroll position. Leave copy mode before retrying. When the server
+  reports version 2.4 or newer, the check and write share tmux's command queue.
+  Older servers, and servers that cannot report their version, use a separate
+  check before every write. That adds a round trip and leaves a small race if
+  the user enters copy mode between the check and Enter. Stock 2.2 and 2.3 also
+  use this legacy path because the server-version format arrived in 2.4.
+  If copy mode begins after a
+  prompt was pasted, the Enter failure carries `pasted: true`; inspect the
+  screen before retrying. An unanswered Enter sets the same local turn guard
+  as an acknowledged Enter, since it may already have started the agent.
 - **Popped-out terminals** — `ctl` keeps reading their status and screen and can
   send input when they move to a separate window or dock again. Their activity
   timestamps stay current, so `wait` recognizes completed or blocked turns.

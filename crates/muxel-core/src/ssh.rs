@@ -831,8 +831,8 @@ pub fn claim_window_size_command(session: &crate::tmux::SessionTarget, tag: &str
 /// is the PATH the user gets on that host by hand. Login *and* interactive, because
 /// `PATH` is as often set in `.zshrc`/`.bashrc` (interactive-only) as in a profile.
 /// The inner `exec` keeps the agent as the pane's own process, so exit status and
-/// signals are unchanged. `$SHELL` is deliberately unquoted — the *remote* shell
-/// expands it.
+/// signals are unchanged. `${SHELL:-/bin/sh}` stays unexpanded here: the `sh -c`
+/// inside the remote pane expands it, so it names the remote user's shell.
 ///
 /// Ported from Swift's `TmuxCommands.launchAgent`, which fixed this on iOS first —
 /// keep the two in step.
@@ -964,7 +964,17 @@ fn remote_command(spec: &SshSpec) -> String {
             &[],
             &[crate::control::INSTANCE_ID_ENV],
         );
-        let program = spec.program.map(|p| login_shell_command(p, spec.args));
+        let program = spec.program.map(|p| {
+            // This shell command runs only on creation, not on `-A` reattach.
+            crate::tmux::control_pane_program(
+                "sh",
+                &["-c".into(), login_shell_command(p, spec.args)],
+            )
+            .iter()
+            .map(|arg| sh_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+        });
         // Fork the remote tmux server off a project-less command line first — it's a
         // separate process, so the server never inherits the argv below. Without this,
         // a `pkill -f <project>` *on the remote host* matches the shared server and
@@ -1637,7 +1647,8 @@ mod tests {
                  mkdir -p -- /srv/app; \
                  exec tmux \"$@\" -u set -g mouse on ';' {profile_cleanup}set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s muxel-abc123 -c /srv/app \
-                 -- \"${{SHELL:-/bin/sh}}\" -ilc 'exec claude'",
+                 -- sh -c 'tmux set-option -t \"$TMUX_PANE\" @muxel_control_pane \"$TMUX_PANE\" 2>/dev/null; exec \"$@\"' \
+                 muxel-agent sh -c '\"${{SHELL:-/bin/sh}}\" -ilc '\\''exec claude'\\'''",
                 tmux_path_prelude(),
                 profile_cleanup = test_profile_cleanup()
             )
@@ -2091,7 +2102,7 @@ mod tests {
             session_tmux_command(&target, &tmux::control_pane_args(&target.name)),
             format!(
                 "{lead} list-panes -s -t '=muxel_app_1a2b3c4d:' -F \
-                 '#{{session_name}}:#{{pane_id}}:#{{?pane_start_command,1,0}}'"
+                 '#{{session_name}}:#{{pane_id}}:#{{?pane_start_command,1,0}}:#{{@muxel_control_pane}}:#{{version}}'"
             )
         );
         let buffer = tmux::control_buffer_name(uuid::Uuid::nil());
@@ -2189,11 +2200,13 @@ mod tests {
             .rsplit_once(" -- ")
             .expect("a command follows the separator");
         assert!(
-            after.starts_with("\"${SHELL:-/bin/sh}\" -ilc "),
+            after.starts_with("sh -c ")
+                && after.contains("${SHELL:-/bin/sh}")
+                && after.contains("-ilc"),
             "the agent must go through a login shell, got: {after}"
         );
         // …and the agent still ends up as the pane's own process.
-        assert!(after.contains("'exec claude --model opus'"), "got: {after}");
+        assert!(after.contains("exec claude --model opus"), "got: {after}");
     }
 
     /// With no program tmux starts its own login shell, so there is nothing to wrap.
@@ -2304,7 +2317,14 @@ mod tests {
         };
         let plain = ssh_args(&spec(None)).last().unwrap().clone();
         let tagged = ssh_args(&spec(Some("ab12"))).last().unwrap().clone();
-        let program = "\"${SHELL:-/bin/sh}\" -ilc 'exec claude'";
+        let program = crate::tmux::control_pane_program(
+            "sh",
+            &["-c".into(), login_shell_command("claude", &[])],
+        )
+        .iter()
+        .map(|arg| sh_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
 
         // The server still starts first, from a command line naming no session, and
         // the session's server is chosen before anything asks it a question.

@@ -341,6 +341,34 @@ Its input timestamp is captured before publishing bytes and committed only
 after admission succeeds, so a resume hook caused by that Enter cannot make
 the selector count as a submission to the replacement conversation.
 
+For ctl delivery through tmux, input is refused while the target pane is in
+copy mode (`tmux_pane_in_mode`). Muxel preserves the user's scroll position;
+the user must leave copy mode before a caller retries. Enter is checked too,
+so entering copy mode after a paste yields an error with `pasted: true` rather
+than a successful submission receipt. A reported server version of 2.4 or newer
+uses an atomic mode check/write in tmux's command queue. Older or unreported
+versions use a separate `display-message` mode check before each write. This
+preserves legacy support without invoking tmux 2.1's unsafe `if-shell -t`
+target lookup on a vanished pane. The legacy path adds a round trip and has a
+small race if the user enters copy mode between the check and Enter. Stock
+2.2/2.3 take that path too because `#{version}` arrived in 2.4; muxel checks the
+server, not a client binary that may have been upgraded while it kept running.
+The existing pane lookup also reads the server version. Muxel caches that
+capability with the pinned pane without another version round trip.
+An unanswered Enter may already have started a turn, so ctl sets its
+local `just_submitted` guard before releasing the send's in-flight marker.
+
+A new agent's launch records `$TMUX_PANE` in the session's
+`@muxel_control_pane` option before exec-ing the program. A program with no
+arguments still runs through the user's shell, as tmux does with a lone command
+string, so `npx opencode` and shell-only PATH keep working. The launch wrapper
+does not run on reattach. First ctl delivery caches that record, which remains
+authoritative after joins, moves and default-command splits. Sessions without
+the option retain the lowest-pane lookup; a vanished recorded pane never
+redirects input to another pane. If moving the only pane destroys its source
+session before the first ctl lookup, its session record is gone too; delivery
+refuses as unresolved. A pin already cached before that move remains usable.
+
 ## Coverage boundary
 
 The reducer keeps the existing no-hook classifier. Provider titles, visible
