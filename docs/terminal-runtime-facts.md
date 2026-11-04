@@ -349,3 +349,18 @@ evidence for the fields they describe. Quiet visible output never proves that
 a provider has no hidden background work, so the snapshot reports
 `ActivityOnly`, `VisibleMarkers`, or `ProviderVisible` coverage rather than
 claiming more than the terminal shows.
+
+## Popout refresh
+
+Popout roots observe their pane entity for title, status and content, and the
+theme global for appearance changes. App notifications invalidate a popout
+only when its own presence, recoverable-close hold or close confirmation
+changes. The confirmation snapshot includes its displayed text and button labels;
+opening, changing and cancelling it all invalidate that popout. Theme palette
+refresh also visits popout-owned terminals, updating their painting and OSC
+color-query palette; unchanged palettes do not invalidate terminal content.
+
+Rendering uses the snapshot rather than reading the app entity, since initial
+window drawing can run inside the app update that opens the window. A recoverable
+close still removes the popout window while retaining its terminal; Undo
+restores that same terminal through the existing close lifecycle.

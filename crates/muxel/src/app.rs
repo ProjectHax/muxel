@@ -6285,11 +6285,55 @@ fn compute_redock_anchor(layout: &Option<PaneNode>, iid: Uuid) -> RedockAnchor {
 struct PopoutView {
     view: PaneView,
     iid: Uuid,
+    close_confirm: Option<PendingConfirm>,
+    app_state: Option<PopoutAppState>,
     /// Profiler-only correlation state. Keeping it on the root that owns the
     /// pane prevents a popped-out terminal from affecting main-app lifecycle
     /// bookkeeping or suppressing the first transition after re-dock.
     profile_status: Option<AgentStatus>,
     profile_window_active: bool,
+}
+
+/// App-owned inputs to a popout. Its PaneView supplies title, status and
+/// content updates; a global subscription supplies theme updates.
+#[derive(PartialEq, Eq)]
+struct PopoutAppState {
+    present: bool,
+    held: bool,
+    confirm: Option<PopoutConfirmState>,
+}
+
+#[derive(PartialEq, Eq)]
+struct PopoutConfirmState {
+    title: SharedString,
+    message: SharedString,
+    confirm_label: SharedString,
+    alternative_label: Option<SharedString>,
+}
+
+impl PopoutAppState {
+    fn read(app: &MuxelApp, iid: Uuid) -> Self {
+        let confirm = app
+            .confirm
+            .as_ref()
+            .filter(|pending| pending.action.pane_instance() == Some(iid))
+            .map(|pending| PopoutConfirmState {
+                title: pending.title.clone(),
+                message: pending.message.clone(),
+                confirm_label: pending.confirm_label.clone(),
+                alternative_label: recoverable_close_ui::close_alternative_label(&pending.action),
+            });
+        Self {
+            present: app.popouts.contains_key(&iid),
+            held: app.closing.contains_key(&iid),
+            confirm,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static POPOUT_TEST_RENDERS: std::cell::RefCell<HashMap<Uuid, usize>> = Default::default();
 }
 
 impl PopoutView {
@@ -6298,7 +6342,20 @@ impl PopoutView {
             .try_global::<MuxelHandle>()
             .and_then(|handle| handle.0.upgrade())
         {
-            cx.observe(&app, |_, _, cx| cx.notify()).detach();
+            cx.observe(&app, |this, app, cx| {
+                let app = app.read(cx);
+                let state = PopoutAppState::read(app, this.iid);
+                if this.app_state.as_ref() != Some(&state) {
+                    this.close_confirm = app
+                        .confirm
+                        .as_ref()
+                        .filter(|pending| pending.action.pane_instance() == Some(this.iid))
+                        .cloned();
+                    this.app_state = Some(state);
+                    cx.notify();
+                }
+            })
+            .detach();
             let weak = app.downgrade();
             window.on_window_should_close(cx, move |_, cx| {
                 let weak = weak.clone();
@@ -6311,6 +6368,8 @@ impl PopoutView {
             });
         }
         ui_profile::register_profile_window(ui_profile::ProfileWindowKind::Popout, window);
+        cx.observe_global::<gpui_component::Theme>(|_, cx| cx.notify())
+            .detach();
         let profile_status = if ui_profile::is_enabled() {
             match &view {
                 PaneView::Terminal(terminal) => Some(terminal.read(cx).status()),
@@ -6363,6 +6422,8 @@ impl PopoutView {
         Self {
             view,
             iid,
+            close_confirm: None,
+            app_state: None,
             profile_status,
             profile_window_active,
         }
@@ -6880,6 +6941,8 @@ impl DevLogEntry {
 
 impl Render for PopoutView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        POPOUT_TEST_RENDERS.with(|counts| *counts.borrow_mut().entry(self.iid).or_default() += 1);
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Popout);
         let title = self.title(cx);
         let has_close_confirm = self.central_close_confirm(cx).is_some();
@@ -10111,8 +10174,15 @@ impl MuxelApp {
     /// live terminals (called after a theme change).
     fn refresh_terminal_palettes(&mut self, cx: &mut Context<Self>) {
         let palette = theme::palette_from_theme(cx);
-        for view in self.terminals.values() {
+        for view in self
+            .terminals
+            .values()
+            .chain(self.popouts.values().filter_map(PopOut::terminal_view))
+        {
             view.update(cx, |view, cx| {
+                if view.palette() == &palette {
+                    return;
+                }
                 view.set_palette(palette.clone());
                 // Terminals render through AnyView::cached — without a notify,
                 // an idle pane replays old pixels until its next PTY byte.

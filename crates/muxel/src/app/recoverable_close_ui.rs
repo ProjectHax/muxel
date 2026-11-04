@@ -406,13 +406,10 @@ fn main_app(cx: &App) -> Option<Entity<MuxelApp>> {
 }
 
 impl PopoutView {
-    pub(super) fn central_close_confirm(&self, cx: &App) -> Option<PendingConfirm> {
-        let app = main_app(cx)?;
-        app.read(cx)
-            .confirm
-            .as_ref()
-            .filter(|pending| pending.action.pane_instance() == Some(self.iid))
-            .cloned()
+    pub(super) fn central_close_confirm(&self, _cx: &App) -> Option<PendingConfirm> {
+        // Initial window drawing can run inside the app update that opens it.
+        // Read the snapshot delivered by the observer, never the borrowed app.
+        self.close_confirm.clone()
     }
 
     fn cancel_central_close_confirm(&self, cx: &mut Context<Self>) {
