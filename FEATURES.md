@@ -154,10 +154,9 @@ feature is added or changed, update the matching entry here in the same change**
   decision. Ordinary saves preserve held panes for crash recovery; workspace
   switch and quit (or logout) finish unshared running countdowns, but keep shared
   closes until a fresh layout read can run on the next visit. A layout is shared
-  for a remote project and whenever tmux is in use, which covers every local Linux
-  and macOS project, so unshared in practice means a local Windows project. An
-  explicit Close of a shared pane also waits for the next layout read. They also
-  keep a pane
+  for a remote project and whenever the tmux setting is on, which is the default,
+  so unshared means a local project with that setting off. An explicit Close of a
+  shared pane also waits for the next layout read. They also keep a pane
   still being checked or waiting for Close / Keep, which reopens next time.
   Local tmux closes save a pending kill before teardown and retry it on project
   activation after layout reconciliation. A pane that reappeared or now shows
@@ -165,13 +164,13 @@ feature is added or changed, update the matching entry here in the same change**
   token; a same-name replacement is kept, and unverified legacy closes are
   cancelled without killing. The event log records the retained target; Import
   keeps its existing server-discovery scope and excludes pending kills on that host.
-  Their worktree cleanup waits for confirmed session death. Unconfirmed remote
-  cleanup keeps the worktree and reports why. Legacy worktrees are kept when
+  Local worktree cleanup waits for confirmed session death. A remote close keeps
+  its worktree on the host and logs why. Legacy worktrees are kept when
   dirty, unmerged or still shared by another pane.
   Removing a project never waits on those kills. One already running finishes in
   the background and an older unconfirmed one gets a last try, but nothing retries
   after that. A session that survives keeps running, the removal says so, and
-  Import lists it.
+  Import lists it. A held pane's file answer is dropped, and its files stay.
   Removing a project waits for that decision. If that save fails, the first
   switch stops with a notice and the next one leaves anyway; the pane reopens
   next time. Saving an untitled editor on close writes the path picked in the

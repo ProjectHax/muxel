@@ -1182,7 +1182,11 @@ impl Project {
                 && (closed.socket == session.socket || closed.socket.is_none())
         });
         let local_close_token = previous.and_then(|closed| closed.local_close_token);
-        let worktree = previous.map_or_else(Default::default, |closed| closed.worktree.clone());
+        let worktree = self
+            .closed_sessions
+            .iter()
+            .find(|closed| closed.instance == instance)
+            .map_or_else(Default::default, |closed| closed.worktree.clone());
         self.closed_sessions.retain(|c| c.instance != instance);
         self.closed_sessions.push(tmux::ClosedSession {
             name: session.name,
@@ -5178,8 +5182,11 @@ mod worktree_registry_tests {
         assert!(project.close_pending_in(mine));
         assert!(!project.close_pending_in(theirs));
 
-        // Resolving the owner later re-remembers the close. It must stay scoped.
+        // Resolving the owner later re-remembers the close, sometimes under the
+        // name the host really has. It must stay scoped.
         project.remember_closed_session(target("member"), member);
+        assert!(project.close_pending_in(mine));
+        project.remember_closed_session(target("member-resolved"), member);
         assert!(project.close_pending_in(mine));
         assert!(!project.close_pending_in(theirs));
 

@@ -17498,7 +17498,10 @@ impl MuxelApp {
                     "close: generation changed for [{iid}] {owner}; session and files kept"
                 ));
             }
-            Ok(None) => {}
+            // Cancelled or superseded. The session may be running in another pane
+            // now, so this worktree can't be removed, and a sibling's kill may have
+            // left it to this one to decide.
+            Ok(None) => self.keep_closed_worktree(iid, &cleanup),
             Err(error) => {
                 muxel_store::append_event_log(&format!(
                     "close: local tmux teardown for [{iid}] failed: {error:#}; activation retries only a stamped session and otherwise keeps it"
@@ -17993,15 +17996,17 @@ impl MuxelApp {
         let Some(w) = self.workspace.worktree(wid) else {
             return;
         };
+        let Some(root) = self
+            .workspace
+            .project(w.project_id)
+            .map(|p| p.root_path.clone())
+        else {
+            return;
+        };
         let path = w.path.clone();
         let name = w.name.clone();
         let color = w.color;
         let branch = w.branch.clone();
-        let root = self
-            .workspace
-            .project(w.project_id)
-            .map(|p| p.root_path.clone())
-            .unwrap_or_default();
         let changed = integrations::worktree_change_count(&path);
         let unmerged = integrations::repo_head(&root).map_or(0, |base| {
             integrations::worktree_unmerged_count(&path, &base)
@@ -30549,7 +30554,12 @@ impl MuxelApp {
             .project(pid)
             .map(|p| p.closed_sessions.clone())
             .unwrap_or_default();
+        // A file answer runs only through its own close, never on the way out, so
+        // held panes leave their files as a workspace departure does.
+        self.deferred_worktree_dispose.remove(&pid);
+        let preserving = std::mem::replace(&mut self.preserve_close_worktrees, true);
         self.finalize_project_closes(pid, cx);
+        self.preserve_close_worktrees = preserving;
         let iids: Vec<_> = self
             .workspace
             .instances
@@ -30586,8 +30596,6 @@ impl MuxelApp {
             self.add_event(NotifKind::Error, t("tmux sessions may still be running"),
                 t("This project had tmux closes that never confirmed. Muxel tried once more and won't retry. Import lists any still running."));
         }
-        // A file action runs only through its own hold, never on the way out.
-        self.deferred_worktree_dispose.remove(&pid);
         self.workspace.projects.retain(|p| p.id != pid);
         if self.workspace.active_project == Some(pid) {
             self.workspace.active_project = self.workspace.projects.first().map(|p| p.id);

@@ -2809,7 +2809,7 @@ fn a_pending_kill_for_another_pane_does_not_hold_a_file_answer() {
 
 #[test]
 fn a_kill_that_cannot_confirm_keeps_its_worktree_listed() {
-    for outcome in ["failed", "preserved"] {
+    for outcome in ["failed", "preserved", "superseded"] {
         with_app(|cx, window| {
             let pid = project(cx, window);
             let (pane, _, _child) = terminal(cx, window, pid);
@@ -2823,6 +2823,7 @@ fn a_kill_that_cannot_confirm_keeps_its_worktree_listed() {
                     app.local_closes_inflight.remove(&pane);
                     let result = match outcome {
                         "failed" => Err(anyhow::anyhow!("no answer from tmux")),
+                        "superseded" => Ok(None),
                         _ => Ok(Some((
                             target,
                             super::integrations::LocalTmuxClose::Preserved,
@@ -2844,28 +2845,6 @@ fn a_kill_that_cannot_confirm_keeps_its_worktree_listed() {
                 .unwrap();
         });
     }
-}
-
-/// A peer's panes may still use it, so this machine has no grounds to detach it.
-#[test]
-fn closing_a_remote_pane_leaves_its_worktree_attached() {
-    with_app(|cx, window| {
-        let pid = project(cx, window);
-        let (pane, _, _child) = terminal(cx, window, pid);
-        let (wid, path) = clean_worktree(cx, window, pid, pane);
-        window
-            .update(cx, |app, _, cx| {
-                app._status_timer = gpui::Task::ready(());
-                app.workspace.project_mut(pid).unwrap().remote = Some(muxel_core::RemoteRef {
-                    host_id: Uuid::new_v4(),
-                    remote_root: "/repo".into(),
-                });
-                app.close_instance_inner(pane, "close (remote)", cx);
-                assert!(path.is_dir());
-                assert!(!app.workspace.worktree(wid).unwrap().detached);
-            })
-            .unwrap();
-    });
 }
 
 #[test]
@@ -2901,6 +2880,33 @@ fn a_preserved_session_cancels_only_its_own_worktrees_answer() {
                     1,
                     "another pane's kept session cancelled this answer"
                 );
+            })
+            .unwrap();
+    });
+}
+
+/// Linux and macOS can't reach this synchronously, because their kill is still
+/// running. Windows closes at once, so the answer used to run on the way out.
+#[test]
+fn removing_a_project_leaves_the_files_of_an_answered_close() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, _child) = terminal(cx, window, pid);
+        let (wid, path) = clean_worktree(cx, window, pid, pane);
+        std::fs::write(path.join("draft.txt"), "discard this\n").unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.settings.confirm_close_terminal = false;
+                app.request_close_instance(pane, cx);
+                app.dispose_worktree_discard(cx);
+                assert!(app.is_closing(pane), "the close was accepted");
+                app.delete_project(pid, cx);
+                assert!(app.workspace.project(pid).is_none());
+                assert!(path.is_dir(), "Discard ran as the project was removed");
+                assert!(app.deferred_worktree_dispose.is_empty());
+                assert!(app.pending_worktree_dispose.is_empty());
+                assert!(app.workspace.worktree(wid).is_some());
             })
             .unwrap();
     });

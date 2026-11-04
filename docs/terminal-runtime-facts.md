@@ -65,15 +65,17 @@ for that worktree's panes are confirmed. Each ledger entry records the worktree 
 pane ran in, so another pane's kill holds nothing back; an entry saved before that
 was recorded counts as any worktree. A worktree with its own kill still running
 waits without a notice. A local one whose kill fails or can't be confirmed is kept
-and detached, so the sidebar still lists it; a remote one stays attached, since a
-peer's panes may use it. Undo, Cancel, a new worktree member or a
+and detached, so the sidebar still lists it. A remote one is never removed on close.
+It stays on the host and attached, since a peer's panes may use it. Undo, Cancel, a new worktree member or a
 preserved session for that worktree cancels the pending file action. Dirty,
 unmerged or shared legacy worktrees are kept rather than force-removed.
 
 Project removal never waits on the ledger, which goes with the project. Kills
 already running finish in the background, older unconfirmed entries get one last
 try, and nothing retries after that. A session that survives keeps running on its
-host, the removal says so, and Import lists it.
+host, the removal says so, and Import lists it. A held pane's file answer is dropped
+and its files stay. A worktree whose kill finishes after removal also stays on disk,
+as no project is left to act from.
 
 ## Reconciliation edges
 
