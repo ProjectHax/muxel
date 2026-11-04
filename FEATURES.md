@@ -563,6 +563,9 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **First-class worktrees** — named, color-coded git worktrees shared by one or
   more panes; toggle "create a git worktree" when spawning.
+- **Read-only git displays** — background polling, change counts, branch labels,
+  and diffs disable optional git locks locally and over SSH. Reading a pane's
+  repository does not refresh its index or contend with an agent staging files.
 - **Inheritance** — a new tab or split joins its pane's worktree; a duplicate
   inherits the source's; otherwise a fresh worktree is created (toggle on).
 - **Visual coding** — the pane outline + glow tint to the worktree color, a name

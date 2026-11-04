@@ -169,13 +169,49 @@ fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
 /// Run `git <args>` at a [`RepoLoc`]: locally (`git -C <path>`) or on the host
 /// over SSH (`ssh … -- git -C <remote_path> …`, fed as one quoted command).
 fn git_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
+    git_command_at(loc, args, true).output()
+}
+
+/// Mutations deliberately keep git's normal locking behavior.
+fn git_write_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
+    git_command_at(loc, args, false).output()
+}
+
+const READ_ONLY_GIT_CONFIG: &str = "diff.autoRefreshIndex=false";
+
+fn git_command_at(loc: &RepoLoc, args: &[&str], read_only: bool) -> Command {
     match loc {
-        RepoLoc::Local(path) => command("git").arg("-C").arg(path).args(args).output(),
+        RepoLoc::Local(path) => {
+            let mut cmd = if read_only {
+                git_read_command()
+            } else {
+                command("git")
+            };
+            cmd.arg("-C").arg(path).args(args);
+            cmd
+        }
         RepoLoc::Remote(c) => {
-            let remote = remote_ops::git(c.host.os, &c.remote_path, args);
-            remote_ssh_command(c, remote).output()
+            let remote = if read_only {
+                remote_ops::git_read_only(c.host.os, &c.remote_path, args)
+            } else {
+                remote_ops::git(c.host.os, &c.remote_path, args)
+            };
+            remote_ssh_command(c, remote)
         }
     }
+}
+
+/// Shared default for background/display git reads.
+fn git_read_command() -> Command {
+    read_only_git(command("git"))
+}
+
+fn read_only_git(mut cmd: Command) -> Command {
+    // Porcelain diff can run update-index --refresh even with optional locks
+    // disabled, so suppress its automatic refresh explicitly as well.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-c", READ_ONLY_GIT_CONFIG]);
+    cmd
 }
 
 /// Cap on the size of a remote file muxel will read into the editor (2 MB).
@@ -670,7 +706,8 @@ fn git_line_loc(loc: &RepoLoc, args: &[&str]) -> Option<String> {
 
 /// `git <args>` at `loc`; `bail!`s with stderr (a useful toast) on failure.
 fn git_run_loc(loc: &RepoLoc, args: &[&str]) -> Result<String> {
-    let out = git_output(loc, args).with_context(|| format!("running `git {}`", args.join(" ")))?;
+    let out =
+        git_write_output(loc, args).with_context(|| format!("running `git {}`", args.join(" ")))?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -947,7 +984,7 @@ pub fn stored_host_key_fingerprints(entry: &str, file: Option<&str>) -> Vec<(Str
 
 /// Whether `path` is inside a git working tree.
 pub fn is_git_repo(path: &Path) -> bool {
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -980,7 +1017,7 @@ pub fn worktree_change_count(worktree_path: &Path) -> usize {
     if !worktree_path.exists() {
         return 0;
     }
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["status", "--porcelain"])
@@ -1075,7 +1112,7 @@ fn find_git_dir(dir: &Path) -> Option<PathBuf> {
 /// Run a git command in `dir` and return its trimmed single-line stdout on
 /// success, else `None`.
 fn git_line(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = command("git")
+    let out = git_read_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -1093,7 +1130,7 @@ pub fn worktree_unmerged_count(worktree_path: &Path, base: &str) -> usize {
     if !worktree_path.exists() {
         return 0;
     }
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["rev-list", "--count", &format!("{base}..HEAD")])
@@ -1261,9 +1298,10 @@ pub fn git_discard_path(loc: &RepoLoc, path: &str) -> Result<String> {
 /// (local + remote) variant of [`merge_worktree_branch`]; aborts a failed merge
 /// so the repo isn't left mid-merge.
 pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
-    let out = git_output(loc, &["merge", "--no-edit", branch]).context("running `git merge`")?;
+    let out =
+        git_write_output(loc, &["merge", "--no-edit", branch]).context("running `git merge`")?;
     if !out.status.success() {
-        let _ = git_output(loc, &["merge", "--abort"]);
+        let _ = git_write_output(loc, &["merge", "--abort"]);
         bail!("git merge: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -1272,7 +1310,7 @@ pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
 /// Remove the worktree at `worktree_path` (force) and prune stale entries, at
 /// `loc`. `RepoLoc` (local + remote) variant of [`remove_worktree`].
 pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String> {
-    let out = git_output(loc, &["worktree", "remove", "--force", worktree_path])
+    let out = git_write_output(loc, &["worktree", "remove", "--force", worktree_path])
         .context("running `git worktree remove`")?;
     if !out.status.success() {
         bail!(
@@ -1280,7 +1318,7 @@ pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String>
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let _ = git_output(loc, &["worktree", "prune"]);
+    let _ = git_write_output(loc, &["worktree", "prune"]);
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -1402,7 +1440,7 @@ const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 /// (we can't tell agent-created files from pre-existing ones without a baseline).
 pub fn git_diff(dir: &Path) -> String {
     let git = |args: &[&str]| {
-        command("git")
+        git_read_command()
             .arg("-C")
             .arg(dir)
             .arg("--no-pager")
@@ -4095,6 +4133,7 @@ fn probe_ssh_command_config(
     let Some(mut cmd) = env.base_command(cwd, ceiling) else {
         return SshConfigProbe::Failed;
     };
+    cmd = read_only_git(cmd);
     cmd.args(["config", "--get", "core.sshCommand"])
         .stderr(Stdio::null());
     let Ok(child) = env.spawn(&mut cmd) else {
@@ -4590,9 +4629,8 @@ fn check_git_output(
     if Instant::now() >= deadline {
         return None;
     }
-    let mut cmd = env.base_command(Some(clone), clone.parent())?;
-    cmd.env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-c", "core.fsmonitor=false"]);
+    let mut cmd = read_only_git(env.base_command(Some(clone), clone.parent())?);
+    cmd.args(["-c", "core.fsmonitor=false"]);
     if let Some(opt) = LONG_PATHS {
         cmd.arg("-c").arg(opt);
     }
@@ -7220,6 +7258,58 @@ mod tests {
             std::fs::read(&index).unwrap(),
             std::fs::metadata(&index).unwrap().modified().unwrap(),
         )
+    }
+
+    #[test]
+    fn display_git_reads_leave_index_untouched() {
+        let repo = check_remote();
+        let clone = repo.path();
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(clone.join(LIB_FILE), FILE_V1).unwrap();
+        let index = index_state(clone);
+        let loc = RepoLoc::Local(clone.to_path_buf());
+
+        assert_eq!(worktree_change_count(clone), 0);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "worktree count refreshed the index"
+        );
+        assert!(git_status_files(&loc).is_empty());
+        assert_eq!(
+            index_state(clone),
+            index,
+            "display status refreshed the index"
+        );
+        let _ = git_diff_for(&loc, LIB_FILE);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "display diff refreshed the index"
+        );
+
+        // A stale optional lock must not obstruct reads, but mutations must
+        // still honor the index lock owned by another git process.
+        let lock = clone.join(".git/index.lock");
+        std::fs::write(&lock, "owned by another process").unwrap();
+        std::fs::write(clone.join("pending.txt"), "untracked").unwrap();
+        let status = git_status_files(&loc);
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].path, "pending.txt");
+        assert_eq!(worktree_change_count(clone), 1);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "reads under lock refreshed the index"
+        );
+        assert!(git_stage_path(&loc, LIB_FILE).is_err());
+        assert_eq!(std::fs::read(&lock).unwrap(), b"owned by another process");
+        std::fs::remove_file(lock).unwrap();
+        std::fs::remove_file(clone.join("pending.txt")).unwrap();
+
+        // Positive control: the same status without the read policy writes.
+        git_out(clone, &["status", "--porcelain"]);
+        assert_ne!(index_state(clone), index, "control: plain status");
     }
 
     #[test]

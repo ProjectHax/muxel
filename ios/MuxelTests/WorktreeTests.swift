@@ -47,7 +47,8 @@ final class WorktreeTests: XCTestCase {
     func testCreateCommandShape() {
         let cmd = WorktreeService.createCommand(root: "/srv/app", dirName: "app_1a2b3c4d",
                                                 branch: "muxel/1a2b3c4d")
-        XCTAssertTrue(cmd.contains("rev-parse --is-inside-work-tree"))
+        XCTAssertTrue(cmd.contains("'rev-parse' '--is-inside-work-tree'"))
+        XCTAssertEqual(cmd.components(separatedBy: "GIT_OPTIONAL_LOCKS=0").count - 1, 1)
         XCTAssertTrue(cmd.contains("worktree add -b"))
         XCTAssertTrue(cmd.contains("XDG_DATA_HOME"))
         XCTAssertTrue(cmd.contains("MUXEL_WT_OK"))
@@ -55,6 +56,8 @@ final class WorktreeTests: XCTestCase {
         // Best-effort env trust so mise/direnv configs load in the new worktree path.
         XCTAssertTrue(cmd.contains("mise trust"))
         XCTAssertTrue(cmd.contains("direnv allow"))
+        XCTAssertFalse(WorktreeService.removeCommand(root: "/srv/app", path: "/srv/wt", branch: "task")
+            .contains("GIT_OPTIONAL_LOCKS=0"))
     }
 
     func testParseResultOK() {
