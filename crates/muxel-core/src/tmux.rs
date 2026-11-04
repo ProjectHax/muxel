@@ -979,21 +979,33 @@ pub fn launch_session_args_with_env(
         "on".to_string(),
         ";".to_string(),
     ];
-    for name in unset {
+    let profiler_keys = crate::child_env::profiler_env_keys(
+        std::env::vars_os()
+            .map(|(key, _)| key)
+            .chain(env.iter().map(|(name, _)| std::ffi::OsString::from(name))),
+    );
+    for name in profiler_keys
+        .iter()
+        .filter_map(|key| key.to_str())
+        .chain(unset.iter().copied())
+    {
         v.extend(["set-environment", "-g", "-u", name, ";"].map(String::from));
     }
     let mut new = new_session_args(session, cwd, program, args);
     // With `new-session`'s other options: after `-A -s NAME`, before `--`.
-    let options = env.iter().flat_map(|(name, value)| {
-        let mut setting = format!("{name}={value}");
-        // tmux's argv parser treats a trailing semicolon as a command separator,
-        // even inside a single argument. Escape it for tmux, which removes this
-        // one backslash before setting the session environment.
-        if setting.ends_with(';') {
-            setting.insert(setting.len() - 1, '\\');
-        }
-        ["-e".to_string(), setting]
-    });
+    let options = env
+        .iter()
+        .filter(|(name, _)| !crate::child_env::is_profiler_var(name.as_ref()))
+        .flat_map(|(name, value)| {
+            let mut setting = format!("{name}={value}");
+            // tmux's argv parser treats a trailing semicolon as a command separator,
+            // even inside a single argument. Escape it for tmux, which removes this
+            // one backslash before setting the session environment.
+            if setting.ends_with(';') {
+                setting.insert(setting.len() - 1, '\\');
+            }
+            ["-e".to_string(), setting]
+        });
     new.splice(4..4, options);
     v.extend(new);
     v
@@ -2719,6 +2731,12 @@ mod tests {
     #[test]
     fn launch_forces_utf8_then_enables_mouse_then_creates_session() {
         let args = launch_session_args("muxel_p_123", Some("/work"), None, &[]);
+        let new = args.iter().position(|arg| arg == "new-session").unwrap();
+        let args: Vec<_> = args[..6]
+            .iter()
+            .chain(args[new..].iter())
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             args,
             vec![
@@ -2743,8 +2761,13 @@ mod tests {
         let env = [("MUXEL_INSTANCE_ID".to_string(), "1a2b".to_string())];
         let unset = ["MUXEL_INSTANCE_ID", "OTHER"];
         let args = launch_session_args_with_env("s", Some("/w"), Some("claude"), &[], &env, &unset);
+        let clear = args
+            .iter()
+            .position(|arg| arg == "MUXEL_INSTANCE_ID")
+            .unwrap()
+            - 3;
         assert_eq!(
-            args[6..],
+            args[clear..],
             [
                 // Off the server first, in the same client's command list.
                 "set-environment",
@@ -2777,6 +2800,41 @@ mod tests {
     }
 
     #[test]
+    fn new_tmux_sessions_drop_server_profiler_variables() {
+        let env = vec![
+            ("MUXEL_PROFILE_FUTURE".into(), "1".into()),
+            ("MUXEL_PROFILE".into(), "1".into()),
+            ("MUXEL_CONTROL".into(), "control.json".into()),
+        ];
+        let args = launch_session_args_with_env("s", None, None, &[], &env, &[]);
+        let new = args.iter().position(|arg| arg == "new-session").unwrap();
+        for key in [
+            "MUXEL_PROFILE",
+            "MUXEL_PROFILE_TERMINAL",
+            "MUXEL_PROFILE_UI",
+            "MUXEL_PROFILE_LOG",
+            "MUXEL_PROFILE_UI_LOG",
+            "MUXEL_PROFILE_STDERR",
+            "MUXEL_PROFILE_CHAINS",
+        ] {
+            assert!(
+                args[..new]
+                    .windows(5)
+                    .any(|a| a == ["set-environment", "-g", "-u", key, ";"]),
+                "{key}"
+            );
+        }
+        assert!(!args.iter().any(|arg| arg == "MUXEL_PROFILE=1"));
+        assert!(!args.iter().any(|arg| arg == "MUXEL_PROFILE_FUTURE=1"));
+        assert!(
+            args[..new]
+                .windows(5)
+                .any(|a| a == ["set-environment", "-g", "-u", "MUXEL_PROFILE_FUTURE", ";"])
+        );
+        assert!(args.iter().any(|arg| arg == "MUXEL_CONTROL=control.json"));
+    }
+
+    #[test]
     fn session_environment_escapes_trailing_semicolons() {
         let env = vec![
             ("ROOT".into(), "/isolated;".into()),
@@ -2784,8 +2842,9 @@ mod tests {
             ("MIDDLE".into(), "/isolated;other".into()),
         ];
         let args = launch_session_args_with_env("s", None, None, &[], &env, &[]);
+        let options = args.iter().position(|arg| arg == "new-session").unwrap() + 4;
         assert_eq!(
-            &args[10..],
+            &args[options..],
             [
                 "-e",
                 r"ROOT=/isolated\;",

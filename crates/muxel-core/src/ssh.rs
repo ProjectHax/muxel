@@ -1068,6 +1068,14 @@ pub fn ssh_args(spec: &SshSpec) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    fn test_profile_cleanup() -> String {
+        crate::child_env::profiler_env_keys(std::env::vars_os().map(|(key, _)| key))
+            .iter()
+            .filter_map(|key| key.to_str())
+            .map(|key| format!("set-environment -g -u {} ';' ", sh_quote(key)))
+            .collect()
+    }
+
     use super::*;
     use crate::winshell::WindowsShell;
     use crate::{RemoteHost, RemoteOs};
@@ -1627,10 +1635,11 @@ mod tests {
                  then set --; else set -- -L mxl; fi; \
                  if [ \"$#\" -gt 0 ]; then tmux \"$@\" start-server ';' set -s exit-empty off; fi; \
                  mkdir -p -- /srv/app; \
-                 exec tmux \"$@\" -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
+                 exec tmux \"$@\" -u set -g mouse on ';' {profile_cleanup}set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s muxel-abc123 -c /srv/app \
                  -- \"${{SHELL:-/bin/sh}}\" -ilc 'exec claude'",
-                tmux_path_prelude()
+                tmux_path_prelude(),
+                profile_cleanup = test_profile_cleanup()
             )
         );
     }
@@ -2311,12 +2320,13 @@ mod tests {
             format!(
                 " new-session 2>/dev/null | grep -q 'f flags' \
                  && tmux \"$@\" list-clients -t '=s' 2>/dev/null | grep -q .; then \
-                 exec tmux \"$@\" -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
+                 exec tmux \"$@\" -u set -g mouse on ';' {profile_cleanup}set-environment -g -u MUXEL_INSTANCE_ID ';' \
                  new-session -A -s s -c /srv/app \
                  -f ignore-size -- {program} ';' set-option -Fq -t '=s:' \
                  @muxel_client_ab12 '#{{client_name}}'; fi; \
-                 exec tmux \"$@\" -u set -g mouse on ';' set-environment -g -u MUXEL_INSTANCE_ID ';' \
-                 new-session -A -s s -c /srv/app -- {program}"
+                 exec tmux \"$@\" -u set -g mouse on ';' {profile_cleanup}set-environment -g -u MUXEL_INSTANCE_ID ';' \
+                 new-session -A -s s -c /srv/app -- {program}",
+                profile_cleanup = test_profile_cleanup()
             )
         );
         // Older tmux, or a session nobody else is in, falls through to exactly the

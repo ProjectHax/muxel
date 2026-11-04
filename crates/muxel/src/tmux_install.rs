@@ -132,7 +132,7 @@ fn install_as_needed(
     // Passwordless sudo (NOPASSWD, or a still-valid timestamp) needs no prompt
     // at all.
     let passwordless = sudo.as_deref().filter(|sudo| {
-        Command::new(sudo)
+        muxel_core::child_env::command(sudo)
             .args(["-n", "true"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -165,11 +165,11 @@ fn install_as_needed(
 fn shell(script: &str, elevate: Option<(&Path, &[&str])>) -> Command {
     let mut cmd = match elevate {
         Some((helper, flags)) => {
-            let mut cmd = Command::new(helper);
+            let mut cmd = muxel_core::child_env::command(helper);
             cmd.args(flags).arg("/bin/sh");
             cmd
         }
-        None => Command::new("/bin/sh"),
+        None => muxel_core::child_env::command("/bin/sh"),
     };
     cmd.arg("-c").arg(script);
     cmd
@@ -178,7 +178,7 @@ fn shell(script: &str, elevate: Option<(&Path, &[&str])>) -> Command {
 /// Try `password` with `sudo -v` alone, so a typo reads as a wrong password
 /// rather than a failed install.
 fn check_sudo_password(sudo: &Path, password: &str) -> Result<(), SudoRefusal> {
-    let mut child = Command::new(sudo)
+    let mut child = muxel_core::child_env::command(sudo)
         .args(["-S", "-k", "-p", "", "-v"])
         .env("LC_ALL", "C")
         .stdin(Stdio::piped())
@@ -201,7 +201,11 @@ fn check_sudo_password(sudo: &Path, password: &str) -> Result<(), SudoRefusal> {
 
 /// The package manager said it worked; make sure muxel can now run tmux.
 fn verify(install: &Install) -> Outcome {
-    match Command::new("tmux").arg("-V").stdin(Stdio::null()).output() {
+    match muxel_core::child_env::command("tmux")
+        .arg("-V")
+        .stdin(Stdio::null())
+        .output()
+    {
         Ok(out) if out.status.success() => {
             Outcome::Installed(String::from_utf8_lossy(&out.stdout).trim().to_string())
         }

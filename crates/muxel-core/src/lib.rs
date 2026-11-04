@@ -7,6 +7,7 @@ mod agent;
 mod appimage;
 pub mod audio;
 pub mod autopilot;
+pub mod child_env;
 pub mod chime;
 pub mod control;
 pub mod diff;

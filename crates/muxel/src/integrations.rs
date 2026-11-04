@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 /// muxel polls git in the background. No-op off Windows.
 fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
-    let mut cmd = Command::new(program);
+    let mut cmd = muxel_core::child_env::command(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -4048,6 +4048,7 @@ impl GitEnv {
     }
 
     fn spawn(&self, command: &mut Command) -> std::io::Result<GitChild> {
+        muxel_core::child_env::remove_profiler_env(command);
         #[cfg(test)]
         let spawn_started = Instant::now();
         let child = command.spawn()?;
