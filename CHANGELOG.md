@@ -5,6 +5,77 @@ All notable changes to muxel are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-11-03
+
+### Added
+- **muxel chimes when an agent finishes or needs you** — an agent in a pane you
+  weren't looking at finished its turn, or stopped on a question, in silence. Now
+  it rings: a rising two-note chime when it finishes, and a brighter double knock
+  when it's waiting on you. Only agents ring; a shell finishing a command never
+  does. A pane that rang stays quiet for that alert until you've looked at it, or
+  five minutes pass, so an agent going back and forth between working and done
+  doesn't keep ringing, and alerts that land together play as one chime.
+  Settings → Sounds turns each alert on or off, plays it, sets the volume, and
+  lets you use your own sound (WAV, AIFF, MP3, OGG, FLAC or M4A, cut short after
+  10 seconds); a file that can't be played falls back to the built-in chime. On
+  Linux, the desktop notification for the same moment no longer plays a sound of
+  its own on top.
+
+### Fixed
+- **Idle shells no longer flash working once a minute** — every local shell runs
+  inside tmux, whose status bar shows a clock. When the minute turned, tmux
+  redrew that bar in every pane, and every idle shell showed as working for two
+  seconds. A redraw that only touches the top or bottom row of the screen no
+  longer counts as activity. That also covers a seconds clock in your own tmux
+  config, tmux on a remote host, and agents whose status muxel reads from their
+  output.
+- **muxel no longer starts git every second for every project** — keeping branch
+  names current ran two git commands for every local project every second,
+  whether anything had changed or the folder was a repository at all: eight
+  processes a second with four projects open, nonstop, and on Windows each one
+  also started a console host and an antivirus scan. muxel now runs git only when
+  a project's branches actually change on disk, with a once-a-minute check for
+  what it can't see. Worktree change counts refresh every 10 seconds, and at once
+  after a git action from muxel, and the check for which agents are installed
+  reruns only when a folder on your PATH or the preset list changes.
+- **muxel's background git reads no longer get in an agent's way** — the reads
+  behind branch names, change counts and the diff views could refresh a
+  repository's index, taking its lock while an agent was staging or committing
+  in the same repository, so the agent's own git command could fail on the lock.
+  Those reads now never write the index, in local and remote projects and in the
+  iOS app; what muxel does on your behalf, like commit and merge, locks as usual.
+  A remote host with Git older than 2.15 behaves as before. Thanks to
+  [@railapex](https://github.com/railapex) ([#120](https://github.com/ProjectHax/muxel/pull/120)).
+- **A popped-out terminal follows theme changes** — changing the theme recolored
+  only the terminals in the main window; a popped-out one kept its old colors,
+  including the ones it reports to programs that ask. It now changes with the
+  rest. Pop-out windows also no longer redraw for every unrelated change in muxel,
+  like sidebar updates or activity in other panes — only when something they show
+  changes. Thanks to
+  [@railapex](https://github.com/railapex) ([#117](https://github.com/ProjectHax/muxel/pull/117)).
+
+### Changed
+- **Grok panes on Windows cost far less to watch** — to follow which conversation
+  a Grok pane holds, muxel listed every process on the system on each check,
+  around 30 ms a time on a typical machine. It now reuses that list for up to 30
+  seconds while nothing about the session changes, and looks again at once when
+  Grok's session record or the pane's process changes, so switching conversations
+  is still noticed. Thanks to
+  [@railapex](https://github.com/railapex) ([#119](https://github.com/ProjectHax/muxel/pull/119)).
+- **The opt-in profiler keeps days of history** — with `MUXEL_PROFILE` set, each
+  profiler log stopped at 2 MB with a single backup, so a busy session lost its
+  history within half an hour and there was nothing to compare from one day to
+  the next. Logs now roll over by size and at midnight into dated files, keeping
+  14 days and up to 256 MiB per log by default (`MUXEL_PROFILE_KEEP_DAYS` and
+  `MUXEL_PROFILE_MAX_BYTES` change that). Repeated idle lookups are counted
+  instead of logged one by one, which cuts the UI log by about three quarters, and
+  quiet terminal work is summed every 30 seconds; terminal records move from v8
+  to v9, so anything that parses them needs updating. Panes no longer inherit the
+  profiler's settings, so a muxel started inside a pane doesn't write into its
+  parent's logs. Thanks to
+  [@railapex](https://github.com/railapex) ([#118](https://github.com/ProjectHax/muxel/pull/118),
+  [#121](https://github.com/ProjectHax/muxel/pull/121)).
+
 ## [0.3.4] — 2026-10-29
 
 ### Added
