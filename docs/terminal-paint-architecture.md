@@ -139,6 +139,17 @@ enabled with:
 
 No always-on logging.
 
+The terminal and UI profiler workers share dated log retention. Stable live
+paths roll at 2 MiB and the local date change; archives append
+`.YYYY-MM-DD.NNNNNN`. `MUXEL_PROFILE_KEEP_DAYS` (14) and
+`MUXEL_PROFILE_MAX_BYTES` (256 MiB per log family) bound history. Terminal v9
+idle summaries keep counts, duration sums, maxima and queue high-water marks
+over 30 seconds. Busy ticks retain the detailed fields, and latency chain
+records remain v8. UI lookup summaries count suppressed steady discovery
+misses as well as logged hits, outcome changes and calls taking at least 5 ms.
+See [profiler formats and retention](terminal-paint-under-load.md#diagnostics-opt-in--off-by-default)
+for the environment settings and field semantics.
+
 ## Non-goals
 
 - More present-pump special cases for paste
