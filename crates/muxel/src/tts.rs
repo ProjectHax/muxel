@@ -356,6 +356,16 @@ fn play_stream(
     Ok(played)
 }
 
+/// Play one finished clip of mono audio (at `rate`), blocking until it has
+/// played or `stop` is raised. Alert sounds (`crate::sound`) share speech's
+/// output path rather than opening their own.
+pub(crate) fn play_clip(samples: Vec<f32>, rate: u32, stop: &AtomicBool) -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = tx.send((0, samples));
+    drop(tx);
+    play_stream(&rx, rate, stop, &AtomicUsize::new(0)).map(drop)
+}
+
 type Shared = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>;
 
 /// Resample a chunk to the device rate and queue it. Returns its length.
@@ -667,7 +677,7 @@ fn system_voice(candidates: Vec<Command>, stop: &AtomicBool) -> Voiced {
 fn cancel_system_voice() {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = Command::new("spd-say")
+        let _ = muxel_core::child_env::command("spd-say")
             .arg("--cancel")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -685,7 +695,7 @@ fn system_voices(text: &str, cfg: &VoiceConfig) -> Vec<Command> {
         // `say` falls back to the default voice itself when `-v` names one that
         // isn't installed. `--` so text that opens with a dash is spoken, not parsed.
         let wpm = muxel_core::tts::say_words_per_minute(cfg.rate).to_string();
-        let mut say = Command::new("say");
+        let mut say = muxel_core::child_env::command("say");
         if !voice.is_empty() {
             say.args(["-v", voice]);
         }
@@ -708,7 +718,7 @@ fn system_voices(text: &str, cfg: &VoiceConfig) -> Vec<Command> {
             )
         };
         let rate = muxel_core::tts::rate_step(cfg.rate, 10);
-        let mut ps = Command::new("powershell");
+        let mut ps = muxel_core::child_env::command("powershell");
         ps.args([
             "-NoProfile",
             "-NonInteractive",
@@ -730,14 +740,14 @@ fn system_voices(text: &str, cfg: &VoiceConfig) -> Vec<Command> {
         // espeak is the fallback for boxes without it.
         let step = muxel_core::tts::rate_step(cfg.rate, 100).to_string();
         let wpm = muxel_core::tts::espeak_words_per_minute(cfg.rate).to_string();
-        let mut spd = Command::new("spd-say");
+        let mut spd = muxel_core::child_env::command("spd-say");
         spd.args(["--wait", "-r", &step]);
         if !voice.is_empty() {
             spd.args(["-y", voice]);
         }
         spd.args(["--", text]);
         let espeak = |program: &str| {
-            let mut cmd = Command::new(program);
+            let mut cmd = muxel_core::child_env::command(program);
             cmd.args(["-s", &wpm]);
             if !voice.is_empty() {
                 cmd.args(["-v", voice]);
@@ -756,7 +766,7 @@ fn system_voices(text: &str, cfg: &VoiceConfig) -> Vec<Command> {
 pub fn system_voice_list() -> Vec<(String, String)> {
     #[cfg(target_os = "macos")]
     {
-        Command::new("say")
+        muxel_core::child_env::command("say")
             .args(["-v", "?"])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -767,7 +777,7 @@ pub fn system_voice_list() -> Vec<(String, String)> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        Command::new("powershell")
+        muxel_core::child_env::command("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",

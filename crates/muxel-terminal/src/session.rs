@@ -1297,7 +1297,9 @@ pub struct TerminalSession {
     hovered_link: Mutex<Option<HoveredLink>>,
     /// Latest pointer position over this terminal (for Ctrl-down re-hit-test).
     pointer_hit: Mutex<Option<PointerHit>>,
-    /// When output was last processed (for idle/status detection).
+    /// When output was last processed (for idle/status detection). A batch
+    /// that only repainted a status bar (`redraws_only_a_status_bar`) doesn't
+    /// count.
     last_output: Mutex<Instant>,
     /// Whether the child has produced any output yet (vs. still starting up).
     output_seen: AtomicBool,
@@ -1572,7 +1574,7 @@ impl TerminalSession {
         ensure_utf8_locale(&mut builder);
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
-        // Last, so anything the instance/preset sets wins over muxel's defaults.
+        // Apply preset overrides, then filter settings owned by the parent.
         apply_spec_env(&mut builder, &spec);
         // These are private transport slots, not preset-overridable child env.
         // Reapply them after preset env so a collision cannot replace the batch
@@ -1985,6 +1987,8 @@ impl TerminalSession {
         let mut processor = self.processor.lock();
         let mut clock = self.read_clock.lock();
         let mut parsed = false;
+        let cursor = term.grid().cursor.point;
+        let cursor_row = term.grid()[cursor.line].clone();
         for (bytes, read_at) in chunks {
             if bytes.is_empty() {
                 continue;
@@ -2059,8 +2063,12 @@ impl TerminalSession {
         // Expiry without another read uses the same original frame time.
         parsed |= self.flush_expired_sync_locked(&mut term, &mut processor, &mut clock);
         self.evidence.lock().end_read();
+        let mut status_bar_only = false;
         if parsed {
             let screen = term.screen_lines() as i32;
+            let cursor_kept = term.grid().display_offset() == 0
+                && term.grid().cursor.point == cursor
+                && term.grid()[cursor.line] == cursor_row;
             let dmg = match term.damage() {
                 TermDamage::Full => ContentDamage::Full,
                 TermDamage::Partial(iter) => {
@@ -2080,12 +2088,19 @@ impl TerminalSession {
                 }
             };
             term.reset_damage();
+            if cursor_kept && let ContentDamage::Partial(lines) = &dmg {
+                status_bar_only = redraws_only_a_status_bar(lines, screen, cursor.line.0);
+            }
             // Do not call bump_content() here — it marks Full damage and would
             // erase the partial lines we just collected.
             self.pending_damage.lock().merge(dmg);
             self.content_gen.fetch_add(1, Ordering::Relaxed);
         }
-        *self.last_output.lock() = Instant::now();
+        // tmux redraws its status bar in every pane when its clock ticks;
+        // that's not the program doing anything, so an idle shell stays idle.
+        if !status_bar_only {
+            *self.last_output.lock() = Instant::now();
+        }
         self.output_seen.store(true, Ordering::Relaxed);
     }
 
@@ -3195,7 +3210,8 @@ impl TerminalSession {
         *self.last_output.lock() = Instant::now() - idle;
     }
 
-    /// Time since output was last processed (for idle detection).
+    /// Time since output was last processed (for idle detection), not counting
+    /// status bar repaints.
     pub fn idle_for(&self) -> Duration {
         self.last_output.lock().elapsed()
     }
@@ -3335,6 +3351,20 @@ impl TerminalSession {
         self.mark_user_input();
         self.write_pointer(&buf);
     }
+}
+
+/// Whether a batch of output only redrew a status bar: it changed the screen's
+/// top or bottom row and nothing else, while the cursor and its own row were
+/// left as they were. `damaged` is the batch's damaged rows, which always
+/// include `cursor_line`. That is how tmux (or screen) repaints its status line
+/// when the clock moves, so the batch says nothing about the program running
+/// inside.
+fn redraws_only_a_status_bar(damaged: &[i32], screen_lines: i32, cursor_line: i32) -> bool {
+    let mut others = damaged
+        .iter()
+        .filter(|&&line| line != cursor_line)
+        .peekable();
+    others.peek().is_some() && others.all(|&line| line == 0 || line == screen_lines - 1)
 }
 
 /// Append one mouse-wheel report — button 64 (scroll up) / 65 (scroll down) — at
@@ -3693,14 +3723,29 @@ fn ensure_utf8_locale(builder: &mut CommandBuilder) {
 fn ensure_utf8_locale(_builder: &mut CommandBuilder) {}
 
 /// `spec`'s variables on top of what `builder` already has (muxel's own
-/// environment and its defaults), then without `spec.env_remove`, which covers
-/// both.
+/// environment and its defaults), then without `spec.env_remove` or the parent
+/// muxel's profiler settings. Removals cover both inherited and configured env.
 fn apply_spec_env(builder: &mut CommandBuilder, spec: &CommandSpec) {
     for (k, v) in &spec.env {
         builder.env(k, v);
     }
     for k in &spec.env_remove {
         builder.env_remove(k);
+    }
+    // Profiler settings belong to the parent muxel, even when a preset repeats
+    // them. Apply last so no configured override can leak them into a pane.
+    let keys = muxel_core::child_env::profiler_env_keys(
+        std::env::vars_os()
+            .map(|(key, _)| key)
+            .chain(
+                builder
+                    .iter_full_env_as_str()
+                    .map(|(key, _)| OsString::from(key)),
+            )
+            .chain(spec.env.iter().map(|(key, _)| OsString::from(key))),
+    );
+    for key in keys {
+        builder.env_remove(key);
     }
 }
 
@@ -4347,6 +4392,81 @@ mod content_damage_tests {
              {baseline} open before, {open} after"
         );
     }
+
+    /// tmux's status bar on row 24 with the clock at `time`, drawn the way
+    /// tmux 3.4 does: from the cursor's row by `\r\n` when it's just above,
+    /// else by position, then the cursor put back after the shell's prompt.
+    fn tmux_status(time: &str, via_newline: bool) -> String {
+        let to_bar = if via_newline { "\r\n" } else { "\x1b[24;1H" };
+        format!(
+            "\x1b[?25l\x1b[30m\x1b[42m{to_bar}[muxel_demo0:zsh* \"user@host:~\" {time} 03-Nov-26\x1b(B\x1b[m\x1b[?12l\x1b[?25h\x1b[23;14H"
+        )
+    }
+
+    /// A shell idle at its prompt on row 23, under tmux's bar.
+    fn idle_shell_under_tmux() -> std::sync::Arc<TerminalSession> {
+        let session = spawn_quiet();
+        session.process_output(b"\x1b[2J\x1b[23;1Huser@host:~$ ");
+        session.process_output(tmux_status("14:50", false).as_bytes());
+        session.set_idle_for_test(Duration::from_secs(6));
+        session
+    }
+
+    /// tmux repaints its status bar in every pane when the minute turns. That
+    /// isn't the shell producing output, so it stays idle (and so out of the
+    /// activity fallback's Working).
+    #[test]
+    fn a_tmux_clock_tick_leaves_an_idle_shell_idle() {
+        for via_newline in [false, true] {
+            let session = idle_shell_under_tmux();
+            let content = session.content_generation();
+            session.process_output(tmux_status("14:51", via_newline).as_bytes());
+            assert!(
+                session.idle_for() >= Duration::from_secs(5),
+                "via_newline={via_newline}: {:?}",
+                session.idle_for()
+            );
+            assert_ne!(session.content_generation(), content, "still repainted");
+        }
+    }
+
+    #[test]
+    fn output_from_the_shell_itself_still_counts() {
+        for output in [
+            // A command's output moves the cursor.
+            "ls\r\nCargo.toml\r\nuser@host:~$ ",
+            // A progress bar redrawn in place on the cursor's row.
+            "\r[#####     ] 50%",
+            // A row away from the edges, with the cursor put back.
+            "\x1b7\x1b[5;1Hhello\x1b8",
+        ] {
+            let session = idle_shell_under_tmux();
+            session.process_output(output.as_bytes());
+            assert!(
+                session.idle_for() < Duration::from_secs(1),
+                "{output:?}: {:?}",
+                session.idle_for()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod status_bar_redraw_tests {
+    use super::redraws_only_a_status_bar;
+
+    #[test]
+    fn only_an_edge_row_away_from_the_cursor_is_a_status_bar() {
+        // A bottom bar, or a top one, with the cursor's row untouched.
+        assert!(redraws_only_a_status_bar(&[22, 23], 24, 22));
+        assert!(redraws_only_a_status_bar(&[0, 22], 24, 22));
+        // Nothing but the cursor's own row.
+        assert!(!redraws_only_a_status_bar(&[22], 24, 22));
+        // A row in the middle changed too.
+        assert!(!redraws_only_a_status_bar(&[10, 22, 23], 24, 22));
+        // The bottom row is where the cursor is: that's the program's own line.
+        assert!(!redraws_only_a_status_bar(&[23], 24, 23));
+    }
 }
 
 #[cfg(test)]
@@ -4370,6 +4490,34 @@ mod wheel_report_tests {
         assert_eq!(builder.get_env("PATH"), None);
         assert_eq!(builder.get_env("MUXEL_TEST_SET"), None);
         assert_eq!(builder.get_env("MUXEL_TEST_KEEP"), Some("1".as_ref()));
+    }
+
+    #[test]
+    fn pane_environment_drops_parent_profiler_settings() {
+        let profilers = [
+            "MUXEL_PROFILE_FUTURE",
+            "MUXEL_PROFILE",
+            "MUXEL_PROFILE_TERMINAL",
+            "MUXEL_PROFILE_UI",
+            "MUXEL_PROFILE_LOG",
+            "MUXEL_PROFILE_UI_LOG",
+            "MUXEL_PROFILE_STDERR",
+            "MUXEL_PROFILE_CHAINS",
+        ];
+        let context = ["MUXEL_INSTANCE_ID", "MUXEL_USER_DATA_DIR", "MUXEL_CONTROL"];
+        let mut builder = portable_pty::CommandBuilder::new("unused");
+        let mut spec = CommandSpec::program("unused", Vec::new());
+        for key in profilers.iter().chain(context.iter()) {
+            builder.env(key, "inherited");
+            spec.env.push((key.to_string(), "configured".to_string()));
+        }
+        apply_spec_env(&mut builder, &spec);
+        for key in profilers {
+            assert_eq!(builder.get_env(key), None, "profiler leaked: {key}");
+        }
+        for key in context {
+            assert_eq!(builder.get_env(key), Some("configured".as_ref()));
+        }
     }
 
     #[test]

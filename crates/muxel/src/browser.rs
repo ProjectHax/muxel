@@ -71,7 +71,7 @@ fn spawn_browser_window(url: &str) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    std::process::Command::new(exe)
+    muxel_core::child_env::command(exe)
         .arg("--browser")
         .arg(url)
         .spawn()

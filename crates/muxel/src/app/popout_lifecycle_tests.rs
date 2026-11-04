@@ -56,6 +56,10 @@ impl Drop for StopChild {
 }
 
 pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
+    with_app_drawing(false, run);
+}
+
+fn with_app_drawing(draw: bool, run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>)) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../.wip/lifecycle-tests")
         .join(Uuid::new_v4().to_string());
@@ -66,7 +70,9 @@ pub(super) fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelA
     assert_eq!(muxel_store::config_dir(), Some(root.join("config")));
     // Drop the app and all of its tasks before restoring normal storage paths.
     let mut cx = TestAppContext::single();
-    cx.skip_drawing();
+    if !draw {
+        cx.skip_drawing();
+    }
     cx.update(|cx| {
         gpui_component::init(cx);
         theme::register_bundled_themes(cx);
@@ -102,6 +108,14 @@ fn popout_fixture(
     cx: &mut TestAppContext,
     window: WindowHandle<MuxelApp>,
 ) -> (Uuid, Entity<TerminalView>, StopChild) {
+    popout_fixture_with_status(cx, window, None)
+}
+
+fn popout_fixture_with_status(
+    cx: &mut TestAppContext,
+    window: WindowHandle<MuxelApp>,
+    status_program: Option<&str>,
+) -> (Uuid, Entity<TerminalView>, StopChild) {
     window
         .update(cx, |app, window, cx| {
             let project_root = muxel_store::data_dir().unwrap().join("project");
@@ -117,12 +131,15 @@ fn popout_fixture(
             instance.program = Some(program.into());
             instance.args = args.iter().map(|arg| (*arg).into()).collect();
             let pane = instance.id;
-            let spec = CommandSpec::program(program, instance.args.clone());
+            let spec = CommandSpec::program(program, instance.args.clone())
+                .with_status_program(status_program.map(str::to_string));
             app.workspace.add_instance(instance);
             app.use_tmux = false;
             app.use_worktree = false;
             let launch = TerminalLaunch::spawn(spec, (80, 24)).expect("spawn fixture");
             let view = cx.new(|cx| TerminalView::new(launch, pane, Instant::now(), window, cx));
+            let palette = theme::palette_from_theme(cx);
+            view.update(cx, |view, _| view.set_palette(palette));
             let child = StopChild::new(view.read(cx).session().clone());
             app.terminals.insert(pane, view.clone());
             app.pop_out_instance(pane, window, cx);
@@ -143,6 +160,176 @@ fn wait_for_exit(cx: &mut TestAppContext, child: &StopChild) {
         assert!(Instant::now() < deadline, "old PTY did not exit");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn unrelated_app_updates_do_not_render_three_quiet_popouts() {
+    with_app_drawing(true, |cx, window| {
+        let fixtures: Vec<_> = (0..3).map(|_| popout_fixture(cx, window)).collect();
+        cx.run_until_parked();
+        super::POPOUT_TEST_RENDERS.with(|counts| counts.borrow_mut().clear());
+        // Sixty independently flushed app updates, a one-minute 1 Hz workload.
+        // GPUI's test effect loop renders only dirty windows. Count Render
+        // calls there rather than forcing otherwise clean windows to draw.
+        for tick in 0..60 {
+            window
+                .update(cx, |app, _, cx| {
+                    app.sidebar_collapsed = tick % 2 == 0;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+        let counts: Vec<_> = fixtures
+            .iter()
+            .map(|(pane, _, _)| {
+                super::POPOUT_TEST_RENDERS
+                    .with(|counts| counts.borrow().get(pane).copied().unwrap_or(0))
+            })
+            .collect();
+        eprintln!("popout renders for 60 unrelated updates (1 Hz equivalent): {counts:?}");
+        assert_eq!(counts, [0, 0, 0]);
+    });
+}
+
+#[test]
+fn popout_theme_updates_the_terminal_palette() {
+    with_app(|cx, window| {
+        let (_, view, _child) = popout_fixture(cx, window);
+        assert_ne!(
+            view.read_with(cx, |view, _| view.palette().background),
+            0xff00ff
+        );
+        cx.update_global::<gpui_component::Theme, _>(|theme, _| {
+            theme.colors.background = gpui::rgb(0xff00ff).into()
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.palette().background),
+            0xff00ff
+        );
+    });
+}
+
+#[test]
+fn popout_renders_its_title_status_close_confirmation_and_theme_updates() {
+    with_app_drawing(true, |cx, window| {
+        let (pane, view, _child) = popout_fixture_with_status(cx, window, Some("muse"));
+        let (other, _, _other_child) = popout_fixture(cx, window);
+        let draw = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+        };
+        let reset = || super::POPOUT_TEST_RENDERS.with(|counts| counts.borrow_mut().clear());
+        let count = |iid| {
+            super::POPOUT_TEST_RENDERS
+                .with(|counts| counts.borrow().get(&iid).copied().unwrap_or(0))
+        };
+        draw(cx);
+        reset();
+        view.update(cx, |view, cx| {
+            view.session()
+                .process_probe_output(b"\x1b]0;Updated popout title\x07");
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.title()).as_deref(),
+            Some("Updated popout title")
+        );
+        assert!(count(pane) > 0);
+        assert_eq!(count(other), 0);
+
+        for state in [
+            muxel_core::muse::MuseState::Blocked,
+            muxel_core::muse::MuseState::Working,
+            muxel_core::muse::MuseState::Done,
+        ] {
+            // Recent title output already makes the pane Working. Start with
+            // Blocked so each hook changes the public state; Working itself
+            // is activity-derived rather than a sticky hook assertion.
+            let expected = match state {
+                muxel_core::muse::MuseState::Blocked => muxel_terminal::AgentStatus::Blocked,
+                muxel_core::muse::MuseState::Working => muxel_terminal::AgentStatus::Working,
+                muxel_core::muse::MuseState::Done => muxel_terminal::AgentStatus::Done,
+                muxel_core::muse::MuseState::Idle => unreachable!(),
+            };
+            assert_ne!(view.read_with(cx, |view, _| view.status()), expected);
+            reset();
+            view.update(cx, |view, cx| {
+                view.set_muse_hook_state(
+                    &muxel_core::muse::MuseMetadata {
+                        state,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            draw(cx);
+            assert_eq!(view.read_with(cx, |view, _| view.status()), expected);
+            assert!(count(pane) > 0, "missing status update {state:?}");
+            assert_eq!(count(other), 0);
+        }
+
+        reset();
+        window
+            .update(cx, |app, _, cx| {
+                app.confirm = Some(super::PendingConfirm {
+                    title: "Close pane?".into(),
+                    message: "Running".into(),
+                    confirm_label: "Close".into(),
+                    details: Vec::new(),
+                    action: super::ConfirmAction::CloseBatch(vec![pane]),
+                });
+                cx.notify();
+            })
+            .unwrap();
+        draw(cx);
+        assert!(count(pane) > 0);
+        assert_eq!(count(other), 0);
+        reset();
+        window
+            .update(cx, |app, _, cx| {
+                app.confirm.as_mut().unwrap().message = "Updated close reason".into();
+                cx.notify();
+            })
+            .unwrap();
+        draw(cx);
+        assert!(count(pane) > 0);
+        assert_eq!(count(other), 0);
+        for action in [
+            super::ConfirmAction::CloseBatch(vec![pane, other]),
+            super::ConfirmAction::SaveEditorBeforeClose {
+                iid: pane,
+                rest: vec![other],
+            },
+        ] {
+            reset();
+            window
+                .update(cx, |app, _, cx| {
+                    app.confirm.as_mut().unwrap().action = action;
+                    cx.notify();
+                })
+                .unwrap();
+            draw(cx);
+            assert!(count(pane) > 0, "changed alternative button must render");
+            assert_eq!(count(other), 0);
+        }
+        reset();
+        window
+            .update(cx, |app, _, cx| app.cancel_confirm(cx))
+            .unwrap();
+        draw(cx);
+        assert!(count(pane) > 0);
+        assert_eq!(count(other), 0);
+
+        reset();
+        cx.update_global::<gpui_component::Theme, _>(|theme, _| theme.radius_lg = gpui::px(9.0));
+        draw(cx);
+        assert!(
+            count(pane) > 0 && count(other) > 0,
+            "theme changes must reach every popout"
+        );
+    });
 }
 
 fn secondary_fixture(

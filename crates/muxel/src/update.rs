@@ -232,7 +232,7 @@ pub fn download_and_apply(kind: InstallKind, asset_url: &str) -> Result<Relaunch
 
 /// Start the freshly-installed version and exit the current process.
 pub fn relaunch_and_exit(plan: &RelaunchPlan) -> ! {
-    let _ = std::process::Command::new(&plan.program)
+    let _ = muxel_core::child_env::command(&plan.program)
         .args(&plan.args)
         .spawn();
     std::process::exit(0);
@@ -308,7 +308,7 @@ fn apply_macos(url: &str, work: &Path) -> Result<RelaunchPlan> {
     let _ = std::fs::remove_dir_all(&backup);
 
     // Clear quarantine so Gatekeeper doesn't block the relaunch (best-effort).
-    let _ = std::process::Command::new("xattr")
+    let _ = muxel_core::child_env::command("xattr")
         .args(["-dr", "com.apple.quarantine"])
         .arg(&bundle)
         .status();

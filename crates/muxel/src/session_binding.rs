@@ -2663,9 +2663,10 @@ mod tests {
         let args = tmux_pane_args(Socket::Default, "s", Some("claude"), &[], id, true, None)
             .unwrap()
             .args;
-        assert_eq!(args[6..11], clear);
+        let new = args.iter().position(|arg| arg == "new-session").unwrap();
+        assert_eq!(args[new - 5..new], clear);
         assert_eq!(
-            args[11..],
+            args[new..],
             ["new-session", "-A", "-s", "s", "-e", &own, "--", "claude"]
         );
         // Older tmux has no `-e`: the program starts without an id rather than
@@ -2673,8 +2674,9 @@ mod tests {
         let args = tmux_pane_args(Socket::Default, "s", None, &[], id, false, None)
             .unwrap()
             .args;
-        assert_eq!(args[6..11], clear);
-        assert_eq!(args[11..], ["new-session", "-A", "-s", "s"]);
+        let new = args.iter().position(|arg| arg == "new-session").unwrap();
+        assert_eq!(args[new - 5..new], clear);
+        assert_eq!(args[new..], ["new-session", "-A", "-s", "s"]);
     }
 
     /// muxel's own server is named ahead of everything else the client is told; a
@@ -2727,7 +2729,11 @@ mod tests {
         );
         // No profile values are installed globally on this profile's server.
         assert_eq!(
-            &launch.args[2..new],
+            launch.args[2..8]
+                .iter()
+                .chain(launch.args[new - 5..new].iter())
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             [
                 "-u",
                 "set",
