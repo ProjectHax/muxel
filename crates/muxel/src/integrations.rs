@@ -370,15 +370,16 @@ fn pipe_to_remote(
 }
 
 /// Add `ignore_line` to `<root>/.gitignore` if not already present (the bare
-/// `MEMORY_DIR` form counts too). Idempotent; shared by the memory-file and
-/// layout-sync writers.
+/// `MEMORY_DIR` form counts too) and git does not already ignore it through
+/// another source, such as `.git/info/exclude` or `core.excludesFile`.
+/// Idempotent; shared by the memory-file and layout-sync writers.
 fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
     let gitignore = root.join(".gitignore");
     let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
     let ignored = current
         .lines()
         .any(|l| l.trim() == ignore_line || l.trim() == MEMORY_DIR);
-    if ignored {
+    if ignored || git_ignores(root, ignore_line) {
         return Ok(());
     }
     let mut next = current;
@@ -388,6 +389,17 @@ fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
     next.push_str(ignore_line);
     next.push('\n');
     std::fs::write(&gitignore, next).with_context(|| format!("updating {}", gitignore.display()))
+}
+
+/// Whether git at `root` ignores `path` from any ignore source. `false` when
+/// git is missing or `root` is not in a repository.
+fn git_ignores(root: &Path, path: &str) -> bool {
+    git_read_command()
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "-q", "--", path])
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Ensure a project's shared memory file exists and is git-ignored, idempotently:
@@ -5525,6 +5537,44 @@ mod tests {
         let gi2 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gi2.matches(".muxel/").count(), 1, "no duplicate ignore");
         assert_eq!(std::fs::read_to_string(&mem).unwrap(), "kept user notes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A repo that already ignores `.muxel/` through `.git/info/exclude` keeps its
+    /// tracked `.gitignore` unmodified; one that doesn't still gets the line.
+    #[test]
+    fn ensure_memory_file_respects_info_exclude() {
+        let root = std::env::temp_dir().join("muxel-it-memory-exclude");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let out = command("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git init");
+        std::fs::write(root.join(".gitignore"), "target\n").unwrap();
+        let exclude = root.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, ".muxel/\n").unwrap();
+
+        ensure_memory_file(&RepoLoc::Local(root.clone())).expect("ensure memory");
+        assert!(root.join(MEMORY_DIR).join(MEMORY_FILE).exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitignore")).unwrap(),
+            "target\n",
+            ".gitignore untouched when info/exclude already ignores .muxel/"
+        );
+
+        std::fs::write(&exclude, "").unwrap();
+        ensure_memory_file(&RepoLoc::Local(root.clone())).expect("ensure memory again");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitignore")).unwrap(),
+            "target\n.muxel/\n",
+            "appended once nothing else ignores .muxel/"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
