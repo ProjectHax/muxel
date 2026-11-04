@@ -93,6 +93,17 @@ pub(super) struct ClientCount {
     count: Option<usize>,
 }
 
+/// What an accepted close does with one pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptedClose {
+    Now,
+    Hold {
+        forced: bool,
+    },
+    /// Left open: "Close only the idle ones" skipped it, or it has unsaved edits.
+    Stays,
+}
+
 impl MuxelApp {
     pub(super) fn is_closing(&self, iid: Uuid) -> bool {
         self.closing.contains_key(&iid)
@@ -240,8 +251,16 @@ impl MuxelApp {
         }
     }
 
-    /// Query real client counts off the UI thread. A failed probe is busy/unknown.
+    /// A close someone just asked for. It replaces any request these panes were
+    /// part of, and a file answer given for that request ends with it.
     pub(super) fn request_recoverable_close(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
+        self.drop_unaccepted_worktree_answers(&ids);
+        self.continue_close_request(ids, cx);
+    }
+
+    /// The next step of a request already under way, such as after a file answer.
+    /// Query real client counts off the UI thread. A failed probe is busy/unknown.
+    pub(super) fn continue_close_request(&mut self, ids: Vec<Uuid>, cx: &mut Context<Self>) {
         let ids: Vec<_> = ids
             .into_iter()
             .filter(|id| !self.is_closing(*id) && self.workspace.instance(*id).is_some())
@@ -389,7 +408,9 @@ impl MuxelApp {
         idle_only: bool,
         cx: &mut Context<Self>,
     ) {
-        let mut holds = Vec::new();
+        // Decide every pane first. Closing one can finish its worktree, and a file
+        // answer has to know by then whether this close takes all its panes.
+        let mut steps = Vec::new();
         for iid in ids {
             let Some(inst) = self.workspace.instance(iid) else {
                 continue;
@@ -397,24 +418,78 @@ impl MuxelApp {
             if self.is_closing(iid) {
                 continue;
             }
-            if inst.kind != InstanceKind::Terminal {
-                if !self
+            let step = if inst.kind != InstanceKind::Terminal {
+                if self
                     .close_editor(iid)
                     .is_some_and(|editor| editor.read(cx).is_dirty())
                 {
-                    self.close_instance_inner(iid, "close", cx);
+                    AcceptedClose::Stays
+                } else {
+                    AcceptedClose::Now
                 }
-                continue;
-            }
-            let facts = self.close_facts(iid, cx);
-            match decide(facts, idle_only || self.settings.confirm_close_terminal) {
-                CloseDecision::Immediate => self.close_instance_inner(iid, "close", cx),
-                CloseDecision::Hold { forced } => holds.push((iid, forced)),
-                CloseDecision::Ask if !idle_only => holds.push((iid, true)),
-                CloseDecision::Ask => {}
+            } else {
+                let facts = self.close_facts(iid, cx);
+                match decide(facts, idle_only || self.settings.confirm_close_terminal) {
+                    CloseDecision::Immediate => AcceptedClose::Now,
+                    CloseDecision::Hold { forced } => AcceptedClose::Hold { forced },
+                    CloseDecision::Ask if !idle_only => AcceptedClose::Hold { forced: true },
+                    CloseDecision::Ask => AcceptedClose::Stays,
+                }
+            };
+            steps.push((iid, step));
+        }
+        self.settle_worktree_answers(&steps);
+        let mut holds = Vec::new();
+        for (iid, step) in steps {
+            match step {
+                AcceptedClose::Now => self.close_instance_inner(iid, "close", cx),
+                AcceptedClose::Hold { forced } => holds.push((iid, forced)),
+                AcceptedClose::Stays => {}
             }
         }
         self.hold_closes(holds, None, cx);
+    }
+
+    /// A file answer covers a close only if that close takes every pane it counted.
+    /// Otherwise it ends here, and the worktree asks again when its last pane goes.
+    fn settle_worktree_answers(&mut self, steps: &[(Uuid, AcceptedClose)]) {
+        let mut ended = Vec::new();
+        for (&project, answers) in &mut self.deferred_worktree_dispose {
+            for (&wid, answer) in answers.iter_mut().filter(|(_, answer)| !answer.accepted) {
+                let open: Vec<_> = answer
+                    .choice
+                    .close_after
+                    .iter()
+                    .copied()
+                    .filter(|&iid| {
+                        self.workspace.instance(iid).is_some() && !self.closing.contains_key(&iid)
+                    })
+                    .collect();
+                // Another request's answer. Its own close decides it.
+                if !open
+                    .iter()
+                    .any(|iid| steps.iter().any(|(step, _)| step == iid))
+                {
+                    continue;
+                }
+                let takes_all = open.iter().all(|iid| {
+                    steps
+                        .iter()
+                        .any(|(step, close)| step == iid && *close != AcceptedClose::Stays)
+                });
+                if takes_all {
+                    answer.accepted = true;
+                } else {
+                    ended.push((project, wid));
+                }
+            }
+        }
+        for (project, wid) in ended {
+            self.take_deferred_worktree_dispose(project, wid);
+            muxel_store::append_event_log(&format!(
+                "close: dropped the file answer for worktree [{wid}]; this close leaves a pane open"
+            ));
+        }
     }
 
     pub(super) fn hold_closes(
@@ -1306,7 +1381,7 @@ impl MuxelApp {
             .iter()
             .any(|iid| !captured.contains(iid))
         {
-            self.request_recoverable_close(
+            self.continue_close_request(
                 choice
                     .close_after
                     .into_iter()
@@ -1418,7 +1493,7 @@ impl MuxelApp {
                             inst.editor_path = Some(saved_path);
                         }
                         this.persist();
-                        this.request_recoverable_close(rest, cx);
+                        this.continue_close_request(rest, cx);
                     }
                     Ok(()) => this.add_event(
                         NotifKind::Error,

@@ -1953,6 +1953,7 @@ mod tests {
             socket: None,
             instance: uuid::Uuid::nil(),
             local_close_token: None,
+            worktree: Default::default(),
         };
         assert_eq!(
             legacy

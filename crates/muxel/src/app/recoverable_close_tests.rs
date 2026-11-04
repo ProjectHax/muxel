@@ -379,7 +379,7 @@ fn unconfirmed_tmux_close_keeps_its_worktree_and_blocks_disposal() {
 }
 
 #[test]
-fn project_removal_preserves_the_local_tmux_retry_ledger() {
+fn removing_a_project_with_a_tmux_pane_works_the_first_time() {
     with_app(|cx, window| {
         let pid = project(cx, window);
         let (pane, _, _child) = terminal(cx, window, pid);
@@ -393,10 +393,13 @@ fn project_removal_preserves_the_local_tmux_retry_ledger() {
                 )));
                 app.delete_project(pid, cx);
                 assert!(
-                    app.workspace.project(pid).is_some(),
-                    "project removal lost the pending kill ledger"
+                    app.workspace.project(pid).is_none(),
+                    "a kill still in flight stopped the project being removed"
                 );
-                assert_eq!(app.workspace.project(pid).unwrap().closed_sessions.len(), 1);
+                assert!(
+                    app.local_closes_inflight.contains_key(&pane),
+                    "removal must leave its kill running"
+                );
             })
             .unwrap();
     });
@@ -2461,4 +2464,444 @@ fn departure_keeps_deferred_worktrees_visible_without_running_answers() {
             wait_for_exit(cx, &child);
         });
     }
+}
+
+fn answer_worktree_question(
+    app: &mut MuxelApp,
+    choice: &str,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<MuxelApp>,
+) {
+    match choice {
+        "discard" => app.dispose_worktree_discard(cx),
+        "commit" => app.dispose_worktree_commit(cx),
+        "merge" => app.dispose_worktree_merge(window, cx),
+        _ => unreachable!(),
+    }
+}
+
+/// Ryan's report: an idle shell and a busy agent share a dirty worktree, the
+/// answer is given, and only the idle one closes. The answer must not survive
+/// to act on what the agent writes afterwards.
+#[test]
+fn close_only_the_idle_ones_drops_the_answer_for_a_worktree_it_leaves_open() {
+    for choice in ["discard", "commit", "merge"] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (quiet, quiet_view, quiet_child) =
+                title_terminal(cx, window, pid, "quiet member", "Ready");
+            let (busy, busy_view, busy_child) =
+                title_terminal(cx, window, pid, "busy member", "Working");
+            wait_for_view(cx, window, &quiet_view, |view| {
+                view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                    && view.status() == AgentStatus::Idle
+            });
+            wait_for_view(cx, window, &busy_view, |view| {
+                view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                    && view.status() == AgentStatus::Working
+            });
+            let (wid, path) = clean_worktree(cx, window, pid, busy);
+            let draft = path.join("draft.txt");
+            std::fs::write(&draft, "written before the answer\n").unwrap();
+            let before = super::integrations::repo_head(&path).unwrap();
+            window
+                .update(cx, |app, window, cx| {
+                    app._status_timer = gpui::Task::ready(());
+                    join_worktree(app, quiet, wid, &path);
+                    app.request_recoverable_close(vec![quiet, busy], cx);
+                    assert_eq!(app.pending_worktree_dispose.len(), 1);
+                    answer_worktree_question(app, choice, window, cx);
+                    assert!(matches!(
+                        app.confirm.as_ref().map(|pending| &pending.action),
+                        Some(ConfirmAction::CloseBatch(_))
+                    ));
+                    app.run_close_alternative(cx);
+                    assert!(app.is_closing(quiet));
+                    assert!(!app.is_closing(busy));
+                    app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                    assert!(app.workspace.instance(quiet).is_none());
+                    assert!(path.is_dir());
+                    // The agent carries on, then exits or is closed much later.
+                    std::fs::write(&draft, "written after the answer\n").unwrap();
+                    app.close_instance_inner(busy, "close (much later)", cx);
+                    assert!(path.is_dir(), "{choice} ran without asking");
+                    assert_eq!(
+                        std::fs::read_to_string(&draft).unwrap(),
+                        "written after the answer\n"
+                    );
+                    assert_eq!(
+                        super::integrations::repo_head(&path).unwrap(),
+                        before,
+                        "{choice} committed later work without asking"
+                    );
+                    assert_eq!(
+                        app.pending_worktree_dispose.len(),
+                        1,
+                        "later work needs a new file decision"
+                    );
+                    assert!(app.deferred_worktree_dispose.is_empty());
+                })
+                .unwrap();
+            wait_for_exit(cx, &quiet_child);
+            wait_for_exit(cx, &busy_child);
+        });
+    }
+}
+
+#[test]
+fn close_only_the_idle_ones_runs_the_answer_when_it_takes_the_whole_worktree() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (quiet, quiet_view, quiet_child) =
+            title_terminal(cx, window, pid, "quiet member", "Ready");
+        let (busy, busy_view, busy_child) =
+            title_terminal(cx, window, pid, "busy outsider", "Working");
+        wait_for_view(cx, window, &quiet_view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                && view.status() == AgentStatus::Idle
+        });
+        wait_for_view(cx, window, &busy_view, |view| {
+            view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                && view.status() == AgentStatus::Working
+        });
+        let (wid, path) = clean_worktree(cx, window, pid, quiet);
+        std::fs::write(path.join("draft.txt"), "discard this\n").unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.request_recoverable_close(vec![quiet, busy], cx);
+                app.dispose_worktree_discard(cx);
+                app.run_close_alternative(cx);
+                assert!(app.is_closing(quiet));
+                assert!(!app.is_closing(busy));
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(!path.exists(), "the answer covered every member");
+                assert!(app.workspace.worktree(wid).is_none());
+                assert!(app.workspace.instance(busy).is_some());
+            })
+            .unwrap();
+        wait_for_exit(cx, &quiet_child);
+        drop(busy_child);
+    });
+}
+
+/// Every way a close can end before it is accepted. None may leave the answer
+/// able to run later, or to skip the question at the next close.
+#[test]
+fn an_answer_never_outlives_the_close_that_asked_for_it() {
+    for ending in ["prompt replaced", "new close", "pane exits"] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (pane, view, child) = title_terminal(cx, window, pid, "agent", "Working");
+            wait_for_view(cx, window, &view, |view| {
+                view.runtime_snapshot().reason == TerminalStatusReason::ProviderTitle
+                    && view.status() == AgentStatus::Working
+            });
+            let (_, path) = clean_worktree(cx, window, pid, pane);
+            std::fs::write(path.join("draft.txt"), "still wanted\n").unwrap();
+            window
+                .update(cx, |app, _, cx| {
+                    app._status_timer = gpui::Task::ready(());
+                    app.request_close_instance(pane, cx);
+                    app.dispose_worktree_discard(cx);
+                    assert!(app.confirm.is_some(), "busy close asks before holding");
+                    match ending {
+                        "prompt replaced" => {
+                            app.request_confirm(
+                                "Other",
+                                "Another prompt took over.",
+                                "OK",
+                                ConfirmAction::DeleteSnippet(0),
+                                cx,
+                            );
+                            app.cancel_confirm(cx);
+                            assert!(
+                                app.deferred_worktree_dispose.is_empty(),
+                                "{ending}: the answer stayed armed"
+                            );
+                            app.request_close_instance(pane, cx);
+                            assert_eq!(
+                                app.pending_worktree_dispose.len(),
+                                1,
+                                "{ending}: the next close reused the old answer"
+                            );
+                        }
+                        "new close" => {
+                            app.request_close_instance(pane, cx);
+                            assert_eq!(
+                                app.pending_worktree_dispose.len(),
+                                1,
+                                "{ending}: a new close reused the old answer"
+                            );
+                            assert!(app.deferred_worktree_dispose.is_empty());
+                        }
+                        "pane exits" => {
+                            // Close-on-exit, while "Close terminals?" still waits.
+                            app.close_instance_inner(pane, "close (exited)", cx);
+                            assert_eq!(
+                                app.pending_worktree_dispose.len(),
+                                1,
+                                "{ending}: the answer ran before the close was accepted"
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(path.is_dir(), "{ending}: Discard ran without a close");
+                    assert_eq!(
+                        std::fs::read_to_string(path.join("draft.txt")).unwrap(),
+                        "still wanted\n"
+                    );
+                })
+                .unwrap();
+            drop(child);
+        });
+    }
+}
+
+#[test]
+fn cancelling_a_close_check_drops_the_answer_waiting_on_it() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, _child) = terminal(cx, window, pid);
+        let (_, path) = clean_worktree(cx, window, pid, pane);
+        std::fs::write(path.join("draft.txt"), "still wanted\n").unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                let instance = app.workspace.instance_mut(pane).unwrap();
+                instance.tmux_session = Some("muxel-close-check-fixture".into());
+                instance.tmux_socket = Some(muxel_core::tmux::Socket::Named(format!(
+                    "muxel-close-test-{}",
+                    Uuid::new_v4()
+                )));
+                app.request_close_instance(pane, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |app, _, cx| {
+                assert_eq!(app.pending_worktree_dispose.len(), 1);
+                app.dispose_worktree_discard(cx);
+                assert!(!app.close_requests.is_empty(), "the check is running");
+                app.cancel_close_checks(cx);
+                assert!(
+                    app.deferred_worktree_dispose.is_empty(),
+                    "Cancel left the answer armed"
+                );
+            })
+            .unwrap();
+    });
+}
+
+fn tmux_pane_fixture(app: &mut MuxelApp, pane: Uuid) -> muxel_core::tmux::SessionTarget {
+    let socket = muxel_core::tmux::Socket::Named(format!("muxel-close-test-{}", Uuid::new_v4()));
+    let name = format!("muxel-close-fixture-{pane}");
+    let instance = app.workspace.instance_mut(pane).unwrap();
+    instance.tmux_session = Some(name.clone());
+    instance.tmux_socket = Some(socket.clone());
+    muxel_core::tmux::SessionTarget::new(name, Some(socket))
+}
+
+/// What a kill's confirmation does in `start_local_close`.
+fn confirm_local_kill(
+    app: &mut MuxelApp,
+    pid: Uuid,
+    pane: Uuid,
+    target: &muxel_core::tmux::SessionTarget,
+    cleanup: muxel_core::WorktreeCleanup,
+    cx: &mut gpui::Context<MuxelApp>,
+) {
+    app.local_closes_inflight.remove(&pane);
+    app.finish_closed_session(pid, pane, target, cx);
+    app.cleanup_closed_worktree(pid, cleanup, cx);
+}
+
+/// Ryan's report: an agent and a shell closed together. The first confirmation
+/// sees the other's pending kill. It must wait for it, not keep the worktree.
+#[test]
+fn a_worktree_waits_for_its_last_kill_and_is_then_removed() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (agent, _, _agent_child) = terminal(cx, window, pid);
+        let (shell, _, _shell_child) = terminal(cx, window, pid);
+        let (wid, path) = clean_worktree(cx, window, pid, agent);
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                join_worktree(app, shell, wid, &path);
+                let agent_target = tmux_pane_fixture(app, agent);
+                let shell_target = tmux_pane_fixture(app, shell);
+                app.close_instance_inner(agent, "close (agent)", cx);
+                app.close_instance_inner(shell, "close (shell)", cx);
+                app.notifications.clear();
+                let cleanup = muxel_core::WorktreeCleanup::Registered(wid);
+                confirm_local_kill(app, pid, agent, &agent_target, cleanup.clone(), cx);
+                assert!(
+                    !app.workspace.worktree(wid).unwrap().detached,
+                    "the first confirmation kept a worktree still being closed"
+                );
+                assert!(
+                    app.notifications.is_empty(),
+                    "a normal close showed an error"
+                );
+                assert!(path.is_dir(), "files went before the last kill confirmed");
+                confirm_local_kill(app, pid, shell, &shell_target, cleanup, cx);
+                assert!(!path.exists(), "a clean worktree was never removed");
+                assert!(app.workspace.worktree(wid).is_none());
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_kill_for_another_pane_does_not_hold_this_worktree() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (member, _, _member_child) = terminal(cx, window, pid);
+        let (outsider, _, _outsider_child) = terminal(cx, window, pid);
+        let (wid, path) = clean_worktree(cx, window, pid, member);
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                let member_target = tmux_pane_fixture(app, member);
+                tmux_pane_fixture(app, outsider);
+                app.close_instance_inner(outsider, "close (outsider)", cx);
+                app.close_instance_inner(member, "close (member)", cx);
+                app.notifications.clear();
+                let cleanup = muxel_core::WorktreeCleanup::Registered(wid);
+                confirm_local_kill(app, pid, member, &member_target, cleanup, cx);
+                assert!(
+                    !path.exists(),
+                    "another pane's kill kept this clean worktree"
+                );
+                assert!(app.notifications.is_empty(), "a false error was shown");
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_pending_kill_for_another_pane_does_not_hold_a_file_answer() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (member, _, member_child) = terminal(cx, window, pid);
+        let (outsider, _, _outsider_child) = terminal(cx, window, pid);
+        let (_, path) = clean_worktree(cx, window, pid, member);
+        std::fs::write(path.join("draft.txt"), "discard this\n").unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                tmux_pane_fixture(app, outsider);
+                app.close_instance_inner(outsider, "close (outsider)", cx);
+                app.settings.confirm_close_terminal = false;
+                app.request_close_instance(member, cx);
+                app.dispose_worktree_discard(cx);
+                app.expire_closes(Instant::now() + Duration::from_secs(16), cx);
+                assert!(
+                    !path.exists(),
+                    "another pane's kill held this worktree's answer"
+                );
+            })
+            .unwrap();
+        wait_for_exit(cx, &member_child);
+    });
+}
+
+#[test]
+fn a_kill_that_cannot_confirm_keeps_its_worktree_listed() {
+    for outcome in ["failed", "preserved"] {
+        with_app(|cx, window| {
+            let pid = project(cx, window);
+            let (pane, _, _child) = terminal(cx, window, pid);
+            let (wid, path) = clean_worktree(cx, window, pid, pane);
+            window
+                .update(cx, |app, _, cx| {
+                    app._status_timer = gpui::Task::ready(());
+                    let target = tmux_pane_fixture(app, pane);
+                    app.close_instance_inner(pane, "close (cannot confirm)", cx);
+                    assert!(!app.workspace.worktree(wid).unwrap().detached);
+                    app.local_closes_inflight.remove(&pane);
+                    let result = match outcome {
+                        "failed" => Err(anyhow::anyhow!("no answer from tmux")),
+                        _ => Ok(Some((
+                            target,
+                            super::integrations::LocalTmuxClose::Preserved,
+                        ))),
+                    };
+                    app.finish_local_close(
+                        pid,
+                        pane,
+                        muxel_core::WorktreeCleanup::Registered(wid),
+                        result,
+                        cx,
+                    );
+                    assert!(path.is_dir());
+                    assert!(
+                        app.workspace.worktree(wid).unwrap().detached,
+                        "{outcome}: nothing in the sidebar could reach this worktree"
+                    );
+                })
+                .unwrap();
+        });
+    }
+}
+
+/// A peer's panes may still use it, so this machine has no grounds to detach it.
+#[test]
+fn closing_a_remote_pane_leaves_its_worktree_attached() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (pane, _, _child) = terminal(cx, window, pid);
+        let (wid, path) = clean_worktree(cx, window, pid, pane);
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.workspace.project_mut(pid).unwrap().remote = Some(muxel_core::RemoteRef {
+                    host_id: Uuid::new_v4(),
+                    remote_root: "/repo".into(),
+                });
+                app.close_instance_inner(pane, "close (remote)", cx);
+                assert!(path.is_dir());
+                assert!(!app.workspace.worktree(wid).unwrap().detached);
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_preserved_session_cancels_only_its_own_worktrees_answer() {
+    with_app(|cx, window| {
+        let pid = project(cx, window);
+        let (kept, _, _kept_child) = terminal(cx, window, pid);
+        let (member, _, _member_child) = terminal(cx, window, pid);
+        let (_, path) = clean_worktree(cx, window, pid, member);
+        std::fs::write(path.join("draft.txt"), "discard this\n").unwrap();
+        window
+            .update(cx, |app, _, cx| {
+                app._status_timer = gpui::Task::ready(());
+                app.settings.confirm_close_terminal = false;
+                let target = tmux_pane_fixture(app, kept);
+                app.close_instance_inner(kept, "close (outsider)", cx);
+                app.request_close_instance(member, cx);
+                app.dispose_worktree_discard(cx);
+                assert_eq!(app.deferred_worktree_dispose.len(), 1);
+                app.local_closes_inflight.remove(&kept);
+                app.finish_local_close(
+                    pid,
+                    kept,
+                    muxel_core::WorktreeCleanup::None,
+                    Ok(Some((
+                        target,
+                        super::integrations::LocalTmuxClose::Preserved,
+                    ))),
+                    cx,
+                );
+                assert_eq!(
+                    app.deferred_worktree_dispose.len(),
+                    1,
+                    "another pane's kept session cancelled this answer"
+                );
+            })
+            .unwrap();
+    });
 }

@@ -7,6 +7,12 @@ use muxel_core::{Instance, PaneNode, Project};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// `test_support::set_root` doesn't move tmux's socket, so `Socket::Private`
+/// here would be the developer's real server.
+fn fixture_socket() -> muxel_core::tmux::Socket {
+    muxel_core::tmux::Socket::Named(format!("muxel-close-test-{}", Uuid::new_v4()))
+}
+
 fn with_app(run: impl FnOnce(&mut TestAppContext, WindowHandle<MuxelApp>, Uuid, Uuid)) {
     let root = std::env::temp_dir().join(format!("muxel-close-layout-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
@@ -240,7 +246,7 @@ fn review_close_retry_forgets_a_session_imported_into_another_pane() {
             .update(cx, |app, window, cx| {
                 let target = muxel_core::tmux::SessionTarget::new(
                     "imported-session",
-                    Some(muxel_core::tmux::Socket::Private),
+                    Some(fixture_socket()),
                 );
                 // Import creates a fresh pane id bound to the still-running target.
                 app.workspace
@@ -276,7 +282,7 @@ fn review_close_reconciles_the_peer_layout_before_replaying_a_kill() {
             .update(cx, |app, window, cx| {
                 let inst = app.workspace.instance_mut(iid).unwrap();
                 inst.tmux_session = Some("peer-kept-session".into());
-                inst.tmux_socket = Some(muxel_core::tmux::Socket::Private);
+                inst.tmux_socket = Some(fixture_socket());
                 let mut peer = app.sync_capture(pid, 1).unwrap();
                 peer.updated_at = u64::MAX / 2;
                 let root = app.workspace.project(pid).unwrap().root_path.clone();
@@ -288,7 +294,7 @@ fn review_close_reconciles_the_peer_layout_before_replaying_a_kill() {
                 project.remember_closed_session(
                     muxel_core::tmux::SessionTarget::new(
                         "peer-kept-session",
-                        Some(muxel_core::tmux::Socket::Private),
+                        Some(fixture_socket()),
                     ),
                     iid,
                 );
@@ -318,10 +324,8 @@ fn review_close_a_recreated_panes_new_intent_supersedes_its_inflight_close() {
     with_app(|cx, window, pid, iid| {
         window
             .update(cx, |app, _, cx| {
-                let target = muxel_core::tmux::SessionTarget::new(
-                    "recreated-pane",
-                    Some(muxel_core::tmux::Socket::Private),
-                );
+                let target =
+                    muxel_core::tmux::SessionTarget::new("recreated-pane", Some(fixture_socket()));
                 let original = app.workspace.instance_mut(iid).unwrap();
                 original.tmux_session = Some(target.name.clone());
                 original.tmux_socket = target.socket.clone();
@@ -691,5 +695,198 @@ fn restore_shows_unused_registered_worktrees_and_leaves_used_ones() {
                 }
             })
             .unwrap();
+    });
+}
+
+#[test]
+fn an_unconfirmed_remote_close_cannot_stop_a_project_being_removed() {
+    with_app(|cx, window, pid, iid| {
+        window
+            .update(cx, |app, _, cx| {
+                app.workspace.remove_instance_meta(iid);
+                let project = app.workspace.project_mut(pid).unwrap();
+                project.layout = None;
+                // A host that no longer exists can never confirm this.
+                project.remote = Some(muxel_core::RemoteRef {
+                    host_id: Uuid::new_v4(),
+                    remote_root: "/gone".into(),
+                });
+                project.remember_closed_session(
+                    muxel_core::tmux::SessionTarget::new("gone-session", Some(fixture_socket())),
+                    iid,
+                );
+                app.delete_project(pid, cx);
+                assert!(
+                    app.workspace.project(pid).is_none(),
+                    "a dead host made the project impossible to remove"
+                );
+                assert!(
+                    app.notifications
+                        .iter()
+                        .any(|notice| notice.title.contains("may still be running")),
+                    "the removal has to say the session may have survived"
+                );
+            })
+            .unwrap();
+    });
+}
+
+#[cfg(unix)]
+fn start_tmux_session(socket: &str, session: &str) {
+    let launched = std::process::Command::new("tmux")
+        .args([
+            "-L",
+            socket,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "sleep 120",
+        ])
+        .output()
+        .expect("tmux is required for Unix CI");
+    assert!(
+        launched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn tmux_session_alive(socket: &str, session: &str) -> bool {
+    std::process::Command::new("tmux")
+        .args(["-L", socket, "has-session", "-t", &format!("={session}")])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+#[cfg(unix)]
+#[test]
+fn removing_a_project_still_kills_its_tmux_sessions() {
+    let socket = format!("muxel-close-test-{}", Uuid::new_v4());
+    let _server = OwnedTmux(socket.clone());
+    let session = "close-removal-fixture";
+    start_tmux_session(&socket, session);
+    with_app(|cx, window, pid, iid| {
+        window
+            .update(cx, |app, _, cx| {
+                let inst = app.workspace.instance_mut(iid).unwrap();
+                inst.tmux_session = Some(session.into());
+                inst.tmux_socket = Some(muxel_core::tmux::Socket::Named(socket.clone()));
+                app.delete_project(pid, cx);
+                assert!(
+                    app.workspace.project(pid).is_none(),
+                    "removal failed the first time"
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            !tmux_session_alive(&socket, session),
+            "removal lost the kill, and the agent kept running"
+        );
+    });
+}
+
+#[cfg(unix)]
+fn git_fixture(root: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.name=Muxel test",
+            "-c",
+            "user.email=muxel-test@example.invalid",
+        ])
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("run git inside disposable fixture");
+    assert!(
+        output.status.success(),
+        "fixture git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Ryan's report, on real tmux: the agent and shell of a clean worktree close
+/// together. Whichever kill confirms first sees the other's entry.
+#[cfg(unix)]
+#[test]
+fn closing_both_tmux_panes_of_a_clean_worktree_removes_it() {
+    let socket = format!("muxel-close-test-{}", Uuid::new_v4());
+    let _server = OwnedTmux(socket.clone());
+    start_tmux_session(&socket, "close-worktree-agent");
+    start_tmux_session(&socket, "close-worktree-shell");
+    with_app(|cx, window, pid, iid| {
+        let (wid, path) = window
+            .update(cx, |app, _, cx| {
+                let root = app.workspace.project(pid).unwrap().root_path.clone();
+                git_fixture(&root, &["init", "--initial-branch=main"]);
+                git_fixture(&root, &["commit", "--allow-empty", "-m", "fixture"]);
+                let path = root.join("close-worktree");
+                git_fixture(
+                    &root,
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        "muxel/close-both",
+                        path.to_str().unwrap(),
+                    ],
+                );
+                let wid = Uuid::new_v4();
+                app.workspace.add_worktree(muxel_core::Worktree {
+                    id: wid,
+                    project_id: pid,
+                    name: "close both".into(),
+                    path: path.clone(),
+                    branch: "muxel/close-both".into(),
+                    color: 0,
+                    detached: false,
+                });
+                let mut second = Instance::shell(pid);
+                second.tmux_session = Some("close-worktree-shell".into());
+                second.tmux_socket = Some(muxel_core::tmux::Socket::Named(socket.clone()));
+                second.worktree_id = Some(wid);
+                second.worktree_path = Some(path.clone());
+                let second_id = second.id;
+                app.workspace.add_instance(second);
+                let agent = app.workspace.instance_mut(iid).unwrap();
+                agent.tmux_session = Some("close-worktree-agent".into());
+                agent.tmux_socket = Some(muxel_core::tmux::Socket::Named(socket.clone()));
+                agent.worktree_id = Some(wid);
+                agent.worktree_path = Some(path.clone());
+                app.notifications.clear();
+                app.close_instance_inner(iid, "close (agent)", cx);
+                app.close_instance_inner(second_id, "close (shell)", cx);
+                (wid, path)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(!tmux_session_alive(&socket, "close-worktree-agent"));
+        assert!(!tmux_session_alive(&socket, "close-worktree-shell"));
+        window
+            .update(cx, |app, _, _| {
+                assert!(
+                    app.notifications.is_empty(),
+                    "a normal close showed a false error"
+                );
+                assert!(
+                    app.workspace.worktree(wid).is_none(),
+                    "a clean worktree was kept"
+                );
+            })
+            .unwrap();
+        assert!(!path.exists(), "a clean worktree stayed on disk");
     });
 }

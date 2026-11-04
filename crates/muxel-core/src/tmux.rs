@@ -596,6 +596,32 @@ pub struct ClosedSession {
     /// may stamp the session; persisted retries only compare this token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_close_token: Option<Uuid>,
+    /// Where the pane ran, so an unconfirmed kill holds up only its own worktree.
+    #[serde(default)]
+    pub worktree: ClosedWorktree,
+}
+
+/// Which worktree a closed pane ran in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosedWorktree {
+    /// Saved before muxel recorded this, so it could be any of the project's.
+    #[default]
+    Unknown,
+    /// The pane wasn't in a worktree.
+    Outside,
+    In(std::path::PathBuf),
+}
+
+impl ClosedWorktree {
+    /// Whether this kill could be for a pane that ran in the worktree at `path`.
+    pub fn may_be(&self, path: &std::path::Path) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Outside => false,
+            Self::In(own) => own == path,
+        }
+    }
 }
 
 impl ClosedSession {
@@ -2309,6 +2335,7 @@ mod tests {
                 socket: Some(socket),
                 instance: Uuid::new_v4(),
                 local_close_token: None,
+                worktree: Default::default(),
             };
             let json = serde_json::to_string(&closed).unwrap();
             let restored: ClosedSession = serde_json::from_str(&json).unwrap();
@@ -2485,6 +2512,7 @@ mod tests {
                 socket: prior,
                 instance: instance.id,
                 local_close_token: None,
+                worktree: Default::default(),
             };
             assert_eq!(
                 closed.resolve_owner(&found, socket.clone()).target(),
@@ -2515,6 +2543,7 @@ mod tests {
             socket: Some(Socket::Private),
             instance: Uuid::nil(),
             local_close_token: None,
+            worktree: Default::default(),
         };
         assert_eq!(
             orphan_sessions(&found, "/p", &[], std::slice::from_ref(&closed)),
@@ -2564,6 +2593,7 @@ mod tests {
             socket: Some(Socket::Default),
             instance: Uuid::nil(),
             local_close_token: None,
+            worktree: Default::default(),
         };
         assert_eq!(live_closed_session(&found, &closed), Some(&found[0]));
     }
@@ -2577,6 +2607,7 @@ mod tests {
             socket: None,
             instance: Uuid::new_v4(),
             local_close_token: None,
+            worktree: Default::default(),
         };
         let resolved = pending.resolve_owner(&sessions, Socket::Private);
         let mut project = crate::Project::new("p", "/p");
@@ -2643,6 +2674,7 @@ mod tests {
             socket: None,
             instance: Uuid::nil(),
             local_close_token: None,
+            worktree: Default::default(),
         };
         // This resolved record is retained in the in-memory confirmed-close ledger.
         let reaped = legacy.resolve_owner(&sessions, Socket::Private);
@@ -2664,6 +2696,7 @@ mod tests {
             socket: None,
             instance: Uuid::nil(),
             local_close_token: None,
+            worktree: Default::default(),
         };
         let reaped = legacy.resolve_owner(&[], Socket::Private);
         assert_eq!(reaped.socket, Some(Socket::Private));
@@ -2685,6 +2718,7 @@ mod tests {
             socket: None,
             instance: id,
             local_close_token: None,
+            worktree: Default::default(),
         };
         assert_eq!(
             legacy.resolve_owner(&sessions, Socket::Private).target(),
@@ -2744,6 +2778,7 @@ mod tests {
             socket: None,
             instance: id,
             local_close_token: None,
+            worktree: Default::default(),
         }
     }
 

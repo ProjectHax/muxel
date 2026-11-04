@@ -55,12 +55,25 @@ runs only after confirmed local session death; unconfirmed remote teardown
 keeps the worktree and logs why.
 
 Worktree choices still pass through busy confirmation and the Undo countdown.
-The selected file action waits until the captured panes have closed and the
-project's tmux ledger is clear. Undo, Cancel, a new worktree member or a preserved
-session cancels the pending file action. Dirty, unmerged or shared legacy
-worktrees are kept rather than force-removed.
-Project removal preserves the project's pending-kill ledger until confirmation;
-remove the empty project again once its sessions have stopped.
+A file answer runs only if the close it was given for is accepted and takes every
+captured pane. Close only the idle ones leaving one open, a replaced prompt, a
+newer close, a cancelled client check, or a pane exiting before acceptance each
+drop the answer, and the worktree asks again when its last pane goes.
+
+The selected file action waits until the captured panes have closed and the kills
+for that worktree's panes are confirmed. Each ledger entry records the worktree its
+pane ran in, so another pane's kill holds nothing back; an entry saved before that
+was recorded counts as any worktree. A worktree with its own kill still running
+waits without a notice. A local one whose kill fails or can't be confirmed is kept
+and detached, so the sidebar still lists it; a remote one stays attached, since a
+peer's panes may use it. Undo, Cancel, a new worktree member or a
+preserved session for that worktree cancels the pending file action. Dirty,
+unmerged or shared legacy worktrees are kept rather than force-removed.
+
+Project removal never waits on the ledger, which goes with the project. Kills
+already running finish in the background, older unconfirmed entries get one last
+try, and nothing retries after that. A session that survives keeps running on its
+host, the removal says so, and Import lists it.
 
 ## Reconciliation edges
 

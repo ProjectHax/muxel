@@ -1176,21 +1176,20 @@ impl Project {
     /// Remote history is capped, oldest first. Local pending kills must all
     /// survive: local inventory cannot adopt an orphan whose kill was forgotten.
     pub fn remember_closed_session(&mut self, session: tmux::SessionTarget, instance: Uuid) {
-        let local_close_token = self
-            .closed_sessions
-            .iter()
-            .find(|closed| {
-                closed.instance == instance
-                    && closed.name == session.name
-                    && (closed.socket == session.socket || closed.socket.is_none())
-            })
-            .and_then(|closed| closed.local_close_token);
+        let previous = self.closed_sessions.iter().find(|closed| {
+            closed.instance == instance
+                && closed.name == session.name
+                && (closed.socket == session.socket || closed.socket.is_none())
+        });
+        let local_close_token = previous.and_then(|closed| closed.local_close_token);
+        let worktree = previous.map_or_else(Default::default, |closed| closed.worktree.clone());
         self.closed_sessions.retain(|c| c.instance != instance);
         self.closed_sessions.push(tmux::ClosedSession {
             name: session.name,
             socket: session.socket,
             instance,
             local_close_token,
+            worktree,
         });
         if self.is_remote() {
             let over = self
@@ -1199,6 +1198,25 @@ impl Project {
                 .saturating_sub(MAX_CLOSED_SESSIONS);
             self.closed_sessions.drain(..over);
         }
+    }
+
+    /// Record where a remembered close's pane ran.
+    pub fn set_closed_worktree(&mut self, instance: Uuid, worktree: tmux::ClosedWorktree) {
+        if let Some(closed) = self
+            .closed_sessions
+            .iter_mut()
+            .find(|closed| closed.instance == instance)
+        {
+            closed.worktree = worktree;
+        }
+    }
+
+    /// Whether an unconfirmed kill could be for a pane that ran in the worktree
+    /// at `path`. Other panes' kills say nothing about those files.
+    pub fn close_pending_in(&self, path: &std::path::Path) -> bool {
+        self.closed_sessions
+            .iter()
+            .any(|closed| closed.worktree.may_be(path))
     }
 
     /// Forget a close whose session the host has confirmed gone.
@@ -1404,6 +1422,20 @@ impl Workspace {
     /// Drop the registry entry (does not touch the filesystem).
     pub fn remove_worktree_meta(&mut self, id: Uuid) {
         self.worktrees.retain(|w| w.id != id);
+    }
+
+    /// Where `instance` runs, for its close's ledger entry. Capture before
+    /// removing its metadata.
+    pub fn closed_worktree_of(&self, instance: &Instance) -> tmux::ClosedWorktree {
+        match (instance.worktree_id, &instance.worktree_path) {
+            (Some(id), _) => self
+                .worktree(id)
+                .map_or(tmux::ClosedWorktree::Unknown, |worktree| {
+                    tmux::ClosedWorktree::In(worktree.path.clone())
+                }),
+            (None, Some(path)) => tmux::ClosedWorktree::In(path.clone()),
+            (None, None) => tmux::ClosedWorktree::Outside,
+        }
     }
 
     /// Instance ids currently referencing `worktree_id`.
@@ -5125,6 +5157,91 @@ mod worktree_registry_tests {
         assert_eq!(ws.worktree(wid).map(|w| w.color), Some(2));
         ws.remove_worktree_meta(wid);
         assert!(ws.worktree(wid).is_none());
+    }
+
+    #[test]
+    fn a_pending_kill_only_holds_the_worktree_its_pane_ran_in() {
+        use std::path::Path;
+        let mut project = Project::new("p", "/repo");
+        let (mine, theirs) = (Path::new("/wt/mine"), Path::new("/wt/theirs"));
+        assert!(!project.close_pending_in(mine));
+        let target = |name: &str| tmux::SessionTarget::new(name, Some(tmux::Socket::Private));
+
+        let outside = Uuid::new_v4();
+        project.remember_closed_session(target("outside"), outside);
+        project.set_closed_worktree(outside, tmux::ClosedWorktree::Outside);
+        assert!(!project.close_pending_in(mine));
+
+        let member = Uuid::new_v4();
+        project.remember_closed_session(target("member"), member);
+        project.set_closed_worktree(member, tmux::ClosedWorktree::In(mine.into()));
+        assert!(project.close_pending_in(mine));
+        assert!(!project.close_pending_in(theirs));
+
+        // Resolving the owner later re-remembers the close. It must stay scoped.
+        project.remember_closed_session(target("member"), member);
+        assert!(project.close_pending_in(mine));
+        assert!(!project.close_pending_in(theirs));
+
+        assert!(project.forget_closed_session(member));
+        assert!(!project.close_pending_in(mine));
+    }
+
+    #[test]
+    fn a_close_saved_before_worktrees_were_recorded_could_be_any_of_them() {
+        let closed: tmux::ClosedSession = serde_json::from_value(serde_json::json!({
+            "name": "older",
+            "instance": Uuid::new_v4(),
+        }))
+        .unwrap();
+        assert_eq!(closed.worktree, tmux::ClosedWorktree::Unknown);
+        assert!(closed.worktree.may_be(std::path::Path::new("/wt/any")));
+        let round: tmux::ClosedSession = serde_json::from_value(
+            serde_json::to_value(tmux::ClosedSession {
+                worktree: tmux::ClosedWorktree::In("/wt/mine".into()),
+                ..closed
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(round.worktree, tmux::ClosedWorktree::In("/wt/mine".into()));
+    }
+
+    #[test]
+    fn a_closing_instance_records_the_worktree_it_ran_in() {
+        let mut workspace = Workspace::default();
+        let project = Uuid::new_v4();
+        let registered = Worktree {
+            id: Uuid::new_v4(),
+            project_id: project,
+            name: "w".into(),
+            path: "/wt/registered".into(),
+            branch: "b".into(),
+            color: 0,
+            detached: false,
+        };
+        let wid = registered.id;
+        workspace.add_worktree(registered);
+        let mut instance = Instance::shell(project);
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::Outside
+        );
+        instance.worktree_path = Some("/wt/legacy".into());
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::In("/wt/legacy".into())
+        );
+        instance.worktree_id = Some(wid);
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::In("/wt/registered".into())
+        );
+        instance.worktree_id = Some(Uuid::new_v4());
+        assert_eq!(
+            workspace.closed_worktree_of(&instance),
+            tmux::ClosedWorktree::Unknown
+        );
     }
 
     #[test]

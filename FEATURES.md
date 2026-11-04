@@ -115,7 +115,9 @@ feature is added or changed, update the matching entry here in the same change**
   binding, input and completion before expiry; changed work gets Close / Keep.
   An OSC 7501 report counts as quiet only while idle or finished; an `error`
   report asks, and any turn a report finishes during the countdown is changed
-  work. Batch closes offer Close all, Close only the idle ones, or Cancel.
+  work. Batch closes offer Close all, Close only the idle ones, or Cancel; a
+  file answer needs the close to take every pane of its worktree, so leaving
+  one open drops the answer and that worktree asks again later.
   Queued input, written to the terminal or sent through tmux, is cancelled
   across close and Undo, and hidden panes leave ctl listings; writes refuse
   with `closing`. Reads by id or name (`status`, `show`, `screen`, `wait`)
@@ -151,7 +153,11 @@ feature is added or changed, update the matching entry here in the same change**
   Cancel; a batch member closed during the check leaves the others to their
   decision. Ordinary saves preserve held panes for crash recovery; workspace
   switch and quit (or logout) finish unshared running countdowns, but keep shared
-  closes until a fresh layout read can run on the next visit. They also keep a pane
+  closes until a fresh layout read can run on the next visit. A layout is shared
+  for a remote project and whenever tmux is in use, which covers every local Linux
+  and macOS project, so unshared in practice means a local Windows project. An
+  explicit Close of a shared pane also waits for the next layout read. They also
+  keep a pane
   still being checked or waiting for Close / Keep, which reopens next time.
   Local tmux closes save a pending kill before teardown and retry it on project
   activation after layout reconciliation. A pane that reappeared or now shows
@@ -162,8 +168,10 @@ feature is added or changed, update the matching entry here in the same change**
   Their worktree cleanup waits for confirmed session death. Unconfirmed remote
   cleanup keeps the worktree and reports why. Legacy worktrees are kept when
   dirty, unmerged or still shared by another pane.
-  Project removal keeps the retry ledger until teardown is confirmed; remove
-  the empty project again after its sessions have stopped.
+  Removing a project never waits on those kills. One already running finishes in
+  the background and an older unconfirmed one gets a last try, but nothing retries
+  after that. A session that survives keeps running, the removal says so, and
+  Import lists it.
   Removing a project waits for that decision. If that save fails, the first
   switch stops with a notice and the next one leaves anyway; the pane reopens
   next time. Saving an untitled editor on close writes the path picked in the
