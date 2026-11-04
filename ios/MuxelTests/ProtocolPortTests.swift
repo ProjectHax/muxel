@@ -172,7 +172,7 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertTrue(cmd.hasPrefix(
             "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("muxel_h_abcdef12")); "
             + "mkdir -p -- '/work'; "
-            + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
+            + "tmux \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
             + "new-session -d -s 'muxel_h_abcdef12' -c '/work' "
             + "-- sh -c "))
         XCTAssertTrue(cmd.contains("@muxel_control_pane"))
@@ -185,7 +185,7 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: nil, args: []),
             "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; "
-                + "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
+                + "tmux \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -d -s 's' -c '/w'")
     }
 
@@ -198,10 +198,10 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(
             TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: nil, args: []),
             "\(TmuxCommands.pathPrelude); \(TmuxCommands.selectSocket("s")); mkdir -p -- '/w'; clear; "
-                + "exec tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' "
+                + "exec tmux \"$@\" \(TmuxCommands.clearProfilerEnvironment()) set-environment -g -u MUXEL_INSTANCE_ID ';' "
                 + "new-session -A -s 's' -c '/w'")
         // Cleared in the same tmux command list, ahead of the session it would leak into.
-        let clearThenCreate = "tmux \"$@\" set-environment -g -u MUXEL_INSTANCE_ID ';' new-session "
+        let clearThenCreate = "set-environment -g -u MUXEL_INSTANCE_ID ';' new-session "
         for cmd in [
             TmuxCommands.launchAgent(session: "s", cwd: "/w", program: "claude", args: []),
             TmuxCommands.newAttachedPTYCommand(session: "s", cwd: "/w", program: "claude", args: []),
@@ -217,6 +217,18 @@ final class ProtocolPortTests: XCTestCase {
         XCTAssertEqual(
             line,
             "\(TmuxCommands.pathPrelude); 'tmux' '-L' 'mxl' 'capture-pane' '-p' '-t' '=muxel_h_abcdef12:'")
+    }
+
+    func testProfilerCleanupCoversFutureKeysWithoutRemovingPaneContext() {
+        let clear = TmuxCommands.clearProfilerEnvironment(environmentNames: [
+            "MUXEL_PROFILE_FUTURE", "MUXEL_INSTANCE_ID", "MUXEL_USER_DATA_DIR", "MUXEL_CONTROL",
+        ])
+        for name in ["MUXEL_PROFILE", "MUXEL_PROFILE_FUTURE", "MUXEL_PROFILE_KEEP_DAYS", "MUXEL_PROFILE_MAX_BYTES"] {
+            XCTAssertTrue(clear.contains("set-environment -g -u \(Shell.quote(name)) ';'"))
+        }
+        for name in ["MUXEL_INSTANCE_ID", "MUXEL_USER_DATA_DIR", "MUXEL_CONTROL"] {
+            XCTAssertFalse(clear.contains(name))
+        }
     }
 
     // Pane/window-target commands must use `=session:` (active pane of the session).

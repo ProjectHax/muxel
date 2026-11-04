@@ -3,7 +3,8 @@
 //! **Off by default.** Enable with `MUXEL_PROFILE_TERMINAL=1` or
 //! `MUXEL_PROFILE=1` (`true` / `yes` also work). Stats dump to a log file
 //! every ~500 ms while **interesting** events are flowing (keypresses, paint
-//! spikes, high felt latency), and a final line after 1 s of quiet.
+//! spikes, high felt latency). Quiet intervals retain totals and maxima in a
+//! summary every 30 seconds, including intervals after a burst ends.
 //!
 //! ## Overhead
 //! When disabled: one cached boolean branch per call site. When enabled:
@@ -32,7 +33,11 @@
 //! ```
 //! Hold a key in a terminal; open the log file (no paste needed).
 //!
-//! Lines are `term-prof[v8 …]` and include PTY writer queue/write timing, PTY
+//! Both profiler workers keep dated archives at the local date change and
+//! before a live file exceeds 2 MiB. `MUXEL_PROFILE_KEEP_DAYS` (14) and
+//! `MUXEL_PROFILE_MAX_BYTES` (256 MiB per family) bound history.
+//!
+//! Busy lines are `term-prof[v9 …]` and include PTY writer queue/write timing, PTY
 //! reader/drain timing, and paint phase splits
 //! (`build=` / `shape=` / `submit=` / `runs=` / `reuse=`) plus felt-latency
 //! samples split at `key→next-read`, `read→process`, and `process→paint`.
@@ -41,25 +46,22 @@
 //! distinguish child/ConPTY delay from Muxel queueing and paint delay.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::profile_idle::IdleTicks;
+use crate::profile_log::{ProfileLog, ProfileLogLimits};
 use crate::session::{OutputQueuePeak, PtyReadTiming};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static LOG_STDERR: OnceLock<bool> = OnceLock::new();
 static LOG_CHAINS: OnceLock<bool> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
-static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
-
-/// Rotate when the profile log reaches this size (keep one `.1` backup).
-const PROFILE_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+static LOG_FILE: OnceLock<Mutex<ProfileLog>> = OnceLock::new();
 
 /// Latest cursor position of the focused pane, pushed by the drain after each
 /// processed batch. Terminal contents never enter profiler state or logs.
@@ -165,65 +167,6 @@ fn log_path() -> &'static PathBuf {
     })
 }
 
-fn rotated_log_path(path: &Path) -> PathBuf {
-    let mut rotated = path.as_os_str().to_owned();
-    rotated.push(".1");
-    PathBuf::from(rotated)
-}
-
-/// Prepare a bounded live log before it is opened. If rotation cannot replace
-/// the backup, truncate the live file; if neither operation succeeds, stop
-/// logging rather than append without a bound.
-fn prepare_log_path(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return true;
-    };
-    if meta.len() < PROFILE_LOG_MAX_BYTES {
-        return true;
-    }
-    let rotated = rotated_log_path(path);
-    match std::fs::remove_file(&rotated) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {}
-    }
-    if std::fs::rename(path, &rotated).is_ok() {
-        return true;
-    }
-    OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .is_ok()
-}
-
-fn open_log_file(path: &Path) -> Option<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Append across restarts so a long session (or many short ones) builds a
-    // corpus; rotate when large so a multi-day run cannot fill the disk.
-    if !prepare_log_path(path) {
-        return None;
-    }
-    match OpenOptions::new().create(true).append(true).open(path) {
-        Ok(f) => Some(f),
-        Err(e) => {
-            if log_stderr() {
-                eprintln!("term-prof: could not open log {}: {e}", path.display());
-            }
-            None
-        }
-    }
-}
-
-fn reopen_log_file(slot: &mut Option<std::fs::File>, path: &Path) {
-    // The explicit first assignment matters on Windows: an assignment whose
-    // RHS opens/rotates first would retain the old handle until too late.
-    *slot = None;
-    *slot = open_log_file(path);
-}
-
 fn emit_line(line: &str) {
     // Wall-clock prefix (epoch seconds.millis) so dump lines correlate with
     // external instruments (capture-window.ps1 hashes, PresentMon traces).
@@ -235,28 +178,17 @@ fn emit_line(line: &str) {
     if log_stderr() {
         eprintln!("{line}");
     }
-    let path = log_path();
     let slot = LOG_FILE.get_or_init(|| {
-        let f = open_log_file(path);
-        if f.is_some() && log_stderr() {
-            eprintln!("term-prof: writing {}", path.display());
-        }
-        Mutex::new(f)
+        Mutex::new(ProfileLog::new(
+            log_path().clone(),
+            ProfileLogLimits::from_env(),
+        ))
     });
-    if let Ok(mut g) = slot.lock() {
-        // Re-open after rotation mid-process when the live file grew too large.
-        let needs_reopen = g.as_ref().is_none_or(|f| {
-            f.metadata()
-                .map(|m| m.len() >= PROFILE_LOG_MAX_BYTES)
-                .unwrap_or(false)
-        });
-        if needs_reopen {
-            reopen_log_file(&mut g, path);
-        }
-        if let Some(f) = g.as_mut() {
-            let _ = writeln!(f, "{line}");
-            let _ = f.flush();
-        }
+    if let Ok(mut g) = slot.lock()
+        && let Err(error) = g.append(line)
+        && log_stderr()
+    {
+        eprintln!("term-prof: could not append log: {error}");
     }
 }
 
@@ -748,9 +680,11 @@ fn touch() {
 fn flusher_loop(rx: Receiver<DeferredRecord>) {
     let mut records = Vec::with_capacity(MAX_PENDING_RECORDS);
     let mut last_dump = Instant::now();
+    let mut idle = IdleTicks::default();
+    let mut last_idle = Instant::now();
     loop {
         if records.len() == MAX_PENDING_RECORDS {
-            dump("capacity", &mut records);
+            dump("capacity", &mut records, &mut idle);
             last_dump = Instant::now();
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -767,6 +701,12 @@ fn flusher_loop(rx: Receiver<DeferredRecord>) {
         }
 
         let c = counters();
+        if last_idle.elapsed() >= Duration::from_secs(30) {
+            if let Some(line) = idle.take_line() {
+                emit_line(&line);
+            }
+            last_idle = Instant::now();
+        }
         let last = c.last_event_us.load(Ordering::Relaxed);
         if last == 0 {
             continue;
@@ -774,7 +714,11 @@ fn flusher_loop(rx: Receiver<DeferredRecord>) {
         let quiet = now_us().saturating_sub(last) >= 1_000_000;
         let periodic = last_dump.elapsed() >= Duration::from_millis(500);
         if quiet || periodic {
-            dump(if quiet { "quiet" } else { "tick" }, &mut records);
+            dump(
+                if quiet { "quiet" } else { "tick" },
+                &mut records,
+                &mut idle,
+            );
             last_dump = Instant::now();
             if quiet {
                 let _ =
@@ -785,7 +729,7 @@ fn flusher_loop(rx: Receiver<DeferredRecord>) {
     }
 }
 
-fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
+fn dump(tag: &str, records: &mut Vec<DeferredRecord>, idle: &mut IdleTicks) {
     let c = counters();
     let keys = c.keys.swap(0, Ordering::Relaxed);
     let keys_held = c.keys_held.swap(0, Ordering::Relaxed);
@@ -846,8 +790,8 @@ fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
     }
 
     // Roll the interval whenever its counters are consumed, including ticks
-    // filtered out below. Otherwise a later interesting tick reports rates over
-    // a window that contains counters already discarded by an earlier tick.
+    // accumulated in the idle summary. Otherwise a later busy tick reports rates
+    // over a window whose counters were already consumed by an earlier tick.
     let dump_at = now_us();
     let interval_start = c.interval_start_us.swap(dump_at, Ordering::Relaxed);
     let win_ms = if interval_start == 0 {
@@ -856,9 +800,8 @@ fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
         (dump_at.saturating_sub(interval_start) as u128 / 1000).max(1)
     };
 
-    // Always-on corpus filter: skip pure background paint/notify ticks. Those
-    // flood the log under multi-agent load and do not explain typing lag.
-    // Keep intervals with keypresses, paint spikes, or high felt latency.
+    // Preserve quiet work in a longer summary. Detailed intervals explain
+    // input, latency samples, spikes, dropped records and slow stages.
     let interesting = keys > 0
         || spikes_3 > 0
         || spikes_8 > 0
@@ -868,44 +811,77 @@ fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
         || read_drain_max >= 30_000 // ≥30ms channel delay on any PTY batch
         || write_queue_max >= 20_000 // ≥20ms waiting behind an earlier PTY write
         || write_max >= 20_000 // ≥20ms blocked in the ConPTY write/flush
-        || !records.is_empty()
+        || process_max >= 30_000
+        || key_read_n > 0 || read_process_n > 0 || process_paint_n > 0
+        || sync_exp > 0
         || deferred_dropped > 0
-        || paint_max >= 8_000 // ≥8ms single paint
-        || tag == "quiet"; // end-of-burst summary still useful after typing
+        || paint_max >= 8_000; // ≥8ms single paint
     if !interesting {
-        // Counters already swapped to zero above; drop the interval.
-        return;
+        idle.add(IdleTicks {
+            ticks: 1,
+            window_ms: win_ms as u64,
+            writes,
+            write_bytes,
+            write_us,
+            write_max_us: write_max,
+            write_queue_us,
+            write_queue_max_us: write_queue_max,
+            reads,
+            read_bytes,
+            drain_us: read_drain_us,
+            drain_max_us: read_drain_max,
+            drain_n: read_drain_n,
+            queue_bytes: read_queue_bytes_high,
+            queue_chunks: read_queue_chunks_high,
+            notify,
+            batches,
+            process_bytes: bytes,
+            process_us,
+            process_max_us: process_max,
+            paints,
+            paint_us,
+            paint_max_us: paint_max,
+            paint_focused: paints_f,
+            paint_full,
+            paint_replay,
+            build_us,
+            shape_us,
+            submit_us,
+            runs: runs_total,
+            reused: runs_reused,
+        });
     }
 
-    let key_avg = key_us.checked_div(keys).unwrap_or(0);
-    let write_queue_avg = write_queue_us.checked_div(writes).unwrap_or(0);
-    let write_avg = write_us.checked_div(writes).unwrap_or(0);
-    let read_drain_avg = read_drain_us.checked_div(read_drain_n).unwrap_or(0);
-    let proc_avg = process_us.checked_div(batches).unwrap_or(0);
-    let paint_avg = paint_us.checked_div(paints).unwrap_or(0);
-    let notify_hz = notify as u128 * 1000 / win_ms;
-    let paint_hz = paints as u128 * 1000 / win_ms;
-    let key_hz = keys as u128 * 1000 / win_ms;
-    let paints_bg = paints.saturating_sub(paints_f);
-    let paint_total_ms = paint_us / 1000;
-    let paint_pct = paint_us as u128 * 100 / (win_ms * 1000);
+    if interesting {
+        let key_avg = key_us.checked_div(keys).unwrap_or(0);
+        let write_queue_avg = write_queue_us.checked_div(writes).unwrap_or(0);
+        let write_avg = write_us.checked_div(writes).unwrap_or(0);
+        let read_drain_avg = read_drain_us.checked_div(read_drain_n).unwrap_or(0);
+        let proc_avg = process_us.checked_div(batches).unwrap_or(0);
+        let paint_avg = paint_us.checked_div(paints).unwrap_or(0);
+        let notify_hz = notify as u128 * 1000 / win_ms;
+        let paint_hz = paints as u128 * 1000 / win_ms;
+        let key_hz = keys as u128 * 1000 / win_ms;
+        let paints_bg = paints.saturating_sub(paints_f);
+        let paint_total_ms = paint_us / 1000;
+        let paint_pct = paint_us as u128 * 100 / (win_ms * 1000);
 
-    let full_n = paint_full.max(1);
-    let build_avg = build_us / full_n;
-    let shape_avg = shape_us / full_n;
-    let submit_avg = submit_us / full_n;
-    let reuse_pct = runs_reused
-        .checked_mul(100)
-        .and_then(|n| n.checked_div(runs_total))
-        .unwrap_or(0);
+        let full_n = paint_full.max(1);
+        let build_avg = build_us / full_n;
+        let shape_avg = shape_us / full_n;
+        let submit_avg = submit_us / full_n;
+        let reuse_pct = runs_reused
+            .checked_mul(100)
+            .and_then(|n| n.checked_div(runs_total))
+            .unwrap_or(0);
 
-    let key_read_avg = key_read_us.checked_div(key_read_n).unwrap_or(0);
-    let read_process_avg = read_process_us.checked_div(read_process_n).unwrap_or(0);
-    let process_paint_avg = process_paint_us.checked_div(process_paint_n).unwrap_or(0);
+        let key_read_avg = key_read_us.checked_div(key_read_n).unwrap_or(0);
+        let read_process_avg = read_process_us.checked_div(read_process_n).unwrap_or(0);
+        let process_paint_avg = process_paint_us.checked_div(process_paint_n).unwrap_or(0);
 
-    // v8: v7 + PTY reader, channel-drain, and UI-update boundaries.
-    let line = format!(
-        "term-prof[v8 {tag}] Δ={win_ms}ms keys={keys} (held={keys_held}, ~{key_hz}/s, avg={key_avg}µs) \
+        // v9: busy intervals keep the detailed boundaries; idle totals emit separately.
+        let line = format!(
+            "term-prof[v9 {tag}] Δ={win_ms}ms keys={keys} (held={keys_held}, ~{key_hz}/s, avg={key_avg}µs) \
          writer={writes}/{write_bytes}B queue_avg={write_queue_avg}µs queue_max={write_queue_max}µs \
          write_avg={write_avg}µs write_max={write_max}µs \
          reader={reads}/{read_bytes}B drain_avg={read_drain_avg}µs drain_max={read_drain_max}µs \
@@ -921,13 +897,14 @@ fn dump(tag: &str, records: &mut Vec<DeferredRecord>) {
          read→process avg={read_process_avg}µs max={read_process_max}µs (n={read_process_n}) \
          process→paint avg={process_paint_avg}µs max={process_paint_max}µs (n={process_paint_n}) \
          sync_exp={sync_exp} deferred_dropped={deferred_dropped}"
-    );
-    let cursor = LAST_CURSOR.lock().ok().and_then(|g| *g);
-    let line = match cursor {
-        Some((pane, col, row)) => format!("{line} cur_pane={pane} cur={col},{row}"),
-        None => line,
-    };
-    emit_line(&line);
+        );
+        let cursor = LAST_CURSOR.lock().ok().and_then(|g| *g);
+        let line = match cursor {
+            Some((pane, col, row)) => format!("{line} cur_pane={pane} cur={col},{row}"),
+            None => line,
+        };
+        emit_line(&line);
+    }
     for record in records.drain(..) {
         match record {
             DeferredRecord::Startup(startup) => emit_line(&startup_line(
@@ -1539,35 +1516,6 @@ mod tests {
             focus_line(pane, true),
             "term-focus[v1] pane=00000000-0000-0000-0000-000000000000 focused=true"
         );
-    }
-
-    #[test]
-    fn rotation_drops_the_live_handle_and_replaces_an_existing_backup() {
-        let dir = std::env::temp_dir().join(format!("muxel-term-prof-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create rotation fixture");
-        let path = dir.join("term-prof.log");
-        let rotated = rotated_log_path(&path);
-        std::fs::write(&path, vec![b'x'; PROFILE_LOG_MAX_BYTES as usize + 1])
-            .expect("write oversized live log");
-        std::fs::write(&rotated, b"stale backup").expect("write stale backup");
-        let mut slot = Some(
-            OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .expect("hold live log open"),
-        );
-
-        reopen_log_file(&mut slot, &path);
-
-        assert_eq!(
-            std::fs::metadata(&rotated).expect("rotated log").len(),
-            PROFILE_LOG_MAX_BYTES + 1
-        );
-        assert_eq!(std::fs::metadata(&path).expect("new live log").len(), 0);
-        writeln!(slot.as_mut().expect("reopened live log"), "bounded").unwrap();
-        drop(slot);
-        assert!(std::fs::metadata(&path).unwrap().len() < PROFILE_LOG_MAX_BYTES);
-        std::fs::remove_dir_all(dir).expect("remove rotation fixture");
     }
 
     #[test]

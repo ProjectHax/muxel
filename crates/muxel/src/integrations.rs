@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 /// muxel polls git in the background. No-op off Windows.
 fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
-    let mut cmd = Command::new(program);
+    let mut cmd = muxel_core::child_env::command(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -169,13 +169,49 @@ fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
 /// Run `git <args>` at a [`RepoLoc`]: locally (`git -C <path>`) or on the host
 /// over SSH (`ssh … -- git -C <remote_path> …`, fed as one quoted command).
 fn git_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
+    git_command_at(loc, args, true).output()
+}
+
+/// Mutations deliberately keep git's normal locking behavior.
+fn git_write_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
+    git_command_at(loc, args, false).output()
+}
+
+const READ_ONLY_GIT_CONFIG: &str = "diff.autoRefreshIndex=false";
+
+fn git_command_at(loc: &RepoLoc, args: &[&str], read_only: bool) -> Command {
     match loc {
-        RepoLoc::Local(path) => command("git").arg("-C").arg(path).args(args).output(),
+        RepoLoc::Local(path) => {
+            let mut cmd = if read_only {
+                git_read_command()
+            } else {
+                command("git")
+            };
+            cmd.arg("-C").arg(path).args(args);
+            cmd
+        }
         RepoLoc::Remote(c) => {
-            let remote = remote_ops::git(c.host.os, &c.remote_path, args);
-            remote_ssh_command(c, remote).output()
+            let remote = if read_only {
+                remote_ops::git_read_only(c.host.os, &c.remote_path, args)
+            } else {
+                remote_ops::git(c.host.os, &c.remote_path, args)
+            };
+            remote_ssh_command(c, remote)
         }
     }
+}
+
+/// Shared default for background/display git reads.
+fn git_read_command() -> Command {
+    read_only_git(command("git"))
+}
+
+fn read_only_git(mut cmd: Command) -> Command {
+    // Porcelain diff can run update-index --refresh even with optional locks
+    // disabled, so suppress its automatic refresh explicitly as well.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-c", READ_ONLY_GIT_CONFIG]);
+    cmd
 }
 
 /// Cap on the size of a remote file muxel will read into the editor (2 MB).
@@ -670,7 +706,8 @@ fn git_line_loc(loc: &RepoLoc, args: &[&str]) -> Option<String> {
 
 /// `git <args>` at `loc`; `bail!`s with stderr (a useful toast) on failure.
 fn git_run_loc(loc: &RepoLoc, args: &[&str]) -> Result<String> {
-    let out = git_output(loc, args).with_context(|| format!("running `git {}`", args.join(" ")))?;
+    let out =
+        git_write_output(loc, args).with_context(|| format!("running `git {}`", args.join(" ")))?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -947,7 +984,7 @@ pub fn stored_host_key_fingerprints(entry: &str, file: Option<&str>) -> Vec<(Str
 
 /// Whether `path` is inside a git working tree.
 pub fn is_git_repo(path: &Path) -> bool {
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -980,7 +1017,7 @@ pub fn worktree_change_count(worktree_path: &Path) -> usize {
     if !worktree_path.exists() {
         return 0;
     }
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["status", "--porcelain"])
@@ -1008,10 +1045,74 @@ pub fn repo_current_branch(loc: &RepoLoc) -> Option<String> {
     git_line_loc(loc, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD")
 }
 
+/// A cheap stamp of the git metadata [`repo_current_branch`] and [`list_branches`]
+/// read for a local `dir`: the git dir found, HEAD's contents, the loose branch
+/// names, and the size/mtime of `packed-refs` and reftable's `tables.list`. It
+/// takes a few `stat`s and no `git` subprocess, so the status poll re-runs git
+/// only when this moves. Not a repo (no `.git` up the tree) is a stamp too, so
+/// a `git init` there is noticed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitRefStamp {
+    git_dir: Option<PathBuf>,
+    head: Option<Vec<u8>>,
+    branches: Vec<PathBuf>,
+    packed_refs: Option<(std::time::SystemTime, u64)>,
+    reftable: Option<(std::time::SystemTime, u64)>,
+}
+
+pub fn git_ref_stamp(dir: &Path) -> GitRefStamp {
+    let Some(git_dir) = find_git_dir(dir) else {
+        return GitRefStamp::default();
+    };
+    // A linked worktree's branches live in the main repo's git dir.
+    let common = std::fs::read_to_string(git_dir.join("commondir"))
+        .map(|rel| git_dir.join(rel.trim()))
+        .unwrap_or_else(|_| git_dir.clone());
+    let file_stamp = |path: PathBuf| {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    };
+    let heads = common.join("refs").join("heads");
+    let mut branches = Vec::new();
+    let mut dirs = vec![heads.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(path);
+            } else if let Ok(name) = path.strip_prefix(&heads) {
+                branches.push(name.to_path_buf());
+            }
+        }
+    }
+    branches.sort();
+    GitRefStamp {
+        head: std::fs::read(git_dir.join("HEAD")).ok(),
+        branches,
+        packed_refs: file_stamp(common.join("packed-refs")),
+        reftable: file_stamp(common.join("reftable").join("tables.list")),
+        git_dir: Some(git_dir),
+    }
+}
+
+/// The git dir for `dir`, found as git does: the nearest `.git` up the tree —
+/// a directory, or (linked worktree, submodule) a file saying `gitdir: <path>`.
+fn find_git_dir(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors().find_map(|d| {
+        let dot = d.join(".git");
+        if std::fs::metadata(&dot).ok()?.is_dir() {
+            return Some(dot);
+        }
+        let file = std::fs::read_to_string(&dot).ok()?;
+        let target = file.lines().next()?.strip_prefix("gitdir:")?.trim();
+        Some(d.join(target))
+    })
+}
+
 /// Run a git command in `dir` and return its trimmed single-line stdout on
 /// success, else `None`.
 fn git_line(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = command("git")
+    let out = git_read_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -1029,7 +1130,7 @@ pub fn worktree_unmerged_count(worktree_path: &Path, base: &str) -> usize {
     if !worktree_path.exists() {
         return 0;
     }
-    command("git")
+    git_read_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["rev-list", "--count", &format!("{base}..HEAD")])
@@ -1197,9 +1298,10 @@ pub fn git_discard_path(loc: &RepoLoc, path: &str) -> Result<String> {
 /// (local + remote) variant of [`merge_worktree_branch`]; aborts a failed merge
 /// so the repo isn't left mid-merge.
 pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
-    let out = git_output(loc, &["merge", "--no-edit", branch]).context("running `git merge`")?;
+    let out =
+        git_write_output(loc, &["merge", "--no-edit", branch]).context("running `git merge`")?;
     if !out.status.success() {
-        let _ = git_output(loc, &["merge", "--abort"]);
+        let _ = git_write_output(loc, &["merge", "--abort"]);
         bail!("git merge: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -1208,7 +1310,7 @@ pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
 /// Remove the worktree at `worktree_path` (force) and prune stale entries, at
 /// `loc`. `RepoLoc` (local + remote) variant of [`remove_worktree`].
 pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String> {
-    let out = git_output(loc, &["worktree", "remove", "--force", worktree_path])
+    let out = git_write_output(loc, &["worktree", "remove", "--force", worktree_path])
         .context("running `git worktree remove`")?;
     if !out.status.success() {
         bail!(
@@ -1216,7 +1318,7 @@ pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String>
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let _ = git_output(loc, &["worktree", "prune"]);
+    let _ = git_write_output(loc, &["worktree", "prune"]);
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -1338,7 +1440,7 @@ const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 /// (we can't tell agent-created files from pre-existing ones without a baseline).
 pub fn git_diff(dir: &Path) -> String {
     let git = |args: &[&str]| {
-        command("git")
+        git_read_command()
             .arg("-C")
             .arg(dir)
             .arg("--no-pager")
@@ -3946,6 +4048,7 @@ impl GitEnv {
     }
 
     fn spawn(&self, command: &mut Command) -> std::io::Result<GitChild> {
+        muxel_core::child_env::remove_profiler_env(command);
         #[cfg(test)]
         let spawn_started = Instant::now();
         let child = command.spawn()?;
@@ -4031,6 +4134,7 @@ fn probe_ssh_command_config(
     let Some(mut cmd) = env.base_command(cwd, ceiling) else {
         return SshConfigProbe::Failed;
     };
+    cmd = read_only_git(cmd);
     cmd.args(["config", "--get", "core.sshCommand"])
         .stderr(Stdio::null());
     let Ok(child) = env.spawn(&mut cmd) else {
@@ -4526,9 +4630,8 @@ fn check_git_output(
     if Instant::now() >= deadline {
         return None;
     }
-    let mut cmd = env.base_command(Some(clone), clone.parent())?;
-    cmd.env("GIT_OPTIONAL_LOCKS", "0")
-        .args(["-c", "core.fsmonitor=false"]);
+    let mut cmd = read_only_git(env.base_command(Some(clone), clone.parent())?);
+    cmd.args(["-c", "core.fsmonitor=false"]);
     if let Some(opt) = LONG_PATHS {
         cmd.arg("-c").arg(opt);
     }
@@ -7159,6 +7262,58 @@ mod tests {
     }
 
     #[test]
+    fn display_git_reads_leave_index_untouched() {
+        let repo = check_remote();
+        let clone = repo.path();
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(clone.join(LIB_FILE), FILE_V1).unwrap();
+        let index = index_state(clone);
+        let loc = RepoLoc::Local(clone.to_path_buf());
+
+        assert_eq!(worktree_change_count(clone), 0);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "worktree count refreshed the index"
+        );
+        assert!(git_status_files(&loc).is_empty());
+        assert_eq!(
+            index_state(clone),
+            index,
+            "display status refreshed the index"
+        );
+        let _ = git_diff_for(&loc, LIB_FILE);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "display diff refreshed the index"
+        );
+
+        // A stale optional lock must not obstruct reads, but mutations must
+        // still honor the index lock owned by another git process.
+        let lock = clone.join(".git/index.lock");
+        std::fs::write(&lock, "owned by another process").unwrap();
+        std::fs::write(clone.join("pending.txt"), "untracked").unwrap();
+        let status = git_status_files(&loc);
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].path, "pending.txt");
+        assert_eq!(worktree_change_count(clone), 1);
+        assert_eq!(
+            index_state(clone),
+            index,
+            "reads under lock refreshed the index"
+        );
+        assert!(git_stage_path(&loc, LIB_FILE).is_err());
+        assert_eq!(std::fs::read(&lock).unwrap(), b"owned by another process");
+        std::fs::remove_file(lock).unwrap();
+        std::fs::remove_file(clone.join("pending.txt")).unwrap();
+
+        // Positive control: the same status without the read policy writes.
+        git_out(clone, &["status", "--porcelain"]);
+        assert_ne!(index_state(clone), index, "control: plain status");
+    }
+
+    #[test]
     fn library_check_is_read_only_and_offline() {
         let repo = check_remote();
         let (lib_dir, _, clone) = lib_cloned(&repo);
@@ -7218,6 +7373,56 @@ mod tests {
         );
         assert!(!marker.exists());
         lib_cleanup(&lib_dir);
+        lib_cleanup(&dir);
+    }
+
+    // ---- Branch-poll stamp ----
+
+    #[test]
+    fn git_ref_stamp_moves_with_head_and_branches() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let base = git_ref_stamp(repo.path());
+        assert_eq!(base, git_ref_stamp(repo.path()), "stable while untouched");
+        let deeper = repo.path().join("src").join("deep");
+        std::fs::create_dir_all(&deeper).unwrap();
+        assert_eq!(git_ref_stamp(&deeper), base, "found from a subdirectory");
+
+        repo.git(&["branch", "feature/x"]);
+        let created = git_ref_stamp(repo.path());
+        assert_ne!(created, base, "new nested branch");
+
+        repo.git(&["checkout", "-q", "feature/x"]);
+        let switched = git_ref_stamp(repo.path());
+        assert_ne!(switched, created, "checkout");
+
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["pack-refs", "--all"]);
+        let packed = git_ref_stamp(repo.path());
+        repo.git(&["branch", "-D", "feature/x"]);
+        assert_ne!(git_ref_stamp(repo.path()), packed, "packed branch deleted");
+    }
+
+    #[test]
+    fn git_ref_stamp_reads_a_linked_worktrees_branches_from_the_main_repo() {
+        let repo = TestRepo::init();
+        repo.commit(&[("a.txt", "one\n")], "init");
+        let wt = crate::test_support::short_temp_path();
+        repo.git(&["worktree", "add", "-q", "-b", "wt", &wt.to_string_lossy()]);
+        let before = git_ref_stamp(&wt);
+        assert_ne!(before, git_ref_stamp(repo.path()), "its own HEAD");
+        repo.git(&["branch", "other"]);
+        assert_ne!(git_ref_stamp(&wt), before, "branch made in the main repo");
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn git_ref_stamp_notices_git_init() {
+        let dir = lib_temp_dir();
+        let plain = git_ref_stamp(&dir);
+        assert_eq!(plain, git_ref_stamp(&dir));
+        git_out(&dir, &["init", "-q", "-b", "main"]);
+        assert_ne!(git_ref_stamp(&dir), plain);
         lib_cleanup(&dir);
     }
 }

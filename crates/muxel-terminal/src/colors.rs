@@ -6,7 +6,7 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use gpui::{Hsla, Rgba};
 
 /// A terminal color palette: default fg/bg/cursor + the 16 ANSI colors.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalPalette {
     pub background: u32,
     pub foreground: u32,

@@ -26,6 +26,7 @@ mod remote_paste;
 mod secrets;
 mod session_binding;
 mod settings_view;
+mod sound;
 mod split;
 mod stt;
 #[cfg(test)]

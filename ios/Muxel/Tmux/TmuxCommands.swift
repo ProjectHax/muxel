@@ -366,6 +366,20 @@ enum TmuxCommands {
         "set-environment -g -u \(instanceIdEnv) ';'"
     }
 
+    /// Match desktop's profiler-family cleanup, including old server globals.
+    static func clearProfilerEnvironment(
+        environmentNames: [String] = Array(ProcessInfo.processInfo.environment.keys)
+    ) -> String {
+        let known = [
+            "MUXEL_PROFILE", "MUXEL_PROFILE_TERMINAL", "MUXEL_PROFILE_UI",
+            "MUXEL_PROFILE_LOG", "MUXEL_PROFILE_UI_LOG", "MUXEL_PROFILE_STDERR",
+            "MUXEL_PROFILE_CHAINS", "MUXEL_PROFILE_KEEP_DAYS", "MUXEL_PROFILE_MAX_BYTES",
+        ]
+        return Set(known + environmentNames.filter { $0.hasPrefix("MUXEL_PROFILE") })
+            .sorted().map { "set-environment -g -u \(Shell.quote($0)) ';'" }
+            .joined(separator: " ")
+    }
+
     /// Kill a session (exact-match `=` target). Port of `kill_session_args`.
     static func killSession(_ session: String) -> [String] {
         ["kill-session", "-t", "=\(session)"]
@@ -384,7 +398,7 @@ enum TmuxCommands {
     /// server first (`clearInstanceId`). Creates a missing `cwd` first (`createDir`).
     static func launchAgent(session: String, cwd: String, program: String?, args: [String]) -> String {
         var cmd =
-            "\(pathPrelude); \(selectSocket(session)); \(createDir(cwd)); tmux \"$@\" \(clearInstanceId) "
+            "\(pathPrelude); \(selectSocket(session)); \(createDir(cwd)); tmux \"$@\" \(clearProfilerEnvironment()) \(clearInstanceId) "
             + "new-session -d -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)
@@ -430,7 +444,7 @@ enum TmuxCommands {
         // `clear;` wipes the login banner + echoed command before tmux takes over.
         var cmd =
             "\(pathPrelude); \(selectSocket(session, socket: socket)); \(createDir(cwd)); clear; "
-            + "exec tmux \"$@\" \(clearInstanceId) "
+            + "exec tmux \"$@\" \(clearProfilerEnvironment()) \(clearInstanceId) "
             + "new-session -A -s \(Shell.quote(session)) -c \(Shell.quote(cwd))"
         if let program {
             let inner = "exec " + Shell.command([program] + args)

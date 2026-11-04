@@ -27,8 +27,9 @@ final class Phase5Tests: XCTestCase {
 
     func testDiffCommandShape() {
         let cmd = RemoteFiles.diffCommand(dir: "/srv/app")
-        XCTAssertTrue(cmd.contains("rev-parse --show-toplevel"))
-        XCTAssertTrue(cmd.contains("diff HEAD --no-color"))
+        XCTAssertTrue(cmd.contains("'rev-parse' '--show-toplevel'"))
+        XCTAssertTrue(cmd.contains("'diff' 'HEAD' '--no-color'"))
+        XCTAssertEqual(cmd.components(separatedBy: "GIT_OPTIONAL_LOCKS=0 git -c diff.autoRefreshIndex=false ").count - 1, 3)
         XCTAssertTrue(cmd.contains("Not a git repository"))
         XCTAssertTrue(cmd.contains("head -c"))
     }

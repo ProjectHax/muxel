@@ -3776,8 +3776,12 @@ impl TerminalView {
         self.session.child_pid()
     }
 
-    /// Replace the color palette used to render this terminal. Also pushed into
-    /// the session so OSC color queries answer with what's actually painted.
+    /// The palette used for terminal painting and OSC color replies.
+    pub fn palette(&self) -> &TerminalPalette {
+        &self.palette
+    }
+
+    /// Replace the palette used to render this terminal and answer OSC queries.
     pub fn set_palette(&mut self, palette: TerminalPalette) {
         self.session.set_palette(palette.clone());
         self.palette = palette;

@@ -100,7 +100,7 @@ unless a deterministic child shows the same regression.
 
 ## Profiler boundaries before changing architecture
 
-`term-prof[v8]` now names the observed boundaries without claiming arbitrary
+`term-prof[v9]` names the observed boundaries without claiming arbitrary
 PTY output is a literal echo:
 
 - `key→next-read` closes on the first PTY read after the key.
@@ -113,6 +113,14 @@ PTY output is a literal echo:
 
 Those samples remain useful as upper-level symptoms. They do not identify the
 child's input-processing stage after a successful write.
+
+For daily comparisons, terminal v9 aggregates quiet intervals into 30-second
+idle records without discarding their totals or maxima; busy ticks retain the
+same detailed boundaries. The UI worker counts every accepted discovery lookup
+in per-minute summaries, logging individual misses only on a changed outcome
+or a call of at least 5 ms. Both workers retain dated archives with configurable
+age and per-family byte bounds; see
+[the profiler reference](terminal-paint-under-load.md) before parsing a corpus.
 
 ### Name focus-path loss before restoring focus
 

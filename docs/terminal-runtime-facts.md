@@ -140,6 +140,23 @@ the reducer resets its latches and reads the new binding's title edges from its
 start. If more title edges arrived than the 64-edge buffer keeps, it rebuilds
 from the current title without a completion edge.
 
+On Windows, every Grok discovery poll still reads the current registry and
+records that read's actual start and finish. Only the process ancestry snapshot
+is reused. A changed registry row (including a different identity or timestamp
+on the same PID), pane root PID, or pane launch refreshes it immediately. Stable
+inputs reuse one snapshot for at most 30 seconds; an empty registry or root set
+skips process enumeration, and a failed empty snapshot is retried next poll.
+The worker shares the snapshot by reference rather than copying the machine's
+process population for each poll. Root observations are shared across staggered
+pane batches; a pane missing from one batch is not treated as a process change.
+Inactive observations are pruned on refresh. Poll cadence, newest-registration
+selection, ownership checks and switch-interval calculation stay the same.
+
+An unchanged stale registry can retain old ancestry until that freshness limit;
+registry changes always invalidate it before selecting a new conversation.
+This bounds steady-state enumeration cost without adding a backoff delay to
+in-process conversation switches.
+
 - A pinned `--session-id` or `--resume` launch begins at binding revision one,
   as does a provider with no binding source. Its first matching UUID title
   confirms that binding; a different UUID begins a replacement binding.
@@ -158,6 +175,7 @@ from the current title without a completion edge.
   to the return of this read. Unrelated panes and unresolved polls cannot advance
   that lower bound. A two-second
   slack allows for delayed reports and reads; it is not a bound on either delay.
+
   Around the interval lies an ambiguity window, from its start less the slack
   to whichever is later: when muxel learned of the switch, or the interval's
   end plus the slack.
@@ -357,3 +375,18 @@ evidence for the fields they describe. Quiet visible output never proves that
 a provider has no hidden background work, so the snapshot reports
 `ActivityOnly`, `VisibleMarkers`, or `ProviderVisible` coverage rather than
 claiming more than the terminal shows.
+
+## Popout refresh
+
+Popout roots observe their pane entity for title, status and content, and the
+theme global for appearance changes. App notifications invalidate a popout
+only when its own presence, recoverable-close hold or close confirmation
+changes. The confirmation snapshot includes its displayed text and button labels;
+opening, changing and cancelling it all invalidate that popout. Theme palette
+refresh also visits popout-owned terminals, updating their painting and OSC
+color-query palette; unchanged palettes do not invalidate terminal content.
+
+Rendering uses the snapshot rather than reading the app entity, since initial
+window drawing can run inside the app update that opens the window. A recoverable
+close still removes the popout window while retaining its terminal; Undo
+restores that same terminal through the existing close lifecycle.

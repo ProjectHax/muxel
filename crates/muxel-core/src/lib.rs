@@ -7,6 +7,8 @@ mod agent;
 mod appimage;
 pub mod audio;
 pub mod autopilot;
+pub mod child_env;
+pub mod chime;
 pub mod control;
 pub mod diff;
 pub mod geometry;
@@ -22,9 +24,11 @@ mod pane;
 pub mod path_paste;
 pub mod readaloud;
 pub mod recoverable_close;
+pub mod refresh_gate;
 pub mod remote_ops;
 pub mod session_discovery;
 mod shell;
+pub mod sound_alert;
 pub mod ssh;
 pub mod startup_flags;
 pub mod stt;
@@ -2152,6 +2156,10 @@ pub fn migrate_worktrees(workspace: &mut Workspace) {
     }
 }
 
+fn default_sound_volume() -> u8 {
+    sound_alert::DEFAULT_VOLUME
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2776,6 +2784,23 @@ pub struct Settings {
     /// Stop after about this many characters, at a sentence (0 = read it all).
     #[serde(default)]
     pub read_aloud_max_chars: u32,
+    // --- Sound alerts (see `sound_alert`) ---
+    /// Chime when an agent finishes a turn in a pane you aren't watching.
+    #[serde(default = "default_true")]
+    pub sound_on_done: bool,
+    /// Chime when an agent is blocked waiting on you.
+    #[serde(default = "default_true")]
+    pub sound_on_blocked: bool,
+    /// The user's own sound for Done (WAV, MP3, OGG, FLAC, …); `None` plays the
+    /// built-in chime (`chime`).
+    #[serde(default)]
+    pub sound_done_file: Option<PathBuf>,
+    /// The user's own sound for Blocked; `None` plays the built-in chime.
+    #[serde(default)]
+    pub sound_blocked_file: Option<PathBuf>,
+    /// Alert volume, 0–100.
+    #[serde(default = "default_sound_volume")]
+    pub sound_volume: u8,
     // --- Outside control (`muxel ctl`; see `control`) ---
     /// Let other programs on this computer (an orchestrating agent such as Grok
     /// Bot) list and drive the agents through `muxel ctl`. Off by default.
@@ -3126,6 +3151,11 @@ impl Default for Settings {
             read_aloud_short_paths: true,
             read_aloud_tables: false,
             read_aloud_max_chars: 0,
+            sound_on_done: true,
+            sound_on_blocked: true,
+            sound_done_file: None,
+            sound_blocked_file: None,
+            sound_volume: sound_alert::DEFAULT_VOLUME,
             control_enabled: false,
             control_allow_new: control::CreationPolicy::Off,
             control_allow_shells: false,
@@ -3548,6 +3578,31 @@ mod settings_tests {
         assert_eq!(s.read_aloud_scope, ReadAloudScope::WholeTurn);
         assert_eq!(s.read_aloud_auto, ReadAloudAuto::All);
         assert_eq!(s.speak_options().max_chars, 1000);
+    }
+
+    #[test]
+    fn sound_alerts_default_on_for_old_configs() {
+        // A config from before sound alerts: both chimes on, built-in sounds,
+        // the default volume.
+        let s: Settings = serde_json::from_str("{}").expect("parse");
+        assert!(s.sound_on_done && s.sound_on_blocked);
+        assert!(s.sound_done_file.is_none() && s.sound_blocked_file.is_none());
+        assert_eq!(s.sound_volume, sound_alert::DEFAULT_VOLUME);
+        // Saved choices come back, through the TOML the settings file uses.
+        let mut s = Settings {
+            sound_on_done: false,
+            sound_blocked_file: Some(PathBuf::from("/sounds/knock.ogg")),
+            sound_volume: 35,
+            ..Settings::default()
+        };
+        s = toml::from_str(&toml::to_string(&s).expect("save")).expect("load");
+        assert!(!s.sound_on_done && s.sound_on_blocked);
+        assert_eq!(
+            sound_alert::AlertSound::Blocked.file(&s),
+            Some(std::path::Path::new("/sounds/knock.ogg"))
+        );
+        assert_eq!(sound_alert::AlertSound::Done.file(&s), None);
+        assert_eq!(s.sound_volume, 35);
     }
 
     #[test]

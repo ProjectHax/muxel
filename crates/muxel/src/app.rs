@@ -31,6 +31,8 @@ use muxel_core::library::resolve::{SnippetStep, snippet_send_action};
 use muxel_core::library::{LibKind, MENU_WINDOW_MARGIN};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::outage::{HostOutages, OutageState, OutageUpdate};
+use muxel_core::refresh_gate::RefreshGate;
+use muxel_core::sound_alert::{AlertGate, AlertSound};
 use muxel_core::tmux::{SessionTarget, Socket};
 use muxel_core::winshell::WindowsShell;
 use muxel_core::{
@@ -82,6 +84,7 @@ mod remote_reconnect_tests;
 mod restart_completion_tests;
 mod restart_guard;
 mod session_discovery;
+mod sound_alerts;
 #[cfg(test)]
 mod transcript_read_tests;
 use claude_launch::TerminalPreparation;
@@ -1295,6 +1298,24 @@ fn shown_terminal_status(
     persisted_status(runtime.status, instance, restoring || unprompted)
 }
 
+/// The chime for an agent notification (Done/Blocked); other kinds have none.
+fn notif_alert_sound(kind: NotifKind) -> Option<AlertSound> {
+    match kind {
+        NotifKind::Done => Some(AlertSound::Done),
+        NotifKind::Blocked => Some(AlertSound::Blocked),
+        NotifKind::Success | NotifKind::Error => None,
+    }
+}
+
+/// The alert a pane in `status` is in, for the sound gate's settle check.
+fn status_alert_sound(status: AgentStatus) -> Option<AlertSound> {
+    match status {
+        AgentStatus::Done => Some(AlertSound::Done),
+        AgentStatus::Blocked => Some(AlertSound::Blocked),
+        AgentStatus::Working | AgentStatus::Idle => None,
+    }
+}
+
 fn attention_rank(runtime: Option<AgentStatus>, activity: Option<&AgentActivity>) -> Option<u8> {
     if runtime == Some(AgentStatus::Blocked) {
         Some(0)
@@ -2176,6 +2197,56 @@ fn installed_programs(presets: &[AgentPreset]) -> HashSet<String> {
         .filter_map(|p| p.program.clone())
         .filter(|prog| program_on_path(prog))
         .collect()
+}
+
+/// What the installed-program scan depends on: the programs asked about and
+/// each `PATH` directory's mtime (installing or removing a binary touches its
+/// directory). A few `stat`s, where the scan itself tries every directory ×
+/// every `PATHEXT` suffix × every preset.
+type ProgramStamp = (Vec<String>, Vec<(PathBuf, Option<SystemTime>)>);
+
+fn program_stamp(presets: &[AgentPreset]) -> ProgramStamp {
+    let programs = presets.iter().filter_map(|p| p.program.clone()).collect();
+    let dirs = std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| {
+                    let modified = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+                    (dir, modified)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (programs, dirs)
+}
+
+/// How long an unchanged project's branch waits before git is asked anyway, for
+/// what [`integrations::GitRefStamp`] can't see (git config, `safe.directory`,
+/// git installed later).
+const BRANCH_BACKSTOP: Duration = Duration::from_secs(60);
+/// How often worktrees' uncommitted changes are recounted (a `git status` each;
+/// nothing cheaper sees a file edit). Adding or removing a worktree, or a git
+/// action run from muxel, recounts at once.
+const WORKTREE_CHANGES_EVERY: Duration = Duration::from_secs(10);
+/// How long the installed-program scan waits while no `PATH` directory changed.
+const PROGRAM_SCAN_BACKSTOP: Duration = Duration::from_secs(60);
+
+/// What `refresh_status`'s probes last saw, so a quiet workspace starts no `git`
+/// and scans no `PATH` on most one-second ticks.
+struct StatusPolls {
+    branches: RefreshGate<Uuid, integrations::GitRefStamp>,
+    worktrees: RefreshGate<(), Vec<(Uuid, PathBuf)>>,
+    programs: RefreshGate<(), ProgramStamp>,
+}
+
+impl Default for StatusPolls {
+    fn default() -> Self {
+        Self {
+            branches: RefreshGate::new(BRANCH_BACKSTOP),
+            worktrees: RefreshGate::new(WORKTREE_CHANGES_EVERY),
+            programs: RefreshGate::new(PROGRAM_SCAN_BACKSTOP),
+        }
+    }
 }
 
 /// Built-in status markers (working spinner / blocked prompt) for a known agent,
@@ -3097,6 +3168,12 @@ static PENDING_NOTIFICATION_FOCUS: std::sync::Mutex<Option<Uuid>> = std::sync::M
 /// set, clicking the notification raises muxel and switches to that instance's
 /// project + pane.
 fn notify(summary: String, body: String, focus: Option<Uuid>) {
+    notify_with(summary, body, focus, false);
+}
+
+/// [`notify`], asking the desktop not to play its own sound when `quiet` — muxel
+/// is ringing its alert chime for the same event.
+fn notify_with(summary: String, body: String, focus: Option<Uuid>, quiet: bool) {
     std::thread::spawn(move || {
         let mut builder = notify_rust::Notification::new();
         builder
@@ -3113,6 +3190,13 @@ fn notify(summary: String, body: String, focus: Option<Uuid>) {
         // (NSUserNotification) or Windows (WinRT) backends.
         #[cfg(all(unix, not(target_os = "macos")))]
         builder.hint(notify_rust::Hint::DesktopEntry("muxel".to_string()));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if quiet {
+            builder.hint(notify_rust::Hint::SuppressSound(true));
+        }
+        // muxel's Windows and macOS toasts are silent already (no sound name).
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let _ = quiet;
         // "default" is the action GNOME invokes when the notification *body* is
         // clicked; only register it when there's a pane to jump to.
         if focus.is_some() {
@@ -5466,17 +5550,29 @@ pub struct MuxelApp {
     /// The agent preset library and the one currently selected for new panes.
     presets: Vec<AgentPreset>,
     current_preset: usize,
-    /// Agent programs whose binary is currently installed (refreshed each tick).
-    /// New-agent menus hide presets whose program isn't here.
+    /// Agent programs whose binary is currently installed (rescanned when a `PATH`
+    /// directory changes). New-agent menus hide presets whose program isn't here.
     available_programs: HashSet<String>,
-    /// Cached git status (refreshed each tick) so the sidebar doesn't shell out
-    /// per render: each project's current branch, and each worktree's change count.
+    /// Cached git status so the sidebar doesn't shell out per render: each
+    /// project's current branch, and each worktree's change count. Refreshed by
+    /// `refresh_status` as `status_polls` finds them due.
     project_branches: HashMap<Uuid, Option<String>>,
     /// Cached branch lists for project context menus. Populated beside
     /// `project_branches` so opening a menu never waits on a git subprocess.
     project_branch_lists: HashMap<Uuid, Vec<String>>,
     /// Prevent slow git probes from accumulating overlapping one-second refresh jobs.
     status_refresh_in_flight: bool,
+    /// When agent panes' Done/Blocked chimes ring (`muxel_core::sound_alert`).
+    alert_gate: AlertGate,
+    /// Raised to cut off the chime still playing when the next one starts.
+    alert_playback: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Settings → Sounds: why the last file tried for an alert won't play.
+    alert_sound_error: Option<(AlertSound, String)>,
+    /// What the status probes last saw; moved into each `refresh_status` job.
+    status_polls: StatusPolls,
+    /// A git action ran from muxel: recount worktree changes on the next tick
+    /// instead of waiting out `WORKTREE_CHANGES_EVERY`.
+    worktree_changes_stale: bool,
     /// Parent-owned Codex thread names, keyed by the session UUID captured from
     /// that pane. Refreshed from Codex's append-only session index.
     codex_session_names: HashMap<String, String>,
@@ -5487,7 +5583,8 @@ pub struct MuxelApp {
     /// Whether `sshpass` is installed (needed for saved-password SSH auth).
     sshpass_available: bool,
     /// Whether `tmux` is installed on a unix host (gates the local-tmux default;
-    /// refreshed each tick). Always false on Windows — muxel's tmux path is unix.
+    /// rescanned with `available_programs`). Always false on Windows — muxel's
+    /// tmux path is unix.
     tmux_available: bool,
     /// The offer to install a missing tmux, and its install — made on the first
     /// launch without it, or from Settings (`app/tmux_install_modal.rs`).
@@ -5572,6 +5669,8 @@ pub struct MuxelApp {
     remote_connect_failed: HashMap<Uuid, String>,
     /// Guards against overlapping git-status refreshes for the panel.
     git_diff_loading: bool,
+    /// The same, for the panel's Worktrees tab.
+    git_diff_worktrees_loading: bool,
     /// The git-diff panel's commit-message input.
     git_diff_commit_input: Entity<InputState>,
     /// Open per-file diff windows, keyed by (project id, repo-relative path), so
@@ -6186,11 +6285,55 @@ fn compute_redock_anchor(layout: &Option<PaneNode>, iid: Uuid) -> RedockAnchor {
 struct PopoutView {
     view: PaneView,
     iid: Uuid,
+    close_confirm: Option<PendingConfirm>,
+    app_state: Option<PopoutAppState>,
     /// Profiler-only correlation state. Keeping it on the root that owns the
     /// pane prevents a popped-out terminal from affecting main-app lifecycle
     /// bookkeeping or suppressing the first transition after re-dock.
     profile_status: Option<AgentStatus>,
     profile_window_active: bool,
+}
+
+/// App-owned inputs to a popout. Its PaneView supplies title, status and
+/// content updates; a global subscription supplies theme updates.
+#[derive(PartialEq, Eq)]
+struct PopoutAppState {
+    present: bool,
+    held: bool,
+    confirm: Option<PopoutConfirmState>,
+}
+
+#[derive(PartialEq, Eq)]
+struct PopoutConfirmState {
+    title: SharedString,
+    message: SharedString,
+    confirm_label: SharedString,
+    alternative_label: Option<SharedString>,
+}
+
+impl PopoutAppState {
+    fn read(app: &MuxelApp, iid: Uuid) -> Self {
+        let confirm = app
+            .confirm
+            .as_ref()
+            .filter(|pending| pending.action.pane_instance() == Some(iid))
+            .map(|pending| PopoutConfirmState {
+                title: pending.title.clone(),
+                message: pending.message.clone(),
+                confirm_label: pending.confirm_label.clone(),
+                alternative_label: recoverable_close_ui::close_alternative_label(&pending.action),
+            });
+        Self {
+            present: app.popouts.contains_key(&iid),
+            held: app.closing.contains_key(&iid),
+            confirm,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static POPOUT_TEST_RENDERS: std::cell::RefCell<HashMap<Uuid, usize>> = Default::default();
 }
 
 impl PopoutView {
@@ -6199,7 +6342,20 @@ impl PopoutView {
             .try_global::<MuxelHandle>()
             .and_then(|handle| handle.0.upgrade())
         {
-            cx.observe(&app, |_, _, cx| cx.notify()).detach();
+            cx.observe(&app, |this, app, cx| {
+                let app = app.read(cx);
+                let state = PopoutAppState::read(app, this.iid);
+                if this.app_state.as_ref() != Some(&state) {
+                    this.close_confirm = app
+                        .confirm
+                        .as_ref()
+                        .filter(|pending| pending.action.pane_instance() == Some(this.iid))
+                        .cloned();
+                    this.app_state = Some(state);
+                    cx.notify();
+                }
+            })
+            .detach();
             let weak = app.downgrade();
             window.on_window_should_close(cx, move |_, cx| {
                 let weak = weak.clone();
@@ -6212,6 +6368,8 @@ impl PopoutView {
             });
         }
         ui_profile::register_profile_window(ui_profile::ProfileWindowKind::Popout, window);
+        cx.observe_global::<gpui_component::Theme>(|_, cx| cx.notify())
+            .detach();
         let profile_status = if ui_profile::is_enabled() {
             match &view {
                 PaneView::Terminal(terminal) => Some(terminal.read(cx).status()),
@@ -6264,6 +6422,8 @@ impl PopoutView {
         Self {
             view,
             iid,
+            close_confirm: None,
+            app_state: None,
             profile_status,
             profile_window_active,
         }
@@ -6781,6 +6941,8 @@ impl DevLogEntry {
 
 impl Render for PopoutView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        POPOUT_TEST_RENDERS.with(|counts| *counts.borrow_mut().entry(self.iid).or_default() += 1);
         let _render = ui_profile::watch_render_build(ui_profile::RenderView::Popout);
         let title = self.title(cx);
         let has_close_confirm = self.central_close_confirm(cx).is_some();
@@ -7863,6 +8025,11 @@ impl MuxelApp {
             project_branches: HashMap::new(),
             project_branch_lists: HashMap::new(),
             status_refresh_in_flight: false,
+            alert_gate: AlertGate::default(),
+            alert_playback: None,
+            alert_sound_error: None,
+            status_polls: StatusPolls::default(),
+            worktree_changes_stale: false,
             codex_session_names: HashMap::new(),
             codex_name_index: Default::default(),
             worktree_changes: HashMap::new(),
@@ -7986,6 +8153,7 @@ impl MuxelApp {
             git_diff_worktrees_expanded: std::collections::HashSet::new(),
             git_diff_branches: Vec::new(),
             git_diff_loading: false,
+            git_diff_worktrees_loading: false,
             git_diff_commit_input,
             diff_file_windows: HashMap::new(),
             show_new_remote: false,
@@ -10006,8 +10174,15 @@ impl MuxelApp {
     /// live terminals (called after a theme change).
     fn refresh_terminal_palettes(&mut self, cx: &mut Context<Self>) {
         let palette = theme::palette_from_theme(cx);
-        for view in self.terminals.values() {
+        for view in self
+            .terminals
+            .values()
+            .chain(self.popouts.values().filter_map(PopOut::terminal_view))
+        {
             view.update(cx, |view, cx| {
+                if view.palette() == &palette {
+                    return;
+                }
                 view.set_palette(palette.clone());
                 // Terminals render through AnyView::cached — without a notify,
                 // an idle pane replays old pixels until its next PTY byte.
@@ -12589,6 +12764,10 @@ impl MuxelApp {
             self.git_diff_branches.clear();
             return;
         }
+        if self.git_diff_worktrees_loading {
+            return;
+        }
+        self.git_diff_worktrees_loading = true;
         let loc = self.repo_loc(pid);
         cx.spawn(async move |this, cx| {
             let (results, branches): (Vec<(Uuid, Vec<integrations::GitChange>)>, Vec<String>) = cx
@@ -12610,6 +12789,7 @@ impl MuxelApp {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                this.git_diff_worktrees_loading = false;
                 this.git_diff_worktree_files = results.into_iter().collect();
                 this.git_diff_branches = branches;
                 cx.notify();
@@ -12901,8 +13081,11 @@ impl MuxelApp {
     /// `sshpass`, project branches, worktree change counts) **off the UI thread**.
     /// These do `$PATH` scans and a `git` subprocess per local project/worktree —
     /// far too slow to run synchronously every tick (it stutters window drags) —
-    /// so they run on the background executor and post results back. Remote
-    /// project branches are handled separately by `poll_remote_branches`.
+    /// so they run on the background executor and post results back. Even there
+    /// they run only when `status_polls` finds them due: a git process a second
+    /// per project is constant churn (on Windows each also starts a console host
+    /// and an antivirus scan). Remote project branches are handled separately by
+    /// `poll_remote_branches`.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
         // Keep the git-diff panel current while it's open, docked or as the
         // Changes view (covers edits and active-project switches; the calls
@@ -12946,55 +13129,80 @@ impl MuxelApp {
             .then(home_dir)
             .flatten();
         let mut codex_name_index = std::mem::take(&mut self.codex_name_index);
+        let mut polls = std::mem::take(&mut self.status_polls);
+        let recount_worktrees = std::mem::take(&mut self.worktree_changes_stale);
         cx.spawn(async move |this, cx| {
-            let (available, gh, sshpass, tmux, branches, changes, codex_names, codex_name_index) =
-                cx.background_executor()
-                    .spawn(async move {
-                        let available = installed_programs(&presets);
-                        let gh = program_on_path("gh");
-                        let sshpass = program_on_path("sshpass");
-                        let tmux = cfg!(unix) && program_on_path("tmux");
-                        let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
-                            .into_iter()
-                            .map(|(id, root)| {
-                                let loc = integrations::RepoLoc::Local(root);
-                                (
-                                    id,
-                                    integrations::repo_current_branch(&loc),
-                                    integrations::list_branches(&loc),
-                                )
-                            })
-                            .collect();
-                        let changes: Vec<(Uuid, usize)> = worktrees
-                            .into_iter()
-                            .map(|(id, path)| (id, integrations::worktree_change_count(&path)))
-                            .collect();
-                        let codex_names = codex_home.map(|home| {
-                            codex_name_index
-                                .refresh(&home)
-                                .map(|changed| changed.then(|| codex_name_index.names().clone()))
-                        });
+            let (programs, branches, changes, codex_names, codex_name_index, polls) = cx
+                .background_executor()
+                .spawn(async move {
+                    let now = Instant::now();
+                    let stamp = program_stamp(&presets);
+                    let programs = polls.programs.due(&(), &stamp, now).then(|| {
+                        polls.programs.record((), stamp, now);
                         (
-                            available,
-                            gh,
-                            sshpass,
-                            tmux,
-                            branches,
-                            changes,
-                            codex_names,
-                            codex_name_index,
+                            installed_programs(&presets),
+                            program_on_path("gh"),
+                            program_on_path("sshpass"),
+                            cfg!(unix) && program_on_path("tmux"),
                         )
-                    })
-                    .await;
+                    });
+                    // Only projects whose HEAD or branches moved (or whose backstop
+                    // passed) run git; the rest keep their cached branch.
+                    let local_ids: HashSet<Uuid> = locals.iter().map(|(id, _)| *id).collect();
+                    polls.branches.retain(|id| local_ids.contains(id));
+                    let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
+                        .into_iter()
+                        .filter_map(|(id, root)| {
+                            let stamp = integrations::git_ref_stamp(&root);
+                            if !polls.branches.due(&id, &stamp, now) {
+                                return None;
+                            }
+                            polls.branches.record(id, stamp, now);
+                            let loc = integrations::RepoLoc::Local(root);
+                            Some((
+                                id,
+                                integrations::repo_current_branch(&loc),
+                                integrations::list_branches(&loc),
+                            ))
+                        })
+                        .collect();
+                    let changes = (recount_worktrees || polls.worktrees.due(&(), &worktrees, now))
+                        .then(|| {
+                            let counts: Vec<(Uuid, usize)> = worktrees
+                                .iter()
+                                .map(|(id, path)| (*id, integrations::worktree_change_count(path)))
+                                .collect();
+                            polls.worktrees.record((), worktrees, now);
+                            counts
+                        });
+                    let codex_names = codex_home.map(|home| {
+                        codex_name_index
+                            .refresh(&home)
+                            .map(|changed| changed.then(|| codex_name_index.names().clone()))
+                    });
+                    (
+                        programs,
+                        branches,
+                        changes,
+                        codex_names,
+                        codex_name_index,
+                        polls,
+                    )
+                })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 this.status_refresh_in_flight = false;
+                this.status_polls = polls;
                 this.codex_name_index = codex_name_index;
-                this.available_programs = available;
-                this.gh_available = gh;
-                this.sshpass_available = sshpass;
-                this.tmux_available = tmux;
-                // Keep only current projects (drop removed ones); overwrite local
-                // branches. Remote ones are maintained by `poll_remote_branches`.
+                if let Some((available, gh, sshpass, tmux)) = programs {
+                    this.available_programs = available;
+                    this.gh_available = gh;
+                    this.sshpass_available = sshpass;
+                    this.tmux_available = tmux;
+                }
+                // Keep only current projects (drop removed ones); overwrite the
+                // local branches that were re-read. Remote ones are maintained by
+                // `poll_remote_branches`.
                 let ids: HashSet<Uuid> = this.workspace.projects.iter().map(|p| p.id).collect();
                 this.project_branches.retain(|id, _| ids.contains(id));
                 this.project_branch_lists.retain(|id, _| ids.contains(id));
@@ -13002,7 +13210,9 @@ impl MuxelApp {
                     this.project_branches.insert(id, b);
                     this.project_branch_lists.insert(id, list);
                 }
-                this.worktree_changes = changes.into_iter().collect();
+                if let Some(changes) = changes {
+                    this.worktree_changes = changes.into_iter().collect();
+                }
                 match codex_names {
                     Some(Ok(Some(names))) => this.codex_session_names = names,
                     Some(Ok(None)) => {}
@@ -13803,6 +14013,9 @@ impl MuxelApp {
         // Projects where an agent just finished a turn — when agents append to the
         // accomplishment log.
         let mut turns_finished: Vec<Uuid> = Vec::new();
+        // Each agent pane's present alert state, for the sound gate.
+        let mut alert_states: HashMap<Uuid, Option<AlertSound>> = HashMap::new();
+        let alert_now = Instant::now();
         let now_epoch = chrono::Utc::now().timestamp_millis();
         for Snap {
             iid,
@@ -13931,6 +14144,24 @@ impl MuxelApp {
             if effect.completed && self.auto_read_wanted(iid, pane_active) {
                 to_read_aloud.push(iid);
             }
+            // Chimes are for agents: a shell "finishes" every command it runs.
+            let agent = self
+                .workspace
+                .instance(iid)
+                .is_some_and(|i| muxel_core::readaloud::is_agent_program(i.program.as_deref()));
+            let chime = effect
+                .notify
+                .and_then(notif_alert_sound)
+                .filter(|sound| agent && sound.enabled(&self.settings));
+            if agent {
+                if attended {
+                    self.alert_gate.attended(iid);
+                }
+                if let Some(sound) = chime {
+                    self.alert_gate.arm(iid, sound, alert_now);
+                }
+                alert_states.insert(iid, status_alert_sound(status));
+            }
             if let Some(kind) = effect.notify {
                 // Collect the in-app entry regardless of the desktop toggle;
                 // only the OS popup respects `notifications_enabled`.
@@ -13939,10 +14170,11 @@ impl MuxelApp {
                 // raising a desktop toast over the app you're already looking
                 // at; the in-app feed already records it.
                 if self.notifications_enabled && !self.window_active {
-                    notify(
+                    notify_with(
                         format!("{title} {}", kind.label()),
                         project.clone(),
                         Some(iid),
+                        chime.is_some(),
                     );
                 }
             }
@@ -14063,6 +14295,13 @@ impl MuxelApp {
                 }
                 dirty = true;
             }
+        }
+        if let Some(sound) = self
+            .alert_gate
+            .due(|pane| alert_states.get(&pane).copied().flatten(), alert_now)
+            && sound.enabled(&self.settings)
+        {
+            self.ring_alert(sound);
         }
         // Read at most once per tick, and only when a remote pane wants back in.
         let mut lid_shut = None;
@@ -17505,6 +17744,8 @@ impl MuxelApp {
         cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
             let result = cx.background_executor().spawn(async move { op() }).await;
             let _ = this.update(cx, |this, cx| {
+                // Commit, stash, pull… may have changed a worktree's change count.
+                this.worktree_changes_stale = true;
                 match result {
                     Ok(out) => this.add_event(NotifKind::Success, ok, git_notify_detail(&out)),
                     Err(e) => {
@@ -31734,6 +31975,7 @@ impl MuxelApp {
             (t("Appearance"), SettingsSection::Appearance),
             (t("Editor"), SettingsSection::Editor),
             (t("Behavior"), SettingsSection::Behavior),
+            (t("Sounds"), SettingsSection::Sounds),
             (t("Speech"), SettingsSection::Speech),
             (t("Read Aloud"), SettingsSection::ReadAloud),
             (t("Agents"), SettingsSection::Agents),
@@ -31771,6 +32013,7 @@ impl MuxelApp {
             SettingsSection::Appearance => self.render_settings_appearance(cx),
             SettingsSection::Editor => self.render_settings_editor(cx),
             SettingsSection::Behavior => self.render_settings_behavior(cx),
+            SettingsSection::Sounds => self.render_settings_sounds(cx),
             SettingsSection::Speech => self.render_settings_speech(cx),
             SettingsSection::ReadAloud => self.render_settings_read_aloud(cx),
             SettingsSection::Agents => self.render_settings_agents(cx),

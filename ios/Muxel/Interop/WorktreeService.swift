@@ -26,9 +26,10 @@ enum WorktreeService {
         let r = Shell.quote(root)
         let b = Shell.quote(branch)
         let d = Shell.quote(dirName)
+        let probe = GitCommands.readOnly(["-C", root, "rev-parse", "--is-inside-work-tree"])
         return """
         root=\(r); branch=\(b); dir=\(d)
-        if ! git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then printf 'MUXEL_WT_ERR %s' 'not a git repository'; exit 0; fi
+        if ! \(probe) >/dev/null 2>&1; then printf 'MUXEL_WT_ERR %s' 'not a git repository'; exit 0; fi
         base="${XDG_DATA_HOME:-$HOME/.local/share}/muxel/worktrees"
         mkdir -p "$base" || { printf 'MUXEL_WT_ERR %s' "cannot create $base"; exit 0; }
         path="$base/$dir"
