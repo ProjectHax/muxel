@@ -3,7 +3,7 @@
 
 #[cfg(windows)]
 use super::{
-    GrokRegistryRead, active_grok_session_for_process, grok_switch_interval, process_parent_map,
+    GrokRegistryRead, active_grok_session_for_process, grok_switch_interval,
     read_grok_active_sessions,
 };
 use super::{
@@ -24,6 +24,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
+
+#[cfg(any(windows, test))]
+mod grok_snapshot;
 
 // Explicit Import searches all history. Restoration uses the bounded,
 // ownership-aware `codex_restore_lookup` instead, on a worker.
@@ -1368,6 +1371,12 @@ fn discover_sessions(
     let _ = previous_grok_reads;
     #[cfg(windows)]
     let mut grok_snapshot = None;
+    #[cfg(windows)]
+    let grok_roots: Vec<_> = requests
+        .iter()
+        .filter(|request| request.key.provider == SessionProvider::Grok)
+        .filter_map(|request| request.key.child_pid.map(|pid| (pid, request.key.launch)))
+        .collect();
     let results = requests
         .into_iter()
         .map(|request| {
@@ -1465,14 +1474,17 @@ fn discover_sessions(
                                 started,
                                 finished: SystemTime::now(),
                             };
-                            (read, active, process_parent_map())
+                            let parents = grok_snapshot::process_snapshot(&grok_roots, &active);
+                            (read, active, parents)
                         });
                         let previous = previous_grok_reads
                             .get(&key.pane)
                             .copied()
                             .map(|(started, finished)| GrokRegistryRead { started, finished });
                         key.child_pid
-                            .and_then(|pid| active_grok_session_for_process(pid, active, parents))
+                            .and_then(|pid| {
+                                active_grok_session_for_process(pid, active, parents.as_ref())
+                            })
                             .map_or(DiscoveryCandidate::Unresolved, |session| {
                                 DiscoveryCandidate::Session {
                                     candidate: SessionCandidate {
