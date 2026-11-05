@@ -392,6 +392,55 @@ fn control_new_focus_selects_the_new_pane_project_and_activates_its_window() {
     }
 }
 
+fn open_from(app: &mut MuxelApp, requesting_pane: Option<Uuid>) -> Uuid {
+    let result = app
+        .open(
+            ctl::NewOptions {
+                preset: Some("Codex".into()),
+                requesting_pane,
+                ..Default::default()
+            },
+            &mut Window::default(),
+        )
+        .unwrap();
+    serde_json::from_value(result["uuid"].clone()).unwrap()
+}
+
+#[test]
+fn control_new_opens_in_the_calling_panes_group_else_the_focused_group() {
+    let mut app = MuxelApp::fixture();
+    let pid = app.workspace.projects[0].id;
+    let focused = app.active_instance.unwrap();
+    let caller = Instance::shell(pid);
+    let caller_id = caller.id;
+    let layout = &mut app.workspace.project_mut(pid).unwrap().layout;
+    assert!(muxel_core::split(
+        layout,
+        focused,
+        SplitDirection::Horizontal,
+        caller_id
+    ));
+    app.workspace.instances.push(caller);
+    let group = |app: &MuxelApp, iid: Uuid| {
+        let layout = app.workspace.project(pid).unwrap().layout.as_ref();
+        layout.unwrap().tab_group(iid).unwrap().to_vec()
+    };
+
+    // An agent in the right-hand group asks while the left-hand group has focus.
+    let from_caller = open_from(&mut app, Some(caller_id));
+    assert_eq!(group(&app, caller_id), [caller_id, from_caller]);
+
+    // A caller outside this project, or no caller, gets the focused group.
+    let (_, other_project_pane) = target_project(&mut app, false);
+    let from_elsewhere = open_from(&mut app, other_project_pane);
+    let from_outside = open_from(&mut app, None);
+    assert_eq!(
+        group(&app, focused),
+        [focused, from_elsewhere, from_outside]
+    );
+    assert_eq!(app.active_instance, Some(focused));
+}
+
 #[test]
 fn control_new_startup_wait_is_pending_before_placement_until_actual_submission() {
     let mut app = MuxelApp::fixture();

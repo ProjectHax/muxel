@@ -73,6 +73,10 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Tabs per pane** — each pane is a tab group; `Ctrl+T` opens a new tab in the
   active pane.
+- **New agents open as tabs** — the toolbar's agent button and `Ctrl+Alt+1–9`
+  add the new agent as a tab in the focused pane, so starting an agent never adds
+  a column. An empty project gets its first pane. New Pane, Split Right/Down, the
+  split buttons and dragging a tab to an edge still make a new pane.
 - **Non-blocking agent creation** — a new agent tab paints and focuses first; PTY
   creation and child startup run on a worker, with stale launches discarded if the
   tab closes or is replaced before startup completes.
@@ -743,7 +747,7 @@ feature is added or changed, update the matching entry here in the same change**
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.
 - **Browser as a preset** — the built-in **Browser** preset opens a web-browser
-  pane; pick it anywhere you pick an agent (the toolbar's new-pane dropdown, or
+  pane; pick it anywhere you pick an agent (the toolbar's agent dropdown, or
   hold a pane's split / `+` button and choose it). Configure its homepage — and
   add more browser presets with their own homepages — in **Settings → Agents**
   (default `duckduckgo.com`; a bare domain gets `https://`). On macOS/Windows it's
@@ -803,8 +807,10 @@ feature is added or changed, update the matching entry here in the same change**
   reply, send it a prompt, answer the question it is blocked on, and press keys.
   Every command prints JSON.
 - **Open panes from another tool** — `muxel ctl new PROJECT` opens a tab using
-  that project's toolbar preset. `--model M` and `--effort E` select per-pane values for
-  plain and prompt launches, retained on restart. The preset needs Model flag /
+  that project's toolbar preset. Run from one of that project's panes, the tab
+  joins the caller's own group; otherwise it joins the focused group.
+  `--model M` and `--effort E` select per-pane values for plain and prompt
+  launches, retained on restart. The preset needs Model flag /
   Effort flag configured and absent from Extra args; literal argv cannot use
   these options (`parameter_unsupported`). Values are 1–64 characters from
   `[A-Za-z0-9._:/@+-]` without a leading `-`. Ask displays the choices before
@@ -1649,10 +1655,10 @@ feature is added or changed, update the matching entry here in the same change**
   sizes.
 - **Keybindings** — configurable shortcuts with a rebind UI, a cheat-sheet overlay
   (`Ctrl+Shift+/`), `Alt+1–9` to jump to a pane's Nth tab, `Ctrl+1–9` to switch to
-  the Nth project, `Ctrl+Alt+1–9` to open a new pane running the Nth agent preset,
-  `Ctrl+Shift+G` to toggle the "new agents get a git worktree" switch, `Ctrl+Shift+A`
-  to focus the next agent needing attention (blocked, then done), and `Cmd+Q`
-  (`Ctrl+Q` elsewhere) to quit from any focus.
+  the Nth project, `Ctrl+Alt+1–9` to open the Nth agent preset as a tab in the
+  focused pane, `Ctrl+Shift+G` to toggle the "new agents get a git worktree"
+  switch, `Ctrl+Shift+A` to focus the next agent needing attention (blocked, then
+  done), and `Cmd+Q` (`Ctrl+Q` elsewhere) to quit from any focus.
 - **Behavior** — immediate-save appearance, confirm destructive actions, quit
   confirmation, "Ask before closing a busy terminal" (on by default; see
   Recoverable terminal close), and auto-close a pane when its process exits
